@@ -44,9 +44,7 @@ concurrency:
 jobs:
   # Stage 1: Check if AITER needs to be rebuilt
   check-aiter-version:
-    if: |
-      github.repository == 'sgl-project/sglang' &&
-      (github.event_name == 'pull_request' || inputs.rocm_version == 'all' || inputs.rocm_version == matrix.rocm-version || inputs.rocm_version == '')
+    if: github.repository == 'sgl-project/sglang'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -59,11 +57,33 @@ jobs:
       aiter_commit_700: ${{ steps.check.outputs.aiter_commit_700 }}
       aiter_commit_720: ${{ steps.check.outputs.aiter_commit_720 }}
     steps:
+      - name: Check if this ROCm version should run
+        id: should_run
+        run: |
+          # For pull_request events, always run all versions
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # For workflow_dispatch, check inputs.rocm_version
+          ROCM_VER="${{ matrix.rocm-version }}"
+          INPUT_VER="${{ inputs.rocm_version }}"
+
+          # Run if input is 'all', empty, or matches this matrix version
+          if [[ "$INPUT_VER" == "all" || "$INPUT_VER" == "" || "$INPUT_VER" == "$ROCM_VER" ]]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_run=false" >> $GITHUB_OUTPUT
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.should_run.outputs.should_run == 'true'
         with:
           ref: ${{ github.event.client_payload.commit_sha || inputs.commit_sha || github.sha }}
 
       - name: Configure AWS credentials
+        if: steps.should_run.outputs.should_run == 'true'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AMD_AWS_ACCESS_KEY_ID }}
@@ -71,6 +91,7 @@ jobs:
           aws-region: us-east-2
 
       - name: Check AITER version for ROCm ${{ matrix.rocm-version }}
+        if: steps.should_run.outputs.should_run == 'true'
         id: check
         env:
           AMD_S3_BUCKET_NAME: ${{ secrets.AMD_S3_BUCKET_NAME }}
