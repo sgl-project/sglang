@@ -65,7 +65,9 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
 
     def _make_eval(self, seed: int = 42, num_examples=None):
         return MixedPrefixGSM8KEval(
-            num_examples=num_examples if num_examples is not None else self.NUM_EXAMPLES,
+            num_examples=(
+                num_examples if num_examples is not None else self.NUM_EXAMPLES
+            ),
             num_threads=1,
             num_shots=self.NUM_SHOTS,
             num_clusters=self.NUM_CLUSTERS,
@@ -77,9 +79,7 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
     def test_mode_0_all_share_standard_prefix(self):
         evaluator = self._make_eval()
         mode0_prefixes = {
-            evaluator._pick_prefix(i)
-            for i in range(self.NUM_EXAMPLES)
-            if i % 4 == 0
+            evaluator._pick_prefix(i) for i in range(self.NUM_EXAMPLES) if i % 4 == 0
         }
         self.assertEqual(len(mode0_prefixes), 1)
         # Standard prefix must be non-empty.
@@ -88,9 +88,7 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
     def test_mode_1_uses_n_distinct_cluster_prefixes(self):
         evaluator = self._make_eval()
         mode1_prefixes = {
-            evaluator._pick_prefix(i)
-            for i in range(self.NUM_EXAMPLES)
-            if i % 4 == 1
+            evaluator._pick_prefix(i) for i in range(self.NUM_EXAMPLES) if i % 4 == 1
         }
         # With NUM_EXAMPLES=40 (10 questions in mode 1) and NUM_CLUSTERS=3,
         # we must see exactly NUM_CLUSTERS distinct prefixes (cycling).
@@ -99,9 +97,7 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
     def test_mode_2_all_prefixes_unique(self):
         evaluator = self._make_eval()
         mode2_prefixes = [
-            evaluator._pick_prefix(i)
-            for i in range(self.NUM_EXAMPLES)
-            if i % 4 == 2
+            evaluator._pick_prefix(i) for i in range(self.NUM_EXAMPLES) if i % 4 == 2
         ]
         # With NUM_SHOTS=4 sampled from a pool of 12, the chance of two
         # 4-element samples being identical (in order) is astronomically low.
@@ -146,9 +142,7 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
         # The label tagged in metrics matches the mode index.
         evaluator = self._make_eval()
         for i in range(20):
-            self.assertEqual(
-                evaluator._mode_label(i), _MODE_LABELS[i % 4]
-            )
+            self.assertEqual(evaluator._mode_label(i), _MODE_LABELS[i % 4])
 
     def test_insufficient_dataset_raises(self):
         tiny = os.path.join(self._tmpdir.name, "tiny.jsonl")

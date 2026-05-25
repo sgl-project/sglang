@@ -128,9 +128,7 @@ class MixedPrefixGSM8KEval(GSM8KEval):
             return self._cluster_prefixes[cluster_idx]
         if mode == 2:
             rng = random.Random(self._seed + idx)
-            sampled_indices = rng.sample(
-                range(len(self._random_pool)), self._num_shots
-            )
+            sampled_indices = rng.sample(range(len(self._random_pool)), self._num_shots)
             return "".join(
                 get_one_example(self._random_pool, i, include_answer=True) + "\n\n"
                 for i in sampled_indices
@@ -170,9 +168,7 @@ class MixedPrefixGSM8KEval(GSM8KEval):
                 correct_answer=correct_answer,
                 extracted_answer=extracted_answer,
             )
-            convo = prompt_messages + [
-                dict(content=response_text, role="assistant")
-            ]
+            convo = prompt_messages + [dict(content=response_text, role="assistant")]
 
             # ``aggregate_results`` averages each metric across the subset of
             # samples that reported it. By tagging only one per-mode key per
