@@ -1449,7 +1449,6 @@ class HiRadixCache(RadixCache):
                     if node.backuped:
                         self.cache_controller.mem_pool_host.free(node.host_value)
                         node.host_value = None
-                        node.backuped = False
                     self.evictable_size_ += len(node.value)
                     self._update_leaf_status(node)
                     self._update_host_leaf_status(node)
@@ -1467,7 +1466,6 @@ class HiRadixCache(RadixCache):
                     if new_node.backuped:
                         self.cache_controller.mem_pool_host.free(new_node.host_value)
                         new_node.host_value = None
-                        new_node.backuped = False
                     self.evictable_size_ += len(new_node.value)
                     self._update_leaf_status(new_node)
                     self._update_host_leaf_status(new_node)
