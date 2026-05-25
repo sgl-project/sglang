@@ -1,31 +1,39 @@
-# Copyright 2024 NVIDIA CORPORATION & AFFILIATES
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
 # SPDX-License-Identifier: Apache-2.0
-"""SANA-WM specific LTX-2 video-only refinement stage."""
+#
+# SANA-WM stage-2 LTX-2 latent refiner.
+#
+# Runs a 3-step Euler loop on top of the SANA-WM stage-1 latent using the
+# upstream LTX-2 video-only refiner:
+#   * `transformer_2` -> `SanaWMLTX2VideoRefiner`
+#   * `connectors`    -> sglang `LTX2TextConnectors`
+#   * `text_encoder_2`/`tokenizer_2` -> sglang `Gemma3ForConditionalGeneration`
+#                                       + HF AutoTokenizer
+#
+# All four modules are loaded by `PipelineComponentLoader` and handed to the
+# stage by `SanaWMTwoStagePipeline.create_pipeline_stages` (see
+# `runtime/pipelines/sana_wm_pipeline.py`). The stage does not load any
+# weights itself, and it does not import raw `diffusers`/`transformers`
+# model classes.
+#
+# Sink/current split: the first stage-1 latent frame is preserved as the
+# clean "anchor" (sink) and only the remaining frames are denoised. The
+# refiner forward feeds the packed (sink + noisy current) token sequence with
+# `n_context_tokens` set so streaming SLA isolates the two halves the same
+# way NVlabs' `inference_sana_wm.py` does.
 
 from __future__ import annotations
 
-import gc
-import os
-from pathlib import Path
+from typing import Any
 
 import torch
 from torch import nn
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.models.dits.sana_wm_refiner_transformer import (
+    pack_latents,
+    unpack_latents,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
@@ -35,65 +43,96 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 
+# Distilled 3-step sigma schedule, matches NVlabs `inference_sana_wm.py`.
 STAGE_2_DISTILLED_SIGMA_VALUES: tuple[float, ...] = (0.909375, 0.725, 0.421875, 0.0)
+
+# Default Gemma-3 token budget for the refiner prompt encoder.
+_REFINER_TEXT_MAX_LENGTH = 1024
+
+
+def default_sana_wm_refiner_dtype(server_args: ServerArgs) -> torch.dtype:
+    precision = getattr(server_args.pipeline_config, "dit_precision", "bf16")
+    return PRECISION_TO_TYPE.get(precision, torch.bfloat16)
+
+
+def _pack_text_embeds(
+    text_hidden_states: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    *,
+    padding_side: str = "left",
+    scale_factor: int = 8,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """SANA-WM-specific text-embed pooling.
+
+    Stacks per-layer Gemma-3 hidden states (`text_hidden_states` shape
+    `(B, L, D, n_layers)`), applies a masked min-max normalization across the
+    (token, layer) axes, scales by `scale_factor`, then flattens layers into
+    the channel dim, padded positions zeroed out. Matches NVlabs upstream.
+    """
+    batch_size, seq_len, hidden_dim, _ = text_hidden_states.shape
+    device = text_hidden_states.device
+    original_dtype = text_hidden_states.dtype
+
+    token_indices = torch.arange(seq_len, device=device).unsqueeze(0)
+    if padding_side == "right":
+        mask = token_indices < sequence_lengths[:, None]
+    elif padding_side == "left":
+        start_indices = seq_len - sequence_lengths[:, None]
+        mask = token_indices >= start_indices
+    else:
+        raise ValueError(
+            f"padding_side must be 'left' or 'right', got {padding_side}"
+        )
+    mask = mask[:, :, None, None]
+
+    masked = text_hidden_states.masked_fill(~mask, 0.0)
+    valid_positions = (sequence_lengths * hidden_dim).view(batch_size, 1, 1, 1)
+    masked_mean = masked.sum(dim=(1, 2), keepdim=True) / (valid_positions + eps)
+    x_min = text_hidden_states.masked_fill(~mask, float("inf")).amin(
+        dim=(1, 2), keepdim=True
+    )
+    x_max = text_hidden_states.masked_fill(~mask, float("-inf")).amax(
+        dim=(1, 2), keepdim=True
+    )
+    normalized = (text_hidden_states - masked_mean) / (x_max - x_min + eps)
+    normalized = (normalized * scale_factor).flatten(2)
+
+    flat_mask = mask.squeeze(-1).expand(-1, -1, normalized.shape[-1])
+    return normalized.masked_fill(~flat_mask, 0.0).to(dtype=original_dtype)
 
 
 class SanaWMLTX2RefinerStage(PipelineStage):
-    """Run the official SANA-WM LTX-2 latent refiner before VAE decode."""
+    """Run the SANA-WM stage-2 LTX-2 refiner before VAE decode.
+
+    Modules are injected by `SanaWMTwoStagePipeline`:
+      * `transformer` (`SanaWMLTX2VideoRefiner`) -- video-only LTX-2 forward
+      * `connectors` (`LTX2TextConnectors`)
+      * `text_encoder` (`Gemma3ForConditionalGeneration`)
+      * `tokenizer` (HF `AutoTokenizer` for the refiner Gemma-3)
+    """
 
     def __init__(
         self,
         *,
-        refiner_root: str,
-        refiner_gemma_root: str,
+        transformer: nn.Module,
+        connectors: nn.Module,
+        text_encoder: nn.Module,
+        tokenizer: Any,
         dtype: torch.dtype,
-        text_max_sequence_length: int = 1024,
+        text_max_sequence_length: int = _REFINER_TEXT_MAX_LENGTH,
     ) -> None:
         super().__init__()
-        self.refiner_root = refiner_root
-        self.refiner_gemma_root = refiner_gemma_root
+        self.transformer = transformer
+        self.connectors = connectors
+        self.text_encoder = text_encoder
+        self.tokenizer = tokenizer
         self.dtype = dtype
-        self.text_max_sequence_length = text_max_sequence_length
-        self._refiner: _DiffusersLTX2VideoRefiner | None = None
+        self.text_max_sequence_length = int(text_max_sequence_length)
 
     @property
     def role_affinity(self) -> RoleType:
         return RoleType.DENOISER
-
-    def _load_refiner(self) -> "_DiffusersLTX2VideoRefiner":
-        if self._refiner is None:
-            self._validate_refiner_layout()
-            self.log_info("Loading SANA-WM LTX-2 refiner from %s", self.refiner_root)
-            self._refiner = _DiffusersLTX2VideoRefiner(
-                refiner_root=self.refiner_root,
-                gemma_root=self.refiner_gemma_root,
-                dtype=self.dtype,
-                device=get_local_torch_device(),
-                text_max_sequence_length=self.text_max_sequence_length,
-            )
-        return self._refiner
-
-    def _validate_refiner_layout(self) -> None:
-        required_paths = [
-            "transformer/config.json",
-            "connectors/config.json",
-            os.path.join("text_encoder", "config.json"),
-        ]
-        missing = [
-            rel_path
-            for rel_path in required_paths
-            if not os.path.exists(os.path.join(self.refiner_root, rel_path))
-        ]
-        if missing:
-            raise ValueError(
-                "SANA-WM two-stage inference requires the upstream refiner "
-                f"directory. Missing under {self.refiner_root}: {missing}"
-            )
-        if not os.path.exists(os.path.join(self.refiner_gemma_root, "config.json")):
-            raise ValueError(
-                "SANA-WM refiner text encoder not found at "
-                f"{self.refiner_gemma_root}."
-            )
 
     @staticmethod
     def _prompts_for_batch(batch: Req, batch_size: int) -> list[str]:
@@ -102,7 +141,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
             prompt = batch.prompt
         if isinstance(prompt, str):
             return [prompt] * batch_size
-        if isinstance(prompt, list) and all(isinstance(item, str) for item in prompt):
+        if isinstance(prompt, list) and all(isinstance(p, str) for p in prompt):
             if len(prompt) == batch_size:
                 return prompt
             if len(prompt) == 1:
@@ -111,15 +150,138 @@ class SanaWMLTX2RefinerStage(PipelineStage):
             "SANA-WM refiner requires a string prompt or one prompt per batch item."
         )
 
-    @staticmethod
-    def _seeds_for_batch(batch: Req, batch_size: int) -> list[int]:
-        if batch.seeds is not None:
-            if len(batch.seeds) == batch_size:
-                return [int(seed) for seed in batch.seeds]
-            if len(batch.seeds) == 1:
-                return [int(batch.seeds[0])] * batch_size
-        seed = getattr(batch, "seed", 42)
-        return [int(seed)] * batch_size
+    @torch.inference_mode()
+    def _encode_prompt(
+        self,
+        prompt: str,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        tokenizer = self.tokenizer
+        if getattr(tokenizer, "padding_side", "right") != "left":
+            tokenizer.padding_side = "left"
+        if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        text_inputs = tokenizer(
+            [prompt.strip()],
+            padding="max_length",
+            max_length=self.text_max_sequence_length,
+            truncation=True,
+            add_special_tokens=True,
+            return_tensors="pt",
+        )
+        input_ids = text_inputs.input_ids.to(device)
+        attention_mask = text_inputs.attention_mask.to(device)
+
+        outputs = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+        )
+        per_layer_hidden = getattr(outputs, "hidden_states", None)
+        if per_layer_hidden is None:
+            raise RuntimeError(
+                "SANA-WM refiner text encoder must return per-layer hidden_states."
+            )
+        stacked = torch.stack(per_layer_hidden, dim=-1)  # (B, L, D, n_layers)
+        seq_lengths = attention_mask.sum(dim=-1)
+        prompt_embeds = _pack_text_embeds(
+            stacked,
+            seq_lengths,
+            padding_side=tokenizer.padding_side,
+        ).to(dtype=self.dtype)
+
+        video_text_embedding, _, video_attention_mask = self.connectors(
+            prompt_embeds, attention_mask
+        )
+        return (
+            video_text_embedding.to(device=device, dtype=self.dtype),
+            video_attention_mask.to(device=device),
+        )
+
+    @torch.inference_mode()
+    def _refine_one(
+        self,
+        latent: torch.Tensor,
+        prompt: str,
+        *,
+        fps: float,
+        seed: int,
+        sink_size: int = 1,
+    ) -> torch.Tensor:
+        device = get_local_torch_device()
+        z = latent.to(device=device, dtype=self.dtype)
+        if z.shape[2] <= sink_size:
+            raise ValueError(
+                f"Stage-1 latent has {z.shape[2]} frames but sink_size={sink_size}."
+            )
+
+        prompt_embeds, prompt_attention_mask = self._encode_prompt(prompt, device)
+        # Reshape mask to additive bias the same way `_forward_video_only` did.
+        if prompt_attention_mask.ndim == 2:
+            additive = (1 - prompt_attention_mask.to(self.dtype)) * -10000.0
+            additive = additive.unsqueeze(1)
+        else:
+            additive = prompt_attention_mask.to(self.dtype)
+
+        sigmas = torch.tensor(
+            STAGE_2_DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=device
+        )
+        start_sigma = float(sigmas[0])
+        sink = z[:, :, :sink_size].contiguous()
+        current = z[:, :, sink_size:].contiguous()
+        gen = torch.Generator(device=device).manual_seed(int(seed))
+        eps = torch.randn(
+            current.shape, generator=gen, device=device, dtype=self.dtype
+        )
+        noisy = (1.0 - start_sigma) * current + start_sigma * eps
+
+        patch_size = int(self.transformer.patch_size)
+        patch_size_t = int(self.transformer.patch_size_t)
+        B = z.shape[0]
+
+        sink_tokens = pack_latents(sink, patch_size, patch_size_t)
+        n_context_tokens = sink_tokens.shape[1]
+
+        for step_idx in range(len(sigmas) - 1):
+            sigma = sigmas[step_idx]
+            full_latent = torch.cat([sink, noisy], dim=2)
+            T_full = full_latent.shape[2]
+            H_full = full_latent.shape[3]
+            W_full = full_latent.shape[4]
+
+            full_tokens = pack_latents(full_latent, patch_size, patch_size_t)
+            L_full = full_tokens.shape[1]
+
+            timestep = torch.zeros(
+                B, L_full, dtype=torch.float32, device=device
+            )
+            timestep[:, n_context_tokens:] = sigma
+
+            velocity_tokens = self.transformer(
+                hidden_states=full_tokens.to(self.dtype),
+                encoder_hidden_states=prompt_embeds,
+                timestep=timestep,
+                encoder_attention_mask=additive,
+                num_frames=T_full,
+                height=H_full,
+                width=W_full,
+                fps=fps,
+                n_context_tokens=n_context_tokens,
+            )
+            velocity_5d = unpack_latents(
+                velocity_tokens,
+                num_frames=T_full,
+                height=H_full,
+                width=W_full,
+                patch_size=patch_size,
+                patch_size_t=patch_size_t,
+            )
+            velocity_current = velocity_5d[:, :, sink_size:].to(self.dtype)
+            dt = (sigmas[step_idx + 1] - sigma).to(self.dtype)
+            noisy = noisy + velocity_current * dt
+
+        return torch.cat([sink, noisy], dim=2)
 
     @torch.inference_mode()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
@@ -131,27 +293,33 @@ class SanaWMLTX2RefinerStage(PipelineStage):
                 f"got {tuple(batch.latents.shape)}."
             )
 
-        refiner = self._load_refiner()
         batch_size = int(batch.latents.shape[0])
         prompts = self._prompts_for_batch(batch, batch_size)
-        seeds = self._seeds_for_batch(batch, batch_size)
         fps = float(getattr(batch, "fps", 16) or 16)
-        progress = not bool(getattr(batch, "is_warmup", False))
 
-        refined_latents: list[torch.Tensor] = []
-        for item_idx, (prompt, seed) in enumerate(zip(prompts, seeds, strict=True)):
-            refined = refiner.refine_latents(
-                batch.latents[item_idx : item_idx + 1],
-                prompt,
-                fps=fps,
-                seed=seed,
-                progress=progress and batch_size == 1,
+        seeds: list[int]
+        if batch.seeds is not None and len(batch.seeds) == batch_size:
+            seeds = [int(s) for s in batch.seeds]
+        elif batch.seeds is not None and len(batch.seeds) == 1:
+            seeds = [int(batch.seeds[0])] * batch_size
+        else:
+            seeds = [int(getattr(batch, "seed", 0) or 0)] * batch_size
+
+        refined: list[torch.Tensor] = []
+        for idx, (prompt, seed) in enumerate(zip(prompts, seeds, strict=True)):
+            refined.append(
+                self._refine_one(
+                    batch.latents[idx : idx + 1],
+                    prompt,
+                    fps=fps,
+                    seed=seed,
+                )
             )
-            refined_latents.append(refined)
-
-        batch.latents = torch.cat(refined_latents, dim=0).to(
+        batch.latents = torch.cat(refined, dim=0).to(
             device=batch.latents.device, dtype=batch.latents.dtype
         )
+        if batch.extra is None:
+            batch.extra = {}
         batch.extra["sana_wm_refiner_applied"] = True
         self.log_info("SANA-WM LTX-2 refiner applied to stage-1 latents.")
         return batch
@@ -179,502 +347,6 @@ class SanaWMRefinerDecodingStage(DecodingStage):
                 "SANA-WM refiner decoding expected a sink frame plus refined "
                 f"frames, got temporal length {frames.shape[2]}."
             )
-        # Match NVlabs inference_sana_wm.py: decode with the clean sink anchor,
-        # then remove that first frame from the returned video.
+        # Match NVlabs `inference_sana_wm.py`: decode with the clean sink anchor,
+        # then drop the first frame from the returned video.
         return frames[:, :, 1:].contiguous()
-
-
-class _DiffusersLTX2VideoRefiner(nn.Module):
-    """Thin adapter around diffusers LTX-2 modules for SANA-WM refinement."""
-
-    def __init__(
-        self,
-        refiner_root: str | Path,
-        gemma_root: str | Path,
-        *,
-        dtype: torch.dtype,
-        device: torch.device | str,
-        text_max_sequence_length: int = 1024,
-    ) -> None:
-        super().__init__()
-        self.refiner_root = Path(refiner_root)
-        self.gemma_root = Path(gemma_root)
-        self.dtype = dtype
-        self.device = torch.device(device)
-        self.text_max_sequence_length = int(text_max_sequence_length)
-        self.transformer, self.connectors = self._load_diffusers_components()
-
-    def _load_diffusers_components(self) -> tuple[nn.Module, nn.Module]:
-        from diffusers.models.transformers.transformer_ltx2 import (
-            LTX2VideoTransformer3DModel,
-        )
-        from diffusers.pipelines.ltx2 import LTX2TextConnectors
-
-        transformer = LTX2VideoTransformer3DModel.from_pretrained(
-            self.refiner_root,
-            subfolder="transformer",
-            torch_dtype=self.dtype,
-        ).eval()
-        connectors = LTX2TextConnectors.from_pretrained(
-            self.refiner_root,
-            subfolder="connectors",
-            torch_dtype=self.dtype,
-        ).eval()
-        return transformer, connectors
-
-    @torch.inference_mode()
-    def refine_latents(
-        self,
-        sana_latent: torch.Tensor,
-        prompt: str,
-        *,
-        fps: float,
-        sink_size: int = 1,
-        seed: int = 42,
-        progress: bool = True,
-    ) -> torch.Tensor:
-        if sana_latent.shape[2] <= sink_size:
-            raise ValueError(
-                f"Stage-1 latent has {sana_latent.shape[2]} frames but "
-                f"sink_size={sink_size}."
-            )
-
-        self.transformer.to("cpu")
-        _empty_cuda_cache()
-        prompt_embeds, prompt_attention_mask = self._encode_prompt(prompt)
-
-        self.transformer.to(self.device)
-        z = sana_latent.to(device=self.device, dtype=self.dtype)
-        sigmas = torch.tensor(
-            STAGE_2_DISTILLED_SIGMA_VALUES,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        start_sigma = float(sigmas[0])
-        sink = z[:, :, :sink_size].contiguous()
-        current = z[:, :, sink_size:].contiguous()
-        generator = torch.Generator(device=self.device).manual_seed(int(seed))
-        eps = torch.randn(
-            current.shape, generator=generator, device=self.device, dtype=self.dtype
-        )
-        noisy = (1.0 - start_sigma) * current + start_sigma * eps
-
-        step_iter = range(len(sigmas) - 1)
-        if progress:
-            from tqdm.auto import tqdm
-
-            step_iter = tqdm(step_iter, desc="sana_wm_refiner", unit="step")
-
-        for step_idx in step_iter:
-            sigma = sigmas[step_idx]
-            denoised = self._predict_current_x0(
-                sink=sink,
-                noisy_current=noisy,
-                prompt_embeds=prompt_embeds,
-                prompt_attention_mask=prompt_attention_mask,
-                sigma=sigma,
-                fps=fps,
-            )
-            noisy_tokens = _pack_latents(
-                noisy,
-                patch_size=self.transformer.config.patch_size,
-                patch_size_t=self.transformer.config.patch_size_t,
-            )
-            velocity = (noisy_tokens.float() - denoised.float()) / sigma.float()
-            next_tokens = noisy_tokens.float() + velocity * (
-                sigmas[step_idx + 1] - sigma
-            ).float()
-            noisy = _unpack_latents(
-                next_tokens.to(self.dtype),
-                num_frames=noisy.shape[2],
-                height=noisy.shape[3],
-                width=noisy.shape[4],
-                patch_size=self.transformer.config.patch_size,
-                patch_size_t=self.transformer.config.patch_size_t,
-            )
-
-        return torch.cat([sink, noisy], dim=2)
-
-    @torch.inference_mode()
-    def _encode_prompt(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
-        from transformers import AutoTokenizer, Gemma3ForConditionalGeneration
-
-        tokenizer = AutoTokenizer.from_pretrained(self.gemma_root)
-        tokenizer.padding_side = "left"
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        text_inputs = tokenizer(
-            [prompt.strip()],
-            padding="max_length",
-            max_length=self.text_max_sequence_length,
-            truncation=True,
-            add_special_tokens=True,
-            return_tensors="pt",
-        )
-        input_ids = text_inputs.input_ids.to(self.device)
-        attention_mask = text_inputs.attention_mask.to(self.device)
-
-        text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
-            self.gemma_root,
-            torch_dtype=self.dtype,
-            low_cpu_mem_usage=True,
-        ).eval()
-        text_encoder.to(self.device)
-        text_backbone = getattr(text_encoder, "model", text_encoder)
-        outputs = text_backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-        )
-        hidden_states = torch.stack(outputs.hidden_states, dim=-1)
-        sequence_lengths = attention_mask.sum(dim=-1)
-        prompt_embeds = _pack_text_embeds(
-            hidden_states,
-            sequence_lengths,
-            device=self.device,
-            padding_side=tokenizer.padding_side,
-        ).to(dtype=self.dtype)
-
-        del text_encoder, text_backbone, outputs, hidden_states
-        _empty_cuda_cache()
-
-        self.connectors.to(self.device)
-        connector_prompt_embeds, _, connector_attention_mask = self.connectors(
-            prompt_embeds, attention_mask
-        )
-        self.connectors.to("cpu")
-        del prompt_embeds, attention_mask
-        _empty_cuda_cache()
-
-        return connector_prompt_embeds.to(
-            device=self.device, dtype=self.dtype
-        ), connector_attention_mask.to(device=self.device)
-
-    def _predict_current_x0(
-        self,
-        *,
-        sink: torch.Tensor,
-        noisy_current: torch.Tensor,
-        prompt_embeds: torch.Tensor,
-        prompt_attention_mask: torch.Tensor,
-        sigma: torch.Tensor,
-        fps: float,
-    ) -> torch.Tensor:
-        full_latent = torch.cat([sink, noisy_current], dim=2)
-        batch_size, _, num_frames, height, width = full_latent.shape
-        latent_tokens = _pack_latents(
-            full_latent,
-            patch_size=self.transformer.config.patch_size,
-            patch_size_t=self.transformer.config.patch_size_t,
-        )
-        n_context_tokens = _pack_latents(
-            sink,
-            patch_size=self.transformer.config.patch_size,
-            patch_size_t=self.transformer.config.patch_size_t,
-        ).shape[1]
-
-        raw_timestep = torch.zeros(
-            batch_size,
-            latent_tokens.shape[1],
-            1,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        raw_timestep[:, n_context_tokens:, 0] = sigma.float()
-        model_timestep = raw_timestep.squeeze(-1) * float(
-            self.transformer.config.timestep_scale_multiplier
-        )
-
-        velocity = self._forward_video_only(
-            hidden_states=latent_tokens,
-            encoder_hidden_states=prompt_embeds,
-            timestep=model_timestep,
-            encoder_attention_mask=prompt_attention_mask,
-            num_frames=num_frames,
-            height=height,
-            width=width,
-            fps=fps,
-            n_context_tokens=n_context_tokens,
-        )
-        denoised = latent_tokens.float() - velocity.float() * raw_timestep
-        return denoised[:, n_context_tokens:, :].to(self.dtype)
-
-    def _forward_video_only(
-        self,
-        *,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        timestep: torch.Tensor,
-        encoder_attention_mask: torch.Tensor | None,
-        num_frames: int,
-        height: int,
-        width: int,
-        fps: float,
-        n_context_tokens: int,
-    ) -> torch.Tensor:
-        transformer = self.transformer
-        batch_size = hidden_states.size(0)
-
-        if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
-            encoder_attention_mask = (
-                1 - encoder_attention_mask.to(hidden_states.dtype)
-            ) * -10000.0
-            encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
-
-        video_coords = transformer.rope.prepare_video_coords(
-            batch_size, num_frames, height, width, hidden_states.device, fps=fps
-        )
-        video_rotary_emb = transformer.rope(video_coords, device=hidden_states.device)
-
-        hidden_states = transformer.proj_in(hidden_states)
-        temb, embedded_timestep = transformer.time_embed(
-            timestep.flatten(),
-            batch_size=batch_size,
-            hidden_dtype=hidden_states.dtype,
-        )
-        temb = temb.view(batch_size, -1, temb.size(-1))
-        embedded_timestep = embedded_timestep.view(
-            batch_size, -1, embedded_timestep.size(-1)
-        )
-
-        encoder_hidden_states = transformer.caption_projection(encoder_hidden_states)
-        encoder_hidden_states = encoder_hidden_states.view(
-            batch_size, -1, hidden_states.size(-1)
-        )
-
-        for block in transformer.transformer_blocks:
-            hidden_states = _forward_video_block(
-                block=block,
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                video_rotary_emb=video_rotary_emb,
-                encoder_attention_mask=encoder_attention_mask,
-                n_context_tokens=n_context_tokens,
-            )
-
-        scale_shift_values = (
-            transformer.scale_shift_table[None, None] + embedded_timestep[:, :, None]
-        )
-        shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
-        hidden_states = transformer.norm_out(hidden_states)
-        hidden_states = hidden_states * (1 + scale) + shift
-        return transformer.proj_out(hidden_states)
-
-
-def _forward_video_block(
-    *,
-    block: nn.Module,
-    hidden_states: torch.Tensor,
-    encoder_hidden_states: torch.Tensor,
-    temb: torch.Tensor,
-    video_rotary_emb: tuple[torch.Tensor, torch.Tensor],
-    encoder_attention_mask: torch.Tensor | None,
-    n_context_tokens: int,
-) -> torch.Tensor:
-    batch_size = hidden_states.size(0)
-    norm_hidden_states = block.norm1(hidden_states)
-    num_ada_params = block.scale_shift_table.shape[0]
-    ada_values = block.scale_shift_table[None, None].to(temb.device) + temb.reshape(
-        batch_size, temb.size(1), num_ada_params, -1
-    )
-    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = ada_values.unbind(
-        dim=2
-    )
-    norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
-
-    attn_hidden_states = _streaming_self_attention(
-        attn=block.attn1,
-        hidden_states=norm_hidden_states,
-        query_rotary_emb=video_rotary_emb,
-        n_context_tokens=n_context_tokens,
-    )
-    hidden_states = hidden_states + attn_hidden_states * gate_msa
-
-    norm_hidden_states = block.norm2(hidden_states)
-    attn_hidden_states = block.attn2(
-        norm_hidden_states,
-        encoder_hidden_states=encoder_hidden_states,
-        query_rotary_emb=None,
-        attention_mask=encoder_attention_mask,
-    )
-    hidden_states = hidden_states + attn_hidden_states
-
-    norm_hidden_states = block.norm3(hidden_states) * (1 + scale_mlp) + shift_mlp
-    return hidden_states + block.ff(norm_hidden_states) * gate_mlp
-
-
-def _streaming_self_attention(
-    *,
-    attn: nn.Module,
-    hidden_states: torch.Tensor,
-    query_rotary_emb: tuple[torch.Tensor, torch.Tensor],
-    n_context_tokens: int,
-) -> torch.Tensor:
-    sequence_length = hidden_states.shape[1]
-    if n_context_tokens <= 0 or n_context_tokens >= sequence_length:
-        return attn(
-            hidden_states=hidden_states,
-            encoder_hidden_states=None,
-            query_rotary_emb=query_rotary_emb,
-        )
-
-    from diffusers.models.attention_dispatch import dispatch_attention_fn
-    from diffusers.models.transformers.transformer_ltx2 import (
-        apply_interleaved_rotary_emb,
-        apply_split_rotary_emb,
-    )
-
-    to_gate_logits = getattr(attn, "to_gate_logits", None)
-    gate_logits = to_gate_logits(hidden_states) if to_gate_logits is not None else None
-
-    query = attn.to_q(hidden_states)
-    key = attn.to_k(hidden_states)
-    value = attn.to_v(hidden_states)
-    query = attn.norm_q(query)
-    key = attn.norm_k(key)
-
-    if attn.rope_type == "interleaved":
-        query = apply_interleaved_rotary_emb(query, query_rotary_emb)
-        key = apply_interleaved_rotary_emb(key, query_rotary_emb)
-    elif attn.rope_type == "split":
-        query = apply_split_rotary_emb(query, query_rotary_emb)
-        key = apply_split_rotary_emb(key, query_rotary_emb)
-    else:
-        raise ValueError(f"Unsupported LTX-2 RoPE type: {attn.rope_type}")
-
-    query = query.unflatten(2, (attn.heads, -1))
-    key = key.unflatten(2, (attn.heads, -1))
-    value = value.unflatten(2, (attn.heads, -1))
-
-    processor = attn.processor
-    backend = getattr(processor, "_attention_backend", None)
-    parallel_config = getattr(processor, "_parallel_config", None)
-    context_hidden_states = dispatch_attention_fn(
-        query[:, :n_context_tokens],
-        key[:, :n_context_tokens],
-        value[:, :n_context_tokens],
-        attn_mask=None,
-        dropout_p=0.0,
-        is_causal=False,
-        backend=backend,
-        parallel_config=parallel_config,
-    )
-    current_hidden_states = dispatch_attention_fn(
-        query[:, n_context_tokens:],
-        key,
-        value,
-        attn_mask=None,
-        dropout_p=0.0,
-        is_causal=False,
-        backend=backend,
-        parallel_config=parallel_config,
-    )
-
-    hidden_states = torch.cat([context_hidden_states, current_hidden_states], dim=1)
-    hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
-
-    if gate_logits is not None:
-        hidden_states = hidden_states.unflatten(2, (attn.heads, -1))
-        gates = 2.0 * torch.sigmoid(gate_logits)
-        hidden_states = hidden_states * gates.unsqueeze(-1)
-        hidden_states = hidden_states.flatten(2, 3)
-
-    hidden_states = attn.to_out[0](hidden_states)
-    return attn.to_out[1](hidden_states)
-
-
-def _pack_text_embeds(
-    text_hidden_states: torch.Tensor,
-    sequence_lengths: torch.Tensor,
-    device: str | torch.device,
-    padding_side: str = "left",
-    scale_factor: int = 8,
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    batch_size, seq_len, hidden_dim, _ = text_hidden_states.shape
-    original_dtype = text_hidden_states.dtype
-    token_indices = torch.arange(seq_len, device=device).unsqueeze(0)
-    if padding_side == "right":
-        mask = token_indices < sequence_lengths[:, None]
-    elif padding_side == "left":
-        start_indices = seq_len - sequence_lengths[:, None]
-        mask = token_indices >= start_indices
-    else:
-        raise ValueError(f"padding_side must be 'left' or 'right', got {padding_side}")
-    mask = mask[:, :, None, None]
-
-    masked_hidden_states = text_hidden_states.masked_fill(~mask, 0.0)
-    valid_positions = (sequence_lengths * hidden_dim).view(batch_size, 1, 1, 1)
-    masked_mean = masked_hidden_states.sum(dim=(1, 2), keepdim=True) / (
-        valid_positions + eps
-    )
-    x_min = text_hidden_states.masked_fill(~mask, float("inf")).amin(
-        dim=(1, 2), keepdim=True
-    )
-    x_max = text_hidden_states.masked_fill(~mask, float("-inf")).amax(
-        dim=(1, 2), keepdim=True
-    )
-    normalized = (text_hidden_states - masked_mean) / (x_max - x_min + eps)
-    normalized = normalized * scale_factor
-    normalized = normalized.flatten(2)
-    mask_flat = mask.squeeze(-1).expand(-1, -1, normalized.shape[-1])
-    return normalized.masked_fill(~mask_flat, 0.0).to(dtype=original_dtype)
-
-
-def _pack_latents(
-    latents: torch.Tensor, patch_size: int = 1, patch_size_t: int = 1
-) -> torch.Tensor:
-    batch_size, _, num_frames, height, width = latents.shape
-    post_patch_num_frames = num_frames // patch_size_t
-    post_patch_height = height // patch_size
-    post_patch_width = width // patch_size
-    latents = latents.reshape(
-        batch_size,
-        -1,
-        post_patch_num_frames,
-        patch_size_t,
-        post_patch_height,
-        patch_size,
-        post_patch_width,
-        patch_size,
-    )
-    return latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
-
-
-def _unpack_latents(
-    latents: torch.Tensor,
-    num_frames: int,
-    height: int,
-    width: int,
-    patch_size: int = 1,
-    patch_size_t: int = 1,
-) -> torch.Tensor:
-    batch_size = latents.size(0)
-    latents = latents.reshape(
-        batch_size,
-        num_frames,
-        height,
-        width,
-        -1,
-        patch_size_t,
-        patch_size,
-        patch_size,
-    )
-    return (
-        latents.permute(0, 4, 1, 5, 2, 6, 3, 7)
-        .flatten(6, 7)
-        .flatten(4, 5)
-        .flatten(2, 3)
-    )
-
-
-def _empty_cuda_cache() -> None:
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    gc.collect()
-
-
-def default_sana_wm_refiner_dtype(server_args: ServerArgs) -> torch.dtype:
-    return PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
