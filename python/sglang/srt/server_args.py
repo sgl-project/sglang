@@ -1324,11 +1324,11 @@ class ServerArgs:
         ``--enforce-piecewise-cuda-graph`` semantics generalized).
         """
         explicit_input = self.cuda_graph_config or {}
-        settings = default_cuda_graph_config()
+        config = default_cuda_graph_config()
         locked: set = set()
 
         def _set(phase: str, key: str, value: Any) -> None:
-            settings[phase][key] = value
+            config[phase][key] = value
             locked.add((phase, key))
 
         # ---- Legacy global flags (lowest precedence above defaults) ----
@@ -1362,14 +1362,14 @@ class ServerArgs:
         if self.cuda_graph_tc_compiler_prefill is not None:
             _set(Phase.PREFILL, "tc_compiler", self.cuda_graph_tc_compiler_prefill)
 
-        # ---- Explicit JSON settings (highest precedence) ----
-        for phase, phase_settings in explicit_input.items():
-            if not isinstance(phase_settings, dict):
+        # ---- Explicit JSON config (highest precedence) ----
+        for phase, phase_config in explicit_input.items():
+            if not isinstance(phase_config, dict):
                 continue
-            for key, value in phase_settings.items():
+            for key, value in phase_config.items():
                 _set(phase, key, value)
 
-        self.cuda_graph_config = settings
+        self.cuda_graph_config = config
         self._cuda_graph_config_locked = locked
 
     def _apply_cuda_graph_compatibility(self):
@@ -1466,20 +1466,20 @@ class ServerArgs:
                 return
 
     def _validate_cuda_graph_config(self):
-        settings = self.cuda_graph_config or {}
-        for phase, phase_settings in settings.items():
+        config = self.cuda_graph_config or {}
+        for phase, phase_config in config.items():
             if phase not in ALLOWED_BACKENDS_PER_PHASE:
                 raise ValueError(
                     f"--cuda-graph-config: unknown phase {phase!r}; "
                     f"allowed: {Phase.ALL}"
                 )
-            if not isinstance(phase_settings, dict):
+            if not isinstance(phase_config, dict):
                 raise ValueError(
                     f"--cuda-graph-config[{phase}] must be a dict, got "
-                    f"{type(phase_settings).__name__}"
+                    f"{type(phase_config).__name__}"
                 )
             allowed_keys = ALLOWED_KEYS_PER_PHASE[phase]
-            for key, value in phase_settings.items():
+            for key, value in phase_config.items():
                 if key not in allowed_keys:
                     raise ValueError(
                         f"--cuda-graph-config[{phase}]: unknown key {key!r}; "
@@ -3968,6 +3968,7 @@ class ServerArgs:
                 self.disable_cuda_graph
                 or self.disable_prefill_cuda_graph
                 or self.prefill_cuda_graph_backend == Backend.DISABLED
+                or self.cuda_graph_backend_prefill == Backend.DISABLED
                 or (
                     self.cuda_graph_config is not None
                     and self.cuda_graph_config.get(Phase.PREFILL, {}).get("backend")
