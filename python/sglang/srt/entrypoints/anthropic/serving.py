@@ -59,11 +59,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Map OpenAI finish reasons to Anthropic stop reasons
+# Map OpenAI finish reasons to Anthropic stop reasons.
+# ``content_filter`` maps to ``refusal`` per Anthropic's documented enum;
+# ``abort`` has no Anthropic equivalent so we surface it as ``end_turn``
+# but log a warning at the call site so operators don't lose the signal.
 STOP_REASON_MAP = {
     "stop": "end_turn",
     "length": "max_tokens",
     "tool_calls": "tool_use",
+    "content_filter": "refusal",
+    "abort": "end_turn",
 }
 
 ERROR_TYPE_MAP = {
@@ -324,6 +329,10 @@ class AnthropicServing:
 
             ``redacted_thinking`` carries encrypted bytes that no local
             parser can interpret, so we raise rather than silently drop it.
+            On non-reasoning models (no detector configured) the rewrap is
+            best-effort: we log a warning and drop the thinking text so a
+            history echo doesn't 400 the whole request — the prior thinking
+            is opaque context the model didn't need anyway.
             """
             if any(block.type == "redacted_thinking" for block in blocks):
                 raise ValueError("Anthropic redacted_thinking history is not supported")
@@ -336,9 +345,17 @@ class AnthropicServing:
             if not thinking_parts:
                 return None
 
-            return self.openai_serving_chat.wrap_reasoning_history(
-                "\n".join(thinking_parts)
-            )
+            try:
+                return self.openai_serving_chat.wrap_reasoning_history(
+                    "\n".join(thinking_parts)
+                )
+            except ValueError as e:
+                logger.warning(
+                    "Dropping prior-turn thinking history (%d blocks): %s",
+                    len(thinking_parts),
+                    e,
+                )
+                return None
 
         # Add system message if provided
         if anthropic_request.system:
@@ -354,6 +371,22 @@ class AnthropicServing:
                 system_text = "\n".join(system_parts)
                 openai_messages.append({"role": "system", "content": system_text})
 
+        def _emit_user_message(parts: list[dict]) -> None:
+            """Append accumulated parts as a user message, then clear them.
+
+            Used to flush content collected BEFORE a tool_result so the
+            wire order stays user(pre) → tool → user(post). Without this
+            flush, text/image parts that appeared before a tool_result
+            block would be moved AFTER the tool message at end of loop.
+            """
+            if not parts:
+                return
+            if len(parts) == 1 and parts[0]["type"] == "text":
+                openai_messages.append({"role": "user", "content": parts[0]["text"]})
+            else:
+                openai_messages.append({"role": "user", "content": list(parts)})
+            parts.clear()
+
         # Convert messages
         for msg in anthropic_request.messages:
             if isinstance(msg.content, str):
@@ -362,8 +395,8 @@ class AnthropicServing:
 
             # Complex content with blocks
             openai_msg = {"role": msg.role}
-            content_parts = []
-            tool_calls = []
+            content_parts: list[dict] = []
+            tool_calls: list[dict] = []
 
             if msg.role == "assistant":
                 reasoning_history = _convert_assistant_thinking_blocks(msg.content)
@@ -377,7 +410,11 @@ class AnthropicServing:
                 if block.type in ("thinking", "redacted_thinking"):
                     continue
 
-                if block.type == "text" and block.text:
+                # ``is not None`` (not truthy) so an empty-string text block
+                # still produces a placeholder text part — without it, an
+                # assistant turn whose only content is "" vanishes and
+                # subsequent user→user pairs trip strict chat templates.
+                if block.type == "text" and block.text is not None:
                     content_parts.append({"type": "text", "text": block.text})
 
                 elif block.type == "image" and block.source:
@@ -411,8 +448,12 @@ class AnthropicServing:
                     # Use tool_use_id (per spec) with fallback to id
                     tool_call_id = block.tool_use_id or block.id or ""
 
-                    # Tool results from user become separate tool messages
+                    # Tool results from user become separate tool messages.
+                    # Flush any pending text/image first so the wire order
+                    # is preserved (a tool_result that arrived AFTER a text
+                    # block must come AFTER that text in OpenAI form too).
                     if msg.role == "user":
+                        _emit_user_message(content_parts)
                         openai_messages.append(
                             {
                                 "role": "tool",
@@ -438,10 +479,19 @@ class AnthropicServing:
                     openai_msg["content"] = content_parts[0]["text"]
                 else:
                     openai_msg["content"] = content_parts
-            elif not tool_calls:
+                openai_messages.append(openai_msg)
+            elif tool_calls:
+                openai_messages.append(openai_msg)
+            elif msg.role == "user":
+                # User turn that was entirely tool_results — the tool
+                # messages were already emitted above, nothing left.
                 continue
-
-            openai_messages.append(openai_msg)
+            else:
+                # Assistant turn with no content and no tool_calls: emit
+                # an empty-string placeholder so strict templates still
+                # see a valid role-alternation sequence.
+                openai_msg["content"] = ""
+                openai_messages.append(openai_msg)
 
         # Build ChatCompletionRequest
         request_data = {
@@ -520,7 +570,11 @@ class AnthropicServing:
             if converted_tools:
                 chat_request.tools = converted_tools
 
-        # Convert tool choice
+        # Convert tool choice. ``any``/``tool`` express a hard requirement
+        # ("the model MUST call a tool"); if every requested tool was a
+        # server-side Anthropic built-in that we just skipped, there is
+        # no tool the model could call. Silently downgrading to "no tool"
+        # would deceive the caller, so raise an explicit 400.
         if anthropic_request.tool_choice is not None:
             tc_type = anthropic_request.tool_choice.type
             if tc_type == "none":
@@ -531,12 +585,26 @@ class AnthropicServing:
                 elif tc_type == "any":
                     chat_request.tool_choice = "required"
                 elif tc_type == "tool":
+                    tool_name = anthropic_request.tool_choice.name
+                    if not any(
+                        t.function.get("name") == tool_name for t in chat_request.tools
+                    ):
+                        raise ValueError(
+                            f"tool_choice references tool {tool_name!r} but it "
+                            f"is not in the forwarded tools list "
+                            f"(server-side Anthropic tools cannot be selected)"
+                        )
                     chat_request.tool_choice = ToolChoice(
                         type="function",
-                        function=ToolChoiceFuncName(
-                            name=anthropic_request.tool_choice.name
-                        ),
+                        function=ToolChoiceFuncName(name=tool_name),
                     )
+            elif tc_type in ("any", "tool"):
+                raise ValueError(
+                    f"tool_choice={tc_type!r} requires at least one custom "
+                    f"tool; all supplied tools were server-side Anthropic "
+                    f"built-ins which the OpenAI-compatible backend cannot "
+                    f"invoke"
+                )
         elif chat_request.tools:
             chat_request.tool_choice = "auto"
 
@@ -720,11 +788,22 @@ class AnthropicServing:
         def _ensure_content_block_events(
             block_type: str,
             content_block: AnthropicContentBlock,
+            force_new: bool = False,
         ) -> list[AnthropicStreamEvent]:
+            """Open a content_block, closing the prior one if needed.
+
+            ``force_new=True`` closes an existing block even when its type
+            matches — required when a stream emits two consecutive
+            ``tool_use`` blocks: each tool needs its own
+            ``content_block_start``/``stop`` pair and its own
+            ``content_block_index``, otherwise the second tool's
+            ``input_json_delta`` chunks would append to the first tool's
+            JSON arguments and corrupt both tool calls.
+            """
             nonlocal content_block_open, content_block_type
 
             events: list[AnthropicStreamEvent] = []
-            if content_block_open and content_block_type != block_type:
+            if content_block_open and (force_new or content_block_type != block_type):
                 events.extend(_close_content_block_events())
             if not content_block_open:
                 events.append(
@@ -737,33 +816,125 @@ class AnthropicServing:
                 content_block_type = block_type
             return events
 
-        async for sse_line in openai_stream:
+        def _ensure_message_started(usage) -> list[str]:
+            """Emit message_start exactly once. Returns SSE frames to yield."""
+            nonlocal message_started
+            if message_started:
+                return []
+            message_started = True
+            return [_emit(_message_start_event(usage))]
+
+        def _build_error_event(error_type: str, message: str) -> ErrorEvent:
+            return ErrorEvent(
+                error=AnthropicError(type=error_type, message=message),
+            )
+
+        def _flush_on_error(error_type: str, message: str) -> list[str]:
+            """Build a self-contained terminal SSE sequence on error.
+
+            Guarantees that whatever events we emit on the failure path
+            leave the wire in a valid state: message_start (if not yet
+            sent), close any open content block, then ErrorEvent and
+            MessageStopEvent. Strict SDK clients reject streams whose
+            content_block_start has no matching content_block_stop, so
+            the close step is mandatory even on the error path.
+            """
+            frames: list[str] = []
+            frames.extend(_ensure_message_started(None))
+            for event in _close_content_block_events():
+                frames.append(_emit(event))
+            frames.append(_emit(_build_error_event(error_type, message)))
+            frames.append(_emit(MessageStopEvent()))
+            return frames
+
+        def _parse_upstream_error(data_str: str) -> Optional[tuple[str, str]]:
+            """Detect an OpenAI handler streaming-error envelope.
+
+            ``OpenAIServingChat.create_streaming_error_response`` emits
+            ``data: {"error": {"object":"error","message":"...",
+            "type":"BadRequestError","code":400}}``; the regular
+            ChatCompletionStreamResponse validator rejects it. Pull the
+            type/message out so the Anthropic client sees the real
+            failure instead of a generic 'Stream processing error'.
+            """
+            try:
+                payload = json.loads(data_str)
+            except (json.JSONDecodeError, ValueError):
+                return None
+            if not isinstance(payload, dict):
+                return None
+            err = payload.get("error")
+            if not isinstance(err, dict):
+                return None
+            upstream_message = err.get("message") or "Upstream error"
+            code = err.get("code")
+            error_type = (
+                ERROR_TYPE_MAP.get(code, "api_error")
+                if isinstance(code, int)
+                else "api_error"
+            )
+            return error_type, str(upstream_message)
+
+        # Pre-first-chunk errors from the OpenAI generator (e.g. tokenization
+        # failure that raises ValueError before any chunk is yielded) would
+        # otherwise abort the StreamingResponse with no envelope at all and
+        # the client would see a half-open SSE / TCP close. Catch them here
+        # and emit a clean Anthropic error sequence instead.
+        try:
+            stream_iter = openai_stream.__aiter__()
+        except Exception as e:
+            logger.exception("Failed to open OpenAI stream: %s", e)
+            for frame in _flush_on_error("api_error", "Internal server error"):
+                yield frame
+            return
+
+        while True:
+            try:
+                sse_line = await stream_iter.__anext__()
+            except StopAsyncIteration:
+                break
+            except asyncio.CancelledError:
+                raise
+            except ValueError as e:
+                # _generate_chat_stream re-raises ValueError when its own
+                # ``stream_started`` flag is still False — surface as a
+                # proper Anthropic error event rather than aborting the
+                # StreamingResponse generator.
+                logger.warning("OpenAI stream raised before first chunk: %s", e)
+                for frame in _flush_on_error(
+                    "invalid_request_error", str(e) or "Request failed"
+                ):
+                    yield frame
+                return
+            except Exception as e:
+                logger.exception("OpenAI stream raised mid-flight: %s", e)
+                for frame in _flush_on_error("api_error", "Internal server error"):
+                    yield frame
+                return
+
             if not sse_line.startswith("data: "):
                 continue
 
             data_str = sse_line[6:].strip()
 
             if data_str == "[DONE]":
-                if not message_started:
-                    yield _emit(_message_start_event(None))
-                    message_started = True
+                for frame in _ensure_message_started(None):
+                    yield frame
 
-                # Detect an empty completion: stream finished without ever
-                # producing a content delta. Don't ship a successful
-                # zero-content message — surface as an explicit error so
-                # operators don't see silent success on backend failures.
-                if not had_content_delta:
+                # No content AND no finish_reason: the backend dropped the
+                # stream silently. Surface as api_error so clients see the
+                # failure instead of a fake empty success. If finish_reason
+                # IS set we trust the backend's signal — a legitimate empty
+                # completion (max_tokens=1 stop, content filter, etc.)
+                # deserves a normal message_delta/message_stop pair, not
+                # an error that triggers SDK retry loops.
+                if not had_content_delta and finish_reason is None:
                     logger.warning(
-                        "Stream produced no content before [DONE]; "
-                        "emitting api_error event"
+                        "Stream produced no content and no finish_reason "
+                        "before [DONE]; emitting api_error event"
                     )
                     yield _emit(
-                        ErrorEvent(
-                            error=AnthropicError(
-                                type="api_error",
-                                message="Backend produced no content",
-                            ),
-                        )
+                        _build_error_event("api_error", "Backend produced no content")
                     )
                     yield _emit(MessageStopEvent())
                     continue
@@ -773,7 +944,14 @@ class AnthropicServing:
                     yield _emit(event)
 
                 # Emit message_delta with stop_reason and usage
-                stop_reason = STOP_REASON_MAP.get(finish_reason or "stop", "end_turn")
+                effective_finish = finish_reason or "stop"
+                if effective_finish not in STOP_REASON_MAP:
+                    logger.warning(
+                        "Unmapped streaming finish_reason %r; defaulting "
+                        "to end_turn",
+                        effective_finish,
+                    )
+                stop_reason = STOP_REASON_MAP.get(effective_finish, "end_turn")
                 yield _emit(
                     MessageDeltaEvent(
                         delta=AnthropicMessageEndDelta(stop_reason=stop_reason),
@@ -788,26 +966,31 @@ class AnthropicServing:
             try:
                 chunk = ChatCompletionStreamResponse.model_validate_json(data_str)
             except (ValidationError, json.JSONDecodeError, UnicodeDecodeError) as e:
+                # First check whether this is the OpenAI handler's
+                # streaming error envelope (validator rejects it because
+                # it lacks id/choices/created/model). Forwarding the real
+                # type/message keeps the failure debuggable instead of
+                # collapsing every backend error into "Stream processing
+                # error".
+                upstream = _parse_upstream_error(data_str)
+                if upstream is not None:
+                    error_type, error_message = upstream
+                    logger.warning(
+                        "Forwarding upstream stream error (%s): %s",
+                        error_type,
+                        error_message,
+                    )
+                    for frame in _flush_on_error(error_type, error_message):
+                        yield frame
+                    return
+
                 logger.warning(
                     "Failed to parse Anthropic stream chunk (%s): %s",
                     type(e).__name__,
                     data_str[:200],
                 )
-                # If message_start hasn't been sent yet, send a minimal one
-                # so the wire format stays valid (clients require the
-                # message_start frame before any other event).
-                if not message_started:
-                    yield _emit(_message_start_event(None))
-                    message_started = True
-                yield _emit(
-                    ErrorEvent(
-                        error=AnthropicError(
-                            type="api_error", message="Stream processing error"
-                        ),
-                    )
-                )
-                # Don't leave the stream half-open — close it cleanly.
-                yield _emit(MessageStopEvent())
+                for frame in _flush_on_error("api_error", "Stream processing error"):
+                    yield frame
                 return
 
             if chunk.usage is not None:
@@ -826,12 +1009,14 @@ class AnthropicServing:
 
             choice = chunk.choices[0]
 
+            # Capture finish_reason on this chunk but DO NOT short-circuit:
+            # some OpenAI-compatible backends pack the final content token
+            # (or last tool-args fragment) into the same chunk as
+            # finish_reason. Skipping delta processing would silently drop
+            # that payload — sometimes the whole completion if it was a
+            # one-token reply. Fall through to the delta handlers below.
             if choice.finish_reason is not None:
                 finish_reason = choice.finish_reason
-                if not message_started:
-                    yield _emit(_message_start_event(chunk.usage))
-                    message_started = True
-                continue
 
             delta = choice.delta
 
@@ -845,7 +1030,13 @@ class AnthropicServing:
                 or (delta.content is not None and delta.content != "")
                 or chunk.usage
             )
-            if has_delta_payload and not message_started:
+            # The finish_reason chunk should also flip message_started so a
+            # zero-content completion (the path that previously fired the
+            # 'Backend produced no content' error) emits the standard
+            # message_start before [DONE] closes the stream.
+            if (
+                has_delta_payload or choice.finish_reason is not None
+            ) and not message_started:
                 yield _emit(_message_start_event(chunk.usage))
                 message_started = True
 
@@ -878,7 +1069,9 @@ class AnthropicServing:
                     tc_id = tc.id
                     tc_func = tc.function
 
-                    # New tool call: close previous block, start new one
+                    # New tool call: always close the previous block (even if
+                    # it was also tool_use — each tool needs its own index)
+                    # and start a fresh one.
                     if tc_func and tc_func.name:
                         for event in _ensure_content_block_events(
                             "tool_use",
@@ -887,6 +1080,7 @@ class AnthropicServing:
                                 name=tc_func.name,
                                 input={},
                             ),
+                            force_new=True,
                         ):
                             yield _emit(event)
                         # A zero-argument tool call may never emit an
@@ -992,7 +1186,19 @@ class AnthropicServing:
                 )
 
         # Map stop reason
-        stop_reason = STOP_REASON_MAP.get(choice.finish_reason or "stop", "end_turn")
+        finish_reason = choice.finish_reason or "stop"
+        if finish_reason not in STOP_REASON_MAP:
+            logger.warning(
+                "Unmapped OpenAI finish_reason %r; defaulting to end_turn",
+                finish_reason,
+            )
+        stop_reason = STOP_REASON_MAP.get(finish_reason, "end_turn")
+
+        # Anthropic requires ``content`` to contain at least one block.
+        # Empty string completions (max_tokens=1 stop, content filter, etc.)
+        # would otherwise ship ``content=[]`` and break strict SDK parsers.
+        if not content:
+            content.append(TextBlock(text=""))
 
         return AnthropicMessagesResponse(
             id=f"msg_{uuid.uuid4().hex}",
@@ -1064,16 +1270,21 @@ class AnthropicServing:
     ) -> JSONResponse:
         """Create an Anthropic-format error response.
 
-        ``exception_name`` is appended to ``error.type`` when provided (e.g.
-        ``"api_error:KeyError"``) so operators can grep server-side errors
-        without having to log-dive — without ever exposing the exception
-        message itself, which may contain stack frames or PII.
+        ``error.type`` is restricted to Anthropic's documented enum so strict
+        SDK clients (anthropic-sdk-python / -typescript) keep parsing the
+        response into their typed error classes. ``exception_name`` — when
+        provided — is logged at WARNING level so operators can still grep
+        server-side, but it never reaches the wire.
         """
-        outward_type = (
-            f"{error_type}:{exception_name}" if exception_name else error_type
-        )
+        if exception_name:
+            logger.warning(
+                "Anthropic error response %s (exception=%s): %s",
+                error_type,
+                exception_name,
+                message,
+            )
         error_resp = AnthropicErrorResponse(
-            error=AnthropicError(type=outward_type, message=message)
+            error=AnthropicError(type=error_type, message=message)
         )
         return JSONResponse(
             status_code=status_code,

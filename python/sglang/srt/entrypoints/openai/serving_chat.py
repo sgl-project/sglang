@@ -1556,13 +1556,19 @@ class OpenAIServingChat(OpenAIServingBase):
             return
 
         toggle_param = self._get_reasoning_toggle_param()
-        if toggle_param is None:
-            # Mirror the read side: if the reasoning parser is set but
-            # nothing resolved a toggle (detector init failed, no template
-            # config), ``_get_reasoning_from_request`` treats reasoning as
-            # disabled. An explicit ``disabled`` request agrees with that
-            # baseline and is a no-op; an explicit ``enabled`` cannot be
-            # honored, so it must raise.
+        # The read side (``_get_reasoning_from_request``) returns False
+        # whenever ``config.toggle_param is None`` OR
+        # ``config.default_enabled is None``. The write side must mirror
+        # both conditions: if ``default_enabled`` is unset we cannot
+        # actually honor an ``enabled=True`` request even when the toggle
+        # name itself is resolvable, so writing the kwarg would set up the
+        # template to emit reasoning tokens while the parser ignores them
+        # (literal ``<think>`` markers leak into the assistant text).
+        config = self.template_manager.reasoning_config
+        read_side_supported = toggle_param is not None and (
+            config is None or config.default_enabled is not None
+        )
+        if not read_side_supported:
             if not enabled:
                 return
             raise ValueError(
