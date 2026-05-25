@@ -33,7 +33,6 @@ from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 
 if TYPE_CHECKING:
-    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -50,8 +49,6 @@ class CanaryManager:
         perturb_config: PerturbConfig,
         buffer_groups: tuple[CanaryBufferGroup, ...],
         device: torch.device,
-        tp_group: Optional["GroupCoordinator"] = None,
-        pp_group: Optional["GroupCoordinator"] = None,
         req_to_token_pool: "ReqToTokenPool",
         launch_capacities: CanaryLaunchCapacities,
         swa_window_size: int = 0,

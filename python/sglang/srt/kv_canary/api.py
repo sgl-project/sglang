@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
-from sglang.srt.distributed.parallel_state import get_pp_group, get_tp_group
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
@@ -63,8 +62,6 @@ def install_canary(
         perturb_config=perturb_config,
         buffer_groups=buffer_groups,
         device=device,
-        tp_group=get_tp_group(),
-        pp_group=get_pp_group(),
         req_to_token_pool=model_runner.req_to_token_pool,
         launch_capacities=launch_capacities,
         swa_window_size=swa_window_size,
