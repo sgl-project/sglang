@@ -17,7 +17,16 @@ from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConf
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
+from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+    FastWan2_2_TI2V_5B_Config,
+    TurboWanT2V480PConfig,
+    Wan2_2_I2V_A14B_Config,
+    Wan2_2_T2V_A14B_Config,
+    WanI2V480PConfig,
+    WanI2V720PConfig,
+    WanT2V480PConfig,
+    WanT2V720PConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
@@ -510,6 +519,54 @@ class TestOffloadDefaults(unittest.TestCase):
             ["text_encoder", "image_encoder", "vae"],
         )
 
+    def test_auto_wan2_2_a14b_layerwise_offload_adds_dit(self):
+        for pipeline_config, model_path in (
+            (Wan2_2_T2V_A14B_Config(), "Wan-AI/Wan2.2-T2V-A14B-Diffusers"),
+            (Wan2_2_I2V_A14B_Config(), "Wan-AI/Wan2.2-I2V-A14B-Diffusers"),
+        ):
+            with self.subTest(pipeline_config=pipeline_config.__class__.__name__):
+                args = self._from_dict_with_pipeline_config(
+                    pipeline_config,
+                    kwargs={
+                        "model_path": model_path,
+                        "performance_mode": "auto",
+                    },
+                )
+
+                self.assertTrue(args.layerwise_offload_components)
+                self.assertFalse(args.use_fsdp_inference)
+                self.assertFalse(args.dit_cpu_offload)
+                self.assertFalse(args.text_encoder_cpu_offload)
+                self.assertFalse(args.image_encoder_cpu_offload)
+                self.assertEqual(args.dit_offload_prefetch_size, 2)
+                self.assertEqual(
+                    args.layerwise_offload_components,
+                    ["dit", "text_encoder", "image_encoder", "vae"],
+                )
+
+    def test_auto_wan2_1_14b_layerwise_offload_uses_non_dit_default(self):
+        for pipeline_config, model_path in (
+            (WanT2V720PConfig(), "Wan-AI/Wan2.1-T2V-14B-Diffusers"),
+            (WanI2V480PConfig(), "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"),
+            (WanI2V720PConfig(), "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"),
+        ):
+            with self.subTest(pipeline_config=pipeline_config.__class__.__name__):
+                args = self._from_dict_with_pipeline_config(
+                    pipeline_config,
+                    kwargs={
+                        "model_path": model_path,
+                        "performance_mode": "auto",
+                    },
+                )
+
+                self.assertTrue(args.layerwise_offload_components)
+                self.assertTrue(args.dit_cpu_offload)
+                self.assertEqual(args.dit_offload_prefetch_size, 0.0)
+                self.assertEqual(
+                    args.layerwise_offload_components,
+                    ["text_encoder", "image_encoder", "vae"],
+                )
+
     def test_memory_wan_layerwise_offload_is_enabled_without_fsdp(self):
         args = self._from_dict_with_pipeline_config(
             WanT2V480PConfig(),
@@ -518,12 +575,12 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.use_fsdp_inference)
-        self.assertTrue(args.dit_cpu_offload)
+        self.assertFalse(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["text_encoder", "image_encoder", "vae"],
+            ["dit", "text_encoder", "image_encoder", "vae"],
         )
 
     def test_auto_wan_layerwise_offload_does_not_disable_explicit_fsdp(self):
@@ -542,6 +599,79 @@ class TestOffloadDefaults(unittest.TestCase):
             ["text_encoder", "image_encoder", "vae"],
         )
         self.assertTrue(args.use_fsdp_inference)
+
+    def test_auto_wan_layerwise_offload_preserves_explicit_dit_cpu_offload(self):
+        args = self._from_dict_with_pipeline_config(
+            WanT2V480PConfig(),
+            kwargs={
+                "model_path": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+                "performance_mode": "auto",
+                "dit_cpu_offload": True,
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["text_encoder", "image_encoder", "vae"],
+        )
+
+    def test_auto_mova_layerwise_offload_does_not_implicitly_add_dit(self):
+        args = self._from_dict_with_pipeline_config(
+            MOVAPipelineConfig(),
+            kwargs={
+                "model_path": "OpenMOSS-Team/MOVA-360p",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["text_encoder", "image_encoder", "vae"],
+        )
+
+    def test_auto_fastwan_layerwise_offload_does_not_implicitly_add_dit(self):
+        args = self._from_dict_with_pipeline_config(
+            FastWan2_2_TI2V_5B_Config(),
+            kwargs={
+                "model_path": "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["text_encoder", "image_encoder", "vae"],
+        )
+
+    def test_auto_turbo_wan_layerwise_offload_does_not_implicitly_add_dit(self):
+        args = self._from_dict_with_pipeline_config(
+            TurboWanT2V480PConfig(),
+            kwargs={
+                "model_path": "IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["text_encoder", "image_encoder", "vae"],
+        )
+
+    def test_explicit_fastwan_dit_layerwise_still_selects_dit_group(self):
+        args = self._from_dict_with_pipeline_config(
+            FastWan2_2_TI2V_5B_Config(),
+            kwargs={
+                "model_path": "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
+                "dit_layerwise_offload": True,
+            },
+        )
+
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertEqual(args.layerwise_offload_components, ["dit"])
 
     def test_auto_multi_gpu_wan_uses_layerwise_offload_without_cfg(self):
         with patch.object(ServerArgs, "_model_default_uses_cfg", return_value=False):
@@ -825,12 +955,12 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.layerwise_offload_components)
-        self.assertTrue(args.dit_cpu_offload)
+        self.assertFalse(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["text_encoder", "image_encoder", "vae"],
+            ["dit", "text_encoder", "image_encoder", "vae"],
         )
 
     def test_memory_mode_preserves_explicit_fsdp(self):
