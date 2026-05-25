@@ -121,6 +121,17 @@ def _effective_cfg_scale(sampling_defaults: SamplingParams) -> float | None:
     return sampling_defaults.guidance_scale
 
 
+def _should_include_warmup_image(
+    server_args: ServerArgs, server_based_warmup: bool
+) -> bool:
+    task_type = server_args.pipeline_config.task_type
+    if task_type.requires_image_input():
+        return True
+    if server_based_warmup:
+        return False
+    return task_type.accepts_image_input()
+
+
 def build_warmup_reqs(
     server_args: ServerArgs,
     *,
@@ -152,6 +163,9 @@ def build_warmup_reqs(
     )
 
     warmup_reqs = []
+    include_warmup_image = _should_include_warmup_image(
+        server_args, server_based_warmup
+    )
     for width, height in resolutions:
         req_kwargs = dict(
             data_type=task_type.data_type(),
@@ -168,7 +182,7 @@ def build_warmup_reqs(
                 true_cfg_scale=sampling_defaults.true_cfg_scale,
                 num_inference_steps=sampling_defaults.num_inference_steps,
             )
-        if task_type.accepts_image_input():
+        if include_warmup_image:
             if warmup_input_path is None:
                 raise RuntimeError(
                     "Warmup image path is required for image-input model"

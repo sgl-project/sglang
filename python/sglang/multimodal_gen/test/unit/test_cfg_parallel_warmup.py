@@ -53,6 +53,7 @@ def _make_bare_scheduler(enable_cfg_parallel: bool) -> Scheduler:
     # branch entirely, so we don't need to mock
     # _prepare_shared_warmup_image_path.
     task_type = MagicMock()
+    task_type.requires_image_input.return_value = False
     task_type.accepts_image_input.return_value = False
     task_type.data_type.return_value = ModelTaskType.T2I.data_type()
     server_args.pipeline_config.task_type = task_type
@@ -110,6 +111,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args.enable_cfg_parallel = False
 
         task_type = MagicMock()
+        task_type.requires_image_input.return_value = False
         task_type.accepts_image_input.return_value = False
         task_type.is_image_gen.return_value = True
         task_type.data_type.return_value = ModelTaskType.T2I.data_type()
@@ -146,6 +148,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args.enable_cfg_parallel = False
 
         task_type = MagicMock()
+        task_type.requires_image_input.return_value = False
         task_type.accepts_image_input.return_value = False
         task_type.is_image_gen.return_value = True
         task_type.data_type.return_value = ModelTaskType.T2I.data_type()
@@ -173,6 +176,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args.enable_cfg_parallel = False
 
         task_type = MagicMock()
+        task_type.requires_image_input.return_value = False
         task_type.accepts_image_input.return_value = False
         task_type.is_image_gen.return_value = True
         task_type.data_type.return_value = ModelTaskType.T2I.data_type()
@@ -194,6 +198,45 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             (req.width, req.height),
             DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION,
         )
+
+    def test_server_based_warmup_does_not_force_optional_image_input(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+        server_args.pipeline_config.task_type = ModelTaskType.TI2I
+
+        with patch(
+            "sglang.multimodal_gen.runtime.server_warmup.get_model_sampling_defaults",
+            return_value=SamplingParams(width=512, height=512),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                use_model_sampling_defaults=True,
+                server_based_warmup=True,
+            )
+
+        self.assertIsNone(reqs[0].image_path)
+
+    def test_server_based_warmup_keeps_required_image_input(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+        server_args.pipeline_config.task_type = ModelTaskType.I2I
+
+        with patch(
+            "sglang.multimodal_gen.runtime.server_warmup.get_model_sampling_defaults",
+            return_value=SamplingParams(width=512, height=512),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                warmup_input_path="/tmp/warmup.png",
+                use_model_sampling_defaults=True,
+                server_based_warmup=True,
+            )
+
+        self.assertEqual(reqs[0].image_path, ["/tmp/warmup.png"])
 
 
 class TestInputValidationCfgParallelGuard(unittest.TestCase):
