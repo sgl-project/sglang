@@ -102,14 +102,14 @@ def _extract_prefix_lens_and_extend_seq_lens(
     forward_mode = forward_batch.forward_mode
     spec_info = forward_batch.spec_info
     if forward_mode.is_decode_or_idle():
-        # Anchor on ``positions`` (canonical write position) instead of seq_lens-1; eagle draft
-        # leaves seq_lens pre-bump so the seq_lens-1 form is off by one. positions can be shorter
-        # than bs under cuda-graph padding — fall back to seq_lens-1 for the inactive tail.
-        seq_lens_i64 = forward_batch.seq_lens[:bs].to(torch.int64)
-        out_prefix_lens.copy_((seq_lens_i64 - 1).clamp(min=0))
+        # Anchor on ``positions`` (canonical write position) — eagle draft leaves seq_lens
+        # pre-bump so deriving prefix_lens from seq_lens is off-by-one. Padding tail rows (where
+        # positions runs short of bs under cuda-graph padding) are zeroed; the plan kernel filters
+        # them out by req_pool_indices==PADDING anyway.
+        out_prefix_lens.zero_()
         positions = forward_batch.positions
-        if positions.shape[0] > 0:
-            num_real = min(positions.shape[0], bs)
+        num_real = min(positions.shape[0], bs)
+        if num_real > 0:
             out_prefix_lens[:num_real].copy_(positions[:num_real].to(torch.int64))
         out_extend_seq_lens.fill_(1)
     elif forward_mode.is_target_verify():
