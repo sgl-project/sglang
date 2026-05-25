@@ -1550,8 +1550,8 @@ class ServerArgs:
 
           The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
         """
-        decode_config = self.cuda_graph_config[Phase.DECODE]
-        prefill_config = self.cuda_graph_config[Phase.PREFILL]
+        decode_cuda_graph_config = self.cuda_graph_config[Phase.DECODE]
+        prefill_cuda_graph_config = self.cuda_graph_config[Phase.PREFILL]
 
         if gpu_mem is not None:
             if gpu_mem < 20 * 1024:
@@ -1559,111 +1559,115 @@ class ServerArgs:
                 # (chunked_prefill_size 2k, max_bs 8)
                 if self.chunked_prefill_size is None:
                     self.chunked_prefill_size = 2048
-                if decode_config["max_bs"] is None:
-                    decode_config["max_bs"] = 8
+                if decode_cuda_graph_config["max_bs"] is None:
+                    decode_cuda_graph_config["max_bs"] = 8
             elif gpu_mem < 35 * 1024:
                 # A10, 4090, 5090
                 # (chunked_prefill_size 2k, max_bs 24 if tp < 4 else 80)
                 if self.chunked_prefill_size is None:
                     self.chunked_prefill_size = 2048
-                if decode_config["max_bs"] is None:
+                if decode_cuda_graph_config["max_bs"] is None:
                     if self.tp_size < 4:
-                        decode_config["max_bs"] = 24
+                        decode_cuda_graph_config["max_bs"] = 24
                     else:
-                        decode_config["max_bs"] = 80
+                        decode_cuda_graph_config["max_bs"] = 80
             elif gpu_mem < 60 * 1024:
                 # A100 (40GB), L40,
                 # (chunked_prefill_size 4k, max_bs 32 if tp < 4 else 160)
                 if self.chunked_prefill_size is None:
                     self.chunked_prefill_size = 4096
-                if decode_config["max_bs"] is None:
+                if decode_cuda_graph_config["max_bs"] is None:
                     if self.tp_size < 4:
-                        decode_config["max_bs"] = 32
+                        decode_cuda_graph_config["max_bs"] = 32
                     else:
-                        decode_config["max_bs"] = 160
+                        decode_cuda_graph_config["max_bs"] = 160
             elif gpu_mem < 90 * 1024:
                 # H100, A100
                 # (chunked_prefill_size 8k, max_bs 256 if tp < 4 else 512)
                 if self.chunked_prefill_size is None:
                     self.chunked_prefill_size = 8192
-                if decode_config["max_bs"] is None:
+                if decode_cuda_graph_config["max_bs"] is None:
                     if self.tp_size < 4:
-                        decode_config["max_bs"] = 256
+                        decode_cuda_graph_config["max_bs"] = 256
                     else:
-                        decode_config["max_bs"] = 512
+                        decode_cuda_graph_config["max_bs"] = 512
             elif gpu_mem < 160 * 1024:
                 # H20, H200
                 # (chunked_prefill_size 8k, max_bs 256 if tp < 4 else 512)
                 if self.chunked_prefill_size is None:
                     self.chunked_prefill_size = 8192
-                if decode_config["max_bs"] is None:
+                if decode_cuda_graph_config["max_bs"] is None:
                     if self.tp_size < 4:
-                        decode_config["max_bs"] = 256
+                        decode_cuda_graph_config["max_bs"] = 256
                     else:
-                        decode_config["max_bs"] = 512
+                        decode_cuda_graph_config["max_bs"] = 512
             else:
                 # B200, MI300
                 # (chunked_prefill_size 16k, max_bs 512)
                 if self.chunked_prefill_size is None:
                     self.chunked_prefill_size = 16384
-                if decode_config["max_bs"] is None:
-                    decode_config["max_bs"] = 512
+                if decode_cuda_graph_config["max_bs"] is None:
+                    decode_cuda_graph_config["max_bs"] = 512
         else:
             # Fallback defaults when gpu_mem is None
             if self.chunked_prefill_size is None:
                 self.chunked_prefill_size = 4096
-            if decode_config["max_bs"] is None:
-                decode_config["max_bs"] = 160
+            if decode_cuda_graph_config["max_bs"] is None:
+                decode_cuda_graph_config["max_bs"] = 160
 
         # Set cuda graph batch sizes
         if self.device != "cpu":
-            if decode_config["bs"] is None:
-                decode_config["bs"] = self._generate_cuda_graph_batch_sizes(
-                    decode_config["max_bs"]
+            if decode_cuda_graph_config["bs"] is None:
+                decode_cuda_graph_config["bs"] = self._generate_cuda_graph_batch_sizes(
+                    decode_cuda_graph_config["max_bs"]
                 )
             else:
-                decode_config["max_bs"] = max(decode_config["bs"])
+                decode_cuda_graph_config["max_bs"] = max(decode_cuda_graph_config["bs"])
         else:
-            # Reuse decode_config["bs"] for cpu graph and use torch_compile_max_bs for cpu graph batch size limit,
+            # Reuse decode_cuda_graph_config["bs"] for cpu graph and use torch_compile_max_bs for cpu graph batch size limit,
             # as cpu graph is based on torch.compile
-            if decode_config["bs"] is not None:
-                self.torch_compile_max_bs = max(decode_config["bs"])
+            if decode_cuda_graph_config["bs"] is not None:
+                self.torch_compile_max_bs = max(decode_cuda_graph_config["bs"])
             else:
-                # If decode_config["bs"] is not set, we will preferentially use torch_compile_max_bs
-                # to generate decode_config["bs"]
+                # If decode_cuda_graph_config["bs"] is not set, we will preferentially use torch_compile_max_bs
+                # to generate decode_cuda_graph_config["bs"]
                 self.torch_compile_max_bs = (
-                    self.torch_compile_max_bs or decode_config["max_bs"]
+                    self.torch_compile_max_bs or decode_cuda_graph_config["max_bs"]
                 )
-                decode_config["bs"] = self._generate_cpu_graph_batch_sizes()
+                decode_cuda_graph_config["bs"] = self._generate_cpu_graph_batch_sizes()
 
             assert (
                 self.torch_compile_max_bs > 0
             ), "cuda_graph_config[decode].bs should contain positive batch sizes"
-            decode_config["max_bs"] = self.torch_compile_max_bs
+            decode_cuda_graph_config["max_bs"] = self.torch_compile_max_bs
 
-        if prefill_config["max_bs"] is None:
+        if prefill_cuda_graph_config["max_bs"] is None:
             # Refer to pr #15927, by default we set the prefill max_bs to the chunked prefill size.
             # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode.
             # To avoid the performance regression, we set max_bs to 2048 by default.
             if not self.use_mla_backend():
-                prefill_config["max_bs"] = self.chunked_prefill_size
+                prefill_cuda_graph_config["max_bs"] = self.chunked_prefill_size
             else:
-                prefill_config["max_bs"] = 2048
+                prefill_cuda_graph_config["max_bs"] = 2048
 
             # If max_total_tokens is set, cap prefill max_bs to not exceed max_total_tokens.
             if self.max_total_tokens is not None:
-                prefill_config["max_bs"] = min(
-                    prefill_config["max_bs"], self.max_total_tokens
+                prefill_cuda_graph_config["max_bs"] = min(
+                    prefill_cuda_graph_config["max_bs"], self.max_total_tokens
                 )
 
             # For Llama2 series models, max_bs is limited to 4096.
             # TODO(yuwei): remove this after the issue is fixed
             if "llama-2" in self.model_path.lower():
-                prefill_config["max_bs"] = min(prefill_config["max_bs"], 4096)
+                prefill_cuda_graph_config["max_bs"] = min(
+                    prefill_cuda_graph_config["max_bs"], 4096
+                )
 
-        if prefill_config["bs"] is None:
-            prefill_config["bs"] = self._generate_piecewise_cuda_graph_tokens(
-                prefill_config["max_bs"]
+        if prefill_cuda_graph_config["bs"] is None:
+            prefill_cuda_graph_config["bs"] = (
+                self._generate_piecewise_cuda_graph_tokens(
+                    prefill_cuda_graph_config["max_bs"]
+                )
             )
 
         if self.mem_fraction_static is None:
@@ -1675,25 +1679,27 @@ class ServerArgs:
             else:
                 reserved_mem += max(self.max_prefill_tokens, 2048) * 1.5
             # For cuda graphs
-            reserved_mem += decode_config["max_bs"] * 2
+            reserved_mem += decode_cuda_graph_config["max_bs"] * 2
             # Some adjustments for large parallel size
             reserved_mem += self.tp_size * self.pp_size / 8 * 1024
 
             if self.enable_dp_attention:
                 # DP attention needs more padding for some operations
-                reserved_mem += decode_config["max_bs"] * self.dp_size * 3
+                reserved_mem += decode_cuda_graph_config["max_bs"] * self.dp_size * 3
 
                 # DP attention uses much more memory for large cuda graph max bs,
                 # likely due to some inefficiencies in torch allocator or our implementation.
                 # So we need to reserve more memory.
-                if decode_config["max_bs"] > 300:
-                    reserved_mem += decode_config["max_bs"] * self.dp_size * 1.5
+                if decode_cuda_graph_config["max_bs"] > 300:
+                    reserved_mem += (
+                        decode_cuda_graph_config["max_bs"] * self.dp_size * 1.5
+                    )
 
             # For piecewise cuda graphs
-            if prefill_config["backend"] != Backend.DISABLED:
+            if prefill_cuda_graph_config["backend"] != Backend.DISABLED:
                 if not self.use_mla_backend():
                     # Only calculate the memory overhead for Non-Torch Memory use since the Torch Memory can be reused with Cuda Graph Capture
-                    reserved_mem += len(prefill_config["bs"]) * 8
+                    reserved_mem += len(prefill_cuda_graph_config["bs"]) * 8
                 else:
                     # For MLA backend the memory overhead is much higher than expected with fa3
                     reserved_mem += 1.5 * 1024
