@@ -14,16 +14,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.12"
-
-      - name: Install pre-commit hook
-        run: |
-          python -m pip install pre-commit
-          pre-commit install
-
       - name: Reject changes under legacy docs/
         if: github.event_name == 'pull_request'
         run: |
@@ -37,6 +27,16 @@ jobs:
           fi
           git diff -z --name-only --diff-filter=ACMRDTUXB "origin/${BASE_REF}...HEAD" \
             | xargs -0 python3 scripts/ci/check_no_docs_changes.py
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install pre-commit hook
+        run: |
+          python -m pip install pre-commit
+          pre-commit install
 
       - name: Run pre-commit checks
         run: SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure
