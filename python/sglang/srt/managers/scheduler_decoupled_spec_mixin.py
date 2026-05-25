@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Deque, Dict, Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -65,6 +67,35 @@ class DraftBatchMetadataUpdate:
     req_batch_idx: int
     new_seq_len: int
     new_tail_token_id: int
+
+
+@triton.jit
+def _flush_draft_batch_metadata_updates_kernel(
+    metadata_ptr,
+    seq_lens_ptr,
+    orig_seq_lens_ptr,
+    output_ids_ptr,
+    num_updates,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_updates
+
+    req_batch_indices = tl.load(metadata_ptr + offsets, mask=mask, other=0)
+    new_seq_lens = tl.load(
+        metadata_ptr + num_updates + offsets, mask=mask, other=0
+    )
+    new_tail_token_ids = tl.load(
+        metadata_ptr + 2 * num_updates + offsets, mask=mask, other=0
+    )
+
+    tl.store(seq_lens_ptr + req_batch_indices, new_seq_lens, mask=mask)
+    tl.store(
+        orig_seq_lens_ptr + req_batch_indices,
+        new_seq_lens.to(tl.int32),
+        mask=mask,
+    )
+    tl.store(output_ids_ptr + req_batch_indices, new_tail_token_ids, mask=mask)
 
 
 class SchedulerDecoupledSpecMixin:
@@ -146,6 +177,7 @@ class SchedulerDecoupledSpecMixin:
     def init_draft_state_tables(self: Scheduler) -> None:
         self.draft_req_table: Dict[DraftReqKey, DraftReqState] = {}
         self.draft_sleeping_reqs: Dict[DraftReqKey, Req] = {}
+        self.draft_pending_verify_commit_keys: set[DraftReqKey] = set()
         self.decoupled_verify_drafter_ranks: list[int] = []
         self.decoupled_verify_req_to_drafter_rank: Dict[str, int] = {}
         self.decoupled_verify_drafter_loads: Dict[int, int] = {}
@@ -660,47 +692,46 @@ class SchedulerDecoupledSpecMixin:
                 "rewrites for the same in-flight request."
             )
 
-        req_batch_indices = [update.req_batch_idx for update in batch_metadata_updates]
-        new_seq_lens = [update.new_seq_len for update in batch_metadata_updates]
-        new_tail_token_ids = [
-            update.new_tail_token_id for update in batch_metadata_updates
-        ]
+        device = batch.seq_lens.device
+        num_updates = len(batch_metadata_updates)
+        req_batch_indices = []
+        new_seq_lens = []
+        new_tail_token_ids = []
+        seq_lens_delta = 0
+        seq_lens_cpu_np = batch.seq_lens_cpu.numpy()
+        for update in batch_metadata_updates:
+            req_batch_idx = int(update.req_batch_idx)
+            new_seq_len = int(update.new_seq_len)
+            old_seq_len = int(seq_lens_cpu_np[req_batch_idx])
 
-        req_batch_indices_cpu = torch.tensor(req_batch_indices, dtype=torch.int64)
-        old_seq_lens_cpu = batch.seq_lens_cpu[req_batch_indices_cpu]
-        new_seq_lens_cpu = torch.tensor(
-            new_seq_lens, dtype=batch.seq_lens_cpu.dtype
-        )
-        batch.seq_lens_cpu[req_batch_indices_cpu] = new_seq_lens_cpu
+            req_batch_indices.append(req_batch_idx)
+            new_seq_lens.append(new_seq_len)
+            new_tail_token_ids.append(int(update.new_tail_token_id))
+            seq_lens_delta += new_seq_len - old_seq_len
 
-        req_batch_indices_device = req_batch_indices_cpu.to(
-            device=batch.seq_lens.device
-        )
-        batch.seq_lens[req_batch_indices_device] = torch.tensor(
-            new_seq_lens,
-            dtype=batch.seq_lens.dtype,
-            device=batch.seq_lens.device,
-        )
-
-        req_batch_indices_device = req_batch_indices_cpu.to(
-            device=batch.orig_seq_lens.device
-        )
-        batch.orig_seq_lens[req_batch_indices_device] = torch.tensor(
-            new_seq_lens,
-            dtype=batch.orig_seq_lens.dtype,
-            device=batch.orig_seq_lens.device,
+        metadata_cpu = torch.tensor(
+            [req_batch_indices, new_seq_lens, new_tail_token_ids],
+            dtype=torch.int64,
+            pin_memory=device.type == "cuda",
         )
 
-        req_batch_indices_device = req_batch_indices_cpu.to(
-            device=batch.output_ids.device
-        )
-        batch.output_ids[req_batch_indices_device] = torch.tensor(
-            new_tail_token_ids,
-            dtype=batch.output_ids.dtype,
-            device=batch.output_ids.device,
+        for req_batch_idx, new_seq_len in zip(req_batch_indices, new_seq_lens):
+            seq_lens_cpu_np[req_batch_idx] = new_seq_len
+
+        metadata_device = metadata_cpu.to(device=device, non_blocking=True)
+        block_size = 256
+        _flush_draft_batch_metadata_updates_kernel[
+            (triton.cdiv(num_updates, block_size),)
+        ](
+            metadata_device,
+            batch.seq_lens,
+            batch.orig_seq_lens,
+            batch.output_ids,
+            num_updates,
+            BLOCK_SIZE=block_size,
         )
 
-        batch.seq_lens_sum += int((new_seq_lens_cpu - old_seq_lens_cpu).sum().item())
+        batch.seq_lens_sum += seq_lens_delta
 
         batch_metadata_updates.clear()
 
@@ -887,7 +918,6 @@ class SchedulerDecoupledSpecMixin:
                 del req.hidden_states[truncate_from:]
 
         req.output_ids.append(bonus_token_id)
-        req.fill_ids = req.origin_input_ids + req.output_ids
         if req.grammar is not None:
             try:
                 req.grammar.accept_token(bonus_token_id)
@@ -1015,6 +1045,7 @@ class SchedulerDecoupledSpecMixin:
                 batch.batch_is_full = False
         self.draft_sleeping_reqs.pop(state.key, None)
         self._release_draft_mamba_ckpt_slots(state)
+        self.draft_pending_verify_commit_keys.discard(state.key)
         self.draft_req_table.pop(state.key, None)
         release_kv_cache(req, self.tree_cache, is_insert=False)
 
@@ -1066,30 +1097,28 @@ class SchedulerDecoupledSpecMixin:
         state.verifier_committed_prefix_len = len(req.output_ids)
         return req
 
-    def _find_req_in_running_batch_idx(
-        self: Scheduler,
-        req: Req,
-    ) -> Optional[int]:
-        batch = self.running_batch
-        if batch is not None and not batch.is_empty():
-            for req_batch_idx, batch_req in enumerate(batch.reqs):
-                if batch_req is req:
-                    return req_batch_idx
-        return None
-
     def _apply_pending_verify_commits(self: Scheduler) -> list[VerifyCommit]:
         kv_truncations: list[DraftKVTruncation] = []
         batch_metadata_updates: list[DraftBatchMetadataUpdate] = []
         applied_commits: list[VerifyCommit] = []
+        pending_keys = self.draft_pending_verify_commit_keys
+        if not pending_keys:
+            return applied_commits
 
-        for state in list(self.draft_req_table.values()):
+        running_req_to_idx = {
+            id(req): req_batch_idx
+            for req_batch_idx, req in enumerate(self.running_batch.reqs)
+        }
+        for draft_key in list(pending_keys):
+            pending_keys.remove(draft_key)
+            state = self.draft_req_table[draft_key]
             req = state.req
             if (
                 req is None
-                or state.pending_close is not None
                 or req.req_pool_idx is None
                 or req.kv_committed_freed
             ):
+                pending_keys.add(draft_key)
                 continue
 
             while state.pending_verify_commits:
@@ -1098,7 +1127,7 @@ class SchedulerDecoupledSpecMixin:
                     # The draft request has not materialized the bonus token position.
                     break
                 state.pending_verify_commits.popleft()
-                req_batch_idx = self._find_req_in_running_batch_idx(req)
+                req_batch_idx = running_req_to_idx.get(id(req))
                 self.apply_verify_commit(
                     req,
                     verify_commit,
@@ -1107,6 +1136,9 @@ class SchedulerDecoupledSpecMixin:
                     batch_metadata_updates=batch_metadata_updates,
                 )
                 applied_commits.append(verify_commit)
+
+            if state.pending_verify_commits:
+                pending_keys.add(draft_key)
 
         self._flush_draft_kv_truncations(kv_truncations)
         self._flush_draft_batch_metadata_updates(batch_metadata_updates)
@@ -1139,8 +1171,10 @@ class SchedulerDecoupledSpecMixin:
         if entry.pending_close is not None:
             return
         entry.pending_verify_commits.append(message)
+        self.draft_pending_verify_commit_keys.add(message.draft_key)
 
     def _handle_draft_close_message(self: Scheduler, message: DraftClose) -> None:
+        self.draft_pending_verify_commit_keys.discard(message.draft_key)
         entry = self.draft_req_table.get(message.draft_key)
         if entry is None:
             entry = self._get_or_create_draft_state(message.draft_key)
@@ -1217,8 +1251,8 @@ class SchedulerDecoupledSpecMixin:
             "num_created_reqs": num_created_reqs,
             "num_applied_commit": num_applied_commit,
             "num_pending_commit": sum(
-                len(state.pending_verify_commits)
-                for state in self.draft_req_table.values()
+                len(self.draft_req_table[key].pending_verify_commits)
+                for key in self.draft_pending_verify_commit_keys
             ),
             "num_sleeping_reqs": len(self.draft_sleeping_reqs),
         }
