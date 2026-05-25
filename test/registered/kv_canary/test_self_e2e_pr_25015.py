@@ -43,6 +43,11 @@ class _EaglePositionsBase(CanaryE2EBase):
     # parallel requests both run; we then read the violation log to assert the position bit fired.
     kv_canary_mode = CanaryMode.LOG
     extra_server_args = _SPEC_EAGLE_SERVER_ARGS
+    # Use unique-prefix prompts so each request keeps its own KV-cache slots without radix
+    # folding. Otherwise the prefix-share chain_hash recomputation hits a subtle timing window
+    # at the last slot of each prefill chunk and surfaces a false-positive chain_hash violation
+    # (orthogonal to this test's eagle position-misalign signal).
+    use_unique_prompts: ClassVar[bool] = True
     revert_pr: ClassVar[bool]
 
     @classmethod
