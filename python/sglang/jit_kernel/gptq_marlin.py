@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
     from sgl_kernel.scalar_type import ScalarType
@@ -31,6 +32,7 @@ def _or_empty(
     return t if t is not None else torch.empty(0, device=device, dtype=dtype)
 
 
+@debug_kernel_api
 def gptq_marlin_gemm(
     a: torch.Tensor,
     c: Optional[torch.Tensor],

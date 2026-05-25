@@ -189,22 +189,23 @@ def get_zmq_socket_on_host(
     Args:
         context: ZeroMQ context to create the socket from.
         socket_type: Type of ZeroMQ socket to create.
-        host: Optional host to bind/connect to, without "tcp://" prefix. If None, binds to "tcp://*".
+        host: Host to bind to, without "tcp://" prefix. Defaults to
+            "127.0.0.1" (localhost-only) to avoid exposing unauthenticated
+            sockets to the network (CVE-2026-3060). Callers that need
+            cross-machine reachability must pass an explicit host.
 
     Returns:
         Tuple of (port, socket) where port is the randomly assigned TCP port.
     """
     socket = context.socket(socket_type)
-    # Bind to random TCP port, auto-wrapping IPv6 and setting zmq.IPV6 flag
     config_socket(socket, socket_type)
-    if host:
-        if is_valid_ipv6_address(host):
-            socket.setsockopt(zmq.IPV6, 1)
-            bind_host = f"tcp://[{host}]"
-        else:
-            bind_host = f"tcp://{host}"
+    if host is None:
+        host = "127.0.0.1"
+    if is_valid_ipv6_address(host):
+        socket.setsockopt(zmq.IPV6, 1)
+        bind_host = f"tcp://[{host}]"
     else:
-        bind_host = "tcp://*"
+        bind_host = f"tcp://{host}"
     port = socket.bind_to_random_port(bind_host)
     return port, socket
 

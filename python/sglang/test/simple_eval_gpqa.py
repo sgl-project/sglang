@@ -32,7 +32,10 @@ class GPQAEval(Eval):
         num_threads: int,
         n_repeats: int = 1,
     ):
-        df = pandas.read_csv(filename)
+        if "://" in filename:
+            df = pandas.read_csv(filename, storage_options={"timeout": 30})
+        else:
+            df = pandas.read_csv(filename)
         examples = [row.to_dict() for _, row in df.iterrows()]
         rng = random.Random(0)
         if num_examples:

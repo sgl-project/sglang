@@ -33,8 +33,11 @@ from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -418,7 +421,7 @@ class Conv3dLocalIsland(nn.Conv3d):
             return super().forward(input)
 
 
-class WanModel(CachableDiT, OffloadableDiTMixin):
+class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = MOVAVideoConfig()._fsdp_shard_conditions
     _compile_conditions = MOVAVideoConfig()._compile_conditions
     _supported_attention_backends = MOVAVideoConfig()._supported_attention_backends
@@ -521,8 +524,12 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
     def patchify(
         self, x: torch.Tensor, control_camera_latents_input: torch.Tensor | None = None
     ):
-        # NOTE(dhyu): avoid slow_conv
-        x = x.contiguous(memory_format=torch.channels_last_3d)
+        if current_platform.is_npu:
+            # torch.channels_last_3d is not supported on NPU
+            x = x.contiguous()
+        else:
+            # NOTE(dhyu): avoid slow_conv
+            x = x.contiguous(memory_format=torch.channels_last_3d)
         x = self.patch_embedding(x)
         grid_size = x.shape[2:]
         x = rearrange(x, "b c f h w -> b (f h w) c").contiguous()

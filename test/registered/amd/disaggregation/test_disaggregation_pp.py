@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_amd_ci(est_time=600, suite="stage-b-test-large-8-gpu-35x-disaggregation-amd")
+register_amd_ci(est_time=600, suite="stage-b-test-large-8-gpu-mi35x-disaggregation-amd")
 
 
 class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
@@ -51,6 +51,8 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--pp-size",
@@ -73,6 +75,8 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--base-gpu-id",
@@ -140,6 +144,8 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--pp-size",
@@ -163,6 +169,8 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--base-gpu-id",
@@ -230,6 +238,8 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--pp-size",
@@ -252,6 +262,8 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--pp-size",

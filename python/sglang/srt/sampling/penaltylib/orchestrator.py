@@ -52,19 +52,56 @@ class BatchedPenalizerOrchestrator:
         for penalizer in self.penalizers.values():
             penalizer.cumulate_output_tokens(output_ids=output_ids)
 
-    def apply(self, logits: torch.Tensor) -> torch.Tensor:
+    def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
         """
-        Apply the penalizers to the logits.
-        Note that it may apply the penalizers in-place.
+        Apply all penalizers to the logits in-place.
 
         Args:
-            logits (torch.Tensor): The logits to apply the penalizers to.
-
-        Returns:
-            torch.Tensor: The logits after applying the penalizers.
+            logits: The logits tensor to apply penalties to.
+            repeat: If set (speculative decoding), per-request penalties are
+                expanded via repeat_interleave to match the draft token layout.
+                Additive penalties are captured into a zeros tensor, expanded,
+                then added; scaling penalties are accumulated, expanded, then
+                applied directly.
         """
+        if repeat is None:
+            for penalizer in self.penalizers.values():
+                penalizer.apply(logits)
+        else:
+            # Additive: capture into zeros, expand, add
+            bs = logits.shape[0] // repeat
+            additive = torch.zeros(
+                (bs, logits.shape[1]), dtype=torch.float32, device=logits.device
+            )
+            self.accumulate_additive_penalties(additive)
+            logits.add_(torch.repeat_interleave(additive, repeat, dim=0))
+            # Scaling: accumulate, expand, apply
+            accumulated = self.accumulate_scaling_penalties()
+            if accumulated is not None:
+                from sglang.srt.sampling.penaltylib.repetition_penalty import (
+                    apply_scaling_penalties,
+                )
+
+                expanded = torch.repeat_interleave(accumulated, repeat, dim=0)
+                apply_scaling_penalties(logits, expanded)
+
+    def accumulate_additive_penalties(self, logits: torch.Tensor):
+        """Apply only additive (non-multiplicative) penalizers."""
         for penalizer in self.penalizers.values():
-            penalizer.apply(logits)
+            if not penalizer.is_multiplicative:
+                penalizer.apply(logits)
+
+    def accumulate_scaling_penalties(self) -> Optional[torch.Tensor]:
+        """Accumulate all multiplicative penalty tensors into one, or None if none active."""
+        result = None
+        for penalizer in self.penalizers.values():
+            if not penalizer._is_prepared or not penalizer.is_multiplicative:
+                continue
+            if result is None:
+                result = penalizer.get_scaling_penalties().clone()
+            else:
+                result *= penalizer.get_scaling_penalties()
+        return result
 
     def filter(self, keep_indices: torch.Tensor):
         """
@@ -131,6 +168,8 @@ class _BatchedPenalizer(abc.ABC):
     """
     An abstract class for a batched penalizer.
     """
+
+    is_multiplicative: bool = False
 
     def __init__(self, orchestrator: BatchedPenalizerOrchestrator):
         self._orchestrator_ref: weakref.ReferenceType[BatchedPenalizerOrchestrator] = (
@@ -226,6 +265,13 @@ class _BatchedPenalizer(abc.ABC):
         Penalizers can modify the logits in-place if needed.
         """
         pass
+
+    def get_scaling_penalties(self) -> torch.Tensor:
+        """
+        Return the accumulated scaling penalty tensor for multiplicative penalizers.
+        Only meaningful when is_multiplicative is True. Subclasses should override.
+        """
+        raise NotImplementedError
 
     @abc.abstractmethod
     def _filter(self, keep_indices: torch.Tensor):

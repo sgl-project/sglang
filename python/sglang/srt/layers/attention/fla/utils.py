@@ -3,6 +3,7 @@
 
 import contextlib
 import functools
+import inspect
 import logging
 import os
 import sys
@@ -20,6 +21,16 @@ logger = logging.getLogger(__name__)
 
 COMPILER_MODE = os.getenv("FLA_COMPILER_MODE") == "1"
 FLA_CI_ENV = os.getenv("FLA_CI_ENV") == "1"
+FLA_CACHE_RESULTS = os.getenv("FLA_CACHE_RESULTS", "1") == "1"
+
+
+SUPPORTS_AUTOTUNE_CACHE = (
+    "cache_results" in inspect.signature(triton.autotune).parameters
+)
+
+autotune_cache_kwargs = (
+    {"cache_results": FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
+)
 
 
 @lru_cache(maxsize=1)
@@ -323,3 +334,6 @@ else:
 
     def custom_device_ctx(index: int):
         return torch.cuda.device(index)
+
+
+device_platform = get_available_device()

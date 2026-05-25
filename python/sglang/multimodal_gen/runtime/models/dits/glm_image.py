@@ -37,12 +37,14 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import Timesteps
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -449,15 +451,9 @@ class GlmImageAttention(torch.nn.Module):
             assert (
                 text_attn_mask.dim() == 2
             ), "the shape of text_attn_mask should be (batch_size, text_seq_length)"
-            text_attn_mask = text_attn_mask.float().to(query.device)
-            mix_attn_mask = torch.ones(
-                (batch_size, text_seq_length + image_seq_length), device=query.device
-            )
-            mix_attn_mask[:, :text_seq_length] = text_attn_mask
-            mix_attn_mask = mix_attn_mask.unsqueeze(2)
-            attn_mask_matrix = mix_attn_mask @ mix_attn_mask.transpose(1, 2)
-            attention_mask = (attn_mask_matrix > 0).unsqueeze(1).to(query.dtype)
-        hidden_states = self.attn(query, key, value)
+        hidden_states = self.attn(
+            query, key, value, num_replicated_prefix=text_seq_length
+        )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
@@ -667,7 +663,7 @@ class GlmImageAdaLayerNormContinuous(nn.Module):
         return x
 
 
-class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
+class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     r"""
     Args:
         patch_size (`int`, defaults to `2`):
