@@ -6,10 +6,12 @@ import torch
 import triton
 from torch import nn
 
+from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkvzba_split_reshape_cat
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
@@ -55,9 +57,6 @@ from sglang.srt.utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkvzba_split_reshape_cat
-from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -1023,6 +1022,12 @@ class Qwen3NextForCausalLM(nn.Module):
         self.capture_aux_hidden_states = False
 
         self.num_fused_shared_experts = self._get_num_fused_shared_experts()
+        if self.num_fused_shared_experts > 1:
+            raise ValueError(
+                "Qwen3-Next shared expert fusion currently supports exactly one "
+                "shared expert because checkpoint weight remapping maps it into "
+                "a single fused MoE expert slot."
+            )
         self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
 
         self._routed_experts_weights_of_layer = LazyValue(
