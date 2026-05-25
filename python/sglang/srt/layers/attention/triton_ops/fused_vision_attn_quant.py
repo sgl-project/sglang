@@ -152,11 +152,6 @@ def fused_qkv_per_tensor_quant_pad(q, k, v, qp, kp, vp, sq, sk, sv):
     sk.copy_(torch.max(torch.abs(k)) / 448.0)
     sv.copy_(torch.max(torch.abs(v)) / 448.0)
 
-    # Ensure contiguity to avoid TMA page faults or stride errors
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
-
     M = q.shape[0] * q.shape[1]
     N = q.shape[2]
     aligned_N = qp.shape[2]
