@@ -12,7 +12,7 @@ from sglang.test.server_fixtures.streaming_session_fixture import (
     StreamingSessionServerBase,
 )
 
-register_cuda_ci(est_time=519, stage="stage-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=519, stage="base-b", runner_config="1-gpu-large")
 
 
 SWA_MODEL = "openai/gpt-oss-20b"

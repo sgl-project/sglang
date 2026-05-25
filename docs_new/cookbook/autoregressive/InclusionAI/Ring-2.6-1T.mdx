@@ -46,8 +46,10 @@ import { Ring261TDeployment } from '/src/snippets/autoregressive/ring-26-1t-depl
 - `--trust-remote-code` is required for the model's custom Bailing hybrid implementation.
 - Use `--tp-size 4` on a single 4-GPU GB300 node.
 - Use `--tp-size 8` on a single 8-GPU B200 node.
+- Use `--tp-size 8` on a single 8-GPU H200 node.
 - Use `--mem-fraction-static 0.95` on GB300 x4. The model uses about 238.5GB/GPU after loading, so lower values can fail during KV-pool initialization.
 - Use `--mem-fraction-static 0.8` on B200 x8.
+- Use `--mem-fraction-static 0.95` on H200 x8.
 - `--model-loader-extra-config '{"enable_multithread_load":"true","num_threads":64}'` is recommended because the model has 175 large safetensors shards.
 - Keep `--tool-call-parser glm` enabled by default for OpenAI-compatible tool calls. Ring's template emits XML `<arg_key>/<arg_value>` tool calls, which the `qwen` parser does not convert into `message.tool_calls`.
 - Keep `--reasoning-parser deepseek-r1` enabled by default so `<think>...</think>` content is split into `message.reasoning_content`.
@@ -148,11 +150,11 @@ For more API examples, see the [SGLang Basic Usage Guide](../../../docs/basic_us
 
 ### 5.1 Speed Benchmark
 
-- Hardware: NVIDIA B200 GPU (8x) and NVIDIA GB300 GPU (4x)
+- Hardware: NVIDIA B200 GPU (8x), NVIDIA H200 GPU (8x), and NVIDIA GB300 GPU (4x)
 - Model: `inclusionAI/Ring-2.6-1T`
 - Docker image: `lmsysorg/sglang:latest`
 - SGLang version tested: `0.5.11`
-- Tensor Parallelism: 8 on B200 x8, 4 on GB300 x4
+- Tensor Parallelism: 8 on B200 x8 and H200 x8, 4 on GB300 x4
 
 Use the deployment command from [Section 3](#3-model-deployment), then confirm that the server is healthy before running benchmarks:
 
@@ -223,6 +225,28 @@ Mean ITL (ms):                           14.22
 ==================================================
 ```
 
+- Test Results (H200 x8):
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  57.10
+Total input tokens:                      6101
+Total generated tokens:                  4220
+Request throughput (req/s):              0.18
+Input token throughput (tok/s):          106.85
+Output token throughput (tok/s):         73.91
+Total token throughput (tok/s):          180.76
+Mean E2E Latency (ms):                   5707.72
+Mean TTFT (ms):                          163.35
+Mean TPOT (ms):                          13.17
+Mean ITL (ms):                           13.17
+==================================================
+```
+
 #### 5.1.2 Throughput-Sensitive Benchmark
 
 - Test Command:
@@ -285,6 +309,28 @@ Mean ITL (ms):                           60.33
 ==================================================
 ```
 
+- Test Results (H200 x8):
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     100
+Benchmark duration (s):                  44.51
+Total input tokens:                      50561
+Total generated tokens:                  52444
+Request throughput (req/s):              2.25
+Input token throughput (tok/s):          1135.88
+Output token throughput (tok/s):         1178.18
+Total token throughput (tok/s):          2314.06
+Mean E2E Latency (ms):                   27177.14
+Mean TTFT (ms):                          2173.08
+Mean TPOT (ms):                          51.11
+Mean ITL (ms):                           47.77
+==================================================
+```
+
 ### 5.2 Accuracy Benchmark
 
 #### 5.2.1 GSM8K Benchmark
@@ -317,4 +363,12 @@ Output throughput: 627.401 token/s
 Total latency: 98.386 s
 Score: 0.990
 Output throughput: 621.469 token/s
+```
+
+- Test Results (H200 x8):
+
+```text Output
+Total latency: 76.849 s
+Score: 0.990
+Output throughput: 793.125 token/s
 ```
