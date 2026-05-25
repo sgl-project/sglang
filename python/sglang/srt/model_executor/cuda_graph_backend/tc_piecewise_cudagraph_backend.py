@@ -95,12 +95,12 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         """
         from sglang.srt.model_executor.cuda_graph_mode import Phase
 
-        prefill = server_args.cuda_graph_settings[Phase.PREFILL]
+        prefill = server_args.cuda_graph_config[Phase.PREFILL]
         num_tokens = prefill["num_tokens"]
         compiler = prefill["tc_compiler"]
         assert (
             num_tokens is not None
-        ), "cuda_graph_settings[prefill].num_tokens is not set"
+        ), "cuda_graph_config[prefill].num_tokens is not set"
         assert compiler in _VALID_COMPILERS, (
             f"By now, only {_VALID_COMPILERS} are supported for the "
             "tc_piecewise prefill compiler."

@@ -2008,7 +2008,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """
         from sglang.srt.lora.layers import FusedMoEWithLoRA
 
-        max_bs = self.server_args.cuda_graph_settings[Phase.DECODE]["max_bs"]
+        max_bs = self.server_args.cuda_graph_config[Phase.DECODE]["max_bs"]
         max_loras = self.server_args.max_loras_per_batch
         for module in self.model.modules():
             if isinstance(module, FusedMoEWithLoRA):
@@ -2814,7 +2814,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
             logger.info(
-                "Disable prefill CUDA graph because cuda_graph_settings "
+                "Disable prefill CUDA graph because cuda_graph_config "
                 "resolved prefill.backend='disabled' (e.g. via "
                 "--cuda-graph-backend-prefill=disabled or auto-disable rules)."
             )
@@ -2834,7 +2834,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
 
         # Disable piecewise CUDA graph for non capture size
-        if not self.server_args.cuda_graph_settings[Phase.PREFILL]["num_tokens"]:
+        if not self.server_args.cuda_graph_config[Phase.PREFILL]["num_tokens"]:
             logger.warning(
                 "Disable piecewise CUDA graph because the capture size is not set"
             )

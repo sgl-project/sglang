@@ -93,12 +93,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_return_pooled_hidden_states = not model_runner.is_generation
 
         # --- bucket sizes ---------------------------------------------
-        capture_tokens = model_runner.server_args.cuda_graph_settings[Phase.PREFILL][
+        capture_tokens = model_runner.server_args.cuda_graph_config[Phase.PREFILL][
             "num_tokens"
         ]
         assert (
             capture_tokens is not None
-        ), "cuda_graph_settings[prefill].num_tokens is not set"
+        ), "cuda_graph_config[prefill].num_tokens is not set"
         self.capture_num_tokens = sorted(capture_tokens)
         self.max_num_tokens = (
             max(self.capture_num_tokens) if self.capture_num_tokens else 8192

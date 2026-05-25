@@ -1,5 +1,5 @@
 """Phase / backend identifiers, the canonical default for
-``cuda_graph_settings``, and the ``--cuda-graph-settings`` JSON CLI parser.
+``cuda_graph_config``, and the ``--cuda-graph-config`` JSON CLI parser.
 
 Module-level imports are pure stdlib — no torch / sglang.srt deps — so
 ``ServerArgs`` can import everything here without pulling in backend
@@ -59,7 +59,7 @@ ALLOWED_KEYS_PER_PHASE = {
     ),
 }
 
-DEFAULT_CUDA_GRAPH_SETTINGS: Dict[str, Dict[str, Any]] = {
+DEFAULT_CUDA_GRAPH_CONFIG: Dict[str, Dict[str, Any]] = {
     Phase.DECODE: {
         "backend": Backend.FULL,
         "max_bs": None,
@@ -79,13 +79,13 @@ DEFAULT_CUDA_GRAPH_SETTINGS: Dict[str, Dict[str, Any]] = {
 }
 
 
-def default_cuda_graph_settings() -> Dict[str, Dict[str, Any]]:
+def default_cuda_graph_config() -> Dict[str, Dict[str, Any]]:
     """Fresh deep copy of the canonical defaults."""
-    return copy.deepcopy(DEFAULT_CUDA_GRAPH_SETTINGS)
+    return copy.deepcopy(DEFAULT_CUDA_GRAPH_CONFIG)
 
 
 def check_cuda_graph_backend(phase: str, backend: str) -> bool:
-    """True if ``cuda_graph_settings[phase]['backend'] == backend`` on the
+    """True if ``cuda_graph_config[phase]['backend'] == backend`` on the
     global server args. Returns False if the global server args have not
     been initialized yet (e.g. unit tests, early startup)."""
     from sglang.srt.server_args import get_global_server_args
@@ -94,25 +94,25 @@ def check_cuda_graph_backend(phase: str, backend: str) -> bool:
         server_args = get_global_server_args()
     except ValueError:
         return False
-    if server_args.cuda_graph_settings is None:
+    if server_args.cuda_graph_config is None:
         return False
-    phase_settings = server_args.cuda_graph_settings.get(phase)
+    phase_settings = server_args.cuda_graph_config.get(phase)
     if phase_settings is None:
         return False
     return phase_settings.get("backend") == backend
 
 
-def parse_cuda_graph_settings_arg(raw: str) -> Dict[str, Dict[str, Any]]:
-    """argparse type for ``--cuda-graph-settings``: parse JSON dict of
+def parse_cuda_graph_config_arg(raw: str) -> Dict[str, Dict[str, Any]]:
+    """argparse type for ``--cuda-graph-config``: parse JSON dict of
     phase → settings dict. Each phase's settings dict is itself validated
     against ``ALLOWED_KEYS_PER_PHASE``."""
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as e:
-        raise argparse.ArgumentTypeError(f"--cuda-graph-settings must be JSON: {e}")
+        raise argparse.ArgumentTypeError(f"--cuda-graph-config must be JSON: {e}")
     if not isinstance(parsed, dict):
         raise argparse.ArgumentTypeError(
-            f"--cuda-graph-settings must be a JSON object, got {type(parsed).__name__}"
+            f"--cuda-graph-config must be a JSON object, got {type(parsed).__name__}"
         )
 
     result: Dict[str, Dict[str, Any]] = {}
@@ -120,11 +120,11 @@ def parse_cuda_graph_settings_arg(raw: str) -> Dict[str, Dict[str, Any]]:
         phase = str(phase)
         if phase not in Phase.ALL:
             raise argparse.ArgumentTypeError(
-                f"--cuda-graph-settings: unknown phase '{phase}', expected one of {Phase.ALL}"
+                f"--cuda-graph-config: unknown phase '{phase}', expected one of {Phase.ALL}"
             )
         if not isinstance(phase_settings, dict):
             raise argparse.ArgumentTypeError(
-                f"--cuda-graph-settings['{phase}'] must be a JSON object, got "
+                f"--cuda-graph-config['{phase}'] must be a JSON object, got "
                 f"{type(phase_settings).__name__}"
             )
         allowed = ALLOWED_KEYS_PER_PHASE[phase]
@@ -132,7 +132,7 @@ def parse_cuda_graph_settings_arg(raw: str) -> Dict[str, Dict[str, Any]]:
         for key, value in phase_settings.items():
             if key not in allowed:
                 raise argparse.ArgumentTypeError(
-                    f"--cuda-graph-settings['{phase}']: unknown key '{key}', expected one of {allowed}"
+                    f"--cuda-graph-config['{phase}']: unknown key '{key}', expected one of {allowed}"
                 )
             result[phase][key] = value
     return result

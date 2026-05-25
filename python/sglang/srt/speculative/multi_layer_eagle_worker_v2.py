@@ -119,8 +119,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
         # Do not capture cuda graph in `TpModelWorker` init,
         # will capture later with init_cuda_graphs()
-        backup_decode_mode = server_args.cuda_graph_settings[Phase.DECODE]["backend"]
-        server_args.cuda_graph_settings[Phase.DECODE]["backend"] = Backend.DISABLED
+        backup_decode_mode = server_args.cuda_graph_config[Phase.DECODE]["backend"]
+        server_args.cuda_graph_config[Phase.DECODE]["backend"] = Backend.DISABLED
 
         # Share the allocator with a target worker.
         # Draft and target worker own their own KV cache pools.
@@ -173,7 +173,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
         # Init attention backend and cuda graphs
         for i in range(self.speculative_num_steps):
-            self.draft_runner_list[i].server_args.cuda_graph_settings[Phase.DECODE][
+            self.draft_runner_list[i].server_args.cuda_graph_config[Phase.DECODE][
                 "backend"
             ] = backup_decode_mode
         self.draft_tp_context = (

@@ -1493,16 +1493,14 @@ def apply_fp8_linear(
         # eliminating a separate kernel launch per linear layer.
         # weight_scale shape does not matter here -- it is only used in the
         # GEMM epilogue, not in the activation quant fusion. Only activates when
-        # cuda_graph_settings[prefill].tc_compiler=inductor; eager PCG and
+        # cuda_graph_config[prefill].tc_compiler=inductor; eager PCG and
         # decode both use the faster custom kernel.
         from sglang.srt.model_executor.cuda_graph_mode import Phase
 
         if (
             input_scale is not None
             and input_scale.numel() == 1
-            and get_global_server_args().cuda_graph_settings[Phase.PREFILL][
-                "tc_compiler"
-            ]
+            and get_global_server_args().cuda_graph_config[Phase.PREFILL]["tc_compiler"]
             == "inductor"
         ):
             qinput = (

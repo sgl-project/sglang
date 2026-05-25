@@ -45,8 +45,8 @@ from sglang.srt.model_executor.cuda_graph_mode import (
     ALLOWED_KEYS_PER_PHASE,
     Backend,
     Phase,
-    default_cuda_graph_settings,
-    parse_cuda_graph_settings_arg,
+    default_cuda_graph_config,
+    parse_cuda_graph_config_arg,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
@@ -706,9 +706,9 @@ class ServerArgs:
     enable_cudagraph_gc: bool = False
     debug_cuda_graph: bool = False
 
-    cuda_graph_settings: Optional[Dict[str, Dict[str, Any]]] = None
+    cuda_graph_config: Optional[Dict[str, Dict[str, Any]]] = None
 
-    # Per-phase convenience CLI inputs that fold into ``cuda_graph_settings``.
+    # Per-phase convenience CLI inputs that fold into ``cuda_graph_config``.
     cuda_graph_backend_decode: Optional[str] = None
     cuda_graph_backend_prefill: Optional[str] = None
     cuda_graph_max_bs_decode: Optional[int] = None
@@ -721,7 +721,7 @@ class ServerArgs:
     cuda_graph_num_tokens_prefill: Optional[List[int]] = None
     cuda_graph_tc_compiler_prefill: Optional[str] = None
 
-    # Legacy CLI inputs that fold into ``cuda_graph_settings`` (with a CLI
+    # Legacy CLI inputs that fold into ``cuda_graph_config`` (with a CLI
     # deprecation warning). Internal-only after parsing.
     disable_cuda_graph: bool = False
     disable_prefill_cuda_graph: bool = False
@@ -730,6 +730,9 @@ class ServerArgs:
     decode_cuda_graph_backend: Optional[str] = None
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
+    piecewise_cuda_graph_max_tokens: Optional[int] = None
+    piecewise_cuda_graph_tokens: Optional[List[int]] = None
+    tc_piecewise_cuda_graph_compiler: Optional[str] = None
     enable_layerwise_nvtx_marker: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
@@ -754,10 +757,6 @@ class ServerArgs:
     enable_torch_compile: bool = False
     enable_torch_compile_debug_mode: bool = False
     torch_compile_max_bs: int = 32
-    # Legacy piecewise CLI inputs — folded into ``cuda_graph_settings['prefill']``.
-    piecewise_cuda_graph_max_tokens: Optional[int] = None
-    piecewise_cuda_graph_tokens: Optional[List[int]] = None
-    piecewise_cuda_graph_compiler: Optional[str] = None
     torchao_config: str = ""
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
@@ -1295,13 +1294,13 @@ class ServerArgs:
 
             set_default_server_args(self)
 
-            current = self.cuda_graph_settings[Phase.PREFILL].get("tc_compiler")
+            current = self.cuda_graph_config[Phase.PREFILL].get("tc_compiler")
             if current is not None and current != "eager":
                 logger.warning(
                     "At this moment Ascend platform only support prefill graph compilation with "
-                    "cuda_graph_settings[prefill].tc_compiler='eager'."
+                    "cuda_graph_config[prefill].tc_compiler='eager'."
                 )
-                self.cuda_graph_settings[Phase.PREFILL]["tc_compiler"] = "eager"
+                self.cuda_graph_config[Phase.PREFILL]["tc_compiler"] = "eager"
 
     def _handle_mps_backends(self):
         if self.device == "mps":
@@ -1310,32 +1309,32 @@ class ServerArgs:
 
     def _handle_xpu_backends(self):
         if self.device == "xpu":
-            if self.cuda_graph_settings[Phase.PREFILL]["backend"] != Backend.DISABLED:
+            if self.cuda_graph_config[Phase.PREFILL]["backend"] != Backend.DISABLED:
                 logger.warning(
                     "XPU platform does not support piecewise CUDA graph, "
                     "disabling prefill cuda graph."
                 )
-            self.cuda_graph_settings[Phase.PREFILL]["backend"] = Backend.DISABLED
+            self.cuda_graph_config[Phase.PREFILL]["backend"] = Backend.DISABLED
 
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
     def _handle_cuda_graph_config(self):
-        self._parse_cuda_graph_settings()
+        self._parse_cuda_graph_config()
         self._apply_cuda_graph_compatibility()
-        self._validate_cuda_graph_settings()
+        self._validate_cuda_graph_config()
 
-    def _parse_cuda_graph_settings(self):
-        """Resolve ``cuda_graph_settings`` from explicit JSON, per-phase
+    def _parse_cuda_graph_config(self):
+        """Resolve ``cuda_graph_config`` from explicit JSON, per-phase
         convenience flags, legacy global flags, and defaults.
         Precedence (highest first): explicit JSON > convenience > legacy > defaults.
-        Also populates ``self._cuda_graph_settings_locked`` — the set of
+        Also populates ``self._cuda_graph_config_locked`` — the set of
         ``(phase, key)`` tuples that came from non-default sources; the
         auto-disable cascade respects this lock (the old
         ``--enforce-piecewise-cuda-graph`` semantics generalized).
         """
-        explicit_input = self.cuda_graph_settings or {}
-        settings = default_cuda_graph_settings()
+        explicit_input = self.cuda_graph_config or {}
+        settings = default_cuda_graph_config()
         locked: set = set()
 
         def _set(phase: str, key: str, value: Any) -> None:
@@ -1354,8 +1353,8 @@ class ServerArgs:
             _set(Phase.PREFILL, "max_num_tokens", self.piecewise_cuda_graph_max_tokens)
         if self.piecewise_cuda_graph_tokens is not None:
             _set(Phase.PREFILL, "num_tokens", self.piecewise_cuda_graph_tokens)
-        if self.piecewise_cuda_graph_compiler is not None:
-            _set(Phase.PREFILL, "tc_compiler", self.piecewise_cuda_graph_compiler)
+        if self.tc_piecewise_cuda_graph_compiler is not None:
+            _set(Phase.PREFILL, "tc_compiler", self.tc_piecewise_cuda_graph_compiler)
 
         # ---- Legacy convenience flags ----
         if self.disable_prefill_cuda_graph:
@@ -1400,8 +1399,8 @@ class ServerArgs:
             for key, value in phase_settings.items():
                 _set(phase, key, value)
 
-        self.cuda_graph_settings = settings
-        self._cuda_graph_settings_locked = locked
+        self.cuda_graph_config = settings
+        self._cuda_graph_config_locked = locked
 
     def _apply_cuda_graph_compatibility(self):
         """Auto-disable prefill cuda graph for incompatible configs.
@@ -1410,11 +1409,11 @@ class ServerArgs:
         prefill backend (this folds in the old
         ``--enforce-piecewise-cuda-graph`` contract).
         """
-        if (Phase.PREFILL, "backend") in self._cuda_graph_settings_locked:
+        if (Phase.PREFILL, "backend") in self._cuda_graph_config_locked:
             return
-        if self.cuda_graph_settings[Phase.PREFILL]["backend"] == Backend.TC_PIECEWISE:
+        if self.cuda_graph_config[Phase.PREFILL]["backend"] == Backend.TC_PIECEWISE:
             self._disable_tc_piecewise_cudagraph_if_incompatible()
-        elif self.cuda_graph_settings[Phase.PREFILL]["backend"] == Backend.BREAKABLE:
+        elif self.cuda_graph_config[Phase.PREFILL]["backend"] == Backend.BREAKABLE:
             self._disable_breakable_cudagraph_if_incompatible()
 
     def _disable_tc_piecewise_cudagraph_if_incompatible(self):
@@ -1473,7 +1472,7 @@ class ServerArgs:
         ]
         for _name, predicate in rules:
             if predicate():
-                self.cuda_graph_settings[Phase.PREFILL]["backend"] = Backend.DISABLED
+                self.cuda_graph_config[Phase.PREFILL]["backend"] = Backend.DISABLED
 
     def _disable_breakable_cudagraph_if_incompatible(self):
         """Breakable (segmented capture, no torch.compile). Breakable enforces HIP
@@ -1493,22 +1492,22 @@ class ServerArgs:
                     "disabling prefill CUDA graph.",
                     name,
                 )
-                self.cuda_graph_settings[Phase.PREFILL]["backend"] = Backend.DISABLED
+                self.cuda_graph_config[Phase.PREFILL]["backend"] = Backend.DISABLED
                 return
 
-    def _validate_cuda_graph_settings(self):
-        settings = self.cuda_graph_settings or {}
+    def _validate_cuda_graph_config(self):
+        settings = self.cuda_graph_config or {}
         for phase, phase_settings in settings.items():
             if phase not in ALLOWED_BACKENDS_PER_PHASE:
                 logger.error(
-                    "--cuda-graph-settings: unknown phase %r; allowed: %s",
+                    "--cuda-graph-config: unknown phase %r; allowed: %s",
                     phase,
                     Phase.ALL,
                 )
                 sys.exit(1)
             if not isinstance(phase_settings, dict):
                 logger.error(
-                    "--cuda-graph-settings[%s] must be a dict, got %s",
+                    "--cuda-graph-config[%s] must be a dict, got %s",
                     phase,
                     type(phase_settings).__name__,
                 )
@@ -1517,7 +1516,7 @@ class ServerArgs:
             for key, value in phase_settings.items():
                 if key not in allowed_keys:
                     logger.error(
-                        "--cuda-graph-settings[%s]: unknown key %r; allowed: %s",
+                        "--cuda-graph-config[%s]: unknown key %r; allowed: %s",
                         phase,
                         key,
                         allowed_keys,
@@ -1529,7 +1528,7 @@ class ServerArgs:
                     and value not in ALLOWED_BACKENDS_PER_PHASE[phase]
                 ):
                     logger.error(
-                        "--cuda-graph-settings[%s].backend=%r not allowed; allowed: %s",
+                        "--cuda-graph-config[%s].backend=%r not allowed; allowed: %s",
                         phase,
                         value,
                         ALLOWED_BACKENDS_PER_PHASE[phase],
@@ -1547,10 +1546,10 @@ class ServerArgs:
         if not self.enable_mis:
             return
 
-        if self.cuda_graph_settings[Phase.DECODE]["backend"] != Backend.DISABLED:
+        if self.cuda_graph_config[Phase.DECODE]["backend"] != Backend.DISABLED:
             logger.warning("CUDA graph is disabled because --enable-mis is set.")
-        self.cuda_graph_settings[Phase.DECODE]["backend"] = Backend.DISABLED
-        self.cuda_graph_settings[Phase.PREFILL]["backend"] = Backend.DISABLED
+        self.cuda_graph_config[Phase.DECODE]["backend"] = Backend.DISABLED
+        self.cuda_graph_config[Phase.PREFILL]["backend"] = Backend.DISABLED
 
         if not self.disable_radix_cache:
             logger.warning("Radix cache is disabled because --enable-mis is set.")
@@ -1591,8 +1590,8 @@ class ServerArgs:
 
           The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
         """
-        decode = self.cuda_graph_settings[Phase.DECODE]
-        prefill = self.cuda_graph_settings[Phase.PREFILL]
+        decode = self.cuda_graph_config[Phase.DECODE]
+        prefill = self.cuda_graph_config[Phase.PREFILL]
 
         if gpu_mem is not None:
             if gpu_mem < 20 * 1024:
@@ -1677,7 +1676,7 @@ class ServerArgs:
 
             assert (
                 self.torch_compile_max_bs > 0
-            ), "cuda_graph_settings[decode].bs should contain positive batch sizes"
+            ), "cuda_graph_config[decode].bs should contain positive batch sizes"
             decode["max_bs"] = self.torch_compile_max_bs
 
         if prefill["max_num_tokens"] is None:
@@ -2009,7 +2008,7 @@ class ServerArgs:
                         # DSACPLayerCommunicator does not all-reduce attention-TP
                         # partial o_proj outputs before replicated dense FFNs.
                         self.attn_cp_size = self.tp_size // self.dp_size
-                        self.cuda_graph_settings[Phase.PREFILL][
+                        self.cuda_graph_config[Phase.PREFILL][
                             "backend"
                         ] = Backend.DISABLED
                         logger.warning(
@@ -2020,7 +2019,7 @@ class ServerArgs:
                             f"tp_size == {self.tp_size}, "
                             f"kv_cache_dtype == {self.kv_cache_dtype}, "
                             f"moe_a2a_backend {self.moe_a2a_backend}, "
-                            f"cuda_graph_settings[prefill].backend=disabled"
+                            f"cuda_graph_config[prefill].backend=disabled"
                         )
                     else:
                         # Pure TP and partial DP Attention mode is active for DSA, logging a warning
@@ -2063,10 +2062,7 @@ class ServerArgs:
 
             else:
                 # DeepSeek V3/R1/V3.1
-                if (
-                    self.cuda_graph_settings[Phase.PREFILL]["backend"]
-                    != Backend.DISABLED
-                ):
+                if self.cuda_graph_config[Phase.PREFILL]["backend"] != Backend.DISABLED:
                     logger.info("Piecewise CUDA graph is enabled, use MLA for prefill.")
 
                 if is_sm100_supported():
@@ -2099,9 +2095,7 @@ class ServerArgs:
                     # DSACPLayerCommunicator does not all-reduce attention-TP
                     # partial o_proj outputs before replicated dense FFNs.
                     self.attn_cp_size = self.tp_size // self.dp_size
-                    self.cuda_graph_settings[Phase.PREFILL][
-                        "backend"
-                    ] = Backend.DISABLED
+                    self.cuda_graph_config[Phase.PREFILL]["backend"] = Backend.DISABLED
                     logger.warning(
                         f"Enable Context Parallel opt for MLA, "
                         f"Setting dp_size == {self.dp_size} and "
@@ -2110,7 +2104,7 @@ class ServerArgs:
                         f"ep_size == {self.ep_size}, "
                         f"tp_size == {self.tp_size}, "
                         f"moe_a2a_backend {self.moe_a2a_backend}, "
-                        f"cuda_graph_settings[prefill].backend=disabled"
+                        f"cuda_graph_config[prefill].backend=disabled"
                     )
 
             # Set moe backend for DeepSeek
@@ -2915,15 +2909,15 @@ class ServerArgs:
             logger.warning(
                 "Cuda graph is disabled because of using torch native attention backend"
             )
-            self.cuda_graph_settings[Phase.DECODE]["backend"] = Backend.DISABLED
-            self.cuda_graph_settings[Phase.PREFILL]["backend"] = Backend.DISABLED
+            self.cuda_graph_config[Phase.DECODE]["backend"] = Backend.DISABLED
+            self.cuda_graph_config[Phase.PREFILL]["backend"] = Backend.DISABLED
 
         if self.attention_backend == "flex_attention":
             logger.warning(
                 "Cuda graph is disabled because of using torch Flex Attention backend"
             )
-            self.cuda_graph_settings[Phase.DECODE]["backend"] = Backend.DISABLED
-            self.cuda_graph_settings[Phase.PREFILL]["backend"] = Backend.DISABLED
+            self.cuda_graph_config[Phase.DECODE]["backend"] = Backend.DISABLED
+            self.cuda_graph_config[Phase.PREFILL]["backend"] = Backend.DISABLED
             assert (
                 self.speculative_algorithm is None
             ), "Speculative decoding is currently not supported with Flex Attention backend"
@@ -3435,12 +3429,12 @@ class ServerArgs:
         # Exception: GptOssForCausalLM wraps the entire MoE block in its own
         # custom op (moe_impl), so bypassed topk is handled inside the op body.
         if (
-            (Phase.PREFILL, "backend") not in self._cuda_graph_settings_locked
+            (Phase.PREFILL, "backend") not in self._cuda_graph_config_locked
             and self.moe_runner_backend in ("flashinfer_trtllm", "flashinfer_mxfp4")
             and self.get_model_config().hf_config.architectures[0]
             != "GptOssForCausalLM"
         ):
-            self.cuda_graph_settings[Phase.PREFILL]["backend"] = Backend.DISABLED
+            self.cuda_graph_config[Phase.PREFILL]["backend"] = Backend.DISABLED
             logger.info(
                 f"Piecewise cuda graph is disabled for MoE runner backend "
                 f"'{self.moe_runner_backend}' (bypassed topk is incompatible "
@@ -3477,8 +3471,8 @@ class ServerArgs:
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
-                self.cuda_graph_settings[Phase.DECODE]["backend"] = Backend.DISABLED
-                self.cuda_graph_settings[Phase.PREFILL]["backend"] = Backend.DISABLED
+                self.cuda_graph_config[Phase.DECODE]["backend"] = Backend.DISABLED
+                self.cuda_graph_config[Phase.PREFILL]["backend"] = Backend.DISABLED
             self.ep_size = self.tp_size
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
@@ -4004,8 +3998,8 @@ class ServerArgs:
                 or self.disable_prefill_cuda_graph
                 or self.prefill_cuda_graph_backend == Backend.DISABLED
                 or (
-                    self.cuda_graph_settings is not None
-                    and self.cuda_graph_settings.get(Phase.PREFILL, {}).get("backend")
+                    self.cuda_graph_config is not None
+                    and self.cuda_graph_config.get(Phase.PREFILL, {}).get("backend")
                     == Backend.DISABLED
                 )
             )
@@ -4333,15 +4327,14 @@ class ServerArgs:
         # On AMD/HIP, disable cuda graph for DLLM and use triton backend
         if is_hip():
             if (
-                self.cuda_graph_settings[Phase.DECODE]["backend"] != Backend.DISABLED
-                or self.cuda_graph_settings[Phase.PREFILL]["backend"]
-                != Backend.DISABLED
+                self.cuda_graph_config[Phase.DECODE]["backend"] != Backend.DISABLED
+                or self.cuda_graph_config[Phase.PREFILL]["backend"] != Backend.DISABLED
             ):
                 logger.warning(
                     "Cuda graph is disabled for diffusion LLM inference on AMD GPUs"
                 )
-                self.cuda_graph_settings[Phase.DECODE]["backend"] = Backend.DISABLED
-                self.cuda_graph_settings[Phase.PREFILL]["backend"] = Backend.DISABLED
+                self.cuda_graph_config[Phase.DECODE]["backend"] = Backend.DISABLED
+                self.cuda_graph_config[Phase.PREFILL]["backend"] = Backend.DISABLED
             if self.attention_backend not in ["triton", "aiter"]:
                 logger.warning(
                     "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
@@ -4353,7 +4346,7 @@ class ServerArgs:
                     "Attention backend is overridden to 'ascend' when running on NPU for diffusion LLM inference."
                 )
                 self.attention_backend = "ascend"
-        elif self.cuda_graph_settings[Phase.DECODE]["backend"] != Backend.DISABLED:
+        elif self.cuda_graph_config[Phase.DECODE]["backend"] != Backend.DISABLED:
             if self.attention_backend != "flashinfer":
                 logger.warning(
                     "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
@@ -4415,8 +4408,8 @@ class ServerArgs:
             logger.warning(
                 "Cuda graph and server warmup are disabled because of using tensor dump mode"
             )
-            self.cuda_graph_settings[Phase.DECODE]["backend"] = Backend.DISABLED
-            self.cuda_graph_settings[Phase.PREFILL]["backend"] = Backend.DISABLED
+            self.cuda_graph_config[Phase.DECODE]["backend"] = Backend.DISABLED
+            self.cuda_graph_config[Phase.PREFILL]["backend"] = Backend.DISABLED
             self.skip_server_warmup = True
 
         if self.msprobe_dump_config is not None:
@@ -4425,8 +4418,8 @@ class ServerArgs:
                 "cuda graph is disabled because msProbe only supports dump in eager mode, "
                 "warmup is disabled(skip_server_warmup=True) because there is no need to dump data for this stage."
             )
-            self.cuda_graph_settings[Phase.DECODE]["backend"] = Backend.DISABLED
-            self.cuda_graph_settings[Phase.PREFILL]["backend"] = Backend.DISABLED
+            self.cuda_graph_config[Phase.DECODE]["backend"] = Backend.DISABLED
+            self.cuda_graph_config[Phase.PREFILL]["backend"] = Backend.DISABLED
             self.skip_server_warmup = True
 
         # Validate limit_mm_per_prompt modalities
@@ -6404,14 +6397,14 @@ class ServerArgs:
             type=str,
             choices=Backend.ALL,
             default=ServerArgs.cuda_graph_backend_decode,
-            help="Backend for the decode phase. Folds into cuda_graph_settings[decode].backend.",
+            help="Backend for the decode phase. Folds into cuda_graph_config[decode].backend.",
         )
         parser.add_argument(
             "--cuda-graph-backend-prefill",
             type=str,
             choices=Backend.ALL,
             default=ServerArgs.cuda_graph_backend_prefill,
-            help="Backend for the prefill phase. Folds into cuda_graph_settings[prefill].backend.",
+            help="Backend for the prefill phase. Folds into cuda_graph_config[prefill].backend.",
         )
         parser.add_argument(
             "--cuda-graph-max-bs-decode",
@@ -6525,9 +6518,9 @@ class ServerArgs:
         )
 
         parser.add_argument(
-            "--cuda-graph-settings",
-            type=parse_cuda_graph_settings_arg,
-            default=ServerArgs.cuda_graph_settings,
+            "--cuda-graph-config",
+            type=parse_cuda_graph_config_arg,
+            default=ServerArgs.cuda_graph_config,
             help="Per-phase CUDA graph settings as JSON, e.g. "
             '\'{"decode":{"backend":"full","max_bs":256},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}\'. '
             "Allowed backends per phase: full, breakable, tc_piecewise, disabled "
@@ -6536,12 +6529,12 @@ class ServerArgs:
         )
         parser.add_argument(
             "--cuda-graph-mode",
-            type=parse_cuda_graph_settings_arg,
+            type=parse_cuda_graph_config_arg,
             action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-settings",
-            dest="cuda_graph_settings",
-            default=ServerArgs.cuda_graph_settings,
-            help="Deprecated alias for --cuda-graph-settings.",
+            new_flag="--cuda-graph-config",
+            dest="cuda_graph_config",
+            default=ServerArgs.cuda_graph_config,
+            help="Deprecated alias for --cuda-graph-config.",
         )
         parser.add_argument(
             "--prefill-cuda-graph-backend",
@@ -6696,7 +6689,7 @@ class ServerArgs:
             action=DeprecatedAction,
             help="Deprecated. The auto-disable cascade is now skipped automatically "
             "whenever the user explicitly sets the prefill backend "
-            "(--cuda-graph-backend-prefill or --cuda-graph-settings).",
+            "(--cuda-graph-backend-prefill or --cuda-graph-config).",
         )
         parser.add_argument(
             "--piecewise-cuda-graph-tokens",
@@ -6712,6 +6705,7 @@ class ServerArgs:
             choices=["eager", "inductor"],
             action=DeprecatedAliasStoreAction,
             new_flag="--cuda-graph-tc-compiler-prefill",
+            dest="tc_piecewise_cuda_graph_compiler",
             help="Deprecated alias for --cuda-graph-tc-compiler-prefill.",
         )
         parser.add_argument(

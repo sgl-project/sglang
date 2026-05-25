@@ -58,7 +58,7 @@ def set_default_server_args(args: "ServerArgs"):
     # NPU memory settings
     from sglang.srt.model_executor.cuda_graph_mode import Phase
 
-    decode = args.cuda_graph_settings[Phase.DECODE]
+    decode = args.cuda_graph_config[Phase.DECODE]
     npu_mem = get_npu_memory_capacity()
     if npu_mem <= 32 * 1024:
         # Ascend 910B4,910B4_1

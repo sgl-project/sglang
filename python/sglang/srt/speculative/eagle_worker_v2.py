@@ -138,8 +138,8 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Do not capture cuda graph in `TpModelWorker` init,
         # will capture later with init_cuda_graphs()
-        backup_decode_mode = server_args.cuda_graph_settings[Phase.DECODE]["backend"]
-        server_args.cuda_graph_settings[Phase.DECODE]["backend"] = Backend.DISABLED
+        backup_decode_mode = server_args.cuda_graph_config[Phase.DECODE]["backend"]
+        server_args.cuda_graph_config[Phase.DECODE]["backend"] = Backend.DISABLED
 
         # Share the allocator with a target worker.
         # Draft and target worker own their own KV cache pools.
@@ -186,7 +186,7 @@ class EagleDraftWorker(BaseDraftWorker):
         self.init_lm_head()
 
         # Init attention backend and cuda graphs
-        self.draft_runner.server_args.cuda_graph_settings[Phase.DECODE][
+        self.draft_runner.server_args.cuda_graph_config[Phase.DECODE][
             "backend"
         ] = backup_decode_mode
         self.draft_tp_context = (

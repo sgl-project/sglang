@@ -410,7 +410,7 @@ def _reshape_for_qk_norm(x: torch.Tensor, head_dim: int) -> torch.Tensor:
 
     if (
         _is_cuda
-        and get_global_server_args().cuda_graph_settings[Phase.PREFILL]["tc_compiler"]
+        and get_global_server_args().cuda_graph_config[Phase.PREFILL]["tc_compiler"]
         == "inductor"
     ):
         return x.view(*x.shape[:-1], -1, head_dim)
@@ -453,7 +453,7 @@ def apply_qk_norm(
         and allow_inplace  # TODO(dark): this can be relaxed if needed
         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
-        and get_global_server_args().cuda_graph_settings[Phase.PREFILL]["tc_compiler"]
+        and get_global_server_args().cuda_graph_config[Phase.PREFILL]["tc_compiler"]
         != "inductor"  # let inductor fuse QK norm
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
