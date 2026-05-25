@@ -3843,7 +3843,7 @@ def run_scheduler_process(
         parent_process.send_signal(signal.SIGQUIT)
         # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands
         # of NCCL/TCPStore tracebacks before they finally die.
-        if envs.SGLANG_FAIL_FAST_SCHEDULER.get():
+        if envs.SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION.get():
             try:
                 os.killpg(os.getpgrp(), signal.SIGKILL)
             except Exception:
