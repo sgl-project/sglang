@@ -935,15 +935,19 @@ class _DsaStrategy(_StackStrategy):
 
 class _PlainKvStrategy(_StackStrategy):
     def matches(self, kvcache, components):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
         from sglang.srt.mem_cache.memory_pool import (
             DSATokenToKVPool,
             HybridLinearKVPool,
         )
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
-        # Hybrid kvcache types are misconfigured if they show up with only
-        # {FULL}; let the dispatcher fall through and raise instead.
-        if isinstance(kvcache, (SWAKVPool, HybridLinearKVPool, DSATokenToKVPool)):
+        if isinstance(
+            kvcache,
+            (SWAKVPool, HybridLinearKVPool, DSATokenToKVPool, DeepSeekV4TokenToKVPool),
+        ):
             return False
         return components == {ComponentType.FULL}
 

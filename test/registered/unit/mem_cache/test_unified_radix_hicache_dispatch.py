@@ -80,12 +80,16 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         self.assertIsInstance(strategy, _PlainKvStrategy)
 
     def test_unknown_combo_raises(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
-        kvcache = _mock_kvcache(SWAKVPool)
-        with self.assertRaises(AssertionError) as cm:
-            _select_strategy(kvcache, {FULL})
-        self.assertIn("No matching HiCache strategy", str(cm.exception))
+        for cls in (SWAKVPool, DeepSeekV4TokenToKVPool):
+            kvcache = _mock_kvcache(cls)
+            with self.assertRaises(AssertionError) as cm:
+                _select_strategy(kvcache, {FULL})
+            self.assertIn("No matching HiCache strategy", str(cm.exception))
 
     def test_register_custom_strategy_takes_precedence(self):
         class _CustomStrategy(_StackStrategy):
