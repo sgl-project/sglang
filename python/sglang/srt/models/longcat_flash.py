@@ -342,6 +342,7 @@ class LongcatFlashDecoderLayer(nn.Module):
         prefix: str = "",
         alt_stream: Optional[Any] = None,
         moe_alt_stream: Optional[Any] = None,
+        first_attn_finished: Optional[Any] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -349,6 +350,7 @@ class LongcatFlashDecoderLayer(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.moe_alt_stream = moe_alt_stream
+        self.first_attn_finished = first_attn_finished
         self.device_module = torch.get_device_module()
         self.is_first_layer = layer_id == 0
         self.is_last_layer = layer_id == config.num_hidden_layers - 1
@@ -499,8 +501,8 @@ class LongcatFlashDecoderLayer(nn.Module):
             )
 
             main_stream = self.device_module.current_stream()
-            first_attn_finished = self.device_module.Event()
-            first_attn_finished.record(main_stream)
+            assert self.first_attn_finished is not None
+            self.first_attn_finished.record(main_stream)
 
             mlp_hidden_states, residual = self.forward_mlp(
                 mlp_hidden_states,
@@ -515,16 +517,16 @@ class LongcatFlashDecoderLayer(nn.Module):
                 ]
 
             with self.device_module.stream(self.moe_alt_stream):
-                self.device_module.current_stream().wait_event(first_attn_finished)
+                self.first_attn_finished.wait()
                 moe_hidden_states = self.mlp(hidden_states)
+                moe_hidden_states, moe_residual = (
+                    self.moe_layer_communicator.postprocess_layer(
+                        moe_hidden_states, moe_residual, forward_batch
+                    )
+                )
                 moe_hidden_states.record_stream(main_stream)
 
             main_stream.wait_stream(self.moe_alt_stream)
-            moe_hidden_states, moe_residual = (
-                self.moe_layer_communicator.postprocess_layer(
-                    moe_hidden_states, moe_residual, forward_batch
-                )
-            )
             hidden_states = moe_hidden_states + mlp_hidden_states
         else:
             hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
@@ -630,8 +632,10 @@ class LongcatFlashModel(nn.Module):
         self.alt_stream = device_module.Stream()
         if envs.SGLANG_ENABLE_LONGCAT_DOUBLE_STREAM.get():
             self.moe_alt_stream = device_module.Stream()
+            self.first_attn_finished = device_module.Event()
         else:
             self.moe_alt_stream = None
+            self.first_attn_finished = None
         self.layers = nn.ModuleList(
             [
                 LongcatFlashDecoderLayer(
@@ -641,6 +645,7 @@ class LongcatFlashModel(nn.Module):
                     prefix=add_prefix(f"layers.{layer_id}", prefix),
                     alt_stream=self.alt_stream,
                     moe_alt_stream=self.moe_alt_stream,
+                    first_attn_finished=self.first_attn_finished,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
