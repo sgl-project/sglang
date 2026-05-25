@@ -24,7 +24,6 @@ class TestPCGWithMTP(PCGSpecBase, unittest.TestCase):
         "fp8",
         "--mamba-scheduler-strategy",
         "extra_buffer",
-        "--enable-piecewise-cuda-graph",
         "--speculative-algorithm",
         "NEXTN",
         "--reasoning-parser",

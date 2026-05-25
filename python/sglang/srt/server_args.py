@@ -30,6 +30,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Union
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
+    DeprecatedStoreConstAction,
     DeprecatedStoreTrueAction,
     LoRAPathAction,
 )
@@ -6453,9 +6454,11 @@ class ServerArgs:
         )
         parser.add_argument(
             "--enable-breakable-cuda-graph",
-            action=DeprecatedAction,
-            help="Deprecated. Use --cuda-graph-backend-prefill=breakable instead. "
-            "No-op when passed.",
+            action=DeprecatedStoreConstAction,
+            dest="cuda_graph_backend_prefill",
+            const_value=Backend.BREAKABLE,
+            new_flag="--cuda-graph-backend-prefill=breakable",
+            help="Deprecated alias for --cuda-graph-backend-prefill=breakable.",
         )
         parser.add_argument(
             "--enable-profile-cuda-graph",
@@ -6624,22 +6627,21 @@ class ServerArgs:
         )
         parser.add_argument(
             "--disable-piecewise-cuda-graph",
-            action=DeprecatedAction,
-            help="Deprecated. Use --cuda-graph-backend-prefill=disabled instead. "
-            "No-op when passed.",
-        )
-        parser.add_argument(
-            "--enable-piecewise-cuda-graph",
-            action=DeprecatedAction,
-            help="Deprecated and no-op. Piecewise cuda graph is selected via "
-            "--cuda-graph-backend-prefill=tc_piecewise.",
+            action=DeprecatedStoreConstAction,
+            dest="cuda_graph_backend_prefill",
+            const_value=Backend.DISABLED,
+            new_flag="--cuda-graph-backend-prefill=disabled",
+            help="Deprecated alias for --cuda-graph-backend-prefill=disabled.",
         )
         parser.add_argument(
             "--enforce-piecewise-cuda-graph",
-            action=DeprecatedAction,
-            help="Deprecated. The auto-disable cascade is now skipped automatically "
-            "whenever the user explicitly sets the prefill backend "
-            "(--cuda-graph-backend-prefill or --cuda-graph-config).",
+            action=DeprecatedStoreConstAction,
+            dest="cuda_graph_backend_prefill",
+            const_value=Backend.TC_PIECEWISE,
+            new_flag="--cuda-graph-backend-prefill=tc_piecewise",
+            help="Deprecated alias for --cuda-graph-backend-prefill=tc_piecewise. "
+            "Explicitly setting the prefill backend now skips the auto-disable "
+            "cascade automatically.",
         )
         parser.add_argument(
             "--piecewise-cuda-graph-tokens",
