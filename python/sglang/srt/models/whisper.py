@@ -214,10 +214,7 @@ class WhisperEncoderLayer(torch.nn.Module):
         hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(hidden_states, forward_batch)
 
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.final_layer_norm(hidden_states)
+        hidden_states, residual = self.final_layer_norm(hidden_states, residual)
         hidden_states, _ = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
 
@@ -288,17 +285,15 @@ class WhisperDecoderLayer(torch.nn.Module):
         residual = decoder_hidden_states
         decoder_hidden_states = self.self_attn_layer_norm(decoder_hidden_states)
         decoder_hidden_states = self.self_attn(decoder_hidden_states, forward_batch)
-        decoder_hidden_states = residual + decoder_hidden_states
-
-        residual = decoder_hidden_states
-        decoder_hidden_states = self.encoder_attn_layer_norm(decoder_hidden_states)
+        decoder_hidden_states, residual = self.encoder_attn_layer_norm(
+            decoder_hidden_states, residual
+        )
         decoder_hidden_states = self.encoder_attn(
             decoder_hidden_states, forward_batch, encoder_hidden_states
         )
-        decoder_hidden_states = residual + decoder_hidden_states
-
-        residual = decoder_hidden_states
-        decoder_hidden_states = self.final_layer_norm(decoder_hidden_states)
+        decoder_hidden_states, residual = self.final_layer_norm(
+            decoder_hidden_states, residual
+        )
         decoder_hidden_states, _ = self.fc1(decoder_hidden_states)
         decoder_hidden_states = self.activation_fn(decoder_hidden_states)
         decoder_hidden_states, _ = self.fc2(decoder_hidden_states)
