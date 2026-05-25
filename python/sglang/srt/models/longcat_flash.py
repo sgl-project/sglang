@@ -333,27 +333,11 @@ class LongcatFlashMoE(nn.Module):
         ]
 
 
-class _Singleton(type):
-    def __call__(cls, *args, **kwargs):
-        if not hasattr(cls, "_instance"):
-            cls._instance = super().__call__(*args, **kwargs)
-        return cls._instance
-
-
-class _LongcatDoubleStreamState(metaclass=_Singleton):
+class _LongcatDoubleStreamState:
     def __init__(self):
-        if getattr(self, "_initialized", False):
-            return
-
-        self._initialized = True
         self.main_stream = None
         self.first_attn_finished = None
         self.moe_alt_stream = None
-
-        if get_global_server_args().enable_longcat_double_stream:
-            device_module = torch.get_device_module()
-            self.first_attn_finished = device_module.Event()
-            self.moe_alt_stream = device_module.Stream()
 
 
 class LongcatFlashDecoderLayer(nn.Module):
@@ -365,12 +349,14 @@ class LongcatFlashDecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[Any] = None,
+        double_stream_state: Optional[_LongcatDoubleStreamState] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.double_stream_state = double_stream_state
         self.device_module = torch.get_device_module()
         self.is_first_layer = layer_id == 0
         self.is_last_layer = layer_id == config.num_hidden_layers - 1
@@ -491,18 +477,13 @@ class LongcatFlashDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        double_stream_state = (
-            _LongcatDoubleStreamState()
-            if get_global_server_args().enable_longcat_double_stream
-            else None
-        )
         enable_double_stream = (
-            double_stream_state is not None
-            and double_stream_state.moe_alt_stream is not None
+            self.double_stream_state is not None
+            and self.double_stream_state.moe_alt_stream is not None
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
-        if enable_double_stream and double_stream_state.main_stream is None:
-            double_stream_state.main_stream = torch.get_device_module().current_stream()
+        if enable_double_stream and self.double_stream_state.main_stream is None:
+            self.double_stream_state.main_stream = torch.get_device_module().current_stream()
 
         # first_attn
         if get_moe_a2a_backend().is_deepep() and not self.is_first_layer:
@@ -529,9 +510,9 @@ class LongcatFlashDecoderLayer(nn.Module):
             )
 
             device_module = torch.get_device_module()
-            double_stream_state.first_attn_finished = device_module.Event()
-            double_stream_state.main_stream.record_event(
-                double_stream_state.first_attn_finished
+            self.double_stream_state.first_attn_finished = device_module.Event()
+            self.double_stream_state.main_stream.record_event(
+                self.double_stream_state.first_attn_finished
             )
 
             mlp_hidden_states, residual = self.forward_mlp(
@@ -546,9 +527,9 @@ class LongcatFlashDecoderLayer(nn.Module):
                     self.attn_tp_rank
                 ]
 
-            with self.device_module.stream(double_stream_state.moe_alt_stream):
-                double_stream_state.moe_alt_stream.wait_event(
-                    double_stream_state.first_attn_finished
+            with self.device_module.stream(self.double_stream_state.moe_alt_stream):
+                self.double_stream_state.moe_alt_stream.wait_event(
+                    self.double_stream_state.first_attn_finished
                 )
                 moe_hidden_states = self.mlp(hidden_states)
                 moe_hidden_states, moe_residual = (
@@ -556,9 +537,11 @@ class LongcatFlashDecoderLayer(nn.Module):
                         moe_hidden_states, moe_residual, forward_batch
                     )
                 )
-                moe_hidden_states.record_stream(double_stream_state.main_stream)
+                moe_hidden_states.record_stream(self.double_stream_state.main_stream)
 
-            double_stream_state.main_stream.wait_stream(double_stream_state.moe_alt_stream)
+            self.double_stream_state.main_stream.wait_stream(
+                self.double_stream_state.moe_alt_stream
+            )
             hidden_states = moe_hidden_states + mlp_hidden_states
         else:
             hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
@@ -663,7 +646,11 @@ class LongcatFlashModel(nn.Module):
         device_module = torch.get_device_module()
         self.alt_stream = device_module.Stream()
         if get_global_server_args().enable_longcat_double_stream:
-            _LongcatDoubleStreamState()
+            self.double_stream_state = _LongcatDoubleStreamState()
+            self.double_stream_state.first_attn_finished = device_module.Event()
+            self.double_stream_state.moe_alt_stream = device_module.Stream()
+        else:
+            self.double_stream_state = None
         self.layers = nn.ModuleList(
             [
                 LongcatFlashDecoderLayer(
@@ -672,6 +659,7 @@ class LongcatFlashModel(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{layer_id}", prefix),
                     alt_stream=self.alt_stream,
+                    double_stream_state=self.double_stream_state,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
