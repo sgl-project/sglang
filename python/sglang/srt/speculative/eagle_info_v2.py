@@ -59,6 +59,9 @@ if is_cuda() or is_musa():
         tree_speculative_sampling_target_only,
     )
 
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.reject_sampling import chain_speculative_sampling_triton
+
 
 @triton.jit
 def assign_draft_cache_locs_page_size_1(
@@ -411,7 +414,11 @@ class EagleVerifyInputV2Mixin:
                 ),
             )
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
-            draft_probs = torch.zeros_like(target_probs)
+            draft_probs = (
+                torch.zeros_like(target_probs)
+                if not get_global_server_args().speculative_use_rs
+                else self.draft_probs
+            )
 
             # coins for rejection sampling
             coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
@@ -420,7 +427,12 @@ class EagleVerifyInputV2Mixin:
                 (bs,), dtype=torch.float32, device=device
             )
 
-            tree_speculative_sampling_target_only(
+            sampling_fn = (
+                chain_speculative_sampling_triton
+                if get_global_server_args().speculative_use_rs
+                else tree_speculative_sampling_target_only
+            )
+            sampling_fn(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
                 accept_token_num=num_correct_drafts,  # mutable
