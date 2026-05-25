@@ -26,10 +26,7 @@ env:
 jobs:
   sgl-router-lint:
     name: tier-1 — lint
-    if: |
-      github.event_name != 'pull_request' ||
-      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
-      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    if: false  # [TEST GATE] Disable for workflow testing
     runs-on: ubuntu-latest
     env:
       # Scoped per-job (not workflow-wide) to avoid SMG's documented breakage

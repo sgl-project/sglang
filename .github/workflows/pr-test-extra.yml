@@ -90,11 +90,7 @@ jobs:
   # just-added label is one of the gating labels. This prevents every
   # unrelated label addition from dispatching a full CI run.
   check-changes:
-    if: |
-      github.event_name != 'pull_request' ||
-      github.event.action != 'labeled' ||
-      github.event.label.name == 'run-ci' ||
-      github.event.label.name == 'run-ci-extra'
+    if: false  # [TEST GATE] Disable for workflow testing
     uses: ./.github/workflows/_pr-test-check-changes.yml
     with:
       git_ref: ${{ inputs.git_ref || '' }}

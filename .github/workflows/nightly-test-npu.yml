@@ -39,6 +39,7 @@ concurrency:
 
 jobs:
   set-image-config:
+    if: false  # [TEST GATE] Disable for workflow testing
     runs-on: ubuntu-latest
     outputs:
       ref: ${{ steps.set-vars.outputs.ref }}

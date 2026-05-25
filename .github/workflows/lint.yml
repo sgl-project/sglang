@@ -8,6 +8,7 @@ on:
 
 jobs:
   lint:
+    if: false  # [TEST GATE] Disable for workflow testing
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

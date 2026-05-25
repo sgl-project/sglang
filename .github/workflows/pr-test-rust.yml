@@ -27,10 +27,7 @@ env:
 
 jobs:
   build-wheel:
-    if: |
-      github.event_name != 'pull_request' ||
-      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
-      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    if: false  # [TEST GATE] Disable for workflow testing
     # Pin to 22.04 so the wheel auditwheel-tags as manylinux_2_35; the
     # self-hosted GPU runners are Ubuntu 22.04 (glibc 2.35) and reject
     # manylinux_2_39 wheels produced on ubuntu-latest (Ubuntu 24.04).

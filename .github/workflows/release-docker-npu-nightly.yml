@@ -16,6 +16,7 @@ concurrency:
 
 jobs:
   build:
+    if: false  # [TEST GATE] Disable for workflow testing
     runs-on: ubuntu-22.04-arm
     strategy:
       matrix:

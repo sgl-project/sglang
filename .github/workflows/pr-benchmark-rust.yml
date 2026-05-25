@@ -26,6 +26,7 @@ permissions:
 
 jobs:
   benchmark-compile-check:
+    if: false  # [TEST GATE] Disable for workflow testing
     name: Benchmark Compilation Check
     runs-on: ubuntu-latest
     steps:

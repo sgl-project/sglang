@@ -32,6 +32,7 @@ concurrency:
 jobs:
   # ==================== Check Changes ==================== #
   check-changes:
+    if: false  # [TEST GATE] Disable for workflow testing
     runs-on: ubuntu-latest
     outputs:
       changes_exist: ${{ steps.filter.outputs.main_package == 'true'

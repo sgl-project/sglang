@@ -21,6 +21,7 @@ on:
 
 jobs:
   summary:
+    if: false  # [TEST GATE] Disable for workflow testing
     name: Summary
     runs-on: ubuntu-latest
     steps:

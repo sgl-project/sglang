@@ -108,7 +108,7 @@ concurrency:
 
 jobs:
   call-gate:
-    if: github.event_name != 'schedule'
+    if: false  # [TEST GATE] Disable for workflow testing
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
   check-changes:

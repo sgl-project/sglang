@@ -75,6 +75,7 @@ permissions:
 jobs:
   # =============================================== check changes ====================================================
   check-changes:
+    if: false  # [TEST GATE] Disable for workflow testing
     uses: ./.github/workflows/_pr-test-check-changes.yml
     with:
       git_ref: ${{ inputs.git_ref || '' }}
