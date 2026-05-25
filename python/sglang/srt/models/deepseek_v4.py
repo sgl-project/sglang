@@ -1230,14 +1230,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             _is_gfx95_supported,
         )
         if fused_mhc is not None:
-            residual, hidden_states, post, comb = fused_mhc
+            residual, hidden_states, post, comb, norm_fused = fused_mhc
         else:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
             residual = hidden_states  # [n, hc, d]
-            hidden_states, post, comb = self.hc_pre(
-                hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+            hidden_states, post, comb, norm_fused = self.hc_pre(
+                hidden_states,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                norm=self.post_attention_layernorm,
             )  # -> [n, d]
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        if not norm_fused:
+            hidden_states = self.post_attention_layernorm(hidden_states)
 
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (

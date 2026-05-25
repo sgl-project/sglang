@@ -99,7 +99,7 @@ def try_fused_hc_post_pre(
     hc_post_mult: float,
     sinkhorn_iters: int,
     is_gfx95_supported: bool,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]]:
     global _TRITON_MHC_POST_PRE_RUNTIME_DISABLED
 
     if (
@@ -155,4 +155,4 @@ def try_fused_hc_post_pre(
         _TRITON_MHC_POST_PRE_RUNTIME_DISABLED = True
         return None
 
-    return new_residual, layer_input_out, bufs["h_post"], bufs["h_res"]
+    return new_residual, layer_input_out, bufs["h_post"], bufs["h_res"], False
