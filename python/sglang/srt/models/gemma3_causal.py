@@ -582,7 +582,11 @@ class Gemma3TextModel(PreTrainedModel):
         global_config.rope_parameters = {
             "rope_theta": global_theta,
             "factor": config.rope_parameters["full_attention"].get("factor", 1.0),
-            "rope_type": "linear" if config.rope_parameters["full_attention"].get("factor") is not None else "default",
+            "rope_type": (
+                "linear"
+                if config.rope_parameters["full_attention"].get("factor") is not None
+                else "default"
+            ),
         }
         self.rotary_emb = Gemma3RotaryEmbedding(config=global_config)
         self.gradient_checkpointing = False
