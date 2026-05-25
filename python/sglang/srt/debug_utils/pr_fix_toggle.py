@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Dict
 
+from environ import envs
+
 from sglang.srt.debug_utils.source_patcher import apply_patches_from_config
 
 _PR_REVERT_YAML_25015 = """
@@ -55,7 +57,12 @@ _PR_FIX_REVERT_YAML: Dict[int, str] = {
 }
 
 
-def revert_pr_fix(pr_num: int) -> None:
+def maybe_revert_pr_fix() -> None:
+    if pr_num := envs.SGLANG_DEBUG_REVERT_PR.get():
+        _revert_pr_fix(pr_num)
+
+
+def _revert_pr_fix(pr_num: int) -> None:
     if pr_num not in _PR_FIX_REVERT_YAML:
         raise NotImplementedError(
             f"PR #{pr_num} revert is not registered; "

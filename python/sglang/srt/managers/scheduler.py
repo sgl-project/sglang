@@ -41,7 +41,7 @@ from torch.distributed import barrier
 from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.constrained.grammar_manager import GrammarManager
-from sglang.srt.debug_utils.pr_fix_toggle import revert_pr_fix
+from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -703,8 +703,7 @@ class Scheduler(
             abort_request=self.abort_request,
         )
 
-        if pr_num := envs.SGLANG_DEBUG_REVERT_PR.get():
-            revert_pr_fix(pr_num)
+        maybe_revert_pr_fix()
 
         self.is_initializing = False
 
