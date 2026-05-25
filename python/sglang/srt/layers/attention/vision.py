@@ -468,9 +468,7 @@ class VisionFlash3Attention(nn.Module):
             ) * HOPPER_TMA_ALIGN_BYTE
 
             # Lazy buffer allocation to avoid repeated CUDA allocation
-            if (
-                not hasattr(self, "q_quant_pad")
-            ):  
+            if not hasattr(self, "q_quant_pad"):
                 self.q_quant_pad = torch.empty(
                     (RAW_VISION_TOKEN_MAX_NUM, q.shape[1], aligned_headsize),
                     dtype=torch.float8_e4m3fn,
@@ -489,7 +487,10 @@ class VisionFlash3Attention(nn.Module):
 
             # [NOTE] exceed currently buffer size will lead reallocation and if during cuda-graph capture, will raise error.
             # for vit cuagraph, we should capture graph from large size to small size
-            if hasattr(self, "q_quant_pad") and ori_shape[0] > self.q_quant_pad.shape[0]:
+            if (
+                hasattr(self, "q_quant_pad")
+                and ori_shape[0] > self.q_quant_pad.shape[0]
+            ):
                 self.q_quant_pad = torch.empty(
                     (ori_shape[0], q.shape[1], aligned_headsize),
                     dtype=torch.float8_e4m3fn,
@@ -506,9 +507,7 @@ class VisionFlash3Attention(nn.Module):
                     device="cuda",
                 )
 
-            if (
-                not hasattr(self, "scale_q_raw")
-            ):
+            if not hasattr(self, "scale_q_raw"):
                 self.scale_q_raw = torch.empty((1), device="cuda", dtype=torch.float32)
                 self.scale_k_raw = torch.empty((1), device="cuda", dtype=torch.float32)
                 self.scale_v_raw = torch.empty((1), device="cuda", dtype=torch.float32)
@@ -543,7 +542,6 @@ class VisionFlash3Attention(nn.Module):
             scale_v = scale_v.expand(cu_seqlens_tensor.size(0) - 1, v.shape[1])
             # use FP8 attention, should use aligned_headsize to recompute softmaxscale
             attn_softmax_scale = aligned_headsize**-0.5
-            
 
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get() and isinstance(cu_seqlens, list):
             max_seqlen = cu_seqlens[1]
