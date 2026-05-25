@@ -426,7 +426,6 @@ def cp_attn_forward_extend(
     where only these four CP-varying parameters differ between halves.
     All other backend-specific args should be captured in the closure.
     """
-    del device  # cu_seqlens tensors are precomputed on CUDA in metadata.
     cp_meta = forward_batch.attn_cp_metadata
 
     q_prev = q[: cp_meta.total_q_prev_tokens]
