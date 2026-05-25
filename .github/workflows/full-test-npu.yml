@@ -155,6 +155,7 @@ jobs:
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
+          TRANSFORMERS_VERBOSITY: "error"
         run: |
           # speed up by using infra cache services
           pip install sglang_router
@@ -217,6 +218,7 @@ jobs:
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
+          TRANSFORMERS_VERBOSITY: "error"
         run: |
           pip install sglang_router
           hf download lmms-lab/MMMU --repo-type dataset
@@ -278,6 +280,7 @@ jobs:
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
+          TRANSFORMERS_VERBOSITY: "error"
         run: |
           pip install sglang_router
           hf download lmms-lab/MMMU --repo-type dataset
@@ -339,6 +342,7 @@ jobs:
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
+          TRANSFORMERS_VERBOSITY: "error"
         run: |
           pip install sglang_router
           hf download lmms-lab/MMMU --repo-type dataset
@@ -400,6 +404,7 @@ jobs:
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
+          TRANSFORMERS_VERBOSITY: "error"
         run: |
           pip install sglang_router
           hf download lmms-lab/MMMU --repo-type dataset
@@ -1342,7 +1347,7 @@ jobs:
 
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
-    needs: [ set-image-config, nightly-poc-single-node-tests ]
+    needs: [ set-image-config, nightly-poc-single-node-tests, nightly-poc-multi-node-tests ]
     if: ${{ !cancelled() && (needs.set-image-config.outputs.test_scope == 'all' || needs.set-image-config.outputs.test_scope == 'poc') }}
     strategy:
       fail-fast: false

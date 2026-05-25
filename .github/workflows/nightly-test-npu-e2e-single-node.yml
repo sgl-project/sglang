@@ -60,6 +60,7 @@ jobs:
           SGLANG_USE_MODELSCOPE: true
           HF_ENDPOINT: https://hf-mirror.com
           SGLANG_IS_IN_CI: true
+          TRANSFORMERS_VERBOSITY: "error"
         shell: bash
         run: |
           sglang_source_path=$(pwd)

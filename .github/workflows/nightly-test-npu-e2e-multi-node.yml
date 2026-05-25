@@ -79,6 +79,7 @@ jobs:
         ASCEND_E2E_TEST_CONFIG_PATH: python/sglang/test/ascend/e2e
         SGLANG_USE_MODELSCOPE: true
         HF_ENDPOINT: https://hf-mirror.com
+        TRANSFORMERS_VERBOSITY: "error"
     steps:
       - name: Install dependencies
         run: |
