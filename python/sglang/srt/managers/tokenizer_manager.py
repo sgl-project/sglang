@@ -2133,19 +2133,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def detokenize_top_logprobs_tokens(
         self,
-        token_logprobs_val: List[float],
-        token_logprobs_idx: List[int],
+        token_logprobs_val,
+        token_logprobs_idx,
         decode_to_text: bool,
     ):
         # TODO: The current implementation only batches the detokenization for top-k tokens per single position.
         # We should batch all top-k tokens in all positions.
+        # PD / disaggregated mode runs the sampler with
+        # ``no_copy_to_cpu=True`` (see ``layers/sampler.py``), so each
+        # per-position slot arrives here as ``torch.Tensor`` for both
+        # values and indices rather than ``List[float]`` / ``List[int]``.
+        # Normalize at this boundary -- see #26286 for the cascading
+        # detokenizer SIGQUIT the unnormalized truthiness check caused.
         ret = []
         for i in range(len(token_logprobs_val)):
-            if token_logprobs_val[i]:
+            val_slot = token_logprobs_val[i]
+            idx_slot = token_logprobs_idx[i]
+            if isinstance(val_slot, torch.Tensor):
+                val_slot = val_slot.tolist()
+            if isinstance(idx_slot, torch.Tensor):
+                idx_slot = idx_slot.tolist()
+            if val_slot:
                 ret.append(
-                    self.detokenize_logprob_tokens(
-                        token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
-                    )
+                    self.detokenize_logprob_tokens(val_slot, idx_slot, decode_to_text)
                 )
             else:
                 ret.append(None)
