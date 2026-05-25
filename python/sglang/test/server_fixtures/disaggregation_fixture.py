@@ -1,6 +1,8 @@
 import logging
 import os
 import shlex
+import sys
+import threading
 import time
 import warnings
 from urllib.parse import urlparse
@@ -112,6 +114,42 @@ class PDDisaggregationServerBase(CustomTestCase):
         cls.launch_lb()
 
     @classmethod
+    def _start_process_exit_watcher(cls):
+        # Fail-fast on subprocess death: if prefill/decode/lb exits non-zero,
+        # kill sibling subprocesses and the test runner immediately. Without
+        # this, the eval client sits in its retry loop hitting connection
+        # refused for ~30s-2min before the test finally reports.
+        watched = [
+            ("prefill", cls.process_prefill),
+            ("decode", cls.process_decode),
+            ("lb", cls.process_lb),
+        ]
+
+        def watcher():
+            while True:
+                for name, proc in watched:
+                    if proc is None:
+                        continue
+                    rc = proc.poll()
+                    if rc is not None and rc != 0:
+                        sys.stderr.write(
+                            f"[FIXTURE FAIL-FAST] {name} (pid={proc.pid}) "
+                            f"exited with code {rc}; aborting test runner.\n"
+                        )
+                        sys.stderr.flush()
+                        for sib_name, sib_proc in watched:
+                            if sib_proc is None or sib_proc is proc:
+                                continue
+                            try:
+                                kill_process_tree(sib_proc.pid, wait_timeout=10)
+                            except Exception:
+                                pass
+                        os._exit(rc)
+                time.sleep(0.1)
+
+        threading.Thread(target=watcher, daemon=True, name="PDProcExitWatcher").start()
+
+    @classmethod
     def launch_lb(cls):
         lb_command = [
             "python3",
@@ -131,6 +169,9 @@ class PDDisaggregationServerBase(CustomTestCase):
         print("Starting load balancer:", shlex.join(lb_command))
         cls.process_lb = popen_with_error_check(lb_command)
         cls.wait_server_ready(cls.lb_url + "/health", process=cls.process_lb)
+        # All three subprocesses are up; start the exit watcher so the test
+        # runner dies the moment any of them does.
+        cls._start_process_exit_watcher()
 
     @classmethod
     def wait_server_ready(
