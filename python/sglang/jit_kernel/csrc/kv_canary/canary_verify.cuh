@@ -1,5 +1,3 @@
-// CUDA verify kernel and tvm-ffi entry for the KV cache canary.
-
 #pragma once
 
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
@@ -20,8 +18,6 @@ namespace {
 constexpr uint32_t kVerifyBlockSize = 512;
 constexpr uint32_t kPersistentBlocks = 64;
 
-// Per-launch parameters packed into a single struct so the kernel signature stays manageable. Pointers are
-// raw int64*/int32*/uint8* views of tvm-ffi TensorView::data_ptr() results.
 struct VerifyKernelParams {
   // Canary buffer this launch verifies. Read-only.
   const uint8_t* canary_buf;

@@ -1,15 +1,3 @@
-// Persistent CUDA kernel for the kv_canary plan-entries step.
-//
-//   - 1 thread = 1 verify entry (embarrassingly parallel; no atomics / sync / shmem).
-//   - 1-D grid sized to num_sms * blocks_per_sm; each thread strides over total_verify entries via a
-//     persistent loop. ``total_verify`` is read on-device from verify_offsets_scratch[bs_padded] so the
-//     grid is static and the kernel is cuda-graph friendly.
-//   - Per-thread: binary-search verify_offsets_scratch (len bs_padded+1 <= 4097) to find req_id, then
-//     a few global loads + 3 scatter stores.
-//
-// Byte-equality contract: the (slot, position, prev_slot) triples this kernel writes must match the
-// python reference in ``kv_canary/plan_ref.py`` row-for-row.
-
 #pragma once
 
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
@@ -26,7 +14,6 @@
 
 namespace {
 
-// Per-launch device-side params struct. Passed via __grid_constant__.
 struct PlanEntriesParams {
   // Inputs.
   const int64_t* __restrict__ req_pool_indices;        // [bs_padded] int64
@@ -152,9 +139,6 @@ __global__ void plan_entries_persistent_kernel(
   }
 }
 
-// JIT-callable host launcher. Selects the templated kernel via the HAS_SWA_LUT bool. The persistent grid
-// is sized to ``num_sms * kBlocksPerSm`` blocks of ``kBlockSize`` threads. For the H200 we expect 132
-// SMs which yields 132 * 8 = 1056 blocks of 128 threads = 135,168 persistent threads.
 struct PlanEntriesKernel {
   static constexpr int kBlockSize = 128;
   static constexpr int kBlocksPerSm = 8;

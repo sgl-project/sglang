@@ -1,5 +1,3 @@
-// CUDA write kernel and tvm-ffi entry for the KV cache canary.
-
 #pragma once
 
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
@@ -80,9 +78,7 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
 
   const int64_t seed_slot_idx = p.write_seed_slot_indices[r];
 
-  // Initialize running_prev_hash by advancing the chain from the seed slot — this keeps the first
-  // written slot's stored prev_hash consistent with the chain link the verify kernel will recompute.
-  // seed_slot_idx < 0 anchors on splitmix64(kCanaryChainAnchor).
+  // Initialize running_prev_hash by advancing the chain from the seed slot
   uint64_t running_prev_hash =
       compute_slot_hash(p.canary_buf, p.slot_stride_bytes, static_cast<int64_t>(seed_slot_idx));
 
@@ -99,19 +95,18 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
   for (int64_t entry_offset = 0; entry_offset < entry_count; ++entry_offset) {
     const int64_t entry_idx = entry_start + entry_offset;
     const int64_t slot = p.out_cache_loc[entry_idx];
+
     if (slot < 0) {
       continue;
     }
     ++entries_written;
+
     const int64_t token = p.input_ids[entry_idx];
     const int64_t position = p.positions[entry_idx];
 
     const uint64_t real_kv_hash_u64 = real_kv_fold_sources(p.sources, p.num_sources, slot, p.real_kv_hash_mode);
     const int64_t real_kv_hash = static_cast<int64_t>(real_kv_hash_u64);
 
-    // Write-time input verification: compare actual (token, position) against caller-supplied expected
-    // values; mismatch records a single violation row carrying both bits OR'd together. Chain still
-    // advances on the actual (token, position) below so a downstream verify won't cascade.
     if (p.enable_assert_inputs) {
       const int64_t expected_token = p.expected_input_tokens[entry_idx];
       const int64_t expected_position = p.expected_input_positions[entry_idx];

@@ -1,11 +1,3 @@
-// Shared device helpers for the KV cache canary verify + write kernels.
-//
-// Real-KV source ABI (tvm-ffi cannot pass tuple[RealKvSource, ...] directly): the host wrapper unpacks the
-// tuple into a fixed-size array of 4 sources and passes 4 separate uint8 tensors plus a single int32 array
-// of (page_size, num_bytes_per_token, read_bytes) triplets of length 12 (4 sources x 3 fields). The host
-// also passes ``num_sources`` (count of valid leading entries); the kernel iterates only
-// ``sources[0..num_sources)`` and never reads the padding tail.
-
 #pragma once
 
 #include <sgl_kernel/utils.cuh>  // For SGL_DEVICE
@@ -24,17 +16,12 @@ struct RealKvSourceHandle {
   int32_t read_bytes;
 };
 
-// Standard splitmix64 finalizer. Bit-equivalent to the Python splitmix64 in
-// kv_canary/verify_ref.py.
 SGL_DEVICE uint64_t splitmix64(uint64_t x) {
   x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
   x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
   return x ^ (x >> 31);
 }
 
-// 3-arg chain step: nested splitmix64 of the three uint64 inputs. Each input is folded into the running
-// accumulator via `acc = splitmix64(acc ^ next)`, so order is significant and a pair of equal inputs no
-// longer self-cancels. Matches the Python helper splitmix64_mix3 in kv_canary/consts.py.
 SGL_DEVICE uint64_t splitmix64_mix3(uint64_t a, uint64_t b, uint64_t c) {
   uint64_t h = splitmix64(a);
   h = splitmix64(h ^ b);
@@ -50,11 +37,6 @@ SGL_DEVICE uint64_t splitmix64_mix3(uint64_t a, uint64_t b, uint64_t c) {
 //
 // row_stride_bytes is the dim-1 size of the underlying tensor in bytes (which may exceed
 // page_size * num_bytes_per_token; trailing bytes are skipped).
-//
-// 16B-alignment precondition (enforced host-side in kv_canary/verify.py::RealKvSource.__post_init__):
-// num_bytes_per_token, row_stride_bytes, and read_bytes are all multiples of 16, and byte_offset is always a
-// multiple of 16. Combined with PyTorch's CUDA-allocator alignment (>= 256B) of src.tensor, every flat_index
-// computed here is 16B-aligned, so the uint4 load below is a single coalesced LDG.E.128.
 SGL_DEVICE void real_kv_load_uint4(
     const RealKvSourceHandle& src, int64_t slot_idx, int64_t byte_offset, uint64_t& word_lo, uint64_t& word_hi) {
   const int64_t row = slot_idx / src.page_size;
@@ -66,15 +48,6 @@ SGL_DEVICE void real_kv_load_uint4(
   word_hi = static_cast<uint64_t>(vec.z) | (static_cast<uint64_t>(vec.w) << 32);
 }
 
-// Fold one source's read_bytes into a uint64 hash, mode-dispatching.
-//
-// PARTIAL mode: pack exactly the first 16 bytes (one 16B chunk = two 8B little-endian words) and
-// splitmix64-fold them. ALL mode: pack every 16 bytes little-endian and splitmix64-fold iteratively.
-//
-// Loads run in 16B (uint4) chunks; the host-side __post_init__ guarantees read_bytes % 16 == 0 so no
-// tail-padding logic is needed inside the kernel. With the 16B-aligned contract, read_bytes is always
-// >= 16 when non-zero, so PARTIAL collapses to a constant 16B prefix. Output is byte-equal to the
-// Python ref helper _splitmix64_fold_bytes_scalar, which loops over 8B little-endian words.
 SGL_DEVICE uint64_t real_kv_fold_one_source(const RealKvSourceHandle& src, int64_t slot_idx, RealKvHashMode mode) {
   const int64_t effective_read_bytes = (mode == RealKvHashMode::kPartial) ? static_cast<int64_t>(16) : src.read_bytes;
   uint64_t acc = 0ULL;
@@ -105,9 +78,6 @@ real_kv_fold_sources(const RealKvSourceHandle* sources, int num_sources, int64_t
   return acc;
 }
 
-// Kernel-wide sink for violation rows. ``ring`` / ``write_index`` are device pointers, ``ring_capacity``
-// caps how many rows physically land in the ring (overflow rows bump ``write_index`` but are not stored),
-// and ``kernel_kind`` is stamped into every row so a host observer can attribute it to its source launch.
 struct ViolationSink {
   int64_t* __restrict__ ring;
   int32_t* __restrict__ write_index;
@@ -115,10 +85,6 @@ struct ViolationSink {
   int32_t kernel_kind;
 };
 
-// One violation row's payload. Field order is meaning-only (not the on-ring column order — that is set by
-// kViolationField* in consts.cuh). ``expected_aux`` is reason-agnostic: verify launches pass
-// expected_chain_hash, write launches pass expected_position. ``stored_chain_hash`` carries
-// running_prev_hash on the write path.
 struct ViolationRow {
   int64_t slot_idx;
   int64_t position;
@@ -129,11 +95,6 @@ struct ViolationRow {
   int64_t fail_reason_bits;
 };
 
-// Append a violation row to the sink's ring (fill-once) and bump the monotonic counter unconditionally.
-//
-// atomicAdd on ``sink.write_index`` serializes arrivals; only writers with idx < ring_capacity store a row.
-// The __threadfence_system after the store guarantees any host observer that reads the post-increment
-// counter also sees the committed row.
 SGL_DEVICE void record_violation(const ViolationSink& sink, const ViolationRow& row) {
   const int32_t seq = atomicAdd(sink.write_index, 1);
   if (seq < sink.ring_capacity) {
@@ -161,14 +122,6 @@ canary_store_field(uint8_t* buf, int64_t slot_idx, int64_t slot_stride_bytes, in
   p[field] = value;
 }
 
-// Compute the chain-step hash of ``source_slot_idx``: fold (token, position, prev_hash) of the slot
-// through splitmix64_mix3. real_kv_hash is intentionally excluded so radix prefix sharing (which
-// legally remaps to a slot with different KV bytes) doesn't break the chain — standalone
-// real_kv_hash field checks cover corruption there.
-//
-// ``source_slot_idx < 0`` signals "no predecessor"; the chain anchors on splitmix64(kCanaryChainAnchor).
-// Shared by the verify path (recompute expected prev_hash from a slot's predecessor) and the write path
-// (seed running_prev_hash from a chain-prefix slot).
 SGL_DEVICE uint64_t compute_slot_hash(const uint8_t* canary_buf, int64_t slot_stride_bytes, int64_t source_slot_idx) {
   if (source_slot_idx < 0) {
     return splitmix64(kCanaryChainAnchor);
