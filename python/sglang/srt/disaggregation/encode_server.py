@@ -1350,7 +1350,7 @@ class MMEncoder:
     async def batch_encode(
         self, requests: List[dict], modality: Modality
     ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
-        """Cross-request encoder fusion (image/audio). Skips local mm_cache."""
+        """Cross-request encoder fusion (image/audio). No cache path."""
         # items_per_req counts grid entries (post-expansion) so per-request
         # slicing of grid_dim/final_slices stays aligned for processors that
         # expand one leaf into multiple grids (e.g. Kimi-VL/K25 dict-of-images).
@@ -1388,133 +1388,14 @@ class MMEncoder:
                         f"_grid_count_per_leaf."
                     ),
                 )
-            cache = self.mm_global_cache
 
-            if cache is None:
-                final_slices = await self._encode_missing(
-                    mm_feature,
-                    mm_inputs,
-                    list(range(total)),
-                    modality,
-                    get_feat,
-                )
-            else:
-                # Cache path: lookup → encoder forward on miss → prefetch hits →
-                # fallback if prefetch fails. Collectives run once over the
-                # union for TP sync.
-                batch_id = f"batch:{random_uuid()}"
-                # Concat per-request user-supplied hashes; fall back to compute
-                # if any request lacks them.
-                user_hashes: Optional[List] = []
-                for req in requests:
-                    h = req.get("hashes")
-                    if h is None:
-                        user_hashes = None
-                        break
-                    user_hashes.extend(h if isinstance(h, list) else [h])
-
-                # Hashes must be grid-space; a leaf-space list would size-
-                # mismatch rank>0's mask (zeros(total)) and deadlock TP.
-                if user_hashes is not None and len(user_hashes) != total:
-                    return self._batch_set_error(
-                        requests,
-                        modality,
-                        BadRequestError(
-                            f"User-supplied hashes length {len(user_hashes)} "
-                            f"!= grid count {total} for {self.model_type}/"
-                            f"{modality.name}; hashes must be in grid space "
-                            f"(1 per encoder grid entry)."
-                        ),
-                    )
-
-                if self.rank == 0:
-                    mm_hashes = user_hashes or self._calculate_hashes_from_features(
-                        mm_feature, grid_dim, modality
-                    )
-                    mask = torch.tensor(
-                        await cache.batch_is_exist(mm_hashes), dtype=torch.int32
-                    )
-                else:
-                    mm_hashes = None
-                    mask = torch.zeros(total, dtype=torch.int32)
-                if self.server_args.tp_size > 1:
-                    torch.distributed.broadcast(
-                        mask, src=0, group=cache.prefetch_tp_group
-                    )
-                miss, hit = [], []
-                for i, e in enumerate(mask.tolist()):
-                    (hit if e else miss).append(i)
-
-                new_slices = (
-                    await self._encode_missing(
-                        mm_feature, mm_inputs, miss, modality, get_feat
-                    )
-                    if miss
-                    else []
-                )
-
-                status = torch.tensor([1], dtype=torch.int32)
-                if self.rank == 0 and hit:
-                    cache.prefetch(
-                        batch_id,
-                        [mm_hashes[i] for i in hit],
-                        [self.get_num_tokens(grid_dim[i], modality) for i in hit],
-                        modality,
-                    )
-                    try:
-
-                        async def _wait():
-                            while not cache.check_prefetch_progress(batch_id):
-                                await asyncio.sleep(0.005)
-
-                        await asyncio.wait_for(_wait(), timeout=60.0)
-                    except (asyncio.TimeoutError, Exception) as e:
-                        logger.error(
-                            f"Prefetch failed for {batch_id}: {e}; encoder fallback for {len(hit)} items"
-                        )
-                        status[0] = 0
-                if self.server_args.tp_size > 1:
-                    torch.distributed.broadcast(
-                        status, src=0, group=cache.prefetch_tp_group
-                    )
-
-                fallback = (
-                    await self._encode_missing(
-                        mm_feature, mm_inputs, hit, modality, get_feat
-                    )
-                    if status.item() == 0 and hit
-                    else None
-                )
-
-                if self.rank != 0:
-                    if self.profiler is not None:
-                        for _ in requests:
-                            self.profiler.step()
-                    return [(0, 0, 0, None, None) for _ in requests]
-
-                final_slices = [None] * total
-                for i, idx in enumerate(miss):
-                    final_slices[idx] = new_slices[i]
-                if hit:
-                    if status.item() == 1:
-                        cached = cache.get_embeddings([mm_hashes[i] for i in hit])
-                        for i, idx in enumerate(hit):
-                            final_slices[idx] = cached[i]
-                    elif fallback is not None:
-                        for i, idx in enumerate(hit):
-                            final_slices[idx] = fallback[i]
-
-                new_hashes = [mm_hashes[i] for i in miss]
-                new_data = list(new_slices)
-                if fallback is not None:
-                    new_hashes += [mm_hashes[i] for i in hit]
-                    new_data += list(fallback)
-                if new_hashes:
-                    task = asyncio.create_task(
-                        asyncio.to_thread(cache.insert_batch, new_hashes, new_data)
-                    )
-                    self.background_tasks.add(task)
-                    task.add_done_callback(self.background_tasks.discard)
+            final_slices = await self._encode_missing(
+                mm_feature,
+                mm_inputs,
+                list(range(total)),
+                modality,
+                get_feat,
+            )
 
             if self.profiler is not None:
                 for _ in requests:
