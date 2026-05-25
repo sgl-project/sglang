@@ -38,6 +38,13 @@ class _SingleForwardPhase(IntEnum):
     AFTER_POST_MAYBE_IN = 3
 
 
+def _torch_reduce_minimum(tensors: list[torch.Tensor]) -> torch.Tensor:
+    out = tensors[0]
+    for t in tensors[1:]:
+        out = torch.minimum(out, t)
+    return out
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _PreOpsMaybeInsideGraphOutput:
     verify_plans: tuple[VerifyPlan, ...]
@@ -244,9 +251,9 @@ class SingleForwardManager:
                 input_check_mode=input_check_mode,
             )
 
-        verify_plan_enable_combined = pre_ops_output.verify_plans[0].enable
-        for vp in pre_ops_output.verify_plans[1:]:
-            verify_plan_enable_combined = torch.minimum(verify_plan_enable_combined, vp.enable)
+        verify_plan_enable_combined = _torch_reduce_minimum(
+            [x.enable for x in pre_ops_output.verify_plans]
+        )
         self._output_buffer.copy_from(
             verify_plan_enable=verify_plan_enable_combined,
             kernel_run_counters=self._device_state.kernel_run_counters,
