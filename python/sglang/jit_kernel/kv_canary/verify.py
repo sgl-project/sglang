@@ -192,23 +192,22 @@ class VerifyPlan:
 
     @classmethod
     def allocate(cls, *, verify_capacity: int, device: torch.device) -> "VerifyPlan":
-        """Allocate a fresh VerifyPlan, all zeros except enable which defaults to 1 (run verify)."""
         if verify_capacity <= 0:
             raise ValueError(
                 f"kv-canary: VerifyPlan verify_capacity must be positive, got {verify_capacity}"
             )
         return cls(
-            verify_slot_indices=torch.zeros(
+            verify_slot_indices=torch.empty(
                 verify_capacity, dtype=torch.int64, device=device
             ),
-            verify_positions=torch.zeros(
+            verify_positions=torch.empty(
                 verify_capacity, dtype=torch.int64, device=device
             ),
-            verify_prev_slot_indices=torch.zeros(
+            verify_prev_slot_indices=torch.empty(
                 verify_capacity, dtype=torch.int64, device=device
             ),
-            verify_num_valid=torch.zeros(1, dtype=torch.int32, device=device),
-            enable=torch.ones(1, dtype=torch.int32, device=device),
+            verify_num_valid=torch.empty(1, dtype=torch.int32, device=device),
+            enable=torch.empty(1, dtype=torch.int32, device=device),
         )
 
 
@@ -362,7 +361,7 @@ def _build_real_kv_source_abi(
         params[i, consts.REAL_KV_SOURCE_FIELD_READ_BYTES] = source.read_bytes
 
     # Pad bufs (never read by the kernel — num_sources bounds the iteration); params already zero.
-    dummy = torch.zeros((1, 1), dtype=torch.uint8, device=device)
+    dummy = torch.empty((1, 1), dtype=torch.uint8, device=device)
     for _ in range(len(real_kv_sources), consts.MAX_REAL_KV_SOURCES):
         padded_bufs.append(dummy)
 
