@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.communicator import get_attn_tp_context
@@ -48,12 +49,21 @@ from sglang.srt.utils import BumpAllocator
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
+_enable_pcg_dsa_eager_fusion = (
+    _is_cuda and envs.SGLANG_ENABLE_PCG_DSA_EAGER_FUSION.get()
+)
+
 if _is_cuda:
     from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
 
     from sglang.srt.compilation.compilation_config import register_split_op
     from sglang.srt.layers.radix_attention import unified_attention_with_output
     from sglang.srt.utils.custom_op import register_custom_op
+
+    def _maybe_register_pcg_dsa_eager_split_op():
+        if _enable_pcg_dsa_eager_fusion:
+            return register_split_op()
+        return lambda op_func: op_func
 
     # TODO(yuwei): remove this wrapper after sgl-kernel registers its own fake/meta impl
     # Wrap bmm_fp8 as a custom op so torch.compile does not trace into
@@ -93,7 +103,7 @@ if _is_cuda:
     @register_custom_op(
         mutates_args=["q_nope_out_buf", "q_nope_out_view", "attn_output_buf"]
     )
-    @register_split_op()
+    @_maybe_register_pcg_dsa_eager_split_op()
     def mla_bmm_then_unified_attention(
         q_nope_t: torch.Tensor,
         w_kc: torch.Tensor,
@@ -187,6 +197,8 @@ class DeepseekMLAForwardMixin:
     def _can_fuse_bmm_into_attention(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
     ) -> bool:
+        if not _enable_pcg_dsa_eager_fusion:
+            return False
         if not (_is_cuda and is_in_piecewise_cuda_graph()):
             return False
         # Keep this fusion on the same non-speculative extend PCG surface as

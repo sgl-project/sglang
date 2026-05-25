@@ -97,11 +97,19 @@ if TYPE_CHECKING:
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
+_enable_pcg_dsa_eager_fusion = (
+    _is_cuda and envs.SGLANG_ENABLE_PCG_DSA_EAGER_FUSION.get()
+)
 
 
 if _is_cuda:
     from sglang.srt.compilation.compilation_config import register_split_op
     from sglang.srt.utils.custom_op import register_custom_op
+
+    def _maybe_register_pcg_dsa_eager_split_op():
+        if _enable_pcg_dsa_eager_fusion:
+            return register_split_op()
+        return lambda op_func: op_func
 
     @register_custom_op(mutates_args=["topk_result"])
     @register_split_op()
@@ -142,7 +150,7 @@ if _is_cuda:
         )
 
     @register_custom_op(mutates_args=["topk_result"])
-    @register_split_op()
+    @_maybe_register_pcg_dsa_eager_split_op()
     def dsa_indexer_pcg_dispatch(
         layer_id: int,
         x: torch.Tensor,
@@ -1442,7 +1450,8 @@ class Indexer(MultiPlatformOp):
             )
 
         if (
-            is_in_piecewise_cuda_graph()
+            _enable_pcg_dsa_eager_fusion
+            and is_in_piecewise_cuda_graph()
             and forward_batch.forward_mode.is_extend_without_speculative()
             and not self.dsa_enable_prefill_cp
             and not isinstance(x, tuple)
