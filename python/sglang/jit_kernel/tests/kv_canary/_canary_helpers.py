@@ -50,6 +50,7 @@ class FakeViolationLog:
     write_index: torch.Tensor
     slot_run_counter: torch.Tensor
     kernel_run_counter: torch.Tensor
+    enable_runtime_assert: torch.Tensor
 
     @classmethod
     def allocate(
@@ -62,6 +63,7 @@ class FakeViolationLog:
             write_index=torch.zeros(1, dtype=torch.int32, device=device),
             slot_run_counter=torch.zeros(1, dtype=torch.int64, device=device),
             kernel_run_counter=torch.zeros(1, dtype=torch.int64, device=device),
+            enable_runtime_assert=torch.ones(1, dtype=torch.int32, device=device),
         )
 
 

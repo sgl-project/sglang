@@ -34,12 +34,9 @@ def launch_canary_write_kernel_torch_reference(
     kernel_run_counter = context.kernel_run_counter
     real_kv_sources = context.real_kv_sources
     real_kv_hash_mode = context.real_kv_hash_mode
-    if context.enable_runtime_assert is None:
-        enable_runtime_assert_value = 1
-    else:
-        enable_runtime_assert_value = int(
-            context.enable_runtime_assert.detach().to("cpu").item()
-        )
+    enable_runtime_assert_value = int(
+        context.enable_runtime_assert.detach().to("cpu").item()
+    )
 
     work_device = torch.device("cpu")
 

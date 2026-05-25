@@ -155,11 +155,11 @@ class VerifyOrWriteContext:
             tuple disables the mixin. Multiple sources are folded sequentially via splitmix64 to produce one
             int64 fingerprint per slot.
         real_kv_hash_mode: RealKvHashMode (OFF / PARTIAL / ALL). Applies uniformly across all sources.
-        enable_runtime_assert: Optional int32 [1] device flag that gates runtime-only asserts in
-            the kernel (currently the write kernel's geometric write_position check). None = treat
-            as always-enabled (kernel sees a dummy tensor whose only value is 1). Production code
+        enable_runtime_assert: int32 [1] device flag that gates runtime-only asserts in the kernel
+            (currently the write kernel's chain-step write_position check). Production code
             (CanaryManager) passes the device-allocated flag which starts at 0 and flips to 1 in
             CanaryManager.mark_init_finished() so cuda-graph capture / warmup don't trip the assert.
+            Tests / bench that want the assert always-on should pass a [1]-int32 tensor of value 1.
     """
 
     canary_buf: torch.Tensor
@@ -170,7 +170,7 @@ class VerifyOrWriteContext:
     kernel_run_counter: torch.Tensor
     real_kv_sources: tuple[RealKvSource, ...]
     real_kv_hash_mode: consts.RealKvHashMode
-    enable_runtime_assert: torch.Tensor | None = None
+    enable_runtime_assert: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

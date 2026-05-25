@@ -80,6 +80,7 @@ def _build_verify_inputs(case: BenchCase, *, device: torch.device) -> Tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor,
     tuple[RealKvSource, ...],
 ]:
     total_entries = _verify_entry_count(case)
@@ -126,6 +127,7 @@ def _build_verify_inputs(case: BenchCase, *, device: torch.device) -> Tuple[
     violation_write_index = torch.zeros(1, dtype=torch.int32, device=device)
     slot_run_counter = torch.zeros(1, dtype=torch.int64, device=device)
     kernel_run_counter = torch.zeros(1, dtype=torch.int64, device=device)
+    enable_runtime_assert = torch.ones(1, dtype=torch.int32, device=device)
 
     real_kv_sources = make_real_kv_sources(
         kind=case.real_kv_kind, num_slots=num_slots, device=device
@@ -138,6 +140,7 @@ def _build_verify_inputs(case: BenchCase, *, device: torch.device) -> Tuple[
         violation_write_index,
         slot_run_counter,
         kernel_run_counter,
+        enable_runtime_assert,
         real_kv_sources,
     )
 
@@ -149,6 +152,7 @@ def _build_context(
     violation_write_index: torch.Tensor,
     slot_run_counter: torch.Tensor,
     kernel_run_counter: torch.Tensor,
+    enable_runtime_assert: torch.Tensor,
     real_kv_sources: tuple[RealKvSource, ...],
     kernel_kind: CanaryLaunchTag,
     hash_mode: consts.RealKvHashMode,
@@ -162,6 +166,7 @@ def _build_context(
         kernel_run_counter=kernel_run_counter,
         real_kv_sources=real_kv_sources,
         real_kv_hash_mode=hash_mode,
+        enable_runtime_assert=enable_runtime_assert,
     )
 
 
@@ -209,6 +214,7 @@ def benchmark(
             violation_write_index,
             slot_run_counter,
             kernel_run_counter,
+            enable_runtime_assert,
             real_kv_sources,
         ) = _build_verify_inputs(case, device=device)
         hash_mode_enum = consts.RealKvHashMode[case.hash_mode.upper()]
@@ -218,6 +224,7 @@ def benchmark(
             violation_write_index=violation_write_index,
             slot_run_counter=slot_run_counter,
             kernel_run_counter=kernel_run_counter,
+            enable_runtime_assert=enable_runtime_assert,
             real_kv_sources=real_kv_sources,
             kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
             hash_mode=hash_mode_enum,
@@ -272,6 +279,7 @@ def benchmark_kernel_kind(
         violation_write_index,
         slot_run_counter,
         kernel_run_counter,
+        enable_runtime_assert,
         real_kv_sources,
     ) = _build_verify_inputs(case, device=device)
     kernel_kind = CanaryLaunchTag[kernel_kind_name]
@@ -282,6 +290,7 @@ def benchmark_kernel_kind(
         violation_write_index=violation_write_index,
         slot_run_counter=slot_run_counter,
         kernel_run_counter=kernel_run_counter,
+        enable_runtime_assert=enable_runtime_assert,
         real_kv_sources=real_kv_sources,
         kernel_kind=kernel_kind,
         hash_mode=hash_mode_enum,
