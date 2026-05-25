@@ -126,13 +126,13 @@ def _should_include_warmup_image(
     server_args: ServerArgs, server_based_warmup: bool
 ) -> bool:
     task_type = server_args.pipeline_config.task_type
+    if not task_type.accepts_image_input():
+        return False
     if task_type.requires_image_input():
         return True
-    if server_based_warmup and task_type == ModelTaskType.TI2V:
-        return True
     if server_based_warmup:
-        return False
-    return task_type.accepts_image_input()
+        return task_type == ModelTaskType.TI2V
+    return True
 
 
 def build_warmup_reqs(
