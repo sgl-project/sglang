@@ -147,11 +147,6 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
       }
     }
 
-    // Chain-step write_position check (single-entry decode shape, post-init, seed present): the only
-    // legitimate transition along the chain is position == running_prev_position + 1. Eagle-DRAFT
-    // under reverted PR #25015 perturbs position by +1, which lands here on the first draft step
-    // (seed = last verified target slot, perturbation breaks the +1 invariant) and surfaces the bug.
-    // Independent of input_check, so tests that don't wire an oracle still get coverage.
     if (do_chain_position_assert) {
       const int64_t expected_position_chain = running_prev_position + 1;
       if (position != expected_position_chain) {
