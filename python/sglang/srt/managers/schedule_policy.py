@@ -442,7 +442,6 @@ class PrefillAdder:
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
-        self.contains_last_prefill_chunk = False
         self.log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
@@ -649,9 +648,6 @@ class PrefillAdder:
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
 
-        if not truncated:
-            self.contains_last_prefill_chunk = True
-
         # Update budget: reserve max_new_tokens only if not truncated
         max_new_tokens = (
             min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
@@ -686,8 +682,6 @@ class PrefillAdder:
                 _rem_tokens = self.rem_chunk_tokens
 
         truncated = req.extend_input_len > _rem_tokens
-        if not truncated:
-            self.contains_last_prefill_chunk = True
         req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
@@ -790,13 +784,11 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             self._add_dllm_req(req, 0)
-            self.contains_last_prefill_chunk = True
         elif (
             self.rem_chunk_tokens is None  # chunked prefill is disabled
             or req.extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
         ):
             # Non-chunked prefill
-            self.contains_last_prefill_chunk = True
             self.can_run_list.append(req)
             self._update_prefill_budget(
                 0,
@@ -923,11 +915,9 @@ class PrefillAdder:
                 ), "truncation_align_size is not supported for dllm prefill"
 
                 self._add_dllm_req(req, prefix_len)
-                self.contains_last_prefill_chunk = True
                 self._req_inc_lock_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
-                self.contains_last_prefill_chunk = True
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
