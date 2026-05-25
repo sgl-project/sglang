@@ -1762,10 +1762,7 @@ mod tests {
         assert_eq!(decode_request.body["data_parallel_rank"], 1);
         assert_eq!(decode_request.body["disagg_prefill_dp_rank"], 2);
         assert_eq!(decode_request.body["bootstrap_room"], 1234);
-        assert!(matches!(
-            prefill_request.body,
-            std::borrow::Cow::Owned(_)
-        ));
+        assert!(matches!(prefill_request.body, std::borrow::Cow::Owned(_)));
         assert!(matches!(decode_request.body, std::borrow::Cow::Owned(_)));
     }
 
@@ -1805,10 +1802,7 @@ mod tests {
             prefill_request.body,
             std::borrow::Cow::Borrowed(_)
         ));
-        assert!(matches!(
-            decode_request.body,
-            std::borrow::Cow::Borrowed(_)
-        ));
+        assert!(matches!(decode_request.body, std::borrow::Cow::Borrowed(_)));
     }
 
     #[test]
