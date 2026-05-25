@@ -6,6 +6,10 @@ on:
       - main
     paths:
       - sgl-kernel/python/sgl_kernel/version.py
+  # [TEST ONLY] Trigger on PR for testing
+  pull_request:
+    paths:
+      - '.github/workflows/release-whl-kernel.yml'
   workflow_dispatch:
     inputs:
       target:
