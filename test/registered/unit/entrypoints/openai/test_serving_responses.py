@@ -21,6 +21,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
 import asyncio
+import json
 import unittest
 from unittest.mock import Mock, patch
 
@@ -519,6 +520,114 @@ class ServingResponsesTestCase(unittest.TestCase):
         ]
         self.assertEqual(len(message_items), 1)
         self.assertEqual(message_items[0].content[0].text, "trailing text")
+
+    def test_responses_request_accepts_extended_tool_types(self):
+        # The ResponseTool literal must accept every type that the OpenAI
+        # Responses spec advertises so clients (Codex CLI, web-search agents)
+        # don't fail at FastAPI validation when the server has no execution
+        # path for that built-in type yet.
+        for tool_type in (
+            "web_search",
+            "web_search_preview",
+            "code_interpreter",
+            "file_search",
+            "image_generation",
+            "computer_use_preview",
+            "local_shell",
+            "mcp",
+            "custom",
+            "namespace",
+        ):
+            request = ResponsesRequest(
+                model="x",
+                input="hi",
+                tools=[{"type": tool_type}],
+                store=False,
+            )
+            self.assertEqual(request.tools[0].type, tool_type)
+
+    def test_namespace_tool_accepts_inner_tools_list(self):
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            tools=[
+                {
+                    "type": "namespace",
+                    "name": "codex",
+                    "tools": [
+                        {"type": "function", "name": "apply_patch"},
+                        {"type": "function", "name": "shell"},
+                    ],
+                }
+            ],
+            store=False,
+        )
+        self.assertEqual(request.tools[0].type, "namespace")
+        self.assertEqual(len(request.tools[0].tools), 2)
+        self.assertEqual(request.tools[0].tools[0]["name"], "apply_patch")
+
+    def test_non_harmony_stream_emits_typed_sse_events(self):
+        serving = _make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = None
+
+        request = ResponsesRequest(model="x", input="hi", stream=True, store=False)
+        request_metadata = RequestResponseMetadata(request_id=request.request_id)
+
+        async def fake_generator():
+            for text, ctoks in [("Hel", 1), ("Hello", 2), ("Hello world", 4)]:
+                yield {
+                    "text": text,
+                    "meta_info": {
+                        "id": "rid",
+                        "prompt_tokens": 5,
+                        "completion_tokens": ctoks,
+                        "cached_tokens": 0,
+                        "reasoning_tokens": 0,
+                        "finish_reason": (
+                            {"type": "stop"} if text == "Hello world" else None
+                        ),
+                    },
+                }
+
+        async def collect():
+            events = []
+            async for chunk in serving.responses_stream_generator_non_harmony(
+                request,
+                sampling_params={},
+                result_generator=fake_generator(),
+                model_name="x",
+                tokenizer=Mock(),
+                request_metadata=request_metadata,
+            ):
+                events.append(chunk)
+            return events
+
+        events = asyncio.run(collect())
+        # Parse out the typed event names from the SSE envelope.
+        types = [
+            line[len("event: ") :].strip()
+            for chunk in events
+            for line in chunk.splitlines()
+            if line.startswith("event: ")
+        ]
+        self.assertEqual(types[0], "response.created")
+        self.assertEqual(types[1], "response.in_progress")
+        self.assertIn("response.output_item.added", types)
+        self.assertIn("response.content_part.added", types)
+        self.assertIn("response.output_text.delta", types)
+        self.assertIn("response.output_text.done", types)
+        self.assertIn("response.content_part.done", types)
+        self.assertIn("response.output_item.done", types)
+        self.assertEqual(types[-1], "response.completed")
+        # ``sequence_number`` must be monotonic and contiguous across the
+        # whole stream so clients can detect dropped events.
+        seqs = []
+        for chunk in events:
+            for line in chunk.splitlines():
+                if line.startswith("data: "):
+                    seqs.append(json.loads(line[len("data: ") :])["sequence_number"])
+        self.assertEqual(seqs, list(range(len(seqs))))
 
     def test_no_tool_call_extraction_when_tool_choice_none(self):
         serving = _make_serving()

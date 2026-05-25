@@ -92,7 +92,11 @@ def get_developer_message(
     if tools is not None:
         function_tools = []
         for tool in tools:
-            if tool.type in ("web_search_preview", "code_interpreter"):
+            if tool.type in (
+                "web_search",
+                "web_search_preview",
+                "code_interpreter",
+            ):
                 # These are built-in tools that are added to the system message.
                 pass
             elif tool.type == "function":
