@@ -17,7 +17,6 @@ Not registered with CI. Run by hand from
 """
 
 import unittest
-
 from test.manual.chunked_prefill.common import (
     LONG_PROMPT_NUM_SHOTS,
     ChunkedRefactorTestBase,

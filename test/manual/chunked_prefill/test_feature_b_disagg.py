@@ -16,14 +16,12 @@ Not registered with CI. Run by hand from
 """
 
 import unittest
-from typing import ClassVar, List
-
 from test.manual.chunked_prefill.common import (
     DEFAULT_CHUNKED_PREFILL_SIZE,
     KV_CANARY_ARGS,
-    SCORE_THRESHOLD,
     ChunkedRefactorTestBase,
 )
+from typing import ClassVar, List
 
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -45,14 +43,11 @@ class TestChunkedFeatureB_Disagg(PDDisaggregationServerBase, ChunkedRefactorTest
     model: ClassVar[str] = DEFAULT_MODEL_NAME_FOR_TEST
 
     # PDDisaggregationServerBase reads these to pass per-side args.
-    extra_prefill_args: ClassVar[List[str]] = (
-        [
-            "--chunked-prefill-size",
-            str(DEFAULT_CHUNKED_PREFILL_SIZE),
-            "--disable-overlap-schedule",
-        ]
-        + KV_CANARY_ARGS
-    )
+    extra_prefill_args: ClassVar[List[str]] = [
+        "--chunked-prefill-size",
+        str(DEFAULT_CHUNKED_PREFILL_SIZE),
+        "--disable-overlap-schedule",
+    ] + KV_CANARY_ARGS
     extra_decode_args: ClassVar[List[str]] = list(KV_CANARY_ARGS)
 
     @classmethod
