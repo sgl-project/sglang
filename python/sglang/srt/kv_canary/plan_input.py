@@ -103,14 +103,12 @@ def _extract_prefix_lens_and_extend_seq_lens(
     spec_info = forward_batch.spec_info
     if forward_mode.is_decode_or_idle():
         # Anchor on ``positions`` (canonical write position) — eagle draft leaves seq_lens
-        # pre-bump so deriving prefix_lens from seq_lens is off-by-one. Padding tail rows (where
-        # positions runs short of bs under cuda-graph padding) are zeroed; the plan kernel filters
-        # them out by req_pool_indices==PADDING anyway.
+        # pre-bump so deriving prefix_lens from seq_lens is off-by-one. Padding tail (where
+        # positions runs short of bs under cuda-graph padding) is zeroed; the plan kernel filters
+        # those rows by req_pool_indices==PADDING anyway.
         out_prefix_lens.zero_()
         positions = forward_batch.positions
-        num_real = min(positions.shape[0], bs)
-        if num_real > 0:
-            out_prefix_lens[:num_real].copy_(positions[:num_real].to(torch.int64))
+        out_prefix_lens[: positions.shape[0]].copy_(positions.to(torch.int64))
         out_extend_seq_lens.fill_(1)
     elif forward_mode.is_target_verify():
         # Evidence: EagleVerifyInputV2Mixin.prepare_for_v2_verify assigns out_cache_loc in
