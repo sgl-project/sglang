@@ -6377,6 +6377,19 @@ class ServerArgs:
             action="store_true",
             help="Disable RadixAttention for prefix caching.",
         )
+        # --- CUDA graph config: canonical JSON entry ---------------------
+        parser.add_argument(
+            "--cuda-graph-config",
+            type=parse_cuda_graph_config_arg,
+            default=ServerArgs.cuda_graph_config,
+            help="Per-phase CUDA graph settings as JSON, e.g. "
+            '\'{"decode":{"backend":"full","max_bs":256},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}\'. '
+            "Allowed backends per phase: full, breakable, tc_piecewise, disabled "
+            "(full is decode-only). JSON wins over the per-phase --cuda-graph-* "
+            "convenience flags and over legacy flags.",
+        )
+
+        # --- CUDA graph: per-phase convenience flags ---------------------
         parser.add_argument(
             "--cuda-graph-backend-decode",
             type=str,
@@ -6424,6 +6437,33 @@ class ServerArgs:
             default=ServerArgs.cuda_graph_tc_compiler_prefill,
             help="Compiler used by the tc_piecewise prefill backend. Ignored for other prefill backends.",
         )
+
+        # --- CUDA graph: debug / profiling flags -------------------------
+        parser.add_argument(
+            "--disable-cuda-graph-padding",
+            action="store_true",
+            help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
+        )
+        parser.add_argument(
+            "--enable-profile-cuda-graph",
+            action="store_true",
+            help="Enable profiling of cuda graph capture.",
+        )
+        parser.add_argument(
+            "--enable-cudagraph-gc",
+            action="store_true",
+            help="Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
+        )
+        parser.add_argument(
+            "--debug-cuda-graph",
+            action="store_true",
+            help="Enable debug/eager mode for CUDA graph using breakable CUDA graph. "
+            "When enabled, graph breaks are inserted so every operation runs eagerly "
+            "while still going through the CUDA graph capture / replay path. "
+            "Useful for debugging CUDA graph capture / replay issues.",
+        )
+
+        # --- CUDA graph: deprecated aliases (kept for backward compat) ---
         parser.add_argument(
             "--cuda-graph-max-bs",
             type=int,
@@ -6448,46 +6488,12 @@ class ServerArgs:
             help="Deprecated. Use --cuda-graph-backend-{decode,prefill}=disabled instead.",
         )
         parser.add_argument(
-            "--disable-cuda-graph-padding",
-            action="store_true",
-            help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
-        )
-        parser.add_argument(
             "--enable-breakable-cuda-graph",
             action=DeprecatedStoreConstAction,
             dest="cuda_graph_backend_prefill",
             const_value=Backend.BREAKABLE,
             new_flag="--cuda-graph-backend-prefill=breakable",
             help="Deprecated alias for --cuda-graph-backend-prefill=breakable.",
-        )
-        parser.add_argument(
-            "--enable-profile-cuda-graph",
-            action="store_true",
-            help="Enable profiling of cuda graph capture.",
-        )
-        parser.add_argument(
-            "--enable-cudagraph-gc",
-            action="store_true",
-            help="Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
-        )
-        parser.add_argument(
-            "--debug-cuda-graph",
-            action="store_true",
-            help="Enable debug/eager mode for CUDA graph using breakable CUDA graph. "
-            "When enabled, graph breaks are inserted so every operation runs eagerly "
-            "while still going through the CUDA graph capture / replay path. "
-            "Useful for debugging CUDA graph capture / replay issues.",
-        )
-
-        parser.add_argument(
-            "--cuda-graph-config",
-            type=parse_cuda_graph_config_arg,
-            default=ServerArgs.cuda_graph_config,
-            help="Per-phase CUDA graph settings as JSON, e.g. "
-            '\'{"decode":{"backend":"full","max_bs":256},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}\'. '
-            "Allowed backends per phase: full, breakable, tc_piecewise, disabled "
-            "(full is decode-only). JSON wins over the per-phase --cuda-graph-* "
-            "convenience flags and over legacy flags.",
         )
         parser.add_argument(
             "--prefill-cuda-graph-backend",
@@ -6516,6 +6522,50 @@ class ServerArgs:
             action=DeprecatedStoreTrueAction,
             new_flag="--cuda-graph-backend-decode=disabled",
             help="Deprecated. Use --cuda-graph-backend-decode=disabled instead.",
+        )
+        parser.add_argument(
+            "--disable-piecewise-cuda-graph",
+            action=DeprecatedStoreConstAction,
+            dest="cuda_graph_backend_prefill",
+            const_value=Backend.DISABLED,
+            new_flag="--cuda-graph-backend-prefill=disabled",
+            help="Deprecated alias for --cuda-graph-backend-prefill=disabled.",
+        )
+        parser.add_argument(
+            "--enforce-piecewise-cuda-graph",
+            action=DeprecatedStoreConstAction,
+            dest="cuda_graph_backend_prefill",
+            const_value=Backend.TC_PIECEWISE,
+            new_flag="--cuda-graph-backend-prefill=tc_piecewise",
+            help="Deprecated alias for --cuda-graph-backend-prefill=tc_piecewise. "
+            "Explicitly setting the prefill backend now skips the auto-disable "
+            "cascade automatically.",
+        )
+        parser.add_argument(
+            "--piecewise-cuda-graph-tokens",
+            type=int,
+            nargs="+",
+            action=DeprecatedAliasStoreAction,
+            new_flag="--cuda-graph-bs-prefill",
+            dest="cuda_graph_bs_prefill",
+            help="Deprecated alias for --cuda-graph-bs-prefill.",
+        )
+        parser.add_argument(
+            "--piecewise-cuda-graph-compiler",
+            type=str,
+            choices=["eager", "inductor"],
+            action=DeprecatedAliasStoreAction,
+            new_flag="--cuda-graph-tc-compiler-prefill",
+            dest="cuda_graph_tc_compiler_prefill",
+            help="Deprecated alias for --cuda-graph-tc-compiler-prefill.",
+        )
+        parser.add_argument(
+            "--piecewise-cuda-graph-max-tokens",
+            type=int,
+            action=DeprecatedAliasStoreAction,
+            new_flag="--cuda-graph-max-bs-prefill",
+            dest="cuda_graph_max_bs_prefill",
+            help="Deprecated alias for --cuda-graph-max-bs-prefill.",
         )
         parser.add_argument(
             "--enable-layerwise-nvtx-marker",
@@ -6626,54 +6676,10 @@ class ServerArgs:
             help="Enable debug mode for torch compile",
         )
         parser.add_argument(
-            "--disable-piecewise-cuda-graph",
-            action=DeprecatedStoreConstAction,
-            dest="cuda_graph_backend_prefill",
-            const_value=Backend.DISABLED,
-            new_flag="--cuda-graph-backend-prefill=disabled",
-            help="Deprecated alias for --cuda-graph-backend-prefill=disabled.",
-        )
-        parser.add_argument(
-            "--enforce-piecewise-cuda-graph",
-            action=DeprecatedStoreConstAction,
-            dest="cuda_graph_backend_prefill",
-            const_value=Backend.TC_PIECEWISE,
-            new_flag="--cuda-graph-backend-prefill=tc_piecewise",
-            help="Deprecated alias for --cuda-graph-backend-prefill=tc_piecewise. "
-            "Explicitly setting the prefill backend now skips the auto-disable "
-            "cascade automatically.",
-        )
-        parser.add_argument(
-            "--piecewise-cuda-graph-tokens",
-            type=int,
-            nargs="+",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-bs-prefill",
-            dest="cuda_graph_bs_prefill",
-            help="Deprecated alias for --cuda-graph-bs-prefill.",
-        )
-        parser.add_argument(
-            "--piecewise-cuda-graph-compiler",
-            type=str,
-            choices=["eager", "inductor"],
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-tc-compiler-prefill",
-            dest="cuda_graph_tc_compiler_prefill",
-            help="Deprecated alias for --cuda-graph-tc-compiler-prefill.",
-        )
-        parser.add_argument(
             "--torch-compile-max-bs",
             type=int,
             default=ServerArgs.torch_compile_max_bs,
             help="Set the maximum batch size when using torch compile.",
-        )
-        parser.add_argument(
-            "--piecewise-cuda-graph-max-tokens",
-            type=int,
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-max-bs-prefill",
-            dest="cuda_graph_max_bs_prefill",
-            help="Deprecated alias for --cuda-graph-max-bs-prefill.",
         )
         parser.add_argument(
             "--torchao-config",
