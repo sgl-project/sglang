@@ -2,6 +2,7 @@
 
 from sglang.srt.hardware_backend.mlx.kv_cache.attention_wrapper import (
     BatchedDecodeContext,
+    MlxAOTKernelBuildInfo,
     MlxAOTKernelContext,
     MlxAOTRoPEContext,
     MLXAttentionWrapper,
@@ -29,6 +30,7 @@ __all__ = [
     "get_context",
     "get_num_layers",
     "MLXAttentionWrapper",
+    "MlxAOTKernelBuildInfo",
     "MlxAOTKernelContext",
     "MlxAOTRoPEContext",
     "MlxKVPool",

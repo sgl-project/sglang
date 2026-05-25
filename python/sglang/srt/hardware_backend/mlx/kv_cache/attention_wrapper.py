@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -14,6 +15,7 @@ import mlx.nn as nn
 
 from sglang.srt.hardware_backend.mlx.kv_cache.contiguous_cache import ContiguousKVCache
 
+logger = logging.getLogger(__name__)
 _thread_local = threading.local()
 
 
@@ -50,6 +52,16 @@ class MlxAOTKernelContext:
     rope: Optional[MlxAOTRoPEContext] = None
 
 
+@dataclass
+class MlxAOTKernelBuildInfo:
+    rope_config: dict = field(default_factory=dict)
+    rope_base: float = 0.0
+    kv_pool: Optional[Any] = None
+    req_ids: Optional[list[str]] = None
+    req_pool_idx: Optional[dict[str, int]] = None
+    req_to_token_pool: Optional[Any] = None
+
+
 # TODO: Move from threading to multiprocessing or asyncio
 @dataclass
 class BatchedDecodeContext:
@@ -64,6 +76,7 @@ class BatchedDecodeContext:
     # MLX decode path so future AOT kernels can be added without growing this
     # context one field at a time.
     aot: MlxAOTKernelContext = field(default_factory=MlxAOTKernelContext)
+    aot_build: Optional[MlxAOTKernelBuildInfo] = None
 
     # Derived tensors/metadata, shared across all layers in one forward pass.
     offsets: mx.array = field(init=False)
@@ -82,6 +95,53 @@ class BatchedDecodeContext:
         self.needs_padding = min(seq_lens) < max_seq_len
         self.pad_sizes = [max_seq_len - s for s in seq_lens]
         self.positions = mx.arange(self.max_len) if self.needs_padding else None
+        if self.aot_build is not None and self.aot.rope is None:
+            self.aot = self._build_aot_kernel_context()
+
+    def _build_aot_kernel_context(self) -> MlxAOTKernelContext:
+        info = self.aot_build
+        if (
+            info is None
+            or not info.rope_config
+            or info.rope_base <= 0.0
+            or info.kv_pool is None
+        ):
+            return MlxAOTKernelContext()
+
+        new_token_slots = None
+        if (
+            info.req_ids is not None
+            and info.req_pool_idx is not None
+            and info.req_to_token_pool is not None
+        ):
+            try:
+                slot_ids = []
+                for req_idx, req_id in enumerate(info.req_ids):
+                    req_pool_idx = info.req_pool_idx.get(req_id)
+                    if req_pool_idx is None:
+                        raise KeyError(req_id)
+                    slot = int(
+                        info.req_to_token_pool.req_to_token[
+                            req_pool_idx, self.layer_caches[0][req_idx].offset
+                        ].item()
+                    )
+                    slot_ids.append(slot)
+                new_token_slots = mx.array(slot_ids, dtype=mx.int32)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "AOT RoPE: failed to resolve new-token slots (%s); "
+                    "falling back to RoPE-only for this decode step",
+                    exc,
+                )
+
+        return MlxAOTKernelContext(
+            rope=MlxAOTRoPEContext(
+                config=info.rope_config,
+                base=info.rope_base,
+                kv_pool=info.kv_pool,
+                new_token_slots=new_token_slots,
+            )
+        )
 
 
 def set_context(ctx: Optional[BatchedDecodeContext]) -> None:

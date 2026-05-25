@@ -31,8 +31,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.kv_cache import (
     BatchedDecodeContext,
     ContiguousKVCache,
-    MlxAOTKernelContext,
-    MlxAOTRoPEContext,
+    MlxAOTKernelBuildInfo,
     MLXAttentionWrapper,
     OffsetCache,
     PoolBackedCache,
@@ -512,48 +511,21 @@ class MlxModelRunner:
         for req_id in list(self._req_caches.keys()):
             self._sync_decode_kv_to_pool(req_id)
 
-    def _build_aot_kernel_context(
-        self,
-        req_ids: list[str],
-        caches: list[list[ContiguousKVCache | PoolBackedCache]],
-    ) -> dict:
-        """Return BatchedDecodeContext kwargs for optional AOT kernels."""
+    def _get_aot_kernel_build_info(
+        self, req_ids: list[str]
+    ) -> MlxAOTKernelBuildInfo | None:
+        """Return build inputs for optional AOT kernels."""
         rope_base, rope_config = self._maybe_get_rope_state()
         if rope_base <= 0.0 or not rope_config or self._kv_pool is None:
-            return {}
-
-        new_token_slots = None
-        if self._req_to_token_pool is not None:
-            try:
-                slot_ids = []
-                for i, rid in enumerate(req_ids):
-                    req_pool_idx = self._req_pool_idx.get(rid)
-                    if req_pool_idx is None:
-                        raise KeyError(rid)
-                    slot = int(
-                        self._req_to_token_pool.req_to_token[
-                            req_pool_idx, caches[i][0].offset
-                        ].item()
-                    )
-                    slot_ids.append(slot)
-                new_token_slots = mx.array(slot_ids, dtype=mx.int32)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "AOT RoPE: failed to resolve new-token slots (%s); "
-                    "falling back to RoPE-only for this decode step",
-                    exc,
-                )
-
-        return {
-            "aot": MlxAOTKernelContext(
-                rope=MlxAOTRoPEContext(
-                    config=rope_config,
-                    base=rope_base,
-                    kv_pool=self._kv_pool,
-                    new_token_slots=new_token_slots,
-                )
-            )
-        }
+            return None
+        return MlxAOTKernelBuildInfo(
+            rope_config=rope_config,
+            rope_base=rope_base,
+            kv_pool=self._kv_pool,
+            req_ids=req_ids,
+            req_pool_idx=self._req_pool_idx,
+            req_to_token_pool=self._req_to_token_pool,
+        )
 
     def decode_batch(
         self,
@@ -749,7 +721,7 @@ class MlxModelRunner:
             batch_size=batch_size,
             seq_lens=seq_lens,
             layer_caches=layer_caches,
-            **self._build_aot_kernel_context(req_ids, caches),
+            aot_build=self._get_aot_kernel_build_info(req_ids),
         )
         set_context(ctx)
         try:
@@ -825,7 +797,7 @@ class MlxModelRunner:
             batch_size=batch_size,
             seq_lens=seq_lens,
             layer_caches=layer_caches,
-            **self._build_aot_kernel_context(prev.req_ids, caches),
+            aot_build=self._get_aot_kernel_build_info(prev.req_ids),
         )
         set_context(ctx)
         try:
