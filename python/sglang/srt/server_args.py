@@ -723,9 +723,6 @@ class ServerArgs:
     disable_decode_cuda_graph: bool = False
     prefill_cuda_graph_backend: Optional[str] = None
     decode_cuda_graph_backend: Optional[str] = None
-    piecewise_cuda_graph_max_tokens: Optional[int] = None
-    piecewise_cuda_graph_tokens: Optional[List[int]] = None
-    tc_piecewise_cuda_graph_compiler: Optional[str] = None
     enable_layerwise_nvtx_marker: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
@@ -1338,12 +1335,6 @@ class ServerArgs:
         if self.disable_cuda_graph:
             _set(Phase.DECODE, "backend", Backend.DISABLED)
             _set(Phase.PREFILL, "backend", Backend.DISABLED)
-        if self.piecewise_cuda_graph_max_tokens is not None:
-            _set(Phase.PREFILL, "max_bs", self.piecewise_cuda_graph_max_tokens)
-        if self.piecewise_cuda_graph_tokens is not None:
-            _set(Phase.PREFILL, "bs", self.piecewise_cuda_graph_tokens)
-        if self.tc_piecewise_cuda_graph_compiler is not None:
-            _set(Phase.PREFILL, "tc_compiler", self.tc_piecewise_cuda_graph_compiler)
 
         # ---- Legacy convenience flags ----
         if self.disable_prefill_cuda_graph:
@@ -6639,6 +6630,7 @@ class ServerArgs:
             nargs="+",
             action=DeprecatedAliasStoreAction,
             new_flag="--cuda-graph-bs-prefill",
+            dest="cuda_graph_bs_prefill",
             help="Deprecated alias for --cuda-graph-bs-prefill.",
         )
         parser.add_argument(
@@ -6647,7 +6639,7 @@ class ServerArgs:
             choices=["eager", "inductor"],
             action=DeprecatedAliasStoreAction,
             new_flag="--cuda-graph-tc-compiler-prefill",
-            dest="tc_piecewise_cuda_graph_compiler",
+            dest="cuda_graph_tc_compiler_prefill",
             help="Deprecated alias for --cuda-graph-tc-compiler-prefill.",
         )
         parser.add_argument(
@@ -6661,6 +6653,7 @@ class ServerArgs:
             type=int,
             action=DeprecatedAliasStoreAction,
             new_flag="--cuda-graph-max-bs-prefill",
+            dest="cuda_graph_max_bs_prefill",
             help="Deprecated alias for --cuda-graph-max-bs-prefill.",
         )
         parser.add_argument(
