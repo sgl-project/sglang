@@ -7,7 +7,11 @@ import torch
 from sglang.jit_kernel.kv_canary.consts import MAX_REAL_KV_SOURCES, RealKvHashMode
 from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
+    CanaryLaunchTag,
     RealKvSource,
+    VerifyOrWriteContext,
+    VerifyPlan,
+    launch_canary_verify_kernel,
 )
 from sglang.srt.kv_canary.buffer_group import PoolKind
 from sglang.srt.kv_canary.pool_patch.api import attach_canary_buffers
@@ -62,13 +66,6 @@ class TestAttachCanaryBuffers(PoolPatchHelper, CustomTestCase):
 class TestRealKvSources(PoolPatchHelper, CustomTestCase):
     def test_real_kv_sources_above_4_raises(self):
         """Verify too many real KV sources are rejected."""
-        from sglang.jit_kernel.kv_canary.verify import (
-            CanaryLaunchTag,
-            VerifyOrWriteContext,
-            VerifyPlan,
-            launch_canary_verify_kernel,
-        )
-
         tensor = torch.zeros(4, 16, dtype=torch.uint8, device=self.device)
         sources = tuple(
             RealKvSource(
