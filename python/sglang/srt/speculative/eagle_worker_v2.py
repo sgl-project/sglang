@@ -600,12 +600,12 @@ class EagleDraftWorker(BaseDraftWorker):
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
-        sfm_index_ctx = (
+        canary_index_ctx = (
             c.with_active_single_forward_manager(0)
             if c is not None
             else contextlib.nullcontext()
         )
-        with canary_outside_ctx, sfm_index_ctx:
+        with canary_outside_ctx, canary_index_ctx:
             logits_output = self.draft_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
 
@@ -668,12 +668,12 @@ class EagleDraftWorker(BaseDraftWorker):
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
-        sfm_index_ctx = (
+        canary_index_ctx = (
             c.with_active_single_forward_manager(0)
             if c is not None
             else contextlib.nullcontext()
         )
-        with canary_outside_ctx, sfm_index_ctx:
+        with canary_outside_ctx, canary_index_ctx:
             if can_cuda_graph:
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
                     forward_batch
