@@ -1,0 +1,181 @@
+"""Helpers used by mem_cache/common.py to wire DSV4-NPU per-req tables.
+
+mem_cache/common.py runs platform-agnostic alloc flow. When the model is
+DSV4 on NPU, after each ``alloc_extend`` / ``alloc_decode`` we need to:
+
+  1. Fetch the bundled :class:`DSV4OutCacheLoc` from the allocator.
+  2. Stash it on ``batch.out_cache_loc_dsv4`` so the attention backend
+     can consume it.
+  3. Write the per-pool slot ids into the per-req tables on the
+     :class:`DSV4NPUReqToTokenPool`.
+
+Non-DSV4 paths short-circuit on ``hasattr(allocator, 'get_last_dsv4_alloc')``
+so this module is a no-op for them.
+
+TODO: disagg DSV4 path bypasses ``alloc_for_extend`` / ``alloc_for_decode``
+entirely (see ``disaggregation/decode.py``: it calls
+``allocator.alloc_extend`` directly then ``req_to_token_pool.write`` without
+going through ``mem_cache/common.py``). The new DSV4OutCacheLoc bundle is
+still produced by the allocator on those paths but never written into the
+per-req tables, so disagg + DSV4 is unsupported here — same status as the
+``8c1e87b`` commit message noted ("Disagg decode and PP profiling paths
+bypass release_kv_cache; c-pages leak there"). Fixing requires either
+calling these hooks from disagg's per-req alloc loop or moving the write
+into the allocator itself.
+"""
+
+from __future__ import annotations
+
+from typing import Optional, TYPE_CHECKING
+
+import torch
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+
+def maybe_write_dsv4_extend(
+    batch: "ScheduleBatch",
+    req_pool_indices_cpu: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+) -> None:
+    """Post-alloc_extend hook for DSV4. No-op when allocator/pool is not DSV4.
+
+    For each compressed pool (c4 / c128), spreads the flat
+    ``out_c{4,128}_loc`` tensor across requests using per-req extend
+    counts (``seq_lens[i] // ratio - prefix_lens[i] // ratio``) and writes
+    the resulting slot ids into ``req_to_token_c{4,128}[req, prefix:seq]``.
+
+    Also writes ``req_to_token_swa[req, prefix:seq]`` with the swa slots
+    derived from out_full_loc via the SWA index mapping.
+    """
+    allocator = batch.tree_cache.token_to_kv_pool_allocator
+    if not hasattr(allocator, "get_last_dsv4_alloc"):
+        return
+    bundle = allocator.get_last_dsv4_alloc()
+    if bundle is None:
+        return
+    batch.out_cache_loc_dsv4 = bundle
+
+    req_to_token_pool = batch.req_to_token_pool
+    if not hasattr(req_to_token_pool, "write_c4"):
+        # Non-DSV4 ReqToTokenPool — should not happen if dispatch is wired
+        # correctly, but skip defensively.
+        return
+
+    # SWA writes: prefix..seq token positions, one slot per raw token.
+    _write_per_req_slice(
+        req_to_token_pool.write_swa,
+        req_pool_indices_cpu,
+        prefix_lens_cpu,
+        seq_lens_cpu,
+        bundle.out_swa_loc,
+        ratio=1,
+    )
+
+    # c4 / c128 writes: prefix//ratio .. seq//ratio compressed positions.
+    _write_per_req_slice(
+        req_to_token_pool.write_c4,
+        req_pool_indices_cpu,
+        prefix_lens_cpu,
+        seq_lens_cpu,
+        bundle.out_c4_loc,
+        ratio=4,
+    )
+    _write_per_req_slice(
+        req_to_token_pool.write_c128,
+        req_pool_indices_cpu,
+        prefix_lens_cpu,
+        seq_lens_cpu,
+        bundle.out_c128_loc,
+        ratio=128,
+    )
+
+
+def maybe_write_dsv4_decode(
+    batch: "ScheduleBatch",
+    seq_lens_cpu: torch.Tensor,
+    token_per_req: int,
+) -> None:
+    """Post-alloc_decode hook for DSV4. Spreads the new token slot ids
+    (one per req) into ``req_to_token_c{4,128}_state`` and into
+    ``req_to_token_c{4,128}`` for reqs that just crossed a ratio boundary.
+
+    ``seq_lens_cpu`` is the POST-decode seq len (already incremented by
+    ``token_per_req``); the new compressed tokens go at positions
+    ``[(old_seq) // ratio, (new_seq) // ratio)``.
+    """
+    allocator = batch.tree_cache.token_to_kv_pool_allocator
+    if not hasattr(allocator, "get_last_dsv4_alloc"):
+        return
+    bundle = allocator.get_last_dsv4_alloc()
+    if bundle is None:
+        return
+    batch.out_cache_loc_dsv4 = bundle
+
+    req_to_token_pool = batch.req_to_token_pool
+    if not hasattr(req_to_token_pool, "write_c4"):
+        return
+
+    prefix_lens_cpu = (seq_lens_cpu - token_per_req).clamp(min=0)
+    req_pool_indices_cpu = batch.req_pool_indices.cpu()
+
+    _write_per_req_slice(
+        req_to_token_pool.write_swa,
+        req_pool_indices_cpu,
+        prefix_lens_cpu,
+        seq_lens_cpu,
+        bundle.out_swa_loc,
+        ratio=1,
+    )
+    _write_per_req_slice(
+        req_to_token_pool.write_c4,
+        req_pool_indices_cpu,
+        prefix_lens_cpu,
+        seq_lens_cpu,
+        bundle.out_c4_loc,
+        ratio=4,
+    )
+    _write_per_req_slice(
+        req_to_token_pool.write_c128,
+        req_pool_indices_cpu,
+        prefix_lens_cpu,
+        seq_lens_cpu,
+        bundle.out_c128_loc,
+        ratio=128,
+    )
+
+
+def _write_per_req_slice(
+    write_fn,
+    req_pool_indices_cpu: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    flat_loc: torch.Tensor,
+    ratio: int,
+) -> None:
+    """Distribute a flat ``[total_alloc]`` slot tensor across reqs and
+    call ``write_fn((req_idx, slice(prefix//ratio, seq//ratio)), values)``.
+
+    Skip-writes when a req contributes 0 new compressed tokens for this
+    ratio (extend straddling a ratio boundary with prefix_len already past
+    boundary, or seq_len < ratio).
+    """
+    if flat_loc.numel() == 0:
+        return
+    pt = 0
+    n_reqs = req_pool_indices_cpu.shape[0]
+    for i in range(n_reqs):
+        c_prefix = int(prefix_lens_cpu[i].item()) // ratio
+        c_seq = int(seq_lens_cpu[i].item()) // ratio
+        c_extend = max(0, c_seq - c_prefix)
+        if c_extend == 0:
+            continue
+        req_idx = int(req_pool_indices_cpu[i].item())
+        chunk = flat_loc[pt : pt + c_extend].to(torch.int32)
+        write_fn((req_idx, slice(c_prefix, c_seq)), chunk)
+        pt += c_extend
+    # If flat_loc was sized to total extend_num_tokens, pt should equal
+    # flat_loc.numel(); otherwise the allocator returned extra padding
+    # which we silently ignore here.

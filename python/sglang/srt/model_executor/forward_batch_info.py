@@ -234,6 +234,27 @@ def compute_local_num_token_non_padded(
 
 
 @dataclass
+class DSV4OutCacheLoc:
+    """Per-forward-pass KV cache allocation for DeepSeek-V4 on NPU.
+
+    Bundles slot indices for full/SWA pools and the four compressed pools
+    (c4/c128 KV + c4/c128 state). Populated by the NPU V4 allocator when
+    the model is DeepSeek-V4; left as ``None`` on ForwardBatch otherwise.
+
+    All fields are token-level slot ids in their respective pools (NOT page
+    ids). Attention backends convert to page ids via ``// page_size`` when
+    constructing PA_ND block tables.
+    """
+
+    out_full_loc: torch.Tensor
+    out_swa_loc: torch.Tensor
+    out_c4_loc: torch.Tensor
+    out_c128_loc: torch.Tensor
+    out_c4_state_loc: torch.Tensor
+    out_c128_state_loc: torch.Tensor
+
+
+@dataclass
 class NgramEmbeddingInfo:
     """Ngram embedding state for LongCat models."""
 
@@ -300,6 +321,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # The indices of output tokens in the token_to_kv_pool_swa
     out_cache_loc_swa: Optional[torch.Tensor] = None
+    # DSV4-NPU only: 6-tuple of per-pool allocation slots (full/swa/c4/c128/
+    # c4_state/c128_state). Populated by DSV4NPUTokenToKVPoolAllocator; the
+    # NPU ascend attention backend consumes this to construct PA_ND block
+    # tables. None for non-DSV4 paths.
+    out_cache_loc_dsv4: Optional[DSV4OutCacheLoc] = None
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     # The mask to track mamba state if needed
@@ -453,6 +479,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,

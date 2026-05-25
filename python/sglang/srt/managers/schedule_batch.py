@@ -1412,6 +1412,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
+    # DSV4-NPU: bundled per-pool slots (full/swa/c4/c128/c4_state/c128_state)
+    # produced by DSV4NPUTokenToKVPoolAllocator. None on non-DSV4 paths.
+    out_cache_loc_dsv4: Optional[Any] = None
     output_ids: torch.Tensor = None  # shape: [b], int64
 
     # For hybrid GDN prefix cache
@@ -2558,6 +2561,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens=self.seq_lens,
             orig_seq_lens=self.orig_seq_lens,
             out_cache_loc=self.out_cache_loc,
+            out_cache_loc_dsv4=self.out_cache_loc_dsv4,
             seq_lens_cpu=seq_lens_cpu,
             seq_lens_sum=self.seq_lens_sum,
             return_logprob=self.return_logprob,
@@ -2806,6 +2810,13 @@ class ModelWorkerBatch:
 
     # token table for ngram embedding
     ne_token_table: Optional[torch.Tensor] = None
+
+    # DSV4-NPU: bundled per-pool allocation slots. Populated by the NPU V4
+    # allocator on alloc_extend/alloc_decode; the NPU attention backend
+    # reads it to write the 5 per-req tables and to build PA_ND block
+    # tables. None for non-DSV4 paths. Typed as Any to avoid an import
+    # cycle with forward_batch_info.
+    out_cache_loc_dsv4: Optional[Any] = None
 
     # For corss-encoder model
     token_type_ids: Optional[torch.Tensor] = None

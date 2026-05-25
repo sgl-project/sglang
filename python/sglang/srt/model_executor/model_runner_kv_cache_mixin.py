@@ -313,7 +313,21 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                 )
             else:
-                self.req_to_token_pool = ReqToTokenPool(
+                # DSV4 on NPU needs an extended ReqToTokenPool that holds
+                # per-req tables for swa / c4 / c128 / c4_state / c128_state
+                # alongside the regular req_to_token. See
+                # hardware_backend/npu/dsv4_req_to_token_pool.py for the
+                # rationale and memory cost. Non-DSV4 + non-NPU stays on
+                # the stock ReqToTokenPool.
+                req_to_token_pool_cls = ReqToTokenPool
+                if _is_npu and is_deepseek_v4(self.model_config.hf_config):
+                    from sglang.srt.hardware_backend.npu.dsv4_req_to_token_pool import (
+                        DSV4NPUReqToTokenPool,
+                    )
+
+                    req_to_token_pool_cls = DSV4NPUReqToTokenPool
+
+                self.req_to_token_pool = req_to_token_pool_cls(
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
@@ -349,7 +363,18 @@ class ModelRunnerKVCacheMixin:
                 ] * self.num_effective_layers
             else:
                 compression_ratios = self.model_config.compress_ratios
-            self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
+            # NPU dispatches to the DSV4-NPU subclass that neutralizes the
+            # legacy in-pool c-page free-list allocator. c4/c128 page alloc
+            # then runs through DSV4NPUTokenToKVPoolAllocator (below).
+            v4_pool_cls = DeepSeekV4TokenToKVPool
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.dsv4_memory_pool import (
+                    DSV4NPUTokenToKVPool,
+                )
+
+                v4_pool_cls = DSV4NPUTokenToKVPool
+
+            self.token_to_kv_pool = v4_pool_cls(
                 max_num_reqs=self.max_running_requests,
                 swa_size=self.swa_max_total_num_tokens,
                 c4_size=self.c4_max_total_num_tokens,
@@ -677,7 +702,18 @@ class ModelRunnerKVCacheMixin:
                 or self.hybrid_gdn_config is not None
             ):
                 if self.is_hybrid_swa:
-                    self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                    # DSV4 on NPU: use the SWA allocator subclass that also
+                    # drives c4/c128 paged allocators and produces a 6-tuple
+                    # DSV4OutCacheLoc on each alloc_extend/alloc_decode.
+                    if is_dsv4_model:
+                        from sglang.srt.hardware_backend.npu.dsv4_allocator import (
+                            DSV4NPUTokenToKVPoolAllocator,
+                        )
+
+                        swa_allocator_cls = DSV4NPUTokenToKVPoolAllocator
+                    else:
+                        swa_allocator_cls = SWATokenToKVPoolAllocator
+                    self.token_to_kv_pool_allocator = swa_allocator_cls(
                         self.full_max_total_num_tokens,
                         self.swa_max_total_num_tokens,
                         page_size=self.page_size,
