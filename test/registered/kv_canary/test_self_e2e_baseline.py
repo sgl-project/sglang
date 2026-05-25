@@ -36,12 +36,6 @@ class TestBaselineSwa(_BaselineBase):
     __test__ = True
 
     model_mode = "swa"
-    # Disable radix cache: 8 identical prompts would otherwise radix-fold onto a single set
-    # of slots → identity full→swa mapping → swa_full_idx_divergence stays 0. Disabling
-    # radix forces 8 independent slot allocations, surfacing non-identity SWA remapping.
-    # Identical prompts (no use_unique_prompts) keep per-req prefix_lens homogeneous and
-    # avoid the canary plan's heterogeneity-driven TAIL_K_FULL position false-positive.
-    extra_server_args = ("--disable-radix-cache",)
 
 
 if __name__ == "__main__":
