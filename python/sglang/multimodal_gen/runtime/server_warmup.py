@@ -24,6 +24,38 @@ DEFAULT_PLACEHOLDER_PROMPT = "warmup"
 DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION = (64, 64)
 
 
+def get_first_generation_req(req_or_group: Any) -> Req | None:
+    """Extract the first req"""
+    if isinstance(req_or_group, Req):
+        return req_or_group
+    if isinstance(req_or_group, list) and req_or_group:
+        first_req = req_or_group[0]
+        if isinstance(first_req, Req):
+            return first_req
+    return None
+
+
+def is_warmup_req(req_or_group: Any) -> bool:
+    req = get_first_generation_req(req_or_group)
+    return req.is_warmup if req is not None else False
+
+
+def is_server_based_warmup(req_or_group: Any) -> bool:
+    req = get_first_generation_req(req_or_group)
+    return (
+        req is not None and req.is_warmup and bool(req.extra.get("server_based_warmup"))
+    )
+
+
+def should_return_warmup_result(req_or_group: Any) -> bool:
+    req = get_first_generation_req(req_or_group)
+    return (
+        req is not None
+        and req.is_warmup
+        and bool(req.extra.get("return_warmup_result"))
+    )
+
+
 def get_model_sampling_defaults(server_args: ServerArgs) -> SamplingParams:
     pipeline_class_name = server_args.pipeline_class_name
     try:

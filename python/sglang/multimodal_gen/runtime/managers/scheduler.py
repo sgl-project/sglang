@@ -50,7 +50,11 @@ from sglang.multimodal_gen.runtime.server_args import (
 )
 from sglang.multimodal_gen.runtime.server_warmup import (
     build_warmup_reqs,
+    get_first_generation_req,
+    is_server_based_warmup,
+    is_warmup_req,
     prepare_warmup_image_path_sync,
+    should_return_warmup_result,
 )
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
@@ -225,22 +229,6 @@ class Scheduler(SchedulerDisaggMixin):
             return reqs[0]
         return reqs
 
-    @staticmethod
-    def _first_generation_req(req_or_group: Any) -> Req | None:
-        """Extract the first req"""
-        if isinstance(req_or_group, Req):
-            return req_or_group
-        if isinstance(req_or_group, list) and req_or_group:
-            first_req = req_or_group[0]
-            if isinstance(first_req, Req):
-                return first_req
-        return None
-
-    @classmethod
-    def _is_warmup_item(cls, req_or_group: Any) -> bool:
-        req = cls._first_generation_req(req_or_group)
-        return req.is_warmup if req is not None else False
-
     def _dispatch_single_request(self, req_or_group: Any) -> OutputBatch:
         if isinstance(req_or_group, list):
             if not all(isinstance(req, Req) for req in req_or_group):
@@ -265,35 +253,6 @@ class Scheduler(SchedulerDisaggMixin):
             return [self._dispatch_single_request(req) for req in reqs]
         return self._dispatch_single_request(reqs[0])
 
-    @classmethod
-    def _is_server_based_warmup(cls, req_or_group: Any) -> bool:
-        req = cls._first_generation_req(req_or_group)
-        return (
-            req is not None
-            and req.is_warmup
-            and bool(req.extra.get("server_based_warmup"))
-        )
-
-    @classmethod
-    def _should_return_warmup_result(cls, req_or_group: Any) -> bool:
-        req = cls._first_generation_req(req_or_group)
-        return (
-            req is not None
-            and req.is_warmup
-            and bool(req.extra.get("return_warmup_result"))
-        )
-
-    @staticmethod
-    def _drop_warmup_payload(output_batch: OutputBatch) -> None:
-        output_batch.output = None
-        output_batch.audio = None
-        output_batch.trajectory_timesteps = None
-        output_batch.trajectory_latents = None
-        output_batch.rollout_trajectory_data = None
-        output_batch.trajectory_decoded = None
-        output_batch.output_file_paths = None
-        output_batch.noise_pred = None
-
     def _log_warmup_result(
         self,
         output_batch: OutputBatch,
@@ -303,7 +262,7 @@ class Scheduler(SchedulerDisaggMixin):
         if not is_warmup:
             return
 
-        server_based_warmup = self._is_server_based_warmup(req_or_group)
+        server_based_warmup = is_server_based_warmup(req_or_group)
 
         if output_batch.error is None:
             total_duration_s = (
@@ -1021,7 +980,7 @@ class Scheduler(SchedulerDisaggMixin):
         # handle server req-based warmup by inserting an identical req to the beginning of the waiting queue
         # only the very first req through server's lifetime will be warmed up
         identity, req_or_group = recv_reqs[0]
-        req = self._first_generation_req(req_or_group)
+        req = get_first_generation_req(req_or_group)
         if req is not None:
             warmup_req = req.copy_as_warmup(self.server_args.warmup_steps)
             recv_reqs.insert(0, (identity, warmup_req))
@@ -1202,11 +1161,11 @@ class Scheduler(SchedulerDisaggMixin):
                 for (identity, processed_req), output_batch in zip(
                     items, output_batches, strict=True
                 ):
-                    is_warmup = self._is_warmup_item(processed_req)
+                    is_warmup = is_warmup_req(processed_req)
                     self._log_warmup_result(output_batch, processed_req, is_warmup)
 
-                    if is_warmup and self._should_return_warmup_result(processed_req):
-                        self._drop_warmup_payload(output_batch)
+                    if is_warmup and should_return_warmup_result(processed_req):
+                        output_batch.drop_warmup_payload()
                         self.return_result(output_batch, identity, is_warmup=False)
                     else:
                         self.return_result(output_batch, identity, is_warmup=is_warmup)

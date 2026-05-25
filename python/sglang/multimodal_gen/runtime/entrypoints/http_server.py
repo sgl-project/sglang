@@ -45,6 +45,7 @@ VERTEX_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate")
 
 
 async def _wait_until_http_ready(server_args: ServerArgs) -> None:
+    """for server warmup"""
     health_url = f"{server_args.url()}/health"
     async with httpx.AsyncClient() as client:
         for _ in range(120):
