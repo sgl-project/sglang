@@ -57,10 +57,6 @@ from sglang.multimodal_gen.runtime.utils.common import (
     is_valid_ipv6_address,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
-    CYAN,
-    GREEN,
-    RED,
-    RESET,
     _sanitize_for_logging,
     configure_logger,
     init_logger,
@@ -424,9 +420,6 @@ class ServerArgs(DisaggArgsMixin):
             if self.image_encoder_cpu_offload is None:
                 self.image_encoder_cpu_offload = True
         elif self.pipeline_config.task_type.is_image_gen():
-            logger.info(
-                "Disabling some offloading (except dit, text_encoder) for image generation model"
-            )
             if self.dit_cpu_offload is None:
                 self.dit_cpu_offload = True
             if self.text_encoder_cpu_offload is None:
@@ -669,9 +662,13 @@ class ServerArgs(DisaggArgsMixin):
         if self.warmup_resolutions is not None:
             self.warmup = True
 
-        if self.warmup:
+        if self.warmup and self.warmup_resolutions is not None:
             logger.info(
-                "Warmup enabled, the launch time is expected to be longer than usual"
+                "Resolution warmup enabled; server launch may take longer than usual"
+            )
+        elif self.warmup:
+            logger.info(
+                "Request-based warmup enabled; the first generation request will run one warmup copy before processing"
             )
 
     @staticmethod
@@ -925,11 +922,18 @@ class ServerArgs(DisaggArgsMixin):
             self.vae_cpu_offload = False
             disabled_flag_names.append("vae_cpu_offload")
 
-        if disabled_flag_names:
+        explicit_disabled_flag_names = [
+            flag_name
+            for flag_name in disabled_flag_names
+            if self.is_arg_explicitly_set(flag_name)
+        ]
+        if explicit_disabled_flag_names:
             logger.info(
-                "Disabling %s because the selected layerwise offload components "
-                "manage the same weights.",
-                ", ".join(disabled_flag_names),
+                "Ignoring explicit CPU-offload flags because layerwise offload "
+                "manages the same component weights: %s",
+                ", ".join(
+                    f"{flag_name}=False" for flag_name in explicit_disabled_flag_names
+                ),
             )
 
     def _adjust_autocast(self):
@@ -1637,7 +1641,10 @@ class ServerArgs(DisaggArgsMixin):
 
     @classmethod
     def from_cli_args(
-        cls, args: argparse.Namespace, unknown_args: list[str] | None = None
+        cls,
+        args: argparse.Namespace,
+        unknown_args: list[str] | None = None,
+        default_args: dict[str, Any] | None = None,
     ) -> "ServerArgs":
         if unknown_args is None:
             unknown_args = []
@@ -1651,24 +1658,33 @@ class ServerArgs(DisaggArgsMixin):
             raise SystemExit(f"error: unrecognized arguments: {' '.join(remaining)}")
 
         provided_args = cls.get_provided_args(args, unknown_args)
+        explicit_arg_names = set(provided_args)
 
         # Handle config file
         config_file = provided_args.get("config")
         if config_file:
             config_args = cls.load_config_file(config_file)
+            explicit_arg_names.update(config_args)
             provided_args = {**config_args, **provided_args}
+
+        if default_args:
+            for key, value in default_args.items():
+                provided_args.setdefault(key, value)
 
         if dynamic_paths:
             existing = dict(provided_args.get("component_paths") or {})
             existing.update(dynamic_paths)
             provided_args["component_paths"] = existing
+            explicit_arg_names.add("component_paths")
         if dynamic_attention_backends:
             existing = cls._parse_component_attention_backend_map(
                 provided_args.get("component_attention_backends")
             )
             existing.update(dynamic_attention_backends)
             provided_args["component_attention_backends"] = existing
+            explicit_arg_names.add("component_attention_backends")
 
+        provided_args["_explicit_arg_names"] = explicit_arg_names
         return cls.from_dict(provided_args)
 
     @classmethod
@@ -1676,14 +1692,19 @@ class ServerArgs(DisaggArgsMixin):
         """Create a ServerArgs object from a dictionary."""
         attrs = [attr.name for attr in dataclasses.fields(cls) if attr.init]
         server_args_kwargs: dict[str, Any] = {}
+        explicit_arg_names = kwargs.get("_explicit_arg_names")
+        if explicit_arg_names is None:
+            explicit_arg_names = set(kwargs)
 
         component_paths = dict(kwargs.get("component_paths") or {})
         if component_paths:
             server_args_kwargs["component_paths"] = component_paths
-        server_args_kwargs["_explicit_arg_names"] = set(kwargs)
+        server_args_kwargs["_explicit_arg_names"] = set(explicit_arg_names)
 
         for attr in attrs:
-            if attr == "pipeline_config":
+            if attr == "_explicit_arg_names":
+                continue
+            elif attr == "pipeline_config":
                 pipeline_config = PipelineConfig.from_kwargs(kwargs)
                 logger.debug(f"Using PipelineConfig: {type(pipeline_config)}")
                 server_args_kwargs["pipeline_config"] = pipeline_config
@@ -1810,17 +1831,17 @@ class ServerArgs(DisaggArgsMixin):
                     "or disable SGLANG_CACHE_DIT_ENABLED."
                 )
 
-            logger.warning(
-                "layerwise offload components are selected: %slower GPU memory usage%s, but %smay reduce throughput or increase latency%s. "
-                "%sIf you are using multi-GPU deployment and already have enough memory headroom, prefer keeping layerwise offload disabled.%s "
-                "Please tune this based on your memory headroom and performance target.",
-                GREEN,
-                RESET,
-                RED,
-                RESET,
-                CYAN,
-                RESET,
-            )
+            if (
+                self.performance_mode == "memory"
+                or self.is_arg_explicitly_set("layerwise_offload_components")
+                or self.dit_layerwise_offload
+            ):
+                logger.info_once(
+                    "Using layerwise offload components: "
+                    f"{', '.join(self.layerwise_offload_components)}. "
+                    "This reduces peak GPU memory and can increase latency; use "
+                    "--performance-mode speed for GPU-resident defaults when memory allows."
+                )
 
     def _validate_parallelism(self):
         if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:
