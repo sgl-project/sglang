@@ -675,11 +675,11 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
-        assert (
-            self.conv_states_shape[-1] < self.mamba_chunk_size
-        ), f"{self.conv_states_shape[-1]=} should be less than {self.mamba_chunk_size}"
 
         if model_runner.server_args.enable_mamba_extra_buffer():
+            assert (
+                self.conv_states_shape[-1] < self.mamba_chunk_size
+            ), f"{self.conv_states_shape[-1]=} should be less than {self.mamba_chunk_size}"
             assert (
                 model_runner.server_args.mamba_track_interval >= self.mamba_chunk_size
             ), f"mamba_track_interval ({model_runner.server_args.mamba_track_interval}) must be >= mamba_chunk_size ({self.mamba_chunk_size})"
