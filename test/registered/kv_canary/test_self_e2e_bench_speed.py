@@ -23,28 +23,15 @@ register_cuda_ci(est_time=600, suite="nightly-1-gpu", nightly=True)
 _QWEN3_MODEL = "Qwen/Qwen3-0.6B"
 _QWEN3_SCENARIO_MODEL = "qwen3-0.6b"
 
-# When set, every bench scenario captures torch profiles of the canary-on run only,
-# under `${SGLANG_KV_CANARY_PROFILE_DIR}/<scenario>_on/{cuda_graph,no_cuda_graph_osl3}/`. In
-# this mode the canary-off baseline run + overhead assertion are skipped. We capture two
-# variants per scenario:
-#   * `cuda_graph/`        — the production config (matches the assertion run).
-#   * `no_cuda_graph_osl3/` — diagnostic-only: `--disable-cuda-graph` (NEVER use this in the
-#     assertion path) and `output_len=3` so the trace shows raw kernel launches without graph
-#     replay folding everything into a single node.
 _PROFILE_DIR_ENV = "SGLANG_KV_CANARY_PROFILE_DIR"
 _PROFILE_STEPS = 30
 _PROFILE_NO_GRAPH_OUTPUT_LEN = 3
-# start_profile blocks until num_steps complete, so it must be <= the actual decode steps the
-# request produces. The no-graph variant runs only 3 decode steps; mirror that here so the
-# trace flushes.
+# start_profile blocks until num_steps server steps complete, so it must be <= actual decode steps.
 _PROFILE_NO_GRAPH_STEPS = 3
 
 
 def _make_server_args(*, canary_on: bool, disable_cuda_graph: bool = False) -> ServerArgs:
-    # canary requires --disable-piecewise-cuda-graph (install_canary asserts it). Pass it on both
-    # sides for apples-to-apples. Do NOT pass --disable-cuda-graph in the assertion path: canary
-    # must run inside the regular cuda graph for a representative measurement. The flag is only
-    # honored in profile mode for the diagnostic no_cuda_graph_osl3 variant.
+    # install_canary asserts --disable-piecewise-cuda-graph; pass on both sides for apples-to-apples.
     extra = [
         "--model-path",
         _QWEN3_MODEL,
@@ -222,8 +209,6 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
         )
 
     def test_qwen3_prefill_overhead_bs32_isl16384_osl1(self) -> None:
-        # Observed ~18.78% on H200 (2026-05-25, commit 058313f54f). Budget set above with
-        # headroom; tighten once the prefill-side canary cost is reduced.
         self._measure_overhead(
             batch_size=32,
             input_len=16384,
@@ -232,7 +217,6 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
         )
 
     def test_qwen3_decode_overhead_bs128_isl512_osl1024(self) -> None:
-        # Tight budget — at bs=128 the per-step canary cost amortizes; observed <5%.
         self._measure_overhead(
             batch_size=128,
             input_len=512,
@@ -241,8 +225,6 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
         )
 
     def test_qwen3_decode_overhead_bs1_isl512_osl1024(self) -> None:
-        # Observed ~10.21% on H200 (2026-05-25, commit 058313f54f). The per-step canary cost does
-        # not amortize at bs=1; tighten once the single-request path is optimized.
         self._measure_overhead(
             batch_size=1,
             input_len=512,
