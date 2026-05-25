@@ -16,12 +16,14 @@ _GOOD_LINE: str = SwaDivergenceLog(
     verify_full=10000,
     verify_swa=4200,
     swa_full_idx_divergence=512,
+    swa_out_of_window_tokens=8192,
 ).format()
 _LATER_LINE: str = SwaDivergenceLog(
     forward_ct=240,
     verify_full=20000,
     verify_swa=8400,
     swa_full_idx_divergence=1024,
+    swa_out_of_window_tokens=16384,
 ).format()
 
 
@@ -84,6 +86,7 @@ class TestAssertSwaDivergenceObserved(CustomTestCase):
             verify_full=5000,
             verify_swa=2000,
             swa_full_idx_divergence=0,
+            swa_out_of_window_tokens=8192,
         ).format()
         harness, patcher = self._make_harness(zero_mapping_line + "\n")
         with patcher:
@@ -101,6 +104,7 @@ class TestAssertSwaDivergenceObserved(CustomTestCase):
             verify_full=5000,
             verify_swa=5000,
             swa_full_idx_divergence=200,
+            swa_out_of_window_tokens=8192,
         ).format()
         harness, patcher = self._make_harness(equal_verify_line + "\n")
         with patcher:
@@ -142,6 +146,7 @@ class TestAssertSwaDivergenceObserved(CustomTestCase):
             verify_full=10000,
             verify_swa=2000,
             swa_full_idx_divergence=0,
+            swa_out_of_window_tokens=8192,
         ).format()
         harness, patcher = self._make_harness(zero_divergence_line + "\n")
         with patcher:

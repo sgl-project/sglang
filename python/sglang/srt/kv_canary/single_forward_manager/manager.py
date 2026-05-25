@@ -38,10 +38,17 @@ class _SingleForwardPhase(IntEnum):
     AFTER_POST_MAYBE_IN = 3
 
 
+def _torch_reduce_minimum(tensors: list[torch.Tensor]) -> torch.Tensor:
+    out = tensors[0]
+    for t in tensors[1:]:
+        out = torch.minimum(out, t)
+    return out
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _PreOpsMaybeInsideGraphOutput:
-    verify_plan: VerifyPlan
-    write_plan: WritePlan
+    verify_plans: tuple[VerifyPlan, ...]
+    write_plans: tuple[WritePlan, ...]
     expected_inputs: ExpectedInputs
 
 
@@ -142,11 +149,17 @@ class SingleForwardManager:
             caller_name="SingleForwardManager.pre_ops_maybe_inside_graph",
         )
 
-        verify_plan = VerifyPlan.allocate(
-            verify_capacity=self._verify_capacity, device=self._device
+        verify_plans = tuple(
+            VerifyPlan.allocate(
+                verify_capacity=self._verify_capacity, device=self._device
+            )
+            for _ in self._buffer_groups
         )
-        write_plan = WritePlan.allocate(
-            write_req_capacity=self._write_req_capacity, device=self._device
+        write_plans = tuple(
+            WritePlan.allocate(
+                write_req_capacity=self._write_req_capacity, device=self._device
+            )
+            for _ in self._buffer_groups
         )
         expected_inputs = ExpectedInputs.allocate(
             capacity=self._write_entry_capacity, device=self._device
@@ -174,7 +187,9 @@ class SingleForwardManager:
         violation_log = self._device_state.violation_log
         num_tokens = int(forward_batch.positions.shape[0])
         expected_inputs_slice = expected_inputs.slice(num_tokens)
-        for group in self._buffer_groups:
+        for group_idx, group in enumerate(self._buffer_groups):
+            verify_plan = verify_plans[group_idx]
+            write_plan = write_plans[group_idx]
             invoke_plan(
                 plan_input=plan_input,
                 verify_plan=verify_plan,
@@ -202,8 +217,8 @@ class SingleForwardManager:
             )
 
         return _PreOpsMaybeInsideGraphOutput(
-            verify_plan=verify_plan,
-            write_plan=write_plan,
+            verify_plans=verify_plans,
+            write_plans=write_plans,
             expected_inputs=expected_inputs,
         )
 
@@ -222,13 +237,13 @@ class SingleForwardManager:
         num_tokens = int(forward_batch.positions.shape[0])
         expected_inputs_slice = pre_ops_output.expected_inputs.slice(num_tokens)
         input_check_mode = self._should_enable_input_check_for_launch(forward_batch)
-        for group in self._buffer_groups:
+        for group_idx, group in enumerate(self._buffer_groups):
             launch_endpoints_per_forward(
                 endpoints=self._endpoints,
                 group=group,
                 tag_filter=_is_tail_tag,
-                verify_plan=pre_ops_output.verify_plan,
-                write_plan=pre_ops_output.write_plan,
+                verify_plan=pre_ops_output.verify_plans[group_idx],
+                write_plan=pre_ops_output.write_plans[group_idx],
                 forward_batch=forward_batch,
                 expected_inputs=expected_inputs_slice,
                 violation_log=violation_log,
@@ -236,8 +251,11 @@ class SingleForwardManager:
                 input_check_mode=input_check_mode,
             )
 
+        verify_plan_enable_combined = _torch_reduce_minimum(
+            [x.enable for x in pre_ops_output.verify_plans]
+        )
         self._output_buffer.copy_from(
-            verify_plan_enable=pre_ops_output.verify_plan.enable,
+            verify_plan_enable=verify_plan_enable_combined,
             kernel_run_counters=self._device_state.kernel_run_counters,
             slot_run_counters=self._device_state.slot_run_counters,
             violation_write_index=self._device_state.violation_log.violation_write_index,
