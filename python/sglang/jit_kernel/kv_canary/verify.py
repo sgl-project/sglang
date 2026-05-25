@@ -192,23 +192,28 @@ class VerifyPlan:
 
     @classmethod
     def allocate(cls, *, verify_capacity: int, device: torch.device) -> "VerifyPlan":
-        """Allocate a fresh VerifyPlan, all zeros except enable which defaults to 1 (run verify)."""
+        """Allocate a fresh VerifyPlan with uninitialized storage.
+
+        plan_offsets_kernel always writes verify_num_valid + enable, and plan_entries_kernel
+        writes verify_slot_indices/positions/prev_slot_indices for [0, num_valid); the verify
+        kernel reads exactly that range. The padding tail is never accessed.
+        """
         if verify_capacity <= 0:
             raise ValueError(
                 f"kv-canary: VerifyPlan verify_capacity must be positive, got {verify_capacity}"
             )
         return cls(
-            verify_slot_indices=torch.zeros(
+            verify_slot_indices=torch.empty(
                 verify_capacity, dtype=torch.int64, device=device
             ),
-            verify_positions=torch.zeros(
+            verify_positions=torch.empty(
                 verify_capacity, dtype=torch.int64, device=device
             ),
-            verify_prev_slot_indices=torch.zeros(
+            verify_prev_slot_indices=torch.empty(
                 verify_capacity, dtype=torch.int64, device=device
             ),
-            verify_num_valid=torch.zeros(1, dtype=torch.int32, device=device),
-            enable=torch.ones(1, dtype=torch.int32, device=device),
+            verify_num_valid=torch.empty(1, dtype=torch.int32, device=device),
+            enable=torch.empty(1, dtype=torch.int32, device=device),
         )
 
 

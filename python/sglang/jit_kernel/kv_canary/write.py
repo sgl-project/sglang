@@ -53,19 +53,23 @@ class WritePlan:
         write_req_capacity: int,
         device: torch.device,
     ) -> "WritePlan":
-        """Allocate a fresh WritePlan, all zeros."""
+        """Allocate a fresh WritePlan with uninitialized storage.
+
+        plan_offsets_kernel writes write_offsets[0, bs+1] / write_seed_slot_indices[0, bs] /
+        write_num_valid_reqs; the write kernel reads exactly that range. Padding tail unused.
+        """
         if write_req_capacity <= 0:
             raise ValueError(
                 f"kv-canary: WritePlan write_req_capacity must be positive, got {write_req_capacity}"
             )
         return cls(
-            write_offsets=torch.zeros(
+            write_offsets=torch.empty(
                 write_req_capacity + 1, dtype=torch.int64, device=device
             ),
-            write_seed_slot_indices=torch.zeros(
+            write_seed_slot_indices=torch.empty(
                 write_req_capacity, dtype=torch.int64, device=device
             ),
-            write_num_valid_reqs=torch.zeros(1, dtype=torch.int32, device=device),
+            write_num_valid_reqs=torch.empty(1, dtype=torch.int32, device=device),
         )
 
 
