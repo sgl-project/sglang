@@ -11,6 +11,7 @@ is set.
 """
 
 import copy
+import dataclasses
 import hashlib
 import inspect
 import json
@@ -34,24 +35,24 @@ from sglang.srt.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
-# 512 MB
+# gRPC defaults to a small 4MB message cap. SMG sends already-preprocessed
+# pixel tensors, so use a larger bounded default and keep an env override.
 _DEFAULT_GRPC_MAX_MESSAGE_MB = 512
 
 
 def _grpc_max_message_bytes() -> int:
     raw = os.environ.get("SGLANG_GRPC_MAX_MESSAGE_MB")
-    if raw is None:
-        return _DEFAULT_GRPC_MAX_MESSAGE_MB * 1024 * 1024
-    try:
-        value = int(raw)
-    except ValueError:
-        logger.warning(
-            "Invalid SGLANG_GRPC_MAX_MESSAGE_MB=%r; falling back to %dMB",
-            raw,
-            _DEFAULT_GRPC_MAX_MESSAGE_MB,
-        )
-        value = _DEFAULT_GRPC_MAX_MESSAGE_MB
-    return max(value, 1) * 1024 * 1024
+    mb = _DEFAULT_GRPC_MAX_MESSAGE_MB
+    if raw is not None:
+        try:
+            mb = int(raw)
+        except ValueError:
+            logger.warning(
+                "Invalid SGLANG_GRPC_MAX_MESSAGE_MB=%r; falling back to %dMB",
+                raw,
+                _DEFAULT_GRPC_MAX_MESSAGE_MB,
+            )
+    return max(mb, 1) * 1024 * 1024
 
 
 def _with_grpc_message_size_options(options, max_message_bytes: int):
@@ -79,9 +80,9 @@ def _patch_grpc_message_size_options() -> None:
             kwargs["options"] = _with_grpc_message_size_options(
                 kwargs["options"], max_message_bytes
             )
-        elif len(args) >= 4:
+        elif len(args) >= 3:
             args = list(args)
-            args[3] = _with_grpc_message_size_options(args[3], max_message_bytes)
+            args[2] = _with_grpc_message_size_options(args[2], max_message_bytes)
         else:
             kwargs["options"] = _with_grpc_message_size_options(None, max_message_bytes)
         return original_aio_server(*args, **kwargs)
@@ -106,14 +107,11 @@ def _patch_grpc_request_manager_shm_transport() -> None:
         if not isinstance(obj, TokenizedGenerateReqInput) or obj.mm_inputs is None:
             return obj
 
-        copied = copy.copy(obj)
-        copied.mm_inputs = copy.copy(obj.mm_inputs)
-        copied.mm_inputs.mm_items = [
-            copy.copy(item) for item in copied.mm_inputs.mm_items
-        ]
-        for item in copied.mm_inputs.mm_items:
+        mm_items = [copy.copy(item) for item in obj.mm_inputs.mm_items]
+        for item in mm_items:
             item.set_pad_value()
-        return copied
+        mm_inputs = dataclasses.replace(obj.mm_inputs, mm_items=mm_items)
+        return dataclasses.replace(obj, mm_inputs=mm_inputs)
 
     async def send_to_scheduler_with_shm(self, obj):
         if obj is not None:
