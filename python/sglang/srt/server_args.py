@@ -755,6 +755,7 @@ class ServerArgs:
     enable_deterministic_inference: bool = False
     rl_on_policy_target: Optional[str] = None
     enable_attn_tp_input_scattered: bool = False
+    disable_attn_tp_gather: bool = False
     gc_threshold: Optional[List[int]] = None
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_dsa_prefill_context_parallel: bool = False
@@ -6525,6 +6526,18 @@ class ServerArgs:
             "--enable-attn-tp-input-scattered",
             action="store_true",
             help="Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
+        )
+        parser.add_argument(
+            "--disable-attn-tp-gather",
+            action="store_true",
+            help="Disable scheduler-side attn_tp_gather (the upstream SP path "
+            "that pads num_tokens to attn_tp_size and pre-allocates a gathered "
+            "buffer). Use for models that manage SP scatter/gather at the "
+            "model level (e.g., perform their own all_gather/reduce_scatter "
+            "inside attention) and do not consume the upstream gathered_buffer. "
+            "Without this, the cuda graph runner pads num_tokens to attn_tp_size, "
+            "which can cause kernel autotuners to select wrong-sized variants "
+            "at small batches.",
         )
         parser.add_argument(
             "--enable-dsa-prefill-context-parallel",
