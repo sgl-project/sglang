@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
 
 import requests
 
@@ -34,7 +33,6 @@ def post_parallel_generate(
     prompts: list[str],
     max_new_tokens: int,
     timeout: float,
-    max_workers: Optional[int] = None,
 ) -> list[dict]:
     def _send(prompt: str) -> dict:
         try:
@@ -53,7 +51,5 @@ def post_parallel_generate(
         except requests.RequestException as exc:
             return {"status_code": -1, "error": repr(exc)}
 
-    workers = max_workers if max_workers is not None else len(prompts)
-    workers = max(1, min(workers, len(prompts)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    with ThreadPoolExecutor(max_workers=max(1, len(prompts))) as pool:
         return list(pool.map(_send, prompts))

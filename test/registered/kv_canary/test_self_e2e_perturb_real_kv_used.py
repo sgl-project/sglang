@@ -30,10 +30,8 @@ class _PerturbRealKvUsedBase(CanaryE2EBase):
 
     def test_real_kv_used_perturbation_reports_real_kv_hash_violation(self) -> None:
         """Verify active real KV perturbation reports a real KV hash violation."""
-        self.send_parallel_requests(
-            n=self.workload_n_requests,
-            max_concurrent=self.workload_max_concurrent,
-        )
+        for _ in range(self.workload_n_batches):
+            self.send_parallel_requests()
         self.assert_per_forward_violation_reported(
             fail_reason="real_kv_hash",
             target_group=self.target_group,
@@ -52,13 +50,7 @@ class _PerturbRealKvUsedSwaBase(_PerturbRealKvUsedBase):
     __test__ = False
 
     model_mode = "swa"
-    extra_server_args = (
-        *_PerturbRealKvUsedBase.extra_server_args,
-        "--swa-full-tokens-ratio",
-        "0.3",
-    )
-    workload_n_requests = 16
-    workload_max_concurrent = 4
+    workload_n_batches = 2
     use_unique_prompts = True
 
 

@@ -20,10 +20,8 @@ class _PerturbReqToTokenBase(CanaryE2EBase):
 
     def test_req_to_token_perturbation_reports_chain_hash_violation(self) -> None:
         """Verify req_to_token perturbation reports a chain hash violation."""
-        self.send_parallel_requests(
-            n=self.workload_n_requests,
-            max_concurrent=self.workload_max_concurrent,
-        )
+        for _ in range(self.workload_n_batches):
+            self.send_parallel_requests()
         self.assert_per_forward_violation_reported(fail_reason="chain_hash")
         self.maybe_assert_swa_divergence_observed()
 
@@ -38,9 +36,7 @@ class TestPerturbReqToTokenSwa(_PerturbReqToTokenBase):
     __test__ = True
 
     model_mode = "swa"
-    extra_server_args = ("--swa-full-tokens-ratio", "0.3")
-    workload_n_requests = 16
-    workload_max_concurrent = 4
+    workload_n_batches = 2
     use_unique_prompts = True
 
 

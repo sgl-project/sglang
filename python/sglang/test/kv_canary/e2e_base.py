@@ -69,11 +69,10 @@ class CanaryE2EBase(CapturedServerE2EBase):
     extra_env: ClassVar[dict[str, str]] = {}
     extra_server_args: ClassVar[tuple[str, ...]] = ()
     use_unique_prompts: ClassVar[bool] = False
-    # Per-class workload knobs consumed by the test_* helpers. SWA divergence assertions
-    # need enough sequential request churn (many small batches) to evict & remap SWA pool
-    # slots; setting workload_n_requests > workload_max_concurrent triggers this.
-    workload_n_requests: ClassVar[int] = 8
-    workload_max_concurrent: ClassVar[Optional[int]] = None
+    # SWA divergence assertions need slot recycling across batches; setting > 1 makes the
+    # test methods send N sequential batches so the SWA allocator's full→swa index mapping
+    # diverges from identity. Default 1 keeps MHA tests fast.
+    workload_n_batches: ClassVar[int] = 1
 
     _cfg: ClassVar[Optional[_ModeConfig]] = None
 
@@ -121,20 +120,13 @@ class CanaryE2EBase(CapturedServerE2EBase):
         assert_all_success: bool = True,
         max_new_tokens: int = 2048,
         timeout: float = 240.0,
-        max_concurrent: Optional[int] = None,
     ) -> list[dict]:
-        """Fan out n /generate requests with bounded concurrency; return response dicts.
-
-        If max_concurrent is None, all n requests are sent in parallel. Otherwise the
-        ThreadPool caps in-flight requests at max_concurrent — useful for SWA tests that
-        need many sequential batches to recycle the SWA pool and trigger divergence.
-        """
+        """Fan out n parallel /generate requests; return list of response dicts."""
         results = post_parallel_generate(
             url=self.base_url + "/generate",
             prompts=self.make_prompts(n),
             max_new_tokens=max_new_tokens,
             timeout=timeout,
-            max_workers=max_concurrent,
         )
         if assert_all_success:
             for result in results:

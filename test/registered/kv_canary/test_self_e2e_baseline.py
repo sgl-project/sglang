@@ -20,10 +20,8 @@ class _BaselineBase(CanaryE2EBase):
 
     def test_no_violation(self) -> None:
         """Verify the baseline canary run completes without violations."""
-        self.send_parallel_requests(
-            n=self.workload_n_requests,
-            max_concurrent=self.workload_max_concurrent,
-        )
+        for _ in range(self.workload_n_batches):
+            self.send_parallel_requests()
         self.assert_no_violation(wait_seconds=2.0)
         self.maybe_assert_swa_divergence_observed()
 
@@ -38,14 +36,12 @@ class TestBaselineSwa(_BaselineBase):
     __test__ = True
 
     model_mode = "swa"
-    # Tight SWA pool (≈19K slots) forces window reorganization across sequential batches
-    # so swa_full_idx_divergence > 0. Concurrency 4 keeps SWA in-flight footprint below
-    # the pool cap; 16 sequential requests cycle the pool enough to surface divergence.
-    # use_unique_prompts isolates per-request slot tables so radix-shared prefixes don't
-    # trip the chunked-prefill chain_hash false-positive (same root cause as pr_25015).
-    extra_server_args = ("--swa-full-tokens-ratio", "0.3")
-    workload_n_requests = 16
-    workload_max_concurrent = 4
+    # Two sequential batches force the SWA allocator's full→swa index mapping to diverge
+    # from identity after the first batch finishes and frees window slots, so
+    # swa_full_idx_divergence > 0 on the second batch's traffic. Unique prompts keep each
+    # request's slot table isolated and avoid the chunked-prefill chain_hash false-positive
+    # (same workaround as pr_25015).
+    workload_n_batches = 2
     use_unique_prompts = True
 
 
