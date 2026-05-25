@@ -17,6 +17,6 @@ Backends in ``cuda_graph_backend/`` import from here. Runners do not.
 CUDA_GRAPH_CAPTURE_FAILED_MSG = (
     "CUDA graph capture failed.\n"
     "To work around this error, add --disable-cuda-graph to your launch command\n"
-    "(or use --decode-disable-cuda-graph to disable only the decode phase).\n"
+    "(or use --disable-decode-cuda-graph to disable only the decode phase).\n"
     "Please report this issue at https://github.com/sgl-project/sglang/issues/new/choose"
 )

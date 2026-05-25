@@ -724,10 +724,10 @@ class ServerArgs:
     # Legacy CLI inputs that fold into ``cuda_graph_settings`` (with a CLI
     # deprecation warning). Internal-only after parsing.
     disable_cuda_graph: bool = False
+    disable_prefill_cuda_graph: bool = False
+    disable_decode_cuda_graph: bool = False
     prefill_cuda_graph_backend: Optional[str] = None
     decode_cuda_graph_backend: Optional[str] = None
-    prefill_disable_cuda_graph: bool = False
-    decode_disable_cuda_graph: bool = False
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
     enable_layerwise_nvtx_marker: bool = False
@@ -1358,9 +1358,9 @@ class ServerArgs:
             _set(Phase.PREFILL, "tc_compiler", self.piecewise_cuda_graph_compiler)
 
         # ---- Legacy convenience flags ----
-        if self.prefill_disable_cuda_graph:
+        if self.disable_prefill_cuda_graph:
             _set(Phase.PREFILL, "backend", Backend.DISABLED)
-        if self.decode_disable_cuda_graph:
+        if self.disable_decode_cuda_graph:
             _set(Phase.DECODE, "backend", Backend.DISABLED)
         if self.prefill_cuda_graph_backend is not None:
             _set(Phase.PREFILL, "backend", self.prefill_cuda_graph_backend)
@@ -4001,7 +4001,7 @@ class ServerArgs:
 
             prefill_cg_disabled_by_user = (
                 self.disable_cuda_graph
-                or self.prefill_disable_cuda_graph
+                or self.disable_prefill_cuda_graph
                 or self.prefill_cuda_graph_backend == Backend.DISABLED
                 or (
                     self.cuda_graph_settings is not None
@@ -6560,13 +6560,13 @@ class ServerArgs:
             help="Deprecated alias for --cuda-graph-backend-decode.",
         )
         parser.add_argument(
-            "--prefill-disable-cuda-graph",
+            "--disable-prefill-cuda-graph",
             action=DeprecatedStoreTrueAction,
             new_flag="--cuda-graph-backend-prefill=disabled",
             help="Deprecated. Use --cuda-graph-backend-prefill=disabled instead.",
         )
         parser.add_argument(
-            "--decode-disable-cuda-graph",
+            "--disable-decode-cuda-graph",
             action=DeprecatedStoreTrueAction,
             new_flag="--cuda-graph-backend-decode=disabled",
             help="Deprecated. Use --cuda-graph-backend-decode=disabled instead.",
