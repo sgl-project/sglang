@@ -71,8 +71,8 @@ class _PoolCapacityBenchCase:
             no padding (``bs_padded == bs``); a concrete value pads ``req_pool_indices``
             with ``REQ_POOL_IDX_PADDING`` sentinels in rows ``[bs, bs_padded)``.
         prefix_len: Per-active-request prefix length.
-        verify_capacity: Plan tensor row capacity (and thus the second grid dim).
-        pool_kind: "full" or "swa_window_128".
+        verify_capacity: Plan tensor row capacity.
+        pool_kind: "full".
     """
 
     bs: int

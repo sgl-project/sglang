@@ -102,7 +102,7 @@ class _MockModelPDBase(PDDisaggregationServerBase):
 
 
 class TestPdTransferCanaryClean(_MockModelPDBase, unittest.TestCase):
-    """PD standard scenario + canary all-on, no violation expected."""
+    """PD standard scenario + baseline canary (input-check, no real-KV checksum); no violation expected."""
 
     def test_pd_transfer_canary_clean(self) -> None:
         # Step 1: send parallel requests through the LB to exercise PD transfer path.

@@ -131,7 +131,7 @@ class TestPoolPatchBufferInfos(PoolPatchHelper, CustomTestCase):
         self.assertEqual(len(state_after), len(state_before) + 4)
 
     def test_pd_layout_canary_inserted_correctly(self):
-        """Verify paged-decoding canary buffers are inserted in layout order."""
+        """Verify PD (prefill-decode disaggregation) canary buffers are inserted in layout order."""
         pool = make_mha_pool(self.device, num_slots=16, dim=8, layer_num=2)
         k_ptrs_orig = [b.data_ptr() for b in pool.k_buffer]
         v_ptrs_orig = [b.data_ptr() for b in pool.v_buffer]

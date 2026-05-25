@@ -25,7 +25,7 @@ register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")
 
 class TestManagerPerForward(CanaryManagerTestCase):
     def test_per_forward_orchestrates_plan_head_tail(self) -> None:
-        """Verify per-forward execution launches plan, head, and tail kernels."""
+        """Verify per-forward execution launches plan, head/tail verify kernels, and write kernels in order."""
         calls: list[object] = []
         with patch.object(
             kernel_launch_module,
@@ -73,7 +73,7 @@ class TestManagerPerForward(CanaryManagerTestCase):
 
 class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
     def test_launch_endpoints_per_forward_keeps_padded_token_tensors(self) -> None:
-        """Verify endpoint launch preserves CUDA graph-stable tensor shapes."""
+        """Verify endpoint launch preserves contiguous int64 tensor shapes/values through the canonicalizer."""
         group = make_buffer_group(device=self.device)
         endpoint = RecordingEndpoint(kernel_kind=CanaryLaunchTag.HEAD_K_FULL)
         forward_batch = make_forward_batch(self.device, bs=1, seq_lens_list=(1,))
@@ -210,15 +210,12 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
 class TestManagerBeforeForward(CanaryManagerTestCase):
     def test_before_forward_does_not_throw_on_oversized_prefix_sum(self) -> None:
         """Verify oversized prefix sums are handled without host-side errors."""
-        # Overflow no longer raises host-side: the plan kernel sets VerifyPlan.enable=0 and the
-        # verify kernel skips the step on-device; host logs a throttled warning instead.
         manager = make_manager(device=self.device, per_forward_verify_capacity=4)
         forward_batch = make_forward_batch(self.device, bs=2, seq_lens_list=(5, 5))
         _drive_one_cycle(manager, forward_batch)
 
     def test_before_forward_passes_when_sum_prefix_lens_fits(self) -> None:
         """Verify prefix sums within capacity pass before-forward handling."""
-        # Same multi-req shape that breaks the old sizing now fits the new capacity formula.
         manager = make_manager(device=self.device, per_forward_verify_capacity=16)
         forward_batch = make_forward_batch(self.device, bs=2, seq_lens_list=(5, 5))
         _drive_one_cycle(manager, forward_batch)

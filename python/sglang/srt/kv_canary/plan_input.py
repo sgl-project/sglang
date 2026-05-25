@@ -17,23 +17,15 @@ class PlanInput:
 
     Fields:
         req_pool_indices: Per-row ReqToTokenPool row index, shape [bs_capacity], int64.
-            0 = padding sentinel. Pre-allocated static buffer that the runner writes into each
-            step (see Static-buffer contract below).
+            0 = padding sentinel.
         prefix_lens: Per-req prefix length already written before this step, shape
             [bs_capacity], int64. Extend → extend_prefix_lens; decode → seq_lens - 1.
         extend_seq_lens: Per-req tokens being written this step, shape [bs_capacity], int64.
             Extend length or all-ones for decode.
 
-    Allocated up front by :class:`SingleForwardManager`. The boundary
+    Allocated fresh per forward by :class:`SingleForwardManager`. The boundary
     ForwardBatch token/position/slot tensors must already be int64
     contiguous (upstream phase-1 hook is responsible).
-
-    **Static-buffer contract (cuda-graph correctness)**: the PlanInput's
-    tensors are allocated once at SingleForwardManager construction time (sized for the
-    worst-case per-forward batch). The per-forward builder MUTATES those
-    tensors in place each step via ``.copy_()`` / ``.fill_()`` / in-place
-    arithmetic. The captured cuda-graph reads them by address; therefore
-    no reallocation is permitted.
     """
 
     req_pool_indices: torch.Tensor

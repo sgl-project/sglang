@@ -111,8 +111,8 @@ def make_verify_plan(
 ) -> VerifyPlan:
     """Build a VerifyPlan whose active prefix matches the three input lists.
 
-    Padding tail entries (when ``capacity`` exceeds the active length) are zeroed; ``verify_num_valid`` is
-    set to the length of the input lists.
+    Active prefix mirrors the input lists. Tail entries are left at the
+    allocate-time zero values; ``verify_num_valid = len(slot_indices)``.
     """
     n_active = len(slot_indices)
     if not (len(positions) == n_active and len(prev_slot_indices) == n_active):

@@ -64,7 +64,7 @@ class CanaryEndpoint:
             plan=verify_plan,
         )
 
-        # SWA endpoints translate the per-token slot indices host-side before invoking the write kernel.
+        # SWA endpoints translate the per-token slot indices via a device tensor index op before invoking the write kernel.
         if self.full_to_swa_index_mapping is not None:
             out_cache_loc_for_canary = self.full_to_swa_index_mapping[out_cache_loc]
         else:

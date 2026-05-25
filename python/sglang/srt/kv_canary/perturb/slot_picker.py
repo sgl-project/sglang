@@ -6,10 +6,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.kv_canary.radix_cache_walker import walk_radix_cache_for_canary
-
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -79,45 +76,6 @@ def collect_active_slots(
             if (value := int(raw_value)) >= 0 and value not in excluded
         )
     return candidates
-
-
-def pick_active_slot(
-    *,
-    maybe_inaccurate_forward_batch: "ForwardBatch",
-    req_to_token_pool: "ReqToTokenPool",
-    exclude_out_cache_loc: bool = True,
-) -> Optional[ReqToTokenEntry]:
-    """Random pick from ``collect_active_slots`` output. Returns None if no candidate."""
-    candidates = collect_active_slots(
-        maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
-        req_to_token_pool=req_to_token_pool,
-        exclude_out_cache_loc=exclude_out_cache_loc,
-    )
-    if not candidates:
-        return None
-    pick = int(torch.randint(0, len(candidates), (1,)).item())
-    return candidates[pick]
-
-
-def pick_orphan_slot(*, radix_cache: Optional["BasePrefixCache"]) -> Optional[int]:
-    """Pick one random orphan slot (radix-cached but not currently locked by any active req).
-    Returns None if radix_cache is None or no orphan slots exist."""
-    if radix_cache is None:
-        return None
-    walk_result = walk_radix_cache_for_canary(
-        radix_cache=radix_cache,
-        unlocked_only=True,
-    )
-    slot_tensor = walk_result.slot_indices
-    if slot_tensor.numel() == 0:
-        return None
-    valid: list[int] = [
-        slot for raw_slot in slot_tensor.tolist() if (slot := int(raw_slot)) >= 0
-    ]
-    if not valid:
-        return None
-    pick = int(torch.randint(0, len(valid), (1,)).item())
-    return valid[pick]
 
 
 def pick_out_cache_loc_slot(

@@ -26,7 +26,7 @@ _QWEN3_SCENARIO_MODEL = "qwen3-0.6b"
 # When set, every bench scenario captures a 30-step torch profile of the
 # canary-on run only, under `${KV_CANARY_PROFILE_DIR}/<scenario>_on/`. In this
 # mode the canary-off baseline run is skipped entirely (no overhead is
-# computed and the 200% assertion does not fire), so the bench finishes in
+# computed and the 5% assertion does not fire), so the bench finishes in
 # roughly half the time and the on-side trace is what you read.
 _PROFILE_DIR_ENV = "KV_CANARY_PROFILE_DIR"
 _PROFILE_STEPS = 30

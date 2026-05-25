@@ -5421,7 +5421,7 @@ class ServerArgs:
             type=str,
             choices=SAMPLING_BACKEND_CHOICES,
             default=ServerArgs.sampling_backend,
-            help="Choose the kernels for sampling layers. ",
+            help="Choose the kernels for sampling layers.",
         )
         parser.add_argument(
             "--grammar-backend",

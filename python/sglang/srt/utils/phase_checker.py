@@ -36,7 +36,7 @@ def _phase_check_kernel(
     if enable_assert != 0:
         if cur != EXPECT_PHASE:
             # constexpr values get baked into the prefix string at compile time;
-            # only `cur` is runtime and shown as "(operand 0) <int>".
+            # only `cur` is runtime.
             tl.device_print(
                 f"[SimplePhaseChecker FAIL] caller_tag={CALLER_TAG} "
                 f"expect={EXPECT_PHASE} next={NEXT_PHASE} actual=",
@@ -63,7 +63,7 @@ class SimplePhaseChecker:
         )
 
     def enable_assert(self) -> None:
-        """Turn on the device-side assert and reset phase to ``initial_phase``."""
+        """Reset phase to initial_phase, then enable the device-side assert."""
         self._reset_to_idle()
         self._enable_assert_device.fill_(1)
         _host_debug(f"[SimplePhaseChecker.enable_assert] assert ENABLED")

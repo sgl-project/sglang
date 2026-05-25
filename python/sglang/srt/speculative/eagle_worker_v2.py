@@ -485,8 +485,8 @@ class EagleDraftWorker(BaseDraftWorker):
             spec_info.hidden_states = hidden_states
 
             # Run forward under a per-step ForwardContext so the model layer
-            # reads attn_backends[i] for the i-th draft step. ``_forward_raw``
-            # honors the outer context and does not override.
+            # reads attn_backends[i] for the i-th draft step, plus a canary
+            # index context so canary tracks which draft step is active.
             canary_index_ctx = (
                 c.with_active_single_forward_manager(i)
                 if (c := self.draft_runner.canary_manager) is not None

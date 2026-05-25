@@ -12,7 +12,7 @@ from sglang.jit_kernel.utils import cache_once, load_jit
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-# Bytes per canary slot. Derived from the int64 field count above.
+# Bytes per canary slot = CANARY_FIELDS_PER_SLOT * 8.
 CANARY_SLOT_BYTES: Final[int] = consts.CANARY_FIELDS_PER_SLOT * 8
 
 
@@ -250,9 +250,11 @@ def launch_canary_verify_kernel(
           verify entries `entry_idx ∈ [tid, tid + grid_threads, ...)` until
           `min(plan.verify_num_valid[0], verify_capacity)`.
         - Per thread, gather:
-          (a) self_slot = canary_buf[plan.verify_slot_indices[tid]] (32 B uint8 load, vectorized as 4× int64).
-          (b) prev_slot = canary_buf[plan.verify_prev_slot_indices[tid]] when prev >= 0 (same shape); else
-              expected_prev_hash = splitmix64(CANARY_CHAIN_ANCHOR).
+          (a) self_slot fields: 4 separate ``canary_load_field`` int64 loads from
+              canary_buf[plan.verify_slot_indices[tid]] for (token, position, prev_hash, real_kv_hash).
+          (b) expected_prev_hash = compute_slot_hash(canary_buf, slot_stride_bytes, prev_slot_idx), which
+              folds only (token, position, prev_hash) from canary_buf[plan.verify_prev_slot_indices[tid]];
+              prev_slot_idx == -1 anchors at splitmix64(CANARY_CHAIN_ANCHOR).
           (c) For each src in real_kv_sources: read src.read_bytes leading bytes from src.tensor[...] (per the
               RealKvSource access invariant) and splitmix64-fold into running_real_kv_hash.
         - Compare expected vs stored (chain hash, position, real_kv_hash) and accumulate fail_reason bits; if
@@ -260,8 +262,9 @@ def launch_canary_verify_kernel(
         - record_violation(): idx = atomicAdd(violation_write_index, 1); if idx < ring_capacity, atomic-write
           the 8 int64 fields to violation_ring[idx] (kernel_kind, slot_idx, position, stored vs expected
           fields, fail_reason).
-        - Counters: warp-reduce per-thread "did I process an active entry?" via __ballot_sync + popc, then
-          warp-leader atomicAdd to slot_run_counter. kernel_run_counter += 1: single thread (tid == 0) does an
+        - Counters: each thread maintains a local count of active entries it processed, warp-reduces via
+          ``__shfl_down_sync`` (offsets 16..1), then the warp leader (lane 0) does a single atomicAdd of the
+          warp's summed count into slot_run_counter. kernel_run_counter += 1: single thread (tid == 0) does an
           atomicAdd once per launch.
 
     Calling contract:

@@ -14,7 +14,8 @@ class ViolationLog:
 
     One instance per canary runner — every launch (head / tail / sweep, K / V half, FULL / SWA group) writes
     into the same ring. The kernel_kind field stamped into each violation row identifies which launch fired
-    (kernel_kind is a unique int per (head|tail|sweep, K|V, FULL|SWA) tuple; assigned by the runner).
+    (kernel_kind is a static IntEnum tag — :class:`CanaryLaunchTag` in
+    ``sglang.jit_kernel.kv_canary.verify`` — with a unique value per (head|tail|sweep, K|V, FULL|SWA) tuple).
 
     Ring capacity is sized generously (≥ 1024) so overflow is a non-concern in practice — violations are
     cold-path and the host raises at the first one anyway (or just logs it in mode="log"). atomicAdd
