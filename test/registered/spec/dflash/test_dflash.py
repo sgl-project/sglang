@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=302, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=336, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):

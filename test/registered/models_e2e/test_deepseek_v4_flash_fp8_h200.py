@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=280, stage="base-c", runner_config="dsv4-8-gpu-h200")
+register_cuda_ci(est_time=176, stage="base-c", runner_config="dsv4-8-gpu-h200")
 
 MODEL_FP8 = "sgl-project/DeepSeek-V4-Flash-FP8"
 SERVER_LAUNCH_TIMEOUT = 3600

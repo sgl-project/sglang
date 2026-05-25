@@ -16,7 +16,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _make_req(
