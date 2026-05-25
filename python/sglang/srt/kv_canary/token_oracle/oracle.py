@@ -7,16 +7,7 @@ import torch
 
 
 class TokenOracle(Protocol):
-    """Deterministic (generalized_req_id, position) -> token_id mapping.
-
-    All inputs/outputs live on device. Element-wise:
-    `out[i] = oracle(generalized_req_ids[i], positions[i])`. No host sync. Input dtypes int64
-    or int32; output dtype int32 on the same device.
-
-    The oracle has NO knowledge of canary. Both the _OracleSampler (output side) and
-    fill_expected_inputs (input-check side) consume the same oracle so the two perspectives
-    agree by construction.
-    """
+    """Deterministic (generalized_req_id, position) -> token_id mapping."""
 
     def expected_tokens(
         self, *, generalized_req_ids: torch.Tensor, positions: torch.Tensor
@@ -25,14 +16,7 @@ class TokenOracle(Protocol):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class HashOracle:
-    """token_id = splitmix64(generalized_req_id XOR position) % vocab_size.
-
-    Default oracle. A `seed: int` field can be reintroduced (XOR'd into the hash input) if
-    different installs ever need decorrelated token streams; today every install shares one
-    deterministic mapping, so the field is omitted to avoid the per-call H2D copy that
-    materializing a scalar seed tensor required.
-    """
-
+    """token_id = splitmix64(generalized_req_id XOR position) % vocab_size."""
     vocab_size: int
 
     def expected_tokens(

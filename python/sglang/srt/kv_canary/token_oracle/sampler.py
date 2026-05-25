@@ -18,7 +18,6 @@ if TYPE_CHECKING:
 
 
 def install_oracle_sampler(*, oracle: TokenOracle) -> TokenOracleManager:
-    """Calling twice replaces the previously registered manager."""
     manager = TokenOracleManager(oracle=oracle)
     register_sampler_backend(
         "token_oracle",
