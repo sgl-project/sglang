@@ -96,7 +96,9 @@ def launch_canary_plan_kernels(
         )
 
     device = verify_plan_out.verify_slot_indices.device
-    verify_offsets_scratch = torch.zeros(
+    # Uninitialized — plan_offsets_kernel writes [0, bs+1] and plan_entries_kernel reads
+    # only that same range; padding tail is never accessed.
+    verify_offsets_scratch = torch.empty(
         _PLAN_BS_BLOCK_SIZE + 1, dtype=torch.int64, device=device
     )
 
