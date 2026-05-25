@@ -664,6 +664,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
 
     num_slots = max_reqs * max_seq_len
 
+    # Step 1: pre-pollute canary_buf slots [0..n_slots) with wrong prev_hash so verify fires n_slots violations.
     buf_real = make_canary_buf(num_slots=num_slots, device=_DEVICE)
     buf_ref = make_canary_buf(num_slots=num_slots, device=_DEVICE)
     for slot_idx in range(n_slots):
@@ -678,6 +679,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
                 real_kv_hash=0,
             )
 
+    # Step 2: run real pipeline (plan + no write + verify); overflow ring capacity=4 with all n_slots violations.
     ring_capacity = 4
     log_real = FakeViolationLog.allocate(capacity=ring_capacity, device=_DEVICE)
     log_ref = FakeViolationLog.allocate(capacity=ring_capacity, device=_DEVICE)
@@ -740,6 +742,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
         plan=plan_v_ref,
     )
 
+    # Step 3: write_index byte-equal; ring contents relaxed (atomic order not guaranteed under overflow).
     assert torch.equal(log_real.write_index, log_ref.write_index)
     assert int(log_real.write_index[0].item()) == n_slots
 

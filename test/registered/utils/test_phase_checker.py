@@ -1,3 +1,5 @@
+"""Unit tests for srt/utils/phase_checker.py — SimplePhaseChecker."""
+
 from __future__ import annotations
 
 import subprocess
