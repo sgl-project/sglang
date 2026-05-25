@@ -16,7 +16,9 @@ import glob
 import json
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # Add python directory to path to import sglang modules
@@ -30,6 +32,8 @@ from sglang.srt.model_loader.ci_weight_validation import (  # noqa: E402
 
 # Limits to avoid spending too much time on validation
 MAX_VALIDATION_TIME_SECONDS = 300  # Max 5 minutes total
+# Validation is I/O-bound (stat + small JSON reads), so threads scale well.
+MAX_VALIDATION_WORKERS = 16
 
 
 def find_all_hf_snapshots():
@@ -280,13 +284,66 @@ def validate_snapshot(model_name, snapshot_dir, weight_files, validated_cache):
         return False, error_msg
 
 
+def _validate_one_snapshot(
+    idx, total, model_name, snapshot_dir, validated_cache, cache_lock
+):
+    """Return (output_text, 'pass'|'fail'|'skip'). Logging is returned as
+    one string so concurrent workers don't interleave mid-block."""
+    snapshot_hash = os.path.basename(snapshot_dir)
+    header = f"[{idx}/{total}] {model_name} ({snapshot_hash[:8]}...)"
+
+    model_index_path = os.path.join(snapshot_dir, "model_index.json")
+    if os.path.exists(model_index_path):
+        try:
+            is_valid, reason = _validate_diffusion_model(snapshot_dir)
+        except Exception as e:
+            return (
+                f"{header}\n  FAIL (diffusion) - Validation raised exception: {e}",
+                "fail",
+            )
+        if is_valid:
+            return f"{header}\n  PASS (diffusion) - Cache complete & valid", "pass"
+        return f"{header}\n  FAIL (diffusion) - {reason}", "fail"
+
+    if not is_transformers_text_model(snapshot_dir):
+        return (
+            f"{header}\n  SKIP (unknown type) - Not a diffusers pipeline or transformers model",
+            "skip",
+        )
+
+    weight_files = scan_weight_files(snapshot_dir)
+    if not weight_files:
+        return f"{header}\n  SKIP (no weights) - empty or incomplete download", "skip"
+
+    with cache_lock:
+        cached = validated_cache.get(snapshot_dir)
+    if cached is not None:
+        return f"{header}\n  SKIP (already validated in this run)", "skip"
+
+    try:
+        result, reason = validate_snapshot(
+            model_name, snapshot_dir, weight_files, validated_cache
+        )
+    except Exception as e:
+        return f"{header}\n  FAIL (error) - Validation raised exception: {e}", "fail"
+
+    if result is True:
+        return f"{header}\n  PASS - Cache complete & valid", "pass"
+    if result is False:
+        detail = reason or "cache validation failed"
+        return f"{header}\n  FAIL (incomplete) - {detail}", "fail"
+    return f"{header}\n  SKIP (already validated in this run)", "skip"
+
+
 def main():
     start_time = time.time()
 
     print("=" * 70)
     print("CI_OFFLINE: Pre-validating cached HuggingFace models")
     print("=" * 70)
-    print(f"Max time: {MAX_VALIDATION_TIME_SECONDS}s")
+    print(
+        f"Max time: {MAX_VALIDATION_TIME_SECONDS}s, workers: {MAX_VALIDATION_WORKERS}"
+    )
     print()
 
     print("Scanning HuggingFace cache for models...")
@@ -297,7 +354,8 @@ def main():
         print("=" * 70)
         return
 
-    print(f"Found {len(snapshots)} snapshot(s) in cache")
+    total = len(snapshots)
+    print(f"Found {total} snapshot(s) in cache")
     print()
 
     validated_count = 0
@@ -305,91 +363,62 @@ def main():
     skipped_count = 0
     processed_count = 0
 
-    # In-process cache to avoid re-validating same snapshot in this run
+    # In-process cache (shared across workers) to avoid re-validating the
+    # same snapshot dir if a model has multiple aliases.
     validated_cache = {}
+    cache_lock = threading.Lock()
 
-    for model_name, snapshot_dir in snapshots:
-        # Check time limit
-        elapsed = time.time() - start_time
-        if elapsed > MAX_VALIDATION_TIME_SECONDS:
-            print()
-            print(
-                f"Time limit reached ({elapsed:.1f}s > {MAX_VALIDATION_TIME_SECONDS}s)"
-            )
-            print(
-                f"Stopping validation, {len(snapshots) - processed_count} snapshots remaining"
-            )
-            break
+    with ThreadPoolExecutor(max_workers=MAX_VALIDATION_WORKERS) as pool:
+        futures = {
+            pool.submit(
+                _validate_one_snapshot,
+                idx,
+                total,
+                model_name,
+                snapshot_dir,
+                validated_cache,
+                cache_lock,
+            ): (idx, model_name)
+            for idx, (model_name, snapshot_dir) in enumerate(snapshots, start=1)
+        }
 
-        snapshot_hash = os.path.basename(snapshot_dir)
-        print(
-            f"[{processed_count + 1}/{len(snapshots)}] {model_name} ({snapshot_hash[:8]}...)"
-        )
-        processed_count += 1
+        for future in as_completed(futures):
+            elapsed = time.time() - start_time
+            if elapsed > MAX_VALIDATION_TIME_SECONDS:
+                # cancel() only drops queued work; in-flight workers run
+                # to completion on pool __exit__ and their results (plus
+                # any raised exceptions) are silently discarded.
+                remaining = len(futures) - processed_count
+                print()
+                print(
+                    f"Time limit reached ({elapsed:.1f}s > "
+                    f"{MAX_VALIDATION_TIME_SECONDS}s); dropping {remaining} "
+                    f"in-flight snapshot(s) (results and any failures discarded)"
+                )
+                for f in futures:
+                    f.cancel()
+                break
 
-        # Determine model type by checking for model_index.json (diffusers pipeline marker)
-        model_index_path = os.path.join(snapshot_dir, "model_index.json")
-        is_diffusion_model = os.path.exists(model_index_path)
-
-        if is_diffusion_model:
-            # This is a diffusers pipeline - use diffusion validation
             try:
-                is_valid, reason = _validate_diffusion_model(snapshot_dir)
-
-                if is_valid:
-                    print("  PASS (diffusion) - Cache complete & valid")
-                    validated_count += 1
-                else:
-                    print(f"  FAIL (diffusion) - {reason}")
-                    failed_count += 1
-
+                output, kind = future.result()
             except Exception as e:
-                print(f"  FAIL (diffusion) - Validation raised exception: {e}")
-                failed_count += 1
-
-            continue
-
-        # Transformers model - use standard validation
-        # First check if this looks like a transformers text model
-        if not is_transformers_text_model(snapshot_dir):
-            # Not a recognized model type, skip
-            print(
-                "  SKIP (unknown type) - Not a diffusers pipeline or transformers model"
-            )
-            skipped_count += 1
-            continue
-
-        # Scan weight files
-        weight_files = scan_weight_files(snapshot_dir)
-
-        if not weight_files:
-            print("  SKIP (no weights) - empty or incomplete download")
-            skipped_count += 1
-            continue
-
-        # Validate
-        try:
-            result, reason = validate_snapshot(
-                model_name, snapshot_dir, weight_files, validated_cache
-            )
-
-            if result is True:
-                print("  PASS - Cache complete & valid")
+                # Preserve the prior serial behavior of counting unexpected
+                # worker failures as fail(error) rather than aborting the
+                # whole validation pass.
+                idx, model_name = futures[future]
+                output = (
+                    f"[{idx}/{total}] {model_name}\n"
+                    f"  FAIL (error) - Worker raised: {type(e).__name__}: {e}"
+                )
+                kind = "fail"
+            print(output)
+            processed_count += 1
+            if kind == "pass":
                 validated_count += 1
-            elif result is False:
-                # Print detailed failure reason
-                if reason:
-                    print(f"  FAIL (incomplete) - {reason}")
-                else:
-                    print("  FAIL (incomplete) - cache validation failed")
+            elif kind == "fail":
                 failed_count += 1
-            else:  # None (skipped)
-                print("  SKIP (already validated in this run)")
+            else:
                 skipped_count += 1
-
-        except Exception as e:
-            print(f"  FAIL (error) - Validation raised exception: {e}")
-            failed_count += 1
 
     elapsed_total = time.time() - start_time
 
@@ -399,7 +428,7 @@ def main():
     print(f"  PASS (complete & valid):      {validated_count}")
     print(f"  FAIL (incomplete/corrupted):  {failed_count}")
     print(f"  SKIP (no weights/duplicate):  {skipped_count}")
-    print(f"  Total processed:              {processed_count}/{len(snapshots)}")
+    print(f"  Total processed:              {processed_count}/{total}")
     print("=" * 70)
 
 

@@ -574,35 +574,149 @@ def popen_with_error_check(command: list[str]):
     return process
 
 
+# Framework weights we never load; everything else (safetensors, configs,
+# tokenizer files, modeling_*.py for trust_remote_code, hf_quant_config.json)
+# must remain to satisfy lightweight snapshot validation.
+_CI_PREFETCH_IGNORE_PATTERNS = [
+    "*.msgpack",
+    "*.h5",
+    "flax_model*",
+    "tf_model*",
+]
+# Bounded so total worst-case retry wait stays under a typical CI test
+# timeout. Actual delay between retries honors the hub's Retry-After when
+# present; otherwise exponential backoff.
+_CI_PREFETCH_MAX_429_RETRIES = 3
+
+
+def _ci_prefetch_snapshot(model_name_or_path: str) -> bool:
+    """snapshot_download only pulls missing blobs, so this is safe to call
+    against a partially-populated cache. Retries on 429 to survive a
+    saturated HF rate window."""
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import HfHubHTTPError
+
+    for attempt in range(_CI_PREFETCH_MAX_429_RETRIES + 1):
+        try:
+            # Serial download: concurrent workers race on `.incomplete` tmp
+            # files on shared/NFS HF caches.
+            snapshot_download(
+                repo_id=model_name_or_path,
+                ignore_patterns=_CI_PREFETCH_IGNORE_PATTERNS,
+                max_workers=1,
+            )
+            return True
+        except HfHubHTTPError as e:
+            resp = getattr(e, "response", None)
+            status = getattr(resp, "status_code", None)
+            if status is None:
+                # Some HfHubHTTPError paths (fsspec wrappers, synthesized
+                # errors) don't carry a response. Recover the 429 signal from
+                # the stringified message so we still retry.
+                msg = str(e)
+                if "429" in msg or "Too Many Requests" in msg:
+                    status = 429
+            if status != 429 or attempt == _CI_PREFETCH_MAX_429_RETRIES:
+                print(
+                    f"CI_OFFLINE: prefetch failed for {model_name_or_path}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                return False
+            ra = (getattr(resp, "headers", None) or {}).get("Retry-After", "")
+            wait = 0.0
+            if ra:
+                try:
+                    wait = float(ra)
+                except (TypeError, ValueError):
+                    print(
+                        f"CI_OFFLINE: unparsable Retry-After={ra!r} from hub, "
+                        f"falling back to exponential backoff"
+                    )
+            if wait <= 0:
+                wait = min(30 * (2**attempt), 300)
+            print(
+                f"CI_OFFLINE: prefetch 429 for {model_name_or_path}, "
+                f"sleep {wait:.0f}s "
+                f"(attempt {attempt + 1}/{_CI_PREFETCH_MAX_429_RETRIES})"
+            )
+            time.sleep(wait)
+        except Exception as e:
+            print(
+                f"CI_OFFLINE: prefetch failed for {model_name_or_path}: "
+                f"{type(e).__name__}: {e}"
+            )
+            return False
+    return False
+
+
+def _ci_resolve_cached_snapshot(
+    model_name_or_path: str, requires_hf_quant_config: bool
+) -> Optional[str]:
+    """Return a valid snapshot dir for model_name_or_path, fetching it if
+    missing or incomplete. None if we cannot make the cache valid."""
+    from sglang.srt.model_loader.ci_weight_validation import (
+        validate_cache_lightweight,
+    )
+    from sglang.srt.utils import find_local_repo_dir
+
+    def _find() -> Optional[str]:
+        try:
+            d = find_local_repo_dir(model_name_or_path, revision=None)
+        except Exception:
+            return None
+        if not d or not os.path.isdir(d):
+            return None
+        return d
+
+    snapshot_dir = _find()
+    if snapshot_dir and validate_cache_lightweight(
+        snapshot_dir, requires_hf_quant_config
+    ):
+        return snapshot_dir
+
+    print(
+        f"CI_OFFLINE: cache miss or incomplete for {model_name_or_path}, "
+        f"prefetching snapshot (requires_hf_quant_config={requires_hf_quant_config})"
+    )
+    if not _ci_prefetch_snapshot(model_name_or_path):
+        print(
+            f"CI_OFFLINE: prefetch failed, falling back to online mode - "
+            f"{model_name_or_path}"
+        )
+        return None
+
+    snapshot_dir = _find()
+    if snapshot_dir and validate_cache_lightweight(
+        snapshot_dir, requires_hf_quant_config
+    ):
+        return snapshot_dir
+
+    print(
+        f"CI_OFFLINE: snapshot still invalid after prefetch "
+        f"(missing required files?), falling back to online mode - "
+        f"{model_name_or_path}"
+    )
+    return None
+
+
 def _try_enable_offline_mode_if_cache_complete(
     model_name_or_path: str, env: dict, other_args: Optional[list[str]] = None
 ) -> Optional[str]:
     """
-    CI helper: Check if model cache is complete and enable offline mode.
-
-    Uses per-run validation markers that are NOT shared across runners.
-    Each runner independently validates its cache using lightweight checks
-    before enabling offline mode.
-
-    IMPORTANT: Even if a per-run marker exists, this function ALWAYS validates
-    the current launch's requirements (e.g., hf_quant_config.json for modelopt).
-    The marker is only a hint that this snapshot was validated earlier in the run.
+    CI helper: ensure the model's cache is complete (fetching if needed)
+    and return a per-run marker path so the subprocess can launch with
+    HF_HUB_OFFLINE=1 and stay off the shared HF rate limit. Returns None
+    to signal the caller to fall back to online mode.
 
     Args:
         model_name_or_path: Model identifier or path
-        env: Environment dict to modify (will add HF_HUB_OFFLINE=1 if validation passes)
-        other_args: Launch command arguments (used to detect quantization requirement)
-
-    Returns:
-        Per-run marker path if offline mode was enabled, None otherwise
+        env: Environment dict to modify (adds HF_HUB_OFFLINE=1 on success)
+        other_args: Launch command arguments (used to detect --quantization)
     """
     from sglang.srt.model_loader.ci_weight_validation import (
         _get_per_run_marker_path,
-        _read_per_run_marker,
         _write_per_run_marker,
-        validate_cache_lightweight,
     )
-    from sglang.srt.utils import find_local_repo_dir
 
     other_args = other_args or []
 
@@ -623,16 +737,8 @@ def _try_enable_offline_mode_if_cache_complete(
     if os.path.isdir(model_name_or_path):
         return None
 
-    # Try to find local snapshot
-    try:
-        snapshot_dir = find_local_repo_dir(model_name_or_path, revision=None)
-        if not snapshot_dir or not os.path.isdir(snapshot_dir):
-            return None
-    except Exception:
-        return None
-
-    # Detect if quantization requires hf_quant_config.json
-    # Do this BEFORE checking marker to ensure current launch requirements are known
+    # Detect if quantization requires hf_quant_config.json. Must happen
+    # before cache resolution so the prefetch/validation path enforces it.
     requires_hf_quant_config = False
     for i, arg in enumerate(other_args):
         if arg == "--quantization" and i + 1 < len(other_args):
@@ -641,61 +747,26 @@ def _try_enable_offline_mode_if_cache_complete(
                 requires_hf_quant_config = True
                 break
 
-    # Check per-run marker (fast hint - snapshot validated earlier in this run)
-    per_run_marker = _read_per_run_marker(snapshot_dir)
-    if per_run_marker is not None:
-        # Marker exists, but STILL validate for current launch requirements
-        # This prevents a test without --quantization from enabling offline
-        # for a later test with --quantization that needs hf_quant_config.json
-        is_valid = validate_cache_lightweight(snapshot_dir, requires_hf_quant_config)
-
-        if not is_valid:
-            # Current launch requirements not met, ignore marker
-            print(
-                f"CI_OFFLINE: Per-run marker found but current validation failed "
-                f"(requires_hf_quant_config={requires_hf_quant_config}), "
-                f"will use online mode - {model_name_or_path}"
-            )
-            return None
-
-        # Marker exists and current validation passed
-        env["HF_HUB_OFFLINE"] = "1"
-        marker_path = _get_per_run_marker_path(snapshot_dir)
+    snapshot_dir = _ci_resolve_cached_snapshot(
+        model_name_or_path, requires_hf_quant_config
+    )
+    if snapshot_dir is None:
         print(
-            f"CI_OFFLINE: Per-run marker found and current validation passed "
-            f"(requires_hf_quant_config={requires_hf_quant_config}), "
-            f"enabling offline mode - {model_name_or_path}"
-        )
-        return marker_path
-
-    # No per-run marker - perform lightweight validation
-    is_valid = validate_cache_lightweight(snapshot_dir, requires_hf_quant_config)
-
-    if not is_valid:
-        # Validation failed - cache is incomplete on this runner
-        print(
-            f"CI_OFFLINE: Cache validation failed "
+            f"CI_OFFLINE: Cache validation failed even after prefetch "
             f"(requires_hf_quant_config={requires_hf_quant_config}), "
             f"will use online mode - {model_name_or_path}"
         )
         return None
 
-    # Validation passed - enable offline mode and write per-run marker
     env["HF_HUB_OFFLINE"] = "1"
-
-    # Write per-run marker for subsequent tests in this run
     _write_per_run_marker(snapshot_dir, model_name_or_path)
-
-    # Return marker path for potential invalidation if offline launch fails
     marker_path = _get_per_run_marker_path(snapshot_dir)
-
-    snapshot_basename = os.path.basename(snapshot_dir)
     print(
         f"CI_OFFLINE: Enabled HF_HUB_OFFLINE=1 for subprocess - "
-        f"validation passed for {model_name_or_path} "
-        f"(snapshot={snapshot_basename}, requires_hf_quant_config={requires_hf_quant_config})"
+        f"{model_name_or_path} "
+        f"(snapshot={os.path.basename(snapshot_dir)}, "
+        f"requires_hf_quant_config={requires_hf_quant_config})"
     )
-
     return marker_path
 
 
