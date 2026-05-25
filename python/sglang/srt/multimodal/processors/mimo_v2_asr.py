@@ -197,7 +197,7 @@ class MiMoV2ASRProcessor(BaseMultimodalProcessor):
         if audio_data and not self.AUDIO_REGEX.search(input_text):
             input_text = f"{self.mm_tokens.audio_token}{input_text}"
 
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=[],
             video_data=[],
