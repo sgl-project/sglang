@@ -39,9 +39,7 @@ class MMMUServerBase(CustomTestCase):
 
         # Prepare environment variables
         process_env = os.environ.copy()
-        # ROCm currently fails while exporting the pooled CUDA IPC buffer
-        # during multimodal processor initialization.
-        process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "0" if is_hip() else "1"
+        process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "1"
 
         # Build server args with MMMU-specific settings
         server_args = [
