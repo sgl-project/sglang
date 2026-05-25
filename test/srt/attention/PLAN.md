@@ -256,19 +256,35 @@ def assert_close(ref, out, atol=1e-2, rtol=1e-2): ...
 
 ### Phase 2 — Backend correctness tests (`test/srt/attention/test_backend_correctness.py`)
 
+Each attention type uses its own model-specific attention class — never a bare backend
+call. This ensures all auxiliary calls made during real model forward (e.g.,
+`init_mha_chunk_metadata`, indexer metadata setup) are exercised automatically.
+
+| Attention type | SGLang attention class used in test |
+|---|---|
+| Standard MHA / GQA | `RadixAttention` |
+| SWA | `RadixAttention` (with `sliding_window_size` set on mock runner) |
+| MLA | DeepSeek MLA attention class from `deepseek_v2.py` |
+| DSA | DeepSeek DSA attention class |
+| DSV4 | DeepSeek V4 attention class |
+| Linear (KDA / Lightning / GDN) | `RadixLinearAttention` with the respective backend |
+| Mamba | Mamba mixer class |
+
 For each valid (attention_type, backend, mode, input_shape) combination:
 
 1. Build mock model runner with hardcoded model config.
 2. Instantiate backend via `Backend.__init__(model_runner)`.
-3. Instantiate attention layer (`RadixAttention` for standard types;
-   model-specific class for MLA/DSA/DSV4/linear).
+3. Instantiate the model-specific attention class with random weights.
 4. Build `ForwardBatch` via `make_forward_batch`.
 5. Call `backend.init_forward_metadata(forward_batch)`.
-6. Call `attention_layer.forward(q, k, v, forward_batch)` — dispatches to correct
-   backend method plus any auxiliary calls (e.g., `init_mha_chunk_metadata`).
+6. Call the attention class's `forward(...)` — this dispatches to the correct backend
+   method and makes all auxiliary calls as the real model forward would.
 7. Reconstruct dense K, V from pool via `reconstruct_dense_kv`.
 8. Run HF reference on the same Q, dense K, dense V.
 9. `assert_close(hf_output, sglang_output)`.
+
+TBO backend: included in the backend list but deferred — no test case implemented yet,
+placeholder `skipIf(True, "TBO deferred")` to track the gap.
 
 Invalid combinations are `skipIf`-guarded, not silently dropped.
 
@@ -308,21 +324,21 @@ Explicitly test:
 
 ---
 
-## Open questions
+## Resolved decisions
 
-1. **Linear / Mamba backends**: Their `forward` signature differs (they use
-   `RadixLinearAttention` not `RadixAttention`). Should the Phase 1 helper accept
-   a layer type parameter, or should linear attention have a separate helper?
+1. **Linear / Mamba backends**: Use `RadixLinearAttention` (or the Mamba mixer class)
+   as the test target, not a bare backend call. The model-specific attention class
+   is always the entry point.
 
-2. **DSA / DSV4**: These use model-specific indexer metadata
-   (`get_indexer_metadata`). Should Phase 2 tests use the actual model class
-   (DeepSeek forward path) or stub out the indexer?
+2. **DSA / DSV4**: Use the model-specific DeepSeek attention class. The indexer
+   metadata is set up naturally by the class's own `forward` method.
 
-3. **TBO backend**: It wraps another backend. Should it be tested as a composition
-   (primary=flashinfer wrapped in TBO) or deferred?
+3. **TBO backend**: Included in the backend table; implementation deferred. A
+   `skipIf(True, "TBO deferred")` placeholder tracks the gap.
 
-4. **HIP-only backends** (`aiter`, HIP DSV4): Same framework with `skipIf` guards,
-   or separate AMD CI registration block?
+4. **HIP-only backends** (`aiter`, HIP DSV4, `wave`, `ascend`): Same test framework
+   with `skipIf` guards for CUDA-only runners; registered with `register_amd_ci()`
+   (or the appropriate non-CUDA CI registration) alongside the main test class.
 
 ---
 
