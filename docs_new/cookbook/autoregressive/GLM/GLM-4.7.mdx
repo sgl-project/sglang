@@ -54,7 +54,7 @@ import { GLM47Deployment } from "/src/snippets/autoregressive/glm-47-deployment.
 
 ### 3.2 Configuration Tips
 
-- **EAGLE Speculative Decoding:** Supported for GLM-4.7. Add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`. Set `SGLANG_ENABLE_SPEC_V2=1` for the experimental overlap scheduler. Enable via the interactive command generator above.
+- **EAGLE Speculative Decoding:** Supported for GLM-4.7. Add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`. The spec-v2 overlap scheduler is enabled by default (`SGLANG_ENABLE_SPEC_V2=True`); set `SGLANG_ENABLE_SPEC_V2=0` to disable. Enable via the interactive command generator above.
 - **Thinking Budget:** Use `--enable-custom-logit-processor` flag and pass `Glm4MoeThinkingBudgetLogitProcessor` in requests to cap the model's thinking token count (see section 4.2.3).
 
 ## 4. Model Invocation
@@ -145,6 +145,10 @@ The answer is 36. To find 15% of 240, we multiply 240 by 0.15, which equals 36.
 **Note:** The reasoning parser captures the model's step-by-step thinking process, allowing you to see how the model arrives at its conclusions.
 
 #### 4.2.2 Tool Calling
+
+<Note>
+**Parser names by model:** GLM-4.5 and GLM-4.6 use `--tool-call-parser glm45`. GLM-4.7 uses `--tool-call-parser glm47`. The same applies to `--reasoning-parser`. Do not mix parsers across model generations.
+</Note>
 
 GLM-4.7 supports tool calling capabilities. Enable the tool call parser:
 

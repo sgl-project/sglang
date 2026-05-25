@@ -104,7 +104,6 @@ sglang serve \
 sglang serve \
   --model-path meta-llama/Llama-4-Maverick-17B-128E-Instruct \
   --tp 8 \
-  --context-length 1000000 \
   --trust-remote-code
 ```
 
@@ -128,7 +127,7 @@ python3 -m sglang.launch_server \
 <Note>The draft model `nvidia/Llama-4-Maverick-17B-128E-Eagle3` only works in chat mode.</Note>
 
 ## 5. Benchmark
-### 5.1 Speed Benchmark
+### 5.1 Speed Benchmark (Scout)
 Test Environment:
 
 Hardware: AMD MI300x GPU
@@ -306,7 +305,7 @@ Max ITL (ms):                            226.06
 ==================================================
 ```
 
-### 5.2 Speed Benchmark
+### 5.2 Speed Benchmark (Maverick)
 Test Environment:
 
 Hardware: AMD MI300x GPU
@@ -532,8 +531,10 @@ Accuracy on MMLU Pro matches [Meta's official benchmark numbers](https://ai.meta
   </tbody>
 </table>
 
+**Scout:**
+
 ```bash Command
-# First start the server
+# Start the server
 python -m sglang.launch_server \
   --model-path meta-llama/Llama-4-Scout-17B-16E-Instruct \
   --port 30000 \
@@ -541,7 +542,7 @@ python -m sglang.launch_server \
   --mem-fraction-static 0.8 \
   --context-length 65536
 
-# Then run lm_eval
+# Run lm_eval
 lm_eval --model local-chat-completions \
   --model_args model=meta-llama/Llama-4-Scout-17B-16E-Instruct,base_url=http://localhost:30000/v1/chat/completions,num_concurrent=128,timeout=999999,max_gen_toks=2048 \
   --tasks mmlu_pro \
@@ -550,4 +551,22 @@ lm_eval --model local-chat-completions \
   --num_fewshot 0
 ```
 
-> Replace the model path and `--model` arg to use `Llama-4-Maverick-17B-128E-Instruct`.
+**Maverick:**
+
+```bash Command
+# Start the server
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-4-Maverick-17B-128E-Instruct \
+  --port 30000 \
+  --tp 8 \
+  --mem-fraction-static 0.8 \
+  --context-length 65536
+
+# Run lm_eval
+lm_eval --model local-chat-completions \
+  --model_args model=meta-llama/Llama-4-Maverick-17B-128E-Instruct,base_url=http://localhost:30000/v1/chat/completions,num_concurrent=128,timeout=999999,max_gen_toks=2048 \
+  --tasks mmlu_pro \
+  --batch_size 128 \
+  --apply_chat_template \
+  --num_fewshot 0
+```

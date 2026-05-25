@@ -415,7 +415,23 @@ print(final_response.choices[0].message.content)
 # Output: "The current weather in Beijing is 22 °C and sunny. Let me know if you’d like a forecast for the next few days or any other details!"
 ```
 
-#### 4.2.3 Responses API and Built-in Tools
+#### 4.2.3 EAGLE3 Speculative Decoding
+
+SGLang supports speculative decoding for GPT-OSS models using the EAGLE3 algorithm. This can significantly improve decoding speed, especially for small batch sizes.
+
+```shell Command
+python3 -m sglang.launch_server \
+  --model-path openai/gpt-oss-120b \
+  --speculative-algorithm EAGLE3 \
+  --speculative-draft-model-path lmsys/EAGLE3-gpt-oss-120b-bf16 \
+  --tp 2
+```
+
+<Tip>
+The spec-v2 overlap scheduler is enabled by default (`SGLANG_ENABLE_SPEC_V2=True`). It improves performance by overlapping draft and verification stages. Set `SGLANG_ENABLE_SPEC_V2=0` to disable.
+</Tip>
+
+#### 4.2.4 Responses API and Built-in Tools
 
 GPT-OSS supports the OpenAI Responses API with built-in tool use (web search and Python interpreter). Set up your environment and launch with `--tool-server demo`:
 

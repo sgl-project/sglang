@@ -12,6 +12,11 @@ import { Qwen35Deployment } from '/src/snippets/autoregressive/qwen35-deployment
 
 Qwen3.5 features a Gated Delta Networks combined with sparse Mixture-of-Experts architecture (397B total parameters, 17B activated), delivering high-throughput inference with minimal latency. It supports multimodal inputs (text, image, video) and natively handles context lengths of up to 262,144 tokens, extensible to over 1M tokens.
 
+**Architecture details:**
+- **Hybrid Attention:** Gated Delta Networks (linear, O(n) complexity) combined with full attention every 4th layer — linear layers provide low-cost long-context processing while periodic full attention ensures high associative recall.
+- **MoE routing:** Top-8 active out of 64 routed experts plus a dedicated shared expert for universal features, keeping 17B parameters active from 397B total.
+- **Native multimodal:** DeepStack Vision Transformer with Conv3d temporal encoding for image and video understanding without separate visual encoders.
+
 **Key Features:**
 
 - **Unified Vision-Language Foundation**: Early fusion training on multimodal tokens achieves cross-generational parity with Qwen3 and outperforms Qwen3-VL models
@@ -859,7 +864,7 @@ SGLANG_USE_CUDA_IPC_TRANSPORT=1 python -m sglang.launch_server \
   --port 30000
 ```
 
-#### 5.3.1 Latency Benchmark
+#### 5.2.1 Latency Benchmark
 
 ```bash Command
 python3 -m sglang.bench_serving \
@@ -914,7 +919,7 @@ Max ITL (ms):                            58.03
 ==================================================
 ```
 
-#### 5.3.2 Throughput Benchmark
+#### 5.2.2 Throughput Benchmark
 
 ```bash Command
 python3 -m sglang.bench_serving \

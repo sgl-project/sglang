@@ -24,6 +24,27 @@ SGLang offers multiple installation methods. You can choose the most suitable in
 
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
 
+### 2.1 Docker Images
+
+Pre-built Docker images are available for different hardware platforms:
+
+```bash Command
+# NVIDIA H200 / B200
+docker pull lmsysorg/sglang:latest
+
+# AMD MI350 / MI355X
+docker pull lmsysorg/sglang:v0.5.8-rocm700-mi35x
+
+# AMD MI300X
+# Note: v0.5.8-rocm700-mi30x does not include PR #17504.
+# Prefer the newest MI30x ROCm image tag from Docker Hub when available, or build from source.
+docker pull lmsysorg/sglang:v0.5.8-rocm700-mi30x
+
+# Ascend NPU (Atlas 800I A2 / A3)
+docker pull lmsysorg/sglang:dsv32-a2
+docker pull lmsysorg/sglang:dsv32-a3
+```
+
 ## 3. Model Deployment
 
 This section provides a progressive guide from quick deployment to performance optimization, suitable for users at different levels.
@@ -42,7 +63,12 @@ import { DeepSeekV32Deployment } from "/src/snippets/autoregressive/deepseek-v32
 - **DSA prefill/decode attention kernels (`--dsa-prefill-backend`, `--dsa-decode-backend`):** The `dsa` backend is automatically selected for DeepSeek-V3.2. Available kernels: `flashmla_sparse`, `flashmla_kv`, `flashmla_auto`, `fa3` (Hopper only), `tilelang` (GPU/HPU/NPU), `aiter` (AMD, decode only), `trtllm` (Blackwell only). Defaults: Hopper BF16 KV → `flashmla_sparse` prefill / `fa3` decode; Hopper FP8 KV → `flashmla_kv` both; Blackwell BF16 → `flashmla_sparse` / `trtllm`; Blackwell FP8 → `trtllm` both.
 - **Index Cache:** Reuses indexer results across layers for efficiency at negligible accuracy cost. For **GLM-5** specifically, append `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` for a better speed/accuracy tradeoff.
 - **HiSparse (experimental):** Reduces per-request GPU memory during long-context decode by offloading KV data to CPU pinned memory. Requires PD disaggregation mode (decode instance only). See [HiSparse Guide](../../../docs/advanced_features/hisparse_guide).
-- **NVFP4 on Blackwell:** Specify `--quantization modelopt_fp4` and `--moe-runner-backend flashinfer_trtllm` (recommended) / `flashinfer_cutlass` / `flashinfer_cutedsl`.
+- **NVFP4 on Blackwell:** Specify `--quantization modelopt_fp4` and `--moe-runner-backend flashinfer_trtllm` (recommended) / `flashinfer_cutlass` / `flashinfer_cutedsl`. Full example:
+  ```bash
+  python -m sglang.launch_server --model nvidia/DeepSeek-V3.2-NVFP4 --tp 4 \
+    --quantization modelopt_fp4 --moe-runner-backend flashinfer_trtllm \
+    --tool-call-parser deepseekv32 --reasoning-parser deepseek-v3
+  ```
 - **NCCL timeout:** Slow model loading → add `--dist-timeout 3600`.
 
 ## 4. Model Invocation
@@ -137,7 +163,15 @@ The answer is 36. To find 15% of 240, we multiply 240 by 0.15, which equals 36.
 
 DeepSeek-V3.2 and DeepSeek-V3.2-Exp support tool calling capabilities. But they use different parameters. Enable the tool call parser:
 
-**Note:** DeepSeek-V3.2-Speciale does **NOT** support tool calling. It is designed exclusively for deep reasoning tasks.
+**Note:** DeepSeek-V3.2-Speciale does **NOT** support tool calling. Launch it with reasoning parser only:
+
+```shell Command
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2-Speciale \
+  --trust-remote-code \
+  --tp-size 8 --dp-size 8 --enable-dp-attention \
+  --reasoning-parser deepseek-v3
+```
 
 **Deployment Command:**
 
@@ -312,7 +346,87 @@ print(final_response.choices[0].message.content)
 # Output: "The weather in Beijing is currently 22°C and sunny."
 ```
 
-#### 4.2.3 Enabling PP, CP and TP with FP8 KV cache
+#### 4.2.3 Multi-Token Prediction (EAGLE Speculative Decoding)
+
+SGLang implements Multi-Token Prediction (MTP) for DeepSeek V3.2 based on [EAGLE speculative decoding](../../../docs/advanced_features/speculative_decoding#EAGLE-Decoding). This optimization significantly improves decoding speed for small batch sizes.
+
+**With DP Attention:**
+
+```bash Command
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp 8 \
+  --enable-dp-attention \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+```
+
+**With Pure TP:**
+
+```bash Command
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+```
+
+Find optimal values for your workload with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py). The minimum viable config is `--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2`.
+
+<Note>
+`--max-running-requests` defaults to 48 for MTP. Increase it for larger batch sizes.
+</Note>
+
+<Tip>
+The spec-v2 overlap scheduler is enabled by default (`SGLANG_ENABLE_SPEC_V2=True`). Set `SGLANG_ENABLE_SPEC_V2=0` to disable.
+</Tip>
+
+#### 4.2.4 PD Disaggregation
+
+Prefill-Decode (PD) disaggregation separates prefill and decode stages onto different instances, improving GPU utilization for mixed workloads.
+
+**Prefill command:**
+
+```bash Command
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2-Exp \
+  --disaggregation-mode prefill \
+  --host $LOCAL_IP \
+  --port $PORT \
+  --tp 8 \
+  --dp 8 \
+  --enable-dp-attention \
+  --dist-init-addr ${HOST}:${DIST_PORT} \
+  --trust-remote-code \
+  --disaggregation-bootstrap-port 8998 \
+  --mem-fraction-static 0.9
+```
+
+**Decode command:**
+
+```bash Command
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2-Exp \
+  --disaggregation-mode decode \
+  --host $LOCAL_IP \
+  --port $PORT \
+  --tp 8 \
+  --dp 8 \
+  --enable-dp-attention \
+  --dist-init-addr ${HOST}:${DIST_PORT} \
+  --trust-remote-code \
+  --mem-fraction-static 0.9
+```
+
+**Router command:**
+
+```bash Command
+python -m sglang_router.launch_router --pd-disaggregation \
+  --prefill $PREFILL_ADDR 8998 \
+  --decode $DECODE_ADDR \
+  --host 127.0.0.1 \
+  --port 30000
+```
+
+For production deployments (RBG / LWS-based, DeepEP EP parallelism), see [multi_node_deployment docs](../../../docs/references/multi_node_deployment/rbg_pd/deepseekv32_pd).
+
+#### 4.2.5 Enabling PP, CP and TP with FP8 KV cache
 
 We suggested `DP2` + `MTP` for local deployment of agentic workflow with DeepSeek V3.2 on Hopper platform:
 

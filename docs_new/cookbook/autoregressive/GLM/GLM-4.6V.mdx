@@ -118,6 +118,8 @@ GLM-4.6V supports image and video inputs via the OpenAI-compatible API.
 **Image Input:**
 
 ```python Example
+import subprocess
+
 curl_command = f"""
 curl -s http://localhost:{30000}/v1/chat/completions \\
   -H "Content-Type: application/json" \\
@@ -130,7 +132,7 @@ curl -s http://localhost:{30000}/v1/chat/completions \\
           {{
             "type": "image_url",
             "image_url": {{
-              "url": "/home/jobuser/sgl_logo.png"
+              "url": "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
             }}
           }},
           {{
@@ -157,6 +159,8 @@ print(response)
 **Video Input:**
 
 ```python Example
+import subprocess
+
 curl_command = f"""
 curl -s http://localhost:{30000}/v1/chat/completions \\
   -H "Content-Type: application/json" \\
@@ -169,12 +173,12 @@ curl -s http://localhost:{30000}/v1/chat/completions \\
           {{
             "type": "video_url",
             "video_url": {{
-              "url": "/home/jobuser/jobs_presenting_ipod.mp4"
+              "url": "https://github.com/sgl-project/sgl-test-files/raw/refs/heads/main/videos/jobs_presenting_ipod.mp4"
             }}
           }},
           {{
             "type": "text",
-            "text": "What is the image"
+            "text": "What is in the video"
           }}
         ]
       }}
@@ -276,14 +280,6 @@ GLM-4.6V supports tool calling with vision capabilities. Pass tools in your API 
 
 ```python Example
 from openai import OpenAI
-import base64
-
-def image_to_base64(image_path):
-    """Convert image file to base64 data URL format for OpenAI API"""
-    with open(image_path, 'rb') as image_file:
-        image_data = image_file.read()
-        base64_string = base64.b64encode(image_data).decode('utf-8')
-        return f"data:image/png;base64,{base64_string}"
 
 openai_api_key = "EMPTY"
 openai_api_base = "http://127.0.0.1:30000/v1"
@@ -342,7 +338,7 @@ messages = [
             {
                 "type": "image_url",
                 "image_url": {
-                     "url": "/home/jobuser/sgl_logo.png"
+                     "url": "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
                 }
             }
         ]
