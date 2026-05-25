@@ -4,6 +4,7 @@
 import asyncio
 import os
 import tempfile
+from copy import copy
 from typing import Any
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
@@ -150,9 +151,10 @@ def build_warmup_reqs(
             data_type=task_type.data_type(),
             width=width,
             height=height,
-            prompt="",
+            prompt=DEFAULT_PLACEHOLDER_PROMPT,
         )
         if use_model_sampling_defaults:
+            req_kwargs["sampling_params"] = copy(sampling_defaults)
             req_kwargs.update(
                 negative_prompt=negative_prompt,
                 guidance_scale=sampling_defaults.guidance_scale,
