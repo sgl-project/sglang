@@ -3841,12 +3841,9 @@ def run_scheduler_process(
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
-        # Opt-in fail-fast: a single scheduler exception otherwise cascades
-        # into thousands of lines of NCCL HeartbeatMonitor / TCPStore
-        # tracebacks from sibling ranks before they finally die. SIGKILLing
-        # the whole process group right after logging the real exception
-        # leaves only that one error in the log.
-        if os.getenv("SGLANG_FAIL_FAST_ON_SCHEDULER_EXCEPTION", "0") == "1":
+        # Opt-in: SIGKILL the process group so sibling ranks don't spew
+        # thousands of NCCL/TCPStore tracebacks before they finally die.
+        if os.getenv("SGLANG_FAIL_FAST", "0") == "1":
             try:
                 os.killpg(os.getpgrp(), signal.SIGKILL)
             except Exception:
