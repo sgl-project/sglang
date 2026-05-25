@@ -57,7 +57,7 @@ if TYPE_CHECKING:
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
-    SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: bool = True
+    SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
     SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU: bool = False
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
@@ -256,8 +256,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(
         "SGLANG_DIFFUSION_CFG_GATE_STEP", 1.0
     ),
-    "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_bool(
-        "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "true"
+    "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_str(
+        "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "auto"
     ),
     # ================== cache-dit Env Vars ==================
     # Enable cache-dit acceleration for DiT inference
@@ -289,6 +289,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
     ),
     # FlashInfer FP4 GEMM backend override for diffusion NVFP4.
+    # When unset, diffusion ModelOpt NVFP4 defaults to flashinfer_trtllm.
     # Supported values:
     # - auto
     # - flashinfer_cudnn
