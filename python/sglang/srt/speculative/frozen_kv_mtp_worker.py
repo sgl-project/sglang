@@ -39,6 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.trace import get_global_tracing_enabled
@@ -248,10 +249,14 @@ class FrozenKVMTPWorker(TpModelWorker):
         self.kv_context = ctx
 
     def _frozen_kv_target_view(self, forward_batch: ForwardBatch):
-        return frozen_kv_target_view(forward_batch, self.kv_context)
+        return frozen_kv_target_view(
+            forward_batch, self.kv_context, self.draft_attn_backend
+        )
 
     def _target_kv_pool_view(self, forward_batch: ForwardBatch):
-        return target_kv_pool_view(forward_batch, self.kv_context)
+        return target_kv_pool_view(
+            forward_batch, self.kv_context, self.draft_attn_backend
+        )
 
     def _set_positions(self, forward_batch: ForwardBatch) -> None:
         set_frozen_kv_positions(forward_batch, self.topk)
@@ -275,7 +280,6 @@ class FrozenKVMTPWorker(TpModelWorker):
             forward_batch.seq_lens_sum = torch.sum(forward_batch.seq_lens).item()
         with self._frozen_kv_target_view(forward_batch):
             self.draft_attn_backend.init_forward_metadata(forward_batch)
-        forward_batch.attn_backend = self.draft_attn_backend
 
     def _init_frozen_kv_metadata_capture_cuda_graph(
         self, forward_batch: ForwardBatch
@@ -290,7 +294,6 @@ class FrozenKVMTPWorker(TpModelWorker):
                 forward_mode=ForwardMode.DECODE,
                 spec_info=None,
             )
-        forward_batch.attn_backend = self.draft_attn_backend
 
     def _init_frozen_kv_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int, seq_lens_sum: int
@@ -310,7 +313,6 @@ class FrozenKVMTPWorker(TpModelWorker):
                     else None
                 ),
             )
-        forward_batch.attn_backend = self.draft_attn_backend
 
     def init_cuda_graphs(self) -> None:
         if self.server_args.disable_cuda_graph or self.speculative_num_steps <= 1:
@@ -396,7 +398,9 @@ class FrozenKVMTPWorker(TpModelWorker):
                 forward_batch.mm_input_embeds = mm_input_embeds
             self._set_positions(forward_batch)
             self._init_frozen_kv_metadata(forward_batch)
-            with self._target_kv_pool_view(forward_batch):
+            with self._target_kv_pool_view(forward_batch), forward_context(
+                ForwardContext(attn_backend=self.draft_attn_backend)
+            ):
                 logits_output = self.draft_model_runner.forward(
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output
@@ -449,8 +453,9 @@ class FrozenKVMTPWorker(TpModelWorker):
         set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
         set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
 
+        # Install verify_input as `batch.spec_info` for the verify forward.
         batch.spec_info = verify_input
-        logits_output, verify_output, can_run_cuda_graph = self.verify(batch)
+        verify_output = self.verify(batch)
 
         if get_global_tracing_enabled():
             for idx, req in enumerate(batch.reqs):
@@ -470,18 +475,19 @@ class FrozenKVMTPWorker(TpModelWorker):
                 self.server_args.enable_dp_attention
                 or draft_extend_input.input_ids.shape[0] > 0
             ):
-                # Stash for the seed step; _run_assistant_seed_step swaps in
-                # a fresh FrozenKVMTPDraftInput for next iter.
+                # Install draft_extend_input as `batch.spec_info` for the seed
+                # step; `_run_assistant_seed_step` replaces it with a fresh
+                # `FrozenKVMTPDraftInput` for next iter.
                 batch.spec_info = draft_extend_input
                 self.forward_draft_extend_after_decode(batch)
         set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
 
         return GenerationBatchResult(
-            logits_output=logits_output,
+            logits_output=verify_output.logits_output,
             next_token_ids=verify_output.accept_tokens,
             num_correct_drafts=sum(verify_output.num_correct_drafts_per_req_cpu),
             num_correct_drafts_per_req_cpu=verify_output.num_correct_drafts_per_req_cpu,
-            can_run_cuda_graph=can_run_cuda_graph,
+            can_run_cuda_graph=verify_output.can_run_cuda_graph,
         )
 
     def forward_target_extend(
@@ -518,7 +524,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         input_is_idle = batch.forward_mode.is_idle()
 
         if not input_is_idle and draft_extend_input.input_ids.shape[0] == 0:
-            # All reqs finished; stash an idle FrozenKVMTPDraftInput so the
+            # All reqs finished. Install an idle FrozenKVMTPDraftInput so the
             # next-iter draft sees a valid spec_info.
             batch = batch.copy()
             batch.prepare_for_idle()
@@ -676,7 +682,9 @@ class FrozenKVMTPWorker(TpModelWorker):
             forward_batch.spec_info.hidden_states = hidden_states
             self._set_positions(forward_batch)
 
-            with self._target_kv_pool_view(forward_batch):
+            with self._target_kv_pool_view(forward_batch), forward_context(
+                ForwardContext(attn_backend=self.draft_attn_backend)
+            ):
                 logits_output = self.draft_model_runner.forward(
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output
@@ -775,4 +783,5 @@ class FrozenKVMTPWorker(TpModelWorker):
         )
 
         del seq_lens_pre_verify
-        return logits_output, res, can_run_cuda_graph
+        res.can_run_cuda_graph = can_run_cuda_graph
+        return res
