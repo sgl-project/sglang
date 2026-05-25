@@ -65,10 +65,8 @@ _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 # ROCm 7.0 hipcc miscompiles gemm_a8w8_blockscale_bpreshuffle on gfx95 (#23319).
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
 # gfx942 uses CK gemm_a8w8_blockscale, not Triton.
-_use_aiter_gfx94 = _use_aiter and (not _is_gfx95_supported) and any(
-    "gfx94" in torch.cuda.get_device_properties(i).gcnArchName
-    for i in range(torch.cuda.device_count())
-)
+# _is_fp8_fnuz checks device 0 for "gfx94" (assumes homogeneous GPUs, same as is_fp8_fnuz()).
+_use_aiter_gfx94 = _use_aiter and (not _is_gfx95_supported) and _is_fp8_fnuz
 
 
 def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
