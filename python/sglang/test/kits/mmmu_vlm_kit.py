@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from sglang.srt.environ import temp_set_env
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -347,10 +347,11 @@ class MMMUMultiModelTestBase(CustomTestCase):
         try:
             # Prepare environment variables
             process_env = os.environ.copy()
+            # ROCm currently fails while exporting the pooled CUDA IPC buffer
+            # during multimodal processor initialization.
+            process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "0" if is_hip() else "1"
             if custom_env:
                 process_env.update(custom_env)
-            # if test vlm with cuda_ipc feature, open this env_var
-            process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "1"
 
             # Prepare stdout/stderr redirection if needed
             stdout_file = None

@@ -2,7 +2,7 @@ import logging
 import os
 import time
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -39,7 +39,9 @@ class MMMUServerBase(CustomTestCase):
 
         # Prepare environment variables
         process_env = os.environ.copy()
-        process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "1"
+        # ROCm currently fails while exporting the pooled CUDA IPC buffer
+        # during multimodal processor initialization.
+        process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "0" if is_hip() else "1"
 
         # Build server args with MMMU-specific settings
         server_args = [
