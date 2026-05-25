@@ -6185,10 +6185,10 @@ class ServerArgs:
             default=ServerArgs.kv_canary,
             choices=["none", "log", "raise"],
             help=(
-                "KV cache canary mode. 'none' disables the canary (default). 'log' "
-                "records mismatches to a violation buffer and logs them while the "
-                "server keeps running (production-safe). 'raise' fails the server "
-                "on the first detected mismatch (CI lane)."
+                "KV cache canary mode. "
+                "'none' disables the canary (default). "
+                "'log' prints them while the server keeps running (production-safe). "
+                "'raise' fails the server on the first detected mismatch (CI lane)."
             ),
         )
         parser.add_argument(
@@ -6197,35 +6197,17 @@ class ServerArgs:
             default=ServerArgs.kv_canary_real_data,
             choices=[m.name.lower() for m in RealKvHashMode],
             help=(
-                "Mix a fingerprint of the real KV-cache slot into the canary's "
-                "chain hash. 'none' (default) "
-                "leaves the real_kv_hash slot field at zero. 'partial' "
-                "splitmix64-folds the first 16 bytes of "
-                "each real-KV slot; useful when corruption is suspected but "
-                "overhead must stay tiny. 'all' "
-                "splitmix64-folds the full real-KV slot stride for maximum "
-                "coverage at higher cost. Catches "
-                "corruption that the pure-canary path misses because the "
-                "canary slot itself is intact but the real KV got written "
-                "wrong."
+                "Check the real KV-cache in the canary. "
+                "'none' (default) disables the feature. "
+                "'partial' checks the first 16 bytes of each real-KV slot. "
+                "'all' checks the full real-KV slot."
             ),
         )
         parser.add_argument(
             "--kv-canary-sweep-interval",
             type=int,
             default=ServerArgs.kv_canary_sweep_interval,
-            help=(
-                "Every N forward steps, run a full-pool sweep that verifies "
-                "real_kv_hash on every slot owned by an alive req in the "
-                "current batch (chain hash check is skipped in this path). "
-                "0 (default) disables the sweep. The per-step head/tail "
-                "canary only covers slots the current forward reads or "
-                "writes; the sweep also catches corruption on slots that "
-                "sit in the KV pool unused by the current forward — "
-                "typically radix-cached slots from completed requests that "
-                "aren't actively being verified per step. Requires "
-                "--kv-canary in {log, raise}."
-            ),
+            help="Every N forward steps, run a full-pool sweep.",
         )
         parser.add_argument(
             "--cuda-graph-max-bs",
