@@ -257,6 +257,15 @@ class DataParallelController:
                     if cur_count != prev_count:
                         prev[d.dp_rank] = cur_count
                         self._prev_digest_entries = prev
+                        logger.debug(
+                            "[CacheAware] digest update rank=%d entries=%d "
+                            "cached=%d evictable=%d protected=%d",
+                            d.dp_rank,
+                            cur_count,
+                            d.total_cached_tokens,
+                            d.evictable_tokens,
+                            d.protected_tokens,
+                        )
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self.status = ranks.status
@@ -760,6 +769,16 @@ class DataParallelController:
                 )
 
         self.dp_budget.total_requests[best_rank] += 1
+        logger.debug(
+            "[CacheAware] req=%s input_len=%d -> rank=%d match=%d "
+            "matches=%s reqs=%s",
+            getattr(req, "rid", "?"),
+            len(token_ids),
+            best_rank,
+            match_info.get(best_rank, 0),
+            match_info,
+            {r: self.dp_budget.total_requests[r] for r in active_ranks},
+        )
         self.workers[best_rank].send_pyobj(req)
 
     def event_loop(self):
