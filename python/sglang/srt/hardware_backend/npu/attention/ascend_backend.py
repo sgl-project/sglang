@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch_npu
+from flash_attn_npu_v3 import flash_attn_with_kvcache
 from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_prefill_triton,
     attention_sinks_triton,
@@ -289,6 +290,7 @@ class AscendAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.graph_mode = False
+        self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.speculative_num_draft_tokens = (
@@ -1130,6 +1132,47 @@ class AscendAttnBackend(AttentionBackend):
                         ],
                         dim=0,
                     )
+            elif self.use_fa:
+                if self.forward_metadata.seq_lens_cpu_int is None:
+                    actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
+                else:
+                    actual_seq_len_kv = (
+                        self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+                    )
+
+                q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                k = k_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                )
+                v = v_cache.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                )
+                extend_seq_lens = self.forward_metadata.extend_seq_lens_cpu_int.npu()
+                cu_seqlens_q = torch.cat([
+                    torch.zeros(1, dtype=torch.int32).npu(),
+                    extend_seq_lens.cumsum(0)
+                ])
+                max_seqlen_q = extend_seq_lens.max().item()
+                attn_output = flash_attn_with_kvcache(
+                    q,
+                    k,
+                    v,
+                    cache_seqlens=torch.tensor(actual_seq_len_kv).npu(),
+                    page_table=self.forward_metadata.block_tables,
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                    window_size=[-1, -1],
+                    softcap=0.0,
+                    rotary_interleaved=False,
+                    num_splits=0,
+                    sm_margin=0,
+                    return_softmax_lse=False
+                )
+                attn_output = attn_output.view(
+                    -1, layer.tp_q_head_num * layer.v_head_dim
+                )
             else:
                 causal = True
                 if (
@@ -2043,6 +2086,34 @@ class AscendAttnBackend(AttentionBackend):
                         ],
                         dim=0,
                     )
+            elif self.use_fa:
+                if self.forward_metadata.seq_lens_cpu_int is None:
+                    actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
+                else:
+                    actual_seq_len_kv = (
+                        self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+                    )
+
+                q = q.view(
+                    forward_batch.batch_size,
+                    -1,
+                    layer.tp_q_head_num,
+                    layer.qk_head_dim
+                )
+                k = k_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                )
+                v = v_cache.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                )
+                attn_output, softmax_lse, *rest = flash_attn_with_kvcache(
+                    q,
+                    k,
+                    v,
+                    page_table=self.forward_metadata.block_tables,
+                    cache_seqlens=torch.tensor(actual_seq_len_kv).npu(),
+                    softmax_scale=layer.scaling,
+                )
             # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
             # forward_batch.encoder_lens is not None in cross attention scend, we add native attn to solve accuracy issues
             elif forward_batch.encoder_lens is None and layer.logit_cap == 0:
