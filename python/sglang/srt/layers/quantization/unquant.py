@@ -268,6 +268,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
+            # Cached permutation indices live outside model parameters/buffers; after
+            # memory-saver offload/onload without CPU backup they must be rebuilt.
+            self._cache_permute_indices.clear()
+
             from flashinfer.fused_moe.core import (
                 _maybe_get_cached_w3_w1_permute_indices,
                 convert_to_block_layout,
