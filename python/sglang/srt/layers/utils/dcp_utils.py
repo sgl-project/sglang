@@ -557,7 +557,7 @@ def update_local_kv_lens_for_dcp(kv_len_arr):
         return
     dcp_rank = get_dcp_rank()
     offset = dcp_rank + 1
-    kv_len_arr.sub(offset).div_(dcp_world_size, rounding_mode="floor").add_(1)
+    kv_len_arr.sub_(offset).div_(dcp_world_size, rounding_mode="floor").add_(1)
 
 
 def plan_dcp_decode_metadata(
