@@ -1,0 +1,606 @@
+from dataclasses import dataclass
+from types import SimpleNamespace
+
+import torch
+from torch import nn
+
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    Mamba2StateDType,
+    Mamba2StateShape,
+)
+from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.layers import dp_attention as _dp_attention
+from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
+from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
+from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
+from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+    fused_sigmoid_gating_delta_rule_update,
+)
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+)
+from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+from sglang.srt.layers.attention.linear.utils import initialize_linear_attn_config
+from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.mem_cache.memory_pool import (
+    HybridReqToTokenPool,
+    MHATokenToKVPool,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.model_runner import ModelRunner
+
+_dp_attention.get_attention_tp_size = lambda: 1
+
+DEFAULT_HEAD_K_DIM = 32
+DEFAULT_HEAD_V_DIM = 32
+DEFAULT_MAX_CONTEXT_LEN = 64
+DEFAULT_DTYPE = torch.bfloat16
+DEFAULT_DEVICE = "cuda"
+GDN_ATOL = 3e-2
+GDN_RTOL = 3e-2
+
+
+@dataclass(frozen=True)
+class GDNAttentionCase:
+    name: str
+    backend: str
+    forward_mode: ForwardMode
+    num_k_heads: int
+    num_v_heads: int
+    page_size: int
+    prefix_lens: tuple[int, ...]
+    extend_lens: tuple[int, ...] = ()
+
+    @property
+    def batch_size(self) -> int:
+        return len(self.prefix_lens)
+
+    @property
+    def input_lens(self) -> tuple[int, ...]:
+        if self.forward_mode.is_decode():
+            return (1,) * self.batch_size
+        return self.extend_lens
+
+    @property
+    def seq_lens(self) -> tuple[int, ...]:
+        return tuple(p + q for p, q in zip(self.prefix_lens, self.input_lens))
+
+    @property
+    def num_input_tokens(self) -> int:
+        return sum(self.input_lens)
+
+
+def make_gdn_cases(backend: str) -> tuple[GDNAttentionCase, ...]:
+    common = dict(backend=backend, num_k_heads=2, num_v_heads=2)
+    return (
+        GDNAttentionCase(
+            name="gdn_decode_page_boundary",
+            forward_mode=ForwardMode.DECODE,
+            page_size=16,
+            prefix_lens=(14, 15, 16),
+            **common,
+        ),
+        GDNAttentionCase(
+            name="gdn_decode_bsz1_nonzero_prefix",
+            forward_mode=ForwardMode.DECODE,
+            page_size=16,
+            prefix_lens=(7,),
+            **common,
+        ),
+        GDNAttentionCase(
+            name="gdn_extend_zero_prefix_exact_page",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(0,),
+            extend_lens=(16,),
+            **common,
+        ),
+        GDNAttentionCase(
+            name="gdn_extend_ragged_page_boundary",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(0, 8, 16),
+            extend_lens=(15, 8, 1),
+            **common,
+        ),
+    )
+
+
+class TinyGDNModelConfig:
+    def __init__(
+        self,
+        *,
+        num_heads: int,
+        head_dim: int,
+        context_len: int,
+    ):
+        self.attention_arch = AttentionArch.MHA
+        self.context_len = context_len
+        self.num_attention_heads = num_heads
+        self.num_key_value_heads = num_heads
+        self.head_dim = head_dim
+        self.v_head_dim = head_dim
+        self.swa_v_head_dim = head_dim
+        self.is_encoder_decoder = False
+        self.is_multimodal = False
+        self.is_generation = True
+        self.is_hybrid_swa = False
+        self.is_local_attention_model = False
+        self.attention_chunk_size = None
+        self.sliding_window_size = None
+        self.hf_config = SimpleNamespace(architectures=["TinyGDNForCausalLM"])
+        self.hf_text_config = self.hf_config
+
+    def get_num_kv_heads(self, tp_size: int) -> int:
+        assert self.num_key_value_heads % tp_size == 0
+        return self.num_key_value_heads // tp_size
+
+
+class MockGDNModelRunner(ModelRunner):
+    def __init__(
+        self,
+        *,
+        case: GDNAttentionCase,
+        model_config: TinyGDNModelConfig,
+        dtype: torch.dtype,
+        device: str,
+        max_context_len: int,
+        head_dim: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        disable_cuda_graph: bool = True,
+        disable_piecewise_cuda_graph: bool = True,
+        runner_batch_size: int | None = None,
+    ):
+        pool_batch_size = runner_batch_size or case.batch_size
+        self.device = device
+        self.dtype = dtype
+        self.kv_cache_dtype = dtype
+        self.gpu_id = 0
+        self.page_size = case.page_size
+        self.model_config = model_config
+        self.server_args = SimpleNamespace(
+            attention_backend=case.backend,
+            chunked_prefill_size=-1,
+            disable_cuda_graph=disable_cuda_graph,
+            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            dllm_algorithm=None,
+            dllm_algorithm_config=None,
+            enable_deterministic_inference=False,
+            enable_mis=False,
+            linear_attn_backend="triton",
+            linear_attn_decode_backend=None,
+            linear_attn_prefill_backend=None,
+            mamba_cache_chunk_size=64,
+            max_running_requests=None,
+            model_path=None,
+            revision=None,
+            speculative_algorithm=None,
+            speculative_eagle_topk=0,
+            speculative_num_draft_tokens=0,
+            speculative_num_steps=0,
+            triton_attention_num_kv_splits=8,
+            triton_attention_split_tile_size=None,
+        )
+        cache_shape = Mamba2StateShape.create(
+            tp_world_size=1,
+            intermediate_size=case.num_v_heads * head_v_dim,
+            n_groups=case.num_k_heads,
+            num_heads=case.num_v_heads,
+            head_dim=head_v_dim,
+            state_size=head_k_dim,
+            conv_kernel=2,
+        )
+        cache_params = Mamba2CacheParams(
+            shape=cache_shape,
+            layers=[0],
+            dtype=Mamba2StateDType(conv=dtype, temporal=torch.float32),
+        )
+        self.req_to_token_pool = HybridReqToTokenPool(
+            size=pool_batch_size,
+            mamba_size=pool_batch_size,
+            mamba_spec_state_size=pool_batch_size,
+            max_context_len=max_context_len,
+            device=device,
+            enable_memory_saver=False,
+            cache_params=cache_params,
+            mamba_layer_ids=[0],
+            enable_mamba_extra_buffer=False,
+            enable_overlap_schedule=False,
+        )
+        max_token_loc = case.page_size + pool_batch_size * max_context_len
+        self.token_to_kv_pool = MHATokenToKVPool(
+            size=max_token_loc + case.page_size,
+            page_size=case.page_size,
+            dtype=dtype,
+            head_num=model_config.num_key_value_heads,
+            head_dim=head_dim,
+            layer_num=1,
+            device=device,
+            enable_memory_saver=False,
+            enable_alt_stream=False,
+        )
+        self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        self.attn_cp_size = 1
+        self.attention_chunk_size = None
+        self.hisparse_coordinator = None
+        self.init_new_workspace = False
+        self.is_hybrid_swa = False
+        self.sliding_window_size = None
+        self.use_mla_backend = False
+        self.is_draft_worker = False
+
+    @property
+    def hybrid_gdn_config(self):
+        return None
+
+    @property
+    def hybrid_lightning_config(self):
+        return None
+
+    @property
+    def kimi_linear_config(self):
+        return None
+
+    @property
+    def linear_attn_model_spec(self):
+        return None
+
+    @property
+    def mamba2_config(self):
+        return None
+
+    @property
+    def mambaish_config(self):
+        return None
+
+
+class ProjectedGDNAttention(nn.Module):
+    def __init__(
+        self,
+        *,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        dtype: torch.dtype,
+        device: str,
+    ):
+        super().__init__()
+        self.num_k_heads = num_k_heads
+        self.num_v_heads = num_v_heads
+        self.head_k_dim = head_k_dim
+        self.head_v_dim = head_v_dim
+        mixed_qkv_dim = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim
+        conv_weights = torch.zeros(mixed_qkv_dim, 2, dtype=dtype, device=device)
+        conv_weights[:, 1] = 1
+        self.A_log = nn.Parameter(
+            torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+        )
+        self.dt_bias = nn.Parameter(
+            torch.randn(num_v_heads, dtype=dtype, device=device) * 0.1
+        )
+        self.attn = RadixLinearAttention(
+            layer_id=0,
+            num_q_heads=num_k_heads,
+            num_k_heads=num_k_heads,
+            num_v_heads=num_v_heads,
+            head_q_dim=head_k_dim,
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
+            conv_weights=conv_weights.contiguous(),
+            bias=None,
+            activation=None,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+        )
+
+    @property
+    def mixed_qkv_dim(self) -> int:
+        return (
+            2 * self.num_k_heads * self.head_k_dim + self.num_v_heads * self.head_v_dim
+        )
+
+    def split_qkv(self, mixed_qkv: torch.Tensor):
+        q, k, v = torch.split(
+            mixed_qkv,
+            [
+                self.num_k_heads * self.head_k_dim,
+                self.num_k_heads * self.head_k_dim,
+                self.num_v_heads * self.head_v_dim,
+            ],
+            dim=-1,
+        )
+        q = q.view(1, mixed_qkv.shape[0], self.num_k_heads, self.head_k_dim)
+        k = k.view(1, mixed_qkv.shape[0], self.num_k_heads, self.head_k_dim)
+        v = v.view(1, mixed_qkv.shape[0], self.num_v_heads, self.head_v_dim)
+        return q, k, v
+
+    def forward(
+        self,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+    ):
+        return self.attn(forward_batch, mixed_qkv=mixed_qkv, a=a, b=b)
+
+
+@dataclass
+class GDNAttentionFixture:
+    case: GDNAttentionCase
+    runner: MockGDNModelRunner
+    backend: HybridLinearAttnBackend
+    module: ProjectedGDNAttention
+    forward_batch: ForwardBatch
+    mixed_qkv: torch.Tensor
+    a: torch.Tensor
+    b: torch.Tensor
+
+
+def _token_loc(req_idx: int, pos: int, *, page_size: int, max_context_len: int) -> int:
+    return page_size + req_idx * max_context_len + pos
+
+
+def _make_forward_batch(
+    case: GDNAttentionCase,
+    runner: MockGDNModelRunner,
+    *,
+    max_context_len: int,
+    device: str,
+) -> ForwardBatch:
+    seq_lens = case.seq_lens
+    input_lens = case.input_lens
+    req_pool_indices = torch.arange(case.batch_size, dtype=torch.int32, device=device)
+    out_cache_locs: list[int] = []
+    positions: list[int] = []
+
+    mamba_indices = torch.arange(
+        1, case.batch_size + 1, dtype=torch.int32, device=device
+    )
+    runner.req_to_token_pool.req_index_to_mamba_index_mapping[req_pool_indices] = (
+        mamba_indices
+    )
+
+    for req_idx, seq_len in enumerate(seq_lens):
+        for pos in range(seq_len):
+            runner.req_to_token_pool.req_to_token[req_idx, pos] = _token_loc(
+                req_idx,
+                pos,
+                page_size=case.page_size,
+                max_context_len=max_context_len,
+            )
+
+        if case.forward_mode.is_decode():
+            positions.append(seq_len - 1)
+            out_cache_locs.append(
+                _token_loc(
+                    req_idx,
+                    seq_len - 1,
+                    page_size=case.page_size,
+                    max_context_len=max_context_len,
+                )
+            )
+        else:
+            prefix_len = case.prefix_lens[req_idx]
+            for offset in range(input_lens[req_idx]):
+                positions.append(prefix_len + offset)
+                out_cache_locs.append(
+                    _token_loc(
+                        req_idx,
+                        prefix_len + offset,
+                        page_size=case.page_size,
+                        max_context_len=max_context_len,
+                    )
+                )
+
+    batch = ForwardBatch(
+        forward_mode=case.forward_mode,
+        batch_size=case.batch_size,
+        input_ids=torch.arange(case.num_input_tokens, dtype=torch.int64, device=device),
+        req_pool_indices=req_pool_indices,
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+        seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int32, device="cpu"),
+        out_cache_loc=torch.tensor(out_cache_locs, dtype=torch.int64, device=device),
+        seq_lens_sum=sum(seq_lens),
+        positions=torch.tensor(positions, dtype=torch.int64, device=device),
+    )
+
+    if case.forward_mode.is_extend():
+        extend_seq_lens = torch.tensor(input_lens, dtype=torch.int32, device=device)
+        batch.extend_prefix_lens = torch.tensor(
+            case.prefix_lens, dtype=torch.int32, device=device
+        )
+        batch.extend_prefix_lens_cpu = list(case.prefix_lens)
+        batch.extend_seq_lens = extend_seq_lens
+        batch.extend_seq_lens_cpu = list(input_lens)
+        batch.extend_start_loc = torch.zeros_like(extend_seq_lens)
+        if case.batch_size > 1:
+            batch.extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+        batch.extend_num_tokens = case.num_input_tokens
+
+    return batch
+
+
+def build_gdn_attention_fixture(
+    testcase,
+    case: GDNAttentionCase,
+    *,
+    head_k_dim: int = DEFAULT_HEAD_K_DIM,
+    head_v_dim: int = DEFAULT_HEAD_V_DIM,
+    max_context_len: int = DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = DEFAULT_DTYPE,
+    device: str = DEFAULT_DEVICE,
+) -> GDNAttentionFixture:
+    seed = 4096 + len(case.name)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    model_config = TinyGDNModelConfig(
+        num_heads=case.num_k_heads,
+        head_dim=head_k_dim,
+        context_len=max_context_len,
+    )
+    runner = MockGDNModelRunner(
+        case=case,
+        model_config=model_config,
+        dtype=dtype,
+        device=device,
+        max_context_len=max_context_len,
+        head_dim=head_k_dim,
+        head_k_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+    )
+    try:
+        full_backend = ATTENTION_BACKENDS[case.backend](runner)
+    except (AssertionError, ImportError, ModuleNotFoundError) as exc:
+        testcase.skipTest(f"{case.backend} backend is not available: {exc}")
+
+    initialize_linear_attn_config(runner.server_args)
+    linear_backend = GDNAttnBackend(runner)
+    backend = HybridLinearAttnBackend(full_backend, linear_backend, full_attn_layers=[])
+    module = ProjectedGDNAttention(
+        num_k_heads=case.num_k_heads,
+        num_v_heads=case.num_v_heads,
+        head_k_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+        dtype=dtype,
+        device=device,
+    )
+    forward_batch = _make_forward_batch(
+        case,
+        runner,
+        max_context_len=max_context_len,
+        device=device,
+    )
+    mixed_qkv = torch.randn(
+        case.num_input_tokens,
+        module.mixed_qkv_dim,
+        dtype=dtype,
+        device=device,
+    )
+    a = torch.randn(case.num_input_tokens, case.num_v_heads, dtype=dtype, device=device)
+    b = torch.randn(case.num_input_tokens, case.num_v_heads, dtype=dtype, device=device)
+
+    return GDNAttentionFixture(
+        case=case,
+        runner=runner,
+        backend=backend,
+        module=module,
+        forward_batch=forward_batch,
+        mixed_qkv=mixed_qkv,
+        a=a,
+        b=b,
+    )
+
+
+def _ssm_states(fixture: GDNAttentionFixture) -> torch.Tensor:
+    return fixture.runner.req_to_token_pool.mamba2_layer_cache(0).temporal
+
+
+def _cache_indices(fixture: GDNAttentionFixture) -> torch.Tensor:
+    return fixture.runner.req_to_token_pool.get_mamba_indices(
+        fixture.forward_batch.req_pool_indices
+    )
+
+
+def run_gdn_fixture_eager(fixture: GDNAttentionFixture) -> torch.Tensor:
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+        fixture.backend.init_forward_metadata(fixture.forward_batch)
+        return fixture.module(
+            fixture.forward_batch,
+            fixture.mixed_qkv,
+            fixture.a,
+            fixture.b,
+        )
+
+
+def expected_gdn_fixture_output(
+    fixture: GDNAttentionFixture,
+    initial_ssm_states: torch.Tensor,
+) -> torch.Tensor:
+    q, k, v = fixture.module.split_qkv(fixture.mixed_qkv)
+    cache_indices = _cache_indices(fixture)
+
+    if fixture.case.forward_mode.is_decode():
+        query_start_loc = torch.arange(
+            0,
+            fixture.case.batch_size + 1,
+            dtype=torch.int32,
+            device=fixture.runner.device,
+        )
+        return fused_sigmoid_gating_delta_rule_update(
+            A_log=fixture.module.A_log,
+            dt_bias=fixture.module.dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=fixture.a,
+            b=fixture.b,
+            initial_state_source=initial_ssm_states,
+            initial_state_indices=cache_indices,
+            cu_seqlens=query_start_loc,
+            use_qk_l2norm_in_kernel=True,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+        )
+
+    g, beta = fused_gdn_gating(
+        fixture.module.A_log,
+        fixture.a,
+        fixture.b,
+        fixture.module.dt_bias,
+    )
+    query_start_loc = torch.empty(
+        fixture.case.batch_size + 1, dtype=torch.int32, device=fixture.runner.device
+    )
+    query_start_loc[:-1] = fixture.forward_batch.extend_start_loc
+    query_start_loc[-1] = fixture.case.num_input_tokens
+    output, _, _ = chunk_gated_delta_rule(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_ssm_states,
+        cu_seqlens=query_start_loc,
+        head_first=False,
+        use_qk_l2norm_in_kernel=True,
+        initial_state_indices=cache_indices,
+    )
+    return output
+
+
+def run_gdn_attention_case(
+    testcase,
+    case: GDNAttentionCase,
+    *,
+    head_k_dim: int = DEFAULT_HEAD_K_DIM,
+    head_v_dim: int = DEFAULT_HEAD_V_DIM,
+    max_context_len: int = DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = DEFAULT_DTYPE,
+    device: str = DEFAULT_DEVICE,
+):
+    fixture = build_gdn_attention_fixture(
+        testcase,
+        case,
+        head_k_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+    )
+    initial_ssm_states = _ssm_states(fixture).clone()
+    actual = run_gdn_fixture_eager(fixture)
+    expected = expected_gdn_fixture_output(fixture, initial_ssm_states)
+
+    torch.testing.assert_close(actual, expected, atol=GDN_ATOL, rtol=GDN_RTOL)
+    if case.forward_mode.is_decode():
+        torch.testing.assert_close(
+            _ssm_states(fixture)[_cache_indices(fixture)],
+            initial_ssm_states[_cache_indices(fixture)],
+            atol=GDN_ATOL,
+            rtol=GDN_RTOL,
+        )

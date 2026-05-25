@@ -14,6 +14,9 @@ Implemented:
   `test/manual/attention/unittest/swa/` for `triton` and `flashinfer`.
 - MLA attention backend correctness exists under
   `test/manual/attention/unittest/mla/` for `triton`.
+- GDN hybrid-linear attention backend correctness exists under
+  `test/manual/attention/unittest/gdn/` for full-attention backend `triton` with
+  linear-attention kernel backend `triton`.
 - Phase 3 dense runner integration is implemented for representative attention
   backends: eager mode for `torch_native`, and CUDA-graph metadata capture/replay
   decode mode for `triton` and `flashinfer`. The CUDA-graph tests now capture
@@ -40,13 +43,13 @@ Implemented:
   orthogonal to runner/backend metadata compatibility.
 
 In progress:
-- Triton GDN coverage is the next active implementation slice.
+- No active dense/SWA/MLA/GDN representative Phase 3 work remains. The next
+  implementation slice should add the remaining MLA-specialized backends or a new
+  attention method.
 
 Next implementation steps:
 - Add `mla/test_<attn_backend>.py` files for `flashinfer`, `flashmla`, and
   `trtllm_mla`.
-- Add `gdn/test_triton.py` for hybrid GDN with full-attention backend `triton`
-  and linear-attention kernel backend `triton`.
 - Add separate method folders for sparse/chunked KV, linear attention, Mamba, and
   speculative draft/verify forward modes inside the affected method folders.
 - Add focused Phase 3 composition coverage for `hybrid_attn` and TBO after the
@@ -75,6 +78,9 @@ Verified:
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
 - `python -m py_compile test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/mla/test_triton.py`
 - `python test/manual/attention/unittest/mla/test_triton.py -v`
+- `python -m py_compile test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/gdn/test_triton.py`
+- `python test/manual/attention/unittest/gdn/test_triton.py -v`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
 
 ---
 
