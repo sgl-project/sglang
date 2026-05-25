@@ -283,6 +283,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
     ),
     # FlashInfer FP4 GEMM backend override for diffusion NVFP4.
+    # When unset, diffusion ModelOpt NVFP4 defaults to flashinfer_trtllm.
     # Supported values:
     # - auto
     # - flashinfer_cudnn
