@@ -331,6 +331,19 @@ def can_fuse(switch_mlp) -> bool:
         return False
     if up.biases is None or gate.biases is None:
         return False
+    # The kernel reads gate scales/biases as the activation dtype (in-kernel
+    # float() then writes back as the activation dtype), so the runtime
+    # precondition in fused_gate_qmv_silu_mul requires a single shared float
+    # dtype across the quant params. Check it here so a mismatch falls through
+    # to the unfused path instead of raising at forward. The packed weight is
+    # uint32 and intentionally excluded from the dtype contract.
+    param_dtype = gate.scales.dtype
+    if (
+        gate.biases.dtype != param_dtype
+        or up.scales.dtype != param_dtype
+        or up.biases.dtype != param_dtype
+    ):
+        return False
     K = up.scales.shape[-1] * _GROUP_SIZE
     N = up.weight.shape[-2]
     if K % _BLOCK_SIZE != 0 or N % _ROWS_PER_TG != 0:
@@ -434,11 +447,13 @@ def patch_switch_glu_with_fused_swiglu(model) -> int:
         # Per-instance override of __call__ via a one-off subclass. Python
         # looks up __call__ on the type, so attribute assignment on the
         # instance won't take effect — we swap sw.__class__ to a subclass
-        # whose __call__ dispatches to the bound wrapper. The subclass is
-        # cached on the parent type so we only build it once per model.
+        # whose __call__ dispatches to the bound wrapper. Cache the subclass
+        # on the exact class (cls.__dict__, not hasattr, which walks the MRO)
+        # so a SwitchGLU subclass gets its own entry instead of inheriting the
+        # base's — otherwise its instances would be downcast to the base class.
         sw._path_b_call = FusedSwitchSwiGLU(sw).fused_forward
         cls = type(sw)
-        if not hasattr(cls, "_PathBSubclass"):
+        if "_PathBSubclass" not in cls.__dict__:
             cls._PathBSubclass = type(
                 f"{cls.__name__}_PathB",
                 (cls,),
