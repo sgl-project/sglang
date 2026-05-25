@@ -348,6 +348,14 @@ def main(argv: list[str] | None = None) -> None:
             "min_indexcache_prompt_tokens": args.min_indexcache_prompt_tokens,
             "profile_prompt_tokens": args.profile_prompt_tokens,
             "eval_min_context_length": args.eval_min_context_length,
+            "batch_policy": (
+                "enable IndexCache only when every request in the batch meets "
+                "min_indexcache_prompt_tokens"
+            ),
+            "expected_perf_regime": (
+                "below-gate prompts may regress; validate speedup on the long-context "
+                "tail at or above the gate"
+            ),
         },
         "quality_eval_repeats": args.eval_repeats,
         "phases": results,

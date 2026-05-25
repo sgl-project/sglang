@@ -423,6 +423,14 @@ def test_dsv4_index_cache_validation_workflow_dry_run_writes_summary(tmp_path):
         "min_indexcache_prompt_tokens": 75000,
         "profile_prompt_tokens": 128000,
         "eval_min_context_length": 75000,
+        "batch_policy": (
+            "enable IndexCache only when every request in the batch meets "
+            "min_indexcache_prompt_tokens"
+        ),
+        "expected_perf_regime": (
+            "below-gate prompts may regress; validate speedup on the long-context "
+            "tail at or above the gate"
+        ),
     }
     assert summary["artifacts"] == {
         "profile": {
