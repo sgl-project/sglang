@@ -100,13 +100,13 @@ class SwaDivergenceReport:
     def _postprocess_on_host(self, host_data: dict[str, Any]) -> None:
         verify_totals = host_data["verify_total_count"].tolist()
         swa_full_idx_divergence = (
-            int(host_data["swa_full_idx_divergence"].item())
-            if "swa_full_idx_divergence" in host_data
+            int(x.item())
+            if (x := host_data.get("swa_full_idx_divergence")) is not None
             else 0
         )
         swa_out_of_window_tokens = (
-            int(host_data["swa_out_of_window_tokens"].item())
-            if "swa_out_of_window_tokens" in host_data
+            int(x.item())
+            if (x := host_data.get("swa_out_of_window_tokens")) is not None
             else 0
         )
         logger.info(
