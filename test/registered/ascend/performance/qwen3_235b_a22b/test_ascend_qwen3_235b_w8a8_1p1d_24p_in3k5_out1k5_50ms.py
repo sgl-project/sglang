@@ -69,6 +69,7 @@ MODEL_CONFIG = {
         "--mem-fraction-static",
         0.6,
         "--disable-radix-cache",
+        "--disable-cuda-graph",
         # "--ep-dispatch-algorithm",
         # "static",
         # "--init-expert-location",
