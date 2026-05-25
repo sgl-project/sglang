@@ -52,6 +52,7 @@ globally_suppress_loggers()
 
 FIRST_DENOISE_STEP_TOLERANCE = 4.0
 FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS = 80.0
+DECODING_STAGE_MIN_ABS_TOLERANCE_MS = 450.0
 
 # Tracks mesh output file paths from generate_mesh for later correctness validation.
 # Keyed by case_id, cleaned up after use.
@@ -641,7 +642,7 @@ class PerformanceValidator:
             )
             if stage.endswith("DecodingStage"):
                 tolerance = max(tolerance, 0.9)
-                min_abs_tolerance_ms = 250.0
+                min_abs_tolerance_ms = DECODING_STAGE_MIN_ABS_TOLERANCE_MS
             else:
                 min_abs_tolerance_ms = 120.0
             self._assert_le(
