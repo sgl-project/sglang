@@ -409,15 +409,14 @@ The symbols used are defined as follows:
       <th>Expert Parallelism</th>
       <th>Context Parallelism</th>
       <th>PD Disaggregation</th>
-      <th>Encode Prefill Disaggregation</th>
-      <th>Multimodal</th>
       <th>Quantization</th>
       <th>Chunked Prefill</th>
-      <th>LoRA</th>
+      <th>Moe A2A</th>
+      <th>Cuda Graph</th>
+      <th>Dsa prefill Context Parallel</th>
       <th>Speculative Decoding</th>
-      <th>Mamba Cache</th>
-      <th>Hierarchical Cache</th>
-      <th>Ngram Speculative Decoding</th>
+      <th>Dp LM Head</th>
+      <th>Disable Radix Cache</th>
     </tr>
   </thead>
   <tbody>
@@ -429,65 +428,61 @@ The symbols used are defined as follows:
       <td>🟢</td>
       <td>🟢</td>
       <td>🟢</td>
-      <td>🟢</td>
       <td>🟠</td>
       <td>🟢</td>
       <td>🟠</td>
-      <td>🟠</td>
       <td>🟢</td>
-      <td>🟠</td>
-      <td>❔</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
     </tr>
     <tr>
       <td>Data Parallelism</td>
       <td>🟢</td>
       <td></td>
       <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
       <td>🟠</td>
       <td>🟢</td>
-      <td>🟠</td>
+      <td>🟢</td>
       <td>🟠</td>
       <td>🟢</td>
       <td>🟠</td>
       <td>❔</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
     </tr>
     <tr>
       <td>Expert Parallelism</td>
       <td>🟢</td>
       <td>🟢</td>
       <td></td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
       <td>🟠</td>
       <td>🟢</td>
-      <td>🟠</td>
+      <td>🟢</td>
       <td>🟠</td>
       <td>🟢</td>
       <td>🟠</td>
       <td>❔</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>🟢</td>
     </tr>
     <tr>
       <td>Context Parallelism</td>
       <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
+      <td>🟠</td>
+      <td>🟠</td>
       <td></td>
       <td>🟢</td>
       <td>🟢</td>
-      <td>🟢</td>
       <td>🟠</td>
       <td>🟢</td>
       <td>🟠</td>
-      <td>🟠</td>
       <td>🟢</td>
-      <td>🟠</td>
+      <td>🟢</td>
       <td>❔</td>
+      <td>🟢</td>
     </tr>
     <tr>
       <td>PD Disaggregation</td>
@@ -496,87 +491,65 @@ The symbols used are defined as follows:
       <td>🟢</td>
       <td>🟢</td>
       <td></td>
-      <td>🟠</td>
       <td>🟢</td>
       <td>🟠</td>
       <td>🟢</td>
       <td>🟠</td>
-      <td>🟠</td>
       <td>🟢</td>
-      <td>🟠</td>
+      <td>🟢</td>
       <td>❔</td>
-    </tr>
-    <tr>
-      <td>Encode Prefill Disaggregation</td>
       <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟠</td>
-      <td></td>
-      <td>🟢</td>
-      <td>🟠</td>
-      <td>🟢</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟢</td>
-      <td>🟠</td>
-      <td>❔</td>
-    </tr>
-    <tr>
-      <td>Multimodal</td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td></td>
-      <td>🟠</td>
-      <td>🟢</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟢</td>
-      <td>🟠</td>
-      <td>❔</td>
     </tr>
     <tr>
       <td>Quantization</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
       <td></td>
       <td>🟠</td>
+      <td>🟢</td>
       <td>🟠</td>
+      <td>🟢</td>
+      <td>🟢</td>
       <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>❔</td>
+      <td>🟢</td>
     </tr>
     <tr>
       <td>Chunked Prefill</td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
       <td>🟠</td>
       <td></td>
       <td>🟠</td>
       <td>🟠</td>
-      <td>🟢</td>
       <td>🟠</td>
-      <td>❔</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟢</td>
     </tr>
     <tr>
-      <td>LoRA</td>
+      <td>Moe A2A</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
       <td>🟠</td>
+      <td></td>
+      <td>🟠</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>🟢</td>
+    </tr>
+    <tr>
+      <td>Cuda Graph</td>
       <td>🟠</td>
       <td>🟠</td>
       <td>🟠</td>
@@ -589,74 +562,70 @@ The symbols used are defined as follows:
       <td>🟠</td>
       <td>🟠</td>
       <td>🟠</td>
+      <td>🟢</td>
+    </tr>
+    <tr>
+      <td>Dsa prefill Context Parallel</td>
+      <td>🟢</td>
       <td>❔</td>
+      <td>❔</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td></td>
+      <td>🟢</td>
+      <td>❔</td>
+      <td>🟢</td>
     </tr>
     <tr>
       <td>Speculative Decoding</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
       <td>🟠</td>
+      <td>🟢</td>
       <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
+      <td>🟢</td>
       <td></td>
       <td>🟠</td>
-      <td>🟠</td>
-      <td>❔</td>
+      <td>🟢</td>
     </tr>
     <tr>
-      <td>Mamba Cache</td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
+      <td>Dp LM Head</td>
       <td>🟢</td>
       <td>🟢</td>
       <td>🟠</td>
-      <td>🟢</td>
+      <td>❔</td>
       <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>❔</td>
       <td>🟠</td>
       <td></td>
-      <td>🟠</td>
-      <td>❔</td>
+      <td>🟢</td>
     </tr>
     <tr>
-      <td>Hierarchical Cache</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td></td>
-      <td>❔</td>
-    </tr>
-    <tr>
-      <td>Ngram Speculative Decoding</td>
-      <td>❔</td>
-      <td>❔</td>
-      <td>❔</td>
-      <td>❔</td>
-      <td>❔</td>
-      <td>❔</td>
-      <td>❔</td>
-      <td>❔</td>
-      <td>❔</td>
-      <td>❔</td>
-      <td>❔</td>
-      <td>❔</td>
-      <td>❔</td>
+      <td>Disable Radix Cache</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
       <td></td>
     </tr>
   </tbody>
