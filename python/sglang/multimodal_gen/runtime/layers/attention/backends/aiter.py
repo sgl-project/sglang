@@ -357,7 +357,10 @@ class AITerImpl(AttentionImpl):
                 one = torch.tensor(1.0, dtype=torch.float32, device=query.device)
                 q_scale = k_scale = v_scale = one
 
-            if _can_use_mla_prefill(v_fp8.shape[-1], q_fp8.shape[2]) and not return_softmax_lse:
+            if (
+                _can_use_mla_prefill(v_fp8.shape[-1], q_fp8.shape[2])
+                and not return_softmax_lse
+            ):
                 return _mla_prefill_ps_attention(
                     q_fp8,
                     k_fp8,
