@@ -6474,15 +6474,6 @@ class ServerArgs:
             "convenience flags and over legacy flags.",
         )
         parser.add_argument(
-            "--cuda-graph-mode",
-            type=parse_cuda_graph_config_arg,
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-config",
-            dest="cuda_graph_config",
-            default=ServerArgs.cuda_graph_config,
-            help="Deprecated alias for --cuda-graph-config.",
-        )
-        parser.add_argument(
             "--prefill-cuda-graph-backend",
             type=str,
             choices=Backend.ALL,
