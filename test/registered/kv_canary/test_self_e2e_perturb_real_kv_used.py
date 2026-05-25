@@ -11,7 +11,12 @@ from sglang.test.kv_canary.e2e_base import CanaryE2EBase
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
 
 
-_SWA_TIGHT_POOL_ARGS = ("--max-total-tokens", "8192")
+_SWA_TIGHT_POOL_ARGS = (
+    "--max-total-tokens",
+    "32768",
+    "--swa-full-tokens-ratio",
+    "0.1",
+)
 
 
 class _PerturbRealKvUsedBase(CanaryE2EBase):

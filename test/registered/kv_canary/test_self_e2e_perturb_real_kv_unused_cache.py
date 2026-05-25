@@ -58,7 +58,12 @@ class TestPerturbRealKvUnusedCacheMhaFull(_PerturbRealKvUnusedCacheBase):
     target_group = TargetGroupKind.FULL
 
 
-_SWA_TIGHT_POOL_ARGS = ("--max-total-tokens", "8192")
+_SWA_TIGHT_POOL_ARGS = (
+    "--max-total-tokens",
+    "32768",
+    "--swa-full-tokens-ratio",
+    "0.1",
+)
 
 
 class TestPerturbRealKvUnusedCacheSwaFull(_PerturbRealKvUnusedCacheBase):
