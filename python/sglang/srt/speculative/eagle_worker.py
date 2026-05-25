@@ -23,6 +23,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
+    evict_from_tree_cache,
     get_last_loc,
 )
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
@@ -533,6 +534,7 @@ class EAGLEWorker(TpModelWorker):
                     next_draft_input = self.forward_draft_extend_after_decode(batch)
                     batch.spec_info = next_draft_input
                 else:
+                    self._clear_hisparse_pending_draft_extend_backup(batch)
                     # All reqs finished and dp_attention isn't forcing extend.
                     # Install an idle EagleDraftInput so next iter's scheduler
                     # ops (merge_batch / filter_batch) see well-typed empty
@@ -555,6 +557,40 @@ class EAGLEWorker(TpModelWorker):
                 num_correct_drafts_per_req_cpu=verify_output.num_correct_drafts_per_req_cpu,
                 can_run_cuda_graph=verify_output.can_run_cuda_graph,
             )
+
+    def check_forward_draft_extend_after_decode(self, verify_output: EagleVerifyOutput):
+        local_need_forward = verify_output.draft_extend_input.input_ids.shape[0] > 0
+        if not self.server_args.enable_dp_attention:
+            return local_need_forward
+
+        global_need_forward = torch.tensor(
+            [
+                (local_need_forward),
+            ],
+            dtype=torch.int64,
+        )
+        torch.distributed.all_reduce(
+            global_need_forward, group=get_tp_group().cpu_group
+        )
+        global_need_forward_cnt = global_need_forward[0].item()
+        need_forward = global_need_forward_cnt > 0
+        return need_forward
+
+    def _finish_hisparse_pending_draft_extend_backup(self, batch: ScheduleBatch):
+        hisparse_coordinator = getattr(batch, "hisparse_coordinator", None)
+        if (
+            hisparse_coordinator is not None
+            and hisparse_coordinator.supports_hisparse_draft_slots()
+        ):
+            hisparse_coordinator.finish_pending_draft_extend_backup()
+
+    def _clear_hisparse_pending_draft_extend_backup(self, batch: ScheduleBatch):
+        hisparse_coordinator = getattr(batch, "hisparse_coordinator", None)
+        if (
+            hisparse_coordinator is not None
+            and hisparse_coordinator.supports_hisparse_draft_slots()
+        ):
+            hisparse_coordinator.clear_pending_draft_extend_backup()
 
     def forward_target_extend(
         self, batch: ScheduleBatch
@@ -666,18 +702,46 @@ class EAGLEWorker(TpModelWorker):
                 )
                 extend_num_tokens = torch.sum((seq_lens_cpu - prefix_lens_cpu)).item()
 
-            out_cache_loc, token_to_kv_pool_state_backup = (
-                alloc_paged_token_slots_extend(
+            hisparse_coordinator = batch.hisparse_coordinator
+            if (
+                hisparse_coordinator is not None
+                and hisparse_coordinator.supports_hisparse_draft_slots()
+            ):
+                allocator = self.token_to_kv_pool_allocator
+                evict_from_tree_cache(
                     batch.tree_cache,
-                    prefix_lens,
-                    prefix_lens_cpu,
-                    seq_lens,
-                    seq_lens_cpu,
-                    last_loc,
-                    extend_num_tokens,
-                    backup_state=True,
+                    extend_num_tokens + len(prefix_lens_cpu) * allocator.page_size,
                 )
-            )
+                device_slots = hisparse_coordinator.get_draft_device_slots_variable(
+                    batch.req_pool_indices,
+                    seq_lens_cpu - prefix_lens_cpu,
+                    prefix_lens_cpu,
+                )
+                out_cache_loc, token_to_kv_pool_state_backup = (
+                    allocator.alloc_extend_with_device_mapping(
+                        prefix_lens,
+                        prefix_lens_cpu,
+                        seq_lens,
+                        seq_lens_cpu,
+                        last_loc,
+                        extend_num_tokens,
+                        device_slots,
+                        backup_state=True,
+                    )
+                )
+            else:
+                out_cache_loc, token_to_kv_pool_state_backup = (
+                    alloc_paged_token_slots_extend(
+                        batch.tree_cache,
+                        prefix_lens,
+                        prefix_lens_cpu,
+                        seq_lens,
+                        seq_lens_cpu,
+                        last_loc,
+                        extend_num_tokens,
+                        backup_state=True,
+                    )
+                )
 
         if self.page_size > 1 and self.topk > 1:
             last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
@@ -1157,6 +1221,7 @@ class EAGLEWorker(TpModelWorker):
             else CaptureHiddenMode.LAST
         )
         if draft_extend_input.input_ids.shape[0] == 0:
+            self._clear_hisparse_pending_draft_extend_backup(batch)
             # Single source for hidden_size via hidden_size_for(self) (incl.
             # EAGLE-3 aux widening). Two stub origins from verify(): fully-idle
             # batch (DP attn rank w/o reqs) and active batch with all reqs
@@ -1233,6 +1298,7 @@ class EAGLEWorker(TpModelWorker):
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             hidden_states = logits_output.hidden_states
 
+        self._finish_hisparse_pending_draft_extend_backup(batch)
         maybe_detect_nan(
             logits_output.next_token_logits,
             f"draft_extend_after_decode (cuda_graph={can_cuda_graph})",

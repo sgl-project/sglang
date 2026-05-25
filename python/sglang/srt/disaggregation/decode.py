@@ -372,15 +372,23 @@ class DecodePreallocQueue:
 
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.ps.dp_rank
-        transfer_kv_pool = (
-            self.scheduler.hisparse_coordinator.mem_pool_host
-            if self.scheduler.enable_hisparse
-            else self.token_to_kv_pool
-        )
-        kv_data_ptrs, kv_data_lens, kv_item_lens = (
-            transfer_kv_pool.get_contiguous_buf_infos()
-        )
-        if self.draft_token_to_kv_pool is not None:
+        if self.scheduler.enable_hisparse:
+            # Direct-to-host: register host pool pointers so P writes to D's host memory
+            host_pool = self.scheduler.hisparse_coordinator.mem_pool_host
+            kv_data_ptrs, kv_data_lens, kv_item_lens = (
+                host_pool.get_contiguous_buf_infos()
+            )
+        else:
+            kv_data_ptrs, kv_data_lens, kv_item_lens = (
+                self.token_to_kv_pool.get_contiguous_buf_infos()
+            )
+        kv_args.target_kv_data_ptr_count = len(kv_data_ptrs)
+        # HiSparse direct-to-host uses host-pool indices for target KV transfer.
+        # Draft KV remains device-indexed and cannot share that destination list.
+        if (
+            self.draft_token_to_kv_pool is not None
+            and not self.scheduler.enable_hisparse
+        ):
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
