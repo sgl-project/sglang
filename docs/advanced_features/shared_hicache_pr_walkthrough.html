@@ -1,0 +1,1221 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Shared HiCache PR Walkthrough</title>
+  <style>
+    :root {
+      --bg: #f7f8fb;
+      --panel: #ffffff;
+      --ink: #1f2937;
+      --muted: #5f6f86;
+      --line: #d7dde8;
+      --code: #111827;
+      --code-bg: #eef2f8;
+      --green: #0f766e;
+      --blue: #2563eb;
+      --orange: #b45309;
+      --red: #b91c1c;
+      --purple: #6d28d9;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    header {
+      background: #172033;
+      color: white;
+      padding: 36px 28px 26px;
+      border-bottom: 5px solid #3b82f6;
+    }
+
+    header h1 {
+      margin: 0 0 8px;
+      font-size: clamp(28px, 4vw, 44px);
+      letter-spacing: 0;
+    }
+
+    header p {
+      margin: 0;
+      max-width: 1100px;
+      color: #d7e2f2;
+      font-size: 17px;
+    }
+
+    main {
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    nav, section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 22px;
+      margin: 18px 0;
+      box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+    }
+
+    h2 {
+      margin: 0 0 14px;
+      font-size: 25px;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      margin: 28px 0 10px;
+      font-size: 19px;
+      letter-spacing: 0;
+    }
+
+    h4 {
+      margin: 18px 0 8px;
+      font-size: 16px;
+      letter-spacing: 0;
+    }
+
+    a { color: var(--blue); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    code, .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 0.93em;
+    }
+
+    code {
+      background: var(--code-bg);
+      color: var(--code);
+      padding: 1px 5px;
+      border-radius: 5px;
+    }
+
+    pre {
+      background: #101828;
+      color: #ecf2ff;
+      border-radius: 8px;
+      padding: 16px;
+      overflow-x: auto;
+      line-height: 1.45;
+      border: 1px solid #26344f;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0 20px;
+      table-layout: fixed;
+    }
+
+    th, td {
+      border: 1px solid var(--line);
+      padding: 9px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #eef3fb;
+      font-weight: 700;
+    }
+
+    td:first-child, th:first-child {
+      width: 250px;
+    }
+
+    .toc {
+      columns: 2;
+      column-gap: 28px;
+      margin: 0;
+      padding-left: 20px;
+    }
+
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      color: white;
+      background: var(--blue);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0;
+      margin-right: 5px;
+    }
+
+    .pill.green { background: var(--green); }
+    .pill.orange { background: var(--orange); }
+    .pill.red { background: var(--red); }
+    .pill.purple { background: var(--purple); }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 12px;
+      margin: 14px 0;
+    }
+
+    .box {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fbfcff;
+      min-height: 100%;
+    }
+
+    .box strong { display: block; margin-bottom: 5px; }
+
+    .sequence {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(170px, 1fr));
+      gap: 10px;
+      align-items: stretch;
+      overflow-x: auto;
+      padding-bottom: 4px;
+    }
+
+    .step {
+      border: 1px solid var(--line);
+      border-left: 5px solid var(--blue);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fbfcff;
+      min-width: 170px;
+      position: relative;
+    }
+
+    .step:after {
+      content: "->";
+      position: absolute;
+      right: -16px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: #64748b;
+      font-weight: 700;
+    }
+
+    .step:last-child:after { content: ""; }
+    .step.green { border-left-color: var(--green); }
+    .step.orange { border-left-color: var(--orange); }
+    .step.red { border-left-color: var(--red); }
+    .step.purple { border-left-color: var(--purple); }
+
+    .state {
+      border-left: 5px solid var(--green);
+      padding: 10px 12px;
+      background: #eefaf7;
+      border-radius: 6px;
+      margin: 10px 0;
+    }
+
+    .warn {
+      border-left: 5px solid var(--orange);
+      padding: 10px 12px;
+      background: #fff7ed;
+      border-radius: 6px;
+      margin: 10px 0;
+    }
+
+    .danger {
+      border-left: 5px solid var(--red);
+      padding: 10px 12px;
+      background: #fff1f2;
+      border-radius: 6px;
+      margin: 10px 0;
+    }
+
+    .small { color: var(--muted); font-size: 13px; }
+    .tight li { margin: 4px 0; }
+
+    details {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin: 12px 0;
+      background: #fbfcff;
+    }
+
+    summary {
+      cursor: pointer;
+      font-weight: 700;
+    }
+
+    @media (max-width: 800px) {
+      main { padding: 14px; }
+      nav, section { padding: 16px; }
+      .toc { columns: 1; }
+      table { table-layout: auto; }
+      td:first-child, th:first-child { width: auto; }
+      .sequence { grid-template-columns: 1fr; }
+      .step:after { content: ""; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Shared HiCache PR Walkthrough</h1>
+    <p>
+      A detailed review artifact for the fork PR implementing native SGLang Shared HiCache:
+      router-supplied CPU HiCache reuse plans, direct Mooncake-backed host-to-target-GPU KV transfer,
+      scheduler fail-open behavior, cache accounting, and focused tests.
+    </p>
+  </header>
+
+  <main>
+    <nav>
+      <h2>Contents</h2>
+      <ol class="toc">
+        <li><a href="#mental-model">Mental Model</a></li>
+        <li><a href="#end-to-end-flow">End-to-End Flow</a></li>
+        <li><a href="#file-map">File Map</a></li>
+        <li><a href="#plan">Plan Contract</a></li>
+        <li><a href="#hiradix">HiRadix Host Primitives</a></li>
+        <li><a href="#manager">SharedHiCacheManager</a></li>
+        <li><a href="#source">Source-Side Resolution</a></li>
+        <li><a href="#control">HTTP Control Plane</a></li>
+        <li><a href="#transfer">Mooncake Transfer Backend</a></li>
+        <li><a href="#scheduler">Scheduler Integration</a></li>
+        <li><a href="#api">API and Request Plumbing</a></li>
+        <li><a href="#metrics">Metrics and Usage Accounting</a></li>
+        <li><a href="#tests">Tests</a></li>
+        <li><a href="#review">Review Hot Spots</a></li>
+      </ol>
+    </nav>
+
+    <section id="mental-model">
+      <h2>Mental Model</h2>
+      <div class="grid">
+        <div class="box">
+          <strong><span class="pill green">1</span>Plan is the contract</strong>
+          The external router gives SGLang a <code>shared_hicache_plan</code>. The plan is not a static peer map.
+          It says: "for this request, this target worker may reuse this prefix from this source worker at this
+          HTTP endpoint, and the reusable medium is HiCache CPU."
+        </div>
+        <div class="box">
+          <strong><span class="pill">2</span>HiCache stays the owner of cache semantics</strong>
+          The feature does not invent a new cache store. It indexes existing host-tier HiCache nodes and inserts
+          transferred pages through a HiCache-facing primitive:
+          <code>insert_shared_hicache_device_blocks</code>.
+        </div>
+        <div class="box">
+          <strong><span class="pill purple">3</span>Mooncake is only the transport</strong>
+          Mooncake is reused for memory registration and transfer writes. It does not own the plan, prefix logic,
+          node lifetime, or cache hit accounting.
+        </div>
+        <div class="box">
+          <strong><span class="pill orange">4</span>Scheduler fails open</strong>
+          If the plan is bad, stale, unsupported, or the direct transfer is not usable, the request continues with
+          ordinary local prefill. Only indeterminate direct-transfer timeouts quarantine target pages.
+        </div>
+      </div>
+
+      <pre class="mono">Router/Dynamo
+  builds SharedHiCachePlan from KV events and selected source endpoint
+      |
+      v
+TokenizerManager / Engine
+  carries shared_hicache_plan as opaque request metadata
+      |
+      v
+Scheduler
+  probes local HiCache prefix, then asks SharedHiCacheManager to stage missing prefix pages
+      |
+      v
+Target worker HTTP client -> source worker HTTP server
+  source resolves protected host pages and Mooncake writes them into target KV pages
+      |
+      v
+HiRadixCache
+  target inserts the newly written device pages as an ordinary prefix cache node</pre>
+
+      <div class="warn">
+        <strong>Worker id purpose.</strong>
+        <code>shared_hicache_worker_id</code> is the stable routing identity that lets a plan prove it was meant
+        for this SGLang worker. It is deliberately separate from process-local rank internals. The manager rejects
+        plans whose target worker id or source worker id do not match the current target/source role.
+      </div>
+    </section>
+
+    <section id="end-to-end-flow">
+      <h2>End-to-End Flow</h2>
+      <div class="sequence">
+        <div class="step green">
+          <strong>1. Request metadata</strong>
+          <code>Engine.generate</code>, <code>async_generate</code>, and <code>GenerateReqInput</code>
+          carry <code>shared_hicache_plan</code>.
+        </div>
+        <div class="step">
+          <strong>2. Scheduler gate</strong>
+          Scheduler calls <code>_prepare_shared_hicache_for_schedule</code> before final
+          <code>req.init_next_round_input</code>.
+        </div>
+        <div class="step purple">
+          <strong>3. Target staging</strong>
+          Manager validates the plan, allocates target KV pages, and submits a direct-transfer RPC.
+        </div>
+        <div class="step orange">
+          <strong>4. Source transfer</strong>
+          Source resolves HiCache host pages, protects nodes, and asks Mooncake to write into target GPU pages.
+        </div>
+        <div class="step green">
+          <strong>5. Local insertion</strong>
+          Target inserts the transferred pages into HiRadix, increments Shared HiCache hit length, and schedules.
+        </div>
+      </div>
+
+      <h3>State Diagram</h3>
+      <pre class="mono">no plan
+  -> schedule normally
+
+plan present
+  -> parse and validate
+      -> invalid/stale/wrong target/source: clear plan, schedule normally
+      -> already satisfied locally: schedule normally
+      -> transfer disabled/unavailable: schedule normally
+      -> remote transfer submitted: pending
+          -> pending and timeout policy says wait: skip this scheduling pass
+          -> complete ok: insert pages, mark hit, schedule
+          -> complete deterministic miss/error: free target pages, schedule normally
+          -> indeterminate timeout: quarantine target pages, schedule normally</pre>
+    </section>
+
+    <section id="file-map">
+      <h2>File Map</h2>
+      <table>
+        <thead>
+          <tr><th>File</th><th>Role in the PR</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>mem_cache/shared_hicache/plan.py</code></td>
+            <td>Strict Shared HiCache plan schema. Normalizes source endpoint, requires CPU medium, rejects loose integer coercion, exposes planned block hashes.</td>
+          </tr>
+          <tr>
+            <td><code>mem_cache/shared_hicache/manager.py</code></td>
+            <td>Target-side orchestrator. Validates plan, chooses endpoint, manages async transfer futures, page allocation, prefix locks, quarantine, metrics, and insertion into HiRadix.</td>
+          </tr>
+          <tr>
+            <td><code>mem_cache/shared_hicache/source.py</code></td>
+            <td>Source-side HiCache host lookup and transfer request handling. Resolves host pages by block hash, protects host nodes, validates target metadata, invokes transfer backend.</td>
+          </tr>
+          <tr>
+            <td><code>mem_cache/shared_hicache/control.py</code></td>
+            <td>Small HTTP control plane. Exposes <code>/transfer_direct</code> on source workers and performs target-side RPC with timeout classification.</td>
+          </tr>
+          <tr>
+            <td><code>mem_cache/shared_hicache/transfer.py</code></td>
+            <td>Direct-transfer abstraction plus Mooncake implementation. Reuses Mooncake engine, registers target GPU buffers and source host pool, batches contiguous page writes.</td>
+          </tr>
+          <tr>
+            <td><code>mem_cache/hiradix_cache.py</code></td>
+            <td>Adds host block index, Shared HiCache device insertion primitive, and storage-hit tracking needed for accurate cache source accounting.</td>
+          </tr>
+          <tr>
+            <td><code>scheduler.py</code></td>
+            <td>Initializes SharedHiCacheManager after HiCache pools exist, stalls only while remote staging is pending, drains on shutdown/idle checks.</td>
+          </tr>
+          <tr>
+            <td><code>server_args.py</code></td>
+            <td>Adds <code>--enable-shared-hicache</code>, <code>--shared-hicache-worker-id</code>, and compact JSON config validation. Static peer maps are rejected.</td>
+          </tr>
+          <tr>
+            <td><code>io_struct.py</code>, <code>engine.py</code>, <code>tokenizer_manager.py</code></td>
+            <td>Carry the opaque plan from Python API and request normalization into the scheduler. Prefix warmup copies the plan once, then clears it for child samples.</td>
+          </tr>
+          <tr>
+            <td><code>schedule_batch.py</code>, <code>output_streamer.py</code>, OpenAI protocol/utils, metrics collector</td>
+            <td>Expose cache source breakdown including <code>shared_hicache</code> and emit Prometheus counters/histograms.</td>
+          </tr>
+          <tr>
+            <td><code>test/registered/hicache/test_shared_hicache.py</code></td>
+            <td>Focused unit coverage for plan strictness, host lookup, manager staging/quarantine, Mooncake helpers, CLI validation, and API metadata plumbing.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="plan">
+      <h2>Plan Contract: <code>shared_hicache/plan.py</code></h2>
+      <p>
+        This file intentionally makes the router-to-SGLang contract narrow. It removes old compatibility aliases
+        except for the current block-hash naming bridge, requires CPU HiCache source medium, and keeps numeric
+        fields strict so bad JSON cannot silently route to the wrong worker or page.
+      </p>
+
+      <table>
+        <thead><tr><th>Lines</th><th>Walkthrough</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>1-8</code></td>
+            <td>Imports only dataclasses, time, typing, <code>StorageMedium</code>, and <code>block_hash_aliases</code>. This keeps the plan parser dependency-light and usable from both manager and control paths.</td>
+          </tr>
+          <tr>
+            <td><code>10-14</code></td>
+            <td>Defines the public extra-args key, no-plan reason key, schema version, timeout reason, and <code>SHARED_HICACHE_SOURCE_MEDIUM = CPU_PINNED</code>. The source medium constant is the core native HiCache decision.</td>
+          </tr>
+          <tr>
+            <td><code>17-27</code></td>
+            <td><code>_now_ms</code> and <code>normalize_endpoint</code>. Endpoint normalization accepts <code>host:port</code>, adds <code>http://</code>, and strips a trailing slash so control paths can append <code>/transfer_direct</code> exactly once.</td>
+          </tr>
+          <tr>
+            <td><code>30-35</code></td>
+            <td><code>_canonical_source_medium</code> accepts only <code>CPU_PINNED</code>. This is deliberately not backward compatible with older remote-g2 medium names.</td>
+          </tr>
+          <tr>
+            <td><code>38-63</code></td>
+            <td>Strict coercion helpers. <code>bool</code> is rejected even though it is an <code>int</code> subclass, numeric strings are not accepted, block hashes must be integers, and arrays must be concrete sequences.</td>
+          </tr>
+          <tr>
+            <td><code>65-76</code></td>
+            <td>Hash alias and first-present helpers. Signed and unsigned int64 block hash aliases are tolerated because JSON and Dynamo/SGLang boundaries can disagree on int64 presentation.</td>
+          </tr>
+          <tr>
+            <td><code>79-96</code></td>
+            <td><code>SharedHiCachePlan</code> dataclass. Important fields: target/source worker ids, target/source DP ranks, source endpoint, CPU source medium, identity block hashes, optional KV block hashes, block size, TTL, and start block index.</td>
+          </tr>
+          <tr>
+            <td><code>99-196</code></td>
+            <td><code>from_dict</code> performs all validation in one place. It requires mapping input, accepts current <code>block_hashes</code> plus a short <code>hashes</code> bridge, clamps planned blocks to available hashes, validates optional <code>kv_block_hashes</code> length, normalizes endpoint, and rejects expired/negative/missing fields later through manager validation.</td>
+          </tr>
+          <tr>
+            <td><code>198-215</code></td>
+            <td>Serialization and read helpers: <code>to_dict</code> keeps the same field names, <code>planned_hashes</code> and <code>planned_kv_block_hashes</code> slice to the planned prefix, <code>is_shared_hicache</code> checks medium, and <code>is_expired</code> centralizes TTL checks.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="state">
+        Plan rule: Shared HiCache only stages CPU HiCache pages. It does not claim disk, external object storage,
+        or Mooncake L3 store content as reusable source pages.
+      </div>
+    </section>
+
+    <section id="hiradix">
+      <h2>HiRadix Host Primitives</h2>
+      <p>
+        The PR adds the minimum HiCache-native primitives needed for cross-worker host reuse. These primitives
+        live in <code>python/sglang/srt/mem_cache/hiradix_cache.py</code> and <code>mem_cache/utils.py</code>.
+      </p>
+
+      <h3><code>hiradix_cache.py</code></h3>
+      <table>
+        <thead><tr><th>Lines</th><th>Walkthrough</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>55-60</code></td>
+            <td>Imports <code>block_hash_aliases</code>, <code>compute_node_hash_values</code>, <code>hash_str_to_int64</code>, and <code>split_node_hash_value</code>. These helpers keep hash math out of the tree logic.</td>
+          </tr>
+          <tr>
+            <td><code>111-115</code></td>
+            <td>Enables the host block index only when <code>server_args.enable_shared_hicache</code> is set. The index is protected by an <code>RLock</code> because source HTTP handlers can read it while scheduler threads mutate tree state.</td>
+          </tr>
+          <tr>
+            <td><code>178-180</code></td>
+            <td>Adds <code>prefetch_loaded_tokens_by_reqid</code>. This separates storage-prefetched host hits from ordinary host hits when producing usage metrics.</td>
+          </tr>
+          <tr>
+            <td><code>632-642</code></td>
+            <td><code>reset</code> now clears prefetch hit tracking and the host block index. This prevents stale block-hash to node pointers after cache reset.</td>
+          </tr>
+          <tr>
+            <td><code>644-665</code></td>
+            <td><code>_index_hicache_host_node</code> indexes each host-backed page by signed and unsigned block hash aliases. It computes node hash values if missing, drops stale entries for the node, and records <code>(node, page_idx, hash_value)</code>.</td>
+          </tr>
+          <tr>
+            <td><code>666-685</code></td>
+            <td><code>_drop_hicache_host_node</code> removes all aliases pointing at a node. This is called when host pages are evicted, when nodes split, and before re-indexing a node.</td>
+          </tr>
+          <tr>
+            <td><code>687-727</code></td>
+            <td><code>lookup_hicache_host_blocks</code> expands requested aliases, validates that each indexed entry still points at the same live host page, optionally protects matched nodes, and lazily removes stale aliases.</td>
+          </tr>
+          <tr>
+            <td><code>729-734</code></td>
+            <td>Lazy lock initializer for test-created cache objects that bypass <code>__init__</code>.</td>
+          </tr>
+          <tr>
+            <td><code>736-739</code></td>
+            <td><code>insert_shared_hicache_device_blocks</code> is intentionally thin. Shared HiCache inserts through the same prefix cache insertion path as local computation, preserving tree semantics.</td>
+          </tr>
+          <tr>
+            <td><code>864</code>, <code>892</code>, <code>1460</code>, <code>1516-1517</code></td>
+            <td>Host index maintenance hooks after backup/load/split operations. When host-resident tree nodes appear or split, their page hashes are made discoverable by source workers.</td>
+          </tr>
+          <tr>
+            <td><code>1017-1029</code>, <code>1063</code></td>
+            <td>Host/device eviction hooks keep KV events correct and remove host index entries as pages leave host memory.</td>
+          </tr>
+          <tr>
+            <td><code>1305-1329</code></td>
+            <td>Storage prefetch completion records tokens loaded from storage, and <code>pop_prefetch_loaded_tokens</code> lets scheduler consume the number once.</td>
+          </tr>
+          <tr>
+            <td><code>1594-1599</code></td>
+            <td>New device insertions still compute hash values and emit <code>BlockStored</code> events, so a transferred Shared HiCache prefix becomes visible to routing/indexing like any other device prefix.</td>
+          </tr>
+          <tr>
+            <td><code>1605-1607</code></td>
+            <td>Abort cleanup now drops stale per-request storage-hit accounting.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3><code>mem_cache/utils.py</code></h3>
+      <table>
+        <thead><tr><th>Lines</th><th>Walkthrough</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>426-441</code></td>
+            <td><code>get_hash_str</code> remains the SHA256 page hash basis. It includes prior hash chaining so page ids are position-aware.</td>
+          </tr>
+          <tr>
+            <td><code>444-452</code></td>
+            <td><code>hash_str_to_int64</code> converts the first 64 bits of the SHA256 hash into signed int64, matching KV event block ids.</td>
+          </tr>
+          <tr>
+            <td><code>455-469</code></td>
+            <td><code>block_hash_aliases</code> maps signed and unsigned representations to each other. This is the narrow compatibility bridge retained because JSON consumers can surface either representation.</td>
+          </tr>
+          <tr>
+            <td><code>472-489</code></td>
+            <td><code>compute_node_hash_values</code> recomputes per-page hashes for a node using parent hash context. Shared HiCache relies on this to map router block ids back to HiCache host pages.</td>
+          </tr>
+          <tr>
+            <td><code>492-516</code></td>
+            <td><code>split_node_hash_value</code> keeps hash lists aligned when a radix node splits. Without this, host index entries could point at wrong logical pages after a split.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="manager">
+      <h2>Target Orchestrator: <code>shared_hicache/manager.py</code></h2>
+      <p>
+        The manager is the target-side control loop. Its job is to turn a router plan into local device-prefix
+        pages without blocking the scheduler indefinitely or corrupting the allocator when a transfer result is
+        ambiguous.
+      </p>
+
+      <h3>Class Skeleton</h3>
+      <table>
+        <thead><tr><th>Lines</th><th>Walkthrough</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>1-55</code></td>
+            <td>Imports scheduler-facing types, HiCache types, plan/control/source/transfer helpers, and exposes plan constants through this module for existing imports.</td>
+          </tr>
+          <tr>
+            <td><code>57-66</code></td>
+            <td>Metric label and endpoint normalization. Labels are truncated/sanitized, endpoints get <code>http://</code> if needed.</td>
+          </tr>
+          <tr>
+            <td><code>68-86</code></td>
+            <td><code>SharedHiCacheResult</code> is the scheduler-facing result: staged token count, pending boolean, reason. <code>_SharedHiCachePendingFetch</code> tracks a submitted transfer future plus allocation and metrics metadata.</td>
+          </tr>
+          <tr>
+            <td><code>88-140</code></td>
+            <td>Small helpers for timeout formatting, indeterminate timeout classification, HTTP bind parsing, and DP endpoint selection. Endpoint selection supports an endpoint string, per-DP JSON map, or <code>{dp_rank}</code> template.</td>
+          </tr>
+          <tr>
+            <td><code>143</code></td>
+            <td><code>_shared_hicache_enabled</code> treats either the explicit flag or a normalized config as enabling the feature.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Initialization and Factory</h3>
+      <table>
+        <thead><tr><th>Lines</th><th>Walkthrough</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>148-209</code></td>
+            <td><code>__init__</code> stores tree cache, worker id, DP rank, timeout policy borrowed from HiCache prefetch settings, direct-transfer backend, metrics collector, local control endpoint, semaphores, executor, pending maps, and quarantine state.</td>
+          </tr>
+          <tr>
+            <td><code>211-256</code></td>
+            <td><code>from_scheduler</code> is the main gate. It requires Shared HiCache enabled, hierarchical cache enabled, tree primitives present, and a worker id. It then asks <code>make_shared_hicache_transfer_backend</code> for a direct backend and constructs the manager.</td>
+          </tr>
+          <tr>
+            <td><code>258-296</code></td>
+            <td>Backend labels and metrics observation. Every hit/miss/error is reported with normalized backend, outcome, reason, token count, wait time, insert time, and byte count when available.</td>
+          </tr>
+          <tr>
+            <td><code>298-343</code></td>
+            <td>Wait policy helpers. Shared HiCache reuses HiCache storage prefetch policy concepts: <code>best_effort</code>, <code>timeout</code>, and <code>wait_complete</code>. This keeps scheduling behavior aligned with existing HiCache semantics.</td>
+          </tr>
+          <tr>
+            <td><code>352-390</code></td>
+            <td>Source resolver and fetch worker semaphores. Source HTTP handlers are bounded separately from target fetch workers so a worker cannot pile up unlimited remote-copy tasks.</td>
+          </tr>
+          <tr>
+            <td><code>391-404</code></td>
+            <td>Starts the local source HTTP server only if this worker has a configured control endpoint. A worker can be a target-only participant if no endpoint is bound.</td>
+          </tr>
+          <tr>
+            <td><code>406-492</code></td>
+            <td>Shutdown drains the HTTP server, fetch executor, and direct transfer backend. Backend shutdown is deferred if fetches are still pending so target/source buffers are not deregistered while Mooncake writes may still be in flight.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Plan Validation, Allocation, and Quarantine</h3>
+      <table>
+        <thead><tr><th>Lines</th><th>Walkthrough</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>494-522</code></td>
+            <td>Endpoint list is now only the plan endpoint. There is no static peer map fallback. <code>_request_source_transfer</code> passes plan, start block, max blocks, target transfer descriptor, target KV ptrs/item sizes, and target page indices to the control client.</td>
+          </tr>
+          <tr>
+            <td><code>524-531</code></td>
+            <td><code>_handle_source_transfer</code> delegates source-side payload validation and transfer to <code>source.handle_source_transfer</code>.</td>
+          </tr>
+          <tr>
+            <td><code>533-539</code></td>
+            <td><code>_max_cacheable_blocks</code> limits the transfer to page-aligned request tokens so the target does not stage beyond the prompt portion it can actually use.</td>
+          </tr>
+          <tr>
+            <td><code>541-561</code></td>
+            <td><code>_validate_plan</code> rejects wrong target worker, wrong DP rank, source-is-target, unsupported schema version, expired plan, wrong source medium, or block size mismatch. All are fail-open reasons.</td>
+          </tr>
+          <tr>
+            <td><code>563-579</code></td>
+            <td>Plan key dedupes completed work by request id and plan id. Allocation uses the existing device allocator and tries eviction before returning <code>None</code>.</td>
+          </tr>
+          <tr>
+            <td><code>581-644</code></td>
+            <td>Quarantine logic is the safety valve for indeterminate direct-transfer timeouts. Pages are not freed if Mooncake may still write into them; they are held until shutdown/release and reported through quarantine metrics.</td>
+          </tr>
+          <tr>
+            <td><code>645-664</code></td>
+            <td><code>_device_indices_to_page_indices</code> validates that target allocations are contiguous and page-aligned, then converts token indices into page indices expected by Mooncake transfer math.</td>
+          </tr>
+          <tr>
+            <td><code>666-682</code></td>
+            <td><code>has_pending</code> includes target fetch futures, detached futures, and active source resolver ops. Scheduler idle checks use this before destructive operations such as attach/detach/flush.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Prefix Locks and Submit Path</h3>
+      <table>
+        <thead><tr><th>Lines</th><th>Walkthrough</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>684-697</code></td>
+            <td>The manager locks the current request prefix node while a remote prefix is being staged. This prevents local eviction of the matched prefix base.</td>
+          </tr>
+          <tr>
+            <td><code>698-738</code></td>
+            <td>Release logic is careful: pending pages are freed only for deterministic misses/errors. If a future is still unfinished, cleanup is attached as a callback. If timeout is indeterminate, pages are quarantined instead of freed.</td>
+          </tr>
+          <tr>
+            <td><code>739-784</code></td>
+            <td><code>_submit_direct_transfer</code> checks backend availability, endpoints, fetch worker availability, allocates target pages, computes target page indices, submits <code>request_source_transfer</code> to the executor, and releases the fetch semaphore in a callback.</td>
+          </tr>
+          <tr>
+            <td><code>786-822</code></td>
+            <td>Public shims preserve readable call sites: <code>maybe_stage_shared_prefix</code>, <code>maybe_stage_reuse_plan</code>, <code>has_reuse_plan</code>, <code>prefetch_shared_prefix</code>, <code>check_reuse_plan_progress</code>, and <code>release_request</code>.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Main Scheduler Loop: <code>check_shared_prefix</code></h3>
+      <table>
+        <thead><tr><th>Lines</th><th>Walkthrough</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>824-849</code></td>
+            <td>Reads <code>req.shared_hicache_plan</code>. No plan means immediate miss/no-op. Bad plan parse clears the plan, logs an error metric, and fail-opens.</td>
+          </tr>
+          <tr>
+            <td><code>850-873</code></td>
+            <td>Validates target/source/version/TTL/medium/block size and dedupes plans already completed for this request. Invalid plans are cleared.</td>
+          </tr>
+          <tr>
+            <td><code>874-914</code></td>
+            <td>Computes the current local matched length using <code>prefix_indices + host_hit_length</code>, requires page alignment, derives the plan offset, and caps planned blocks by prompt length and plan length.</td>
+          </tr>
+          <tr>
+            <td><code>915-965</code></td>
+            <td>Handles an existing pending fetch. If not done and policy still waits, scheduler skips this request for the pass. If done, it calls <code>_finish_pending_fetch</code>. If timed out deterministically, it releases pages and fail-opens.</td>
+          </tr>
+          <tr>
+            <td><code>966-1006</code></td>
+            <td>Before submitting, it short-circuits when direct transfer is disabled, no endpoint exists, or local host cache already covers the planned blocks. It then locks the local prefix, submits transfer, and records pending state.</td>
+          </tr>
+          <tr>
+            <td><code>1007-1020</code></td>
+            <td>Returns a pending result to scheduler. The request is skipped until the future completes or the timeout policy says to stop waiting.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Completion Path</h3>
+      <table>
+        <thead><tr><th>Lines</th><th>Walkthrough</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>1022-1062</code></td>
+            <td><code>_finish_pending_fetch</code> removes pending state, computes wait time, and handles future exceptions. Exceptions free pages unless the reason is indeterminate.</td>
+          </tr>
+          <tr>
+            <td><code>1063-1109</code></td>
+            <td>Empty page result is a miss/error. Indeterminate timeout quarantines pages. Deterministic no-pages frees pages and fail-opens.</td>
+          </tr>
+          <tr>
+            <td><code>1110-1154</code></td>
+            <td>Validates that the source did not return more blocks than expected and that target pages are contiguous. Bad shape is an error and target pages are released.</td>
+          </tr>
+          <tr>
+            <td><code>1155-1185</code></td>
+            <td>Inserts pages into local HiRadix, increments <code>req.shared_hicache_hit_length</code>, emits hit metrics, clears plan once satisfied, and returns staged token count.</td>
+          </tr>
+          <tr>
+            <td><code>1187-1259</code></td>
+            <td><code>_insert_device_pages</code> builds the exact suffix key, trims to request length and allocated token count, requires that the remote suffix begins at the current prefix length, calls <code>tree_cache.insert_shared_hicache_device_blocks</code>, and frees duplicate device indices if the tree already had some of the prefix.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="source">
+      <h2>Source-Side Resolution: <code>shared_hicache/source.py</code></h2>
+      <p>
+        This file runs on the source worker. It treats the plan as a proof that a specific target may copy
+        specific CPU HiCache pages, then resolves only the contiguous prefix currently present in host memory.
+      </p>
+
+      <table>
+        <thead><tr><th>Lines</th><th>Walkthrough</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>22-39</code></td>
+            <td><code>ResolvedHostPage</code> is the byte-copy fallback shape. <code>ResolvedHostPageLocation</code> is the direct-transfer shape: identity block hash, KV block hash, host token start, host page index, node, and page index in that node.</td>
+          </tr>
+          <tr>
+            <td><code>41-53</code></td>
+            <td><code>_lookup_hicache_host_blocks</code> calls the tree primitive <code>lookup_hicache_host_blocks(..., protect=True)</code>. The source file does not scan the tree itself.</td>
+          </tr>
+          <tr>
+            <td><code>56-84</code></td>
+            <td>Lookup helpers bridge signed/unsigned aliases and turn a node's host value into token-start page indices. These are used to compute Mooncake source page indices.</td>
+          </tr>
+          <tr>
+            <td><code>87-120</code></td>
+            <td><code>resolve_host_pages</code> is the byte-copy path for tests/fallback. It resolves host page locations, copies page data to bytes, and releases protected nodes.</td>
+          </tr>
+          <tr>
+            <td><code>122-189</code></td>
+            <td><code>resolve_host_page_locations</code> validates worker id, DP rank, TTL, CPU source medium, and block size. It looks up optional KV hashes, returns a contiguous prefix until the first miss, and reports reasons such as <code>missing_first_block</code> or <code>partial</code>.</td>
+          </tr>
+          <tr>
+            <td><code>192-229</code></td>
+            <td>Protected host nodes are released in one helper. Transfer integer parsing rejects booleans, negative addresses, and out-of-range unsigned 64-bit values.</td>
+          </tr>
+          <tr>
+            <td><code>235-307</code></td>
+            <td><code>_parse_target_kv_metadata</code> validates target session id, target buffer pointers, item lengths, and expected item-size agreement with the transfer backend. This prevents a source from writing to malformed target descriptors.</td>
+          </tr>
+          <tr>
+            <td><code>310-354</code></td>
+            <td><code>handle_source_transfer</code> checks backend availability, requested backend match, plan validity, start/max block bounds, target metadata, and target page index count.</td>
+          </tr>
+          <tr>
+            <td><code>355-425</code></td>
+            <td>It resolves host page locations, maps host token starts to source page indices, trims target page indices to the found pages, computes transfer byte count, and calls <code>transfer_backend.transfer_pages</code>.</td>
+          </tr>
+          <tr>
+            <td><code>426-487</code></td>
+            <td>Timeouts become the shared indeterminate reason <code>source_transfer_timeout_maybe_inflight</code>. The response carries ok/reason, block size, timing fields, bytes, and <code>transferred_blocks</code>. Protected host nodes are released in <code>finally</code>.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="control">
+      <h2>HTTP Control Plane: <code>shared_hicache/control.py</code></h2>
+      <p>
+        The control plane is intentionally small: one source endpoint for direct transfer and one target client.
+        It does not carry data pages back to the target; the data movement happens through Mooncake.
+      </p>
+
+      <table>
+        <thead><tr><th>Lines</th><th>Walkthrough</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>23-33</code></td>
+            <td><code>_ReusableThreadingHTTPServer</code> enables address reuse, daemon request threads, and <code>TCP_NODELAY</code>.</td>
+          </tr>
+          <tr>
+            <td><code>36-49</code></td>
+            <td>Timeout classification helpers. Timeout reasons are treated as indeterminate because a write may still complete after the target gives up waiting.</td>
+          </tr>
+          <tr>
+            <td><code>50-204</code></td>
+            <td><code>start_source_transfer_server</code> creates the source <code>/transfer_direct</code> handler. It bounds resolver concurrency, validates <code>Content-Length</code>, checks max body size, parses JSON mapping payloads, checks transfer backend availability, invokes the manager handler, attaches timing, and writes JSON responses.</td>
+          </tr>
+          <tr>
+            <td><code>207-213</code></td>
+            <td>Local integer coercion for response fields. It preserves the same strictness as the plan parser.</td>
+          </tr>
+          <tr>
+            <td><code>215-232</code></td>
+            <td><code>pages_from_transfer_result</code> reconstructs transferred block metadata from the original plan and <code>transferred_blocks</code>. The old path that returned serialized page bytes is gone.</td>
+          </tr>
+          <tr>
+            <td><code>235-388</code></td>
+            <td><code>request_source_transfer</code> builds the target payload, posts to each candidate endpoint, handles timeout as indeterminate, skips malformed/rejected deterministic failures, and returns reconstructed pages plus reason.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="transfer">
+      <h2>Direct Transfer Backend: <code>shared_hicache/transfer.py</code></h2>
+      <p>
+        This file is the extracted reusable transfer layer. The important design choice: it reuses the existing
+        Mooncake transfer engine but keeps Shared HiCache semantics above it.
+      </p>
+
+      <table>
+        <thead><tr><th>Lines</th><th>Walkthrough</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>17-39</code></td>
+            <td><code>SharedHiCacheTransferBackend</code> protocol: enabled flag, target descriptor, page transfer, shutdown.</td>
+          </tr>
+          <tr>
+            <td><code>42-68</code></td>
+            <td>Scheduler KV introspection and topology rejection. The first pass supports dense KV pools only and requires direct topology <code>tp=1</code>, <code>pp=1</code>, <code>attn_cp=1</code>.</td>
+          </tr>
+          <tr>
+            <td><code>71-86</code></td>
+            <td>Config readers normalize the compact server config: transfer backend name and timeout seconds.</td>
+          </tr>
+          <tr>
+            <td><code>89-106</code></td>
+            <td><code>_get_or_init_mooncake_transfer_engine</code> reuses the process-global Mooncake engine. It gets local IP, scheduler GPU id, and configured IB device rather than creating a parallel Mooncake stack.</td>
+          </tr>
+          <tr>
+            <td><code>109-127</code></td>
+            <td><code>_source_host_buf_infos</code> requires layer-first host pool layout and returns host KV buffer pointers and lengths from existing HiCache host memory.</td>
+          </tr>
+          <tr>
+            <td><code>130-192</code></td>
+            <td>Item-size validation and transfer-array construction. It uses existing <code>group_concurrent_contiguous</code> behavior to collapse contiguous pages into fewer Mooncake writes, then computes source and destination byte addresses with uint64-safe arithmetic.</td>
+          </tr>
+          <tr>
+            <td><code>194-229</code></td>
+            <td><code>MooncakeSharedHiCacheTransferBackend.__init__</code> stores engine, tree, target KV ptrs/item lengths, transport info, transfer parallelism, and lazy transfer executor state.</td>
+          </tr>
+          <tr>
+            <td><code>231-289</code></td>
+            <td><code>from_scheduler</code> is fail-open for <code>auto</code> but raises for explicit unsupported <code>mooncake</code>. It initializes Mooncake, registers target KV regions, registers the source host pool, and logs readiness.</td>
+          </tr>
+          <tr>
+            <td><code>291-325</code></td>
+            <td><code>enabled</code>, <code>target_descriptor</code>, and ready logging expose backend/session/transport details to the source.</td>
+          </tr>
+          <tr>
+            <td><code>327-357</code></td>
+            <td><code>_register_source_host_pool</code> validates layer-first host KV buffer layout, checks item lengths, and registers the host pool once.</td>
+          </tr>
+          <tr>
+            <td><code>359-384</code></td>
+            <td>Shutdown intentionally keeps Mooncake memory registrations process-lifetime but shuts down the local transfer executor.</td>
+          </tr>
+          <tr>
+            <td><code>386-429</code></td>
+            <td><code>_batch_transfer_sync</code> splits writes across configured transfer parallelism and drains all chunks before raising. This avoids freeing target pages while another transfer chunk is still in flight.</td>
+          </tr>
+          <tr>
+            <td><code>431-469</code></td>
+            <td><code>transfer_pages</code> builds grouped arrays and calls Mooncake <code>batch_transfer_sync</code>. Nonzero return codes become explicit runtime errors.</td>
+          </tr>
+          <tr>
+            <td><code>472-498</code></td>
+            <td><code>make_shared_hicache_transfer_backend</code> centralizes backend construction. Explicit <code>mooncake</code> fails loudly; <code>auto</code> returns <code>None</code> when unavailable so scheduling can continue.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Existing Mooncake Helper Reuse</h3>
+      <table>
+        <thead><tr><th>File lines</th><th>What changed</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>mooncake_transfer_engine.py:162-191</code></td>
+            <td><code>register_regions_checked</code> was added to reuse Mooncake registration while detecting concrete failures. It prefers scalar <code>register_memory</code> because some Mooncake versions can report batch success despite individual CUDA registration failures.</td>
+          </tr>
+          <tr>
+            <td><code>mooncake_transfer_engine.py:257-286</code></td>
+            <td>Existing <code>batch_transfer_sync</code> is reused for actual writes. Shared HiCache does not duplicate Mooncake write APIs.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="scheduler">
+      <h2>Scheduler Integration</h2>
+      <table>
+        <thead><tr><th>Lines</th><th>Walkthrough</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>scheduler.py:223</code></td>
+            <td>Imports <code>SharedHiCacheManager</code>.</td>
+          </tr>
+          <tr>
+            <td><code>scheduler.py:489-490</code></td>
+            <td>Initializes Shared HiCache after HiCache pools and draft registration exist. This ordering matters because transfer backend registration needs KV pool and host pool information.</td>
+          </tr>
+          <tr>
+            <td><code>scheduler.py:1001-1003</code></td>
+            <td><code>init_shared_hicache</code> is a thin factory call. Disabled/unsupported configurations return <code>None</code>.</td>
+          </tr>
+          <tr>
+            <td><code>scheduler.py:2037-2065</code></td>
+            <td><code>_prepare_shared_hicache_for_schedule</code> is the scheduling gate. It checks whether a request has a plan, probes local prefix without COW allocation, asks the manager for progress, and fail-opens on exceptions.</td>
+          </tr>
+          <tr>
+            <td><code>scheduler.py:2577-2588</code></td>
+            <td>The main waiting-queue loop first drains normal HiCache prefetch progress, then calls Shared HiCache. If Shared HiCache returns pending, the request is skipped for this scheduling pass.</td>
+          </tr>
+          <tr>
+            <td><code>scheduler.py:3213-3215</code></td>
+            <td>Idle checks include Shared HiCache pending state. Attach/detach/flush operations cannot proceed while remote writes or source handlers may still be active.</td>
+          </tr>
+          <tr>
+            <td><code>scheduler.py:3223-3225</code></td>
+            <td>Scheduler shutdown delegates to manager shutdown so the HTTP server and transfer executor are stopped.</td>
+          </tr>
+          <tr>
+            <td><code>batch_result_processor.py:81,96,236,321,794</code></td>
+            <td>Finished or aborted requests call <code>release_shared_hicache_request</code>. This releases pending allocations, prefix locks, and stale request state.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="api">
+      <h2>API and Request Plumbing</h2>
+      <table>
+        <thead><tr><th>Lines</th><th>Walkthrough</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>server_args.py:641-653</code></td>
+            <td>Adds <code>enable_shared_hicache</code>, <code>shared_hicache_worker_id</code>, and <code>shared_hicache_config</code> beside HiCache settings.</td>
+          </tr>
+          <tr>
+            <td><code>server_args.py:3649-3798</code></td>
+            <td>Config normalization. Config implies enablement, enablement requires hierarchical cache and worker id, static endpoint maps are rejected, worker id must be a nonnegative int, transfer backend is <code>auto</code> or <code>mooncake</code>, timeout must be positive, and the normalized config stores worker id, control endpoint, timeout, and backend.</td>
+          </tr>
+          <tr>
+            <td><code>environ.py:344-345,729-733</code></td>
+            <td>Adds env knobs for target fetch workers and transfer parallelism. Default transfer parallelism is 4 unless explicitly set.</td>
+          </tr>
+          <tr>
+            <td><code>engine.py:344,380,438,474</code></td>
+            <td>Sync and async Python APIs accept <code>shared_hicache_plan</code> and forward it into <code>GenerateReqInput</code>.</td>
+          </tr>
+          <tr>
+            <td><code>io_struct.py:218-219</code></td>
+            <td><code>GenerateReqInput</code> carries opaque external Shared HiCache metadata.</td>
+          </tr>
+          <tr>
+            <td><code>io_struct.py:411,614-623</code></td>
+            <td>Batch normalization requires a plan list to match original batch size, then preserves one plan per original request. This avoids accidental plan expansion for parallel sampling children.</td>
+          </tr>
+          <tr>
+            <td><code>io_struct.py:705-709,792</code></td>
+            <td>Indexing a batched request passes the per-item plan to <code>TokenizedGenerateReqInput</code>.</td>
+          </tr>
+          <tr>
+            <td><code>tokenizer_manager.py:1054</code></td>
+            <td>Tokenization forwards the plan to the scheduler-bound tokenized request.</td>
+          </tr>
+          <tr>
+            <td><code>tokenizer_manager.py:1461-1487</code></td>
+            <td>Prefix warmup explicitly copies the original plan only for the warmup request, then clears it for the expanded parallel samples. This removes the previous implicit behavior.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="metrics">
+      <h2>Metrics and Usage Accounting</h2>
+      <table>
+        <thead><tr><th>Lines</th><th>Walkthrough</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>schedule_batch.py:668,747</code></td>
+            <td><code>Req</code> stores the plan as request state.</td>
+          </tr>
+          <tr>
+            <td><code>schedule_batch.py:895-906</code></td>
+            <td>Each request tracks total cached tokens plus device, host, storage, and Shared HiCache breakdown fields. The computed flag prevents chunked-prefill double counting.</td>
+          </tr>
+          <tr>
+            <td><code>schedule_batch.py:1898-1934</code></td>
+            <td>At prefill accounting time, host total is split into host and storage, device total is split into ordinary device and Shared HiCache, and the breakdown is recorded once.</td>
+          </tr>
+          <tr>
+            <td><code>output_streamer.py:60-94</code></td>
+            <td>Builds <code>cached_tokens_details</code>. It includes <code>shared_hicache</code> only when positive and storage fields only when a storage backend exists.</td>
+          </tr>
+          <tr>
+            <td><code>output_streamer.py:168-229,340-358,470-480</code></td>
+            <td>Embedding and token-id outputs carry the details back to TokenizerManager.</td>
+          </tr>
+          <tr>
+            <td><code>tokenizer_manager.py:1754-1769</code></td>
+            <td>Response metadata includes <code>cached_tokens_details</code> when present.</td>
+          </tr>
+          <tr>
+            <td><code>tokenizer_manager.py:2247-2272</code></td>
+            <td>Finished request metrics receive the detailed breakdown.</td>
+          </tr>
+          <tr>
+            <td><code>openai/protocol.py:156-176</code></td>
+            <td>OpenAI-compatible usage details add optional <code>shared_hicache</code>. Serializer removes optional fields when absent.</td>
+          </tr>
+          <tr>
+            <td><code>openai/protocol.py:332,398,680</code></td>
+            <td>Completion/chat requests can ask for cache details, and SGLang extension response payloads can carry them.</td>
+          </tr>
+          <tr>
+            <td><code>openai/utils.py:109-145</code></td>
+            <td>Converts raw meta info into the typed <code>CachedTokensDetails</code> object, preserving <code>shared_hicache</code> and optional storage fields.</td>
+          </tr>
+          <tr>
+            <td><code>metrics_collector.py:554-600</code></td>
+            <td>Creates Shared HiCache Prometheus metrics for requests, tokens, wait seconds, insert seconds, transfer bytes, quarantine events, quarantined total tokens, and current quarantined tokens.</td>
+          </tr>
+          <tr>
+            <td><code>metrics_collector.py:1104-1171</code></td>
+            <td>Observation helpers centralize Shared HiCache metric emission and are no-ops if metrics are disabled.</td>
+          </tr>
+          <tr>
+            <td><code>metrics_collector.py:1531-1535,1660-1700</code></td>
+            <td>The existing cached token counter now labels source as <code>device</code>, <code>host</code>, <code>shared_hicache</code>, or <code>storage_&lt;backend&gt;</code>.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="tests">
+      <h2>Focused Tests</h2>
+      <p>
+        The test file is intentionally a first-pass unit suite rather than a full benchmark/regression wall. It
+        targets the review risks that changed with the Shared HiCache refactor.
+      </p>
+
+      <table>
+        <thead><tr><th>Lines</th><th>Test coverage</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>1-44</code></td>
+            <td>Imports only the units under test plus lightweight fakes.</td>
+          </tr>
+          <tr>
+            <td><code>46-235</code></td>
+            <td>Plan, future, tree, transfer, Mooncake, metrics, and tokenizer-manager fakes. These keep tests small and avoid launching a real server.</td>
+          </tr>
+          <tr>
+            <td><code>256-275</code></td>
+            <td>Plan parser requires CPU source medium and real integer fields.</td>
+          </tr>
+          <tr>
+            <td><code>276-309</code></td>
+            <td>Source resolution protects host nodes, finds KV-hash-backed pages, copies bytes, and releases protection.</td>
+          </tr>
+          <tr>
+            <td><code>310-359</code></td>
+            <td>HiRadix host index tracks signed/unsigned aliases and drops stale entries after host eviction.</td>
+          </tr>
+          <tr>
+            <td><code>360-387</code></td>
+            <td>Manager stages a direct transfer into local prefix and increments request Shared HiCache hits.</td>
+          </tr>
+          <tr>
+            <td><code>388-411</code></td>
+            <td>Indeterminate timeout quarantines target pages instead of freeing them.</td>
+          </tr>
+          <tr>
+            <td><code>412-456</code></td>
+            <td>Mooncake backend registers the source host pool and emits grouped transfers with correct source and destination addresses.</td>
+          </tr>
+          <tr>
+            <td><code>457-525</code></td>
+            <td>Registration failure is detected, GPU id comes from scheduler parallel state, and explicit unsupported topology raises.</td>
+          </tr>
+          <tr>
+            <td><code>527-615</code></td>
+            <td>Server args enforce hierarchical cache, worker id, no static peer maps, and valid transfer backend choices.</td>
+          </tr>
+          <tr>
+            <td><code>617-670</code></td>
+            <td>Cache details and metrics use <code>shared_hicache</code> names.</td>
+          </tr>
+          <tr>
+            <td><code>672-706</code></td>
+            <td>Batch request normalization and <code>Engine.async_generate</code> preserve/forward the plan metadata.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="review">
+      <h2>Review Hot Spots</h2>
+      <div class="grid">
+        <div class="box">
+          <strong>Plan schema and naming</strong>
+          The public names are now Shared HiCache names: <code>--enable-shared-hicache</code>,
+          <code>shared_hicache_plan</code>, <code>SharedHiCacheManager</code>, and metrics prefixed
+          with <code>shared_hicache</code>.
+        </div>
+        <div class="box">
+          <strong>No static peer map</strong>
+          Static endpoint maps are rejected in <code>server_args.py</code>. The source endpoint is carried
+          per plan. That makes the scheduler behavior explicit and router-owned.
+        </div>
+        <div class="box">
+          <strong>HiCache-native primitives</strong>
+          The shared feature uses <code>lookup_hicache_host_blocks</code> and
+          <code>insert_shared_hicache_device_blocks</code> rather than building an alternate tree/cache store.
+        </div>
+        <div class="box">
+          <strong>Mooncake reuse boundary</strong>
+          Reused: engine init, memory registration, batch transfer. Not reused: Mooncake store APIs, offload
+          manager logic, or storage backend abstractions, because this is CPU HiCache peer reuse, not L3 object fetch.
+        </div>
+        <div class="box">
+          <strong>Timeout safety</strong>
+          Direct-transfer timeouts are treated as potentially in-flight writes. The target quarantines pages instead
+          of returning them to the allocator.
+        </div>
+        <div class="box">
+          <strong>Prefix warmup explicitness</strong>
+          Prefix warmup copies the plan for the warmup request only. Expanded parallel samples clear the plan so
+          they do not race the same remote staging implicitly.
+        </div>
+      </div>
+
+      <h3>What to review first</h3>
+      <ol class="tight">
+        <li><code>shared_hicache/manager.py:824-1259</code> for target correctness and page lifetime.</li>
+        <li><code>shared_hicache/source.py:122-189</code> and <code>310-487</code> for source validation and host-node protection.</li>
+        <li><code>shared_hicache/transfer.py:130-192</code> and <code>386-469</code> for address math and chunk draining.</li>
+        <li><code>hiradix_cache.py:644-739</code> for host-index correctness.</li>
+        <li><code>server_args.py:3684-3798</code> for user-facing config semantics.</li>
+      </ol>
+    </section>
+  </main>
+</body>
+</html>
