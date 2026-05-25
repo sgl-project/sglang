@@ -806,6 +806,11 @@ class HiRadixCache(RadixCache):
     def evictable_size(self):
         return self.evictable_size_
 
+    def _skip_node_in_digest(self, node: TreeNode) -> bool:
+        # Include evicted nodes that have a host backup — they are recoverable
+        # via load_back() and should be visible to cache-aware DP routing.
+        return node.evicted and not node.backuped
+
     def _to_radix_key(self, token_ids: List[int]) -> RadixKey:
         """Convert raw token_ids to a RadixKey; must be list (not tuple) for paged match."""
         return RadixKey(token_ids=list(token_ids))
@@ -909,6 +914,8 @@ class HiRadixCache(RadixCache):
                 self._evict_backuped(node)
 
         self.update_eviction_metrics(num_evicted, start_time)
+        if num_evicted > 0:
+            self._digest_dirty = True
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _evict_backuped(self, node: TreeNode):
@@ -1034,6 +1041,7 @@ class HiRadixCache(RadixCache):
             self._record_store_event(node, medium=StorageMedium.GPU)
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
+        self._digest_dirty = True
 
         if self.metrics_collector is not None:
             self.metrics_collector.observe_load_back_duration(
@@ -1492,6 +1500,7 @@ class HiRadixCache(RadixCache):
 
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)
+        self._digest_dirty = True
         return InsertResult(prefix_len=total_prefix_length)
 
     def release_aborted_request(self, rid: str):

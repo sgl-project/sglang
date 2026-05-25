@@ -775,6 +775,10 @@ class ServerArgs:
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
 
+    # Cache-aware DP routing (decode multi-DP)
+    dp_routing_digest_chunk_size: int = 256
+    dp_routing_max_extra_reqs: int = 1
+
     # Encode prefill disaggregation
     encoder_only: bool = False
     language_only: bool = False
@@ -993,12 +997,18 @@ class ServerArgs:
             # Default behavior:
             # - non-PD: round_robin
             # - PD prefill: follow_bootstrap_room
-            # - PD decode: round_robin
-            self.load_balance_method = (
-                "follow_bootstrap_room"
-                if self.disaggregation_mode == "prefill"
-                else "round_robin"
-            )
+            # - PD decode + radix cache + dp > 1: cache_aware
+            # - PD decode (other): round_robin
+            if self.disaggregation_mode == "prefill":
+                self.load_balance_method = "follow_bootstrap_room"
+            elif (
+                self.disaggregation_mode == "decode"
+                and self.disaggregation_decode_enable_radix_cache
+                and self.dp_size > 1
+            ):
+                self.load_balance_method = "cache_aware"
+            else:
+                self.load_balance_method = "round_robin"
             return
 
     def _handle_ssl_validation(self):
@@ -5160,6 +5170,7 @@ class ServerArgs:
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "cache_aware",
             ],
         )
         parser.add_argument(
@@ -6538,6 +6549,20 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_decode_polling_interval,
             help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
+        )
+
+        # Cache-aware DP routing
+        parser.add_argument(
+            "--dp-routing-digest-chunk-size",
+            type=int,
+            default=ServerArgs.dp_routing_digest_chunk_size,
+            help="Chunk size (in tokens) for CacheDigest prefix hashing. Default 256.",
+        )
+        parser.add_argument(
+            "--dp-routing-max-extra-reqs",
+            type=int,
+            default=ServerArgs.dp_routing_max_extra_reqs,
+            help="Max extra requests a cache-preferred rank can have over the least-loaded rank before falling back to load balance. Default 1.",
         )
 
         # Encode prefill disaggregation

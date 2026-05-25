@@ -660,6 +660,7 @@ class Scheduler(
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
             get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
             get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
+            get_tree_cache=lambda: self.tree_cache,
         )
 
         self.output_streamer = SchedulerOutputStreamer(
