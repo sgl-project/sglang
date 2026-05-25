@@ -3844,7 +3844,7 @@ def run_scheduler_process(
         # Opt-in: SIGKILL the process group so sibling ranks don't spew
         # thousands of NCCL/TCPStore tracebacks before they finally die.
         # Skips the `finally` FPM shutdown; acceptable -- we're crashing.
-        if os.getenv("SGLANG_FAIL_FAST_SCHEDULER", "0") == "1":
+        if envs.SGLANG_FAIL_FAST_SCHEDULER.get():
             try:
                 os.killpg(os.getpgrp(), signal.SIGKILL)
             except Exception:
