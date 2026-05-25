@@ -10,6 +10,9 @@ import numpy as np
 
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.environ import default_shared_hicache_transfer_parallelism
+from sglang.srt.mem_cache.shared_hicache.config import (
+    shared_hicache_transfer_backend_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,24 +69,6 @@ def _direct_topology_rejection(scheduler) -> Optional[str]:
         "SharedHiCache direct transfer V0 supports only tp_size=1, pp_size=1, "
         f"and attn_cp_size=1; got {', '.join(unsupported)}"
     )
-
-
-def shared_hicache_config(server_args) -> Mapping[str, Any]:
-    config = getattr(server_args, "shared_hicache_config", None)
-    return config if isinstance(config, Mapping) else {}
-
-
-def shared_hicache_config_value(server_args, key: str, default=None):
-    config = shared_hicache_config(server_args)
-    return config.get(key, default)
-
-
-def shared_hicache_transfer_backend_name(server_args, default: str = "auto") -> str:
-    return str(shared_hicache_config_value(server_args, "transfer_backend", default)).lower()
-
-
-def shared_hicache_timeout_secs(server_args, default: float = 1.0) -> float:
-    return float(shared_hicache_config_value(server_args, "timeout_secs", default))
 
 
 def _get_or_init_mooncake_transfer_engine(scheduler):

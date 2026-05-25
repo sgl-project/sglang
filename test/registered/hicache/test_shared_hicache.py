@@ -20,19 +20,19 @@ from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+from sglang.srt.mem_cache.hicache_host_index import HiCacheHostBlockIndex
 from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
-from sglang.srt.mem_cache.shared_hicache.manager import (
-    SharedHiCacheManager,
-    SharedHiCachePlan,
-    _SharedHiCachePendingFetch,
-)
+from sglang.srt.mem_cache.shared_hicache.manager import SharedHiCacheManager
+from sglang.srt.mem_cache.shared_hicache.pending import SharedHiCachePendingFetch
 from sglang.srt.mem_cache.shared_hicache.plan import (
     SHARED_HICACHE_DIRECT_TIMEOUT_REASON,
+    SharedHiCachePlan,
 )
 from sglang.srt.mem_cache.shared_hicache.source import (
     ResolvedHostPage,
     resolve_host_pages,
 )
+from sglang.srt.mem_cache.shared_hicache.target import SharedHiCacheTarget
 from sglang.srt.mem_cache.shared_hicache.transfer import (
     MooncakeSharedHiCacheTransferBackend,
     _get_or_init_mooncake_transfer_engine,
@@ -228,10 +228,8 @@ def _make_manager(tree=None):
     manager._pending_fetches = {}
     manager._detached_fetches = set()
     manager._finished_plan_keys = set()
-    manager._quarantined_device_indices = []
-    manager._quarantined_tokens_by_backend = {}
-    manager._source_activity_lock = threading.Lock()
-    manager._active_source_resolver_ops = 0
+    manager.target_cache = SharedHiCacheTarget(tree_cache=tree, metrics_collector=None)
+    manager.source_service = None
     return manager
 
 
@@ -247,7 +245,7 @@ def _make_req(plan):
         logprob_start_len=-1,
         positional_embed_overrides=None,
         extra_key=None,
-        shared_hicache_plan=plan,
+        shared_hicache_plan=SharedHiCachePlan.coerce(plan),
         last_node=None,
     )
 
@@ -310,8 +308,7 @@ class TestSharedHiCache(unittest.TestCase):
     def test_hiradix_host_index_tracks_aliases_and_stale_entries(self):
         cache = HiRadixCache.__new__(HiRadixCache)
         cache.page_size = 2
-        cache.hicache_host_index_lock = threading.RLock()
-        cache.hicache_host_block_index = {}
+        cache.hicache_host_index = HiCacheHostBlockIndex(cache.page_size)
         node = TreeNode()
         node.host_value = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
         node.hash_value = ["aa" * 32, "bb" * 32]
@@ -372,12 +369,12 @@ class TestSharedHiCache(unittest.TestCase):
 
         manager._request_source_transfer = request_source_transfer
         try:
-            first = manager.check_shared_prefix(req)
+            first = manager.prepare_reuse(req)
             self.assertTrue(first.pending)
             pending = manager._pending_fetches[req.rid]
             pending.future.result(timeout=1)
 
-            second = manager.check_shared_prefix(req)
+            second = manager.prepare_reuse(req)
             self.assertFalse(second.pending)
             self.assertEqual(second.staged_tokens, 4)
             self.assertEqual(req.shared_hicache_hit_length, 4)
@@ -391,7 +388,7 @@ class TestSharedHiCache(unittest.TestCase):
         plan = SharedHiCachePlan.from_dict(_make_plan([11, 22]))
         req = _make_req(plan.to_dict())
         device_indices = torch.arange(200, 204)
-        pending = _SharedHiCachePendingFetch(
+        pending = SharedHiCachePendingFetch(
             plan=plan,
             plan_offset=0,
             target_start_block=0,
@@ -403,11 +400,13 @@ class TestSharedHiCache(unittest.TestCase):
         )
         manager._pending_fetches[req.rid] = pending
 
-        result = manager.check_shared_prefix(req)
+        result = manager.prepare_reuse(req)
 
         self.assertEqual(result.staged_tokens, 0)
         self.assertEqual(tree.device_allocator.freed, [])
-        self.assertEqual(manager._quarantined_device_indices, [device_indices])
+        self.assertEqual(
+            manager.target_cache.quarantined_device_indices, [device_indices]
+        )
 
     def test_mooncake_backend_registers_source_and_transfers_pages(self):
         page_size = 2
@@ -445,14 +444,23 @@ class TestSharedHiCache(unittest.TestCase):
         )
 
         self.assertTrue(backend.enabled)
-        self.assertIn((int(host_buffer.data_ptr()), int(host_buffer.nbytes)), engine.registered)
-        self.assertEqual(backend.target_descriptor()["transport"]["path_hint"], "explicit_ib_device")
+        self.assertIn(
+            (int(host_buffer.data_ptr()), int(host_buffer.nbytes)), engine.registered
+        )
+        self.assertEqual(
+            backend.target_descriptor()["transport"]["path_hint"], "explicit_ib_device"
+        )
         self.assertEqual(len(engine.transfers), 1)
         session_id, src_addrs, dst_addrs, lengths = engine.transfers[0]
         self.assertEqual(session_id, "peer")
         self.assertEqual(lengths, [item_len * 2, item_len * 2])
-        self.assertEqual(src_addrs, [int(source_k.data_ptr()) + item_len, int(source_v.data_ptr()) + item_len])
-        self.assertEqual(dst_addrs, [1_000_000 + item_len * 3, 2_000_000 + item_len * 3])
+        self.assertEqual(
+            src_addrs,
+            [int(source_k.data_ptr()) + item_len, int(source_v.data_ptr()) + item_len],
+        )
+        self.assertEqual(
+            dst_addrs, [1_000_000 + item_len * 3, 2_000_000 + item_len * 3]
+        )
 
     def test_mooncake_from_scheduler_fails_fast_on_checked_registration_error(self):
         engine = FakeMooncakeEngine(register_returns=[0, -202])
@@ -577,9 +585,11 @@ class TestSharedHiCache(unittest.TestCase):
         self.assertEqual(server_args.shared_hicache_config["worker_id"], 7)
         self.assertEqual(
             server_args.shared_hicache_config["control_endpoint"],
-            "127.0.0.1:39007",
+            "http://127.0.0.1:39007",
         )
-        self.assertEqual(server_args.shared_hicache_config["transfer_backend"], "mooncake")
+        self.assertEqual(
+            server_args.shared_hicache_config["transfer_backend"], "mooncake"
+        )
         self.assertEqual(server_args.shared_hicache_config["timeout_secs"], 2.5)
 
     def test_server_args_rejects_static_peer_config_and_unknown_backend(self):
@@ -654,8 +664,12 @@ class TestSharedHiCache(unittest.TestCase):
             "outcome": "hit",
             "reason": "ok",
         }
-        self.assertEqual(collector.shared_hicache_requests_total.calls, [("inc", labels, 1)])
-        self.assertEqual(collector.shared_hicache_tokens_total.calls, [("inc", labels, 4)])
+        self.assertEqual(
+            collector.shared_hicache_requests_total.calls, [("inc", labels, 1)]
+        )
+        self.assertEqual(
+            collector.shared_hicache_tokens_total.calls, [("inc", labels, 4)]
+        )
         self.assertEqual(
             collector.shared_hicache_wait_seconds.calls,
             [("observe", labels, 0.0125)],
@@ -681,8 +695,8 @@ class TestSharedHiCache(unittest.TestCase):
 
         req.normalize_batch_and_arguments()
 
-        self.assertEqual(req[0].shared_hicache_plan, plan_0)
-        self.assertEqual(req[1].shared_hicache_plan, plan_1)
+        self.assertEqual(req[0].shared_hicache_plan, SharedHiCachePlan.coerce(plan_0))
+        self.assertEqual(req[1].shared_hicache_plan, SharedHiCachePlan.coerce(plan_1))
 
     def test_engine_async_generate_forwards_shared_hicache_plan(self):
         plan = _make_plan([11])

@@ -32,6 +32,7 @@ import torch
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Modality
+from sglang.srt.mem_cache.shared_hicache.plan import SharedHiCachePlan
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
@@ -130,6 +131,7 @@ MultimodalDataInputFormat = Union[
     List[MultimodalDataInputItem],
     MultimodalDataInputItem,
 ]
+SharedHiCachePlanInput = Union[SharedHiCachePlan, Dict[str, Any]]
 
 
 @dataclass
@@ -216,7 +218,12 @@ class GenerateReqInput(BaseReq):
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
     # External SharedHiCache host-cache reuse metadata.
-    shared_hicache_plan: Optional[Any] = None
+    shared_hicache_plan: Optional[
+        Union[
+            SharedHiCachePlanInput,
+            List[Optional[SharedHiCachePlanInput]],
+        ]
+    ] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False
@@ -387,6 +394,7 @@ class GenerateReqInput(BaseReq):
             self.top_logprobs_num = 0
         if not self.token_ids_logprob:  # covers both None and []
             self.token_ids_logprob = None
+        self.shared_hicache_plan = SharedHiCachePlan.coerce(self.shared_hicache_plan)
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -619,8 +627,12 @@ class GenerateReqInput(BaseReq):
                 raise ValueError(
                     "The length of shared_hicache_plan should be equal to the batch size."
                 )
+            self.shared_hicache_plan = [
+                SharedHiCachePlan.coerce(plan) for plan in self.shared_hicache_plan
+            ]
         else:
-            self.shared_hicache_plan = [self.shared_hicache_plan] * batch_size
+            plan = SharedHiCachePlan.coerce(self.shared_hicache_plan)
+            self.shared_hicache_plan = [plan] * batch_size
 
     def _validate_session_params(self):
         """Validate that session parameters are properly formatted."""
@@ -789,7 +801,7 @@ class TokenizedGenerateReqInput(BaseReq):
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
-    shared_hicache_plan: Optional[Any] = None
+    shared_hicache_plan: Optional[SharedHiCachePlan] = None
 
     # Priority for the request
     priority: Optional[int] = None

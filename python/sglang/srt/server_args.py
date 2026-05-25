@@ -39,6 +39,9 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.mem_cache.shared_hicache.config import (
+    normalize_shared_hicache_server_config,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
@@ -184,7 +187,6 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
-SHARED_HICACHE_TRANSFER_BACKEND_CHOICES = ["auto", "mooncake"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
@@ -3646,154 +3648,18 @@ class ServerArgs:
             )
         return False
 
-    def _load_json_object_config(
-        self, raw: Optional[Union[str, Dict[str, Any]]], arg_name: str
-    ) -> Optional[Dict[str, Any]]:
-        if raw is None:
-            return None
-        if isinstance(raw, dict):
-            data = dict(raw)
-        elif isinstance(raw, str):
-            text = raw.strip()
-            if not text:
-                return None
-            if text.startswith("{"):
-                data = json.loads(text)
-            else:
-                path = os.path.expanduser(os.path.expandvars(text))
-                with open(path) as f:
-                    data = json.load(f)
-        else:
-            raise ValueError(f"{arg_name} must be a JSON object or path")
-
-        if not isinstance(data, dict):
-            raise ValueError(f"{arg_name} must be a JSON object")
-        return data
-
-    def _normalize_shared_hicache_endpoint(
-        self, value: object, field_name: str
-    ) -> Optional[str]:
-        if value is None:
-            return None
-        if isinstance(value, str):
-            if not value.strip():
-                raise ValueError(f"{field_name} must be non-empty")
-            return value.strip()
-        raise ValueError(f"{field_name} must be a non-empty string")
-
     def _handle_shared_hicache(self):
         """Normalize Shared HiCache reuse knobs."""
-        raw_config = self._load_json_object_config(
-            self.shared_hicache_config, "--shared-hicache-config"
+        (
+            self.enable_shared_hicache,
+            worker_id,
+            self.shared_hicache_config,
+        ) = normalize_shared_hicache_server_config(
+            enable_shared_hicache=self.enable_shared_hicache,
+            raw_config=self.shared_hicache_config,
+            worker_id=self.shared_hicache_worker_id,
+            enable_hierarchical_cache=self.enable_hierarchical_cache,
         )
-        if raw_config is not None:
-            self.enable_shared_hicache = True
-
-        if not self.enable_shared_hicache:
-            self.shared_hicache_config = None
-            return
-
-        if not self.enable_hierarchical_cache:
-            raise ValueError(
-                "--enable-shared-hicache requires --enable-hierarchical-cache"
-            )
-
-        config: Dict[str, Any] = dict(raw_config or {})
-        if any(
-            key in config
-            for key in (
-                "endpoint",
-                "peer_endpoints",
-                "static_peer_endpoints",
-                "http_control",
-            )
-        ):
-            raise ValueError(
-                "shared_hicache_config static endpoint maps are not supported; put the "
-                "local bind endpoint under control.endpoint and let each SharedHiCache "
-                "plan provide source_endpoint"
-            )
-        if "fetch_workers" in config:
-            raise ValueError(
-                "shared_hicache_config.fetch_workers is not supported; use "
-                "SGLANG_SHARED_HICACHE_FETCH_WORKERS"
-            )
-        if "transfer_parallelism" in config:
-            raise ValueError(
-                "shared_hicache_config.transfer_parallelism is not supported; use "
-                "SGLANG_SHARED_HICACHE_TRANSFER_PARALLELISM"
-            )
-
-        control_config = config.get("control") or {}
-        if not isinstance(control_config, dict):
-            raise ValueError("shared_hicache_config.control must be a JSON object")
-        if any(
-            key in control_config
-            for key in ("workers", "peer_endpoints", "static_peer_endpoints")
-        ):
-            raise ValueError(
-                "shared_hicache_config.control static worker maps are not supported; "
-                "use source_endpoint from each SharedHiCache plan"
-            )
-        transfer_config = config.get("transfer") or {}
-        if not isinstance(transfer_config, dict):
-            raise ValueError("shared_hicache_config.transfer must be a JSON object")
-        if "parallelism" in transfer_config:
-            raise ValueError(
-                "shared_hicache_config.transfer.parallelism is not supported; use "
-                "SGLANG_SHARED_HICACHE_TRANSFER_PARALLELISM"
-            )
-
-        worker_id = self.shared_hicache_worker_id
-        if "worker_id" in config:
-            worker_id = config["worker_id"]
-        if worker_id is None:
-            raise ValueError("--enable-shared-hicache requires --shared-hicache-worker-id")
-        if not isinstance(worker_id, int) or isinstance(worker_id, bool):
-            raise ValueError(
-                "shared_hicache_worker_id must be a non-negative integer"
-            )
-        if worker_id < 0:
-            raise ValueError(
-                "shared_hicache_worker_id must be a non-negative integer"
-            )
-
-        if "control_backend" in config or "backend" in control_config:
-            raise ValueError(
-                "shared_hicache_config.control.backend is not supported; "
-                "SharedHiCache plans carry the source endpoint directly"
-            )
-
-        transfer_backend = str(
-            config.get(
-                "transfer_backend", transfer_config.get("backend", "auto")
-            )
-        ).lower()
-        if transfer_backend not in SHARED_HICACHE_TRANSFER_BACKEND_CHOICES:
-            raise ValueError(
-                "shared_hicache_config.transfer_backend must be one of "
-                f"{SHARED_HICACHE_TRANSFER_BACKEND_CHOICES}, got {transfer_backend!r}"
-            )
-
-        timeout_secs = config.get(
-            "timeout_secs",
-            transfer_config.get("timeout_secs", control_config.get("timeout_secs", 1.0)),
-        )
-        if not isinstance(timeout_secs, (int, float)) or isinstance(timeout_secs, bool):
-            raise ValueError("shared_hicache_config.timeout_secs must be a positive number")
-        timeout_secs = float(timeout_secs)
-        if timeout_secs <= 0:
-            raise ValueError("shared_hicache_config.timeout_secs must be > 0")
-
-        self.shared_hicache_config = {
-            "worker_id": worker_id,
-            "control_endpoint": self._normalize_shared_hicache_endpoint(
-                control_config.get("endpoint", config.get("control_endpoint")),
-                "shared_hicache_config.control.endpoint",
-            ),
-            "timeout_secs": timeout_secs,
-            "transfer_backend": transfer_backend,
-        }
         self.shared_hicache_worker_id = worker_id
 
     def _handle_load_format(self):

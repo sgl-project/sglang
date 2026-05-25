@@ -2045,7 +2045,7 @@ class Scheduler(
             # Probe the current local prefix without taking COW allocations.
             # The final schedule path below recomputes the prefix after remote pages land.
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
-            result = shared_hicache_manager.check_reuse_plan_progress(req)
+            result = shared_hicache_manager.prepare_reuse(req)
         except Exception:
             logger.exception(
                 "SharedHiCache failed for rid=%s; continuing with local prefill",

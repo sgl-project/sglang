@@ -75,6 +75,7 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
+    SharedHiCachePlanInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
@@ -341,7 +342,7 @@ class Engine(EngineScoreMixin, EngineBase):
         disagg_prefill_dp_rank: Optional[int] = None,
         # Deprecated: use routed_dp_rank instead
         data_parallel_rank: Optional[int] = None,
-        shared_hicache_plan: Optional[Any] = None,
+        shared_hicache_plan: Optional[SharedHiCachePlanInput] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
@@ -435,7 +436,7 @@ class Engine(EngineScoreMixin, EngineBase):
         disagg_prefill_dp_rank: Optional[int] = None,
         # Deprecated: use routed_dp_rank instead
         data_parallel_rank: Optional[int] = None,
-        shared_hicache_plan: Optional[Any] = None,
+        shared_hicache_plan: Optional[SharedHiCachePlanInput] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,

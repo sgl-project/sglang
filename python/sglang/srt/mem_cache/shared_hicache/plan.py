@@ -7,8 +7,6 @@ from typing import Any, Dict, Iterable, Mapping, Optional
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.mem_cache.utils import block_hash_aliases
 
-SHARED_HICACHE_PLAN_EXTRA_ARGS_KEY = "shared_hicache_plan"
-SHARED_HICACHE_NO_PLAN_REASON_EXTRA_ARGS_KEY = "shared_hicache_no_plan_reason"
 SHARED_HICACHE_PLAN_VERSION = 1
 SHARED_HICACHE_DIRECT_TIMEOUT_REASON = "source_transfer_timeout_maybe_inflight"
 SHARED_HICACHE_SOURCE_MEDIUM = StorageMedium.CPU.value
@@ -194,6 +192,14 @@ class SharedHiCachePlan:
             )
         except KeyError as err:
             raise ValueError(f"SharedHiCache plan missing {err.args[0]}") from err
+
+    @classmethod
+    def coerce(cls, data: Optional[Any]) -> Optional["SharedHiCachePlan"]:
+        if data is None:
+            return None
+        if isinstance(data, cls):
+            return data
+        return cls.from_dict(data)
 
     def to_dict(self) -> Dict[str, Any]:
         value = asdict(self)

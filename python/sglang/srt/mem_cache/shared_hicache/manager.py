@@ -1,45 +1,52 @@
 from __future__ import annotations
 
 import atexit
-import json
 import logging
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Mapping, Optional
-from urllib.parse import urlparse
 
-import numpy as np
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-from sglang.srt.mem_cache.shared_hicache.transfer import (
-    SharedHiCacheTransferBackend,
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.radix_cache import TreeNode
+from sglang.srt.mem_cache.shared_hicache.config import (
     shared_hicache_config,
     shared_hicache_config_value,
     shared_hicache_timeout_secs,
-    make_shared_hicache_transfer_backend,
 )
-from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
 from sglang.srt.mem_cache.shared_hicache.control import (
     is_indeterminate_direct_transfer_reason,
     request_source_transfer,
-    start_source_transfer_server,
+)
+from sglang.srt.mem_cache.shared_hicache.metrics import observe_reuse
+from sglang.srt.mem_cache.shared_hicache.pending import (
+    SharedHiCachePendingFetch,
+    format_optional_ms,
+    pending_ready_wait_ms,
+    pending_should_stop_waiting,
+    pending_wait_ms,
+    transfer_bytes_for_pages,
 )
 from sglang.srt.mem_cache.shared_hicache.plan import (
-    SHARED_HICACHE_NO_PLAN_REASON_EXTRA_ARGS_KEY as _NO_PLAN_REASON_KEY,
-    SHARED_HICACHE_PLAN_EXTRA_ARGS_KEY as _PLAN_EXTRA_ARGS_KEY,
-    SHARED_HICACHE_PLAN_VERSION as _PLAN_VERSION,
+    SHARED_HICACHE_PLAN_VERSION,
     SharedHiCachePlan,
-    normalize_endpoint,
+)
+from sglang.srt.mem_cache.shared_hicache.service import (
+    SharedHiCacheSourceService,
+    select_dp_endpoint,
 )
 from sglang.srt.mem_cache.shared_hicache.source import (
     ResolvedHostPage,
     handle_source_transfer,
-    resolve_host_pages as _resolve_host_pages,
 )
-from sglang.srt.environ import envs
+from sglang.srt.mem_cache.shared_hicache.target import SharedHiCacheTarget
+from sglang.srt.mem_cache.shared_hicache.transfer import (
+    SharedHiCacheTransferBackend,
+    make_shared_hicache_transfer_backend,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -47,97 +54,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-SHARED_HICACHE_PLAN_EXTRA_ARGS_KEY = _PLAN_EXTRA_ARGS_KEY
-SHARED_HICACHE_NO_PLAN_REASON_EXTRA_ARGS_KEY = _NO_PLAN_REASON_KEY
-SHARED_HICACHE_PLAN_VERSION = _PLAN_VERSION
 SHARED_HICACHE_MAX_CONTROL_BODY_BYTES = 16 * 1024 * 1024
-resolve_host_pages = _resolve_host_pages
-
-
-def _normalize_metric_label(value: Any, default: str = "unknown") -> str:
-    value = str(value or default).split(":", 1)[0].strip().lower()
-    chars = [ch if ch.isalnum() or ch == "_" else "_" for ch in value]
-    value = "".join(chars).strip("_")
-    return (value or default)[:80]
-
-
-def _normalize_endpoint(endpoint: str) -> str:
-    return normalize_endpoint(endpoint)
 
 
 @dataclass(frozen=True)
 class SharedHiCacheResult:
     staged_tokens: int = 0
     pending: bool = False
-
-
-@dataclass
-class _SharedHiCachePendingFetch:
-    plan: SharedHiCachePlan
-    plan_offset: int
-    target_start_block: int
-    expected_hashes: tuple[int, ...]
-    future: Future
-    device_indices: Optional[torch.Tensor] = None
-    locked_node: Optional[TreeNode] = None
-    backend: str = "unknown"
-    bytes_per_page: int = 0
-    submitted_at: float = 0.0
-
-
-def _format_optional_ms(value: Optional[float]) -> str:
-    return "n/a" if value is None else f"{value:.3f}"
-
-
-def _is_indeterminate_direct_transfer_reason(reason: str) -> bool:
-    return is_indeterminate_direct_transfer_reason(reason)
-
-
-def _endpoint_to_bind(endpoint: str) -> tuple[str, int]:
-    parsed = urlparse(_normalize_endpoint(endpoint))
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError(f"unsupported shared HiCache endpoint scheme: {parsed.scheme}")
-    if parsed.hostname is None or parsed.port is None:
-        raise ValueError(f"shared HiCache endpoint must include host and port: {endpoint}")
-    return parsed.hostname, parsed.port
-
-
-def _select_dp_endpoint(endpoint_spec: object, dp_rank: int) -> Optional[str]:
-    if not endpoint_spec:
-        return None
-    if isinstance(endpoint_spec, Mapping):
-        endpoint = endpoint_spec.get(str(dp_rank))
-        if endpoint is None:
-            return None
-        if not isinstance(endpoint, str) or not endpoint.strip():
-            raise ValueError(
-                "shared_hicache_config.control.endpoint values must be non-empty strings; "
-                f"got {endpoint!r} for dp_rank={dp_rank}"
-            )
-        return _normalize_endpoint(endpoint)
-    if not isinstance(endpoint_spec, str):
-        raise ValueError(
-            "shared_hicache_config.control.endpoint must be a string or JSON object"
-        )
-    spec = endpoint_spec.strip()
-    if not spec:
-        return None
-    if spec.startswith("{"):
-        endpoints = json.loads(spec)
-        if not isinstance(endpoints, Mapping):
-            raise ValueError("shared_hicache_config.control.endpoint must be a JSON object")
-        endpoint = endpoints.get(str(dp_rank))
-        if endpoint is None:
-            return None
-        if not isinstance(endpoint, str) or not endpoint.strip():
-            raise ValueError(
-                "shared_hicache_config.control.endpoint values must be non-empty strings; "
-                f"got {endpoint!r} for dp_rank={dp_rank}"
-            )
-        return _normalize_endpoint(endpoint)
-    if "{dp_rank}" in spec:
-        spec = spec.format(dp_rank=dp_rank)
-    return _normalize_endpoint(spec)
 
 
 def _shared_hicache_enabled(server_args: "ServerArgs") -> bool:
@@ -178,26 +101,24 @@ class SharedHiCacheManager:
             "control_endpoint",
             None,
         )
-        self.endpoint = _select_dp_endpoint(endpoint_spec, dp_rank)
-        self._source_server: Optional[Any] = None
-        self._source_thread: Optional[threading.Thread] = None
+        self.endpoint = select_dp_endpoint(endpoint_spec, dp_rank)
+        self.source_service: Optional[SharedHiCacheSourceService] = None
         self._shutdown = False
         worker_limit = max(
             1,
             int(envs.SGLANG_SHARED_HICACHE_FETCH_WORKERS.get()),
         )
-        self._source_activity_lock = threading.Lock()
-        self._active_source_resolver_ops = 0
-        self._source_resolver_semaphore = threading.BoundedSemaphore(worker_limit)
         self._fetch_semaphore = threading.BoundedSemaphore(worker_limit)
         self._fetch_executor = ThreadPoolExecutor(
             max_workers=worker_limit,
             thread_name_prefix=f"shared_hicache-fetch-dp{dp_rank}",
         )
-        self._pending_fetches: dict[str, _SharedHiCachePendingFetch] = {}
+        self._pending_fetches: dict[str, SharedHiCachePendingFetch] = {}
         self._detached_fetches: set[Future] = set()
-        self._quarantined_device_indices: list[torch.Tensor] = []
-        self._quarantined_tokens_by_backend: dict[str, int] = {}
+        self.target_cache = SharedHiCacheTarget(
+            tree_cache=tree_cache,
+            metrics_collector=metrics_collector,
+        )
         self._finished_plan_keys: set[tuple[str, str]] = set()
         self.max_control_body_bytes = SHARED_HICACHE_MAX_CONTROL_BODY_BYTES
         self._direct_transfer_shutdown_done = False
@@ -205,7 +126,16 @@ class SharedHiCacheManager:
         self._direct_transfer_shutdown_lock = threading.Lock()
 
         if self.endpoint is not None:
-            self._start_source_resolver()
+            self.source_service = SharedHiCacheSourceService(
+                endpoint=self.endpoint,
+                worker_id=self.worker_id,
+                dp_rank=self.dp_rank,
+                worker_limit=worker_limit,
+                max_body_bytes=self._max_control_body_bytes,
+                direct_transfer_enabled=self._direct_transfer_enabled,
+                handle_source_transfer=self._handle_source_transfer,
+            )
+            self.source_service.start()
         atexit.register(self.shutdown)
 
     @classmethod
@@ -267,79 +197,6 @@ class SharedHiCacheManager:
             getattr(direct_transfer, "enabled", False)
         )
 
-    def _observe_reuse(
-        self,
-        *,
-        backend: str,
-        outcome: str,
-        reason: str,
-        tokens: int = 0,
-        wait_ms: Optional[float] = None,
-        insert_ms: Optional[float] = None,
-        transfer_bytes: Optional[int] = None,
-    ) -> None:
-        metrics_collector = getattr(self, "metrics_collector", None)
-        observe = getattr(metrics_collector, "observe_shared_hicache", None)
-        if observe is None:
-            return
-        try:
-            observe(
-                backend=_normalize_metric_label(backend),
-                outcome=_normalize_metric_label(outcome),
-                reason=_normalize_metric_label(reason),
-                tokens=max(0, int(tokens)),
-                wait_ms=wait_ms,
-                insert_ms=insert_ms,
-                transfer_bytes=transfer_bytes,
-            )
-        except Exception:
-            logger.debug("Failed to record SharedHiCache metrics", exc_info=True)
-
-    def _pending_wait_ms(self, pending: _SharedHiCachePendingFetch) -> Optional[float]:
-        submitted_at = getattr(pending, "submitted_at", 0.0)
-        if submitted_at <= 0:
-            return None
-        return (time.perf_counter() - submitted_at) * 1000
-
-    def _pending_timeout_secs(self, pending: _SharedHiCachePendingFetch) -> float:
-        cfg = getattr(self, "prefetch_timeout_config", None)
-        if cfg is None:
-            return float(getattr(self, "timeout_secs", 0.0))
-        num_tokens = len(pending.expected_hashes) * self.tree_cache.page_size
-        return float(min(cfg.max, cfg.base + cfg.per_ki_token * num_tokens / 1024))
-
-    def _pending_should_stop_waiting(
-        self, pending: _SharedHiCachePendingFetch
-    ) -> tuple[bool, str]:
-        policy = str(getattr(self, "prefetch_stop_policy", "timeout"))
-        if policy == "best_effort":
-            return True, "best_effort_incomplete"
-        if policy == "wait_complete":
-            return False, ""
-        if policy == "timeout":
-            timeout_secs = self._pending_timeout_secs(pending)
-            elapsed = time.perf_counter() - pending.submitted_at
-            if timeout_secs >= 0 and elapsed > timeout_secs:
-                return True, "prefetch_timeout"
-            return False, ""
-        return True, "unknown_prefetch_policy"
-
-    def _pending_ready_wait_ms(
-        self, pending: _SharedHiCachePendingFetch
-    ) -> Optional[float]:
-        done_at = getattr(pending.future, "_shared_hicache_done_at", 0.0)
-        if done_at <= 0:
-            return None
-        return max(0.0, (time.perf_counter() - done_at) * 1000)
-
-    def _transfer_bytes_for_pages(
-        self, pending: _SharedHiCachePendingFetch, pages: list[ResolvedHostPage]
-    ) -> int:
-        bytes_per_page = int(getattr(pending, "bytes_per_page", 0) or 0)
-        if bytes_per_page > 0:
-            return len(pages) * bytes_per_page
-        return sum(len(page.data) for page in pages)
-
     def _max_control_body_bytes(self) -> int:
         return int(
             getattr(
@@ -348,24 +205,6 @@ class SharedHiCacheManager:
                 SHARED_HICACHE_MAX_CONTROL_BODY_BYTES,
             )
         )
-
-    def _try_enter_source_resolver(self) -> bool:
-        if not self._source_resolver_semaphore.acquire(blocking=False):
-            return False
-        if not hasattr(self, "_source_activity_lock"):
-            self._source_activity_lock = threading.Lock()
-            self._active_source_resolver_ops = 0
-        with self._source_activity_lock:
-            self._active_source_resolver_ops += 1
-        return True
-
-    def _exit_source_resolver(self) -> None:
-        if not hasattr(self, "_source_activity_lock"):
-            self._source_activity_lock = threading.Lock()
-            self._active_source_resolver_ops = 0
-        with self._source_activity_lock:
-            self._active_source_resolver_ops -= 1
-        self._source_resolver_semaphore.release()
 
     def _try_acquire_fetch_worker(self) -> bool:
         semaphore = getattr(self, "_fetch_semaphore", None)
@@ -380,28 +219,15 @@ class SharedHiCacheManager:
         try:
             semaphore.release()
         except ValueError:
-            logger.debug("SharedHiCache fetch worker semaphore release ignored", exc_info=True)
+            logger.debug(
+                "SharedHiCache fetch worker semaphore release ignored", exc_info=True
+            )
 
     def _on_fetch_worker_done(self, future: Future) -> None:
         try:
             setattr(future, "_shared_hicache_done_at", time.perf_counter())
         finally:
             self._release_fetch_worker()
-
-    def _start_source_resolver(self) -> None:
-        host, port = _endpoint_to_bind(self.endpoint)
-        self._source_server, self._source_thread = start_source_transfer_server(
-            host=host,
-            port=port,
-            endpoint=self.endpoint,
-            worker_id=self.worker_id,
-            dp_rank=self.dp_rank,
-            max_body_bytes=self._max_control_body_bytes,
-            try_enter=self._try_enter_source_resolver,
-            exit_resolver=self._exit_source_resolver,
-            direct_transfer_enabled=self._direct_transfer_enabled,
-            handle_source_transfer=self._handle_source_transfer,
-        )
 
     def _shutdown_direct_transfer_backend(self) -> None:
         direct_transfer = getattr(self, "direct_transfer", None)
@@ -430,7 +256,7 @@ class SharedHiCacheManager:
             while self.has_pending():
                 time.sleep(0.01)
             try:
-                self._release_quarantined_device_indices()
+                self.target_cache.release_quarantined_device_indices()
                 self._shutdown_direct_transfer_backend()
             except Exception:
                 logger.warning(
@@ -451,25 +277,10 @@ class SharedHiCacheManager:
             return
         self._shutdown = True
 
-        server = self._source_server
-        self._source_server = None
-        if server is not None:
-            try:
-                server.shutdown()
-                server.server_close()
-            except Exception:
-                logger.debug("Shared HiCache source resolver shutdown failed", exc_info=True)
-
-        source_thread = self._source_thread
-        self._source_thread = None
-        if (
-            source_thread is not None
-            and source_thread is not threading.current_thread()
-        ):
-            try:
-                source_thread.join(timeout=1)
-            except Exception:
-                logger.debug("Shared HiCache source resolver join failed", exc_info=True)
+        source_service = getattr(self, "source_service", None)
+        self.source_service = None
+        if source_service is not None:
+            source_service.shutdown()
 
         for pending in self._pending_fetches.values():
             self._release_pending_fetch(pending)
@@ -488,7 +299,7 @@ class SharedHiCacheManager:
             self._defer_direct_transfer_shutdown()
             return
 
-        self._release_quarantined_device_indices()
+        self.target_cache.release_quarantined_device_indices()
         self._shutdown_direct_transfer_backend()
 
     def _candidate_endpoints_for_plan(self, plan: SharedHiCachePlan) -> list[str]:
@@ -563,122 +374,19 @@ class SharedHiCacheManager:
     def _plan_key(self, req: "Req", plan: SharedHiCachePlan) -> tuple[str, str]:
         return str(req.rid), plan.plan_id
 
-    def _alloc_device_indices(self, token_count: int) -> Optional[torch.Tensor]:
-        allocator = self.tree_cache.cache_controller.mem_pool_device_allocator
-        device_indices = allocator.alloc(token_count)
-        if device_indices is None:
-            self.tree_cache.evict(EvictParams(num_tokens=token_count))
-            device_indices = allocator.alloc(token_count)
-        if device_indices is None:
-            logger.warning("Shared HiCache failed to allocate %d device tokens", token_count)
-        return device_indices
-
-    def _free_device_indices(self, device_indices: Optional[torch.Tensor]) -> None:
-        if device_indices is None:
-            return
-        self.tree_cache.cache_controller.mem_pool_device_allocator.free(device_indices)
-
-    def _observe_quarantine(
-        self, *, backend: str, reason: str, tokens: int, current_tokens: int
-    ) -> None:
-        metrics_collector = getattr(self, "metrics_collector", None)
-        observe = getattr(
-            metrics_collector, "observe_shared_hicache_quarantine", None
-        )
-        if observe is None:
-            return
-        try:
-            observe(
-                backend=_normalize_metric_label(backend),
-                reason=_normalize_metric_label(reason),
-                tokens=max(0, int(tokens)),
-                current_tokens=max(0, int(current_tokens)),
-            )
-        except Exception:
-            logger.debug(
-                "Failed to record SharedHiCache quarantine metrics", exc_info=True
-            )
-
-    def _quarantine_device_indices(
-        self, device_indices: torch.Tensor, reason: str, *, backend: str
-    ) -> None:
-        quarantined = getattr(self, "_quarantined_device_indices", None)
-        if quarantined is None:
-            quarantined = self._quarantined_device_indices = []
-        quarantined.append(device_indices)
-        backend_label = _normalize_metric_label(backend)
-        token_count = int(device_indices.numel())
-        tokens_by_backend = getattr(self, "_quarantined_tokens_by_backend", None)
-        if tokens_by_backend is None:
-            tokens_by_backend = self._quarantined_tokens_by_backend = {}
-        current_tokens = int(tokens_by_backend.get(backend_label, 0)) + token_count
-        tokens_by_backend[backend_label] = current_tokens
-        self._observe_quarantine(
-            backend=backend_label,
-            reason=reason,
-            tokens=token_count,
-            current_tokens=current_tokens,
-        )
-        logger.error(
-            "Quarantining %d SharedHiCache target KV indices after indeterminate direct transfer: %s",
-            token_count,
-            reason,
-        )
-
-    def _release_quarantined_device_indices(self) -> None:
-        quarantined = getattr(self, "_quarantined_device_indices", None)
-        if not quarantined:
-            return
-        self._quarantined_device_indices = []
-        tokens_by_backend = getattr(self, "_quarantined_tokens_by_backend", {})
-        self._quarantined_tokens_by_backend = {}
-        for device_indices in quarantined:
-            self._free_device_indices(device_indices)
-        for backend in tokens_by_backend:
-            self._observe_quarantine(
-                backend=backend,
-                reason="released",
-                tokens=0,
-                current_tokens=0,
-            )
-
-    def _device_indices_to_page_indices(
-        self, device_indices: torch.Tensor
-    ) -> Optional[list[int]]:
-        page_size = self.tree_cache.page_size
-        indices = device_indices.detach().cpu().numpy()
-        if len(indices) == 0 or len(indices) % page_size != 0:
-            return None
-
-        page_rows = indices.reshape(-1, page_size)
-        starts = page_rows[:, 0]
-        offsets = np.arange(page_size, dtype=page_rows.dtype)
-        if np.any(starts % page_size != 0) or np.any(
-            page_rows != starts[:, None] + offsets[None, :]
-        ):
-            return None
-
-        page_indices = starts // page_size
-        if np.any(page_indices < 0) or np.any(page_indices > np.iinfo(np.int32).max):
-            return None
-        return page_indices.astype(np.int32, copy=False).tolist()
-
-    def _active_source_resolver_count(self) -> int:
-        lock = getattr(self, "_source_activity_lock", None)
-        if lock is None:
-            return int(getattr(self, "_active_source_resolver_ops", 0))
-        with lock:
-            return int(getattr(self, "_active_source_resolver_ops", 0))
-
     def has_pending(self) -> bool:
         detached_fetches = getattr(self, "_detached_fetches", set())
         for future in list(detached_fetches):
             if future.done():
                 detached_fetches.discard(future)
+        source_service = getattr(self, "source_service", None)
+        active_source_count = (
+            source_service.active_count() if source_service is not None else 0
+        )
         return (
             bool(getattr(self, "_pending_fetches", {}))
             or bool(detached_fetches)
-            or self._active_source_resolver_count() > 0
+            or active_source_count > 0
         )
 
     def _lock_request_prefix(self, req: "Req") -> Optional[TreeNode]:
@@ -688,23 +396,23 @@ class SharedHiCacheManager:
         self.tree_cache.inc_lock_ref(last_node)
         return last_node
 
-    def _unlock_pending_prefix(self, pending: _SharedHiCachePendingFetch) -> None:
+    def _unlock_pending_prefix(self, pending: SharedHiCachePendingFetch) -> None:
         locked_node = getattr(pending, "locked_node", None)
         if locked_node is None:
             return
         pending.locked_node = None
         self.tree_cache.dec_lock_ref(locked_node)
 
-    def _release_pending_fetch(self, pending: _SharedHiCachePendingFetch) -> None:
+    def _release_pending_fetch(self, pending: SharedHiCachePendingFetch) -> None:
         cancelled = pending.future.cancel()
         self._unlock_pending_prefix(pending)
         if pending.device_indices is None:
             return
         backend = getattr(pending, "backend", self._current_backend_label())
         if cancelled:
-            self._free_device_indices(pending.device_indices)
+            self.target_cache.free_device_indices(pending.device_indices)
         elif pending.future.done():
-            self._release_device_indices_after_fetch_done(
+            self.target_cache.release_device_indices_after_fetch_done(
                 pending.future, pending.device_indices, backend=backend
             )
         else:
@@ -715,26 +423,13 @@ class SharedHiCacheManager:
 
             def _free_detached_fetch(_future, device_indices=pending.device_indices):
                 try:
-                    self._release_device_indices_after_fetch_done(
+                    self.target_cache.release_device_indices_after_fetch_done(
                         _future, device_indices, backend=backend
                     )
                 finally:
                     detached_fetches.discard(_future)
 
             pending.future.add_done_callback(_free_detached_fetch)
-
-    def _release_device_indices_after_fetch_done(
-        self, future: Future, device_indices: torch.Tensor, *, backend: str
-    ) -> None:
-        try:
-            pages, reason = future.result()
-        except Exception:
-            self._free_device_indices(device_indices)
-            return
-        if not pages and _is_indeterminate_direct_transfer_reason(reason):
-            self._quarantine_device_indices(device_indices, reason, backend=backend)
-            return
-        self._free_device_indices(device_indices)
 
     def _submit_direct_transfer(
         self,
@@ -753,17 +448,19 @@ class SharedHiCacheManager:
         if not self._try_acquire_fetch_worker():
             return None, None
 
-        device_indices = self._alloc_device_indices(token_count)
+        device_indices = self.target_cache.alloc_device_indices(token_count)
         if device_indices is None:
             self._release_fetch_worker()
             return None, None
 
-        target_page_indices = self._device_indices_to_page_indices(device_indices)
+        target_page_indices = self.target_cache.device_indices_to_page_indices(
+            device_indices
+        )
         if target_page_indices is None:
             logger.warning(
                 "Shared HiCache direct transfer got non page-aligned target device allocation"
             )
-            self._free_device_indices(device_indices)
+            self.target_cache.free_device_indices(device_indices)
             self._release_fetch_worker()
             return None, None
         try:
@@ -777,38 +474,19 @@ class SharedHiCacheManager:
                 target_page_indices=target_page_indices,
             )
         except Exception:
-            self._free_device_indices(device_indices)
+            self.target_cache.free_device_indices(device_indices)
             self._release_fetch_worker()
             raise
         future.add_done_callback(self._on_fetch_worker_done)
         return future, device_indices
 
-    def maybe_stage_shared_prefix(self, req: "Req") -> int:
-        return self.check_shared_prefix(req).staged_tokens
-
-    def maybe_stage_reuse_plan(self, req: "Req") -> int:
-        return self.maybe_stage_shared_prefix(req)
-
     def has_reuse_plan(self, req: "Req") -> bool:
-        plan_data = getattr(req, "shared_hicache_plan", None)
-        if plan_data is None:
-            return False
-        try:
-            plan = SharedHiCachePlan.from_dict(plan_data)
-        except ValueError:
+        plan = getattr(req, "shared_hicache_plan", None)
+        if not isinstance(plan, SharedHiCachePlan):
             return False
         if self._validate_plan(plan) is not None:
             return False
         return self._direct_transfer_enabled()
-
-    def prefetch_shared_prefix(self, req: "Req") -> SharedHiCacheResult:
-        return SharedHiCacheResult()
-
-    def prefetch_reuse_plan(self, req: "Req") -> SharedHiCacheResult:
-        return self.prefetch_shared_prefix(req)
-
-    def check_reuse_plan_progress(self, req: "Req") -> SharedHiCacheResult:
-        return self.check_shared_prefix(req)
 
     def release_request(self, rid: str) -> None:
         rid = str(rid)
@@ -821,16 +499,18 @@ class SharedHiCacheManager:
             key for key in self._finished_plan_keys if key[0] != rid
         }
 
-    def check_shared_prefix(self, req: "Req") -> SharedHiCacheResult:
-        plan_data = getattr(req, "shared_hicache_plan", None)
-        if plan_data is None:
+    def prepare_reuse(self, req: "Req") -> SharedHiCacheResult:
+        plan = getattr(req, "shared_hicache_plan", None)
+        if plan is None:
             return SharedHiCacheResult()
-
-        try:
-            plan = SharedHiCachePlan.from_dict(plan_data)
-        except ValueError as err:
-            logger.debug("Ignoring invalid shared HiCache plan for rid=%s: %s", req.rid, err)
-            self._observe_reuse(
+        if not isinstance(plan, SharedHiCachePlan):
+            logger.debug(
+                "Ignoring invalid shared HiCache plan for rid=%s: expected SharedHiCachePlan got %s",
+                req.rid,
+                type(plan).__name__,
+            )
+            observe_reuse(
+                self.metrics_collector,
                 backend=self._current_backend_label(),
                 outcome="skip",
                 reason="invalid_plan",
@@ -845,7 +525,8 @@ class SharedHiCacheManager:
                 plan.plan_id,
                 rejection,
             )
-            self._observe_reuse(
+            observe_reuse(
+                self.metrics_collector,
                 backend=self._current_backend_label(),
                 outcome="skip",
                 reason=rejection,
@@ -866,7 +547,8 @@ class SharedHiCacheManager:
                 matched_tokens,
                 page_size,
             )
-            self._observe_reuse(
+            observe_reuse(
+                self.metrics_collector,
                 backend=self._current_backend_label(),
                 outcome="skip",
                 reason="unaligned_matched_tokens",
@@ -881,7 +563,8 @@ class SharedHiCacheManager:
                 computed_blocks,
                 plan.start_block_index,
             )
-            self._observe_reuse(
+            observe_reuse(
+                self.metrics_collector,
                 backend=self._current_backend_label(),
                 outcome="skip",
                 reason="before_plan_start",
@@ -902,7 +585,8 @@ class SharedHiCacheManager:
                 plan_offset,
                 max_plan_blocks,
             )
-            self._observe_reuse(
+            observe_reuse(
+                self.metrics_collector,
                 backend=self._current_backend_label(),
                 outcome="skip",
                 reason="no_remaining_planned_blocks",
@@ -915,16 +599,25 @@ class SharedHiCacheManager:
                 self._pending_fetches.pop(str(req.rid), None)
                 self._release_pending_fetch(pending)
             elif not pending.future.done():
-                stop_waiting, reason = self._pending_should_stop_waiting(pending)
+                stop_waiting, reason = pending_should_stop_waiting(
+                    pending,
+                    policy=str(getattr(self, "prefetch_stop_policy", "timeout")),
+                    page_size=self.tree_cache.page_size,
+                    timeout_secs=float(getattr(self, "timeout_secs", 0.0)),
+                    prefetch_timeout_config=getattr(
+                        self, "prefetch_timeout_config", None
+                    ),
+                )
                 if stop_waiting:
                     self._pending_fetches.pop(str(req.rid), None)
                     self._release_pending_fetch(pending)
                     self._finished_plan_keys.add(self._plan_key(req, pending.plan))
-                    self._observe_reuse(
+                    observe_reuse(
+                        self.metrics_collector,
                         backend=pending.backend,
                         outcome="miss",
                         reason=reason,
-                        wait_ms=self._pending_wait_ms(pending),
+                        wait_ms=pending_wait_ms(pending),
                     )
                     return SharedHiCacheResult()
                 return SharedHiCacheResult(pending=True)
@@ -954,7 +647,8 @@ class SharedHiCacheManager:
                 plan.plan_id,
             )
             self._finished_plan_keys.add(plan_key)
-            self._observe_reuse(
+            observe_reuse(
+                self.metrics_collector,
                 backend="none",
                 outcome="miss",
                 reason="direct_transfer_unavailable",
@@ -962,7 +656,8 @@ class SharedHiCacheManager:
             return SharedHiCacheResult()
         if direct_transfer_enabled and req.host_hit_length > 0:
             self._finished_plan_keys.add(plan_key)
-            self._observe_reuse(
+            observe_reuse(
+                self.metrics_collector,
                 backend=self._current_backend_label(),
                 outcome="skip",
                 reason="local_host_hit",
@@ -987,7 +682,8 @@ class SharedHiCacheManager:
                 if locked_node is not None:
                     self.tree_cache.dec_lock_ref(locked_node)
                 self._finished_plan_keys.add(plan_key)
-                self._observe_reuse(
+                observe_reuse(
+                    self.metrics_collector,
                     backend=self._current_backend_label(),
                     outcome="miss",
                     reason="direct_submit_unavailable",
@@ -1005,7 +701,7 @@ class SharedHiCacheManager:
                 )
             except Exception:
                 bytes_per_page = 0
-        self._pending_fetches[str(req.rid)] = _SharedHiCachePendingFetch(
+        self._pending_fetches[str(req.rid)] = SharedHiCachePendingFetch(
             plan=plan,
             plan_offset=plan_offset,
             target_start_block=plan.start_block_index + plan_offset,
@@ -1020,7 +716,7 @@ class SharedHiCacheManager:
         return SharedHiCacheResult(pending=True)
 
     def _finish_pending_fetch(
-        self, req: "Req", pending: _SharedHiCachePendingFetch
+        self, req: "Req", pending: SharedHiCachePendingFetch
     ) -> SharedHiCacheResult:
         self._pending_fetches.pop(str(req.rid), None)
         plan = pending.plan
@@ -1033,13 +729,14 @@ class SharedHiCacheManager:
             )
             self._unlock_pending_prefix(pending)
             if pending.device_indices is not None:
-                self._free_device_indices(pending.device_indices)
+                self.target_cache.free_device_indices(pending.device_indices)
             self._finished_plan_keys.add(self._plan_key(req, plan))
-            self._observe_reuse(
+            observe_reuse(
+                self.metrics_collector,
                 backend=pending.backend,
                 outcome="error",
                 reason="fetch_exception",
-                wait_ms=self._pending_wait_ms(pending),
+                wait_ms=pending_wait_ms(pending),
             )
             return SharedHiCacheResult()
 
@@ -1051,10 +748,10 @@ class SharedHiCacheManager:
                 reason,
             )
             self._unlock_pending_prefix(pending)
-            indeterminate_transfer = _is_indeterminate_direct_transfer_reason(reason)
+            indeterminate_transfer = is_indeterminate_direct_transfer_reason(reason)
             if pending.device_indices is not None:
                 if indeterminate_transfer:
-                    self._quarantine_device_indices(
+                    self.target_cache.quarantine_device_indices(
                         pending.device_indices,
                         reason,
                         backend=getattr(
@@ -1062,13 +759,14 @@ class SharedHiCacheManager:
                         ),
                     )
                 else:
-                    self._free_device_indices(pending.device_indices)
+                    self.target_cache.free_device_indices(pending.device_indices)
             self._finished_plan_keys.add(self._plan_key(req, plan))
-            self._observe_reuse(
+            observe_reuse(
+                self.metrics_collector,
                 backend=pending.backend,
                 outcome="error" if indeterminate_transfer else "miss",
                 reason=reason,
-                wait_ms=self._pending_wait_ms(pending),
+                wait_ms=pending_wait_ms(pending),
             )
             return SharedHiCacheResult()
 
@@ -1082,14 +780,15 @@ class SharedHiCacheManager:
             )
             self._unlock_pending_prefix(pending)
             if pending.device_indices is not None:
-                self._free_device_indices(pending.device_indices)
+                self.target_cache.free_device_indices(pending.device_indices)
             self._finished_plan_keys.add(self._plan_key(req, plan))
-            self._observe_reuse(
+            observe_reuse(
+                self.metrics_collector,
                 backend=pending.backend,
                 outcome="error",
                 reason="too_many_pages",
-                wait_ms=self._pending_wait_ms(pending),
-                transfer_bytes=self._transfer_bytes_for_pages(pending, pages),
+                wait_ms=pending_wait_ms(pending),
+                transfer_bytes=transfer_bytes_for_pages(pending, pages),
             )
             return SharedHiCacheResult()
 
@@ -1102,14 +801,15 @@ class SharedHiCacheManager:
             )
             self._unlock_pending_prefix(pending)
             if pending.device_indices is not None:
-                self._free_device_indices(pending.device_indices)
+                self.target_cache.free_device_indices(pending.device_indices)
             self._finished_plan_keys.add(self._plan_key(req, plan))
-            self._observe_reuse(
+            observe_reuse(
+                self.metrics_collector,
                 backend=pending.backend,
                 outcome="error",
                 reason="non_contiguous_pages",
-                wait_ms=self._pending_wait_ms(pending),
-                transfer_bytes=self._transfer_bytes_for_pages(pending, pages),
+                wait_ms=pending_wait_ms(pending),
+                transfer_bytes=transfer_bytes_for_pages(pending, pages),
             )
             return SharedHiCacheResult()
 
@@ -1120,14 +820,15 @@ class SharedHiCacheManager:
                     "Shared HiCache direct transfer completed without target device indices"
                 )
                 self._finished_plan_keys.add(self._plan_key(req, plan))
-                self._observe_reuse(
+                observe_reuse(
+                    self.metrics_collector,
                     backend=pending.backend,
                     outcome="error",
                     reason="missing_target_device_indices",
-                    wait_ms=self._pending_wait_ms(pending),
+                    wait_ms=pending_wait_ms(pending),
                 )
                 return SharedHiCacheResult()
-            staged_tokens = self._insert_device_pages(
+            staged_tokens = self.target_cache.insert_device_pages(
                 req,
                 pages,
                 device_indices=pending.device_indices,
@@ -1141,13 +842,14 @@ class SharedHiCacheManager:
                 plan.plan_id,
             )
             self._finished_plan_keys.add(self._plan_key(req, plan))
-            self._observe_reuse(
+            observe_reuse(
+                self.metrics_collector,
                 backend=pending.backend,
                 outcome="error",
                 reason="insert_exception",
-                wait_ms=self._pending_wait_ms(pending),
+                wait_ms=pending_wait_ms(pending),
                 insert_ms=insert_ms,
-                transfer_bytes=self._transfer_bytes_for_pages(pending, pages),
+                transfer_bytes=transfer_bytes_for_pages(pending, pages),
             )
             return SharedHiCacheResult()
         finally:
@@ -1157,8 +859,8 @@ class SharedHiCacheManager:
             req.shared_hicache_hit_length = (
                 getattr(req, "shared_hicache_hit_length", 0) + staged_tokens
             )
-            wait_ms = self._pending_wait_ms(pending)
-            ready_wait_ms = self._pending_ready_wait_ms(pending)
+            wait_ms = pending_wait_ms(pending)
+            ready_wait_ms = pending_ready_wait_ms(pending)
             logger.debug(
                 "Shared HiCache staged %d tokens rid=%s plan_id=%s source=%s:%s wait_ms=%s future_ready_wait_ms=%s insert_ms=%.3f direct=%s",
                 staged_tokens,
@@ -1166,94 +868,21 @@ class SharedHiCacheManager:
                 plan.plan_id,
                 plan.source_worker_id,
                 plan.source_dp_rank,
-                _format_optional_ms(wait_ms),
-                _format_optional_ms(ready_wait_ms),
+                format_optional_ms(wait_ms),
+                format_optional_ms(ready_wait_ms),
                 insert_ms,
                 pending.device_indices is not None,
             )
         self._finished_plan_keys.add(self._plan_key(req, plan))
         outcome = "hit" if staged_tokens > 0 else "miss"
-        self._observe_reuse(
+        observe_reuse(
+            self.metrics_collector,
             backend=pending.backend,
             outcome=outcome,
             reason=reason if staged_tokens > 0 else "insert_returned_zero",
             tokens=staged_tokens,
-            wait_ms=self._pending_wait_ms(pending),
+            wait_ms=pending_wait_ms(pending),
             insert_ms=insert_ms,
-            transfer_bytes=self._transfer_bytes_for_pages(pending, pages),
+            transfer_bytes=transfer_bytes_for_pages(pending, pages),
         )
         return SharedHiCacheResult(staged_tokens=staged_tokens)
-
-    def _insert_device_pages(
-        self,
-        req: "Req",
-        pages: list[ResolvedHostPage],
-        *,
-        device_indices: torch.Tensor,
-        start_block: int,
-    ) -> int:
-        page_size = self.tree_cache.page_size
-        token_count = len(pages) * page_size
-        token_start = start_block * page_size
-        token_end = token_start + token_count
-        allocated_tokens = len(device_indices)
-
-        if token_end > len(req.fill_ids):
-            token_count = ((len(req.fill_ids) - token_start) // page_size) * page_size
-            pages = pages[: token_count // page_size]
-            token_end = token_start + token_count
-
-        if token_count <= 0:
-            self._free_device_indices(device_indices)
-            return 0
-
-        if token_count < allocated_tokens:
-            self._free_device_indices(device_indices[token_count:])
-            device_indices = device_indices[:token_count]
-
-        try:
-            prefix_indices = getattr(
-                req, "prefix_indices", torch.empty((0,), dtype=torch.int64)
-            )
-            if token_start != len(prefix_indices):
-                logger.debug(
-                    "Shared HiCache direct insert cannot attach suffix rid=%s token_start=%d prefix_indices=%d",
-                    getattr(req, "rid", None),
-                    token_start,
-                    len(prefix_indices),
-                )
-                self._free_device_indices(device_indices)
-                return 0
-
-            key = RadixKey(
-                req.fill_ids[:token_end],
-                extra_key=req.extra_key,
-                is_bigram=self.tree_cache.is_eagle,
-            )
-            if token_start > 0:
-                prefix_indices = prefix_indices.to(
-                    dtype=torch.int64, device=device_indices.device, copy=False
-                )
-                insert_value = torch.cat([prefix_indices, device_indices])
-            else:
-                insert_value = device_indices
-
-            insert_shared_blocks = getattr(
-                self.tree_cache, "insert_shared_hicache_device_blocks", None
-            )
-            if not callable(insert_shared_blocks):
-                raise RuntimeError(
-                    "tree cache does not support insert_shared_hicache_device_blocks"
-                )
-            result = insert_shared_blocks(key=key, value=insert_value)
-            matched_length = result.prefix_len
-            matched_new_tokens = min(max(0, matched_length - token_start), token_count)
-            if matched_new_tokens > 0:
-                self._free_device_indices(device_indices[:matched_new_tokens])
-            staged_tokens = token_count - matched_new_tokens
-            if staged_tokens <= 0:
-                return 0
-            return staged_tokens
-        except Exception:
-            self._free_device_indices(device_indices)
-            raise

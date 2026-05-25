@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PrefetchTimeoutConfig,
 )
+from sglang.srt.mem_cache.hicache_host_index import HiCacheHostBlockIndex
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -53,9 +54,7 @@ from sglang.srt.mem_cache.radix_cache import (
     TreeNode,
 )
 from sglang.srt.mem_cache.utils import (
-    block_hash_aliases,
     compute_node_hash_values,
-    hash_str_to_int64,
     split_node_hash_value,
 )
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
@@ -111,8 +110,11 @@ class HiRadixCache(RadixCache):
         self.enable_shared_hicache = bool(
             getattr(server_args, "enable_shared_hicache", False)
         )
-        self.hicache_host_index_lock = threading.RLock()
-        self.hicache_host_block_index = {} if self.enable_shared_hicache else None
+        self.hicache_host_index = (
+            HiCacheHostBlockIndex(self.page_size)
+            if self.enable_shared_hicache
+            else None
+        )
 
         (
             extra_config,
@@ -636,102 +638,24 @@ class HiRadixCache(RadixCache):
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
-        if getattr(self, "hicache_host_block_index", None) is not None:
-            with self.hicache_host_index_lock:
-                self.hicache_host_block_index.clear()
+        if getattr(self, "hicache_host_index", None) is not None:
+            self.hicache_host_index.clear()
         super().reset()
 
     def _index_hicache_host_node(self, node: TreeNode) -> None:
-        if getattr(self, "hicache_host_block_index", None) is None:
-            return
-        if node.host_value is None:
-            self._drop_hicache_host_node(node)
-            return
-        if node.hash_value is None:
-            node.hash_value = compute_node_hash_values(node, self.page_size)
+        if getattr(self, "hicache_host_index", None) is not None:
+            self.hicache_host_index.index_node(node)
 
-        num_pages = min(len(node.hash_value), len(node.host_value) // self.page_size)
-        with self._hicache_host_index_lock():
-            self._drop_hicache_host_node(node, locked=True)
-            for page_idx in range(num_pages):
-                hash_value = node.hash_value[page_idx]
-                block_hash = hash_str_to_int64(hash_value)
-                for alias in block_hash_aliases(block_hash):
-                    self.hicache_host_block_index[alias] = (
-                        node,
-                        page_idx,
-                        hash_value,
-                    )
-
-    def _drop_hicache_host_node(
-        self, node: TreeNode, *, locked: bool = False
-    ) -> None:
-        if getattr(self, "hicache_host_block_index", None) is None:
-            return
-
-        def drop() -> None:
-            stale = [
-                block_hash
-                for block_hash, entry in self.hicache_host_block_index.items()
-                if entry[0] is node
-            ]
-            for block_hash in stale:
-                self.hicache_host_block_index.pop(block_hash, None)
-
-        if locked:
-            drop()
-        else:
-            with self._hicache_host_index_lock():
-                drop()
+    def _drop_hicache_host_node(self, node: TreeNode, *, locked: bool = False) -> None:
+        if getattr(self, "hicache_host_index", None) is not None:
+            self.hicache_host_index.drop_node(node, locked=locked)
 
     def lookup_hicache_host_blocks(
         self, wanted_hashes: set[int], *, protect: bool = False
     ):
-        if getattr(self, "hicache_host_block_index", None) is None:
+        if getattr(self, "hicache_host_index", None) is None:
             return ({}, []) if protect else {}
-
-        matches: dict[int, tuple[TreeNode, int, str]] = {}
-        protected_nodes: list[TreeNode] = []
-        protected_ids: set[int] = set()
-        wanted_aliases: set[int] = set()
-        for block_hash in wanted_hashes:
-            wanted_aliases.update(block_hash_aliases(block_hash))
-
-        stale_aliases = []
-        with self._hicache_host_index_lock():
-            for alias in wanted_aliases:
-                entry = self.hicache_host_block_index.get(alias)
-                if entry is None:
-                    continue
-                node, page_idx, hash_value = entry
-                valid = (
-                    node.host_value is not None
-                    and node.hash_value is not None
-                    and 0 <= page_idx < len(node.hash_value)
-                    and page_idx * self.page_size < len(node.host_value)
-                    and node.hash_value[page_idx] == hash_value
-                )
-                if valid:
-                    matches[alias] = entry
-                    if protect and node.id not in protected_ids:
-                        node.protect_host()
-                        protected_nodes.append(node)
-                        protected_ids.add(node.id)
-                else:
-                    stale_aliases.append(alias)
-
-            for alias in stale_aliases:
-                self.hicache_host_block_index.pop(alias, None)
-        if protect:
-            return matches, protected_nodes
-        return matches
-
-    def _hicache_host_index_lock(self):
-        lock = getattr(self, "hicache_host_index_lock", None)
-        if lock is None:
-            lock = threading.RLock()
-            self.hicache_host_index_lock = lock
-        return lock
+        return self.hicache_host_index.lookup(wanted_hashes, protect=protect)
 
     def insert_shared_hicache_device_blocks(
         self, *, key: RadixKey, value: torch.Tensor
