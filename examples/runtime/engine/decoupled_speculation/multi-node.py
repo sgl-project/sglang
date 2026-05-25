@@ -648,14 +648,97 @@ def create_target_placement_group(target_nnodes: int, target_gpus_per_node: int)
     return pg
 
 
+def _get_node_resource_key(node: dict[str, Any]) -> str | None:
+    for resource_name in node.get("Resources", {}):
+        if resource_name.startswith("node:"):
+            return resource_name
+    return None
+
+
+def _plan_stable_target_node_groups(
+    num_replicas: int,
+    target_nnodes: int,
+    target_gpus_per_node: int,
+) -> list[list[dict[str, Any]]] | None:
+    candidate_nodes = []
+    for node in ray.nodes():
+        if not node.get("Alive"):
+            continue
+        if float(node.get("Resources", {}).get("GPU", 0)) < target_gpus_per_node:
+            continue
+        node_resource_key = _get_node_resource_key(node)
+        if node_resource_key is None:
+            return None
+        candidate_nodes.append(
+            {
+                "node_ip": node["NodeManagerAddress"],
+                "node_resource_key": node_resource_key,
+                "remaining_bundles": int(
+                    float(node.get("Resources", {}).get("GPU", 0))
+                    // target_gpus_per_node
+                ),
+            }
+        )
+
+    candidate_nodes.sort(key=lambda item: item["node_ip"])
+
+    node_groups = []
+    for _ in range(num_replicas):
+        node_group = []
+        for node in candidate_nodes:
+            if node["remaining_bundles"] <= 0:
+                continue
+            node_group.append(node)
+            node["remaining_bundles"] -= 1
+            if len(node_group) == target_nnodes:
+                break
+        if len(node_group) != target_nnodes:
+            return None
+        node_groups.append(node_group)
+
+    return node_groups
+
+
+def create_target_placement_group_on_nodes(
+    target_nnodes: int,
+    target_gpus_per_node: int,
+    node_group: list[dict[str, Any]] | None,
+):
+    if node_group is None:
+        return create_target_placement_group(target_nnodes, target_gpus_per_node)
+
+    bundles = []
+    for node in node_group:
+        bundles.append(
+            {
+                "CPU": 1,
+                "GPU": target_gpus_per_node,
+                node["node_resource_key"]: 0.001,
+            }
+        )
+    strategy = "PACK" if target_nnodes == 1 else "STRICT_SPREAD"
+    pg = placement_group(bundles, strategy=strategy)
+    ray.get(pg.ready())
+    return pg
+
+
 def create_target_placement_groups(
     num_replicas: int,
     target_nnodes: int,
     target_gpus_per_node: int,
 ):
+    node_groups = _plan_stable_target_node_groups(
+        num_replicas,
+        target_nnodes,
+        target_gpus_per_node,
+    )
     return [
-        create_target_placement_group(target_nnodes, target_gpus_per_node)
-        for _ in range(num_replicas)
+        create_target_placement_group_on_nodes(
+            target_nnodes,
+            target_gpus_per_node,
+            node_groups[replica_index] if node_groups is not None else None,
+        )
+        for replica_index in range(num_replicas)
     ]
 
 
