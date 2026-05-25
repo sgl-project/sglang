@@ -43,6 +43,41 @@ def event_category(name: str) -> str:
     return suffix.split(".layer_", maxsplit=1)[0]
 
 
+def summarize_cuda_graph_paths(graph_paths: dict[str, int]) -> dict:
+    outcomes = defaultdict(int)
+    modes = defaultdict(lambda: defaultdict(int))
+    variants = defaultdict(lambda: defaultdict(int))
+
+    for path, count in graph_paths.items():
+        parts = path.split(".")
+        if not parts:
+            continue
+        outcome = parts[-1]
+        mode = parts[0]
+        variant = ".".join(parts[1:-1]) or "default"
+        outcomes[outcome] += count
+        modes[mode][outcome] += count
+        variants[variant][outcome] += count
+
+    total = sum(outcomes.values())
+    replay = outcomes.get("replay", 0)
+    fallback = outcomes.get("fallback", 0)
+    return {
+        "total": total,
+        "replay": replay,
+        "fallback": fallback,
+        "replay_rate": replay / total if total else 0.0,
+        "fallback_rate": fallback / total if total else 0.0,
+        "by_mode": {
+            mode: dict(sorted(counts.items())) for mode, counts in sorted(modes.items())
+        },
+        "by_variant": {
+            variant: dict(sorted(counts.items()))
+            for variant, counts in sorted(variants.items())
+        },
+    }
+
+
 def summarize_trace(path: Path) -> dict:
     trace = open_trace(path)
     totals = defaultdict(float)
@@ -78,6 +113,7 @@ def summarize_trace(path: Path) -> dict:
             for category, total in sorted(totals.items())
         },
         "cuda_graph_paths": dict(sorted(graph_paths.items())),
+        "cuda_graph_summary": summarize_cuda_graph_paths(graph_paths),
         "layers": {
             layer: {
                 category: total / 1000.0

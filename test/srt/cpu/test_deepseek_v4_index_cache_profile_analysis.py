@@ -61,4 +61,38 @@ def test_dsv4_index_cache_profile_analysis_groups_trace_regions(tmp_path):
         "decode.indexcache_on.replay": 1,
         "decode.replay": 1,
     }
+    assert summary["cuda_graph_summary"] == {
+        "total": 4,
+        "replay": 2,
+        "fallback": 2,
+        "replay_rate": 0.5,
+        "fallback_rate": 0.5,
+        "by_mode": {
+            "decode": {
+                "fallback": 2,
+                "replay": 2,
+            }
+        },
+        "by_variant": {
+            "default": {
+                "fallback": 2,
+                "replay": 1,
+            },
+            "indexcache_on": {
+                "replay": 1,
+            },
+        },
+    }
     assert summary["layers"]["4"]["raw_to_page_translation"] == 0.5
+
+
+def test_dsv4_index_cache_profile_analysis_summarizes_empty_cuda_graph_paths():
+    assert analyzer.summarize_cuda_graph_paths({}) == {
+        "total": 0,
+        "replay": 0,
+        "fallback": 0,
+        "replay_rate": 0.0,
+        "fallback_rate": 0.0,
+        "by_mode": {},
+        "by_variant": {},
+    }
