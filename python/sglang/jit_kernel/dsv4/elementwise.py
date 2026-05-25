@@ -175,6 +175,7 @@ def fused_q_indexer_rope_hadamard_quant(
         from .fused_q_indexer_rope_hadamard_quant_torch import (
             fused_q_indexer_rope_hadamard_quant_torch,
         )
+
         fused_q_indexer_rope_hadamard_quant_torch(
             q_input,
             q_fp8,
