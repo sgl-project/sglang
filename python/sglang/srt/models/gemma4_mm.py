@@ -596,14 +596,11 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 "You must specify exactly one of input_ids or inputs_embeds"
             )
 
-        # Gemma RoPE expects 1-indexed positions. Default behavior shifts
-        # in-place to match the historical reference; flip
-        # SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION to leave
-        # ``forward_batch.positions`` canonical (required by kv_canary).
         if envs.SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION.get():
             positions = positions + 1
         else:
             positions += 1
+
         per_layer_inputs = None
         # PLE table and the per-layer projection live on the first rank only,
         # so non-first ranks must skip this and pull per_layer_inputs from the
