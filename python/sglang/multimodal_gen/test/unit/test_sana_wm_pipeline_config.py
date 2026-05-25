@@ -1,12 +1,27 @@
+import os
+import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-from sglang.multimodal_gen.registry import _get_config_info
+from sglang.multimodal_gen.registry import _get_config_info, get_pipeline_config_classes
+from sglang.multimodal_gen.runtime.pipelines.sana_wm_pipeline import (
+    SanaWMTwoStagePipeline,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_refiner import (
+    SanaWMLTX2RefinerStage,
+    SanaWMRefinerDecodingStage,
+)
+from sglang.multimodal_gen.runtime.utils.model_overlay import (
+    resolve_model_overlay_target,
+)
 from sglang.multimodal_gen.test.test_utils import DEFAULT_SANA_WM_MODEL_NAME_FOR_TEST
 
 
@@ -105,6 +120,72 @@ class TestSanaWMRegistry(unittest.TestCase):
         self.assertIsNotNone(info)
         self.assertIs(info.pipeline_config_cls, SanaWMPipelineConfig)
         self.assertIs(info.sampling_param_cls, SanaWMSamplingParams)
+
+    def test_two_stage_pipeline_registers_sana_wm_config_classes(self) -> None:
+        classes = get_pipeline_config_classes("SanaWMTwoStagePipeline")
+        self.assertIsNotNone(classes)
+        pipeline_config_cls, sampling_param_cls = classes
+        self.assertIs(pipeline_config_cls, SanaWMPipelineConfig)
+        self.assertIs(sampling_param_cls, SanaWMSamplingParams)
+
+    def test_overlay_resolver_matches_hf_cache_snapshot_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            snapshot_dir = (
+                f"{tmp_dir}/hub/models--Lightricks--LTX-2.3/snapshots/abc123"
+            )
+            os.makedirs(snapshot_dir)
+            target = resolve_model_overlay_target(snapshot_dir)
+        self.assertIsNotNone(target)
+        source_model_id, _ = target
+        self.assertEqual(source_model_id, "Lightricks/LTX-2.3")
+
+
+class TestSanaWMTwoStagePipeline(unittest.TestCase):
+    def test_resolve_refiner_paths_defaults_to_model_refiner_dir(self) -> None:
+        pipeline = object.__new__(SanaWMTwoStagePipeline)
+        pipeline.model_path = "/models/sana-wm"
+        server_args = SimpleNamespace(component_paths={})
+        refiner_root, refiner_gemma_root = pipeline._resolve_refiner_paths(server_args)
+        self.assertEqual(refiner_root, "/models/sana-wm/refiner")
+        self.assertEqual(refiner_gemma_root, "/models/sana-wm/refiner/text_encoder")
+
+    def test_resolve_refiner_paths_accepts_component_overrides(self) -> None:
+        pipeline = object.__new__(SanaWMTwoStagePipeline)
+        pipeline.model_path = "/models/sana-wm"
+        server_args = SimpleNamespace(
+            component_paths={
+                "refiner": "/custom/refiner",
+                "refiner_text_encoder": "/custom/refiner/text_encoder",
+            }
+        )
+        refiner_root, refiner_gemma_root = pipeline._resolve_refiner_paths(server_args)
+        self.assertEqual(refiner_root, "/custom/refiner")
+        self.assertEqual(refiner_gemma_root, "/custom/refiner/text_encoder")
+
+
+class TestSanaWMRefinerStage(unittest.TestCase):
+    def test_prompt_resolution_broadcasts_single_prompt(self) -> None:
+        batch = Req(prompt="drive forward")
+        prompts = SanaWMLTX2RefinerStage._prompts_for_batch(batch, batch_size=2)
+        self.assertEqual(prompts, ["drive forward", "drive forward"])
+
+    def test_prompt_resolution_accepts_batch_prompt_list(self) -> None:
+        batch = Req(prompt=["left", "right"])
+        prompts = SanaWMLTX2RefinerStage._prompts_for_batch(batch, batch_size=2)
+        self.assertEqual(prompts, ["left", "right"])
+
+    def test_refiner_decoding_drops_clean_sink_frame_after_decode(self) -> None:
+        stage = SanaWMRefinerDecodingStage(vae=None)
+        decoded = torch.arange(1 * 3 * 4 * 2 * 2).reshape(1, 3, 4, 2, 2)
+
+        with patch.object(DecodingStage, "decode", return_value=decoded):
+            frames = stage.decode(
+                torch.empty(1, 128, 4, 2, 2),
+                SimpleNamespace(),
+                vae_dtype=torch.bfloat16,
+            )
+
+        self.assertTrue(torch.equal(frames, decoded[:, :, 1:]))
 
 
 if __name__ == "__main__":

@@ -1,20 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# SANA-WM TI2V Pipeline.
+# SANA-WM TI2V pipelines.
 #
-# Stage ordering (Hybrid style):
-#   InputValidationStage
-#   → TextEncodingStage (Gemma-2, same as SANA T2I)
-#   → SanaWMBeforeDenoisingStage (first-frame VAE, Plücker, noise latents, timesteps)
-#   → DenoisingStage (standard)
-#   → DecodingStage (standard, uses LTX-2 VAE decoder)
+# Two variants share stages 1–4 and differ only in whether an LTX-2 latent
+# refiner runs before VAE decode:
 #
-# Optional two-stage pipeline (SanaWMTwoStagePipeline):
-#   Same as above + LTX2RefinementStage for high-quality up-sampling.
+#   SanaWMPipeline (single-stage):
+#     InputValidation → TextEncoding (Gemma-2) → SanaWMBeforeDenoising
+#       → Denoising → standard decoding (LTX-2 VAE)
 #
-# pipeline_name must match _class_name in SANA-WM model_index.json.
-# Default expected: "SanaWMPipeline" (update if the HF checkpoint differs).
+#   SanaWMTwoStagePipeline (matches NVlabs official inference):
+#     ... → Denoising → SanaWMLTX2RefinerStage
+#       → refiner decoding (LTX-2 VAE + drop clean sink anchor frame)
+#
+# The two-stage variant requires the upstream refiner subtree
+# (refiner/{transformer,connectors,text_encoder}). When using the
+# `Efficient-Large-Model/SANA-WM_bidirectional` overlay this is materialized
+# at `<model_path>/refiner/`; component_paths overrides are also honored.
 
+import os
+
+from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
+from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -27,26 +34,21 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
     SanaWMBeforeDenoisingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_refiner import (
+    SanaWMLTX2RefinerStage,
+    SanaWMRefinerDecodingStage,
+    default_sana_wm_refiner_dtype,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
 
 
 class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
-    """
-    SANA-WM TI2V pipeline.
+    """SANA-WM TI2V pipeline (single-stage)."""
 
-    Expects the following modules from the HuggingFace model directory:
-    - text_encoder: Gemma-2-2b-it
-    - tokenizer: Gemma-2 tokenizer
-    - vae: LTX-2 VAE
-    - transformer: SanaWMTransformer3DModel
-    - scheduler: FlowMatchEulerDiscreteScheduler
-    """
-
-    # Must match `_class_name` in model_index.json of the checkpoint.
+    # Must match `_class_name` in model_index.json of the materialized checkpoint.
     pipeline_name = "SanaWMPipeline"
+    pipeline_config_cls = SanaWMPipelineConfig
+    sampling_params_cls = SanaWMSamplingParams
 
     _required_config_modules = [
         "text_encoder",
@@ -57,10 +59,8 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        # 1. Input validation (standard)
         self.add_stage(InputValidationStage())
 
-        # 2. Text encoding via Gemma-2 (standard — handles deduplication, masking, CFG)
         self.add_stage(
             TextEncodingStage(
                 text_encoders=[self.get_module("text_encoder")],
@@ -69,7 +69,6 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
             "prompt_encoding_stage",
         )
 
-        # 3. Video-specific pre-processing (first-frame VAE, Plücker, noise init, timesteps)
         self.add_stage(
             SanaWMBeforeDenoisingStage(
                 vae=self.get_module("vae"),
@@ -80,7 +79,6 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
             "sana_wm_before_denoising",
         )
 
-        # 4. Standard denoising loop (calls transformer.forward at each step)
         self.add_stage(
             DenoisingStage(
                 transformer=self.get_module("transformer"),
@@ -88,63 +86,62 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
             ),
         )
 
-        # 5. Standard VAE decoding (LTX-2 VAE decoder)
+        # Subclasses (e.g. SanaWMTwoStagePipeline) insert latent-domain stages
+        # between denoising and VAE decoding.
+        self._maybe_add_refiner_stage(server_args)
+
+        self._add_decoding_stage()
+
+    def _add_decoding_stage(self) -> None:
         self.add_standard_decoding_stage()
+
+    def _maybe_add_refiner_stage(self, server_args: ServerArgs) -> None:
+        """Hook for subclasses; single-stage pipeline is a no-op."""
+        return None
 
 
 class SanaWMTwoStagePipeline(SanaWMPipeline):
-    """
-    Optional two-stage SANA-WM pipeline with LTX-2 refinement.
+    """SANA-WM two-stage pipeline: SANA-WM DiT + LTX-2 latent refiner.
 
-    Stage-1: SanaWM DiT (generates coarse 720p video)
-    Stage-2: LTX-2 Refiner (σ_start=0.9, ~3 Euler steps, sharpens detail)
-
-    Requires `ltx2_transformer` module in the model directory (or component_paths).
-    Falls back gracefully to single-stage if LTX-2 modules are not found.
+    Stage-1 (SanaWMPipeline) generates a coarse 720p latent; the LTX-2 video
+    refiner then runs a few Euler steps on that latent before VAE decode,
+    matching the NVlabs ``inference_sana_wm.py`` default. The refiner loads its
+    own LTX-2 transformer/connectors/Gemma3 text encoder lazily on first use.
     """
 
     pipeline_name = "SanaWMTwoStagePipeline"
 
-    _required_config_modules = [
-        "text_encoder",
-        "tokenizer",
-        "vae",
-        "transformer",
-        "scheduler",
-    ]
+    def _resolve_refiner_paths(self, server_args: ServerArgs) -> tuple[str, str]:
+        component_paths = getattr(server_args, "component_paths", {}) or {}
+        refiner_root = component_paths.get(
+            "refiner", os.path.join(self.model_path, "refiner")
+        )
+        refiner_gemma_root = component_paths.get(
+            "refiner_text_encoder",
+            os.path.join(refiner_root, "text_encoder"),
+        )
+        return refiner_root, refiner_gemma_root
 
-    _optional_config_modules = [
-        "transformer_2",  # LTX-2 refiner transformer (optional)
-    ]
+    def _maybe_add_refiner_stage(self, server_args: ServerArgs) -> None:
+        refiner_root, refiner_gemma_root = self._resolve_refiner_paths(server_args)
+        self.add_stage(
+            SanaWMLTX2RefinerStage(
+                refiner_root=refiner_root,
+                refiner_gemma_root=refiner_gemma_root,
+                dtype=default_sana_wm_refiner_dtype(server_args),
+            ),
+            "sana_wm_refiner",
+        )
 
-    def create_pipeline_stages(self, server_args: ServerArgs):
-        # Stages 1-5: same as SanaWMPipeline
-        super().create_pipeline_stages(server_args)
-
-        # Stage 6 (optional): LTX-2 refinement if refiner transformer is loaded
-        transformer_2 = self.get_module("transformer_2", required=False)
-        if transformer_2 is not None:
-            try:
-                from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-                    LTX2RefinementStage,
-                )
-                self.add_stage(
-                    LTX2RefinementStage(
-                        transformer=transformer_2,
-                        scheduler=self.get_module("scheduler"),
-                    ),
-                    "ltx2_refinement",
-                )
-                logger.info("LTX-2 refinement stage added (two-stage mode).")
-            except ImportError:
-                logger.warning(
-                    "LTX2RefinementStage not available; running single-stage mode."
-                )
-        else:
-            logger.info(
-                "No refiner transformer found; running SanaWM in single-stage mode."
-            )
+    def _add_decoding_stage(self) -> None:
+        self.add_stage(
+            SanaWMRefinerDecodingStage(
+                vae=self.get_module("vae"),
+                pipeline=self,
+                component_name="vae",
+            ),
+            "decoding_stage",
+        )
 
 
-# REQUIRED: entry point for the pipeline registry auto-discovery
 EntryClass = [SanaWMPipeline, SanaWMTwoStagePipeline]

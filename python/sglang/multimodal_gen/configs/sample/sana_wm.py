@@ -40,6 +40,9 @@ class SanaWMSamplingParams(SamplingParams):
     # Frame count: 49 = (49-1)/8 = 6 latent frames → ~3 seconds at 16fps
     num_frames: int = 49
 
+    # SANA-WM is trained at 16fps (override base default of 24).
+    fps: int = 16
+
     # SANA-WM inference steps: 20 steps is a good default for quality/speed
     num_inference_steps: int = 20
 
