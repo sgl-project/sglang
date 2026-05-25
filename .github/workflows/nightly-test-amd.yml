@@ -82,6 +82,11 @@ on:
         required: false
         type: string
         default: ''
+      image_suffix:
+        description: 'Optional suffix matching a tag_suffix-tagged image published by the AMD nightly Docker workflow (e.g. test-pr-22037). When non-empty, every stage starts its container from rocm/sgl-dev:<base>-<DATE>-<suffix>. Leave empty for the default daily image. Only honored on manual workflow_dispatch.'
+        required: false
+        type: string
+        default: ''
   workflow_call:
     inputs:
       ref:
@@ -109,6 +114,9 @@ env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+  # Forwarded to amd_ci_start_container.sh; only set on manual workflow_dispatch.
+  # Empty for push / schedule / workflow_call, preserving default image-discovery behavior.
+  IMAGE_SUFFIX: ${{ inputs.image_suffix }}
 
 concurrency:
   # When called via workflow_call with ref set, use a unique group per caller run to avoid
