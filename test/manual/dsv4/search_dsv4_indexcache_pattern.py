@@ -97,9 +97,15 @@ def score_endpoint(
     return sum(losses) / len(losses)
 
 
-def wait_for_endpoint(endpoint: str, timeout: int) -> None:
+def wait_for_endpoint(
+    endpoint: str, timeout: int, proc: subprocess.Popen | None = None
+) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if proc is not None and proc.poll() not in (None, 0):
+            raise RuntimeError(
+                f"candidate deploy command exited with status {proc.returncode}"
+            )
         try:
             requests.get(endpoint.rstrip("/") + "/health", timeout=5).raise_for_status()
             server_info = fetch_server_info(endpoint, timeout=5)
@@ -124,7 +130,7 @@ def run_candidate(
         if command_template:
             cmd = command_template.format(pattern=pattern)
             proc = subprocess.Popen(cmd, shell=True, preexec_fn=os.setsid)
-            wait_for_endpoint(endpoint, startup_timeout)
+            wait_for_endpoint(endpoint, startup_timeout, proc)
         return score_endpoint(endpoint, texts, request_timeout, min_prompt_tokens)
     finally:
         if proc is not None:
@@ -240,6 +246,16 @@ def validate_args(args) -> None:
         )
     if "{pattern}" not in args.command_template:
         raise SystemExit("--command-template must contain {pattern}")
+    if args.num_c4_layers < 1:
+        raise SystemExit("--num-c4-layers must be at least 1")
+    if args.pp_block_c4_layers < 0:
+        raise SystemExit("--pp-block-c4-layers must be non-negative")
+    if args.startup_timeout < 1:
+        raise SystemExit("--startup-timeout must be at least 1 second")
+    if args.request_timeout < 1:
+        raise SystemExit("--request-timeout must be at least 1 second")
+    if args.min_indexcache_prompt_tokens < 0:
+        raise SystemExit("--min-indexcache-prompt-tokens must be non-negative")
 
 
 def main() -> None:

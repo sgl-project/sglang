@@ -1,4 +1,5 @@
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -132,10 +133,47 @@ def test_dsv4_index_cache_search_requires_pattern_deployment_template():
 
 
 def test_dsv4_index_cache_search_requires_pattern_placeholder():
-    args = type("Args", (), {"command_template": "modal deploy endpoint.py"})()
+    args = type(
+        "Args",
+        (),
+        {
+            "command_template": "modal deploy endpoint.py",
+            "num_c4_layers": 21,
+            "pp_block_c4_layers": 0,
+            "startup_timeout": 1,
+            "request_timeout": 1,
+            "min_indexcache_prompt_tokens": 75000,
+        },
+    )()
 
     with pytest.raises(SystemExit, match=r"\{pattern\}"):
         search_mod.validate_args(args)
+
+
+def test_dsv4_index_cache_search_rejects_invalid_runtime_args():
+    args = type(
+        "Args",
+        (),
+        {
+            "command_template": "deploy --pattern {pattern}",
+            "num_c4_layers": 0,
+            "pp_block_c4_layers": 0,
+            "startup_timeout": 1,
+            "request_timeout": 1,
+            "min_indexcache_prompt_tokens": 75000,
+        },
+    )()
+
+    with pytest.raises(SystemExit, match="--num-c4-layers"):
+        search_mod.validate_args(args)
+
+
+def test_dsv4_index_cache_search_surfaces_failed_candidate_deploy():
+    proc = subprocess.Popen(["sh", "-c", "exit 7"])
+    proc.wait(timeout=5)
+
+    with pytest.raises(RuntimeError, match="status 7"):
+        search_mod.wait_for_endpoint("http://127.0.0.1:9", timeout=30, proc=proc)
 
 
 def test_dsv4_index_cache_search_rejects_short_tokenized_calibration(
