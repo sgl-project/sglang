@@ -95,7 +95,6 @@ FLASHINFER_MAX_SEQLEN_BUCKETS = [
 ]
 
 HOPPER_TMA_ALIGN_BYTE = 16
-FA3_ENABLE_FP8_SHAPE = 2400
 RAW_VISION_TOKEN_MAX_NUM = 32768
 
 
@@ -443,8 +442,9 @@ class VisionFlash3Attention(nn.Module):
         """
         window_size = kwargs.get("window_size", (-1, -1))
         s_aux = kwargs.get("s_aux", None)
+        vision_attn_shape = envs.SGLANG_VISION_ATTN_FP8_SHAPE.get()
 
-        if envs.SGLANG_VISION_ATTN_FP8.get():
+        if vision_attn_shape:
             if isinstance(cu_seqlens, list):
                 cu_seqlens_tensor = cu_seqlens[0]
             else:
@@ -455,7 +455,7 @@ class VisionFlash3Attention(nn.Module):
             avg_len = q.shape[0] / num_images if num_images > 0 else q.shape[0]
 
             # Use FP8 TMA optimization for thresholds above 2400 (depend on hardware)
-            use_fp8 = avg_len > FA3_ENABLE_FP8_SHAPE
+            use_fp8 = avg_len > vision_attn_shape
         else:
             use_fp8 = False
 
