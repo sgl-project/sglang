@@ -44,7 +44,10 @@ def is_timeout_error(err: BaseException) -> bool:
 
 
 def is_indeterminate_direct_transfer_reason(reason: str) -> bool:
-    return str(reason).startswith(SHARED_HICACHE_DIRECT_TIMEOUT_REASON)
+    reason = str(reason)
+    return reason.startswith(SHARED_HICACHE_DIRECT_TIMEOUT_REASON) or reason.startswith(
+        "direct_transfer_failed:"
+    )
 
 
 def start_source_transfer_server(
@@ -53,7 +56,7 @@ def start_source_transfer_server(
     port: int,
     endpoint: str,
     worker_id: int | None,
-    dp_rank: int,
+    attn_dp_rank: int,
     max_body_bytes: Callable[[], int],
     try_enter: Callable[[], bool],
     exit_resolver: Callable[[], None],
@@ -196,10 +199,10 @@ def start_source_transfer_server(
     )
     thread.start()
     logger.info(
-        "Shared HiCache source resolver listening on %s for worker_id=%s dp_rank=%s",
+        "Shared HiCache source resolver listening on %s for worker_id=%s attn_dp_rank=%s",
         endpoint,
         worker_id,
-        dp_rank,
+        attn_dp_rank,
     )
     return server, thread
 

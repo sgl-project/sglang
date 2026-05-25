@@ -13,6 +13,9 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    _get_mooncake_transfer_protocol,
+)
 from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.entrypoints.openai.utils import cached_tokens_details_from_dict
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -29,8 +32,10 @@ from sglang.srt.mem_cache.shared_hicache.plan import (
     SHARED_HICACHE_DIRECT_TIMEOUT_REASON,
     SharedHiCachePlan,
 )
+from sglang.srt.mem_cache.shared_hicache.service import format_control_endpoint
 from sglang.srt.mem_cache.shared_hicache.source import (
     ResolvedHostPage,
+    handle_source_transfer,
     resolve_host_pages,
 )
 from sglang.srt.mem_cache.shared_hicache.target import SharedHiCacheTarget
@@ -49,9 +54,9 @@ def _make_plan(block_hashes, **overrides):
         "plan_id": "plan-1",
         "request_id": "request-1",
         "target_worker_id": 42,
-        "target_dp_rank": 0,
+        "target_attn_dp_rank": 0,
         "source_worker_id": 7,
-        "source_dp_rank": 0,
+        "source_attn_dp_rank": 0,
         "source_endpoint": "127.0.0.1:39007",
         "source_medium": StorageMedium.CPU.value,
         "block_hashes": block_hashes,
@@ -218,7 +223,23 @@ def _make_manager(tree=None):
     manager = SharedHiCacheManager.__new__(SharedHiCacheManager)
     manager.tree_cache = tree
     manager.worker_id = 42
-    manager.dp_rank = 0
+    manager._set_parallel_metadata(
+        {
+            "attn_dp_rank": 0,
+            "attn_dp_size": 1,
+            "attn_tp_rank": 0,
+            "attn_tp_size": 1,
+            "attn_cp_rank": 0,
+            "attn_cp_size": 1,
+            "tp_rank": 0,
+            "tp_size": 1,
+            "pp_rank": 0,
+            "pp_size": 1,
+            "moe_ep_rank": 0,
+            "moe_ep_size": 1,
+        },
+        attn_dp_rank=0,
+    )
     manager.timeout_secs = 1.0
     manager.prefetch_stop_policy = "timeout"
     manager.prefetch_timeout_config = None
@@ -272,6 +293,39 @@ class TestSharedHiCache(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "target_worker_id must be an integer"):
             SharedHiCachePlan.from_dict(not_int)
 
+    def test_plan_accepts_attention_tp_rank_metadata(self):
+        plan = SharedHiCachePlan.from_dict(
+            _make_plan(
+                [11],
+                source_attn_tp_rank=1,
+                source_attn_tp_size=2,
+                target_attn_tp_rank=1,
+                target_attn_tp_size=2,
+            )
+        )
+
+        self.assertEqual(plan.source_attn_tp_rank, 1)
+        self.assertEqual(plan.source_attn_tp_size, 2)
+        self.assertEqual(plan.target_attn_tp_rank, 1)
+        self.assertEqual(plan.target_attn_tp_size, 2)
+
+        with self.assertRaisesRegex(ValueError, "source_attn_tp_rank"):
+            SharedHiCachePlan.from_dict(
+                _make_plan([11], source_attn_tp_rank=2, source_attn_tp_size=2)
+            )
+
+    def test_control_endpoint_formats_attention_rank_fields(self):
+        endpoint = format_control_endpoint(
+            "127.0.0.1:391{attn_dp_rank}{attn_tp_rank}",
+            2,
+            {
+                "attn_dp_rank": 2,
+                "attn_tp_rank": 1,
+            },
+        )
+
+        self.assertEqual(endpoint, "http://127.0.0.1:39121")
+
     def test_source_resolves_protected_hicache_host_pages(self):
         kv_hash = hash_str_to_int64("aa" * 32)
         identity_hash = 123
@@ -296,7 +350,12 @@ class TestSharedHiCache(unittest.TestCase):
         )
 
         pages, reason = resolve_host_pages(
-            tree, plan, start_block=0, max_blocks=1, worker_id=7, dp_rank=0
+            tree,
+            plan,
+            start_block=0,
+            max_blocks=1,
+            worker_id=7,
+            attn_dp_rank=0,
         )
 
         self.assertEqual(reason, "ok")
@@ -384,30 +443,35 @@ class TestSharedHiCache(unittest.TestCase):
             manager._fetch_executor.shutdown(wait=False, cancel_futures=True)
 
     def test_manager_quarantines_indeterminate_target_pages(self):
-        tree = FakeTree()
-        manager = _make_manager(tree)
-        plan = SharedHiCachePlan.from_dict(_make_plan([11, 22]))
-        req = _make_req(plan.to_dict())
-        device_indices = torch.arange(200, 204)
-        pending = SharedHiCachePendingFetch(
-            plan=plan,
-            plan_offset=0,
-            target_start_block=0,
-            expected_hashes=plan.planned_hashes,
-            future=_completed_future(([], SHARED_HICACHE_DIRECT_TIMEOUT_REASON)),
-            device_indices=device_indices,
-            backend="mooncake",
-            submitted_at=time.perf_counter(),
-        )
-        manager._pending_fetches[req.rid] = pending
+        for reason in (
+            SHARED_HICACHE_DIRECT_TIMEOUT_REASON,
+            "direct_transfer_failed:Mooncake direct KV transfer failed with ret=-1",
+        ):
+            with self.subTest(reason=reason):
+                tree = FakeTree()
+                manager = _make_manager(tree)
+                plan = SharedHiCachePlan.from_dict(_make_plan([11, 22]))
+                req = _make_req(plan.to_dict())
+                device_indices = torch.arange(200, 204)
+                pending = SharedHiCachePendingFetch(
+                    plan=plan,
+                    plan_offset=0,
+                    target_start_block=0,
+                    expected_hashes=plan.planned_hashes,
+                    future=_completed_future(([], reason)),
+                    device_indices=device_indices,
+                    backend="mooncake",
+                    submitted_at=time.perf_counter(),
+                )
+                manager._pending_fetches[req.rid] = pending
 
-        result = manager.prepare_reuse(req)
+                result = manager.prepare_reuse(req)
 
-        self.assertEqual(result.staged_tokens, 0)
-        self.assertEqual(tree.device_allocator.freed, [])
-        self.assertEqual(
-            manager.target_cache.quarantined_device_indices, [device_indices]
-        )
+                self.assertEqual(result.staged_tokens, 0)
+                self.assertEqual(tree.device_allocator.freed, [])
+                self.assertEqual(
+                    manager.target_cache.quarantined_device_indices, [device_indices]
+                )
 
     def test_mooncake_backend_registers_source_and_transfers_pages(self):
         page_size = 2
@@ -463,6 +527,101 @@ class TestSharedHiCache(unittest.TestCase):
             dst_addrs, [1_000_000 + item_len * 3, 2_000_000 + item_len * 3]
         )
 
+    def test_mooncake_nvlink_stages_host_pages_through_gpu_buffer(self):
+        class FakeStagingBuffer:
+            def __init__(self, size_bytes, device, gpu_id, custom_mem_pool=None):
+                self.size_bytes = int(size_bytes)
+                self.buffer = torch.empty(self.size_bytes, dtype=torch.uint8)
+                self.ptr = 10_000_000
+
+            def fits(self, required_bytes):
+                return int(required_bytes) <= self.size_bytes
+
+            def get_ptr(self):
+                return self.ptr
+
+            def get_size(self):
+                return self.size_bytes
+
+        page_size = 2
+        source_k = torch.arange(80, dtype=torch.uint8).reshape(20, 4)
+        source_v = torch.arange(80, 160, dtype=torch.uint8).reshape(20, 4)
+        host_buffer = torch.zeros((64,), dtype=torch.uint8)
+        item_len = source_k[0].nbytes * page_size
+        engine = FakeMooncakeEngine(protocol="nvlink")
+        tree = SimpleNamespace(
+            page_size=page_size,
+            cache_controller=SimpleNamespace(
+                mem_pool_host=SimpleNamespace(
+                    layout="layer_first",
+                    kv_buffer=host_buffer,
+                    k_data_refs=[source_k],
+                    v_data_refs=[source_v],
+                )
+            ),
+        )
+        backend = MooncakeSharedHiCacheTransferBackend(
+            engine=engine,
+            tree_cache=tree,
+            target_kv_ptrs=[1_000_000, 2_000_000],
+            target_kv_item_lens=[item_len, item_len],
+            custom_mem_pool=object(),
+            transfer_parallelism=1,
+        )
+        backend._register_source_host_pool()
+
+        with (
+            patch(
+                "sglang.srt.mem_cache.shared_hicache.transfer.StagingBuffer",
+                FakeStagingBuffer,
+            ),
+            patch("torch.cuda.synchronize"),
+        ):
+            backend.transfer_pages(
+                target_session_id="peer",
+                source_page_indices=torch.tensor([1, 2], dtype=torch.int32).numpy(),
+                target_page_indices=torch.tensor([3, 4], dtype=torch.int32).numpy(),
+                target_kv_ptrs=backend.target_kv_ptrs,
+                target_kv_item_lens=backend.target_kv_item_lens,
+            )
+
+        self.assertIn((10_000_000, item_len * 4), engine.registered)
+        self.assertEqual(len(engine.transfers), 1)
+        session_id, src_addrs, dst_addrs, lengths = engine.transfers[0]
+        self.assertEqual(session_id, "peer")
+        self.assertEqual(src_addrs, [10_000_000, 10_000_000 + item_len * 2])
+        self.assertEqual(lengths, [item_len * 2, item_len * 2])
+        self.assertEqual(
+            dst_addrs, [1_000_000 + item_len * 3, 2_000_000 + item_len * 3]
+        )
+        self.assertEqual(
+            backend._staging_buffer.buffer[: item_len * 2].tolist(),
+            source_k.view(torch.uint8).reshape(-1)[item_len : item_len * 3].tolist(),
+        )
+        self.assertEqual(
+            backend._staging_buffer.buffer[item_len * 2 : item_len * 4].tolist(),
+            source_v.view(torch.uint8).reshape(-1)[item_len : item_len * 3].tolist(),
+        )
+
+    def test_mooncake_transfer_protocol_uses_nvlink_env(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "SGLANG_MOONCAKE_TE_PROTOCOL": "nvlink",
+                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL": "",
+            },
+        ):
+            self.assertEqual(_get_mooncake_transfer_protocol(), "nvlink")
+
+        with patch.dict(
+            "os.environ",
+            {
+                "SGLANG_MOONCAKE_TE_PROTOCOL": "",
+                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL": "NVLINK",
+            },
+        ):
+            self.assertEqual(_get_mooncake_transfer_protocol(), "nvlink")
+
     def test_mooncake_from_scheduler_fails_fast_on_checked_registration_error(self):
         engine = FakeMooncakeEngine(register_returns=[0, -202])
         scheduler = SimpleNamespace(
@@ -490,6 +649,68 @@ class TestSharedHiCache(unittest.TestCase):
 
         self.assertIsNone(backend)
         self.assertEqual(engine.registered, [(1, 128), (2, 128)])
+
+    def test_mooncake_from_scheduler_supports_tp_and_ep_rank_layout(self):
+        page_size = 2
+        source_k = torch.zeros((20, 4), dtype=torch.uint8)
+        source_v = torch.zeros((20, 4), dtype=torch.uint8)
+        host_buffer = torch.zeros((64,), dtype=torch.uint8)
+        item_len = source_k[0].nbytes * page_size
+        engine = FakeMooncakeEngine(ib_device="mlx5_0")
+        scheduler = SimpleNamespace(
+            server_args=SimpleNamespace(
+                shared_hicache_config={"transfer_backend": "mooncake"},
+                mooncake_ib_device="mlx5_0",
+            ),
+            ps=SimpleNamespace(
+                tp_rank=1,
+                tp_size=2,
+                pp_rank=0,
+                pp_size=1,
+                attn_dp_rank=0,
+                attn_dp_size=1,
+                attn_tp_rank=1,
+                attn_tp_size=2,
+                attn_cp_rank=0,
+                attn_cp_size=1,
+                moe_ep_rank=1,
+                moe_ep_size=4,
+                gpu_id=1,
+            ),
+            gpu_id=1,
+            tree_cache=SimpleNamespace(
+                page_size=page_size,
+                cache_controller=SimpleNamespace(
+                    mem_pool_host=SimpleNamespace(
+                        layout="layer_first",
+                        kv_buffer=host_buffer,
+                        k_data_refs=[source_k],
+                        v_data_refs=[source_v],
+                    )
+                ),
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                get_kvcache=lambda: SimpleNamespace(
+                    get_contiguous_buf_infos=lambda: (
+                        [1_000_000, 2_000_000],
+                        [128, 128],
+                        [item_len, item_len],
+                    )
+                )
+            ),
+        )
+
+        with patch(
+            "sglang.srt.mem_cache.shared_hicache.transfer._get_or_init_mooncake_transfer_engine",
+            return_value=engine,
+        ):
+            backend = MooncakeSharedHiCacheTransferBackend.from_scheduler(scheduler)
+
+        self.assertIsNotNone(backend)
+        self.assertEqual(backend.parallel_metadata["attn_tp_rank"], 1)
+        self.assertEqual(backend.parallel_metadata["attn_tp_size"], 2)
+        self.assertEqual(backend.parallel_metadata["moe_ep_size"], 4)
+        self.assertEqual(backend.target_descriptor()["attn_tp_rank"], 1)
 
     def test_mooncake_engine_init_uses_scheduler_parallel_state_gpu_id(self):
         calls = []
@@ -520,18 +741,86 @@ class TestSharedHiCache(unittest.TestCase):
         self.assertEqual(engine, "engine")
         self.assertEqual(calls, [("127.0.0.1", 3, "mlx5_0")])
 
-    def test_make_transfer_backend_rejects_unsupported_topology_when_requested(self):
+    def test_make_transfer_backend_rejects_pp_and_cp_when_requested(self):
         scheduler = SimpleNamespace(
             server_args=SimpleNamespace(
                 shared_hicache_config={"transfer_backend": "mooncake"},
-                tp_size=2,
-                pp_size=1,
+                tp_size=1,
+                pp_size=2,
                 attn_cp_size=1,
             )
         )
 
-        with self.assertRaisesRegex(RuntimeError, "tp_size=1"):
+        with self.assertRaisesRegex(RuntimeError, "PP/CP are deferred"):
             make_shared_hicache_transfer_backend(scheduler)
+
+        scheduler.server_args.pp_size = 1
+        scheduler.server_args.attn_cp_size = 2
+        with self.assertRaisesRegex(RuntimeError, "PP/CP are deferred"):
+            make_shared_hicache_transfer_backend(scheduler)
+
+    def test_source_transfer_rejects_wrong_tp_rank_metadata(self):
+        plan = SharedHiCachePlan.from_dict(
+            _make_plan(
+                [11],
+                source_attn_tp_size=2,
+                target_attn_tp_size=2,
+            )
+        )
+        response = handle_source_transfer(
+            payload={
+                "plan": plan.to_dict(),
+                "start_block": 0,
+                "max_blocks": 1,
+                "target_session_id": "target-session",
+                "transfer_backend": "mooncake",
+                "target_metadata": {
+                    "backend": "mooncake",
+                    "session_id": "target-session",
+                    "attn_dp_rank": 0,
+                    "attn_tp_rank": 1,
+                    "attn_tp_size": 2,
+                },
+                "target_kv_ptrs": [1],
+                "target_kv_item_lens": [64],
+                "target_page_indices": [0],
+            },
+            transfer_backend=FakeDirectTransfer(),
+            tree_cache=FakeTree(),
+            worker_id=7,
+            attn_dp_rank=0,
+            attn_tp_rank=0,
+            attn_tp_size=2,
+        )
+
+        self.assertFalse(response["ok"])
+        self.assertIn("wrong_source_attn_tp_rank_for_target", response["reason"])
+
+    def test_manager_formats_plan_endpoint_by_current_attention_tp_rank(self):
+        manager = _make_manager()
+        manager._set_parallel_metadata(
+            {
+                "attn_dp_rank": 0,
+                "attn_tp_rank": 1,
+                "attn_tp_size": 2,
+                "tp_rank": 1,
+                "tp_size": 2,
+            },
+            attn_dp_rank=0,
+        )
+        plan = SharedHiCachePlan.from_dict(
+            _make_plan(
+                [11],
+                source_endpoint="127.0.0.1:3900{source_attn_tp_rank}",
+                source_attn_tp_size=2,
+                target_attn_tp_size=2,
+            )
+        )
+
+        self.assertEqual(
+            manager._candidate_endpoints_for_plan(plan),
+            ["http://127.0.0.1:39001"],
+        )
 
     def test_server_args_enable_shared_hicache_requires_hicache_and_worker_id(self):
         parser = argparse.ArgumentParser()
@@ -591,6 +880,61 @@ class TestSharedHiCache(unittest.TestCase):
         )
         self.assertEqual(server_args.shared_hicache_config.transfer_backend, "mooncake")
         self.assertEqual(server_args.shared_hicache_config.timeout_secs, 2.5)
+
+    def test_manager_uses_server_arg_worker_id_after_dynamo_identity_update(self):
+        server_args = SimpleNamespace(
+            enable_shared_hicache=True,
+            shared_hicache_worker_id=99,
+            shared_hicache_config=SharedHiCacheConfig(
+                worker_id=2,
+                control_endpoint=None,
+                timeout_secs=1.0,
+                transfer_backend="auto",
+            ),
+            hicache_storage_prefetch_policy="timeout",
+            tp_size=2,
+            pp_size=1,
+            attn_cp_size=1,
+            ep_size=1,
+        )
+        scheduler = SimpleNamespace(
+            server_args=server_args,
+            enable_hierarchical_cache=True,
+            tree_cache=SimpleNamespace(
+                lookup_hicache_host_blocks=lambda *_args, **_kwargs: ({}, []),
+                insert_shared_hicache_device_blocks=lambda **_kwargs: None,
+                prefetch_timeout_config=None,
+            ),
+            ps=SimpleNamespace(
+                attn_dp_rank=0,
+                attn_dp_size=1,
+                attn_tp_rank=1,
+                attn_tp_size=2,
+                tp_rank=1,
+                tp_size=2,
+                pp_rank=0,
+                pp_size=1,
+                attn_cp_rank=0,
+                attn_cp_size=1,
+                moe_ep_rank=0,
+                moe_ep_size=1,
+            ),
+            enable_metrics=False,
+        )
+
+        with patch(
+            "sglang.srt.mem_cache.shared_hicache.manager.make_shared_hicache_transfer_backend",
+            return_value=None,
+        ):
+            manager = SharedHiCacheManager.from_scheduler(scheduler)
+
+        self.assertIsNotNone(manager)
+        try:
+            self.assertEqual(manager.worker_id, 99)
+            self.assertEqual(manager.attn_tp_rank, 1)
+            self.assertEqual(manager.attn_tp_size, 2)
+        finally:
+            manager.shutdown()
 
     def test_server_args_rejects_static_peer_config_and_unknown_backend(self):
         parser = argparse.ArgumentParser()

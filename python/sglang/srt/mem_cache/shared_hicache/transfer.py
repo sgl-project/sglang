@@ -7,7 +7,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Mapping, Optional, Protocol
 
 import numpy as np
+import torch
 
+from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.environ import default_shared_hicache_transfer_parallelism
 from sglang.srt.mem_cache.shared_hicache.config import (
@@ -42,32 +44,81 @@ class SharedHiCacheTransferBackend(Protocol):
     def shutdown(self) -> None: ...
 
 
-def _target_kv_infos_from_scheduler(scheduler):
+def _target_kv_pool_from_scheduler(scheduler):
     target_pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
     if hasattr(target_pool, "full_kv_pool") and hasattr(target_pool, "full_layer_nums"):
         raise RuntimeError(
             "SharedHiCache direct transfer does not support hybrid linear-attention KV pools"
         )
-    return target_pool.get_contiguous_buf_infos()
+    return target_pool
 
 
-def _get_topology_value(scheduler, name: str) -> int:
+def _server_arg(scheduler, name: str, default: int) -> int:
     server_args = getattr(scheduler, "server_args", None)
-    value = getattr(server_args, name, getattr(scheduler, name, 1))
-    return int(value if value is not None else 1)
+    value = getattr(server_args, name, default)
+    return int(value if value is not None else default)
+
+
+def _parallel_value(scheduler, name: str, default: int) -> int:
+    ps = getattr(scheduler, "ps", None)
+    if ps is not None and hasattr(ps, name):
+        value = getattr(ps, name)
+    else:
+        value = getattr(scheduler, name, default)
+    return int(value if value is not None else default)
+
+
+def scheduler_parallel_metadata(scheduler) -> dict[str, int]:
+    """Return the same parallel-rank vocabulary used by disagg and HiCache."""
+
+    return {
+        "attn_dp_rank": _parallel_value(scheduler, "attn_dp_rank", 0),
+        "attn_dp_size": _parallel_value(
+            scheduler, "attn_dp_size", _server_arg(scheduler, "dp_size", 1)
+        ),
+        "attn_tp_rank": _parallel_value(scheduler, "attn_tp_rank", 0),
+        "attn_tp_size": _parallel_value(
+            scheduler, "attn_tp_size", _server_arg(scheduler, "tp_size", 1)
+        ),
+        "tp_rank": _parallel_value(scheduler, "tp_rank", 0),
+        "tp_size": _parallel_value(
+            scheduler, "tp_size", _server_arg(scheduler, "tp_size", 1)
+        ),
+        "pp_rank": _parallel_value(scheduler, "pp_rank", 0),
+        "pp_size": _parallel_value(
+            scheduler, "pp_size", _server_arg(scheduler, "pp_size", 1)
+        ),
+        "attn_cp_rank": _parallel_value(scheduler, "attn_cp_rank", 0),
+        "attn_cp_size": _parallel_value(
+            scheduler, "attn_cp_size", _server_arg(scheduler, "attn_cp_size", 1)
+        ),
+        "moe_ep_rank": _parallel_value(scheduler, "moe_ep_rank", 0),
+        "moe_ep_size": _parallel_value(
+            scheduler, "moe_ep_size", _server_arg(scheduler, "ep_size", 1)
+        ),
+    }
+
+
+def shared_hicache_parallel_rejection(
+    *, pp_size: int, attn_cp_size: int
+) -> Optional[str]:
+    unsupported = []
+    if pp_size != 1:
+        unsupported.append(f"pp_size={pp_size}")
+    if attn_cp_size != 1:
+        unsupported.append(f"attn_cp_size={attn_cp_size}")
+    if unsupported:
+        return (
+            "SharedHiCache direct transfer supports TP, DP-attn, and EP, but "
+            f"PP/CP are deferred; got {', '.join(unsupported)}"
+        )
+    return None
 
 
 def _direct_topology_rejection(scheduler) -> Optional[str]:
-    unsupported = []
-    for name in ("tp_size", "pp_size", "attn_cp_size"):
-        value = _get_topology_value(scheduler, name)
-        if value != 1:
-            unsupported.append(f"{name}={value}")
-    if not unsupported:
-        return None
-    return (
-        "SharedHiCache direct transfer V0 supports only tp_size=1, pp_size=1, "
-        f"and attn_cp_size=1; got {', '.join(unsupported)}"
+    return shared_hicache_parallel_rejection(
+        pp_size=_server_arg(scheduler, "pp_size", 1),
+        attn_cp_size=_server_arg(scheduler, "attn_cp_size", 1),
     )
 
 
@@ -92,6 +143,14 @@ def _get_or_init_mooncake_transfer_engine(scheduler):
 
 
 def _source_host_buf_infos(tree_cache) -> tuple[list[int], list[int]]:
+    refs = _source_host_tensors(tree_cache)
+    page_size = tree_cache.page_size
+    ptrs = [int(ref.data_ptr()) for ref in refs]
+    item_lens = [int(ref[0].nbytes) * page_size for ref in refs]
+    return ptrs, item_lens
+
+
+def _source_host_tensors(tree_cache) -> list[torch.Tensor]:
     host_pool = tree_cache.cache_controller.mem_pool_host
     if getattr(host_pool, "layout", None) != "layer_first":
         raise RuntimeError(
@@ -105,11 +164,13 @@ def _source_host_buf_infos(tree_cache) -> tuple[list[int], list[int]]:
         refs = host_pool.data_refs
     else:
         raise RuntimeError("Unsupported HiCache host pool for SharedHiCache direct transfer")
+    return list(refs)
 
-    page_size = tree_cache.page_size
-    ptrs = [int(ref.data_ptr()) for ref in refs]
-    item_lens = [int(ref[0].nbytes) * page_size for ref in refs]
-    return ptrs, item_lens
+
+def _tensor_byte_view(tensor: torch.Tensor) -> torch.Tensor:
+    if not tensor.is_contiguous():
+        raise RuntimeError("SharedHiCache staging requires contiguous host KV tensors")
+    return tensor.view(torch.uint8).reshape(-1)
 
 
 def _validate_kv_item_lens_match(
@@ -188,7 +249,9 @@ class MooncakeSharedHiCacheTransferBackend:
         tree_cache,
         target_kv_ptrs,
         target_kv_item_lens,
+        parallel_metadata: Optional[Mapping[str, int]] = None,
         target_registered: bool = False,
+        custom_mem_pool=None,
         transfer_parallelism: Optional[int] = None,
     ):
         self.engine = engine
@@ -196,6 +259,9 @@ class MooncakeSharedHiCacheTransferBackend:
         self.target_session_id = engine.get_session_id()
         self.target_kv_ptrs = [int(ptr) for ptr in target_kv_ptrs]
         self.target_kv_item_lens = [int(length) for length in target_kv_item_lens]
+        self.parallel_metadata = {
+            key: int(value) for key, value in (parallel_metadata or {}).items()
+        }
         self._target_registered = bool(target_registered)
         self._source_registered = False
         self._source_registered_ptrs: list[int] = []
@@ -210,6 +276,13 @@ class MooncakeSharedHiCacheTransferBackend:
         self._transfer_parallelism = max(1, int(transfer_parallelism))
         self._transfer_executor: Optional[ThreadPoolExecutor] = None
         self._transfer_executor_lock = threading.Lock()
+        self._staging_lock = threading.Lock()
+        self._staging_buffer: Optional[StagingBuffer] = None
+        self._staging_registered_ptr: Optional[int] = None
+        self._custom_mem_pool = custom_mem_pool
+        gpu_id = getattr(engine, "gpu_id", None)
+        self._gpu_id = int(gpu_id if gpu_id is not None else 0)
+        self._device = f"cuda:{self._gpu_id}"
         self._shutdown = False
 
     @classmethod
@@ -235,8 +308,9 @@ class MooncakeSharedHiCacheTransferBackend:
         try:
             engine = _get_or_init_mooncake_transfer_engine(scheduler)
 
+            target_pool = _target_kv_pool_from_scheduler(scheduler)
             target_kv_ptrs, target_kv_lens, target_kv_item_lens = (
-                _target_kv_infos_from_scheduler(scheduler)
+                target_pool.get_contiguous_buf_infos()
             )
             registered, register_reason = engine.register_regions_checked(
                 target_kv_ptrs, target_kv_lens
@@ -252,7 +326,13 @@ class MooncakeSharedHiCacheTransferBackend:
                 tree_cache=scheduler.tree_cache,
                 target_kv_ptrs=target_kv_ptrs,
                 target_kv_item_lens=target_kv_item_lens,
+                parallel_metadata=scheduler_parallel_metadata(scheduler),
                 target_registered=True,
+                custom_mem_pool=(
+                    target_pool.maybe_get_custom_mem_pool()
+                    if callable(getattr(target_pool, "maybe_get_custom_mem_pool", None))
+                    else None
+                ),
             )
             transfer._register_source_host_pool()
             if transfer.enabled:
@@ -286,6 +366,7 @@ class MooncakeSharedHiCacheTransferBackend:
                 "path_hint": self.path_hint,
                 "transfer_parallelism": self._transfer_parallelism,
             },
+            **self.parallel_metadata,
         }
 
     def _log_ready(self) -> None:
@@ -359,6 +440,37 @@ class MooncakeSharedHiCacheTransferBackend:
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
 
+    def _should_stage_source_host_for_nvlink(self) -> bool:
+        if "nvlink" not in self.path_hint and "nvlink" not in self.protocol:
+            return False
+        source_refs = _source_host_tensors(self.tree_cache)
+        return any(not ref.is_cuda for ref in source_refs)
+
+    def _ensure_staging_buffer(self, required_bytes: int) -> StagingBuffer:
+        staging = self._staging_buffer
+        if staging is not None and staging.fits(required_bytes):
+            return staging
+
+        if self._custom_mem_pool is None:
+            raise RuntimeError(
+                "SharedHiCache NVLink staging requires a Mooncake custom memory pool"
+            )
+
+        staging = StagingBuffer(
+            required_bytes,
+            self._device,
+            self._gpu_id,
+            custom_mem_pool=self._custom_mem_pool,
+        )
+        registered, reason = self.engine.register_regions_checked(
+            [staging.get_ptr()], [staging.get_size()]
+        )
+        if not registered:
+            raise RuntimeError(f"SharedHiCache staging registration failed: {reason}")
+        self._staging_buffer = staging
+        self._staging_registered_ptr = staging.get_ptr()
+        return staging
+
     def _get_transfer_executor(self) -> ThreadPoolExecutor:
         with self._transfer_executor_lock:
             if self._transfer_executor is None:
@@ -413,6 +525,90 @@ class MooncakeSharedHiCacheTransferBackend:
             raise first_error
         return ret
 
+    def _transfer_pages_via_gpu_staging(
+        self,
+        *,
+        target_session_id: str,
+        source_page_indices: np.ndarray,
+        target_page_indices: np.ndarray,
+        target_kv_ptrs: list[int],
+        target_kv_item_lens: list[int],
+    ) -> None:
+        source_refs = _source_host_tensors(self.tree_cache)
+        source_kv_item_lens = [
+            int(ref[0].nbytes) * self.tree_cache.page_size for ref in source_refs
+        ]
+        _validate_kv_item_lens_match(source_kv_item_lens, target_kv_item_lens)
+        if len(source_refs) != len(target_kv_ptrs):
+            raise RuntimeError(
+                "KV pointer count mismatch: "
+                f"source={len(source_refs)} target={len(target_kv_ptrs)}"
+            )
+
+        src_blocks, dst_blocks = group_concurrent_contiguous(
+            source_page_indices.astype(np.int32, copy=False),
+            target_page_indices.astype(np.int32, copy=False),
+        )
+        if not src_blocks:
+            return
+
+        lengths: list[int] = []
+        dst_addrs: list[int] = []
+        staging_offsets: list[int] = []
+        total_bytes = 0
+        for src_block, dst_block in zip(src_blocks, dst_blocks):
+            block_len = len(src_block)
+            src_start = int(src_block[0])
+            dst_start = int(dst_block[0])
+            for item_len, dst_ptr in zip(source_kv_item_lens, target_kv_ptrs):
+                length = int(item_len) * block_len
+                lengths.append(length)
+                dst_addrs.append(int(dst_ptr) + dst_start * int(item_len))
+                staging_offsets.append(total_bytes)
+                total_bytes += length
+
+        with self._staging_lock:
+            staging = self._ensure_staging_buffer(total_bytes)
+            staging_base = int(staging.get_ptr())
+            staging_src_addrs: list[int] = []
+            transfer_index = 0
+            for src_block in src_blocks:
+                block_len = len(src_block)
+                src_start = int(src_block[0])
+                for source_ref, item_len in zip(source_refs, source_kv_item_lens):
+                    length = int(item_len) * block_len
+                    staging_offset = staging_offsets[transfer_index]
+                    src_offset = src_start * int(item_len)
+                    source_bytes = _tensor_byte_view(source_ref).narrow(
+                        0, src_offset, length
+                    )
+                    staging.buffer.narrow(0, staging_offset, length).copy_(
+                        source_bytes,
+                        non_blocking=True,
+                    )
+                    staging_src_addrs.append(staging_base + staging_offset)
+                    transfer_index += 1
+
+            torch.cuda.synchronize(self._device)
+            start = time.perf_counter()
+            ret = self._batch_transfer_sync(
+                target_session_id,
+                np.asarray(staging_src_addrs, dtype=np.uint64),
+                np.asarray(dst_addrs, dtype=np.uint64),
+                np.asarray(lengths, dtype=np.uint64),
+            )
+            transfer_ms = (time.perf_counter() - start) * 1000
+            logger.info(
+                "SharedHiCache staged host pages through GPU staging blocks=%d slices=%d bytes=%d parallelism=%d ms=%.3f",
+                len(src_blocks),
+                len(staging_src_addrs),
+                int(sum(lengths)),
+                min(self._transfer_parallelism, len(staging_src_addrs)),
+                transfer_ms,
+            )
+            if ret != 0:
+                raise RuntimeError(f"Mooncake staged KV transfer failed with ret={ret}")
+
     def _source_host_buf_infos(self) -> tuple[list[int], list[int]]:
         return _source_host_buf_infos(self.tree_cache)
 
@@ -426,6 +622,16 @@ class MooncakeSharedHiCacheTransferBackend:
         target_kv_item_lens: list[int],
         target_metadata: Optional[Mapping[str, Any]] = None,
     ) -> None:
+        if self._should_stage_source_host_for_nvlink():
+            self._transfer_pages_via_gpu_staging(
+                target_session_id=target_session_id,
+                source_page_indices=source_page_indices,
+                target_page_indices=target_page_indices,
+                target_kv_ptrs=target_kv_ptrs,
+                target_kv_item_lens=target_kv_item_lens,
+            )
+            return
+
         source_kv_ptrs, source_kv_item_lens = self._source_host_buf_infos()
         src_addrs, dst_addrs, lengths, num_blocks = _build_grouped_transfer_arrays(
             source_page_indices=source_page_indices,
@@ -442,7 +648,7 @@ class MooncakeSharedHiCacheTransferBackend:
                 target_session_id, src_addrs, dst_addrs, lengths
             )
             transfer_ms = (time.perf_counter() - start) * 1000
-            logger.debug(
+            logger.info(
                 "SharedHiCache Mooncake transferred blocks=%d slices=%d bytes=%d parallelism=%d ms=%.3f",
                 num_blocks,
                 len(src_addrs),

@@ -41,6 +41,19 @@ def _coerce_int(value: Any, field_name: str) -> int:
     raise ValueError(f"{field_name} must be an integer, got {value!r}")
 
 
+def _coerce_optional_int(value: Any, field_name: str) -> Optional[int]:
+    if value is None:
+        return None
+    return _coerce_int(value, field_name)
+
+
+def _coerce_positive_int(value: Any, field_name: str) -> int:
+    value = _coerce_int(value, field_name)
+    if value <= 0:
+        raise ValueError(f"{field_name} must be positive")
+    return value
+
+
 def _coerce_array(value: Any, field_name: str) -> list[Any]:
     if isinstance(value, (str, bytes, Mapping)):
         raise ValueError(f"{field_name} must be an array")
@@ -79,9 +92,9 @@ class SharedHiCachePlan:
     plan_id: str
     request_id: str
     target_worker_id: int
-    target_dp_rank: int
+    target_attn_dp_rank: int
     source_worker_id: int
-    source_dp_rank: int
+    source_attn_dp_rank: int
     source_endpoint: Optional[str]
     source_medium: str
     block_hashes: tuple[int, ...]
@@ -92,6 +105,10 @@ class SharedHiCachePlan:
     start_block_index: int = 0
     plan_version: int = SHARED_HICACHE_PLAN_VERSION
     kv_block_hashes: tuple[int, ...] = ()
+    source_attn_tp_rank: Optional[int] = None
+    source_attn_tp_size: int = 1
+    target_attn_tp_rank: Optional[int] = None
+    target_attn_tp_size: int = 1
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "SharedHiCachePlan":
@@ -150,22 +167,22 @@ class SharedHiCachePlan:
             source_endpoint = normalize_endpoint(source_endpoint)
 
         try:
-            return cls(
+            plan = cls(
                 plan_id=str(_first_present(data, "plan_id", default="")),
                 request_id=str(_first_present(data, "request_id", default="")),
                 target_worker_id=_coerce_int(
                     data["target_worker_id"], "target_worker_id"
                 ),
-                target_dp_rank=_coerce_int(
-                    _first_present(data, "target_dp_rank", default=0),
-                    "target_dp_rank",
+                target_attn_dp_rank=_coerce_int(
+                    _first_present(data, "target_attn_dp_rank", default=0),
+                    "target_attn_dp_rank",
                 ),
                 source_worker_id=_coerce_int(
                     data["source_worker_id"], "source_worker_id"
                 ),
-                source_dp_rank=_coerce_int(
-                    _first_present(data, "source_dp_rank", default=0),
-                    "source_dp_rank",
+                source_attn_dp_rank=_coerce_int(
+                    _first_present(data, "source_attn_dp_rank", default=0),
+                    "source_attn_dp_rank",
                 ),
                 source_endpoint=source_endpoint,
                 source_medium=_canonical_source_medium(
@@ -189,7 +206,38 @@ class SharedHiCachePlan:
                     "plan_version",
                 ),
                 kv_block_hashes=kv_block_hashes,
+                source_attn_tp_rank=_coerce_optional_int(
+                    _first_present(data, "source_attn_tp_rank", default=None),
+                    "source_attn_tp_rank",
+                ),
+                source_attn_tp_size=_coerce_positive_int(
+                    _first_present(data, "source_attn_tp_size", default=1),
+                    "source_attn_tp_size",
+                ),
+                target_attn_tp_rank=_coerce_optional_int(
+                    _first_present(data, "target_attn_tp_rank", default=None),
+                    "target_attn_tp_rank",
+                ),
+                target_attn_tp_size=_coerce_positive_int(
+                    _first_present(data, "target_attn_tp_size", default=1),
+                    "target_attn_tp_size",
+                ),
             )
+            for rank, size, name in (
+                (
+                    plan.source_attn_tp_rank,
+                    plan.source_attn_tp_size,
+                    "source_attn_tp_rank",
+                ),
+                (
+                    plan.target_attn_tp_rank,
+                    plan.target_attn_tp_size,
+                    "target_attn_tp_rank",
+                ),
+            ):
+                if rank is not None and (rank < 0 or rank >= size):
+                    raise ValueError(f"{name} must be in [0, {size})")
+            return plan
         except KeyError as err:
             raise ValueError(f"SharedHiCache plan missing {err.args[0]}") from err
 

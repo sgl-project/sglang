@@ -2039,13 +2039,37 @@ class Scheduler(
         if shared_hicache_manager is None:
             return True
 
+        has_reuse_plan = shared_hicache_manager.has_reuse_plan(req)
+        any_rank_has_plan, all_ranks_have_plan = self._sync_shared_hicache_bool(
+            has_reuse_plan
+        )
+        if not any_rank_has_plan:
+            return True
+        if not all_ranks_have_plan:
+            logger.warning(
+                "SharedHiCache plan availability diverged across TP ranks for rid=%s; "
+                "falling back to local prefill",
+                req.rid,
+            )
+            req.shared_hicache_plan = None
+            release = getattr(shared_hicache_manager, "release_request", None)
+            if release is not None:
+                try:
+                    release(req.rid)
+                except Exception:
+                    logger.debug(
+                        "Failed to release SharedHiCache state after TP fallback",
+                        exc_info=True,
+                    )
+            return True
+
+        pending = False
         try:
-            if not shared_hicache_manager.has_reuse_plan(req):
-                return True
             # Probe the current local prefix without taking COW allocations.
             # The final schedule path below recomputes the prefix after remote pages land.
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             result = shared_hicache_manager.prepare_reuse(req)
+            pending = result.pending
         except Exception:
             logger.exception(
                 "SharedHiCache failed for rid=%s; continuing with local prefill",
@@ -2061,8 +2085,30 @@ class Scheduler(
                         "Failed to release SharedHiCache state after error",
                         exc_info=True,
                     )
-            return True
-        return not result.pending
+            pending = False
+        any_rank_pending, _ = self._sync_shared_hicache_bool(pending)
+        return not any_rank_pending
+
+    def _sync_shared_hicache_bool(self, value: bool) -> tuple[bool, bool]:
+        group_size = 1
+        group = None
+        if self.server_args.enable_dp_attention:
+            group_size = self.ps.attn_tp_size
+            group = self.attn_tp_cpu_group
+        else:
+            group_size = self.ps.tp_size
+            group = self.tp_cpu_group
+        if group_size <= 1:
+            return value, value
+
+        flag = torch.tensor([1 if value else 0], dtype=torch.int32)
+        torch.distributed.all_reduce(
+            flag,
+            op=torch.distributed.ReduceOp.SUM,
+            group=group,
+        )
+        count = int(flag.item())
+        return count > 0, count == group_size
 
     def _release_shared_hicache_request(self, rid: str) -> None:
         shared_hicache_manager = getattr(self, "shared_hicache_manager", None)

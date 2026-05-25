@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.shared_hicache.plan import (
 )
 from sglang.srt.mem_cache.shared_hicache.service import (
     SharedHiCacheSourceService,
+    endpoint_format_fields,
     format_control_endpoint,
 )
 from sglang.srt.mem_cache.shared_hicache.source import (
@@ -46,6 +47,8 @@ from sglang.srt.mem_cache.shared_hicache.target import SharedHiCacheTarget
 from sglang.srt.mem_cache.shared_hicache.transfer import (
     SharedHiCacheTransferBackend,
     make_shared_hicache_transfer_backend,
+    scheduler_parallel_metadata,
+    shared_hicache_parallel_rejection,
 )
 
 if TYPE_CHECKING:
@@ -75,13 +78,16 @@ class SharedHiCacheManager:
         server_args: "ServerArgs",
         tree_cache,
         worker_id: Optional[int],
-        dp_rank: int,
+        attn_dp_rank: int,
+        parallel_metadata: Optional[Mapping[str, int]] = None,
         direct_transfer: Optional[SharedHiCacheTransferBackend] = None,
         metrics_collector=None,
     ):
         self.tree_cache = tree_cache
         self.worker_id = worker_id
-        self.dp_rank = dp_rank
+        self._set_parallel_metadata(
+            parallel_metadata, attn_dp_rank=attn_dp_rank
+        )
         self.timeout_secs = shared_hicache_timeout_secs(server_args)
         self.prefetch_stop_policy = getattr(
             server_args, "hicache_storage_prefetch_policy", "timeout"
@@ -101,7 +107,9 @@ class SharedHiCacheManager:
             "control_endpoint",
             None,
         )
-        self.endpoint = format_control_endpoint(endpoint_spec, dp_rank)
+        self.endpoint = self._format_local_control_endpoint(
+            endpoint_spec, self.attn_dp_rank
+        )
         self.source_service: Optional[SharedHiCacheSourceService] = None
         self._shutdown = False
         worker_limit = max(
@@ -111,7 +119,7 @@ class SharedHiCacheManager:
         self._fetch_semaphore = threading.BoundedSemaphore(worker_limit)
         self._fetch_executor = ThreadPoolExecutor(
             max_workers=worker_limit,
-            thread_name_prefix=f"shared_hicache-fetch-dp{dp_rank}",
+            thread_name_prefix=f"shared_hicache-fetch-adp{self.attn_dp_rank}",
         )
         self._pending_fetches: dict[str, SharedHiCachePendingFetch] = {}
         self._detached_fetches: set[Future] = set()
@@ -129,7 +137,7 @@ class SharedHiCacheManager:
             self.source_service = SharedHiCacheSourceService(
                 endpoint=self.endpoint,
                 worker_id=self.worker_id,
-                dp_rank=self.dp_rank,
+                attn_dp_rank=self.attn_dp_rank,
                 worker_limit=worker_limit,
                 max_body_bytes=self._max_control_body_bytes,
                 direct_transfer_enabled=self._direct_transfer_enabled,
@@ -137,6 +145,75 @@ class SharedHiCacheManager:
             )
             self.source_service.start()
         atexit.register(self.shutdown)
+
+    def _set_parallel_metadata(
+        self,
+        parallel_metadata: Optional[Mapping[str, int]],
+        *,
+        attn_dp_rank: int,
+    ) -> None:
+        metadata = {
+            key: int(value) for key, value in (parallel_metadata or {}).items()
+        }
+        self.attn_dp_rank = int(metadata.get("attn_dp_rank", attn_dp_rank))
+        self.attn_dp_size = int(metadata.get("attn_dp_size", 1))
+        self.attn_tp_rank = int(metadata.get("attn_tp_rank", 0))
+        self.attn_tp_size = int(metadata.get("attn_tp_size", 1))
+        self.tp_rank = int(metadata.get("tp_rank", self.attn_tp_rank))
+        self.tp_size = int(metadata.get("tp_size", self.attn_tp_size))
+        self.pp_rank = int(metadata.get("pp_rank", 0))
+        self.pp_size = int(metadata.get("pp_size", 1))
+        self.attn_cp_rank = int(metadata.get("attn_cp_rank", 0))
+        self.attn_cp_size = int(metadata.get("attn_cp_size", 1))
+        self.moe_ep_rank = int(metadata.get("moe_ep_rank", 0))
+        self.moe_ep_size = int(metadata.get("moe_ep_size", 1))
+
+    def _endpoint_format_values(self) -> dict[str, int]:
+        return {
+            "attn_dp_rank": self.attn_dp_rank,
+            "attn_dp_size": self.attn_dp_size,
+            "attn_tp_rank": self.attn_tp_rank,
+            "attn_tp_size": self.attn_tp_size,
+            "tp_rank": self.tp_rank,
+            "tp_size": self.tp_size,
+            "pp_rank": self.pp_rank,
+            "pp_size": self.pp_size,
+            "attn_cp_rank": self.attn_cp_rank,
+            "attn_cp_size": self.attn_cp_size,
+            "moe_ep_rank": self.moe_ep_rank,
+            "moe_ep_size": self.moe_ep_size,
+        }
+
+    def _format_local_control_endpoint(
+        self, endpoint_spec: object, attn_dp_rank: int
+    ) -> Optional[str]:
+        endpoint = format_control_endpoint(
+            endpoint_spec,
+            attn_dp_rank,
+            self._endpoint_format_values(),
+        )
+        if endpoint is None:
+            return None
+        fields = endpoint_format_fields(endpoint_spec)
+        if self.attn_tp_size > 1 and not fields.intersection(
+            {"attn_tp_rank", "tp_rank"}
+        ):
+            logger.warning(
+                "SharedHiCache source resolver endpoint must include {attn_tp_rank} "
+                "or {tp_rank} when attn_tp_size=%d; not starting source resolver "
+                "for this rank",
+                self.attn_tp_size,
+            )
+            return None
+        if self.attn_dp_size > 1 and "attn_dp_rank" not in fields:
+            logger.warning(
+                "SharedHiCache source resolver endpoint must include {attn_dp_rank} "
+                "when attn_dp_size=%d; not starting source resolver "
+                "for this rank",
+                self.attn_dp_size,
+            )
+            return None
+        return endpoint
 
     @classmethod
     def from_scheduler(cls, scheduler) -> Optional["SharedHiCacheManager"]:
@@ -164,7 +241,9 @@ class SharedHiCacheManager:
                 ", ".join(missing_tree_methods),
             )
             return None
-        worker_id = shared_hicache_config_value(server_args, "worker_id", None)
+        worker_id = getattr(server_args, "shared_hicache_worker_id", None)
+        if worker_id is None:
+            worker_id = shared_hicache_config_value(server_args, "worker_id", None)
         if worker_id is None:
             logger.warning(
                 "SharedHiCache disabled because worker_id is not set; "
@@ -172,11 +251,13 @@ class SharedHiCacheManager:
             )
             return None
         direct_transfer = make_shared_hicache_transfer_backend(scheduler)
+        parallel_metadata = scheduler_parallel_metadata(scheduler)
         return cls(
             server_args=server_args,
             tree_cache=scheduler.tree_cache,
             worker_id=worker_id,
-            dp_rank=getattr(scheduler, "dp_rank", 0) or 0,
+            attn_dp_rank=parallel_metadata["attn_dp_rank"],
+            parallel_metadata=parallel_metadata,
             direct_transfer=direct_transfer,
             metrics_collector=(
                 scheduler.metrics_collector
@@ -311,7 +392,24 @@ class SharedHiCacheManager:
             if endpoint and endpoint not in endpoints:
                 endpoints.append(endpoint)
 
-        add(plan.source_endpoint)
+        if plan.source_endpoint:
+            values = self._endpoint_format_values()
+            values.update(
+                {
+                    "attn_dp_rank": int(plan.source_attn_dp_rank),
+                    "source_attn_tp_rank": int(self.attn_tp_rank),
+                    "source_attn_tp_size": int(plan.source_attn_tp_size),
+                    "source_attn_dp_rank": int(plan.source_attn_dp_rank),
+                    "target_attn_dp_rank": int(self.attn_dp_rank),
+                    "target_attn_tp_rank": int(self.attn_tp_rank),
+                    "target_attn_tp_size": int(self.attn_tp_size),
+                }
+            )
+            add(
+                format_control_endpoint(
+                    plan.source_endpoint, plan.source_attn_dp_rank, values
+                )
+            )
         return endpoints
 
     def _request_source_transfer(
@@ -340,7 +438,11 @@ class SharedHiCacheManager:
             transfer_backend=self.direct_transfer,
             tree_cache=getattr(self, "tree_cache", None),
             worker_id=getattr(self, "worker_id", None),
-            dp_rank=getattr(self, "dp_rank", 0),
+            attn_dp_rank=self.attn_dp_rank,
+            attn_tp_rank=getattr(self, "attn_tp_rank", 0),
+            attn_tp_size=getattr(self, "attn_tp_size", 1),
+            pp_size=getattr(self, "pp_size", 1),
+            attn_cp_size=getattr(self, "attn_cp_size", 1),
         )
 
     def _max_cacheable_blocks(self, req: "Req") -> int:
@@ -356,11 +458,14 @@ class SharedHiCacheManager:
             return "missing_worker_id"
         if plan.target_worker_id != self.worker_id:
             return "wrong_target_worker"
-        if plan.target_dp_rank != self.dp_rank:
-            return "wrong_target_dp_rank"
+        if plan.target_attn_dp_rank != self.attn_dp_rank:
+            return "wrong_target_attn_dp_rank"
+        rank_rejection = self._validate_target_rank(plan)
+        if rank_rejection is not None:
+            return rank_rejection
         if (
             plan.source_worker_id == plan.target_worker_id
-            and plan.source_dp_rank == plan.target_dp_rank
+            and plan.source_attn_dp_rank == plan.target_attn_dp_rank
         ):
             return "source_is_target"
         if plan.plan_version != SHARED_HICACHE_PLAN_VERSION:
@@ -371,6 +476,26 @@ class SharedHiCacheManager:
             return "unsupported_source_medium"
         if plan.block_size_tokens != self.tree_cache.page_size:
             return "incompatible_block_size"
+        return None
+
+    def _validate_target_rank(self, plan: SharedHiCachePlan) -> Optional[str]:
+        topology_rejection = shared_hicache_parallel_rejection(
+            pp_size=getattr(self, "pp_size", 1),
+            attn_cp_size=getattr(self, "attn_cp_size", 1),
+        )
+        if topology_rejection is not None:
+            return f"unsupported_target_topology:{topology_rejection}"
+
+        if plan.target_attn_tp_size != self.attn_tp_size:
+            return (
+                "wrong_target_attn_tp_size:"
+                f"plan={plan.target_attn_tp_size}:local={self.attn_tp_size}"
+            )
+        if plan.source_attn_tp_size != self.attn_tp_size:
+            return (
+                "incompatible_source_attn_tp_size:"
+                f"source={plan.source_attn_tp_size}:target={self.attn_tp_size}"
+            )
         return None
 
     def _plan_key(self, req: "Req", plan: SharedHiCachePlan) -> tuple[str, str]:
@@ -605,9 +730,10 @@ class SharedHiCacheManager:
                     policy=str(getattr(self, "prefetch_stop_policy", "timeout")),
                     page_size=self.tree_cache.page_size,
                     timeout_secs=float(getattr(self, "timeout_secs", 0.0)),
-                    prefetch_timeout_config=getattr(
-                        self, "prefetch_timeout_config", None
-                    ),
+                    # Shared remote transfers use the SharedHiCache timeout.
+                    # HiCache storage's canary timeout is tuned for local storage
+                    # prefetch and can race slower TP ranks.
+                    prefetch_timeout_config=None,
                 )
                 if stop_waiting:
                     self._pending_fetches.pop(str(req.rid), None)
@@ -630,7 +756,7 @@ class SharedHiCacheManager:
             req.rid,
             plan.plan_id,
             plan.source_worker_id,
-            plan.source_dp_rank,
+            plan.source_attn_dp_rank,
             plan_offset,
             planned_blocks - plan_offset,
             matched_tokens,
@@ -837,6 +963,18 @@ class SharedHiCacheManager:
                     wait_ms=pending_wait_ms(pending),
                 )
                 return SharedHiCacheResult()
+            device = pending.device_indices.device
+            if device.type == "cuda":
+                sync_start = time.perf_counter()
+                torch.cuda.synchronize(device)
+                logger.info(
+                    "Shared HiCache direct transfer target synchronized rid=%s plan_id=%s device=%s tokens=%d sync_ms=%.3f",
+                    req.rid,
+                    plan.plan_id,
+                    device,
+                    int(pending.device_indices.numel()),
+                    (time.perf_counter() - sync_start) * 1000,
+                )
             staged_tokens = self.target_cache.insert_device_pages(
                 req,
                 pages,
@@ -870,13 +1008,13 @@ class SharedHiCacheManager:
             )
             wait_ms = pending_wait_ms(pending)
             ready_wait_ms = pending_ready_wait_ms(pending)
-            logger.debug(
+            logger.info(
                 "Shared HiCache staged %d tokens rid=%s plan_id=%s source=%s:%s wait_ms=%s future_ready_wait_ms=%s insert_ms=%.3f direct=%s",
                 staged_tokens,
                 req.rid,
                 plan.plan_id,
                 plan.source_worker_id,
-                plan.source_dp_rank,
+                plan.source_attn_dp_rank,
                 format_optional_ms(wait_ms),
                 format_optional_ms(ready_wait_ms),
                 insert_ms,

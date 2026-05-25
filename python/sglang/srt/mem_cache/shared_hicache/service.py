@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from string import Formatter
 from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlparse
 
@@ -23,7 +24,22 @@ def endpoint_to_bind(endpoint: str) -> tuple[str, int]:
     return parsed.hostname, parsed.port
 
 
-def format_control_endpoint(endpoint_spec: object, dp_rank: int) -> Optional[str]:
+def endpoint_format_fields(endpoint_spec: object) -> set[str]:
+    if not isinstance(endpoint_spec, str):
+        return set()
+    fields: set[str] = set()
+    for _, field_name, _, _ in Formatter().parse(endpoint_spec):
+        if field_name:
+            fields.add(field_name.split(".", 1)[0].split("[", 1)[0])
+    return fields
+
+
+def format_control_endpoint(
+    endpoint_spec: object,
+    attn_dp_rank: int,
+    values: Optional[Mapping[str, Any]] = None,
+    **extra_values,
+) -> Optional[str]:
     if not endpoint_spec:
         return None
     if not isinstance(endpoint_spec, str):
@@ -31,8 +47,13 @@ def format_control_endpoint(endpoint_spec: object, dp_rank: int) -> Optional[str
     spec = endpoint_spec.strip()
     if not spec:
         return None
-    if "{dp_rank}" in spec:
-        spec = spec.format(dp_rank=dp_rank)
+    format_values = {}
+    if values is not None:
+        format_values.update({key: int(value) for key, value in values.items()})
+    format_values.update({key: int(value) for key, value in extra_values.items()})
+    format_values["attn_dp_rank"] = int(attn_dp_rank)
+    if "{" in spec:
+        spec = spec.format(**format_values)
     return normalize_endpoint(spec)
 
 
@@ -42,7 +63,7 @@ class SharedHiCacheSourceService:
         *,
         endpoint: str,
         worker_id: Optional[int],
-        dp_rank: int,
+        attn_dp_rank: int,
         worker_limit: int,
         max_body_bytes: Callable[[], int],
         direct_transfer_enabled: Callable[[], bool],
@@ -50,7 +71,7 @@ class SharedHiCacheSourceService:
     ):
         self.endpoint = endpoint
         self.worker_id = worker_id
-        self.dp_rank = dp_rank
+        self.attn_dp_rank = attn_dp_rank
         self.max_body_bytes = max_body_bytes
         self.direct_transfer_enabled = direct_transfer_enabled
         self.handle_source_transfer = handle_source_transfer
@@ -67,7 +88,7 @@ class SharedHiCacheSourceService:
             port=port,
             endpoint=self.endpoint,
             worker_id=self.worker_id,
-            dp_rank=self.dp_rank,
+            attn_dp_rank=self.attn_dp_rank,
             max_body_bytes=self.max_body_bytes,
             try_enter=self.try_enter,
             exit_resolver=self.exit,
