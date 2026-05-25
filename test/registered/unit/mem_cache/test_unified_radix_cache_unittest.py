@@ -10,6 +10,7 @@ import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -114,9 +115,12 @@ class CacheConfig:
 
 def build_fixture(cfg: CacheConfig):
     """Create (tree, allocator, req_to_token_pool) from a CacheConfig."""
-    set_global_server_args_for_scheduler(
-        ServerArgs(model_path="dummy", page_size=cfg.page_size)
-    )
+    server_args = ServerArgs(model_path="dummy", page_size=cfg.page_size)
+    # MambaRadixCache reads mamba_cache_chunk_size, whose property otherwise
+    # loads the HF config for self.model_path — impossible for the dummy model.
+    # Mirror the property's default for a dummy HF config: FLA_CHUNK_SIZE.
+    server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, cfg.page_size)
+    set_global_server_args_for_scheduler(server_args)
     device = get_device()
 
     mamba2_cache_params = None
@@ -1336,6 +1340,8 @@ class UnifiedRadixCacheSuite:
             hicache_io_backend="direct",
             hicache_write_policy=write_policy,
         )
+        # See build_fixture for why _mamba_cache_chunk_size is preset.
+        server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, self.cfg.page_size)
         set_global_server_args_for_scheduler(server_args)
         tree.init_hicache(server_args, tree.cache_init_params)
         tree.write_through_threshold = 1 << 30
