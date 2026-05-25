@@ -507,18 +507,31 @@ class EagleDraftWorker(BaseDraftWorker):
         ss_token_list = torch.cat(
             token_list, dim=1
         )  # b, (self.topk + (num_steps-1) * self.topk)
-        top_scores = torch.topk(
-            score_list, self.speculative_num_draft_tokens - 1, dim=-1
-        )
-        top_scores_index = top_scores.indices
-        top_scores_index = torch.sort(top_scores_index).values
-        maybe_detect_oob(
-            top_scores_index,
-            0,
-            ss_token_list.shape[1],
-            "draft_forward: top_scores_index OOB for gather on ss_token_list",
-        )
-        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
+        if self.topk == 1:
+            # Single-path tree: ss_token_list already has exactly
+            # `num_draft_tokens - 1` columns (topk + (num_steps-1)*topk = num_steps)
+            # in the natural draft order; the tail topk+sort+gather is the
+            # identity, so skip those kernels.
+            k = self.speculative_num_draft_tokens - 1
+            top_scores_index = (
+                torch.arange(k, device=ss_token_list.device, dtype=torch.int64)
+                .unsqueeze(0)
+                .expand(ss_token_list.shape[0], k)
+            )
+            draft_tokens = ss_token_list[:, :k].contiguous()
+        else:
+            top_scores = torch.topk(
+                score_list, self.speculative_num_draft_tokens - 1, dim=-1
+            )
+            top_scores_index = top_scores.indices
+            top_scores_index = torch.sort(top_scores_index).values
+            maybe_detect_oob(
+                top_scores_index,
+                0,
+                ss_token_list.shape[1],
+                "draft_forward: top_scores_index OOB for gather on ss_token_list",
+            )
+            draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
 
         if len(parents_list) > 1:
             parent_list = torch.cat(parents_list[:-1], dim=1)
