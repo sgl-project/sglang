@@ -488,7 +488,7 @@ class VisionFlash3Attention(nn.Module):
                 )
 
             # [NOTE] exceed currently buffer size will lead reallocation and if during cuda-graph capture, will raise error.
-            # so for vit cuagraph, we should capture graph from large size to small size
+            # for vit cuagraph, we should capture graph from large size to small size
             if hasattr(self, "q_quant_pad") and ori_shape[0] > self.q_quant_pad.shape[0]:
                 self.q_quant_pad = torch.empty(
                     (ori_shape[0], q.shape[1], aligned_headsize),
