@@ -1519,7 +1519,9 @@ class MMEncoder:
             if self.profiler is not None:
                 for _ in requests:
                     self.profiler.step()
-            aux_data = _build_mm_aux_data(mm_inputs, self.model_type)
+            # No aux_data here: batch_encode only handles IMAGE/AUDIO
+            # (_BATCHABLE_MODALITIES), and _build_mm_aux_data only extracts
+            # video-meta fields — which never appear in image/audio mm_inputs.
             results = []
             offset = 0
             for req, n in zip(requests, items_per_req):
@@ -1533,7 +1535,6 @@ class MMEncoder:
                         grid_dim[offset : offset + n],
                         modality,
                         emb,
-                        **aux_data,
                     )
                 results.append((emb.nbytes, emb.shape[0], emb.shape[1], None, None))
                 offset += n
