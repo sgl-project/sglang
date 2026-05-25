@@ -574,7 +574,9 @@ def popen_with_error_check(command: list[str]):
     return process
 
 
-def start_subprocess_fail_fast_watcher(named_procs):
+def start_subprocess_fail_fast_watcher(
+    named_procs: list[tuple[str, subprocess.Popen]],
+) -> threading.Event:
     """Abort the test runner the moment any watched subprocess exits non-zero.
 
     Caller must `.set()` the returned Event before intentional teardown."""
