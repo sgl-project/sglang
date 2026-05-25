@@ -33,7 +33,6 @@ class TestPerturbRaiseMha(CanaryE2EBase):
     }
 
     def test_real_kv_used_perturbation_raises_in_raise_mode(self) -> None:
-        """Verify raise mode surfaces real KV perturbation as a logged violation."""
         try:
             self.send_parallel_requests(
                 n=4,

@@ -68,7 +68,6 @@ class TestSelfUnitEndpoint(CustomTestCase):
         self.device = DEFAULT_DEVICE
 
     def test_launch_sweep_only_calls_verify(self):
-        """Verify sweep launch invokes only the verify kernel."""
         calls: list[str] = []
         with patch.object(
             endpoint_module,
@@ -91,7 +90,6 @@ class TestSelfUnitEndpoint(CustomTestCase):
         self.assertEqual(calls, ["verify"])
 
     def test_launch_per_forward_passes_kernel_kind(self):
-        """Verify per-forward launch passes the endpoint kernel kind."""
         captured: list[tuple[str, CanaryLaunchTag]] = []
         with patch.object(
             endpoint_module,
@@ -121,7 +119,6 @@ class TestSelfUnitEndpoint(CustomTestCase):
         self.assertIn(("write", CanaryLaunchTag.TAIL_V_SWA), captured)
 
     def test_endpoint_shares_violation_log_across_launches(self):
-        """Verify endpoints can reuse the same violation log."""
         captured_rings: list[int] = []
         with patch.object(
             endpoint_module,
@@ -157,7 +154,6 @@ class TestSelfUnitEndpoint(CustomTestCase):
         self.assertEqual(captured_rings[0], shared_log.violation_ring.data_ptr())
 
     def test_swa_endpoint_pre_translates_out_cache_loc(self):
-        """Verify SWA endpoints translate cache locations before write launch."""
         captured: list[torch.Tensor] = []
         with patch.object(
             endpoint_module, "launch_canary_verify_kernel", lambda **kwargs: None
@@ -209,7 +205,6 @@ class TestSelfUnitEndpoint(CustomTestCase):
         self.assertIs(captured[1], args.out_cache_loc)
 
     def test_swa_endpoint_trailing_sentinel_row_yields_skip(self):
-        """Verify SWA sentinel cache rows become write-skip markers."""
         captured: list[torch.Tensor] = []
         with patch.object(
             endpoint_module, "launch_canary_verify_kernel", lambda **kwargs: None

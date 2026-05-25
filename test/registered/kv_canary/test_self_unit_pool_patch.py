@@ -35,7 +35,6 @@ class PoolPatchHelper:
 
 class TestAttachCanaryBuffers(PoolPatchHelper, CustomTestCase):
     def test_canary_buffer_group_allocate_full_only(self):
-        """Verify MHA pools allocate only full canary buffers."""
         pool = make_mha_pool(self.device, num_slots=16, dim=8, layer_num=2)
         groups_tuple = attach_canary_buffers(
             pool=pool, config=self.config, device=self.device
@@ -50,7 +49,6 @@ class TestAttachCanaryBuffers(PoolPatchHelper, CustomTestCase):
         self.assertEqual(group.v_head.shape, (16, CANARY_SLOT_BYTES))
 
     def test_canary_buffer_group_allocate_full_and_swa(self):
-        """Verify SWA pools allocate full and SWA canary buffers."""
         pool = make_swa_pool(self.device, full_slots=16, swa_slots=8)
         groups_tuple = attach_canary_buffers(
             pool=pool, config=self.config, device=self.device
@@ -65,7 +63,6 @@ class TestAttachCanaryBuffers(PoolPatchHelper, CustomTestCase):
 
 class TestRealKvSources(PoolPatchHelper, CustomTestCase):
     def test_real_kv_sources_above_4_raises(self):
-        """Verify too many real KV sources are rejected."""
         tensor = torch.zeros(4, 16, dtype=torch.uint8, device=self.device)
         sources = tuple(
             RealKvSource(
@@ -100,7 +97,6 @@ class TestRealKvSources(PoolPatchHelper, CustomTestCase):
 
 class TestPoolPatchBufferInfos(PoolPatchHelper, CustomTestCase):
     def test_get_contiguous_buf_infos_inserts_canary_entries(self):
-        """Verify contiguous buffer metadata includes canary entries after patching."""
         for patched in (False, True):
             with self.subTest(patched=patched):
                 pool = make_mha_pool(self.device, num_slots=16, dim=8, layer_num=2)
@@ -118,7 +114,6 @@ class TestPoolPatchBufferInfos(PoolPatchHelper, CustomTestCase):
                     self.assertEqual(ptrs_after, ptrs_before)
 
     def test_swa_attach_splices_full_into_contiguous_and_swa_into_state(self):
-        """Verify SWA patching splices canary buffers into both buffer lists."""
         pool = make_swa_pool(self.device, full_slots=16, swa_slots=8)
         contiguous_before, _, _ = pool.get_contiguous_buf_infos()
         state_before, _, _ = pool.get_state_buf_infos()
@@ -131,7 +126,6 @@ class TestPoolPatchBufferInfos(PoolPatchHelper, CustomTestCase):
         self.assertEqual(len(state_after), len(state_before) + 4)
 
     def test_pd_layout_canary_inserted_correctly(self):
-        """Verify PD (prefill-decode disaggregation) canary buffers are inserted in layout order."""
         pool = make_mha_pool(self.device, num_slots=16, dim=8, layer_num=2)
         k_ptrs_orig = [b.data_ptr() for b in pool.k_buffer]
         v_ptrs_orig = [b.data_ptr() for b in pool.v_buffer]
@@ -156,7 +150,6 @@ class TestPoolPatchBufferInfos(PoolPatchHelper, CustomTestCase):
 
 class TestCanaryBufferBudget(PoolPatchHelper, CustomTestCase):
     def test_canary_buf_per_token_bytes_within_budget(self):
-        """Verify canary per-token storage stays below the real KV budget."""
         pool = make_mha_pool(self.device, num_slots=16, dim=64, layer_num=2)
         groups_tuple = attach_canary_buffers(
             pool=pool, config=self.config, device=self.device

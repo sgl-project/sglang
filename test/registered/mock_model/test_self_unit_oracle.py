@@ -33,7 +33,6 @@ def _call(oracle: HashOracle, *, generalized_req_id: int, position: int) -> int:
 
 class TestHashOracle(CustomTestCase):
     def test_hash_oracle_is_deterministic_for_same_inputs(self) -> None:
-        """Verify HashOracle returns the same token for identical inputs."""
         oracle = HashOracle(vocab_size=32000)
 
         first = _call(oracle, generalized_req_id=7, position=42)
@@ -42,7 +41,6 @@ class TestHashOracle(CustomTestCase):
         self.assertEqual(first, second)
 
     def test_hash_oracle_output_in_vocab_range(self) -> None:
-        """Verify HashOracle outputs stay within the configured vocabulary range."""
         vocab_size = 1024
         oracle = HashOracle(vocab_size=vocab_size)
 
@@ -60,7 +58,6 @@ class TestHashOracle(CustomTestCase):
 
 class TestSplitmix64Tensor(CustomTestCase):
     def test_splitmix64_tensor_matches_scalar_ref_on_random_inputs(self) -> None:
-        """Verify tensor SplitMix64 matches the scalar reference on random inputs."""
         rng = random.Random(0)
         num_cases = 1000
         unsigned_inputs: list[int] = [
@@ -79,7 +76,6 @@ class TestSplitmix64Tensor(CustomTestCase):
         self.assertEqual(actual_unsigned, expected_unsigned)
 
     def test_splitmix64_tensor_known_vectors(self) -> None:
-        """Verify tensor SplitMix64 matches scalar reference values for known inputs."""
         inputs = [0, 1, -1, 1 << 32, (1 << 63) - 1, -(1 << 63)]
         expected_unsigned = [splitmix64(_signed_to_unsigned_i64(v)) for v in inputs]
 
@@ -89,7 +85,6 @@ class TestSplitmix64Tensor(CustomTestCase):
         self.assertEqual(actual_unsigned, expected_unsigned)
 
     def test_splitmix64_tensor_preserves_shape_and_dtype(self) -> None:
-        """Verify tensor SplitMix64 preserves input shape and int64 dtype."""
         shape = (3, 4, 5)
         rng = torch.Generator().manual_seed(42)
         inputs = torch.randint(
@@ -106,7 +101,6 @@ class TestSplitmix64Tensor(CustomTestCase):
         self.assertEqual(out.dtype, torch.int64)
 
     def test_splitmix64_tensor_is_deterministic(self) -> None:
-        """Verify tensor SplitMix64 returns stable values for repeated calls."""
         inputs = torch.tensor([0, 1, 2, 3, 1 << 40, -7], dtype=torch.int64)
 
         first = _splitmix64_tensor(inputs.clone()).tolist()
@@ -115,7 +109,6 @@ class TestSplitmix64Tensor(CustomTestCase):
         self.assertEqual(first, second)
 
     def test_splitmix64_tensor_is_injective_on_distinct_inputs(self) -> None:
-        """Verify tensor SplitMix64 maps distinct sampled inputs to distinct outputs."""
         inputs = torch.arange(-1000, 1000, dtype=torch.int64)
 
         out = _splitmix64_tensor(inputs).tolist()

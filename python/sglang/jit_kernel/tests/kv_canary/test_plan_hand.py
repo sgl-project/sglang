@@ -109,7 +109,6 @@ def _run_label(
 class TestBasicShape:
     def test_single_req_extend_basic(self) -> None:
         """bs=1, prefix=0, extend=5 → verify entries empty; write_offsets[0:2] = [0, 5]; seed = -1."""
-        # Step 1: build a one-req batch with no prefix and 5 extend tokens.
         req_to_token = make_req_to_token(
             kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE
         )
@@ -124,7 +123,6 @@ class TestBasicShape:
         )
 
         triton_v, triton_w = plans[0]
-        # Step 2: prefix=0 → no verify entries; seed = -1 because prefix==0.
         assert int(triton_v.verify_num_valid[0].item()) == 0
         assert int(triton_w.write_num_valid_reqs[0].item()) == 1
         assert int(triton_w.write_offsets[0].item()) == 0
@@ -148,7 +146,6 @@ class TestBasicShape:
         )
 
         triton_v, triton_w = plans[0]
-        # Step: verify covers positions [0..7); seed slot for req rp=2 is at position 6 = rp * max_seq_len + 6.
         assert int(triton_v.verify_num_valid[0].item()) == 7
         assert int(triton_w.write_seed_slot_indices[0].item()) == 2 * max_seq_len + 6
 
@@ -158,7 +155,6 @@ class TestBasicShape:
             kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE
         )
         plans = _plan_pair(verify_capacity=64, write_req_capacity=8)
-        # req0: prefill extend=8; req1: decode extend=1; req2: decode extend=1.
         run_plan_diff(
             plan_pair=plans,
             req_pool_indices=_tensor([1, 2, 3]),
@@ -169,11 +165,9 @@ class TestBasicShape:
         )
 
         triton_v, triton_w = plans[0]
-        # Step: write_offsets exclusive cumsum on extend_seq_lens.
         expected_write_offsets = [0, 8, 9, 10]
         for i, value in enumerate(expected_write_offsets):
             assert int(triton_w.write_offsets[i].item()) == value
-        # Verify count = 0 + 4 + 10 = 14.
         assert int(triton_v.verify_num_valid[0].item()) == 14
 
 
@@ -210,7 +204,6 @@ class TestSeedSlot:
             extras=empty_extras(),
         )
 
-        # First entry has pos=0 → prev_slot = -1.
         assert int(plans[0][0].verify_prev_slot_indices[0].item()) == -1
 
     def test_prev_slot_is_self_minus_one(self) -> None:
@@ -230,9 +223,7 @@ class TestSeedSlot:
         )
 
         triton_v = plans[0][0]
-        # entry[1] is pos=1: prev_slot = req_to_token[2, 0] = 2 * max_seq_len + 0 = 32.
         assert int(triton_v.verify_prev_slot_indices[1].item()) == 2 * max_seq_len + 0
-        # entry[2] is pos=2: prev_slot = req_to_token[2, 1] = 2 * max_seq_len + 1 = 33.
         assert int(triton_v.verify_prev_slot_indices[2].item()) == 2 * max_seq_len + 1
 
     def test_seed_translated_through_permuted_lut(self) -> None:
@@ -337,7 +328,6 @@ class TestPadding:
             kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE
         )
         plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
-        # Step: bs=3 with row 1 marked as padding (rpi=0).
         run_plan_diff(
             plan_pair=plans,
             req_pool_indices=_tensor([1, 0, 2]),
@@ -348,13 +338,10 @@ class TestPadding:
         )
 
         triton_v, triton_w = plans[0]
-        # verify count = 5 (req0) + 0 (padding) + 3 (req2) = 8.
         assert int(triton_v.verify_num_valid[0].item()) == 8
-        # write_offsets cumsum: [0, 1, 1, 2] — padding row contributes 0.
         expected_write_offsets = [0, 1, 1, 2]
         for i, value in enumerate(expected_write_offsets):
             assert int(triton_w.write_offsets[i].item()) == value
-        # Padding row's seed must be -1.
         assert int(triton_w.write_seed_slot_indices[1].item()) == -1
 
     def test_per_req_slot_when_req_to_token_is_sparse(self) -> None:
@@ -491,7 +478,6 @@ class TestSwa:
 
         triton_v = plans[0][0]
         assert int(triton_v.verify_num_valid[0].item()) == 128
-        # First verify entry should be at position 72.
         assert int(triton_v.verify_positions[0].item()) == 72
 
     def test_swa_lut_translates_verify_slots(self) -> None:
@@ -715,13 +701,10 @@ class TestMisc:
         )
 
         triton_v, triton_w = plans[0]
-        # VerifyPlan covers 4+6 = 10 entries; write offsets are zero.
         assert int(triton_v.verify_num_valid[0].item()) == 10
-        # write_offsets cumsum of zeros stays zero across the active prefix.
         assert int(triton_w.write_offsets[0].item()) == 0
         assert int(triton_w.write_offsets[1].item()) == 0
         assert int(triton_w.write_offsets[2].item()) == 0
-        # Seeds for write-empty reqs must be -1 per plan semantics.
         assert int(triton_w.write_seed_slot_indices[0].item()) == -1
         assert int(triton_w.write_seed_slot_indices[1].item()) == -1
 
@@ -860,7 +843,6 @@ class TestVerifyContent:
 
     def test_verify_covers_all_tokens_no_skip(self) -> None:
         """FULL group + bs=4 → verify_num_valid == Σ(prefix_lens) — every prefix token verified."""
-        # Step: 4 reqs with mixed prefix and extend; FULL group means no SWA window clip.
         prefix_values = [0, 3, 7, 12]
         extend_values = [4, 1, 1, 1]
         req_to_token = make_req_to_token(
@@ -894,7 +876,6 @@ class TestVerifyContent:
         )
 
         triton_v = plans[0][0]
-        # Req 0: positions [0..5); Req 1: positions [0..8).
         req0_positions = triton_v.verify_positions[:5].cpu().tolist()
         req1_positions = triton_v.verify_positions[5:13].cpu().tolist()
         assert req0_positions == [0, 1, 2, 3, 4]
@@ -906,7 +887,6 @@ class TestVerifyContent:
             kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE
         )
         plans = _plan_pair(verify_capacity=64, write_req_capacity=8)
-        # bs=4, last two rows are padding.
         run_plan_diff(
             plan_pair=plans,
             req_pool_indices=_tensor([1, 2, 0, 0]),
@@ -917,7 +897,6 @@ class TestVerifyContent:
         )
 
         triton_w = plans[0][1]
-        # Padding rows must contribute 0 to write_offsets cumsum: [0, 1, 2, 2, 2].
         expected_write_offsets = [0, 1, 2, 2, 2]
         for i, value in enumerate(expected_write_offsets):
             assert int(triton_w.write_offsets[i].item()) == value
@@ -941,7 +920,6 @@ class TestByteEqual:
 
     def test_byte_equal_python_reference_hardcoded(self) -> None:
         """bs=3, three prefix combinations → hand-computed verify_offsets / write_offsets / seed slots."""
-        # Step 1: pin (prefix, extend) per req.
         prefixes = [0, 4, 7]
         extends = [3, 1, 1]
         rps = [1, 2, 3]
@@ -960,7 +938,6 @@ class TestByteEqual:
         )
 
         triton_v, triton_w = plans[0]
-        # Step 2: hand-compute expected write_offsets (exclusive cumsum of extends) and verify_num_valid.
         expected_write_offsets = [0, 3, 4, 5]
         expected_verify_num_valid = sum(prefixes)
         expected_seeds = [

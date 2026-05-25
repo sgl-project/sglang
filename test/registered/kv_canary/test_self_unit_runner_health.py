@@ -17,7 +17,6 @@ register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")
 
 class TestSelfUnitManagerHealth(CanaryManagerTestCase):
     def test_kernel_run_counter_watchdog_raises_on_zero(self) -> None:
-        """Verify the kernel watchdog raises when counters stop advancing."""
         manager = make_manager(device=self.device)
         manager._outer_step_counter = 1000
         manager._device_state.kernel_run_counters.zero_()
@@ -29,7 +28,6 @@ class TestSelfUnitManagerHealth(CanaryManagerTestCase):
     def test_kernel_run_counter_watchdog_ignores_sweep_when_sweep_is_disabled(
         self,
     ) -> None:
-        """Verify the watchdog ignores disabled sweep counters."""
         config = make_config(sweep_interval=0)
         manager = make_manager(device=self.device, config=config)
         manager._device_state.kernel_run_counters.zero_()
@@ -47,7 +45,6 @@ class TestSelfUnitManagerHealth(CanaryManagerTestCase):
         manager._health_checker.step()
 
     def test_periodic_stats_log_every_n_step(self) -> None:
-        """Verify periodic stats are logged at the configured interval."""
         config = make_config(stats_print_every_n_steps=5)
         manager = make_manager(device=self.device, config=config)
         manager._device_state.slot_run_counters.fill_(7)

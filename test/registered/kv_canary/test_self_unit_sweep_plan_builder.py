@@ -21,7 +21,6 @@ class TestSelfUnitSweepPlanBuilder(CustomTestCase):
         self.device = DEFAULT_DEVICE
 
     def test_build_verify_plan_radix_sweep(self) -> None:
-        """Verify radix sweep verify plans include cached slot chains."""
         empty_cache = make_radix_cache([[]], device=self.device)
         empty_cache.req_to_token_pool = make_req_to_token_pool(self.device)
         empty_out = build_verify_plan_radix_sweep(
@@ -47,7 +46,6 @@ class TestSelfUnitSweepPlanBuilder(CustomTestCase):
         self.assertEqual(out.verify_prev_slot_indices[:3].tolist(), [-1, 100, 101])
 
     def test_radix_held_slot_still_swept(self) -> None:
-        """Verify held radix slots are still included in sweep plans."""
         cache = make_radix_cache([[], [42, 43, 44]], device=self.device)
         cache.req_to_token_pool = make_req_to_token_pool(self.device)
         out = build_verify_plan_radix_sweep(
@@ -62,7 +60,6 @@ class TestSelfUnitSweepPlanBuilder(CustomTestCase):
         )
 
     def test_truly_free_slot_not_swept(self) -> None:
-        """Verify free radix slots are excluded from sweep plans."""
         empty_cache = make_radix_cache([[]], device=self.device)
         empty_cache.req_to_token_pool = make_req_to_token_pool(self.device)
         out = build_verify_plan_radix_sweep(

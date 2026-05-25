@@ -37,7 +37,6 @@ class TestComputeLaunchCapacities(CustomTestCase):
         )
 
     def test_per_forward_verify_capacity_covers_multi_req_prefix_sum(self) -> None:
-        """Verify per-forward verify capacity equals max_total_num_tokens * 3."""
         max_bs = 8
         max_seq_len = 64
         max_total_num_tokens = 1024
@@ -52,7 +51,6 @@ class TestComputeLaunchCapacities(CustomTestCase):
         )
 
     def test_from_args_treats_missing_speculative_draft_tokens_as_zero(self) -> None:
-        """per_forward_write_entry_capacity is floored by max_prefill_tokens when batch * tokens_per_bs is smaller."""
         server_args = self._make_server_args(max_bs=2)
         server_args.speculative_num_draft_tokens = None
 
@@ -66,7 +64,6 @@ class TestComputeLaunchCapacities(CustomTestCase):
         self.assertEqual(capacities.per_forward_write_entry_capacity, 128)
 
     def test_manual_capacities_reject_non_positive_fields(self) -> None:
-        """Verify manual launch capacities fail instead of being clamped."""
         with self.assertRaisesRegex(ValueError, "per_forward_verify_capacity"):
             CanaryLaunchCapacities(
                 per_forward_verify_capacity=0,
@@ -75,7 +72,6 @@ class TestComputeLaunchCapacities(CustomTestCase):
             )
 
     def test_from_args_rejects_empty_pool_capacity(self) -> None:
-        """Verify derived launch capacities reject invalid pool sizing."""
         with self.assertRaisesRegex(ValueError, "pool_slot_count"):
             CanaryLaunchCapacities.from_args(
                 server_args=self._make_server_args(max_bs=1),
