@@ -59,11 +59,13 @@
     during the next eviction cycle.
 */
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use rand::Rng;
 use smg_mesh::{tree_ops::TreeOperation, OptionalMeshSyncManager};
 use tracing::{debug, warn};
 
@@ -112,6 +114,7 @@ pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>,
     mesh_sync: OptionalMeshSyncManager,
+    miss_counter: AtomicUsize,
     _eviction_task: Option<PeriodicTask>,
 }
 
@@ -152,6 +155,7 @@ impl CacheAwarePolicy {
             config,
             trees,
             mesh_sync: None,
+            miss_counter: AtomicUsize::new(0),
             _eviction_task: eviction_task,
         }
     }
@@ -306,7 +310,16 @@ impl CacheAwarePolicy {
         }
     }
 
-    fn select_worker_min_load(
+    fn select_worker_round_robin(&self, healthy_indices: &[usize]) -> Option<usize> {
+        if healthy_indices.is_empty() {
+            return None;
+        }
+
+        let count = self.miss_counter.fetch_add(1, Ordering::Relaxed);
+        Some(healthy_indices[count % healthy_indices.len()])
+    }
+
+    fn select_worker_for_miss(
         &self,
         workers: &[Arc<dyn Worker>],
         request_text: &Option<&str>,
@@ -319,26 +332,24 @@ impl CacheAwarePolicy {
         if tracing::enabled!(tracing::Level::DEBUG) {
             let worker_loads: Vec<(&str, usize)> =
                 workers.iter().map(|w| (w.url(), w.load())).collect();
-            debug!(
-                "Load balancing triggered | max: {} | min: {} | workers: {:?}",
-                max_load, min_load, worker_loads
-            );
+            debug!("Cache miss placement | max: {max_load} | min: {min_load} | workers: {worker_loads:?}");
         }
 
-        // Use shortest queue when imbalanced
-        let min_load_idx = healthy_indices
-            .iter()
-            .min_by_key(|&&idx| workers[idx].load())
-            .copied()?;
+        // New cache entries should be spread fairly. If we use min-load here,
+        // transient zero/under-counted streaming load can collapse many first
+        // turns onto one DP rank, and later terminal-prefix hits will pin those
+        // conversations to that bad initial placement.
+        let idx = self.select_worker_round_robin(healthy_indices)?;
 
-        // Even in imbalanced mode, update the tree to maintain cache state
+        // Insert the miss under the selected worker so subsequent exact
+        // terminal-prefix hits return to the same owner.
         if let Some(text) = request_text {
             // Get the tree reference without locking the entire HashMap
             // DashMap only locks the specific shard containing this key
             let tree = self.trees.get(tree_key).map(|entry| entry.value().clone());
 
             if let Some(tree) = tree {
-                let worker_url = workers[min_load_idx].url();
+                let worker_url = workers[idx].url();
                 self.insert_tree_tenant(&tree, tree_key, text, worker_url);
             } else {
                 warn!(
@@ -351,9 +362,9 @@ impl CacheAwarePolicy {
         }
 
         // Increment processed counter
-        workers[min_load_idx].increment_processed();
+        workers[idx].increment_processed();
 
-        Some(min_load_idx)
+        Some(idx)
     }
 
     fn insert_tree_tenant(&self, tree: &Tree, tree_key: &str, text: &str, tenant_url: &str) {
@@ -473,7 +484,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 }
             }
 
-            self.select_worker_min_load(
+            self.select_worker_for_miss(
                 workers,
                 &request_text,
                 &healthy_indices,
@@ -490,9 +501,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                  clears",
                 tree_key
             );
-            let mut rng = rand::rng();
-            let random_idx = rng.random_range(0..healthy_indices.len());
-            Some(healthy_indices[random_idx])
+            self.select_worker_round_robin(&healthy_indices)
         }
     }
 
@@ -514,6 +523,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
     fn needs_request_text(&self) -> bool {
         true // Cache-aware policy needs request text for cache affinity
+    }
+
+    fn reset(&self) {
+        self.miss_counter.store(0, Ordering::Relaxed);
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -598,7 +611,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cache_aware_with_imbalanced_load() {
+    async fn test_cache_aware_miss_uses_round_robin_even_when_imbalanced() {
         let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
             cache_threshold: 0.5,
             balance_abs_threshold: 5,
@@ -623,14 +636,16 @@ mod tests {
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker1), Arc::new(worker2)];
         policy.init_workers(&workers);
 
-        // Should select worker2 (lower load) despite cache affinity
-        let info = SelectWorkerInfo {
-            request_text: Some("test"),
-            ..Default::default()
-        };
-        for _ in 0..5 {
+        // New cache entries should be spread fairly. They should not all collapse
+        // onto the current min-load worker, because later terminal-prefix hits
+        // will preserve whatever owner the first request selected.
+        for (request_text, expected_idx) in [("alpha", 0), ("beta", 1), ("gamma", 0)] {
+            let info = SelectWorkerInfo {
+                request_text: Some(request_text),
+                ..Default::default()
+            };
             let idx = policy.select_worker(&workers, &info).await.unwrap();
-            assert_eq!(idx, 1); // Should always pick worker2
+            assert_eq!(idx, expected_idx);
         }
     }
 
