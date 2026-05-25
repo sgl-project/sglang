@@ -43,7 +43,7 @@ class TestDeepepLowlatencyQwen3(CustomTestCase):
                 "low_latency",
                 "--disable-cuda-graph",
                 "--chunked-prefill-size",
-                "512",
+                "1024",
             ],
             env={
                 "SGLANG_ENABLE_JIT_DEEPGEMM": "0",
@@ -82,7 +82,7 @@ class TestDeepepLowlatencyQwen3(CustomTestCase):
             num_examples=200,
             num_threads=64,
             num_shots=5,
-            max_tokens=512,
+            max_tokens=4096,
         )
         metrics = run_eval(args)
         self.assertGreaterEqual(
