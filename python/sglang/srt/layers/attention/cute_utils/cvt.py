@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from https://github.com/vllm-project/vllm/blob/4868b542c9dfd166662eecc4bb8be3a36a3feaa2/vllm/cute_utils/cvt.py
 from cutlass import Constexpr, Float32, Uint32, cute
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
