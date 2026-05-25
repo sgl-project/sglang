@@ -653,7 +653,7 @@ _COMPONENT_HOST_ATTR: dict[ComponentType, tuple[str, str]] = {
 
 
 @dataclass
-class _StackBuildResult:
+class StackBuildResult:
     host_pool_group: HostPoolGroup
     cache_controller: HybridCacheController
     component_host_pools: dict[ComponentType, Any]
@@ -665,7 +665,7 @@ class _StackBuildResult:
     pools_desc: str = ""
 
 
-class _StackStrategy:
+class StackStrategy:
     def matches(self, kvcache: Any, components: set[ComponentType]) -> bool:
         raise NotImplementedError
 
@@ -679,11 +679,11 @@ class _StackStrategy:
         load_cache_event,
         attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
         attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
-    ) -> _StackBuildResult:
+    ) -> StackBuildResult:
         raise NotImplementedError
 
 
-class _DeepSeekV4Strategy(_StackStrategy):
+class _DeepSeekV4Strategy(StackStrategy):
     def matches(self, kvcache, components):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             DeepSeekV4TokenToKVPool,
@@ -734,7 +734,7 @@ class _DeepSeekV4Strategy(_StackStrategy):
             )
             if name in host_pool_group.entry_map
         ]
-        return _StackBuildResult(
+        return StackBuildResult(
             host_pool_group=host_pool_group,
             cache_controller=cache_controller,
             component_host_pools={
@@ -747,7 +747,7 @@ class _DeepSeekV4Strategy(_StackStrategy):
         )
 
 
-class _MambaStrategy(_StackStrategy):
+class _MambaStrategy(StackStrategy):
     def matches(self, kvcache, components):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
@@ -790,7 +790,7 @@ class _MambaStrategy(_StackStrategy):
             pp_rank=params.pp_rank,
             pp_size=params.pp_size,
         )
-        return _StackBuildResult(
+        return StackBuildResult(
             host_pool_group=host_pool_group,
             cache_controller=cache_controller,
             component_host_pools={
@@ -811,7 +811,7 @@ def _swa_layer_mappings(kvcache) -> tuple[dict[int, int], dict[int, int]]:
     return full, swa
 
 
-class _SwaStrategy(_StackStrategy):
+class _SwaStrategy(StackStrategy):
     def matches(self, kvcache, components):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             DeepSeekV4TokenToKVPool,
@@ -857,7 +857,7 @@ class _SwaStrategy(_StackStrategy):
             pp_rank=params.pp_rank,
             pp_size=params.pp_size,
         )
-        return _StackBuildResult(
+        return StackBuildResult(
             host_pool_group=host_pool_group,
             cache_controller=cache_controller,
             component_host_pools={
@@ -869,7 +869,7 @@ class _SwaStrategy(_StackStrategy):
         )
 
 
-class _DsaStrategy(_StackStrategy):
+class _DsaStrategy(StackStrategy):
     def matches(self, kvcache, components):
         from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
@@ -916,7 +916,7 @@ class _DsaStrategy(_StackStrategy):
             pp_rank=params.pp_rank,
             pp_size=params.pp_size,
         )
-        return _StackBuildResult(
+        return StackBuildResult(
             host_pool_group=host_pool_group,
             cache_controller=cache_controller,
             component_host_pools={
@@ -933,7 +933,7 @@ class _DsaStrategy(_StackStrategy):
         )
 
 
-class _PlainKvStrategy(_StackStrategy):
+class _PlainKvStrategy(StackStrategy):
     def matches(self, kvcache, components):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             DeepSeekV4TokenToKVPool,
@@ -982,7 +982,7 @@ class _PlainKvStrategy(_StackStrategy):
             pp_rank=params.pp_rank,
             pp_size=params.pp_size,
         )
-        return _StackBuildResult(
+        return StackBuildResult(
             host_pool_group=host_pool_group,
             cache_controller=cache_controller,
             component_host_pools={
@@ -994,7 +994,7 @@ class _PlainKvStrategy(_StackStrategy):
 
 
 # Resolved first-to-last; _PlainKvStrategy is the catch-all fallback.
-_STRATEGIES: list[_StackStrategy] = [
+_STRATEGIES: list[StackStrategy] = [
     _DeepSeekV4Strategy(),
     _MambaStrategy(),
     _SwaStrategy(),
@@ -1003,13 +1003,13 @@ _STRATEGIES: list[_StackStrategy] = [
 ]
 
 
-def register_stack_strategy(strategy: _StackStrategy) -> None:
+def register_stack_strategy(strategy: StackStrategy) -> None:
     """Prepend a strategy so downstream forks can plug in (kvcache, components)
     combinations not in the built-in list."""
     _STRATEGIES.insert(0, strategy)
 
 
-def _select_strategy(kvcache: Any, components: set[ComponentType]) -> _StackStrategy:
+def _select_strategy(kvcache: Any, components: set[ComponentType]) -> StackStrategy:
     for strategy in _STRATEGIES:
         if strategy.matches(kvcache, components):
             return strategy
@@ -1023,7 +1023,7 @@ def _apply_stack_result(
     cache: UnifiedRadixCache,
     kvcache: Any,
     params: CacheInitParams,
-    result: _StackBuildResult,
+    result: StackBuildResult,
 ) -> None:
     cache.host_pool_group = result.host_pool_group
     cache.cache_controller = result.cache_controller

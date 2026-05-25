@@ -1,15 +1,18 @@
 import unittest
 from unittest.mock import MagicMock
 
+from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _STRATEGIES,
+    StackBuildResult,
+    StackStrategy,
+    _apply_stack_result,
     _DeepSeekV4Strategy,
     _DsaStrategy,
     _MambaStrategy,
     _PlainKvStrategy,
     _select_strategy,
-    _StackStrategy,
     _SwaStrategy,
     register_stack_strategy,
 )
@@ -92,7 +95,7 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
             self.assertIn("No matching HiCache strategy", str(cm.exception))
 
     def test_register_custom_strategy_takes_precedence(self):
-        class _CustomStrategy(_StackStrategy):
+        class _CustomStrategy(StackStrategy):
             def matches(self, kvcache, components):
                 return components == {FULL}
 
@@ -109,6 +112,71 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
             self.assertIs(_select_strategy(kvcache, {FULL}), custom)
         finally:
             hybrid_pool_assembler._STRATEGIES[:] = original
+
+
+class TestApplyStackResult(unittest.TestCase):
+    @staticmethod
+    def _fake_cache(component_types):
+        cache = MagicMock()
+        cache.components = {ct: MagicMock() for ct in component_types}
+        return cache
+
+    def test_wires_components_sidecars_and_counters(self):
+        full_host, swa_host, mamba_host = MagicMock(), MagicMock(), MagicMock()
+        cache = self._fake_cache([FULL, SWA, MAMBA])
+        kvcache = MagicMock()
+        params = MagicMock()
+        controller = MagicMock()
+        sidecar = SidecarPoolSpec(
+            pool_name=PoolName.INDEXER, indices_from_pool=PoolName.KV
+        )
+        result = StackBuildResult(
+            host_pool_group=MagicMock(),
+            cache_controller=controller,
+            component_host_pools={FULL: full_host, SWA: swa_host, MAMBA: mamba_host},
+            sidecars=[sidecar],
+            register_req_to_token_counter=True,
+            transfer_layer_num=8,
+            pools_desc="KV + SWA + MAMBA",
+        )
+
+        _apply_stack_result(cache, kvcache, params, result)
+
+        self.assertIs(cache.host_pool_group, result.host_pool_group)
+        self.assertIs(cache.cache_controller, controller)
+        self.assertIs(cache.full_kv_pool_host, full_host)
+        self.assertIs(cache.swa_kv_pool_host, swa_host)
+        self.assertIs(cache.mamba_pool_host, mamba_host)
+        self.assertIs(cache.components[FULL]._full_kv_pool_host, full_host)
+        self.assertIs(cache.components[SWA]._swa_kv_pool_host, swa_host)
+        self.assertIs(cache.components[MAMBA]._mamba_pool_host, mamba_host)
+        cache.register_sidecar_pool.assert_called_once_with(sidecar)
+        kvcache.register_layer_transfer_counter.assert_called_once_with(
+            controller.layer_done_counter
+        )
+        params.req_to_token_pool.register_layer_transfer_counter.assert_called_once_with(
+            controller.layer_done_counter
+        )
+
+    def test_skips_req_to_token_counter_when_flag_false(self):
+        cache = self._fake_cache([FULL])
+        kvcache = MagicMock()
+        params = MagicMock()
+        result = StackBuildResult(
+            host_pool_group=MagicMock(),
+            cache_controller=MagicMock(),
+            component_host_pools={FULL: MagicMock()},
+            sidecars=[],
+            register_req_to_token_counter=False,
+            transfer_layer_num=1,
+            pools_desc="KV",
+        )
+
+        _apply_stack_result(cache, kvcache, params, result)
+
+        kvcache.register_layer_transfer_counter.assert_called_once()
+        params.req_to_token_pool.register_layer_transfer_counter.assert_not_called()
+        cache.register_sidecar_pool.assert_not_called()
 
 
 if __name__ == "__main__":
