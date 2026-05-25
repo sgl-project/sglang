@@ -40,17 +40,37 @@ calls `get_attn_backend().init_mha_chunk_metadata(forward_batch)` for the chunke
 path. Bypassing these calls produces a silently wrong test.
 
 ### Mock model runner
-Backends are instantiated with a `model_runner` that supplies configuration
-(`page_size`, `sliding_window_size`, pool handles, dtype, etc.). Tests construct a
-lightweight mock/stub with exactly the fields each backend reads in `__init__` and
-`init_forward_metadata`. These config values live on the mock runner, not as parameters
-of `make_forward_batch`.
+Tests subclass the real `ModelRunner` and override `__init__` to skip server startup,
+replacing it with direct field assignment. Using a real subclass (rather than
+`SimpleNamespace`) means: `isinstance` checks pass, any new field added to the real
+`ModelRunner` that a backend starts reading will surface immediately as `AttributeError`
+in tests rather than silently returning `None`.
 
 ### Random weights, real model configs
 Attention layer weights are randomly initialized (no checkpoint download needed).
 Model configs (num_heads, num_kv_heads, head_dim, window_size, etc.) are copied from
 real HuggingFace model cards and hardcoded in the test file. This is sufficient because
 attention correctness does not depend on the specific weight values.
+
+For model-specific attention classes that have learnable weights (MLA compression
+matrices, linear attention gating, etc.), the same random weight tensors are copied
+into both the sglang class and the HF reference class before comparison.
+
+### RoPE handling
+Two cases depending on the attention class under test:
+
+- **`RadixAttention` (standard MHA / GQA / SWA)**: RoPE is applied by the surrounding
+  model class *before* `RadixAttention.forward(q, k, v, forward_batch)` is called.
+  Test inputs are random post-RoPE Q, K, V tensors passed directly to both sglang and
+  the HF reference. No RoPE computation is needed in either path.
+
+- **Model-specific attention classes (MLA, DSA, DSV4, linear, etc.)**: These classes
+  take hidden states as input and apply QKV projection + RoPE internally before calling
+  the backend. RoPE is part of the forward path and must run in both sglang and the HF
+  reference. The test feeds the same random hidden state to both, shares the same
+  random weight tensors (including RoPE frequency buffers), and provides the same
+  `positions` tensor to both paths (`forward_batch.positions` for sglang, passed
+  explicitly to the HF reference kernel).
 
 ---
 
@@ -179,6 +199,10 @@ different acceptance kernel branches).
 Eager execution (no CUDA graph) is tested separately from the CUDA graph runners
 because it exercises a different code path in both the worker and the attention backend.
 
+Note: some backends (e.g., `DFlash`) are exclusively used during spec decode modes and
+are not exercised by Phase 2. Phase 4 is therefore the *only* correctness check for
+those backends — the HF comparison cannot be dropped.
+
 ---
 
 ## Implementation phases
@@ -187,49 +211,62 @@ because it exercises a different code path in both the worker and the attention 
 
 #### 1a. Mock model runner
 
-```python
-def make_mock_model_runner(
-    page_size: int,          # backend config, NOT a ForwardBatch param
-    sliding_window_size: int | None,
-    max_total_num_tokens: int,
-    num_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    dtype: torch.dtype,
-    device: str,
-    **extra_fields,          # backend-specific (e.g., kv_lora_rank for MLA)
-) -> SimpleNamespace:
-    """
-    Lightweight mock of ModelRunner. Allocates real ReqToTokenPool and
-    TokenToKVPool. page_size and sliding_window_size live here.
-    """
-```
-
-#### 1b. Forward batch factory
+Subclass the real `ModelRunner`, overriding `__init__` to skip server startup:
 
 ```python
-def make_forward_batch(
-    mode: ForwardMode,
-    bsz: int,
-    seq_lens: list[int],
-    model_runner: SimpleNamespace,
-) -> ForwardBatch:
-    """
-    Build a minimal ForwardBatch with random KV data pre-loaded into the pools.
-    Does NOT accept page_size or window_size — those come from model_runner.
-    """
+class MockModelRunner(ModelRunner):
+    def __init__(self, page_size, sliding_window_size, max_total_num_tokens,
+                 num_heads, num_kv_heads, head_dim, dtype, device, **extra_fields):
+        # Skip ModelRunner.__init__; assign fields directly.
+        self.page_size = page_size
+        self.sliding_window_size = sliding_window_size
+        self.req_to_token_pool = ReqToTokenPool(...)
+        self.token_to_kv_pool = TokenToKVPool(...)
+        # ... other fields backends read
+        for k, v in extra_fields.items():
+            setattr(self, k, v)
 ```
+
+Using a real subclass means any new field a backend starts reading surfaces immediately
+as `AttributeError` in tests rather than silently returning `None`.
+
+`page_size` and `sliding_window_size` live here — not on `ForwardBatch`.
+
+#### 1b. Forward batch factories (per mode)
+
+One function per mode, making the required fields explicit:
+
+```python
+def make_decode_batch(bsz, seq_lens, model_runner) -> ForwardBatch:
+    """Populates: req_pool_indices, out_cache_loc, seq_lens, forward_mode=DECODE."""
+
+def make_extend_batch(bsz, prefix_lens, extend_lens, model_runner) -> ForwardBatch:
+    """Populates: req_pool_indices, out_cache_loc, extend_prefix_lens,
+    extend_seq_lens, extend_num_tokens, seq_lens, forward_mode=EXTEND."""
+
+def make_mixed_batch(decode_bsz, extend_bsz, ..., model_runner) -> ForwardBatch:
+    """Combines decode and extend portions; forward_mode=MIXED."""
+
+def make_forward_batch(mode, bsz, seq_lens, model_runner) -> ForwardBatch:
+    """Thin dispatcher to the above."""
+```
+
+Chunked-KV (`MHA_CHUNKED_KV`) path: activated when `sum_prefix_length >=
+chunked_prefix_cache_threshold` (default 8192). Tests monkeypatch this threshold to a
+small value (e.g., 64) on the mock model runner so the path is triggered with small
+synthetic sequences without expensive large-batch construction.
 
 #### 1c. KV reconstruction
 
 ```python
 def reconstruct_dense_kv(
     forward_batch: ForwardBatch,
-    model_runner: SimpleNamespace,
+    model_runner: MockModelRunner,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Read K and V back from the paged pool in (bsz, seq_len, num_kv_heads, head_dim)
     dense layout for feeding into HF reference attention.
+    Called after the sglang forward pass so newly written tokens are included.
     """
 ```
 
@@ -240,11 +277,19 @@ def hf_mha_reference(q, k, v, causal=True) -> torch.Tensor: ...
 def hf_gqa_reference(q, k, v, causal=True) -> torch.Tensor: ...
 def hf_swa_reference(q, k, v, window_size: int) -> torch.Tensor: ...
 def hf_mla_reference(q, k_compressed, v_compressed, W_kv_up, ...) -> torch.Tensor: ...
-# etc. per attention type
+def hf_draft_extend_reference(q, k, v) -> torch.Tensor:
+    """Standard causal attention — DRAFT_EXTEND is a normal prefill."""
+def hf_target_verify_reference(q, k, v, spec_info) -> torch.Tensor:
+    """Builds the explicit draft tree attention mask from spec_info, then calls
+    F.scaled_dot_product_attention with that mask."""
 ```
 
-Each calls `F.scaled_dot_product_attention` with the appropriate mask, or a small
-hand-written kernel. No checkpoint downloads.
+`make_tree_attn_mask(spec_info) -> torch.BoolTensor` is a standalone helper used by
+`hf_target_verify_reference`. It constructs the `(total_verify_tokens, total_kv_tokens)`
+boolean mask from the draft tree structure in `spec_info`.
+
+Each reference calls `F.scaled_dot_product_attention` with the appropriate mask. No
+checkpoint downloads.
 
 #### 1e. Assertion helper
 
@@ -272,19 +317,21 @@ call. This ensures all auxiliary calls made during real model forward (e.g.,
 
 For each valid (attention_type, backend, mode, input_shape) combination:
 
-1. Build mock model runner with hardcoded model config.
+1. Build `MockModelRunner` with hardcoded model config.
 2. Instantiate backend via `Backend.__init__(model_runner)`.
 3. Instantiate the model-specific attention class with random weights.
-4. Build `ForwardBatch` via `make_forward_batch`.
+   For classes with learnable weights (MLA, linear), copy the same random tensors
+   into the HF reference class before comparison.
+4. Build `ForwardBatch` via the appropriate per-mode factory.
 5. Call `backend.init_forward_metadata(forward_batch)`.
 6. Call the attention class's `forward(...)` — this dispatches to the correct backend
    method and makes all auxiliary calls as the real model forward would.
-7. Reconstruct dense K, V from pool via `reconstruct_dense_kv`.
-8. Run HF reference on the same Q, dense K, dense V.
+7. Reconstruct dense K, V from pool via `reconstruct_dense_kv` (called after forward).
+8. Run the appropriate HF reference on the same Q, dense K, dense V.
 9. `assert_close(hf_output, sglang_output)`.
 
-TBO backend: included in the backend list but deferred — no test case implemented yet,
-placeholder `skipIf(True, "TBO deferred")` to track the gap.
+TBO backend: included in the backend list but deferred — placeholder
+`skipIf(True, "TBO deferred")` tracks the gap.
 
 Invalid combinations are `skipIf`-guarded, not silently dropped.
 
@@ -292,33 +339,52 @@ Invalid combinations are `skipIf`-guarded, not silently dropped.
 
 ### Phase 3 — Runner integration tests (`test/srt/attention/test_runner_integration.py`)
 
-Tests that runner bookkeeping does not corrupt attention outputs.
+Tests that runner bookkeeping does not corrupt attention outputs. Two-step verification:
 
-**Eager**: `init_forward_metadata` → `attention_layer.forward`. Assert vs. HF reference.
+**Step A — Eager correctness**: `init_forward_metadata` → `attention_layer.forward`.
+Assert output matches HF reference (same as Phase 2). This establishes a known-correct
+eager baseline.
 
-**CUDA graph / BCG**:
+**Step B — Graph consistency**: run CUDA graph capture + replay; assert replayed output
+matches the eager output from Step A. Since Step A verified correctness, matching eager
+is sufficient to prove the graph path is also correct.
+
+**CUDA graph / BCG (Step B)**:
 1. `init_cuda_graph_state` → warmup capture → `on_after_cuda_graph_warmup`.
 2. Replay → forward.
-3. Assert replayed output matches eager output.
+3. Assert replayed output == eager output from Step A.
 
-**PCG**: same pattern with piecewise capture/replay API.
+**PCG**: same two-step pattern with piecewise capture/replay API.
 
 ---
 
 ### Phase 4 — Speculative decoding (`test/srt/attention/test_spec_decoding_attention.py`)
 
-Enumerate (spec_worker, draft_runner, topk, num_draft_steps, forward_mode, backend):
+Some backends (e.g., `DFlash`) are exclusively used during spec decode modes and are
+not exercised by Phase 2. Phase 4 is therefore the *only* correctness check for those
+backends — HF comparison is mandatory, not optional.
 
-1. Construct `SpecInfo` / `EagleInfo` / `FrozenKVMTPInfo` fixture with synthetic draft
-   tree matching the (topk, num_draft_steps) parameters.
-2. Build `ForwardBatch` for `DRAFT_EXTEND` or `TARGET_VERIFY`.
+HF reference strategy per forward mode:
+- **`DRAFT_EXTEND`**: standard causal attention. Use `hf_draft_extend_reference` directly.
+- **`TARGET_VERIFY`**: tree-masked attention. Use `hf_target_verify_reference`, which
+  calls `make_tree_attn_mask(spec_info)` to build the explicit tree mask from the
+  synthetic `SpecInfo`, then passes it to `F.scaled_dot_product_attention`.
+
+For each (spec_worker, execution_mode, draft_runner, topk, num_draft_steps, forward_mode, backend):
+
+1. Construct `SpecInfo` / `EagleInfo` / `FrozenKVMTPInfo` with synthetic draft tree
+   matching (topk, num_draft_steps).
+2. Build `ForwardBatch` for the target forward mode.
 3. `backend.init_forward_metadata(batch)` → `attention_layer.forward(...)`.
-4. Compare output against HF reference with the same Q/K/V.
+4. Compare output against HF reference (mode-appropriate reference from above).
+
+**Secondary consistency check** (in addition to HF comparison):
+For each (spec_worker, backend) pair, run both eager and cuda_graph execution and assert
+their outputs match. This validates runner bookkeeping independently of math correctness.
 
 Explicitly test:
-- `topk=1` (greedy chain) vs `topk=4` (tree draft) — different tensor layouts in
-  `eagle_info_v2.py`.
-- `num_draft_steps=1` vs `num_draft_steps=4` — multi-step draft extend paths.
+- `topk=1` (greedy chain) vs `topk=4` (tree draft).
+- `num_draft_steps=1` vs `num_draft_steps=4`.
 - `get_verify_buffers_to_fill_after_draft()` shape correctness.
 - `update_verify_buffers_to_fill_after_draft(spec_info, cuda_graph_bs)` correctness.
 
@@ -339,6 +405,27 @@ Explicitly test:
 4. **HIP-only backends** (`aiter`, HIP DSV4, `wave`, `ascend`): Same test framework
    with `skipIf` guards for CUDA-only runners; registered with `register_amd_ci()`
    (or the appropriate non-CUDA CI registration) alongside the main test class.
+
+5. **RoPE**: Out of scope for `RadixAttention` (inputs are post-RoPE Q/K/V). In scope
+   for model-specific attention classes (MLA, DSA, DSV4, etc.) — RoPE runs inside
+   their forward; both sglang and HF reference receive the same hidden state, shared
+   weights, and same `positions` tensor.
+
+6. **Chunked-KV threshold**: Monkeypatched to a small value (e.g., 64) on the mock
+   model runner so the `MHA_CHUNKED_KV` path is triggered with small synthetic
+   sequences.
+
+7. **Mock model runner**: Implemented as a `ModelRunner` subclass (not `SimpleNamespace`)
+   so `isinstance` checks pass and missing fields surface as `AttributeError`.
+
+8. **Phase 3 verification**: Two-step — Step A compares eager against HF reference,
+   Step B compares graph replay against eager. Only Step A establishes correctness;
+   Step B establishes consistency.
+
+9. **Phase 4 HF reference**: `DRAFT_EXTEND` uses standard causal HF reference.
+   `TARGET_VERIFY` uses `make_tree_attn_mask(spec_info)` to build the explicit tree
+   mask, then `F.scaled_dot_product_attention`. HF comparison is mandatory in Phase 4
+   because some backends are spec-decode-exclusive and not covered by Phase 2.
 
 ---
 
