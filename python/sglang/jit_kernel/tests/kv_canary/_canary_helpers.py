@@ -63,7 +63,9 @@ class FakeViolationLog:
             write_index=torch.zeros(1, dtype=torch.int32, device=device),
             slot_run_counter=torch.zeros(1, dtype=torch.int64, device=device),
             kernel_run_counter=torch.zeros(1, dtype=torch.int64, device=device),
-            enable_chain_position_assert=torch.ones(
+            # Default off so fuzz tests (which use arbitrary positions) don't trip the chain
+            # position assert. Tests that exercise chain semantics explicitly fill_(1).
+            enable_chain_position_assert=torch.zeros(
                 1, dtype=torch.int32, device=device
             ),
         )
