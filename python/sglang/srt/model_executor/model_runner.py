@@ -2812,11 +2812,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Initialize piecewise CUDA graph runner."""
         self.prefill_cuda_graph_runner = None
 
-        if (self.server_args.cuda_graph_mode or {}).get("prefill") == Backend.DISABLED:
+        if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
             logger.info(
-                "Disable prefill CUDA graph because cuda_graph_mode resolved "
-                "prefill='disabled' (e.g. via --disable-piecewise-cuda-graph, "
-                "--prefill-disable-cuda-graph, or auto-disable rules)."
+                "Disable prefill CUDA graph because cuda_graph_settings "
+                "resolved prefill.backend='disabled' (e.g. via "
+                "--cuda-graph-backend-prefill=disabled or auto-disable rules)."
             )
             return
 

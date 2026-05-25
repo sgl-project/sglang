@@ -706,9 +706,6 @@ class ServerArgs:
     enable_cudagraph_gc: bool = False
     debug_cuda_graph: bool = False
 
-    # CUDA graph settings — per-phase nested dict. Consumed by
-    # ``_handle_cuda_graph_config`` and merged from legacy/convenience CLI
-    # inputs; downstream code reads ``cuda_graph_settings`` only.
     cuda_graph_settings: Optional[Dict[str, Dict[str, Any]]] = None
 
     # Per-phase convenience CLI inputs that fold into ``cuda_graph_settings``.
@@ -727,7 +724,6 @@ class ServerArgs:
     # Legacy CLI inputs that fold into ``cuda_graph_settings`` (with a CLI
     # deprecation warning). Internal-only after parsing.
     disable_cuda_graph: bool = False
-    enable_breakable_cuda_graph: bool = False
     prefill_cuda_graph_backend: Optional[str] = None
     decode_cuda_graph_backend: Optional[str] = None
     prefill_disable_cuda_graph: bool = False
@@ -1350,8 +1346,6 @@ class ServerArgs:
         if self.disable_cuda_graph:
             _set(Phase.DECODE, "backend", Backend.DISABLED)
             _set(Phase.PREFILL, "backend", Backend.DISABLED)
-        if self.enable_breakable_cuda_graph:
-            _set(Phase.PREFILL, "backend", Backend.BREAKABLE)
         if self.cuda_graph_max_bs is not None:
             _set(Phase.DECODE, "max_bs", self.cuda_graph_max_bs)
         if self.cuda_graph_bs is not None:
@@ -6507,9 +6501,9 @@ class ServerArgs:
         )
         parser.add_argument(
             "--enable-breakable-cuda-graph",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--cuda-graph-backend-prefill=breakable",
-            help="Deprecated. Use --cuda-graph-backend-prefill=breakable instead.",
+            action=DeprecatedAction,
+            help="Deprecated. Use --cuda-graph-backend-prefill=breakable instead. "
+            "No-op when passed.",
         )
         parser.add_argument(
             "--enable-profile-cuda-graph",

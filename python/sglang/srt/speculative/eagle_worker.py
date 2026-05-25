@@ -134,8 +134,8 @@ class EAGLEWorker(TpModelWorker):
 
         # Do not capture cuda graph in `super().__init__()`
         # It will be captured later.
-        backup_decode_mode = server_args.cuda_graph_mode[Phase.DECODE]
-        server_args.cuda_graph_mode[Phase.DECODE] = Backend.DISABLED
+        backup_decode_mode = server_args.cuda_graph_settings[Phase.DECODE]["backend"]
+        server_args.cuda_graph_settings[Phase.DECODE]["backend"] = Backend.DISABLED
         # Share the allocator with a target worker.
         # Draft and target worker own their own KV cache pools.
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -210,9 +210,9 @@ class EAGLEWorker(TpModelWorker):
             self.draft_model_runner.model.set_embed_and_head(embed, head)
 
         # Init attention backend and cuda graphs
-        self.draft_model_runner.server_args.cuda_graph_mode[Phase.DECODE] = (
-            backup_decode_mode
-        )
+        self.draft_model_runner.server_args.cuda_graph_settings[Phase.DECODE][
+            "backend"
+        ] = backup_decode_mode
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
