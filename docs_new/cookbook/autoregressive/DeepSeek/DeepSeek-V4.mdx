@@ -20,13 +20,16 @@ import { benchmarks } from "/src/snippets/configs/deepseek-ai/deepseek-v4-benchm
 
 <Deployment config={config} benchmarks={benchmarks} />
 
-The panel generates the full launch command for your selected combo. Controls at the top of the command box:
-
-- **Python / Docker** — toggle between a bare `sglang serve …` invocation and a `docker run … sglang serve …` wrap against the per-hardware image listed in [§2](#2-sglang-installation).
-- **⧉ Copy** — copies the current command to your clipboard.
-- **$ cURL** — opens a sample request you can send to the running server (`localhost:30000` by default).
-- **⚙ Env** — edits the placeholder values (`HOST`, `PORT`, `HF_TOKEN`, `NODE_RANK`, `NODE0_IP`, …) that the command and the cURL example both interpolate. Values persist in your browser across visits and across cookbooks.
-- **Verified / Not Verified** badge — green when the exact `(hardware, variant, quant, strategy, nodes)` combination has been validated end-to-end on real hardware; yellow when no one has independently re-checked the auto-generated recipe yet.
+<div style={{fontSize: "0.85em", lineHeight: "1.55", color: "#6b7280", margin: "0.5rem 0 1rem 0"}}>
+  <p style={{margin: "0 0 0.3rem 0"}}><strong>Panel controls</strong> (top of the command box):</p>
+  <ul style={{margin: 0, paddingLeft: "1.25rem"}}>
+    <li style={{marginBottom: "0.2rem"}}><strong>Python / Docker</strong> — bare <code>sglang serve …</code> for an existing SGLang env, or a <code>docker run … sglang serve …</code> wrap against the per-hardware image from <a href="#2-sglang-installation">§2</a>.</li>
+    <li style={{marginBottom: "0.2rem"}}><strong>⧉ Copy</strong> — copies the current command (with whichever framing is active) to your clipboard.</li>
+    <li style={{marginBottom: "0.2rem"}}><strong>$ cURL</strong> — a sample request against <code>localhost:30000</code> to confirm the server is up.</li>
+    <li style={{marginBottom: "0.2rem"}}><strong>⚙ Env</strong> — edits the placeholders (<code>HOST_IP</code>, <code>PORT</code>, <code>HF_TOKEN</code>, <code>NODE_RANK</code>, <code>NODE0_IP</code>) the command and cURL share. Persists in localStorage across cookbooks.</li>
+    <li><strong>Verified / Not Verified</strong> badge — green when the <code>(hw, variant, quant, strategy, nodes)</code> combo has been run end-to-end on real hardware; yellow when auto-derived from a neighbor and not yet re-checked.</li>
+  </ul>
+</div>
 
 ## Playground
 
@@ -34,7 +37,7 @@ The Playground is where you experiment with **SGLang features beyond the verifie
 
 The knobs come in two flavors:
 
-- **Built-in SGLang features** — parallelism overrides (TP / DP / CP / DP-Attention), MoE backend + EP, reasoning / tool-call parsers, speculative-decoding presets, prefill/decode disaggregation, HiCache tiers.
+- **Built-in SGLang features** — parallelism overrides (TP / CP / DP-Attention — DP-Attention's value is the DP degree, with `off` to disable), MoE backend + EP, reasoning / tool-call parsers, speculative-decoding presets, prefill/decode disaggregation, HiCache tiers.
 - **DeepSeek-V4 specific features** — MegaMoE W4A8 / W4A4 fused kernel (Blackwell only).
 
 Lines highlighted **green** are added by your overrides; lines with **red strikethrough** were in the verified base but stripped by an override. When no override differs from the base cell, the playground inherits the base's **Verified** badge; any actual change flips it to **Not Verified** until the new configuration is run end-to-end and submitted back.
@@ -43,9 +46,12 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 <Playground config={config} />
 
-The Playground panel reuses the same **Python / Docker**, **⧉ Copy**, **$ cURL**, and **⚙ Env** controls described in the Deploy section above, plus one extra:
-
-- **Submit ↗** — opens a pre-filled GitHub issue so you can submit your override combination as a new verified cookbook cell. Only visible while the badge says **Not Verified** (i.e. once you've changed at least one knob from the verified base); once you've actually run the command and confirmed it works, click it and we'll land the cell.
+<div style={{fontSize: "0.85em", lineHeight: "1.55", color: "#6b7280", margin: "0.5rem 0 1rem 0"}}>
+  <p style={{margin: "0 0 0.3rem 0"}}><strong>Panel controls</strong> reuse <strong>Python / Docker</strong> · <strong>⧉ Copy</strong> · <strong>$ cURL</strong> · <strong>⚙ Env</strong> from the Deploy panel, plus one extra:</p>
+  <ul style={{margin: 0, paddingLeft: "1.25rem"}}>
+    <li><strong>Submit ↗</strong> — opens a pre-filled GitHub issue so you can land your override combo as a new verified cookbook cell. Shown only while the badge says <strong>Not Verified</strong>; click it once you've actually run the command on your hardware and confirmed it works.</li>
+  </ul>
+</div>
 
 ## 1. Model Introduction
 
