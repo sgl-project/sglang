@@ -27,6 +27,20 @@ MAMBA_STATE_PER_REQ_NO_CACHE = 1
 logger = logging.getLogger(__name__)
 
 
+class KVPoolOOMError(RuntimeError):
+    """KV pool could not satisfy an allocation. Subclasses ``RuntimeError``
+    so existing ``except RuntimeError`` catches still work; callers that
+    treat OOM as transient (e.g. the scheduler's prefill admission cycle)
+    can catch this specific type and retract instead of crashing."""
+
+
+def _raise_kv_oom(error_msg: str, tree_cache: BasePrefixCache | None) -> None:
+    logger.error(error_msg)
+    if tree_cache is not None:
+        tree_cache.pretty_print()
+    raise KVPoolOOMError(error_msg)
+
+
 def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
     # The page is guaranteed to be full except the last page.
     if page_size == 1:
@@ -314,15 +328,12 @@ def alloc_token_slots(
     out_cache_loc = allocator.alloc(num_tokens)
 
     if out_cache_loc is None:
-        error_msg = (
+        _raise_kv_oom(
             f"Out of memory. Try to lower your batch size.\n"
             f"Try to allocate {num_tokens} tokens.\n"
-            f"{available_and_evictable_str(tree_cache)}"
+            f"{available_and_evictable_str(tree_cache)}",
+            tree_cache,
         )
-        logger.error(error_msg)
-        if tree_cache is not None:
-            tree_cache.pretty_print()
-        raise RuntimeError(error_msg)
 
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
@@ -382,15 +393,12 @@ def alloc_paged_token_slots_extend(
     )
 
     if out_cache_loc is None:
-        error_msg = (
+        _raise_kv_oom(
             f"Prefill out of memory. Try to lower your batch size.\n"
             f"Try to allocate {extend_num_tokens} tokens.\n"
-            f"{available_and_evictable_str(tree_cache)}"
+            f"{available_and_evictable_str(tree_cache)}",
+            tree_cache,
         )
-        logger.error(error_msg)
-        if tree_cache is not None:
-            tree_cache.pretty_print()
-        raise RuntimeError(error_msg)
 
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
@@ -436,6 +444,12 @@ def alloc_for_extend(
         out_cache_loc: allocated cache locations
         req_pool_indices_device: request pool indices at a device tensor
         req_pool_indices: request pool indices as list
+
+    Raises ``KVPoolOOMError`` on KV exhaustion. The freshly-allocated
+    req_pool slots are released before the exception propagates, so a
+    caller that catches and retries (e.g. the scheduler's prefill
+    retract path) starts from a clean state. Slots reused by an
+    in-flight chunked prefill are preserved.
     """
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
@@ -448,33 +462,37 @@ def alloc_for_extend(
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
-    # Allocate req slots
+    # Capture freshly-allocated reqs *before* alloc_req_slots assigns
+    # req_pool_idx, so the rollback path knows which to free.
+    fresh_alloc_reqs = [r for r in batch.reqs if r.req_pool_idx is None]
     req_pool_indices = alloc_req_slots(
         batch.req_to_token_pool, batch.reqs, batch.tree_cache
     )
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
-    # Allocate KV cache (throws exception on failure)
-    if batch.tree_cache.page_size == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
-    else:
-        # Paged allocation - build last_loc
-        last_loc = [
-            (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
-            for t in prefix_tensors
-        ]
-        out_cache_loc = alloc_paged_token_slots_extend(
-            tree_cache=batch.tree_cache,
-            prefix_lens=prefix_lens_device,
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=batch.seq_lens,
-            seq_lens_cpu=batch.seq_lens_cpu,
-            last_loc=torch.cat(last_loc),
-            extend_num_tokens=batch.extend_num_tokens,
-        )
+    try:
+        if batch.tree_cache.page_size == 1:
+            out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+        else:
+            last_loc = [
+                (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
+                for t in prefix_tensors
+            ]
+            out_cache_loc = alloc_paged_token_slots_extend(
+                tree_cache=batch.tree_cache,
+                prefix_lens=prefix_lens_device,
+                prefix_lens_cpu=prefix_lens_cpu,
+                seq_lens=batch.seq_lens,
+                seq_lens_cpu=batch.seq_lens_cpu,
+                last_loc=torch.cat(last_loc),
+                extend_num_tokens=batch.extend_num_tokens,
+            )
+    except KVPoolOOMError:
+        for r in fresh_alloc_reqs:
+            batch.req_to_token_pool.free(r)
+        raise
 
-    # Write to req_to_token_pool
     write_cache_indices(
         out_cache_loc,
         req_pool_indices_device,
@@ -508,15 +526,12 @@ def alloc_paged_token_slots_decode(
     out_cache_loc = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
 
     if out_cache_loc is None:
-        error_msg = (
+        _raise_kv_oom(
             f"Decode out of memory. Try to lower your batch size.\n"
             f"Try to allocate {len(seq_lens) * token_per_req} tokens.\n"
-            f"{available_and_evictable_str(tree_cache)}"
+            f"{available_and_evictable_str(tree_cache)}",
+            tree_cache,
         )
-        logger.error(error_msg)
-        if tree_cache is not None:
-            tree_cache.pretty_print()
-        raise RuntimeError(error_msg)
 
     return out_cache_loc
 

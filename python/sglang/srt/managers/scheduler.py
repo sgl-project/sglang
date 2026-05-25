@@ -219,7 +219,12 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
-from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
+from sglang.srt.mem_cache.common import (
+    KVPoolOOMError,
+    maybe_cache_unfinished_req,
+    release_kv_cache,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -2516,6 +2521,12 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
         )
 
+        # Snapshot for the alloc-failure retract path below.
+        pre_admit_chunked_req = self.chunked_req
+        pre_admit_chunked_req_scheduled_last_iter = (
+            self._chunked_req_scheduled_last_iter
+        )
+
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
@@ -2642,7 +2653,20 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend()
+        try:
+            new_batch.prepare_for_extend()
+        except KVPoolOOMError:
+            # Mirror decode-side ``retract_decode``: a transient KV
+            # exhaustion is not grounds for SIGQUIT. Roll back admission
+            # and let the next tick retry once active reqs free space.
+            if not self.server_args.retry_prefill_on_kv_oom:
+                raise
+            self._retract_prefill_admission(
+                can_run_list,
+                pre_admit_chunked_req,
+                pre_admit_chunked_req_scheduled_last_iter,
+            )
+            return None
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
@@ -2679,6 +2703,51 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch
+
+    def _retract_prefill_admission(
+        self,
+        admitted_reqs: List[Req],
+        pre_admit_chunked_req: Optional[Req],
+        pre_admit_chunked_req_scheduled_last_iter: bool,
+    ) -> None:
+        """Roll back a prefill admission cycle whose KV alloc failed.
+
+        Inverse of admission's mutations: undoes ``_req_inc_lock_ref``,
+        the ``add_chunked_req`` swap and ``inflight_middle_chunks`` bump,
+        and the eager ``waiting_queue`` removal. Host-loaded prefix
+        tokens pulled in by ``init_load_back`` are left in the tree
+        cache so the retry can reuse them.
+        """
+        for req in admitted_reqs:
+            if self.is_hybrid_swa:
+                self.tree_cache.dec_lock_ref(
+                    req.last_node,
+                    DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
+                )
+            else:
+                self.tree_cache.dec_lock_ref(req.last_node)
+
+        if self.chunked_req is not None:
+            self.chunked_req.inflight_middle_chunks -= 1
+        self.chunked_req = pre_admit_chunked_req
+        self._chunked_req_scheduled_last_iter = (
+            pre_admit_chunked_req_scheduled_last_iter
+        )
+
+        # Prepend to preserve FCFS: these reqs were ahead of everyone
+        # else in this cycle, so they must stay ahead on the next tick.
+        # Exclude any pre-existing chunked req: it was already in
+        # ``can_run_list`` via ``add_chunked_req``, but we just restored
+        # it as ``self.chunked_req``, so the next tick's chunked-req
+        # branch will re-process it. Re-queueing it would cause it to
+        # be admitted twice on the same tick.
+        self.waiting_queue[:0] = [
+            r for r in admitted_reqs if r is not pre_admit_chunked_req
+        ]
+
+        # ``batch_is_full`` may have been latched mid-admission; the
+        # next tick must be free to re-evaluate.
+        self.running_batch.batch_is_full = False
 
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]

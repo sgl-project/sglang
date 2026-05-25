@@ -689,6 +689,11 @@ class ServerArgs:
     # placeholder token. See MIS_DELIMITER_TOKEN_ID for details.
     enable_mis: bool = False
 
+    # Treat prefill KV-pool exhaustion as a transient signal: retract the
+    # admission cycle and retry on the next scheduler tick instead of
+    # crashing the scheduler with SIGQUIT. Mirrors decode-side retract.
+    retry_prefill_on_kv_oom: bool = True
+
     # Optimization/debug options
     disable_radix_cache: bool = False
     cuda_graph_max_bs: Optional[int] = None
