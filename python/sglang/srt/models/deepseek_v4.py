@@ -641,6 +641,7 @@ class MQALayer(nn.Module):
                 x=x,
                 q_lora=q_lora,
                 forward_batch=forward_batch,
+                attn_backend=attn_backend,
                 skip_compressor=True,
             )
         elif self.compressor is not None:
@@ -795,6 +796,7 @@ class MQALayer(nn.Module):
             and get_is_capture_mode()
             and x.shape[0] <= self._multi_stream_bs_limit
             and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
+            and not (_is_hip and self.compressor is None)
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
