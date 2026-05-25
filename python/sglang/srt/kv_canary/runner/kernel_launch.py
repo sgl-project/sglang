@@ -88,7 +88,7 @@ def launch_endpoints_per_forward(
         if _endpoint_belongs_to_group(endpoint, group)
         and tag_filter(endpoint.kernel_kind)
         and not _is_sweep_tag(endpoint.kernel_kind)
-        and _passes_v_half_gate(endpoint.kernel_kind)
+        and passes_v_half_gate(endpoint.kernel_kind)
     ]
     assert len(active_endpoints) > 0
 
@@ -119,7 +119,7 @@ def launch_endpoints_sweep(
         for endpoint in endpoints
         if _endpoint_belongs_to_group(endpoint, group)
         and _is_sweep_tag(endpoint.kernel_kind)
-        and _passes_v_half_gate(endpoint.kernel_kind)
+        and passes_v_half_gate(endpoint.kernel_kind)
     ]
     assert len(active_endpoints) > 0
 
@@ -151,7 +151,7 @@ def _is_v_half_tag(tag: CanaryLaunchTag) -> bool:
     )
 
 
-def _passes_v_half_gate(tag: CanaryLaunchTag) -> bool:
+def passes_v_half_gate(tag: CanaryLaunchTag) -> bool:
     if not _is_v_half_tag(tag):
         return True
     return envs.SGLANG_KV_CANARY_ENABLE_MHA_V.get()
