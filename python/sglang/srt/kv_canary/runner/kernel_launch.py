@@ -152,10 +152,6 @@ def _is_v_half_tag(tag: CanaryLaunchTag) -> bool:
 
 
 def _v_half_kernel_enabled(tag: CanaryLaunchTag) -> bool:
-    # MHA / GQA models build V endpoints (has_v_half=True); gate their kernel exec behind
-    # SGLANG_KV_CANARY_ENABLE_MHA_V. Pool patches and IPC fields stay attached either way so PD
-    # / external consumers see a stable surface. MLA-like models (has_v_half=False) never built
-    # V endpoints so this is a no-op for them.
     if not _is_v_half_tag(tag):
         return True
     return envs.SGLANG_KV_CANARY_ENABLE_MHA_V.get()
