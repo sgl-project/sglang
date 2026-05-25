@@ -3,435 +3,622 @@
 ## Problem
 
 ### Issue 1 — Coverage gaps
-Current tests do not cover arbitrary combinations of:
-- Runners (eager, cuda_graph, PCG/BCG, EAGLE and MTP runners with variants)
-- Attention backends (many exist; most are untested at the unit level)
-- Input cases (various bsz, input len, KV cache size)
+
+Current tests do not cover representative combinations of:
+- Runners: eager, CUDA graph, BCG/PCG, EAGLE and MTP runners with variants.
+- Attention backends: many exist, but most are not covered by fast unit-level
+  correctness tests.
+- Input cases: batch size, prefix length, extend length, page size, ragged
+  sequence lengths, sliding-window boundaries, and speculative tree layouts.
 
 ### Issue 2 — Test expense
-Most tests are e2e (full server + model load + eval). That is slow and unnecessary for
-verifying attention backend correctness.
+
+Most coverage today is e2e: full server launch, model load, and eval. That is too
+slow and too coarse for validating attention backend math and metadata.
 
 ---
 
 ## Approach
 
-### Reference implementation
-Use the HuggingFace attention implementation for each attention type as the reference.
+### Primary test target: attention-module boundary
 
-Rationale:
-- There is no universal sglang reference backend — `torch_native` does not support SWA,
-  Mamba, DeepSeek-V4-style sparse attention, or linear attention variants.
-- HF implementations serve as an independent ground truth per attention type.
-- Preparing HF inputs is straightforward: populate the paged KV pool from dense tensors
-  before the forward pass, or read them back from the pool afterwards. This is a
-  one-time `reconstruct_dense_kv` helper, not a per-test burden.
-- Model configs (head counts, head dim, window size, etc.) are hardcoded in the test
-  file. No network access to HuggingFace is required. Only the attention math logic
-  from transformers (or a small hand-written reference kernel) is used.
+The primary correctness tests enter through the smallest real attention module that
+represents the model family under test. Do not call backend methods directly, and do
+not force every case through `RadixAttention`.
 
-### Test target: complete attention layer, not just the backend
-Tests must exercise the full attention layer (e.g., `RadixAttention` or the
-model-specific class), not just `backend.forward_decode/extend()` directly.
+Reason:
+- For standard MHA/GQA/SWA, the natural boundary can be a small model attention
+  module that owns QKV projection and RoPE before calling `RadixAttention`.
+- For MLA, DSA, DSV4, linear attention, Mamba, and speculative verify paths, the
+  real behavior includes projections, RoPE, compression, sparse index metadata,
+  state updates, tree masks, or other side effects before backend dispatch.
+- Backend-only tests miss auxiliary calls such as
+  `get_attn_backend().init_mha_chunk_metadata(forward_batch)` in the DeepSeek
+  chunked-KV path.
 
-Reason: some attention paths call additional backend methods during the model forward
-that are not invoked by calling the backend directly. For example, `forward_mha.py`
-calls `get_attn_backend().init_mha_chunk_metadata(forward_batch)` for the chunked-KV
-path. Bypassing these calls produces a silently wrong test.
+Keep a tiny `RadixAttention` smoke-test suite for the leaf backend contract
+(`q/k/v + ForwardBatch -> output`), but keep it outside the main correctness matrix.
 
-### Mock model runner
-Tests subclass the real `ModelRunner` and override `__init__` to skip server startup,
-replacing it with direct field assignment. Using a real subclass (rather than
-`SimpleNamespace`) means: `isinstance` checks pass, any new field added to the real
-`ModelRunner` that a backend starts reading will surface immediately as `AttributeError`
-in tests rather than silently returning `None`.
+### Unified module target adapter
 
-### Random weights, real model configs
-Attention layer weights are randomly initialized (no checkpoint download needed).
-Model configs (num_heads, num_kv_heads, head_dim, window_size, etc.) are copied from
-real HuggingFace model cards and hardcoded in the test file. This is sufficient because
-attention correctness does not depend on the specific weight values.
+Every attention family implements the same adapter contract:
 
-For model-specific attention classes that have learnable weights (MLA compression
-matrices, linear attention gating, etc.), the same random weight tensors are copied
-into both the sglang class and the HF reference class before comparison.
+```python
+class AttentionModuleTarget:
+    def build_runner(self, case) -> MockModelRunner: ...
+    def build_backend(self, runner, case) -> AttentionBackend: ...
+    def build_module(self, runner, case) -> torch.nn.Module: ...
+    def init_shared_random_weights(self, module, reference, seed) -> None: ...
+    def make_inputs(self, batch, case) -> dict[str, torch.Tensor]: ...
+    def run_sglang(self, module, inputs, batch) -> torch.Tensor: ...
+    def run_reference(self, reference, inputs, batch, dense_kv) -> torch.Tensor: ...
+```
+
+This gives one test harness, one capability system, and one input-preparation
+pipeline while preserving model-specific behavior.
+
+Recommended targets:
+
+| Attention family | Primary test target |
+|---|---|
+| Standard MHA | Small GPT/LLaMA-style attention module |
+| GQA | Small LLaMA/Qwen-style attention module |
+| SWA | Small Mistral/Gemma-style sliding-window attention module |
+| MLA | DeepSeek MLA attention module from `deepseek_v2.py` |
+| DSA | DeepSeek sparse attention module |
+| DSV4 | DeepSeek V4 attention module |
+| Linear KDA/Lightning/GDN | Model-specific linear attention module, falling back to `RadixLinearAttention` only if no smaller model module is exposed |
+| Mamba | Mamba/Mamba2 mixer module |
+| Spec verify/draft | Module target plus synthetic `SpecInput` metadata |
+
+### Reference implementations
+
+Use a reference at the same module boundary whenever practical. No checkpoint
+download is required: configs are hardcoded, and weights are random but shared between
+the SGLang module and the reference.
+
+Reference strategy by family:
+- MHA/GQA/SWA: explicit PyTorch reference using dense Q/K/V after the same random
+  projections and RoPE as the SGLang module. Use `F.scaled_dot_product_attention`
+  with causal or sliding-window masks.
+- MLA: explicit DeepSeek MLA math or a minimal HF-compatible attention module with
+  the same random projection/compression weights.
+- DSA/DSV4: model-family reference that builds the equivalent sparse or compressed
+  attention mask/index result, then compares the final module output.
+- Linear KDA/Lightning/GDN and Mamba: family-specific reference kernels or compact
+  PyTorch implementations. Do not claim these are all SDPA references.
+- Speculative verify: explicit causal/tree masks built from synthetic `SpecInput`
+  objects, then compared at the same module boundary.
+
+### Real configs, random weights
+
+Model configs (head counts, KV heads, head dim, window size, compression rank, etc.)
+are copied from representative HuggingFace configs and hardcoded in the test file.
+Attention weights are randomly initialized. For modules with learnable projections,
+compression matrices, gates, or RoPE buffers, copy the same random tensors into the
+reference before comparison.
 
 ### RoPE handling
-Two cases depending on the attention class under test:
 
-- **`RadixAttention` (standard MHA / GQA / SWA)**: RoPE is applied by the surrounding
-  model class *before* `RadixAttention.forward(q, k, v, forward_batch)` is called.
-  Test inputs are random post-RoPE Q, K, V tensors passed directly to both sglang and
-  the HF reference. No RoPE computation is needed in either path.
+RoPE is part of the module boundary for the primary matrix. Tests feed hidden states
+and positions to both SGLang and the reference module. The module applies QKV
+projection, RoPE, compression/indexing, and backend dispatch.
 
-- **Model-specific attention classes (MLA, DSA, DSV4, linear, etc.)**: These classes
-  take hidden states as input and apply QKV projection + RoPE internally before calling
-  the backend. RoPE is part of the forward path and must run in both sglang and the HF
-  reference. The test feeds the same random hidden state to both, shares the same
-  random weight tensors (including RoPE frequency buffers), and provides the same
-  `positions` tensor to both paths (`forward_batch.positions` for sglang, passed
-  explicitly to the HF reference kernel).
+The direct `RadixAttention` smoke tests remain post-RoPE leaf tests and may use random
+Q/K/V directly.
+
+### Forward context
+
+All module-level tests that dispatch through `get_attn_backend()` must publish the
+active backend:
+
+```python
+with forward_context(ForwardContext(attn_backend=backend)):
+    backend.init_forward_metadata(forward_batch)
+    output = target.run_sglang(module, inputs, forward_batch)
+```
+
+### Capability-first enumeration
+
+Before enumerating parametrized tests, define a capability table/helper:
+
+```python
+def supports(case) -> tuple[bool, str]:
+    """Return (supported, skip_reason)."""
+```
+
+The helper gates invalid combinations by attention family, backend, forward mode,
+hardware, graph mode, dtype, page size, and speculative mode. Invalid combinations
+are skipped with explicit reasons; they are not silently omitted and not discovered
+by crashing deep inside backend initialization.
 
 ---
 
-## Full list of attention backends
+## Attention Backends
 
-### Registered backends (from `attention_registry.py`)
+### Registered backends from `attention_registry.py`
 
 | Name | Class | Notes |
 |---|---|---|
-| `flashinfer` | `FlashInferAttnBackend` / `FlashInferMLABackend` | Primary CUDA backend; dispatches to MLA variant for MLA models |
+| `flashinfer` | `FlashInferAttnBackend` / `FlashInferMLAAttnBackend` | Primary CUDA backend; dispatches to MLA variant for MLA models |
 | `triton` | `TritonAttnBackend` | Pure Triton kernels |
 | `torch_native` | `TorchNativeAttnBackend` | PyTorch SDPA |
 | `flex_attention` | `TorchFlexAttnBackend` | PyTorch flex attention |
-| `fa3` | `FlashAttentionBackend` (v3) | SM90+ only |
-| `fa4` | `FlashAttentionBackend` (v4) | SM90+ only |
-| `flashmla` | `FlashMLABackend` | MLA-only, SM90+ |
+| `fa3` | `FlashAttentionBackend` v3 | Hardware-gated |
+| `fa4` | `FlashAttentionBackend` v4 | Hardware-gated |
+| `flashmla` | `FlashMLABackend` | MLA-only |
 | `cutlass_mla` | `CutlassMLABackend` | MLA-only |
-| `trtllm_mha` | `TrtllmMHABackend` | TensorRT-LLM MHA |
-| `trtllm_mla` | `TrtllmMLABackend` | TensorRT-LLM MLA |
-| `tokenspeed_mla` | `TokenSpeedMLABackend` | MLA variant |
+| `trtllm_mha` | `TRTLLMHAAttnBackend` | TensorRT-LLM MHA |
+| `trtllm_mla` | `TRTLLMMLABackend` | TensorRT-LLM MLA |
+| `tokenspeed_mla` | `TokenspeedMLABackend` | MLA variant |
 | `aiter` | `AiterAttnBackend` | AMD ROCm |
 | `wave` | `WaveAttnBackend` | Wave attention |
-| `ascend` | — | Ascend NPU |
-| `dsa` | `DSABackend` | DeepSeek Sparse Attention |
-| `dsv4` | `DeepseekV4Backend` | DeepSeek V4 CUDA (HIP variant: `deepseek_v4_backend_hip_radix`) |
-| `dual_chunk_flash_attn` | `DualChunkFlashAttentionBackend` | Long-context chunked |
-| `intel_amx` | `IntelAMXBackend` | Intel CPU AMX |
-| `intel_xpu` | `IntelXPUBackend` | Intel XPU |
+| `ascend` | `AscendAttnBackend` | Ascend NPU |
+| `dsa` | `DeepseekSparseAttnBackend` | DeepSeek sparse attention |
+| `nsa` | Alias for `dsa` | Deprecated compatibility alias |
+| `dsv4` | `DeepseekV4AttnBackend` / HIP radix variant | DeepSeek V4 compressed attention |
+| `dual_chunk_flash_attn` | `DualChunkFlashAttentionBackend` | Long-context chunked attention |
+| `intel_amx` | `IntelAMXAttnBackend` | Intel CPU AMX |
+| `intel_xpu` | `XPUAttentionBackend` | Intel XPU |
 
-### Wrapper / hybrid backends (not in registry; composed at runtime)
-
-| Name | Class | Notes |
-|---|---|---|
-| `hybrid_attn` | `HybridAttnBackend` | Configurable prefill+decode split (e.g., FA3 prefill + FlashInfer decode) |
-| `tbo` | `TboAttnBackend` | Two-batch overlap backend; wraps a primary backend |
-| `hybrid_linear_attn` | `MambaAttnBackendBase` | Wraps any attention backend with Mamba/linear-attention layers |
-
-### Linear / state-space attention backends (under `linear/`)
+### Wrapper / hybrid backends
 
 | Name | Class | Notes |
 |---|---|---|
-| `kda` | `KDABackend` | KDA linear attention |
-| `lightning_attn` | `LightningAttnBackend` | Lightning attention |
-| `gdn` | `GDNBackend` | GDN linear attention |
+| `hybrid_attn` | `HybridAttnBackend` | Composed when prefill and decode backends differ |
+| `tbo` | `TboAttnBackend` | Two-batch overlap wrapper around child backends |
+| `hybrid_linear_attn` | `HybridLinearAttnBackend` | Wraps full attention with Mamba/linear-attention layers |
+
+### Linear / state-space backends
+
+These are selected by model config through `attn_backend_wrapper`, not by direct
+`--attention-backend` names in the same way as full attention backends.
+
+| Family | Class | Notes |
+|---|---|---|
+| KDA | `KDAAttnBackend` | Kimi-style linear attention |
+| Lightning | `LightningAttentionBackend` | Lightning attention |
+| GDN | `GDNAttnBackend` | GDN linear attention |
+| Mamba2 | `Mamba2AttnBackend` | Mamba/state-space path |
 
 ---
 
-## Full list of speculative decoding workers and runners
+## Speculative Decoding Workers And Runners
 
-### Workers (draft model inference)
+### Workers
 
 | Worker | Description |
 |---|---|
 | `EAGLEWorker` | EAGLE v1 draft worker |
-| `EAGLEWorkerV2` | EAGLE v2 draft worker (tree-based, supports `topk > 1`) |
-| `StandaloneWorker` / `StandaloneWorkerV2` | Self-speculative (draft = target) |
-| `MultiLayerEagleWorker` / `MultiLayerEagleDraftWorker` (v2) | Multi-layer EAGLE |
+| `EAGLEWorkerV2` | EAGLE v2 draft worker, tree/spec-v2 path |
+| `StandaloneWorker` / `StandaloneWorkerV2` | Self-speculative, draft equals target |
+| `MultiLayerEagleWorker` / `MultiLayerEagleWorkerV2` | Multi-layer EAGLE |
+| `MultiLayerEagleDraftWorker` | Draft worker used by multi-layer EAGLE v2 |
 | `FrozenKVMTPWorker` / `FrozenKVMTPWorkerV2` | Frozen-KV MTP |
 | `DFlashWorker` | DFlash speculative worker |
 | `NGRAMWorker` | N-gram draft worker |
 
-### CUDA graph runners (for draft phase)
+### CUDA graph runners
 
 | Runner | Description |
 |---|---|
-| `EAGLEDraftCudaGraphRunner` | EAGLE v1 decode draft |
-| `EAGLEDraftExtendCudaGraphRunner` | EAGLE v1/v2 extend draft |
+| `EAGLEDraftCudaGraphRunner` | EAGLE decode draft |
+| `EAGLEDraftExtendCudaGraphRunner` | EAGLE draft-extend, including v2 mode |
 | `MultiLayerEagleDraftExtendCudaGraphRunner` | Multi-layer EAGLE extend |
 | `MultiLayerEagleMultiStepDraftExtendCudaGraphRunner` | Multi-layer, multi-step extend |
 | `FrozenKVMTPCudaGraphRunner` | Frozen-KV MTP decode |
 
 ---
 
-## Dimensions to enumerate
+## Dimensions To Enumerate
 
-### Phase 2 matrix (attention backend correctness)
+### Capability matrix
+
+Represent each test case as:
+
+```python
+@dataclass(frozen=True)
+class AttentionCase:
+    attention_family: str
+    config_variant: str
+    backend: str
+    forward_mode: ForwardMode
+    graph_mode: str  # eager, cuda_graph, bcg, pcg
+    input_shape: str
+    page_size: int
+    dtype: torch.dtype
+    hardware: str
+```
+
+Minimum capability dimensions:
+- Backend supports attention family: MHA/GQA/SWA/MLA/DSA/DSV4/linear/Mamba.
+- Backend supports attention config variant: MHA head layout, GQA head grouping,
+  MQA, SWA, MLA ranks, sparse-index config, linear-attention config, etc.
+- Backend supports mode: `DECODE`, `EXTEND`, `MIXED`, `TARGET_VERIFY`,
+  `DRAFT_EXTEND`, `DRAFT_EXTEND_V2`.
+- Backend supports hardware and dtype.
+- Backend supports graph path: eager, CUDA graph, BCG, PCG.
+- Model family supports page size and KV pool type.
+- Spec worker supports `topk`, `num_draft_steps`, draft runner, and forward mode.
+
+### Phase 2 matrix: module-level backend correctness
 
 | Dimension | Values |
 |---|---|
-| **Attention type** | Standard MHA, GQA, SWA, MLA (DeepSeek), DSA, DSV4, linear (KDA/Lightning/GDN), Mamba |
-| **Backend** | See full list above; one or more per attention type |
-| **Forward mode** | `DECODE`, `EXTEND`, `MIXED`, chunked-KV (`MHA_CHUNKED_KV` path) |
-| **Input shape** | small bsz + short seq, large bsz + long seq, bsz=1 decode |
+| **Attention family** | Standard MHA, GQA, SWA, MLA, DSA, DSV4, linear KDA/Lightning/GDN, Mamba |
+| **Attention config** | MHA, GQA with `num_heads / num_kv_heads > 1`, MQA with `num_kv_heads=1`, finite-window SWA, MLA rank variants, sparse-index variants |
+| **Backend** | Capability-gated subset from the backend list |
+| **Forward mode** | `DECODE`, `EXTEND`, `MIXED`; DeepSeek chunked-KV path as a model forward-method case |
+| **Input shape** | Small ragged batch, exact-page batch, page-boundary batch, long prefix batch, bsz=1 decode |
+| **Page size** | 1, representative paged value such as 32 or 64 |
 
-Representative model configs (hardcoded, no download):
+Representative configs, hardcoded with no network access:
 
-| Attention type | Representative model | Key config |
+| Attention family | Representative model | Key config |
 |---|---|---|
-| Standard MHA | GPT-2 small | `num_heads=12, head_dim=64` |
-| GQA | LLaMA-3-8B | `num_heads=32, num_kv_heads=8, head_dim=128` |
-| SWA | Gemma-3 / Mistral | `num_heads=8, num_kv_heads=4, head_dim=256, window_size=4096` |
+| Standard MHA | GPT-2/LLaMA-style tiny config | `num_heads=12, head_dim=64` |
+| GQA | LLaMA-3/Qwen-style tiny config | `num_heads=32, num_kv_heads=8, head_dim=128` |
+| SWA | Mistral/Gemma-style tiny config | `num_heads=8, num_kv_heads=4, head_dim=256, window_size < seq_len` |
 | MLA | DeepSeek-V2-Lite | `qk_nope_head_dim=128, qk_rope_head_dim=64, kv_lora_rank=512` |
-| DSA | DeepSeek-V3 | DSA-specific head config |
-| DSV4 | DeepSeek-V4 | DSV4-specific config |
-| Linear (KDA) | Kimi model | KDA linear config |
-| Linear (Lightning) | Bailing model | Lightning config |
+| DSA | DeepSeek-V3 sparse config | DSA-specific head and index config |
+| DSV4 | DeepSeek-V4 | DSV4 compressed attention config |
+| Linear KDA | Kimi-style config | KDA linear config |
+| Linear Lightning | Bailing-style config | Lightning config |
+| Linear GDN | Hybrid GDN config | GDN config |
 | Mamba | Mamba-2 | SSM config |
 
-### Phase 3 matrix (runner integration)
+DeepSeek `MHA_CHUNKED_KV` is not a `ForwardMode`. It is a model forward method chosen
+inside the DeepSeek attention path. Trigger it by configuring the DeepSeek attention
+module threshold or environment to a small value, then run through the DeepSeek module.
+
+### Phase 3 matrix: runner and graph integration
 
 | Dimension | Values |
 |---|---|
-| **Runner** | eager, cuda_graph (regular / BCG), piecewise_cuda_graph (PCG) |
-| **Backend** | flashinfer, triton, torch_native, flex_attention, fa3, fa4 (SM90+), flashmla, cutlass_mla, trtllm_mha, trtllm_mla, dual_chunk_flash_attn, hybrid_attn, tbo |
-| **Forward mode** | DECODE, EXTEND |
+| **Runner mode** | eager baseline, CUDA graph, BCG, PCG |
+| **Backend** | Capability-gated subset: flashinfer, triton, torch_native, flex_attention, fa3, fa4, flashmla, cutlass_mla, trtllm_mha, trtllm_mla, dual_chunk_flash_attn, hybrid_attn, tbo |
+| **Forward mode** | `DECODE`, `EXTEND`; selected speculative graph modes in Phase 4 |
+| **Attention family** | Small representative subset, not the full Phase 2 matrix |
 
-Not all (runner, backend) pairs are valid — e.g., PCG is only used with certain MLA
-backends; TBO wraps another backend and is tested in composition.
+Two-step verification:
+1. Eager module output matches the family reference.
+2. Graph replay output matches the eager module output.
 
-### Phase 4 matrix (speculative decoding attention)
+Graph consistency does not replace the reference comparison; it validates runner and
+metadata bookkeeping after correctness has been established by the eager path.
+
+### Phase 4 matrix: speculative decoding attention
+
+Split Phase 4 into two layers.
+
+#### Layer A: synthetic spec metadata attention tests
+
+These tests construct synthetic `SpecInput` objects and validate attention metadata and
+module output directly.
 
 | Dimension | Values |
 |---|---|
-| **Spec worker** | EAGLEWorker, EAGLEWorkerV2, StandaloneWorker, StandaloneWorkerV2, MultiLayerEagleWorker, MultiLayerEagleDraftWorker, FrozenKVMTPWorker, FrozenKVMTPWorkerV2, DFlashWorker, NGRAMWorker |
-| **Execution mode** | eager (no CUDA graph), cuda_graph |
-| **Draft runner (cuda_graph only)** | EAGLEDraftCudaGraphRunner, EAGLEDraftExtendCudaGraphRunner, MultiLayerEagleDraftExtendCudaGraphRunner, MultiLayerEagleMultiStepDraftExtendCudaGraphRunner, FrozenKVMTPCudaGraphRunner |
-| **topk** | 1 (greedy / chain draft), >1 (tree draft) |
-| **num_draft_steps** | 1, >1 (multi-step draft) |
-| **Forward mode** | `DRAFT_EXTEND`, `TARGET_VERIFY` |
-| **Backend** | flashinfer, triton, fa3, fa4, cutlass_mla, flashmla, trtllm_mha, trtllm_mla, dual_chunk_flash_attn, hybrid_attn |
+| **Spec info** | `EagleVerifyInput`, EAGLE v2 verify input, `FrozenKVMTPInfo`, `DFlashVerifyInput`, `NGRAM` verify input |
+| **Forward mode** | `TARGET_VERIFY`, `DRAFT_EXTEND`, `DRAFT_EXTEND_V2` |
+| **topk** | 1 and 4 |
+| **num_draft_steps** | 1 and 4 |
+| **Backend** | Capability-gated subset: flashinfer, triton, fa3, fa4, cutlass_mla, flashmla, trtllm_mha, trtllm_mla, dual_chunk_flash_attn, hybrid_attn |
+| **Execution mode** | eager and CUDA graph where supported |
 
-`topk=1` vs `topk>1` and `num_draft_steps=1` vs `>1` are explicit axes because they
-change code paths in `eagle_info.py`/`eagle_info_v2.py` (different tensor layouts,
-different acceptance kernel branches).
+Reference strategy:
+- `DRAFT_EXTEND`: causal prefill reference.
+- `DRAFT_EXTEND_V2`: fixed-shape draft-extend reference that accounts for all
+  speculative tokens, not only accepted tokens.
+- `TARGET_VERIFY`: explicit tree mask built from `spec_info`, then reference
+  attention against dense KV.
 
-Eager execution (no CUDA graph) is tested separately from the CUDA graph runners
-because it exercises a different code path in both the worker and the attention backend.
+Also test:
+- `get_verify_buffers_to_fill_after_draft()` shape and dtype.
+- `update_verify_buffers_to_fill_after_draft(spec_info, cuda_graph_bs)` contents.
+- Tree-mask equivalence for `topk=1` chain draft and `topk=4` tree draft.
 
-Note: some backends (e.g., `DFlash`) are exclusively used during spec decode modes and
-are not exercised by Phase 2. Phase 4 is therefore the *only* correctness check for
-those backends — the HF comparison cannot be dropped.
+#### Layer B: worker and draft-runner integration tests
+
+These tests use a small subset of workers/runners to prove they produce compatible
+`ForwardBatch` and `SpecInput` metadata. They are not a full Cartesian product.
+
+| Dimension | Values |
+|---|---|
+| **Spec worker** | `EAGLEWorker`, `EAGLEWorkerV2`, `StandaloneWorker`, `StandaloneWorkerV2`, `MultiLayerEagleWorker`, `MultiLayerEagleWorkerV2`, `FrozenKVMTPWorker`, `FrozenKVMTPWorkerV2`, `DFlashWorker`, `NGRAMWorker` |
+| **Draft runner** | `EAGLEDraftCudaGraphRunner`, `EAGLEDraftExtendCudaGraphRunner`, `MultiLayerEagleDraftExtendCudaGraphRunner`, `MultiLayerEagleMultiStepDraftExtendCudaGraphRunner`, `FrozenKVMTPCudaGraphRunner` |
+| **Execution mode** | eager worker path, CUDA graph worker path where supported |
+| **Backend** | One or two representative valid backends per worker family |
+
+DFlash is a speculative worker/path, not an attention backend. Phase 4 covers
+speculative-only attention modes and metadata that Phase 2 cannot exercise.
 
 ---
 
-## Implementation phases
+## Implementation Phases
 
 ### Phase 1 — Infrastructure (`test/srt/attention/utils.py`)
 
-#### 1a. Mock model runner
+#### 1a. Module target adapters
+
+Create one adapter per attention family:
+
+```python
+class MHAAttentionTarget(AttentionModuleTarget): ...
+class GQAAttentionTarget(AttentionModuleTarget): ...
+class SWAAttentionTarget(AttentionModuleTarget): ...
+class DeepSeekMLATarget(AttentionModuleTarget): ...
+class DeepSeekDSATarget(AttentionModuleTarget): ...
+class DeepSeekV4Target(AttentionModuleTarget): ...
+class LinearAttentionTarget(AttentionModuleTarget): ...
+class MambaAttentionTarget(AttentionModuleTarget): ...
+class SpecVerifyTarget(AttentionModuleTarget): ...
+```
+
+Each adapter owns module construction, input preparation, reference execution, and
+shape-specific assertions. The outer test harness should not need attention-family
+branches except capability filtering.
+
+#### 1b. Mock model runner
 
 Subclass the real `ModelRunner`, overriding `__init__` to skip server startup:
 
 ```python
 class MockModelRunner(ModelRunner):
-    def __init__(self, page_size, sliding_window_size, max_total_num_tokens,
-                 num_heads, num_kv_heads, head_dim, dtype, device, **extra_fields):
+    def __init__(
+        self,
+        *,
+        model_config,
+        server_args,
+        page_size,
+        max_batch_size,
+        max_context_len,
+        token_to_kv_pool,
+        dtype,
+        device,
+        **extra_fields,
+    ):
         # Skip ModelRunner.__init__; assign fields directly.
+        self.model_config = model_config
+        self.server_args = server_args
         self.page_size = page_size
-        self.sliding_window_size = sliding_window_size
+        self.device = device
+        self.dtype = dtype
         self.req_to_token_pool = ReqToTokenPool(...)
-        self.token_to_kv_pool = TokenToKVPool(...)
-        # ... other fields backends read
+        self.token_to_kv_pool = token_to_kv_pool
+        self.token_to_kv_pool_allocator = ...
+        self.sliding_window_size = getattr(model_config, "sliding_window_size", None)
+        self.use_mla_backend = model_config.attention_arch == AttentionArch.MLA
         for k, v in extra_fields.items():
             setattr(self, k, v)
 ```
 
-Using a real subclass means any new field a backend starts reading surfaces immediately
-as `AttributeError` in tests rather than silently returning `None`.
+Use real `ReqToTokenPool` and real KV pools (`MHATokenToKVPool`, `MLATokenToKVPool`,
+DSA/DSV4-specific pools) instead of ad hoc tensors. A real subclass means
+`isinstance` checks pass and missing fields surface as `AttributeError`.
 
-`page_size` and `sliding_window_size` live here — not on `ForwardBatch`.
+#### 1c. Forward context helper
 
-#### 1b. Forward batch factories (per mode)
+```python
+@contextmanager
+def attention_test_context(backend):
+    with forward_context(ForwardContext(attn_backend=backend)):
+        yield
+```
 
-One function per mode, making the required fields explicit:
+All module-level tests use this helper before calling `backend.init_forward_metadata`
+or module `forward`.
+
+#### 1d. Forward batch factories
+
+One function per mode, making required fields explicit:
 
 ```python
 def make_decode_batch(bsz, seq_lens, model_runner) -> ForwardBatch:
-    """Populates: req_pool_indices, out_cache_loc, seq_lens, forward_mode=DECODE."""
+    """req_pool_indices, out_cache_loc, seq_lens, positions, forward_mode=DECODE."""
 
 def make_extend_batch(bsz, prefix_lens, extend_lens, model_runner) -> ForwardBatch:
-    """Populates: req_pool_indices, out_cache_loc, extend_prefix_lens,
-    extend_seq_lens, extend_num_tokens, seq_lens, forward_mode=EXTEND."""
+    """extend_prefix_lens, extend_seq_lens, extend_num_tokens, positions."""
 
 def make_mixed_batch(decode_bsz, extend_bsz, ..., model_runner) -> ForwardBatch:
-    """Combines decode and extend portions; forward_mode=MIXED."""
+    """Combined decode and extend portions; forward_mode=MIXED."""
 
-def make_forward_batch(mode, bsz, seq_lens, model_runner) -> ForwardBatch:
-    """Thin dispatcher to the above."""
+def make_target_verify_batch(spec_info, model_runner) -> ForwardBatch: ...
+def make_draft_extend_batch(spec_info, model_runner, *, v2: bool = False) -> ForwardBatch: ...
+def make_forward_batch(case, model_runner) -> ForwardBatch: ...
 ```
 
-Chunked-KV (`MHA_CHUNKED_KV`) path: activated when `sum_prefix_length >=
-chunked_prefix_cache_threshold` (default 8192). Tests monkeypatch this threshold to a
-small value (e.g., 64) on the mock model runner so the path is triggered with small
-synthetic sequences without expensive large-batch construction.
+Factories must populate `req_to_token_pool.req_to_token` consistently with
+`out_cache_loc`, prefix lengths, page size, and sequence lengths. Add assertions that
+the dense reconstruction sees the expected token order.
 
-#### 1c. KV reconstruction
+#### 1e. KV setup and reconstruction
 
 ```python
+def populate_prefix_kv(
+    module,
+    forward_batch: ForwardBatch,
+    model_runner: MockModelRunner,
+    dense_k: torch.Tensor,
+    dense_v: torch.Tensor,
+) -> None: ...
+
 def reconstruct_dense_kv(
+    module,
     forward_batch: ForwardBatch,
     model_runner: MockModelRunner,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Read K and V back from the paged pool in (bsz, seq_len, num_kv_heads, head_dim)
-    dense layout for feeding into HF reference attention.
-    Called after the sglang forward pass so newly written tokens are included.
-    """
+    """Return dense K/V in batch-major sequence order after SGLang forward."""
 ```
 
-#### 1d. HF reference kernels (hardcoded, no network access)
+For MLA/DSA/DSV4 pools, reconstruction may return family-specific compressed or
+expanded tensors as required by the reference.
+
+#### 1f. Reference helpers
 
 ```python
-def hf_mha_reference(q, k, v, causal=True) -> torch.Tensor: ...
-def hf_gqa_reference(q, k, v, causal=True) -> torch.Tensor: ...
-def hf_swa_reference(q, k, v, window_size: int) -> torch.Tensor: ...
-def hf_mla_reference(q, k_compressed, v_compressed, W_kv_up, ...) -> torch.Tensor: ...
-def hf_draft_extend_reference(q, k, v) -> torch.Tensor:
-    """Standard causal attention — DRAFT_EXTEND is a normal prefill."""
-def hf_target_verify_reference(q, k, v, spec_info) -> torch.Tensor:
-    """Builds the explicit draft tree attention mask from spec_info, then calls
-    F.scaled_dot_product_attention with that mask."""
+def sdpa_mha_reference(...): ...
+def sdpa_gqa_reference(...): ...
+def sdpa_swa_reference(...): ...
+def deepseek_mla_reference(...): ...
+def dsa_reference(...): ...
+def dsv4_reference(...): ...
+def linear_attention_reference(...): ...
+def mamba_reference(...): ...
+def spec_target_verify_reference(...): ...
 ```
 
-`make_tree_attn_mask(spec_info) -> torch.BoolTensor` is a standalone helper used by
-`hf_target_verify_reference`. It constructs the `(total_verify_tokens, total_kv_tokens)`
-boolean mask from the draft tree structure in `spec_info`.
+`make_tree_attn_mask(spec_info)` remains a standalone helper used by speculative
+references.
 
-Each reference calls `F.scaled_dot_product_attention` with the appropriate mask. No
-checkpoint downloads.
-
-#### 1e. Assertion helper
+#### 1g. Assertion helper
 
 ```python
-def assert_close(ref, out, atol=1e-2, rtol=1e-2): ...
+def assert_close(case, ref, out):
+    """Use dtype/family/backend-specific tolerances and print first mismatch."""
 ```
 
 ---
 
 ### Phase 2 — Backend correctness tests (`test/srt/attention/test_backend_correctness.py`)
 
-Each attention type uses its own model-specific attention class — never a bare backend
-call. This ensures all auxiliary calls made during real model forward (e.g.,
-`init_mha_chunk_metadata`, indexer metadata setup) are exercised automatically.
+For each supported `AttentionCase`:
 
-| Attention type | SGLang attention class used in test |
-|---|---|
-| Standard MHA / GQA | `RadixAttention` |
-| SWA | `RadixAttention` (with `sliding_window_size` set on mock runner) |
-| MLA | DeepSeek MLA attention class from `deepseek_v2.py` |
-| DSA | DeepSeek DSA attention class |
-| DSV4 | DeepSeek V4 attention class |
-| Linear (KDA / Lightning / GDN) | `RadixLinearAttention` with the respective backend |
-| Mamba | Mamba mixer class |
+1. Select the `AttentionModuleTarget`.
+2. Build `MockModelRunner` with the hardcoded representative config.
+3. Instantiate the backend through the same registry path used by `ModelRunner`.
+4. Build the module and reference module/kernel.
+5. Initialize shared random weights and deterministic input tensors.
+6. Build `ForwardBatch` through the mode-specific factory.
+7. Populate prefix KV for decode or prefix-extend cases.
+8. Enter `attention_test_context(backend)`.
+9. Call `backend.init_forward_metadata(forward_batch)`.
+10. Call `target.run_sglang(module, inputs, forward_batch)`.
+11. Reconstruct dense or family-specific KV after the forward pass.
+12. Run `target.run_reference(...)`.
+13. Assert output closeness with case-specific tolerances.
 
-For each valid (attention_type, backend, mode, input_shape) combination:
+Required attention config cases:
+- MHA where `num_heads == num_kv_heads`.
+- GQA where `num_heads / num_kv_heads > 1`.
+- MQA where `num_kv_heads == 1`, if supported by the target/backend.
+- SWA with a finite window size.
+- MLA, DSA, DSV4, linear, and Mamba family-specific configs.
 
-1. Build `MockModelRunner` with hardcoded model config.
-2. Instantiate backend via `Backend.__init__(model_runner)`.
-3. Instantiate the model-specific attention class with random weights.
-   For classes with learnable weights (MLA, linear), copy the same random tensors
-   into the HF reference class before comparison.
-4. Build `ForwardBatch` via the appropriate per-mode factory.
-5. Call `backend.init_forward_metadata(forward_batch)`.
-6. Call the attention class's `forward(...)` — this dispatches to the correct backend
-   method and makes all auxiliary calls as the real model forward would.
-7. Reconstruct dense K, V from pool via `reconstruct_dense_kv` (called after forward).
-8. Run the appropriate HF reference on the same Q, dense K, dense V.
-9. `assert_close(hf_output, sglang_output)`.
+Required input cases:
+- Page size 1.
+- Paged KV with representative page sizes such as 32 or 64.
+- Sequence length exactly equal to one page.
+- Sequence length one token below and one token above a page boundary.
+- Prefix length exactly equal to one page.
+- Prefix plus extend length exactly equal to one page.
+- Prefix plus extend length crossing a page boundary.
+- Ragged batch with requests below, exactly at, and above a page boundary.
+- Decode with nonzero prefix.
+- Extend with zero prefix and with nonzero prefix.
+- SWA with `seq_len < window_size`, `seq_len == window_size`, and
+  `seq_len > window_size`.
+- DeepSeek chunked-KV path, triggered through the DeepSeek module.
 
-TBO backend: included in the backend list but deferred — placeholder
-`skipIf(True, "TBO deferred")` tracks the gap.
-
-Invalid combinations are `skipIf`-guarded, not silently dropped.
+Invalid combinations are `skipIf`-guarded through the capability helper.
 
 ---
 
 ### Phase 3 — Runner integration tests (`test/srt/attention/test_runner_integration.py`)
 
-Tests that runner bookkeeping does not corrupt attention outputs. Two-step verification:
+Use a smaller representative subset from Phase 2. The goal is runner bookkeeping, not
+another full correctness matrix.
 
-**Step A — Eager correctness**: `init_forward_metadata` → `attention_layer.forward`.
-Assert output matches HF reference (same as Phase 2). This establishes a known-correct
-eager baseline.
+For each supported runner/backend/family case:
 
-**Step B — Graph consistency**: run CUDA graph capture + replay; assert replayed output
-matches the eager output from Step A. Since Step A verified correctness, matching eager
-is sufficient to prove the graph path is also correct.
+1. Run the eager module path and compare against the reference.
+2. Capture/warm up the graph path:
+   - CUDA graph: `init_cuda_graph_state`, capture metadata, warmup,
+     `on_after_cuda_graph_warmup`, replay metadata.
+   - BCG/PCG: use the corresponding runner APIs and active forward context.
+3. Replay the graph path.
+4. Assert graph replay output matches the eager output.
 
-**CUDA graph / BCG (Step B)**:
-1. `init_cuda_graph_state` → warmup capture → `on_after_cuda_graph_warmup`.
-2. Replay → forward.
-3. Assert replayed output == eager output from Step A.
-
-**PCG**: same two-step pattern with piecewise capture/replay API.
-
----
-
-### Phase 4 — Speculative decoding (`test/srt/attention/test_spec_decoding_attention.py`)
-
-Some backends (e.g., `DFlash`) are exclusively used during spec decode modes and are
-not exercised by Phase 2. Phase 4 is therefore the *only* correctness check for those
-backends — HF comparison is mandatory, not optional.
-
-HF reference strategy per forward mode:
-- **`DRAFT_EXTEND`**: standard causal attention. Use `hf_draft_extend_reference` directly.
-- **`TARGET_VERIFY`**: tree-masked attention. Use `hf_target_verify_reference`, which
-  calls `make_tree_attn_mask(spec_info)` to build the explicit tree mask from the
-  synthetic `SpecInfo`, then passes it to `F.scaled_dot_product_attention`.
-
-For each (spec_worker, execution_mode, draft_runner, topk, num_draft_steps, forward_mode, backend):
-
-1. Construct `SpecInfo` / `EagleInfo` / `FrozenKVMTPInfo` with synthetic draft tree
-   matching (topk, num_draft_steps).
-2. Build `ForwardBatch` for the target forward mode.
-3. `backend.init_forward_metadata(batch)` → `attention_layer.forward(...)`.
-4. Compare output against HF reference (mode-appropriate reference from above).
-
-**Secondary consistency check** (in addition to HF comparison):
-For each (spec_worker, backend) pair, run both eager and cuda_graph execution and assert
-their outputs match. This validates runner bookkeeping independently of math correctness.
-
-Explicitly test:
-- `topk=1` (greedy chain) vs `topk=4` (tree draft).
-- `num_draft_steps=1` vs `num_draft_steps=4`.
-- `get_verify_buffers_to_fill_after_draft()` shape correctness.
-- `update_verify_buffers_to_fill_after_draft(spec_info, cuda_graph_bs)` correctness.
+This phase should include `hybrid_attn` and TBO composition in a focused way instead
+of as part of the full Cartesian product.
 
 ---
 
-## Resolved decisions
+### Phase 4 — Speculative decoding attention (`test/srt/attention/test_spec_decoding_attention.py`)
 
-1. **Linear / Mamba backends**: Use `RadixLinearAttention` (or the Mamba mixer class)
-   as the test target, not a bare backend call. The model-specific attention class
-   is always the entry point.
+#### 4a. Synthetic spec metadata correctness
 
-2. **DSA / DSV4**: Use the model-specific DeepSeek attention class. The indexer
-   metadata is set up naturally by the class's own `forward` method.
+For each supported synthetic spec case:
 
-3. **TBO backend**: Included in the backend table; implementation deferred. A
-   `skipIf(True, "TBO deferred")` placeholder tracks the gap.
+1. Construct synthetic `SpecInput` / EAGLE / Frozen-KV MTP / DFlash / NGRAM metadata
+   matching `topk` and `num_draft_steps`.
+2. Build `ForwardBatch` for `TARGET_VERIFY`, `DRAFT_EXTEND`, or `DRAFT_EXTEND_V2`.
+3. Build module inputs and populate prefix/draft KV as required.
+4. Enter `attention_test_context(backend)`.
+5. Run `backend.init_forward_metadata(batch)` and module forward.
+6. Build the explicit reference mask from `spec_info`.
+7. Compare module output against the speculative reference.
+8. Validate verify-buffer shape/content helpers.
 
-4. **HIP-only backends** (`aiter`, HIP DSV4, `wave`, `ascend`): Same test framework
-   with `skipIf` guards for CUDA-only runners; registered with `register_amd_ci()`
-   (or the appropriate non-CUDA CI registration) alongside the main test class.
+#### 4b. Worker and draft-runner integration
 
-5. **RoPE**: Out of scope for `RadixAttention` (inputs are post-RoPE Q/K/V). In scope
-   for model-specific attention classes (MLA, DSA, DSV4, etc.) — RoPE runs inside
-   their forward; both sglang and HF reference receive the same hidden state, shared
-   weights, and same `positions` tensor.
+For each selected worker family:
 
-6. **Chunked-KV threshold**: Monkeypatched to a small value (e.g., 64) on the mock
-   model runner so the `MHA_CHUNKED_KV` path is triggered with small synthetic
-   sequences.
+1. Run the worker path with tiny synthetic requests or minimal local fixtures.
+2. Inspect the produced `ForwardBatch` and `SpecInput`.
+3. Verify required fields, shapes, cache locations, positions, and mode.
+4. For CUDA graph runners, compare graph replay output against eager output for the
+   same worker/backend family.
 
-7. **Mock model runner**: Implemented as a `ModelRunner` subclass (not `SimpleNamespace`)
-   so `isinstance` checks pass and missing fields surface as `AttributeError`.
-
-8. **Phase 3 verification**: Two-step — Step A compares eager against HF reference,
-   Step B compares graph replay against eager. Only Step A establishes correctness;
-   Step B establishes consistency.
-
-9. **Phase 4 HF reference**: `DRAFT_EXTEND` uses standard causal HF reference.
-   `TARGET_VERIFY` uses `make_tree_attn_mask(spec_info)` to build the explicit tree
-   mask, then `F.scaled_dot_product_attention`. HF comparison is mandatory in Phase 4
-   because some backends are spec-decode-exclusive and not covered by Phase 2.
+Do not run a full Cartesian product of workers, draft runners, backends, `topk`, and
+`num_draft_steps`. Use the capability matrix to select representative cases.
 
 ---
 
-## CI registration
+## Resolved Decisions
 
-- Phase 2: `register_cuda_ci()`, fast tier (target < 60 s total).
-- Phase 3: `register_cuda_ci()`, medium tier.
-- Phase 4: `register_cuda_ci()` under speculative decoding group.
-- AMD variants: `register_amd_ci()` where applicable.
+1. **Primary target boundary**: The main matrix uses model-level attention modules via
+   `AttentionModuleTarget` adapters. Direct `RadixAttention` coverage is retained only
+   as a small leaf-backend smoke suite.
+
+2. **References**: References are family-specific. SDPA is only the reference for
+   MHA/GQA/SWA-style dense attention and speculative masks after dense KV
+   reconstruction; linear, Mamba, MLA, DSA, and DSV4 need their own references.
+
+3. **Forward context**: All module-level tests publish `ForwardContext(attn_backend)`
+   before backend metadata initialization and module forward.
+
+4. **Chunked-KV**: `MHA_CHUNKED_KV` is a DeepSeek attention forward method, not a
+   `ForwardMode`. Trigger it through the DeepSeek attention module by patching the
+   module threshold or environment to a small value.
+
+5. **Capability matrix**: Every parametrized case is filtered through an explicit
+   support helper that returns a skip reason.
+
+6. **Speculative decoding**: Phase 4 is split into synthetic metadata correctness and
+   worker/draft-runner integration. It includes `DRAFT_EXTEND_V2`.
+
+7. **DFlash**: DFlash is a speculative worker/path, not an attention backend.
+
+8. **Mock model runner**: Use a `ModelRunner` subclass plus real request-token and KV
+   pools so missing backend fields fail loudly and pool layout matches production.
+
+9. **Graph verification**: Eager-vs-reference establishes correctness; graph-vs-eager
+   establishes graph metadata and replay consistency.
+
+---
+
+## CI Registration
+
+Use tiers instead of trying to fit the full matrix into one fast job.
+
+- Fast CUDA PR tier: `register_cuda_ci()`, target under 60s. Cover representative
+  MHA/GQA/SWA plus one MLA case across `torch_native`, `triton`, and `flashinfer`;
+  include decode, extend, ragged lengths, and one paged-KV case.
+- Medium CUDA tier: graph integration for selected backends and families, including
+  CUDA graph/BCG/PCG where supported.
+- Nightly CUDA tier: FA3/FA4/FlashMLA/Cutlass/TRTLLM/dual-chunk/hybrid/TBO and larger
+  speculative matrices.
+- Speculative tier: synthetic metadata correctness in fast/medium, worker integration
+  in medium/nightly depending on cost.
+- AMD/NPU/CPU/XPU tiers: register with the appropriate backend-specific CI helpers and
+  skip CUDA-only runner modes.
