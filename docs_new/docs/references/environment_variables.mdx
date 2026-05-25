@@ -393,7 +393,7 @@ SGLang supports various environment variables that can be used to configure its 
 </tbody>
 </table>
 
-## NSA Backend Configuration (For DeepSeek V3.2)
+## DSA Backend Configuration (For DeepSeek V3.2)
 
 {/* # Environment variable to control mtp precomputing of metadata for multi-step speculative decoding */}
 
@@ -412,13 +412,13 @@ SGLang supports various environment variables that can be used to configure its 
   </thead>
   <tbody>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NSA_FUSE_TOPK</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fuse the operation of picking topk logits and picking topk indices from page table</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_FUSE_TOPK</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fuse the operation of picking topk logits and picking topk indices from page table. <code>SGLANG_NSA_FUSE_TOPK</code> is a deprecated alias.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Precompute metadata that can be shared among different draft steps when MTP is enabled</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Precompute metadata that can be shared among different draft steps when MTP is enabled. <code>SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA</code> is a deprecated alias.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
@@ -427,8 +427,8 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When the maximum kv len in current prefill batch exceeds this value, the sparse mla kernel will be applied, else it falls back to dense MHA implementation. Default to the index topk of model (2048 for DeepSeek V3.2)</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When the maximum kv len in current prefill batch exceeds this value, the sparse mla kernel will be applied, else it falls back to dense MHA implementation. Default to the index topk of model (2048 for DeepSeek V3.2). <code>SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD</code> is a deprecated alias.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>2048</code></td>
     </tr>
   </tbody>
