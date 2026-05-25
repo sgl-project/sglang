@@ -2783,6 +2783,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # In DP Attention, IDLE batches are padded (batch_size > 0) for MLP sync.
         # in this case, we need to reinit the forward metadata, otherwise the stale
         # metadata causes batch_size mismatch in attention kernel(e.g. NSA Indexer).
+        # When batch_size == 0 (no padding, e.g. CUDA graphs disabled with MoE +
+        # DP-attention), pad to 1 dummy token so model.forward() can execute the
+        # MoE all-to-all collectives without crashing on empty tensor reshapes.
+        if forward_batch.batch_size == 0:
+            device = forward_batch.input_ids.device
+            forward_batch.input_ids = torch.zeros(1, dtype=torch.int64, device=device)
+            forward_batch.positions = torch.zeros(1, dtype=torch.int64, device=device)
+            forward_batch.batch_size = 1
+            forward_batch.seq_lens = torch.ones(1, dtype=torch.int64, device=device)
+            forward_batch.seq_lens_cpu = torch.ones(1, dtype=torch.int64)
+            forward_batch.seq_lens_sum = 1
+            forward_batch.req_pool_indices = torch.zeros(
+                1, dtype=torch.int64, device=device
+            )
+            forward_batch.out_cache_loc = torch.zeros(
+                1, dtype=torch.int64, device=device
+            )
+
         if forward_batch.batch_size > 0:
             self.attn_backend.init_forward_metadata(forward_batch)
 

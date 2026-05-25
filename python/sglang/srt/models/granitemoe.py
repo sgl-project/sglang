@@ -6,7 +6,14 @@ import torch
 from torch import nn
 from transformers import GraniteConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.layers.dp_attention import (
+    dp_gather_partial,
+    dp_scatter,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    get_global_dp_buffer,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -24,8 +31,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models import mixtral
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
 
@@ -105,20 +114,17 @@ class GraniteMoeAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
+        assert self.total_num_heads % attn_tp_size == 0
+        self.num_heads = self.total_num_heads // attn_tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
+        if self.total_num_kv_heads >= attn_tp_size:
+            assert self.total_num_kv_heads % attn_tp_size == 0
         else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+            assert attn_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
         self.head_dim = hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -136,6 +142,8 @@ class GraniteMoeAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
             prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
@@ -143,6 +151,9 @@ class GraniteMoeAttention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+            use_dp_attention_reduce=True,
             prefix=f"{prefix}.o_proj",
         )
         self.rotary_emb = get_rope(
@@ -215,6 +226,10 @@ class GraniteMoeDecoderLayer(nn.Module):
         )
 
         self.residual_multiplier = config.residual_multiplier
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.dp_gather_enabled = (
+            is_dp_attention_enabled() and get_attention_tp_size() < self.tp_size
+        )
 
     def forward(
         self,
@@ -224,7 +239,6 @@ class GraniteMoeDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        # Self Attention
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -233,7 +247,17 @@ class GraniteMoeDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states * self.residual_multiplier
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.block_sparse_moe(hidden_states)
+
+        if self.dp_gather_enabled:
+            local_hidden_states = hidden_states
+            hidden_states = get_global_dp_buffer()
+            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            hidden_states = self.block_sparse_moe(hidden_states)
+            dp_scatter(local_hidden_states, hidden_states, forward_batch)
+            hidden_states = local_hidden_states
+        else:
+            hidden_states = self.block_sparse_moe(hidden_states)
+
         hidden_states = residual + hidden_states * self.residual_multiplier
 
         return hidden_states
@@ -252,6 +276,7 @@ class GraniteMoeModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
+            use_attn_tp_group=is_dp_attention_enabled(),
         )
         self.embedding_multiplier = config.embedding_multiplier
 
@@ -315,6 +340,7 @@ class GraniteMoeForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
