@@ -13,6 +13,7 @@ from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.pool_patch.adapters.mha import attach_mha
 from sglang.srt.kv_canary.pool_patch.adapters.swa import attach_swa
 from sglang.srt.kv_canary.pool_patch.api import register_pool_attacher
+from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 
 DEFAULT_DEVICE: torch.device = torch.device("cuda")
 
@@ -269,8 +270,6 @@ def make_radix_cache(
 
     slot_lists[0] = root.value (usually empty), [1+] = children chained linearly.
     """
-    from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
-
     cache = RadixCache.__new__(RadixCache)
     cache.device = device
     cache.page_size = 1
