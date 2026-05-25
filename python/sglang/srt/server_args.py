@@ -1618,8 +1618,10 @@ class ServerArgs:
         # Set cuda graph batch sizes
         if self.device != "cpu":
             if decode_cuda_graph_config["bs"] is None:
-                decode_cuda_graph_config["bs"] = self._generate_cuda_graph_batch_sizes(
-                    decode_cuda_graph_config["max_bs"]
+                decode_cuda_graph_config["bs"] = (
+                    self._generate_decode_cuda_graph_batch_sizes(
+                        decode_cuda_graph_config["max_bs"]
+                    )
                 )
             else:
                 decode_cuda_graph_config["max_bs"] = max(decode_cuda_graph_config["bs"])
@@ -1665,7 +1667,7 @@ class ServerArgs:
 
         if prefill_cuda_graph_config["bs"] is None:
             prefill_cuda_graph_config["bs"] = (
-                self._generate_piecewise_cuda_graph_tokens(
+                self._generate_prefill_cuda_graph_batch_sizes(
                     prefill_cuda_graph_config["max_bs"]
                 )
             )
@@ -1735,7 +1737,7 @@ class ServerArgs:
                 "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
             )
 
-    def _generate_cuda_graph_batch_sizes(self, max_bs: int):
+    def _generate_decode_cuda_graph_batch_sizes(self, max_bs: int):
         """
         Generate the list of batch sizes for CUDA graph capture based on ``max_bs``.
         This integrates the logic from cuda_graph_runner.py.
@@ -1788,10 +1790,11 @@ class ServerArgs:
 
         return capture_bs
 
-    def _generate_piecewise_cuda_graph_tokens(self, max_num_tokens: int):
+    def _generate_prefill_cuda_graph_batch_sizes(self, max_bs: int):
         """
-        Generate the list of num_tokens for piecewise CUDA graph capture
-        based on ``max_num_tokens``.
+        Generate the list of batch sizes for prefill CUDA graph capture
+        based on ``max_bs``. For tc_piecewise prefill, ``bs`` carries the
+        captured token count (one shape knob per phase).
         """
         capture_sizes = (
             list(range(4, 33, 4))
@@ -1799,10 +1802,10 @@ class ServerArgs:
             + list(range(288, 513, 32))
             + list(range(576, 1024 + 1, 64))
             + list(range(1280, 4096 + 1, 256))
-            + list(range(4608, max_num_tokens + 1, 512))
+            + list(range(4608, max_bs + 1, 512))
         )
 
-        capture_sizes = [s for s in capture_sizes if s <= max_num_tokens]
+        capture_sizes = [s for s in capture_sizes if s <= max_bs]
 
         return capture_sizes
 
