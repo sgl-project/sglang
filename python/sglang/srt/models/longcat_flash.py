@@ -496,7 +496,6 @@ class LongcatFlashDecoderLayer(nn.Module):
         if enable_double_stream:
             main_stream = self.device_module.current_stream()
             first_attn_finished = self.device_module.Event()
-            fia_ffn_finished_event = self.device_module.Event()
 
             hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
                 hidden_states, residual, forward_batch
@@ -507,7 +506,6 @@ class LongcatFlashDecoderLayer(nn.Module):
             with self.device_module.stream(self.moe_alt_stream):
                 self.device_module.current_stream().wait_event(first_attn_finished)
                 moe_hidden_states = self.mlp(hidden_states)
-                self.device_module.current_stream().wait_event(fia_ffn_finished_event)
                 moe_hidden_states, moe_residual = (
                     self.moe_layer_communicator.postprocess_layer(
                         moe_hidden_states, moe_residual, forward_batch
@@ -521,7 +519,6 @@ class LongcatFlashDecoderLayer(nn.Module):
                 mlp_residual,
                 forward_batch,
                 zero_allocator,
-                fia_ffn_finished_event,
             )
             if not self.is_last_layer and get_moe_a2a_backend().is_deepep():
                 mlp_hidden_states = mlp_hidden_states.tensor_split(self.attn_tp_size)[
@@ -559,7 +556,6 @@ class LongcatFlashDecoderLayer(nn.Module):
         residual,
         forward_batch,
         zero_allocator,
-        fia_ffn_finished_event=None,
     ):
         # first_mlp
         hidden_states, residual = self.mlp_layer_communicator[0].prepare_mlp(
@@ -592,8 +588,6 @@ class LongcatFlashDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
         hidden_states = self.mlps[1](hidden_states)
-        if fia_ffn_finished_event is not None:
-            self.device_module.current_stream().record_event(fia_ffn_finished_event)
         # TP all_reduce
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
