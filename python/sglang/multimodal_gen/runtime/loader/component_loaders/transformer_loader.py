@@ -1,9 +1,12 @@
 import copy
 import logging
+import os
+import time
 from typing import Any
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
@@ -14,6 +17,9 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     resolve_transformer_safetensors_to_load,
 )
 from sglang.multimodal_gen.runtime.loader.utils import _normalize_component_type
+from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    can_use_runai_distributed_streamer,
+)
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -51,6 +57,59 @@ def _server_args_for_transformer_component(
     return component_server_args
 
 
+def _has_merged_param_mapping(model_cls: type[torch.nn.Module]) -> bool:
+    param_names_mapping = getattr(model_cls, "param_names_mapping", {})
+    return any(
+        isinstance(replacement, tuple) for replacement in param_names_mapping.values()
+    )
+
+
+def _checkpoint_size_gib(safetensors_list: list[str]) -> float | None:
+    """infer the model size from checkpoint (GiB)"""
+    if not safetensors_list:
+        return None
+
+    total_bytes = 0
+    for path in safetensors_list:
+        try:
+            total_bytes += os.path.getsize(path)
+        except OSError:
+            return None
+    return total_bytes / (1024**3)
+
+
+def _should_use_runai_distributed_streaming(
+    server_args: ServerArgs,
+    component_server_args: ServerArgs,
+    model_cls: type[torch.nn.Module],
+    quant_spec,
+    safetensors_list: list[str],
+) -> tuple[bool, str]:
+    """distributed runai_model_streaming load faster for large components"""
+    if not can_use_runai_distributed_streamer():
+        return False, "runai distributed streamer is not available"
+    if component_server_args.dit_cpu_offload:
+        return False, "dit_cpu_offload is enabled"
+    if server_args.use_fsdp_inference:
+        return False, "FSDP inference is enabled"
+    if quant_spec.runtime_quant_config is not None:
+        return False, "quantized transformer load is enabled"
+    if quant_spec.post_load_hooks:
+        return False, "post-load hooks are required"
+    if _has_merged_param_mapping(model_cls):
+        return False, "merged parameter mapping is required"
+
+    min_weight_gib = envs.SGLANG_RUNAI_DISTRIBUTED_MODEL_STREAMER_MIN_WEIGHT_GB
+    checkpoint_size_gib = _checkpoint_size_gib(safetensors_list)
+    if checkpoint_size_gib is not None and checkpoint_size_gib < min_weight_gib:
+        return (
+            False,
+            "checkpoint is too small for distributed streaming "
+            f"({checkpoint_size_gib:.2f} GiB < {min_weight_gib:.2f} GiB)",
+        )
+    return True, ""
+
+
 class TransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
@@ -61,6 +120,7 @@ class TransformerLoader(ComponentLoader):
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
         """Load the transformer based on the model path, and inference args."""
+        requested_component_name = component_name
         component_server_args = _server_args_for_transformer_component(
             server_args, component_name
         )
@@ -121,6 +181,28 @@ class TransformerLoader(ComponentLoader):
             logger.debug("quantization config: %s", init_params["quant_config"])
 
         # Load the model using FSDP loader
+        use_runai_distributed_streaming, disabled_reason = (
+            _should_use_runai_distributed_streaming(
+                server_args,
+                component_server_args,
+                model_cls,
+                quant_spec,
+                safetensors_list,
+            )
+        )
+        if use_runai_distributed_streaming:
+            logger.info(
+                "Using RunAI distributed GPU streaming for %s",
+                requested_component_name,
+            )
+        elif can_use_runai_distributed_streamer():
+            logger.info(
+                "RunAI distributed GPU streaming disabled for %s: %s",
+                requested_component_name,
+                disabled_reason,
+            )
+
+        load_start = time.perf_counter()
         model = maybe_load_fsdp_model(
             model_cls=model_cls,
             init_params=init_params,
@@ -135,6 +217,12 @@ class TransformerLoader(ComponentLoader):
             reduce_dtype=torch.float32,
             output_dtype=None,
             strict=False,
+            use_runai_distributed_streaming=use_runai_distributed_streaming,
+        )
+        logger.info(
+            "Loaded %s weights in %.2fs",
+            requested_component_name,
+            time.perf_counter() - load_start,
         )
 
         # post-hooks (e.g., patch scales (nunchaku))
