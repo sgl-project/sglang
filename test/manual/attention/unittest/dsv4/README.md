@@ -34,6 +34,39 @@ folded into the dense, MLA, or DSA folders.
 - Hardware-gated / kernel-specific backend paths beyond flash_mla SWA are not
   enabled yet.
 
+## Production-Unsupported
+
+These are not "next-step follow-ups": production code rejects them and they
+can never appear at runtime.
+
+- **MTP `topk > 1`** —
+  `python/sglang/srt/layers/attention/deepseek_v4_backend.py:369`
+  asserts `self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"`.
+  Same assertion in the HIP radix variant
+  (`deepseek_v4_backend_hip_radix.py:363`). So DSV4 speculative draft-extend
+  / target-verify is *always* chain (`topk=1`); tree spec is structurally
+  impossible.
+- **Non-256 page size** — `deepseek_v4_backend.py:355` (and
+  `deepseek_v4_backend_hip_radix.py:349`,
+  `python/sglang/srt/layers/attention/dsv4/metadata.py:134`) asserts
+  `self.page_size == 256, "the system hardcodes page_size=256"`. Any fixture
+  picking a different page size will trip the assertion at backend
+  construction.
+- **Non-512 head_dim** — `deepseek_v4_backend.py:345-347` asserts
+  `head_dim == 512`. DSV4 is hard-wired to `qk_nope_head_dim=448 +
+  qk_rope_head_dim=64`.
+- **Unknown `compress_ratio`** — `DSV4AttnMetadata.get_flashmla_metadata`
+  raises `ValueError(f"invalid {compress_ratio=}")` for any value outside
+  `Literal[0, 4, 128]` (`deepseek_v4_backend.py:125-133`). So only the three
+  named ratios 0 (SWA), 4 (C4), 128 (C128) are reachable; coverage past
+  `compress_ratio=0` requires fixture extensions for C4 / C128.
+- **Forward modes outside the `_GraphBucket` set** — `_GraphBucket.of`
+  raises `NotImplementedError(f"unsupported {forward_mode=}")` for anything
+  not in `{decode_or_idle, target_verify, draft_extend(v1 or v2)}`
+  (`deepseek_v4_backend.py:320-328`). `init_forward_metadata` itself raises
+  `NotImplementedError(f"unsupported mode")` outside the same set
+  (`deepseek_v4_backend.py:713-714`).
+
 ## Required Fixture Work
 
 - Model the C4 (4x) and C128 (128x) compressed-attention layers and their
@@ -43,7 +76,8 @@ folded into the dense, MLA, or DSA folders.
   covered but DECODE shares enough metadata setup to warrant a separate
   fixture.
 - Add a speculative target-verify and draft-extend fixture using
-  `DSV4RawVerifyMetadata`.
+  `DSV4RawVerifyMetadata` (chain `topk=1` only — tree is production-
+  unsupported).
 - Account for FlashMLA attention-sink semantics with non-zero `attn_sink`
   values (today the reference applies `-1e30`).
 - Extend the reference to `seq_len > SWA_WINDOW=128` once the corresponding
@@ -53,6 +87,6 @@ folded into the dense, MLA, or DSA folders.
 
 - C4 (4x) and C128 (128x) compressed-attention coverage.
 - Decode-mode SWA coverage.
-- Speculative target-verify / draft-extend coverage.
+- Speculative target-verify / draft-extend coverage at `topk == 1` only.
 - Non-zero attention-sink coverage.
 - CUDA graph capture/replay for the DSV4 SWA path.

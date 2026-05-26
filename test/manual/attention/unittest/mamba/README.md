@@ -31,6 +31,24 @@ SSM core entirely in pure torch.
   `MambaAttnBackendBase` dispatch path and Mamba2 cache parameter setup to
   be wired through the fixture.
 
+## Production-Unsupported
+
+- **`Mamba2AttnBackend.forward_decode` / `forward_extend` raise** —
+  `python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py:743-749`
+  raises `NotImplementedError` for direct `forward_decode` / `forward_extend`
+  on `Mamba2AttnBackend`. Production dispatches through
+  `HybridLinearAttnBackend.forward_extend` /
+  `HybridLinearAttnBackend.forward_decode`
+  (`hybrid_linear_attn_backend.py:899-917,868-886`) instead.
+- **CUDA-graph capture/replay outside `DECODE_OR_IDLE` / `TARGET_VERIFY`** —
+  the underlying `MambaAttnBackendBase` capture/replay rejects all other
+  modes (`hybrid_linear_attn_backend.py:509,572`).
+- **Per-mixer head_dim / chunk constraints** — `MambaMixer2.__init__` asserts
+  weight dimension sums (`mamba.py:92`), TP head divisibility
+  (`mamba.py:217,221,226`), and ssd kernels reject mismatched group / chunk
+  shapes (`ops/ssd_chunk_state.py:448-509,576-583`). These are config-time
+  asserts and the test fixture explicitly sets dims to satisfy them.
+
 ## Required Fixture Work
 
 - Wire the `HybridLinearAttnBackend` dispatch wrapper into the fixture so

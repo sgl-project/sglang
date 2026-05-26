@@ -22,7 +22,7 @@ structurally wrong for this method.
   and `query_inter` are active and use independent projection weights.
 - Sparse all-column prefill coverage uses `head_dim=128` to match the local
   sparse FlashAttention build and selects every column in the first chunk
-  (≤16 tokens) so the dense reference remains valid.
+  (<=16 tokens) so the dense reference remains valid.
 - Multi-request sparse and page-boundary sparse variants exercise per-request
   `cu_seqlens_*` slicing inside `_dual_chunk_flash_attn_prefill_func` under
   sparse enabled.
@@ -42,6 +42,28 @@ structurally wrong for this method.
   merges intra, successor, and inter groups by global softmax semantics.
 - Runner and speculative coverage remain intentionally deferred until sparse
   and graph metadata behavior are scoped.
+
+## Production-Unsupported
+
+- **Non-prefill / non-decode forward modes** — `init_forward_metadata` asserts
+  `forward_mode.is_prefill() or forward_mode.is_decode()`
+  (`python/sglang/srt/layers/attention/dual_chunk_flashattention_backend.py:179`).
+  `is_prefill()` aliases to `is_extend()` (`forward_batch_info.py:103-104`) and
+  covers `EXTEND` / `MIXED` / `DRAFT_EXTEND` / `TARGET_VERIFY` /
+  `SPLIT_PREFILL` / `DLLM_EXTEND`, but `DRAFT_EXTEND_V2` is excluded by
+  default. So `DRAFT_EXTEND_V2` is structurally unreachable.
+- **Non-causal / windowed-attention requests** — `forward_extend`
+  raises `ValueError("Dual Chunk Attention does not support causal=False")`
+  (`dual_chunk_flashattention_backend.py:698`) and
+  `ValueError("Dual Chunk Attention does not support window_size")`
+  (`dual_chunk_flashattention_backend.py:700`).
+- **Sparse mode `chunk_len % block_size != 0`** — raises
+  `ValueError("chunk_len must be divisible by block_size.")`
+  (`dual_chunk_flashattention_backend.py:860,1491`). The current fixture
+  picks divisible values.
+- **Unsupported head_dim** — only `head_dim in {16, 32, 64, 128, 256, 512}`
+  is accepted (`dual_chunk_flashattention_backend.py:1611`); other
+  head_dims fail before any kernel call.
 
 ## Next Work
 

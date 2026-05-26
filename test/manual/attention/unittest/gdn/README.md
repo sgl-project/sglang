@@ -27,6 +27,25 @@ PyTorch gated-delta recurrence reference, not Triton/FLA GDN kernels.
 - Phase 4 EAGLE chain/tree coverage includes recurrent state buffers and graph
   replay for the currently stable full-attention backends.
 
+## Production-Unsupported
+
+- **HybridLinearAttnBackend CUDA-graph capture/replay outside
+  `DECODE_OR_IDLE` / `TARGET_VERIFY`** — `MambaAttnBackendBase._capture_metadata`
+  / `_replay_metadata`
+  (`python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py:493-572`)
+  both raise `ValueError(f"Invalid forward mode: {forward_mode=}")` for
+  anything other than decode-or-idle and target-verify. This is the underlying
+  contract for GDN's `Mamba2AttnBackend` as well as for KDA, Lightning, and
+  Mamba2 in this codebase. So `DRAFT_EXTEND` / `DRAFT_EXTEND_V2` CUDA-graph
+  capture/replay is structurally unreachable for the GDN linear-attention side.
+- **HybridLinearAttnBackend `_forward_metadata` modes** — same file
+  (`hybrid_linear_attn_backend.py:246`): non-decode, non-extend modes raise
+  `ValueError`. The legal modes are `is_decode_or_idle`, plus
+  `is_extend(include_draft_extend_v2=True)` (which subsumes
+  `EXTEND` / `MIXED` / `DRAFT_EXTEND` / `DRAFT_EXTEND_V2` / `TARGET_VERIFY` /
+  `SPLIT_PREFILL` / `DLLM_EXTEND` per
+  `model_executor/forward_batch_info.py:106-115`).
+
 ## Next Work
 
 - Add additional linear-attention kernel backend variants when available.

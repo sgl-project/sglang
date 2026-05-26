@@ -30,6 +30,15 @@ conv1d output, per-channel gate broadcast), not the KDA Triton kernel.
   will land alongside the GDN-style coverage once a representative kernel
   contract is selected.
 
+## Production-Unsupported
+
+- **CUDA-graph capture/replay outside `DECODE_OR_IDLE` / `TARGET_VERIFY`** —
+  KDA inherits the same `MambaAttnBackendBase` capture/replay path as GDN, so
+  the `ValueError("Invalid forward mode")` at
+  `python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py:509,572`
+  rejects `DRAFT_EXTEND` / `DRAFT_EXTEND_V2` / `EXTEND` graph runners. Any
+  Phase 4 KDA draft-extend graph runner is structurally unreachable.
+
 ## Next Work
 
 - Add CUDA graph decode and PCG/BCG runner coverage modeled on the existing

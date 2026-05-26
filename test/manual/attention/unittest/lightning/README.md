@@ -31,6 +31,19 @@ outer(k_t, v_t)`, `o_t = q_t @ state_t * head_dim**-0.5`).
   layouts against the pure PyTorch reference.
 - Runner and speculative coverage are intentionally deferred.
 
+## Production-Unsupported
+
+- **`raise ValueError` paths in `LightningAttentionBackend`** —
+  `python/sglang/srt/layers/attention/linear/lightning_backend.py:332` and
+  `lightning_backend.py:369` reject configurations the seg_la kernels do not
+  support; the head-dim assertions above are the practical entry-point
+  guards.
+- **CUDA-graph capture/replay outside `DECODE_OR_IDLE` / `TARGET_VERIFY`** —
+  Lightning inherits the `MambaAttnBackendBase` capture/replay contract, so
+  the same `ValueError("Invalid forward mode")` raises at
+  `python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py:509,572`
+  apply. Draft-extend graph runners are structurally unreachable.
+
 ## Next Work
 
 - Add CUDA graph decode and PCG/BCG runner coverage. Lightning's recurrent

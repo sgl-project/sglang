@@ -135,9 +135,15 @@ Implemented:
   FlashInfer sliding-window metadata updater expects prefix lengths that are not
   supplied by the target-verify path (`prefix_lens=None`), so the Triton SWA spec
   tests cover the interaction for now.
-- FlashInfer MLA EAGLE tree verify (`topk=2`) is intentionally not enabled yet.
-  Chain verify (`topk=1`) passes, but the tree custom-mask path currently
-  mismatches the HF-style PyTorch reference on realistic MLA shapes.
+- FlashInfer MLA EAGLE tree verify (`topk=2`) is **production-unsupported**, not
+  a deferred follow-up. `FlashInferMLAMultiStepDraftBackend.__init__` raises
+  `ValueError("Currently Flashinfer MLA only supports topk=1 for speculative
+  decoding")` at `flashinfer_mla_backend.py:910-913`, so the draft side never
+  runs for MLA EAGLE tree. The same reject is inherited by `TRTLLMMLA`
+  (`trtllm_mla_backend.py:1223-1229`) and `TokenspeedMLA`
+  (`tokenspeed_mla_backend.py:341-347`). FlashMLA has an independent matching
+  reject at `flashmla_backend.py:555-558`. Chain verify (`topk=1`) remains the
+  only valid MLA EAGLE shape. See "Production Support Matrix" below.
 - FlashMLA MLA `DRAFT_EXTEND` CUDA-graph replay is intentionally not enabled yet.
   The eager path passes, but capture falls through to
   `FlashInferMLAAttnBackend.init_forward_metadata_capture_cuda_graph` (since
@@ -1095,9 +1101,23 @@ Current Layer A status:
 - Deferred: Triton `DRAFT_EXTEND` until the fixture/reference semantics are
   clarified; production `DRAFT_EXTEND_V2` / multi-layer draft-runner graph
   coverage until the draft-runner buffer lifecycle is represented faithfully;
-  FlashInfer SWA target verify until prefix-lens metadata is available in its
-  sliding-window updater; GDN speculative verify until recurrent speculative-state
-  setup is represented faithfully.
+  GDN speculative verify until recurrent speculative-state setup is
+  represented faithfully.
+- Production-unsupported (do not add as next-step follow-ups; see
+  "Production Support Matrix"): FlashInfer SWA `TARGET_VERIFY` /
+  `DRAFT_EXTEND` — `FlashInferIndicesUpdaterPrefill.update_sliding_window`
+  computes `min(seq_lens, window + seq_lens - prefix_lens)` at
+  `flashinfer_backend.py:1316`, and the verify/draft paths pass
+  `prefix_lens=None` (`flashinfer_backend.py:742,754`), so the metadata
+  updater cannot run on those modes without a separate prefill-metadata
+  contract fix. FlashInfer non-MLA and FlashInfer MLA `DRAFT_EXTEND_V2` graph
+  capture/replay — the `init_forward_metadata_capture_cuda_graph` and
+  `_replay_cuda_graph` dispatches use `is_draft_extend()` with the default
+  `include_v2=False`, then `raise ValueError` for anything else. FlashInfer
+  MLA / FlashMLA / TRT-LLM MLA / Tokenspeed MLA tree verify (`topk > 1`) —
+  the multi-step draft constructor raises `ValueError` (citations above).
+  DSV4 tree verify (`topk > 1`) — `assert self.topk in [0, 1]` at
+  `deepseek_v4_backend.py:369`.
 
 #### Layer B: worker and draft-runner integration tests
 
@@ -1495,3 +1515,128 @@ output-diff style assertions the rest of the suite relies on:
   argument is dead in this code path and the mutation is a true no-op.
   See the `@unittest.skip`-documented `test_eager_target_verify_prefix_lens_is_noop`
   in `mla/test_flashinfer.py`.
+
+## Production Support Matrix
+
+This section is the canonical place to look up which (backend, forward_mode,
+spec topk, page size, kv dtype, hardware) combinations are *production-
+impossible* — i.e. the production code in `python/sglang/srt/layers/attention/`
+(or `server_args.py`) raises / asserts / hardware-gates before any test
+fixture can reach the kernel. Test fixtures must not list these as
+"next-step" follow-ups; they are blocked by production design.
+
+Every entry below cites the rejecting line in production code. If you add or
+relax a rejection, update the citation here and in the affected per-method
+README.
+
+### Speculative `topk`
+
+| Backend | topk gate | Citation |
+|---|---|---|
+| `flashinfer_mla` | `topk == 1` only | `FlashInferMLAMultiStepDraftBackend.__init__` raises `ValueError("Currently Flashinfer MLA only supports topk=1 for speculative decoding")` at `flashinfer_mla_backend.py:910-913`. Dispatched from `speculative/draft_utils.py:126-132`. |
+| `flashmla` | `topk == 1` only | `FlashMLAMultiStepDraftBackend.__init__` raises `ValueError("Currently FlashMLA only supports topk=1 for speculative decoding")` at `flashmla_backend.py:555-558`. Dispatched from `speculative/draft_utils.py:173-180`. |
+| `trtllm_mla` | `topk == 1` only | `TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend)` at `trtllm_mla_backend.py:1223-1229` inherits the FlashInfer MLA reject. |
+| `tokenspeed_mla` | `topk == 1` only | `TokenspeedMLAMultiStepDraftBackend(TRTLLMMLAMultiStepDraftBackend)` at `tokenspeed_mla_backend.py:341-347` inherits the same reject. |
+| `dsv4` | `topk in {0, 1}` only | `DeepseekV4AttnBackend.__init__` asserts `self.topk in [0, 1]` at `deepseek_v4_backend.py:369` (and `deepseek_v4_backend_hip_radix.py:363`). |
+| `trtllm_mha` | `topk == 1` only in graph replay | Replay branches at `trtllm_mha_backend.py:459` (decode draft) and `trtllm_mha_backend.py:492` (target verify) explicitly comment "Here we only support topk = 1 for now"; matches the server-side note at `server_args.py:2391-2392`. |
+| `triton`, `flashinfer` (non-MLA), `fa3`, `fa4`, `dsa`, GDN / KDA / Lightning / Mamba2 hybrid-linear | No `topk` reject in the multi-step constructor | None — these backends accept `topk > 1`. |
+
+### Forward modes accepted by `init_forward_metadata*`
+
+| Backend | DECODE | EXTEND | MIXED | TARGET_VERIFY | DRAFT_EXTEND | DRAFT_EXTEND_V2 |
+|---|---|---|---|---|---|---|
+| `triton` | yes | yes | yes (via `is_extend`) | yes | yes | yes (`triton_backend.py:696,850` use `include_v2=True`) |
+| `flashinfer` non-MLA | yes | yes | yes | yes | yes | **no graph** (`flashinfer_backend.py:651,748` use default `include_v2=False`; `else: raise ValueError`) |
+| `flashinfer_mla` | yes | yes | yes | yes | yes | **no graph** (`flashinfer_mla_backend.py:432,501` use `is_draft_extend()`; `else: raise ValueError("Invalid mode")` at lines 454-455 / 512) |
+| `flashmla` | yes | yes | — | yes | yes (eager only) | yes (eager only) (`flashmla_backend.py:480-485` lists `EXTEND`, `DRAFT_EXTEND`, `DRAFT_EXTEND_V2`); DRAFT_EXTEND graph capture falls through to FlashInfer MLA path — incompatible buffer layout, see PLAN.md `FlashMLA MLA DRAFT_EXTEND` blocker. |
+| `cutlass_mla` | yes (decode only) | falls through to FlashInfer MLA | — | falls through | falls through | falls through; only `forward_decode` is overridden (`cutlass_mla_backend.py:226`). Graph capture only handles decode (`cutlass_mla_backend.py:156`). |
+| `trtllm_mha` | yes | yes (no graph capture handles extend) | — | yes (topk=1 only) | yes (topk=1 only) | — (replay branches at `trtllm_mha_backend.py:456-538` cover decode_or_idle, target_verify, draft_extend; no draft_extend_v2 branch). |
+| `trtllm_mla` | yes | yes (via super) | — | yes | yes | — (inherits FlashInfer MLA). |
+| `fa3` / `fa4` | yes | yes | yes | yes | yes | yes (`flashattention_backend.py:1914,2259` use `is_draft_extend(include_v2=True)` / `is_draft_extend_v2()`) |
+| `torch_native` | yes | yes | — | — | — | — (no graph at all; verify-path metadata not wired). |
+| `flex_attention` | yes | yes (causal only) | — | — | — | — (no CUDA-graph capture/replay methods; raises for non-causal `torch_flex_backend.py:151`, cross/encoder-only at `torch_flex_backend.py:267-270`). |
+| `dual_chunk_flash_attn` | yes | yes (asserts prefill or decode at `dual_chunk_flashattention_backend.py:179`) | yes (in `is_prefill()` set) | yes (in `is_prefill()` set) | yes (in `is_prefill()` set) | **no** — `is_prefill()` aliases to `is_extend()` without `include_draft_extend_v2`, so `DRAFT_EXTEND_V2` is rejected by `assert forward_mode.is_prefill() or forward_mode.is_decode()`. |
+| `dsa` (DeepseekSparseAttn) | yes | yes (`is_extend`) | yes | yes | yes | yes (`dsa_backend.py:448,491,650-651,940` use `include_v2=True`). |
+| `dsv4` (DeepseekV4) | yes | yes | — | yes | yes | yes (`deepseek_v4_backend.py:326,701` use `include_v2=True`); `_GraphBucket.of` rejects anything else (`deepseek_v4_backend.py:328`). |
+| `HybridLinearAttnBackend` graph capture/replay (GDN, KDA, Lightning, Mamba2) | yes | extend not in graph | — | yes | **no graph** (raises `ValueError("Invalid forward mode")` at `hybrid_linear_attn_backend.py:509,572`) | **no graph** (same `ValueError`) |
+
+### CUDA graph capture/replay availability
+
+A backend can lack CUDA graph either by not overriding the methods (defaults
+raise `NotImplementedError` from `base_attn_backend.py:24-55`) or by raising
+inside its own implementation.
+
+- **No CUDA graph at all**: `torch_native`, `flex_attention`. The Phase 3
+  matrix lists these as eager-only and that is correct.
+- **Decode-only CUDA graph capture**: `cutlass_mla`
+  (`cutlass_mla_backend.py:156`). Anything else falls through to the parent
+  FlashInfer MLA path.
+- **`DRAFT_EXTEND_V2` graph capture/replay unsupported**: FlashInfer non-MLA
+  (`flashinfer_backend.py:651,748`), FlashInfer MLA
+  (`flashinfer_mla_backend.py:432,454-455,501,512`), and the hybrid linear-
+  attention family (GDN / KDA / Lightning / Mamba2) at
+  `hybrid_linear_attn_backend.py:509,572`.
+
+### Page size
+
+| Backend | Allowed page sizes | Citation |
+|---|---|---|
+| `flashmla` | `64` only | `server_args.py:2767-2770` warns and forces `page_size = 64`. |
+| `cutlass_mla` | `128` only | `server_args.py:2776-2779` and `cutlass_mla_backend.py:31` (`PAGE_SIZE = 128`). |
+| `trtllm_mla` | `{32, 64}` | `server_args.py:2790-2794`. |
+| `tokenspeed_mla` | `{32, 64}` | `server_args.py:2809-2813` and `tokenspeed_mla_backend.py:111-113`. |
+| `trtllm_mha` | `{16, 32, 64}` | `server_args.py:2849-2853`. |
+| `fa4` (non-MLA) | `128` only when default-selected | `server_args.py:2862-2870`. |
+| `dsv4` | `256` only | `deepseek_v4_backend.py:355`, `deepseek_v4_backend_hip_radix.py:349`, `dsv4/metadata.py:134`. |
+| `dsa` indexer | `1` (HIP legacy) or `64` (CUDA) | `dsa/dsa_indexer.py:547-548,724-725,550,727,946,1095`; `dsa/transform_index.py:53,79,100,121`. |
+| `intel_xpu` MLA decode | `{16, 32, 64, 128}` | `server_args.py:2906`. |
+| `intel_xpu` non-MLA decode | `{64, 128}` | `server_args.py:2909`. |
+
+### KV cache dtype
+
+| Backend | KV dtype | Citation |
+|---|---|---|
+| `tokenspeed_mla` | `fp8_e4m3` only | `server_args.py:2814-2818`. |
+| `trtllm_mla` | `{fp8_e4m3, fp4_e2m1, bf16, auto}` | `server_args.py:2796-2799`. |
+| `fa3` | not `fp8_e5m2` (silently falls back to `triton`) | `server_args.py:2855-2860`. |
+| `dsv4` | packed FP8/BF16 layout enforced by `DeepSeekV4TokenToKVPool` | `deepseek_v4_backend.py:363`. |
+
+### Hardware (compute capability)
+
+| Backend | Required SM | Citation |
+|---|---|---|
+| `fa3` (non-MLA) | SM 80 or SM 90 | `attention_registry.py:177-180`. |
+| `fa3` (MLA) | SM 90 only | same line. |
+| `trtllm_mha` prefill | SM 100 (Blackwell) | `server_args.py:2831-2834`. |
+| `trtllm_mha` decode | SM 90 / 100 / 120 | `server_args.py:2842-2847`. |
+| `trtllm_mla` | SM 100 or SM12x (Blackwell) | `server_args.py:2785-2788`. |
+| `tokenspeed_mla` | SM 100 / SM12x (Blackwell) | `server_args.py:2805-2807`. |
+| `cutlass_mla` | SM 10.0 (Blackwell) | observed in tests; backend uses `cutlass_mla_decode` from `sgl_kernel` requiring Blackwell. |
+
+### MLA dimensions and shape gates
+
+| Backend | Constraint | Citation |
+|---|---|---|
+| `dsv4` | `head_dim == 512` (= `qk_nope=448 + qk_rope=64`) | `deepseek_v4_backend.py:345-347`. |
+| `dsv4` | `compress_ratio in {0, 4, 128}` | `deepseek_v4_backend.py:125-133`. |
+| `dsv4` | `c4_sparse_topk in {512, 1024}` | `deepseek_v4_backend.py:246`. |
+| `flashinfer` (non-MLA) | SM90 prefill kernels require `value_head_dim in {64, 128, 256}` | observed in existing tests, fixture uses `head_dim=64`. |
+| `dual_chunk_flash_attn` | `head_dim in {16, 32, 64, 128, 256, 512}` | `dual_chunk_flashattention_backend.py:1611`. |
+| `dual_chunk_flash_attn` | `chunk_len % block_size == 0` (sparse path) | `dual_chunk_flashattention_backend.py:860,1491`. |
+
+### Hybrid / TBO wrappers
+
+- `HybridAttnBackend` (`hybrid_attn_backend.py`): composes a separate prefill
+  and decode backend. Each child backend's own production-support constraints
+  apply.
+- `TboAttnBackend` (`tbo_backend.py`): two-batch overlap wrapper. The
+  child-pair must agree on graph mode and KV cache layout; otherwise the
+  child constraints again dominate.
+- `HybridLinearAttnBackend` (`hybrid_linear_attn_backend.py`): wraps a
+  full-attention backend with a linear-attention backend
+  (Mamba2 / GDN / KDA / Lightning). Both children share `topk` / `forward_mode`
+  metadata, so the joint capability is the *intersection* of the two child
+  capability tables (notably: graph capture only for `DECODE_OR_IDLE` and
+  `TARGET_VERIFY`).
+
+

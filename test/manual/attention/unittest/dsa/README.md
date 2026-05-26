@@ -36,6 +36,23 @@ small deterministic backend slices with independent PyTorch references.
 - Higher-level registered/model coverage should stay separate from this
   folder's small deterministic unit matrix.
 
+## Production-Unsupported
+
+- **Page size other than 1 (HIP legacy path) or 64 (CUDA path)** — the DSA
+  indexer hard-asserts the page size: HIP legacy at
+  `python/sglang/srt/layers/attention/dsa/dsa_indexer.py:547-548,724-725`
+  (`assert page_size == 1`) and CUDA at
+  `dsa/dsa_indexer.py:550,727,946,1095` and
+  `dsa/index_buf_accessor.py:436` (`assert page_size == 64`). The
+  `dsa/transform_index.py:53,79,100,121` helpers also assert `page_size == 1`.
+- **`Unsupported {forward_batch.forward_mode = }`** — `forward_extend`
+  fall-through path asserts `False`
+  (`python/sglang/srt/layers/attention/dsa_backend.py:629`) for modes outside
+  decode-or-idle, target-verify, extend, draft-extend (v1/v2). Mode coverage
+  is broader than for dual_chunk: DSA accepts `is_decode_or_idle`,
+  `is_extend()` (which includes `MIXED`, `DRAFT_EXTEND`, `TARGET_VERIFY`,
+  `SPLIT_PREFILL`, `DLLM_EXTEND`), and `is_draft_extend(include_v2=True)`.
+
 ## Required Fixture Work
 
 - Extend the sparse reference to additional block/index layouts that diverge
