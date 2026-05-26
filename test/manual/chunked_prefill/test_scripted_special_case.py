@@ -27,7 +27,6 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     run_until,
-    run_until_all_finished,
     run_until_finished,
 )
 
@@ -43,15 +42,30 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
     # scheduler.py:2487 / 2499. While r1 is mid-chunk, the scheduler must
     # *not* return None from ``_get_new_batch_prefill_raw`` even if the
     # waiting_queue is empty — the in-flight chunked req still needs
-    # continuation.
+    # continuation. In-loop S2 invariant ensures the chunked_req is
+    # never simultaneously in the running batch (mutually-exclusive slot).
     @staticmethod
     def _script_chunked_in_flight_no_idle(t: ScriptedRuntime):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
-        # waiting_queue is empty (no other reqs submitted), but r is mid-chunk.
-        # The scheduler must keep advancing — if it idled out, r would never finish.
-        yield from run_until_finished(r)
+        # While r is chunking, scheduler must not idle and S2 invariant must hold.
+        saw_chunking = False
+        for _ in range(DEFAULT_MAX_STEPS):
+            if r.is_chunking:
+                saw_chunking = True
+                assert (
+                    not t.is_idle
+                ), "scheduler must not idle while chunked_req is in flight"
+            assert t.chunked_req_in_batch_violation_count() == 0, (
+                "S2 invariant: chunked_req must be mutually exclusive with "
+                "running_batch.reqs"
+            )
+            if r.finished:
+                break
+            yield
         assert r.finished
+        assert saw_chunking, "test must observe r mid-chunk at least once"
+        assert t.chunked_req_in_batch_violation_count() == 0
 
     def test_add_chunked_req_path(self):
         """``adder.add_chunked_req`` path (scheduler.py:2541-2548)."""
@@ -59,13 +73,23 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
 
     # ``adder.add_chunked_req`` path (scheduler.py:2541-2548). The
     # primary chunked-resume admission loop. Naive long request exercises
-    # this on every chunk after the first.
+    # this on every chunk after the first. Across multi-chunk admission,
+    # B6 invariant must hold: extend_batch_idx is monotonic (only reset
+    # path may shrink it).
     @staticmethod
     def _script_add_chunked_req_path(t: ScriptedRuntime):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
+        for _ in range(DEFAULT_MAX_STEPS):
+            assert r.extend_batch_idx_regression_count == 0, (
+                "B6 invariant: extend_batch_idx must be monotonic across "
+                "consecutive chunk admissions"
+            )
+            if r.finished:
+                break
+            yield
         assert r.finished
         assert r.chunks_done >= 2
+        assert r.extend_batch_idx_regression_count == 0
 
     def test_admission_with_chunked_in_flight(self):
         """``add_one_req`` kwarg ``has_chunked_req=True`` propagation (scheduler.py:2593)."""
@@ -73,7 +97,8 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
 
     # ``add_one_req`` kwarg ``has_chunked_req=True`` propagation
     # (scheduler.py:2593). With a chunked req in flight, the admission of
-    # new reqs takes this code path.
+    # new reqs takes this code path. S2 invariant must hold across both
+    # reqs' lifetimes.
     @staticmethod
     def _script_admission_with_chunked_in_flight(t: ScriptedRuntime):
         r_chunk = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -87,8 +112,16 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
         # has had to take has_chunked_req=True branch.
         comp = t.batch_composition()
         assert r_chunk.rid in comp.get("chunked", [])
-        yield from run_until_finished(r_small)
-        yield from run_until_finished(r_chunk)
+
+        for _ in range(DEFAULT_MAX_STEPS):
+            assert t.chunked_req_in_batch_violation_count() == 0, (
+                "S2 invariant: admission with has_chunked_req=True must "
+                "not place chunked_req into running batch"
+            )
+            if r_small.finished and r_chunk.finished:
+                break
+            yield
+        assert r_small.finished and r_chunk.finished
 
     def test_new_chunked_req_first_chunk(self):
         """``adder.new_chunked_req`` assignment on first chunk (scheduler.py:2636-2642)."""
@@ -96,14 +129,27 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
 
     # ``adder.new_chunked_req`` assignment on first chunk
     # (scheduler.py:2636-2642). The very first chunk of a long req takes
-    # this assignment + assert path.
+    # this assignment + assert path. The chunked req must transition
+    # through is_chunking and S2 invariant must hold throughout.
     @staticmethod
     def _script_new_chunked_req_first_chunk(t: ScriptedRuntime):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield  # request enters admission, new_chunked_req path triggers
         yield from run_until(r, lambda h: h.chunks_done >= 1)
-        yield from run_until_finished(r)
+        # While the chunked req runs, S2 invariant must stay zero.
+        saw_chunking = False
+        for _ in range(DEFAULT_MAX_STEPS):
+            if r.is_chunking:
+                saw_chunking = True
+            assert (
+                t.chunked_req_in_batch_violation_count() == 0
+            ), "S2 invariant: chunked_req exclusive of running batch"
+            if r.finished:
+                break
+            yield
         assert r.finished
+        assert r.chunks_done >= 1
+        assert saw_chunking, "first-chunk assignment branch must be exercised"
 
     def test_inflight_middle_chunks_counter(self):
         """``inflight_middle_chunks += 1`` every iteration the chunked req is admitted (scheduler.py:2644-2645)."""
@@ -111,7 +157,9 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
 
     # ``inflight_middle_chunks += 1`` every iteration the chunked
     # req is admitted (scheduler.py:2644-2645). Counter should equal
-    # number of chunks minus the initial admission.
+    # number of chunks minus the initial admission. R1 invariant:
+    # decrement only fires on the final chunk — premature decrement
+    # counter must stay zero.
     @staticmethod
     def _script_inflight_middle_chunks_counter(t: ScriptedRuntime):
         # 3 chunks: chunks_done == 3, inflight_middle_chunks ++ for chunks 1, 2.
@@ -122,14 +170,21 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
         # Exact value depends on implementation; lower bound: at least 1
         # middle chunk for a 3-chunk request.
         assert r.inflight_middle_chunks >= 1
+        # R1 invariant — inflight_middle_chunks decrement must only fire
+        # on the final chunk; premature-decrement counter == 0.
+        assert r.inflight_middle_chunks_premature_decrement_count == 0, (
+            f"R1 invariant: inflight_middle_chunks decremented before final "
+            f"chunk {r.inflight_middle_chunks_premature_decrement_count} times"
+        )
 
     def test_chunked_req_passes_through_batch(self):
         """``chunked_req=self.chunked_req`` wiring into ScheduleBatch (scheduler.py:2658)."""
         self.runtime.run(self._script_chunked_req_passes_through_batch)
 
     # ``chunked_req=self.chunked_req`` wiring into ScheduleBatch
-    # (scheduler.py:2658). Verifies ``extend_input_len`` correctly
-    # reflects the *remaining* tokens after each chunk.
+    # (scheduler.py:2658). Verifies the wiring places the chunked req in
+    # the chunked slot of the batch composition, and S2 invariant holds
+    # across the chunked lifecycle.
     @staticmethod
     def _script_chunked_req_passes_through_batch(t: ScriptedRuntime):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -138,7 +193,15 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
         comp = t.batch_composition()
         assert r.rid in comp.get("chunked", [])
 
-        yield from run_until_finished(r)
+        for _ in range(DEFAULT_MAX_STEPS):
+            assert t.chunked_req_in_batch_violation_count() == 0, (
+                "S2 invariant: chunked_req must remain mutually exclusive "
+                "of running_batch.reqs"
+            )
+            if r.finished:
+                break
+            yield
+        assert r.finished
 
     def test_no_idle_during_chunked(self):
         """Idle path bypass — ``chunked_req is None`` check in ``check_idle`` (scheduler.py:3174)."""
@@ -183,16 +246,28 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
 
     @staticmethod
     def _script_get_chunked_req_lambda_getter(t: ScriptedRuntime):
-        # scheduler.py:680 — get_chunked_req lambda. Verify that during
-        # a chunked req's lifetime, the getter returns the right rid.
+        # scheduler.py:680 — get_chunked_req lambda. While r is chunking,
+        # the getter must always return r.rid (never some other rid or
+        # stale value). Verified across the whole mid-chunk window.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
-
-        # NEW API NEEDED: t.get_chunked_req_rid() — query the scheduler's
-        # current chunked_req's rid (or None).
-        cur = t.get_chunked_req_rid()
-        if cur is not None:
-            assert cur == r.rid
+        saw_match = False
+        for _ in range(DEFAULT_MAX_STEPS):
+            if r.is_chunking:
+                cur = t.get_chunked_req_rid()
+                assert cur in (None, r.rid), (
+                    f"getter returned unrelated rid: got {cur!r}, expected "
+                    f"None or {r.rid!r}"
+                )
+                if cur == r.rid:
+                    saw_match = True
+            if r.finished:
+                break
+            yield
+        assert r.finished
+        assert saw_match, "getter must return r.rid at least once while r.is_chunking"
+        # After finish the slot must be cleared back to None.
+        assert t.get_chunked_req_rid() is None
 
     def test_chunked_req_reset_to_none(self):
         """Scheduler.py:3596 — chunked_req=None reset path."""
@@ -207,68 +282,44 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
         cur = t.get_chunked_req_rid()
         assert cur is None
 
+    @unittest.skip(
+        "requires real disaggregation prefill/decode split — single-engine "
+        "ScriptedRuntime cannot exercise the decode-side waiting_queue "
+        "KV-hold path. Belongs in test_scripted_disagg.py with D3 counter "
+        "wiring once disagg topology is available."
+    )
     def test_disagg_decode_waiting_queue_kv_held(self):
         """Disaggregation/decode.py — waiting_queue reqs hold KV in decode mode."""
-        self.runtime.run(self._script_disagg_decode_waiting_queue_kv_held)
 
-    @staticmethod
-    def _script_disagg_decode_waiting_queue_kv_held(t: ScriptedRuntime):
-        # disaggregation/decode.py — waiting_queue reqs hold KV in decode mode.
-        # Smoke: chunked req traverses decode-side waiting state cleanly.
-        # TODO(round-3): recreate the specific bug shape; this currently
-        # is a forward-pointing smoke.
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
-
+    @unittest.skip(
+        "requires DLLM model + staging mixin — single-engine cannot drive "
+        "both DLLM staging AND chunked admission incrementing "
+        "pending_middle_outputs from two sources. Belongs in DLLM-specific "
+        "test file."
+    )
     def test_dllm_staging_double_pending_middle_outputs(self):
-        """Dllm/mixin/scheduler.py — DLLM staging AND chunked admission both incrementing pending_middle_outputs (double-source)."""
-        self.runtime.run(self._script_dllm_staging_double_pending_middle_outputs)
+        """Dllm/mixin/scheduler.py — DLLM staging double-source pending_middle_outputs."""
 
-    @staticmethod
-    def _script_dllm_staging_double_pending_middle_outputs(t: ScriptedRuntime):
-        # dllm/mixin/scheduler.py — DLLM staging AND chunked admission both
-        # incrementing pending_middle_outputs (double-source).
-        # Single-engine smoke (DLLM model required for full coverage).
-        # TODO(round-3): recreate the specific bug shape; this currently
-        # is a forward-pointing smoke.
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
-
+    @unittest.skip(
+        "requires real disaggregation topology — single-engine cannot "
+        "exercise staging_handler chunked path."
+    )
     def test_staging_handler_chunked(self):
         """Disaggregation/common/staging_handler.py — chunked interaction."""
-        self.runtime.run(self._script_staging_handler_chunked)
 
-    @staticmethod
-    def _script_staging_handler_chunked(t: ScriptedRuntime):
-        # disaggregation/common/staging_handler.py — chunked interaction.
-        # TODO(round-3): recreate the specific bug shape; this currently
-        # is a forward-pointing smoke.
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
-
+    @unittest.skip(
+        "requires mooncake KV transport backend — single-engine cannot "
+        "drive the conn layer chunked path."
+    )
     def test_mooncake_conn_chunked(self):
         """Disaggregation/mooncake/conn.py — chunked path in conn layer."""
-        self.runtime.run(self._script_mooncake_conn_chunked)
 
-    @staticmethod
-    def _script_mooncake_conn_chunked(t: ScriptedRuntime):
-        # disaggregation/mooncake/conn.py — chunked path in conn layer.
-        # TODO(round-3): recreate the specific bug shape; this currently
-        # is a forward-pointing smoke.
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
-
+    @unittest.skip(
+        "requires NIXL KV transport backend — single-engine cannot drive "
+        "the NIXL conn layer chunked path."
+    )
     def test_nixl_conn_chunked(self):
         """Disaggregation/nixl/conn.py — chunked path."""
-        self.runtime.run(self._script_nixl_conn_chunked)
-
-    @staticmethod
-    def _script_nixl_conn_chunked(t: ScriptedRuntime):
-        # disaggregation/nixl/conn.py — chunked path.
-        # TODO(round-3): recreate the specific bug shape; this currently
-        # is a forward-pointing smoke.
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
 
     def test_idle_path_chunked_req_none(self):
         """Scheduler.py:3174 — idle path checks chunked_req is None."""
@@ -291,10 +342,26 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
     @staticmethod
     def _script_admission_path_with_chunked_inflight_flag(t: ScriptedRuntime):
         # scheduler.py:2593 — add_one_req called with has_chunked_req=True.
+        # While r_chunked is in flight, S2 invariant must remain zero across
+        # every admission attempt (new short req cannot collide with the
+        # chunked slot).
         r_chunked = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r_chunked, lambda h: h.is_chunking)
+        # Confirm r_chunked is in batch as chunked at this point.
+        comp = t.batch_composition()
+        assert r_chunked.rid in comp.get(
+            "chunked", []
+        ), f"r_chunked must occupy chunked slot before admission; got {comp!r}"
         r_new = t.start_req(prompt_len=16, max_new_tokens=2)
-        yield from run_until_all_finished([r_chunked, r_new])
+        for _ in range(DEFAULT_MAX_STEPS):
+            assert t.chunked_req_in_batch_violation_count() == 0, (
+                "S2 invariant: admission of new req must not place chunked_req "
+                "into running batch simultaneously"
+            )
+            if r_chunked.finished and r_new.finished:
+                break
+            yield
+        assert r_chunked.finished and r_new.finished
 
     def test_inflight_counter_increments_each_chunk(self):
         """Scheduler.py:2644-2645 — inflight_middle_chunks += 1 per chunk."""
@@ -303,6 +370,8 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
     @staticmethod
     def _script_inflight_counter_increments_each_chunk(t: ScriptedRuntime):
         # scheduler.py:2644-2645 — inflight_middle_chunks += 1 per chunk.
+        # In-loop R1 invariant: premature-decrement count must never grow
+        # while the counter is incrementing.
         r = t.start_req(prompt_len=4 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         saw_increment = False
         last = 0
@@ -311,11 +380,17 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
             if cur > last:
                 saw_increment = True
             last = max(last, cur)
+            assert r.inflight_middle_chunks_premature_decrement_count == 0, (
+                "R1 invariant: inflight_middle_chunks must only decrement "
+                "on the final chunk"
+            )
             if r.finished:
                 break
             yield
         # After at least one chunk, the counter must have moved up at some point.
         assert saw_increment, "expected inflight_middle_chunks to increment"
+        assert r.finished
+        assert r.inflight_middle_chunks_premature_decrement_count == 0
 
     def test_filter_batch_exclude_chunked_flag(self):
         """Filter_batch + chunked: exclude_chunked_req branch."""
@@ -323,48 +398,67 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
 
     @staticmethod
     def _script_filter_batch_exclude_chunked_flag(t: ScriptedRuntime):
-        # filter_batch + chunked: exclude_chunked_req branch.
+        # filter_batch + chunked: exclude_chunked_req branch. While both
+        # reqs are alive, the chunked slot must stay mutually exclusive
+        # of the running batch — S2 invariant must hold every step.
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         r2 = t.start_req(prompt_len=16, max_new_tokens=2)
-        yield from run_until_all_finished([r1, r2])
+        saw_r1_chunking = False
+        for _ in range(DEFAULT_MAX_STEPS * 2):
+            if r1.is_chunking:
+                saw_r1_chunking = True
+            assert t.chunked_req_in_batch_violation_count() == 0, (
+                "S2 invariant: filter_batch must keep chunked slot "
+                "mutually-exclusive of running batch"
+            )
+            if r1.finished and r2.finished:
+                break
+            yield
+        assert r1.finished and r2.finished
+        assert (
+            saw_r1_chunking
+        ), "r1 must have chunked at some point to exercise the exclude branch"
 
+    @unittest.skip(
+        "pdmux split_prefill_batch requires the pdmux topology — "
+        "single-engine ScriptedRuntime cannot drive the split path. "
+        "Belongs in a pdmux-specific test once that lane is wired up."
+    )
     def test_pdmux_split_prefill_batch(self):
         """34c02d6a67: filter chunked-resume from split_prefill_batch."""
-        self.runtime.run(self._script_pdmux_split_prefill_batch)
-
-    @staticmethod
-    def _script_pdmux_split_prefill_batch(t: ScriptedRuntime):
-        # 34c02d6a67: filter chunked-resume from split_prefill_batch.
-        # pdmux-specific; single-engine smoke.
-        # TODO(round-3): recreate the specific bug shape; this currently
-        # is a forward-pointing smoke.
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
 
     def test_streaming_session_kv_committed_bound(self):
-        """116584e8fa: bound streaming-session chunked stash by kv_committed_len."""
+        """116584e8fa: streaming-session chunked stash must stay bounded by kv_committed_len."""
         self.runtime.run(self._script_streaming_session_kv_committed_bound)
 
+    # 116584e8fa: bound streaming-session chunked stash by
+    # kv_committed_len. Across the chunked lifecycle, any positional
+    # length surfaced to the next chunk (prefix_indices) must not exceed
+    # the committed KV length — otherwise the next chunk would read
+    # uninitialized rows.
     @staticmethod
     def _script_streaming_session_kv_committed_bound(t: ScriptedRuntime):
-        # 116584e8fa: bound streaming-session chunked stash by kv_committed_len.
-        # TODO(round-3): recreate the specific bug shape; this currently
-        # is a forward-pointing smoke.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
+        for _ in range(DEFAULT_MAX_STEPS):
+            if r.is_chunking:
+                assert r.prefix_indices_len <= r.kv_committed_len, (
+                    f"streaming-session chunked stash must stay bounded by "
+                    f"kv_committed_len; prefix_indices_len={r.prefix_indices_len}, "
+                    f"kv_committed_len={r.kv_committed_len}"
+                )
+            if r.finished:
+                break
+            yield
+        assert r.finished
 
+    @unittest.skip(
+        "mamba_pool_idx cleanup applies only to mamba-class models — "
+        "single-engine with a non-mamba model cannot drive the NO_TOKEN "
+        "chunked-resume cleanup-skip branch. Belongs in a mamba-specific "
+        "test file once mamba scripted coverage is added."
+    )
     def test_mamba_pool_idx_cleanup_skip_chunked_resume(self):
         """Dbdcdde245: skip mamba_pool_idx cleanup for chunked-resume on NO_TOKEN."""
-        self.runtime.run(self._script_mamba_pool_idx_cleanup_skip_chunked_resume)
-
-    @staticmethod
-    def _script_mamba_pool_idx_cleanup_skip_chunked_resume(t: ScriptedRuntime):
-        # dbdcdde245: skip mamba_pool_idx cleanup for chunked-resume on
-        # NO_TOKEN. Mamba-specific; single-engine smoke.
-        # TODO(round-3): recreate the specific bug shape; this currently
-        # is a forward-pointing smoke.
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
 
     # ================================================================
     # Round-3 source-driven additions.
@@ -379,15 +473,34 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
         # scheduler.py: get_num_allocatable_reqs is the gate for
         # admitting new waiters, but a chunked req mid-flight must bypass
         # it on the resume iteration. Drive into mid-chunk, then exhaust
-        # the req pool externally; the chunked req must still complete.
+        # the req pool externally; the chunked req must still complete
+        # AND keep making progress (chunks_done advancing).
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
+        chunks_before_pressure = r.chunks_done
 
         # Force the req pool to look exhausted to a fresh waiter.
-        t.exhaust_row_pool()
-        # The in-flight chunked req must still advance to completion.
-        yield from run_until_finished(r)
+        t.exhaust_row_pool(leave_rows=0)
+
+        # The in-flight chunked req must still advance to completion, and
+        # must do so while S2 invariant holds (no slot collision under
+        # pressure).
+        progressed_under_pressure = False
+        for _ in range(DEFAULT_MAX_STEPS * 2):
+            if r.chunks_done > chunks_before_pressure:
+                progressed_under_pressure = True
+            assert (
+                t.chunked_req_in_batch_violation_count() == 0
+            ), "S2 invariant must hold even under row-pool exhaustion"
+            if r.finished:
+                break
+            yield
         assert r.finished
+        assert progressed_under_pressure, (
+            "chunked req must advance even when get_num_allocatable_reqs "
+            "returns 0; pre-fix the bypass would block forever"
+        )
+        assert r.kv_pages == 0
 
     def test_pause_retract_clears_chunked_req(self):
         """Pause_generation(retract) mid-chunk: scheduler.chunked_req is cleared and all reqs retracted."""
@@ -696,24 +809,23 @@ class TestSpecialCaseDynamicChunking(ScriptedRuntimeTestCase):
     # dynamic chunking reads ``history_len`` from
     # ``self.chunked_req.prefix_indices`` (scheduler.py:2516-2517). With
     # ``--enable-dynamic-chunking``, the per-iter chunk size adjusts to
-    # the chunked req's history length.
+    # the chunked req's history length. S2 and B6 invariants must hold
+    # since dynamic chunking varies extend_batch_idx more aggressively.
     @staticmethod
     def _script_dynamic_chunking_history_len(t: ScriptedRuntime):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
+        for _ in range(DEFAULT_MAX_STEPS):
+            assert t.chunked_req_in_batch_violation_count() == 0
+            assert r.extend_batch_idx_regression_count == 0
+            if r.finished:
+                break
+            yield
         assert r.finished
         assert r.chunks_done >= 2
 
-    def test_dynamic_chunking_history_len_extra(self):
-        """Scheduler.py:2516-2517 — dynamic chunking reads history_len from chunked_req."""
-        self.runtime.run(self._script_dynamic_chunking_history_len_extra)
-
-    @staticmethod
-    def _script_dynamic_chunking_history_len_extra(t: ScriptedRuntime):
-        # scheduler.py:2516-2517 — dynamic chunking reads history_len from
-        # chunked_req. Enabled via --enable-dynamic-chunking.
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
+    # test_dynamic_chunking_history_len_extra was deleted: it duplicated
+    # test_dynamic_chunking_history_len above (same scenario, weaker
+    # body — no assertions). REDUNDANT.
 
 
 class TestSpecialCaseMixedChunk(ScriptedRuntimeTestCase):
@@ -751,7 +863,20 @@ class TestSpecialCaseMixedChunk(ScriptedRuntimeTestCase):
             t.forward_mode == "MIXED"
         ), f"expected forward_mode == MIXED with enable_mixed_chunk, got {t.forward_mode!r}"
 
-        yield from run_until_all_finished([r_chunk, *decodes])
+        # B6 + S2 invariants must hold across the mixed-chunk lifecycle.
+        all_reqs = [r_chunk, *decodes]
+        for _ in range(DEFAULT_MAX_STEPS * 2):
+            assert t.chunked_req_in_batch_violation_count() == 0, (
+                "S2 invariant: mix-with-running must not duplicate chunked_req "
+                "into running batch"
+            )
+            assert (
+                r_chunk.extend_batch_idx_regression_count == 0
+            ), "B6 invariant: extend_batch_idx must stay monotonic in MIXED mode"
+            if all(x.finished for x in all_reqs):
+                break
+            yield
+        assert all(x.finished for x in all_reqs)
 
     def test_mixed_chunk_with_logprob_falls_back(self):
         """Enable_mixed_chunk + return_logprob: mix path is bypassed for logprob reqs."""
@@ -794,7 +919,14 @@ class TestSpecialCaseMixedChunk(ScriptedRuntimeTestCase):
         assert (
             t.forward_mode == "MIXED"
         ), f"chunked admission with running batch must enter MIXED; got {t.forward_mode!r}"
-        yield from run_until_all_finished([r_chunk, r_dec])
+        # B6 + S2 invariants must hold while MIXED runs.
+        for _ in range(DEFAULT_MAX_STEPS * 2):
+            assert t.chunked_req_in_batch_violation_count() == 0
+            assert r_chunk.extend_batch_idx_regression_count == 0
+            if r_chunk.finished and r_dec.finished:
+                break
+            yield
+        assert r_chunk.finished and r_dec.finished
 
 
 class TestSpecialCaseTransformers(ScriptedRuntimeTestCase):
@@ -935,7 +1067,9 @@ class TestSpecialCaseHiCache(ScriptedRuntimeTestCase):
         # schedule_batch.py:1909-1932: ``cached_tokens_*`` (HiCache
         # breakdown stats) should be populated only on the first chunk.
         # Subsequent chunks must not overwrite — that would double-count
-        # the prefix cache hit metric.
+        # the prefix cache hit metric. B5 counter
+        # (hicache_cached_tokens_write_count) makes this invariant
+        # directly observable: must stay <= 1 across the whole lifecycle.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         first_chunk_snap = None
         for _ in range(DEFAULT_MAX_STEPS):
@@ -947,10 +1081,19 @@ class TestSpecialCaseHiCache(ScriptedRuntimeTestCase):
                     f"HiCache cached_tokens_* must freeze after first chunk; "
                     f"first={first_chunk_snap!r}, now={cur!r}"
                 )
+            # B5 invariant — cached_tokens_* must be written at most once.
+            assert r.hicache_cached_tokens_write_count <= 1, (
+                f"B5 invariant: HiCache cached_tokens_* written more than "
+                f"once; count={r.hicache_cached_tokens_write_count}"
+            )
             if r.finished:
-                return
+                break
             yield
-        raise AssertionError("chunked req did not finish")
+        assert r.finished
+        assert r.hicache_cached_tokens_write_count <= 1, (
+            f"B5 invariant: final hicache_cached_tokens_write_count must be "
+            f"<= 1, got {r.hicache_cached_tokens_write_count}"
+        )
 
     def test_init_load_back_called_once_per_request_with_hicache(self):
         """HiCache + multi-chunk req: init_load_back fires exactly once for the whole req, not once per chunk."""
@@ -980,6 +1123,13 @@ class TestSpecialCaseHiCache(ScriptedRuntimeTestCase):
             f"HiCache init_load_back must run exactly once per request, "
             f"not once per chunk; got init_load_back_count="
             f"{r.init_load_back_count}"
+        )
+        # B5 invariant — the HiCache cached_tokens_* breakdown must be
+        # written at most once even across multiple chunks (same gate as
+        # init_load_back, expressed via the dedicated counter).
+        assert r.hicache_cached_tokens_write_count <= 1, (
+            f"B5 invariant: cached_tokens_* must be written at most once; "
+            f"got count={r.hicache_cached_tokens_write_count}"
         )
 
 
