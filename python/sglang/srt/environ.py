@@ -5,11 +5,6 @@ from contextlib import ExitStack, contextmanager
 from enum import IntEnum
 from typing import Any, Optional
 
-# Import cuda_coredump to trigger auto-injection of CUDA env vars
-# when SGLANG_CUDA_COREDUMP=1. Best-effort; for strict guarantees,
-# set CUDA_* env vars in the shell before launching Python.
-import sglang.srt.debug_utils.cuda_coredump  # noqa: F401, E402
-
 
 @contextmanager
 def temp_set_env(*, allow_sglang: bool = False, **env_vars: Any):
@@ -812,6 +807,11 @@ _warn_deprecated_env_to_cli_flag(
     "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK",
     "Please use '--prefill-delayer-token-usage-low-watermark' instead.",
 )
+
+# Import cuda_coredump to trigger auto-injection of CUDA env vars
+# when SGLANG_CUDA_COREDUMP=1. Best-effort; for strict guarantees,
+# set CUDA_* env vars in the shell before launching Python.
+import sglang.srt.debug_utils.cuda_coredump  # noqa: F401, E402  # isort: skip
 
 
 def example_with_exit_stack():

@@ -27,7 +27,11 @@ from functools import partial
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
-import psutil
+from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
+
+suppress_noisy_warnings()
+
+import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
@@ -241,7 +245,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
-from sglang.srt.utils.common import is_npu, suppress_noisy_warnings
+from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -251,9 +255,6 @@ from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
-
-suppress_noisy_warnings()
-
 
 if is_mps():
     CudaStreamContext = nullcontext
