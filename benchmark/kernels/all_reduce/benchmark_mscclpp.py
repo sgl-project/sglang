@@ -178,7 +178,6 @@ if __name__ == "__main__":
     cpu_group = get_tensor_model_parallel_group().cpu_group
     pynccl_comm = get_tensor_model_parallel_group().pynccl_comm
     pymscclpp_comm = get_tensor_model_parallel_group().pymscclpp_comm
-    custom_comm = get_tensor_model_parallel_group().ca_comm
     dist.barrier()
     profile = False
     dtype = torch.bfloat16

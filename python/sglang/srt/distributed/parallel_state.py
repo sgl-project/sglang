@@ -598,13 +598,11 @@ class GroupCoordinator:
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
+        should_use_pymscclpp = self.pymscclpp_comm is not None and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
         if (
             self.pynccl_comm is not None
             and self.is_symmetric_memory_enabled()
-            and (
-                self.pymscclpp_comm is None
-                or not self.pymscclpp_comm.should_mscclpp_allreduce(input_)
-            )
+            and not should_use_pymscclpp
         ):
             self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
             with self.pynccl_comm.change_state(enable=True):
@@ -615,10 +613,7 @@ class GroupCoordinator:
         if (
             self.ca_comm is not None
             and not self.ca_comm.disabled
-            and (
-                self.pymscclpp_comm is None
-                or not self.pymscclpp_comm.should_mscclpp_allreduce(input_)
-            )
+            and not should_use_pymscclpp
             and self.ca_comm.should_custom_ar(input_)
         ):
             outplace_all_reduce_method = "ca"
@@ -630,8 +625,7 @@ class GroupCoordinator:
             outplace_all_reduce_method = "qr"
         elif (
             self.pymscclpp_comm is not None
-            and not self.pymscclpp_comm.disabled
-            and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
+            and should_use_pymscclpp
         ):
             outplace_all_reduce_method = "pymscclpp"
         elif (
