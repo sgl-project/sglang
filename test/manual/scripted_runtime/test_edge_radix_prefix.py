@@ -65,8 +65,8 @@ def _script_radix_hit_partial_then_chunk_tail(t: ScriptedRuntime):
 
     r2 = t.start_req(prompt_len=3 * DEFAULT_CHUNK_SIZE + 1, max_new_tokens=1)
     yield from run_until_finished(r2)
-    # Tail chunks_done depends on tail length; should be 2.
-    assert r2.chunks_done >= 1
+    # Tail length is chunk_size + 1, which chunks into exactly 2.
+    assert r2.chunks_done == 2
 
 
 def _script_radix_evict_then_resubmit_rechunks(t: ScriptedRuntime):
@@ -138,10 +138,14 @@ def _script_radix_lock_ref_concurrent_chunked(t: ScriptedRuntime):
 
 def _script_radix_partial_hit_exact_chunk_boundary(t: ScriptedRuntime):
     # Hit equals exactly the chunk boundary; second req tail = chunk_size.
+    # With a chunk_size-long prefix hit and a chunk_size tail, the tail
+    # is single-shot (per pinned semantics, prompt_len <= chunk_size of
+    # *uncached* tail => no chunked path).
     r1 = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE, max_new_tokens=1)
     yield from run_until_finished(r1)
     r2 = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=1)
     yield from run_until_finished(r2)
+    assert r2.chunks_done == 1
 
 
 def _script_radix_warmup_helper(t: ScriptedRuntime):
@@ -189,11 +193,20 @@ def _script_radix_prefix_match_with_priority(t: ScriptedRuntime):
 
 def _script_radix_calc_priority_skip_chunked_resume(t: ScriptedRuntime):
     # aaf3752d2b: skip chunked-resume reqs in calc_priority prefix matching.
-    # Two reqs share a prefix; one is chunked-resume.
+    # Two reqs share a prefix; one is chunked-resume. The scheduler must
+    # observably take the "skip chunked-resume in priority calc" branch.
+    # NEW API NEEDED: t.last_admission_path() returns the most recent
+    # admission branch label, e.g. "priority_skip_chunked_resume".
     r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="high")
     yield from run_until(r1, lambda h: h.is_chunking)
     r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="low")
-    yield from run_until_all_finished([r1, r2])
+    saw_skip = False
+    while not (r1.finished and r2.finished):
+        path = t.last_admission_path()
+        if path == "priority_skip_chunked_resume":
+            saw_skip = True
+        yield
+    assert saw_skip, "expected priority-skip-chunked-resume branch to fire at least once"
 
 
 class TestEdgeRadixPrefix(CustomTestCase):
