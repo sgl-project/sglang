@@ -13,9 +13,6 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
-from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
-    _get_mooncake_transfer_protocol,
-)
 from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.entrypoints.openai.utils import cached_tokens_details_from_dict
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -41,10 +38,8 @@ from sglang.srt.mem_cache.shared_hicache.source import (
 )
 from sglang.srt.mem_cache.shared_hicache.target import SharedHiCacheTarget
 from sglang.srt.mem_cache.shared_hicache.transfer import (
-    MooncakeSharedHiCacheTransferBackend,
     NixlSharedHiCacheTransferBackend,
     SharedHiCacheTransferBackend,
-    _get_or_init_mooncake_transfer_engine,
     make_shared_hicache_transfer_backend,
 )
 from sglang.srt.mem_cache.utils import block_hash_aliases, hash_str_to_int64
@@ -138,7 +133,7 @@ class FakeTree:
 
 
 class FakeDirectTransfer(SharedHiCacheTransferBackend):
-    name = "mooncake"
+    name = "nixl"
 
     def __init__(self):
         super().__init__(
@@ -153,45 +148,6 @@ class FakeDirectTransfer(SharedHiCacheTransferBackend):
 
     def transfer_pages(self, **kwargs):
         pass
-
-
-class FakeMooncakeEngine:
-    def __init__(self, ib_device=None, protocol="rdma", register_returns=None):
-        self.ib_device = ib_device
-        self.protocol = protocol
-        self.register_returns = list(register_returns or [])
-        self.registered = []
-        self.transfers = []
-
-    def get_session_id(self):
-        return "target-session"
-
-    def get_transport_info(self):
-        return {
-            "protocol": self.protocol,
-            "ib_device": self.ib_device,
-            "path_hint": (
-                "explicit_ib_device"
-                if self.protocol == "rdma" and self.ib_device is not None
-                else "no_explicit_ib_device"
-                if self.protocol == "rdma"
-                else self.protocol
-            ),
-        }
-
-    def register_regions_checked(self, ptrs, lengths, prefer_scalar=True):
-        checked = [(int(ptr), int(length)) for ptr, length in zip(ptrs, lengths)]
-        self.registered.extend(checked)
-        for index, _ in enumerate(checked):
-            if self.register_returns:
-                ret = self.register_returns.pop(0)
-                if ret != 0:
-                    return False, f"register_memory_failed:index={index}:ret={ret}"
-        return True, "ok"
-
-    def batch_transfer_sync(self, session_id, src_addrs, dst_addrs, lengths):
-        self.transfers.append((session_id, src_addrs, dst_addrs, lengths))
-        return 0
 
 
 class FakeNixlAgent:
@@ -515,7 +471,7 @@ class TestSharedHiCache(unittest.TestCase):
         cases = (
             (SHARED_HICACHE_DIRECT_TIMEOUT_REASON, [], True),
             (
-                "direct_transfer_failed:Mooncake direct KV transfer failed with ret=-1",
+                "direct_transfer_failed:NIXL direct KV transfer failed",
                 [200, 201, 202, 203],
                 False,
             ),
@@ -534,7 +490,7 @@ class TestSharedHiCache(unittest.TestCase):
                     expected_hashes=plan.planned_hashes,
                     future=_completed_future(([], reason)),
                     device_indices=device_indices,
-                    backend="mooncake",
+                    backend="nixl",
                     submitted_at=time.perf_counter(),
                 )
                 manager._pending_fetches[req.rid] = pending
@@ -547,136 +503,6 @@ class TestSharedHiCache(unittest.TestCase):
                     manager.target_cache.quarantined_device_indices,
                     [device_indices] if expect_quarantine else [],
                 )
-
-    def test_mooncake_backend_registers_source_and_transfers_pages(self):
-        page_size = 2
-        source_k = torch.zeros((20, 4), dtype=torch.uint8)
-        source_v = torch.zeros((20, 4), dtype=torch.uint8)
-        host_buffer = torch.zeros((64,), dtype=torch.uint8)
-        item_len = source_k[0].nbytes * page_size
-        engine = FakeMooncakeEngine(ib_device="mlx5_0")
-        tree = SimpleNamespace(
-            page_size=page_size,
-            cache_controller=SimpleNamespace(
-                mem_pool_host=SimpleNamespace(
-                    layout="layer_first",
-                    kv_buffer=host_buffer,
-                    k_data_refs=[source_k],
-                    v_data_refs=[source_v],
-                )
-            ),
-        )
-
-        backend = MooncakeSharedHiCacheTransferBackend(
-            engine=engine,
-            tree_cache=tree,
-            target_kv_ptrs=[1_000_000, 2_000_000],
-            target_kv_item_lens=[item_len, item_len],
-            transfer_parallelism=1,
-        )
-        backend._register_source_host_pool()
-        backend.transfer_pages(
-            target_session_id="peer",
-            source_page_indices=torch.tensor([1, 2], dtype=torch.int32).numpy(),
-            target_page_indices=torch.tensor([3, 4], dtype=torch.int32).numpy(),
-            target_kv_ptrs=backend.target_kv_ptrs,
-            target_kv_item_lens=backend.target_kv_item_lens,
-        )
-
-        self.assertTrue(backend.enabled)
-        self.assertIn(
-            (int(host_buffer.data_ptr()), int(host_buffer.nbytes)), engine.registered
-        )
-        self.assertEqual(
-            backend.target_descriptor()["transport"]["path_hint"], "explicit_ib_device"
-        )
-        self.assertEqual(len(engine.transfers), 1)
-        session_id, src_addrs, dst_addrs, lengths = engine.transfers[0]
-        self.assertEqual(session_id, "peer")
-        self.assertEqual(lengths, [item_len * 2, item_len * 2])
-        self.assertEqual(
-            src_addrs,
-            [int(source_k.data_ptr()) + item_len, int(source_v.data_ptr()) + item_len],
-        )
-        self.assertEqual(
-            dst_addrs, [1_000_000 + item_len * 3, 2_000_000 + item_len * 3]
-        )
-
-    def test_mooncake_nvlink_stages_host_pages_through_gpu_buffer(self):
-        class FakeStagingBuffer:
-            def __init__(self, size_bytes, device, gpu_id, custom_mem_pool=None):
-                self.size_bytes = int(size_bytes)
-                self.buffer = torch.empty(self.size_bytes, dtype=torch.uint8)
-                self.ptr = 10_000_000
-
-            def fits(self, required_bytes):
-                return int(required_bytes) <= self.size_bytes
-
-            def get_ptr(self):
-                return self.ptr
-
-            def get_size(self):
-                return self.size_bytes
-
-        page_size = 2
-        source_k = torch.arange(80, dtype=torch.uint8).reshape(20, 4)
-        source_v = torch.arange(80, 160, dtype=torch.uint8).reshape(20, 4)
-        host_buffer = torch.zeros((64,), dtype=torch.uint8)
-        item_len = source_k[0].nbytes * page_size
-        engine = FakeMooncakeEngine(protocol="nvlink")
-        tree = SimpleNamespace(
-            page_size=page_size,
-            cache_controller=SimpleNamespace(
-                mem_pool_host=SimpleNamespace(
-                    layout="layer_first",
-                    kv_buffer=host_buffer,
-                    k_data_refs=[source_k],
-                    v_data_refs=[source_v],
-                )
-            ),
-        )
-        backend = MooncakeSharedHiCacheTransferBackend(
-            engine=engine,
-            tree_cache=tree,
-            target_kv_ptrs=[1_000_000, 2_000_000],
-            target_kv_item_lens=[item_len, item_len],
-            custom_mem_pool=object(),
-            transfer_parallelism=1,
-        )
-        backend._register_source_host_pool()
-
-        with (
-            patch(
-                "sglang.srt.mem_cache.shared_hicache.transfer.StagingBuffer",
-                FakeStagingBuffer,
-            ),
-            patch("torch.cuda.synchronize"),
-        ):
-            backend.transfer_pages(
-                target_session_id="peer",
-                source_page_indices=torch.tensor([1, 2], dtype=torch.int32).numpy(),
-                target_page_indices=torch.tensor([3, 4], dtype=torch.int32).numpy(),
-                target_kv_ptrs=backend.target_kv_ptrs,
-                target_kv_item_lens=backend.target_kv_item_lens,
-            )
-
-        self.assertIn((10_000_000, item_len * 4), engine.registered)
-        self.assertEqual(len(engine.transfers), 1)
-        session_id, src_addrs, dst_addrs, lengths = engine.transfers[0]
-        self.assertEqual(session_id, "peer")
-        self.assertEqual(src_addrs, [10_000_000, 10_000_000 + item_len * 2])
-        self.assertEqual(lengths, [item_len * 2, item_len * 2])
-        self.assertEqual(
-            dst_addrs, [1_000_000 + item_len * 3, 2_000_000 + item_len * 3]
-        )
-        self.assertEqual(
-            backend._staging_buffer.buffer[: item_len * 2].tolist(),
-            source_k.view(torch.uint8).reshape(-1)[item_len : item_len * 3].tolist(),
-        )
-        self.assertEqual(
-            backend._staging_buffer.buffer[item_len * 2 : item_len * 4].tolist(),
-            source_v.view(torch.uint8).reshape(-1)[item_len : item_len * 3].tolist(),
-        )
 
     def test_nixl_backend_registers_source_and_transfers_pages(self):
         page_size = 2
@@ -741,141 +567,10 @@ class TestSharedHiCache(unittest.TestCase):
         self.assertEqual(source_agent.transfers, ["handle-1"])
         self.assertEqual(source_agent.released, ["handle-1"])
 
-    def test_mooncake_transfer_protocol_uses_nvlink_env(self):
-        with patch.dict(
-            "os.environ",
-            {
-                "SGLANG_MOONCAKE_TE_PROTOCOL": "nvlink",
-                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL": "",
-            },
-        ):
-            self.assertEqual(_get_mooncake_transfer_protocol(), "nvlink")
-
-        with patch.dict(
-            "os.environ",
-            {
-                "SGLANG_MOONCAKE_TE_PROTOCOL": "",
-                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL": "NVLINK",
-            },
-        ):
-            self.assertEqual(_get_mooncake_transfer_protocol(), "nvlink")
-
-    def test_mooncake_from_scheduler_fails_fast_on_checked_registration_error(self):
-        engine = FakeMooncakeEngine(register_returns=[0, -202])
-        scheduler = SimpleNamespace(
-            server_args=SimpleNamespace(
-                shared_hicache_config={"transfer_backend": "mooncake"},
-                mooncake_ib_device=None,
-                tp_size=1,
-                pp_size=1,
-                attn_cp_size=1,
-            ),
-            gpu_id=0,
-            tree_cache=SimpleNamespace(page_size=2),
-            token_to_kv_pool_allocator=SimpleNamespace(
-                get_kvcache=lambda: SimpleNamespace(
-                    get_contiguous_buf_infos=lambda: ([1, 2], [128, 128], [8, 8])
-                )
-            ),
-        )
-
-        with patch(
-            "sglang.srt.mem_cache.shared_hicache.transfer._get_or_init_mooncake_transfer_engine",
-            return_value=engine,
-        ):
-            backend = MooncakeSharedHiCacheTransferBackend.from_scheduler(scheduler)
-
-        self.assertIsNone(backend)
-        self.assertEqual(engine.registered, [(1, 128), (2, 128)])
-
-    def test_mooncake_from_scheduler_supports_tp_rank_layout(self):
-        page_size = 2
-        source_k = torch.zeros((20, 4), dtype=torch.uint8)
-        source_v = torch.zeros((20, 4), dtype=torch.uint8)
-        host_buffer = torch.zeros((64,), dtype=torch.uint8)
-        item_len = source_k[0].nbytes * page_size
-        engine = FakeMooncakeEngine(ib_device="mlx5_0")
-        scheduler = SimpleNamespace(
-            server_args=SimpleNamespace(
-                shared_hicache_config={"transfer_backend": "mooncake"},
-                mooncake_ib_device="mlx5_0",
-            ),
-            ps=SimpleNamespace(
-                tp_rank=1,
-                tp_size=2,
-                pp_rank=0,
-                pp_size=1,
-                attn_cp_rank=0,
-                attn_cp_size=1,
-                gpu_id=1,
-            ),
-            gpu_id=1,
-            tree_cache=SimpleNamespace(
-                page_size=page_size,
-                cache_controller=SimpleNamespace(
-                    mem_pool_host=SimpleNamespace(
-                        layout="layer_first",
-                        kv_buffer=host_buffer,
-                        k_data_refs=[source_k],
-                        v_data_refs=[source_v],
-                    )
-                ),
-            ),
-            token_to_kv_pool_allocator=SimpleNamespace(
-                get_kvcache=lambda: SimpleNamespace(
-                    get_contiguous_buf_infos=lambda: (
-                        [1_000_000, 2_000_000],
-                        [128, 128],
-                        [item_len, item_len],
-                    )
-                )
-            ),
-        )
-
-        with patch(
-            "sglang.srt.mem_cache.shared_hicache.transfer._get_or_init_mooncake_transfer_engine",
-            return_value=engine,
-        ):
-            backend = MooncakeSharedHiCacheTransferBackend.from_scheduler(scheduler)
-
-        self.assertIsNotNone(backend)
-        self.assertEqual(backend.parallel_metadata["tp_rank"], 1)
-        self.assertEqual(backend.parallel_metadata["tp_size"], 2)
-        self.assertEqual(backend.target_descriptor()["tp_rank"], 1)
-
-    def test_mooncake_engine_init_uses_scheduler_parallel_state_gpu_id(self):
-        calls = []
-        scheduler = SimpleNamespace(
-            ps=SimpleNamespace(gpu_id=3),
-            server_args=SimpleNamespace(mooncake_ib_device="mlx5_0"),
-        )
-
-        with (
-            patch(
-                "sglang.srt.distributed.device_communicators.mooncake_transfer_engine.get_mooncake_transfer_engine",
-                return_value=None,
-            ),
-            patch(
-                "sglang.srt.distributed.device_communicators.mooncake_transfer_engine.init_mooncake_transfer_engine",
-                side_effect=lambda ip, gpu_id, ib_device: calls.append(
-                    (ip, gpu_id, ib_device)
-                )
-                or "engine",
-            ),
-            patch(
-                "sglang.srt.utils.network.get_local_ip_auto",
-                return_value="127.0.0.1",
-            ),
-        ):
-            engine = _get_or_init_mooncake_transfer_engine(scheduler)
-
-        self.assertEqual(engine, "engine")
-        self.assertEqual(calls, [("127.0.0.1", 3, "mlx5_0")])
-
     def test_make_transfer_backend_rejects_pp_and_cp_when_requested(self):
         scheduler = SimpleNamespace(
             server_args=SimpleNamespace(
-                shared_hicache_config={"transfer_backend": "mooncake"},
+                shared_hicache_config={"transfer_backend": "nixl"},
                 tp_size=1,
                 pp_size=2,
                 attn_cp_size=1,
@@ -904,9 +599,9 @@ class TestSharedHiCache(unittest.TestCase):
                 "start_block": 0,
                 "max_blocks": 1,
                 "target_session_id": "target-session",
-                "transfer_backend": "mooncake",
+                "transfer_backend": "nixl",
                 "target_metadata": {
-                    "backend": "mooncake",
+                    "backend": "nixl",
                     "session_id": "target-session",
                     "tp_rank": 1,
                     "tp_size": 2,
@@ -986,7 +681,7 @@ class TestSharedHiCache(unittest.TestCase):
                 json.dumps(
                     {
                         "control": {"endpoint": "127.0.0.1:39007"},
-                        "transfer_backend": "mooncake",
+                        "transfer_backend": "nixl",
                         "timeout_secs": 2.5,
                     }
                 ),
@@ -1003,7 +698,7 @@ class TestSharedHiCache(unittest.TestCase):
             server_args.shared_hicache_config.control_endpoint,
             "http://127.0.0.1:39007",
         )
-        self.assertEqual(server_args.shared_hicache_config.transfer_backend, "mooncake")
+        self.assertEqual(server_args.shared_hicache_config.transfer_backend, "nixl")
         self.assertEqual(server_args.shared_hicache_config.timeout_secs, 2.5)
 
     def test_manager_uses_server_arg_worker_id_after_dynamo_identity_update(self):
@@ -1128,7 +823,7 @@ class TestSharedHiCache(unittest.TestCase):
         collector.shared_hicache_insert_seconds = FakePrometheusMetric()
         collector.shared_hicache_transfer_bytes_total = FakePrometheusMetric()
         collector.observe_shared_hicache(
-            backend="mooncake",
+            backend="nixl",
             outcome="hit",
             reason="ok",
             tokens=4,
@@ -1139,7 +834,7 @@ class TestSharedHiCache(unittest.TestCase):
 
         labels = {
             "model_name": "dummy",
-            "backend": "mooncake",
+            "backend": "nixl",
             "outcome": "hit",
             "reason": "ok",
         }

@@ -47,7 +47,7 @@ def is_indeterminate_direct_transfer_reason(reason: str) -> bool:
     reason = str(reason)
     # A timeout can leave a source-side transfer still running after the target
     # has given up, so target pages must not be reused. Synchronous source-side
-    # transfer failures return only after Mooncake reports completion/failure;
+    # transfer failures return only after the backend reports completion/failure;
     # those target pages may contain partial data, but they are safe to free
     # because they were never attached to the radix cache or request.
     return reason.startswith(SHARED_HICACHE_DIRECT_TIMEOUT_REASON)

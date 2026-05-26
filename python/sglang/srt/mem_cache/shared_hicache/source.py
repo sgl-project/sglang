@@ -397,7 +397,12 @@ def handle_source_transfer(
 ) -> Mapping[str, Any]:
     if transfer_backend is None or not getattr(transfer_backend, "enabled", False):
         return {"ok": False, "reason": "direct_transfer_unavailable"}
-    requested_backend = str(payload.get("transfer_backend", "mooncake")).lower()
+    if "transfer_backend" not in payload:
+        return {
+            "ok": False,
+            "reason": "malformed_transfer_request:missing_transfer_backend",
+        }
+    requested_backend = str(payload["transfer_backend"]).lower()
     if requested_backend != transfer_backend.name:
         return {
             "ok": False,
