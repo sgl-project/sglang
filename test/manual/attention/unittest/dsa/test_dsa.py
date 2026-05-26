@@ -18,8 +18,10 @@ from common.attention_methods.dsa_attention import (
     make_dsa_sparse_cases,
     run_dsa_attention_case,
     run_dsa_sparse_attention_case,
+    run_dsa_sparse_cuda_graph_decode_impl_variant_case,
     run_dsa_sparse_decode_impl_variant_case,
     run_dsa_sparse_prefill_impl_variant_case,
+    run_dsa_sparse_speculative_forward_mode_case,
 )
 from common.runner_modes.cuda_graph_decode_runner import (
     run_dsa_sparse_cuda_graph_decode_case,
@@ -115,6 +117,56 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
             with self.subTest(impl=impl):
                 run_dsa_sparse_decode_impl_variant_case(
                     self, self.DECODE_IMPL_CASE, impl
+                )
+
+    # Speculative forward-mode coverage. DRAFT_EXTEND and DRAFT_EXTEND_V2
+    # route through the `dsa_decode_impl` dispatcher (the same kernel
+    # selection as plain DECODE), but exercise a different metadata setup
+    # path. TARGET_VERIFY is intentionally absent — deep_gemm's
+    # `paged_mqa_logits_metadata` kernel does not compile for the small
+    # `aligned_batch_size` shapes produced by this fixture; the larger
+    # aligned shapes only appear in the production speculative graph
+    # runner.
+    SPECULATIVE_FORWARD_MODE_CASES = (
+        DSAAttentionCase(
+            name="dsa_sparse_draft_extend",
+            backend="dsa",
+            forward_mode=ForwardMode.DRAFT_EXTEND,
+            num_heads=4,
+            num_kv_heads=1,
+            page_size=DSA_PAGE_SIZE,
+            prefix_lens=(128,),
+            extend_lens=(3,),
+        ),
+        DSAAttentionCase(
+            name="dsa_sparse_draft_extend_v2",
+            backend="dsa",
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            num_heads=4,
+            num_kv_heads=1,
+            page_size=DSA_PAGE_SIZE,
+            prefix_lens=(128,),
+            extend_lens=(3,),
+        ),
+    )
+
+    def test_sparse_speculative_forward_mode_cases(self):
+        for case in self.SPECULATIVE_FORWARD_MODE_CASES:
+            with self.subTest(case=case.name, mode=case.forward_mode.name):
+                run_dsa_sparse_speculative_forward_mode_case(self, case)
+
+    # CG decode replay parametrized over `dsa_decode_backend` impl. The
+    # `flashmla_kv` baseline is already covered by
+    # `test_runner_mode_cuda_graph_decode_cases`; this method extends the
+    # CG matrix to every supported decode impl (`flashmla_sparse` /
+    # `flashmla_kv` / `fa3` on H200, with `tilelang` / `trtllm` / `aiter`
+    # skip-gated). Each impl re-builds the fixture with the impl forced
+    # so the captured graph uses that specific kernel.
+    def test_sparse_cuda_graph_decode_impl_variants(self):
+        for impl in DSA_DECODE_IMPL_VARIANTS:
+            with self.subTest(impl=impl):
+                run_dsa_sparse_cuda_graph_decode_impl_variant_case(
+                    self, self.CUDA_GRAPH_DECODE_CASES[0], impl
                 )
 
 

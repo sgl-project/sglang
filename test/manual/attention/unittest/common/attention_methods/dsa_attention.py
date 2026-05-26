@@ -1094,6 +1094,84 @@ def run_dsa_sparse_decode_impl_variant_case(
     )
 
 
+def run_dsa_sparse_cuda_graph_decode_impl_variant_case(
+    testcase,
+    case: DSAAttentionCase,
+    impl: str,
+):
+    """CUDA-graph decode replay parametrized over `dsa_decode_backend=impl`.
+
+    Imported lazily because the runner module imports this module — the
+    circular dependency only resolves at call time.
+    """
+    supported, reason = dsa_impl_capability(impl)
+    if not supported:
+        testcase.skipTest(
+            f"DSA CG decode impl `{impl}` not supported: {reason}"
+        )
+    if impl == "tilelang":
+        testcase.skipTest(
+            "DSA tilelang decode requires topk=2048; the shared sparse fixture "
+            f"uses topk={DSA_SPARSE_INDEX_TOPK}."
+        )
+    if not case.forward_mode.is_decode():
+        raise ValueError(
+            "run_dsa_sparse_cuda_graph_decode_impl_variant_case expects a "
+            "DECODE case."
+        )
+    from ..runner_modes.cuda_graph_decode_runner import (
+        run_dsa_sparse_cuda_graph_decode_case,
+    )
+
+    run_dsa_sparse_cuda_graph_decode_case(
+        testcase,
+        case,
+        dsa_decode_backend=impl,
+    )
+
+
+def run_dsa_sparse_speculative_forward_mode_case(
+    testcase,
+    case: DSAAttentionCase,
+    *,
+    hidden_size: int = DEFAULT_HIDDEN_SIZE,
+    max_context_len: int = DSA_PAGE_SIZE,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = DEFAULT_DEVICE,
+    dsa_decode_backend: str = "flashmla_kv",
+) -> None:
+    """Run a sparse case with a speculative forward mode (DRAFT_EXTEND or
+    DRAFT_EXTEND_V2). DSA dispatches `is_draft_extend(include_v2=True)`
+    through `dsa_decode_impl` (`dsa_backend.py:1352-1358`), so the kernel
+    selection is the same as plain decode but the metadata path
+    (`extend_seq_lens`, `cu_seqlens_q`, etc.) is exercised differently."""
+    if not case.forward_mode.is_draft_extend(include_v2=True):
+        raise ValueError(
+            "run_dsa_sparse_speculative_forward_mode_case expects a "
+            "DRAFT_EXTEND or DRAFT_EXTEND_V2 case."
+        )
+    # NOTE: TARGET_VERIFY isn't covered here because the deep_gemm
+    # `paged_mqa_logits_metadata` kernel fails to compile for small
+    # `aligned_batch_size` values that the synthetic fixture produces
+    # (`zero-sized variable "num_segs" is not allowed in device code` in
+    # `deep_gemm/include/deep_gemm/scheduler/paged_mqa_logits.cuh:38`).
+    # This is a kernel-side limit on minimum batch shape rather than a
+    # DSA backend bug; production scenarios always run TARGET_VERIFY at
+    # larger aligned batch sizes via the speculative graph runner. The
+    # variant is left out of this matrix until the fixture can grow a
+    # large enough TARGET_VERIFY shape (or deep_gemm relaxes the
+    # alignment constraint).
+    run_dsa_sparse_attention_case(
+        testcase,
+        case,
+        hidden_size=hidden_size,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        dsa_decode_backend=dsa_decode_backend,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Runner-mode helpers for DSA dense fallback split-op extend
 # ---------------------------------------------------------------------------

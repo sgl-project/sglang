@@ -15,8 +15,25 @@ Columns are runner modes; rows are the two DSA sub-paths exercised through the
 
 | DSA sub-path | Eager Phase 2 | CG decode | PCG extend | BCG extend | Verify eager | Verify CG | DE eager | DE CG | DE-V2 CG | EAGLE-draft runner | EAGLE-DE runner | FKVMTP runner |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `dsa` MHA_ONE_SHOT dense prefill fallback | ✓ 6 dense-fallback extend layouts: no-prefix ragged, no-prefix exact-page, prefix ragged, cross-page-boundary, prefix-exact-page, total-exact-page | deferred: graph metadata parity not scoped | deferred | deferred | deferred | deferred | deferred | deferred | deferred | deferred | deferred | — |
-| `dsa` sparse top-k (`flashmla_sparse` prefill + `flashmla_kv` decode) | ✓ 7 sparse top-k layouts: long-prefix bsz=1 prefill, long-prefix multi-token prefill, multi-request long-prefix prefill, decode with bsz=2 trailing-topk, decode with sub-topk prefix padding, ragged 3-request decode, long-prefix decode | deferred | deferred | deferred | deferred | deferred | deferred | deferred | deferred | deferred | deferred | — |
+| `dsa` MHA_ONE_SHOT dense prefill fallback | ✓ 6 dense-fallback extend layouts: no-prefix ragged, no-prefix exact-page, prefix ragged, cross-page-boundary, prefix-exact-page, total-exact-page | deferred: graph metadata parity not scoped | blocked: K-slice mismatch | blocked | — | — | — | — | — | — | — | — |
+| `dsa` sparse top-k (`flashmla_sparse` prefill + `flashmla_kv` decode) | ✓ 7 sparse top-k layouts: long-prefix bsz=1 prefill, long-prefix multi-token prefill, multi-request long-prefix prefill, decode with bsz=2 trailing-topk, decode with sub-topk prefix padding, ragged 3-request decode, long-prefix decode | ✓ flashmla_kv | — | — | blocked: deep_gemm metadata fails on small `aligned_batch_size` | blocked | ✓ DRAFT_EXTEND eager | — | ✓ DRAFT_EXTEND_V2 eager | — | — | — |
+
+## Implementation Variant Matrix (`--dsa-prefill-backend` / `--dsa-decode-backend`)
+
+DSA has multiple kernel impls; `dsa_impl_capability(impl)` gates each per
+hardware/SDK. The variant tests live in `test_dsa.py` as
+`test_sparse_prefill_impl_variants`, `test_sparse_decode_impl_variants`, and
+`test_sparse_cuda_graph_decode_impl_variants`.
+
+| Impl | Prefill | Decode | CG decode | Hardware gate (test box: H200 SM9.0) |
+|---|---|---|---|---|
+| `flashmla_sparse` | ✓ | ✓ | ✓ | SM>=9.0 + `sgl_kernel.flash_mla` |
+| `flashmla_kv` | ✓ | ✓ | ✓ | SM>=9.0 + `sgl_kernel.flash_mla` |
+| `fa3` | ✓ | ✓ | ✓ | SM>=9.0 + `sglang.jit_kernel.flash_attention` |
+| `tilelang` | skipped: topk=2048 contract | skipped: topk=2048 contract | skipped: topk=2048 contract | `tilelang_sparse_fwd` asserts `topk == 2048`; shared sparse fixture uses `topk=128`. Needs a topk=2048 fixture variant. |
+| `trtllm` | skipped: SM<10 | skipped: SM<10 | skipped: SM<10 | TRT-LLM Gen FMHA/MLA requires Blackwell (SM>=10.0). |
+| `aiter` | skipped: not HIP | skipped: not HIP | skipped: not HIP | AMD-only kernel library. |
+| `flashmla_auto` (default) | ✓ (resolves to `flashmla_sparse` for bf16, `flashmla_kv` for FP8) | ✓ | ✓ | covered indirectly by all sparse cases |
 
 ## Input And Config Coverage
 
@@ -84,11 +101,22 @@ Columns are runner modes; rows are the two DSA sub-paths exercised through the
 
 ## Next Work
 
-- Add CG decode coverage via the sparse fixture: the
-  `dsa_sparse_decode_*` cases are DECODE-mode and the backend selects
-  `flashmla_kv` which uses cached K (compatible with piecewise CG).
-  Needs the inputs dict to carry `topk_indices` through capture/replay
-  and a sparse-specific `run_dsa_sparse_forward(fixture, batch, inputs)`
-  that re-passes `topk_indices=inputs["topk_indices"]` on each call.
+- **FP8 KV cache path** — `DSATokenToKVPool.dsa_kv_cache_store_fp8`
+  needs `dtype=torch.float8_e4m3fn` and a non-None `override_kv_cache_dim`;
+  the fixture currently uses bf16. Adding it would unlock
+  `TopkTransformMethod.RAGGED` coverage (`get_topk_transform_method`:
+  RAGGED needs `dsa_kv_cache_store_fp8 AND dsa_prefill_impl == "flashmla_sparse"
+  AND forward_mode == EXTEND`) and the FP8 `flashmla_auto → flashmla_kv`
+  resolution branch. The prefix-write path also needs to pack BF16 K into
+  the FP8 store layout (UE8M0 scales + packed quants) so the reference
+  matches what the kernel reads from cache.
+- **TARGET_VERIFY** — deep_gemm's `paged_mqa_logits_metadata` kernel
+  fails to compile for small `aligned_batch_size`
+  (`zero-sized variable "num_segs"`); the production speculative graph
+  runner only hits large aligned shapes, so the synthetic fixture would
+  need to mock the deep_gemm metadata path or raise the alignment.
+- **tilelang topk=2048 fixture** — `tilelang_sparse_fwd` asserts
+  `topk == 2048`; building a separate sparse fixture with
+  `DSA_SPARSE_INDEX_TOPK=2048` would unlock the tilelang variant tests.
 - Add non-trailing index-layout sparse cases when a representative
   index-construction path is identified.

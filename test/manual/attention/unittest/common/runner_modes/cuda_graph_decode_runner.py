@@ -821,6 +821,7 @@ def run_dsa_sparse_cuda_graph_decode_case(
     dtype: torch.dtype = torch.bfloat16,
     device: str = DENSE_DEFAULT_DEVICE,
     cuda_graph_capture_batch_size: int | None = None,
+    dsa_decode_backend: str = "flashmla_kv",
 ):
     """DSA sparse-topk CUDA-graph decode replay (`flashmla_kv` path).
     Sparse decode uses cached MLA latent KV (written by
@@ -867,6 +868,7 @@ def run_dsa_sparse_cuda_graph_decode_case(
             max_context_len=max_context_len,
             dtype=dtype,
             device=device,
+            dsa_decode_backend=dsa_decode_backend,
         ),
         capture_batch_size=capture_batch_size,
         max_context_len=max_context_len,

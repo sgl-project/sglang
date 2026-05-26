@@ -358,6 +358,27 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Strengthened DSA coverage to span every kernel implementation
+  variant the backend dispatches between. DSA exposes
+  `flashmla_sparse`, `flashmla_kv`, `fa3`, `tilelang`, `trtllm`, and
+  `aiter` via `--dsa-prefill-backend` and `--dsa-decode-backend`; each
+  one maps to a distinct kernel path in `dsa_backend.py`. The previous
+  tests only covered the `flashmla_auto` defaults (resolving to
+  `flashmla_sparse` prefill + `flashmla_kv` decode for bf16). Now
+  `DSAMockModelRunner` accepts `dsa_prefill_backend` and
+  `dsa_decode_backend` overrides, `dsa_impl_capability(impl)` returns
+  `(supported, reason)` per impl, and three new parametrized methods
+  in `dsa/test_dsa.py` iterate over the impl matrix:
+  - `test_sparse_prefill_impl_variants` (eager EXTEND)
+  - `test_sparse_decode_impl_variants` (eager DECODE)
+  - `test_sparse_cuda_graph_decode_impl_variants` (CG decode replay)
+  Plus a new `test_sparse_speculative_forward_mode_cases` covering
+  DRAFT_EXTEND and DRAFT_EXTEND_V2 forward modes through the decode
+  impl dispatcher. On H200/SM9.0 this exercises `flashmla_sparse`,
+  `flashmla_kv`, and `fa3`; `tilelang` (topk=2048 contract), `trtllm`
+  (Blackwell-only), and `aiter` (HIP-only) emit explicit `skipTest`
+  with the gate reason. `dsa/README.md` documents the variant matrix
+  and the remaining FP8 / TARGET_VERIFY / tilelang follow-ups.
 - Added FA3 and FA4 production EAGLE `DRAFT_EXTEND` (V1) graph-runner
   coverage in `dense/test_fa3.py` and `dense/test_fa4.py` via
   `run_dense_eagle_draft_extend_cuda_graph_runner_case`. Both FA3 and
@@ -914,6 +935,15 @@ Latest verification:
 - `python test/manual/attention/unittest/gdn/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_flashinfer.py -v`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
+  - Ran 136 tests in 35.002s (12 skipped) after adding the DSA
+    implementation-variant matrix (`test_sparse_prefill_impl_variants` +
+    `test_sparse_decode_impl_variants` +
+    `test_sparse_cuda_graph_decode_impl_variants` +
+    `test_sparse_speculative_forward_mode_cases`). The extra skips
+    are the hardware/structural gates for `tilelang` (topk=2048),
+    `trtllm` (SM<10), and `aiter` (HIP-only) across all three variant
+    matrices.
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
   - Ran 132 tests in 38.626s (3 skipped) after adding DSA sparse CG decode,
     Dual-chunk CG decode, FA3/FA4 EAGLE chain verify (eager + CG), FA3/FA4
