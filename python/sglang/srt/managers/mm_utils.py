@@ -493,7 +493,6 @@ def _move_items_to_device(
             item.feature = item.feature.to(device, non_blocking=True)
 
 
-<<<<<<< HEAD
 def _item_patches_for_dp_encoder(item: MultimodalDataItem) -> Optional[int]:
     """Compute the per-item patch count (load metric) for image items.
 
