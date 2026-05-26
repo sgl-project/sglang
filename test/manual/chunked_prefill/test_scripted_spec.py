@@ -8,8 +8,8 @@ any state-machine surprises.
 
 import unittest
 
-from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
+from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
@@ -17,7 +17,6 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until,
     run_until_finished,
 )
-from sglang.test.test_utils import CustomTestCase
 
 _SPEC_MODEL = "Qwen/Qwen3-8B"
 _SPEC_DRAFT = "Qwen/Qwen3-8B-EAGLE"
@@ -36,13 +35,12 @@ def _spec_engine_kwargs(**overrides):
     )
 
 
-class TestScriptedSpec(CustomTestCase):
+class TestSpecBasic(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = _spec_engine_kwargs()
+
     def test_naive_spec_chunked(self):
         """Speculative decoding × chunked: naive ScriptedRuntime smoke."""
-        execute_scripted_runtime(
-            self._script_naive_spec_chunked,
-            **_spec_engine_kwargs(),
-        )
+        self.runtime.run(self._script_naive_spec_chunked)
 
     @staticmethod
     def _script_naive_spec_chunked(t: ScriptedRuntime):
@@ -53,10 +51,7 @@ class TestScriptedSpec(CustomTestCase):
 
     def test_spec_chunked_handoff_first_verify(self):
         """First spec verify after chunked prefill must include all chunked tokens with right prefix length."""
-        execute_scripted_runtime(
-            self._script_spec_chunked_handoff_first_verify,
-            **_spec_engine_kwargs(),
-        )
+        self.runtime.run(self._script_spec_chunked_handoff_first_verify)
 
     # Spec handoff from chunked prefill — the first verify pass
     # after the last chunk must see prefix_len == prompt_len and include
@@ -78,10 +73,7 @@ class TestScriptedSpec(CustomTestCase):
 
     def test_spec_acceptance_chunked_matches_baseline(self):
         """Chunked vs non-chunked spec acceptance rate must be approximately equal."""
-        execute_scripted_runtime(
-            self._script_spec_acceptance_chunked_matches_baseline,
-            **_spec_engine_kwargs(),
-        )
+        self.runtime.run(self._script_spec_acceptance_chunked_matches_baseline)
 
     # Spec acceptance — chunked vs non-chunked on the same
     # prompt should yield approximately the same accept rate (chunked must
@@ -105,10 +97,7 @@ class TestScriptedSpec(CustomTestCase):
 
     def test_spec_abort_during_chunked_prepare(self):
         """Spec draft prepare + chunked abort must reset draft state cleanly."""
-        execute_scripted_runtime(
-            self._script_spec_abort_during_chunked_prepare,
-            **_spec_engine_kwargs(),
-        )
+        self.runtime.run(self._script_spec_abort_during_chunked_prepare)
 
     # Spec draft preparation racing with chunked abort —
     # cancellation must clean up partial draft state; no orphaned spec
@@ -125,12 +114,13 @@ class TestScriptedSpec(CustomTestCase):
             r.spec_draft_state_cleared
         ), "spec draft state must be cleared after abort during chunked prefill"
 
+
+class TestSpecDisagg(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = _spec_engine_kwargs(disaggregation_mode="prefill")
+
     def test_spec_eagle_disagg_chunked(self):
         """EAGLE + disagg + chunked last chunk must land topk_p, topk_index, hidden_states."""
-        execute_scripted_runtime(
-            self._script_spec_eagle_disagg_chunked,
-            **_spec_engine_kwargs(disaggregation_mode="prefill"),
-        )
+        self.runtime.run(self._script_spec_eagle_disagg_chunked)
 
     # EAGLE + disagg + chunked — last chunk must capture all three
     # spec tensors (topk_p, topk_index, hidden_states) for the decode side
