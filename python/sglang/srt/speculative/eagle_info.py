@@ -16,7 +16,6 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
-from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
@@ -693,9 +692,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = -1
 
-    # V2 overlap worker only
-    future_indices: Optional[FutureIndices] = None
-    new_seq_lens: Optional[torch.Tensor] = None
+    # V2 overlap worker only: req_pool_indices used as buf slot keys.
+    future_indices: Optional[torch.Tensor] = None
     # V2 reuses `EagleDraftInput` across phases (V1 has a separate
     # `EagleDraftExtendInput` for these). Set during V2's draft-extend.
     num_correct_drafts: Optional[torch.Tensor] = None
@@ -742,12 +740,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
-            new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
         )
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
-            self.future_indices.indices = self.future_indices.indices[new_indices]
+            self.future_indices = self.future_indices[new_indices]
             return
 
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
@@ -777,10 +774,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
-            self.future_indices = FutureIndices(
-                indices=torch.cat(
-                    [self.future_indices.indices, spec_info.future_indices.indices]
-                )
+            self.future_indices = torch.cat(
+                [self.future_indices, spec_info.future_indices]
             )
             return
 
