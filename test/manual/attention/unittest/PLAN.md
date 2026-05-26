@@ -2,7 +2,7 @@
 
 ## Current progress
 
-Last updated: 2026-05-25
+Last updated: 2026-05-26
 
 Implemented:
 - Shared dense MHA/GQA correctness helpers exist in
@@ -62,8 +62,12 @@ Implemented:
 - Runner mechanics are isolated under `common/*_runner.py`. Attention-method
   helpers build modules, inputs, references, and metadata; runner files own CUDA
   graph/PCG/BCG capture and replay orchestration. `common/cuda_graph_runner.py`
-  now shares the dense/SWA and MLA projected-attention graph path through one
-  helper, with GDN kept separate for recurrent cache handling.
+  now uses one CUDA graph decode lifecycle for dense/SWA, MLA, and GDN through
+  attention-family adapters. Reusable family-specific callbacks such as case
+  cloning, random capture inputs, padded replay inputs, forward calls, and
+  reference-output adapters live in the attention-method helper files rather than
+  in the CUDA graph runner. GDN only supplies the recurrent-cache snapshot and
+  restore hooks from the runner side.
 - RoPE is intentionally omitted from the current unit-level runner x attention
   tests. These tests feed post-RoPE-equivalent Q/K tensors because rotary math is
   orthogonal to runner/backend metadata compatibility.
@@ -89,20 +93,11 @@ Latest verification:
 - `python test/manual/attention/unittest/dense/test_triton.py -v`
 - `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
 - `python test/manual/attention/unittest/mla/test_triton.py -v`
+- `python test/manual/attention/unittest/gdn/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_flashinfer.py -v`
-- `python test/manual/attention/unittest/gdn/test_triton.py -v`
-- `python -m py_compile test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/mla/test_triton.py`
-- `python test/manual/attention/unittest/mla/test_triton.py -v`
-- `python -m py_compile test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/dense/test_torch_native.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/swa/test_flashinfer.py`
-- `python -m unittest discover -s test/manual/attention/unittest/dense -p 'test_*.py' -v`
-- `python -m unittest discover -s test/manual/attention/unittest/swa -p 'test_*.py' -v`
-- `python -m py_compile test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/gdn/test_triton.py`
-- `python test/manual/attention/unittest/gdn/test_triton.py -v`
-- `python test/manual/attention/unittest/dense/test_torch_native.py -v`
-- `python test/manual/attention/unittest/dense/test_triton.py -v`
-- `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
-- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+- Previous broad sweep before the latest runner refactor:
+  `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
 
 ---
 

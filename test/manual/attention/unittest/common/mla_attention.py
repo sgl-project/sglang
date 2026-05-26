@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import List
+from typing import Any, List
 
 import torch
 import torch.nn.functional as F
@@ -753,6 +753,136 @@ def expected_mla_fixture_output(fixture: MLAAttentionFixture) -> torch.Tensor:
         fixture.case,
         fixture.prefix_hidden,
         fixture.input_hidden,
+    )
+
+
+def make_mla_case_with_prefix_lens(
+    case: MLAAttentionCase,
+    name: str,
+    prefix_lens: tuple[int, ...],
+) -> MLAAttentionCase:
+    return MLAAttentionCase(
+        name=name,
+        backend=case.backend,
+        forward_mode=case.forward_mode,
+        num_heads=case.num_heads,
+        page_size=case.page_size,
+        prefix_lens=prefix_lens,
+    )
+
+
+def mla_fixture_inputs(fixture: MLAAttentionFixture) -> dict[str, Any]:
+    return {
+        "prefix_hidden": fixture.prefix_hidden,
+        "input_hidden": fixture.input_hidden,
+    }
+
+
+def _random_hidden_by_lens(
+    lens: tuple[int, ...],
+    *,
+    hidden_size: int,
+    dtype: torch.dtype,
+    device: str,
+) -> list[torch.Tensor]:
+    return [
+        torch.randn(length, hidden_size, dtype=dtype, device=device) for length in lens
+    ]
+
+
+def make_mla_random_inputs(
+    case: MLAAttentionCase,
+    fixture: MLAAttentionFixture,
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> dict[str, Any]:
+    hidden_size = fixture.actual_module.hidden_size
+    return {
+        "prefix_hidden": _random_hidden_by_lens(
+            case.prefix_lens,
+            hidden_size=hidden_size,
+            dtype=dtype,
+            device=device,
+        ),
+        "input_hidden": torch.randn(
+            case.num_input_tokens,
+            hidden_size,
+            dtype=dtype,
+            device=device,
+        ),
+    }
+
+
+def make_mla_padded_replay_inputs(
+    case: MLAAttentionCase,
+    fixture: MLAAttentionFixture,
+    pad_prefix_lens: tuple[int, ...],
+    base_inputs: dict[str, Any],
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> dict[str, Any]:
+    hidden_size = fixture.actual_module.hidden_size
+    pad_prefix_hidden = _random_hidden_by_lens(
+        pad_prefix_lens,
+        hidden_size=hidden_size,
+        dtype=dtype,
+        device=device,
+    )
+    pad_input_hidden = torch.randn(
+        case.num_input_tokens - base_inputs["input_hidden"].shape[0],
+        hidden_size,
+        dtype=dtype,
+        device=device,
+    )
+    return {
+        "prefix_hidden": base_inputs["prefix_hidden"] + pad_prefix_hidden,
+        "input_hidden": torch.cat(
+            [base_inputs["input_hidden"], pad_input_hidden],
+            dim=0,
+        ),
+    }
+
+
+def prepare_mla_runner_inputs(
+    fixture: MLAAttentionFixture,
+    case: MLAAttentionCase,
+    batch: ForwardBatch,
+    inputs: dict[str, Any],
+    *,
+    max_context_len: int,
+) -> None:
+    del batch
+    _populate_prefix_kv(
+        fixture.actual_module,
+        case,
+        fixture.runner,
+        fixture.backend,
+        inputs["prefix_hidden"],
+        max_context_len=max_context_len,
+    )
+
+
+def run_mla_forward(
+    fixture: MLAAttentionFixture,
+    batch: ForwardBatch,
+    inputs: dict[str, Any],
+) -> torch.Tensor:
+    return fixture.actual_module(inputs["input_hidden"], batch)
+
+
+def expected_mla_output_from_inputs(
+    fixture: MLAAttentionFixture,
+    case: MLAAttentionCase,
+    inputs: dict[str, Any],
+    _state,
+) -> torch.Tensor:
+    return _mla_attention_reference(
+        fixture.reference_module,
+        case,
+        inputs["prefix_hidden"],
+        inputs["input_hidden"],
     )
 
 

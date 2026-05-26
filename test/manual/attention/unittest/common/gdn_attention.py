@@ -720,6 +720,110 @@ def _pure_torch_gdn_reference(
     )
 
 
+def make_gdn_case_with_prefix_lens(
+    case: GDNAttentionCase,
+    name: str,
+    prefix_lens: tuple[int, ...],
+) -> GDNAttentionCase:
+    return GDNAttentionCase(
+        name=name,
+        backend=case.backend,
+        forward_mode=case.forward_mode,
+        num_k_heads=case.num_k_heads,
+        num_v_heads=case.num_v_heads,
+        page_size=case.page_size,
+        prefix_lens=prefix_lens,
+    )
+
+
+def gdn_fixture_inputs(fixture: GDNAttentionFixture) -> dict[str, torch.Tensor]:
+    return {
+        "mixed_qkv": fixture.mixed_qkv,
+        "a": fixture.a,
+        "b": fixture.b,
+    }
+
+
+def make_gdn_random_inputs(
+    case: GDNAttentionCase,
+    fixture: GDNAttentionFixture,
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> dict[str, torch.Tensor]:
+    return {
+        "mixed_qkv": torch.randn(
+            case.num_input_tokens,
+            fixture.actual_module.mixed_qkv_dim,
+            dtype=dtype,
+            device=device,
+        ),
+        "a": torch.randn(
+            case.num_input_tokens,
+            case.num_v_heads,
+            dtype=dtype,
+            device=device,
+        ),
+        "b": torch.randn(
+            case.num_input_tokens,
+            case.num_v_heads,
+            dtype=dtype,
+            device=device,
+        ),
+    }
+
+
+def make_gdn_replay_inputs(
+    _case: GDNAttentionCase,
+    fixture: GDNAttentionFixture,
+    _pad_prefix_lens: tuple[int, ...],
+    base_inputs: dict[str, torch.Tensor],
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> dict[str, torch.Tensor]:
+    del fixture, dtype, device
+    return base_inputs
+
+
+def prepare_gdn_runner_inputs(
+    fixture: GDNAttentionFixture,
+    case: GDNAttentionCase,
+    batch: ForwardBatch,
+    inputs: dict[str, torch.Tensor],
+    *,
+    max_context_len: int,
+) -> None:
+    del max_context_len
+    fixture.case = case
+    fixture.forward_batch = batch
+    fixture.mixed_qkv = inputs["mixed_qkv"]
+    fixture.a = inputs["a"]
+    fixture.b = inputs["b"]
+
+
+def run_gdn_forward(
+    fixture: GDNAttentionFixture,
+    batch: ForwardBatch,
+    inputs: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    return fixture.actual_module(
+        batch,
+        inputs["mixed_qkv"],
+        inputs["a"],
+        inputs["b"],
+    )
+
+
+def expected_gdn_output_from_inputs(
+    fixture: GDNAttentionFixture,
+    _case: GDNAttentionCase,
+    _inputs: dict[str, torch.Tensor],
+    state,
+) -> torch.Tensor:
+    return _pure_torch_gdn_reference(fixture, state[1]).output
+
+
 def run_gdn_attention_case(
     testcase,
     case: GDNAttentionCase,
