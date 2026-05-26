@@ -93,7 +93,9 @@ class TestScriptedRuntimeFunctional(CustomTestCase):
     def test_script_raises_assertion_surfaces_to_caller(self):
         """AssertionError from script body surfaces back to the caller."""
         with self.assertRaises(AssertionError) as ctx:
-            execute_scripted_runtime(self._script_assertion_failure, **_COMMON_ENGINE_KWARGS)
+            execute_scripted_runtime(
+                self._script_assertion_failure, **_COMMON_ENGINE_KWARGS
+            )
         self.assertIn("boom", str(ctx.exception))
 
     @staticmethod
@@ -104,7 +106,9 @@ class TestScriptedRuntimeFunctional(CustomTestCase):
     def test_script_raises_runtime_error_surfaces_to_caller(self):
         """RuntimeError from script body surfaces back to the caller as AssertionError."""
         with self.assertRaises(AssertionError) as ctx:
-            execute_scripted_runtime(self._script_runtime_error, **_COMMON_ENGINE_KWARGS)
+            execute_scripted_runtime(
+                self._script_runtime_error, **_COMMON_ENGINE_KWARGS
+            )
         err_text = str(ctx.exception)
         self.assertIn("RuntimeError", err_text)
         self.assertIn("simulated runtime error", err_text)
@@ -117,7 +121,9 @@ class TestScriptedRuntimeFunctional(CustomTestCase):
     def test_non_generator_script_function_errors_cleanly(self):
         """Non-generator script function is rejected with a clear error."""
         with self.assertRaises(AssertionError) as ctx:
-            execute_scripted_runtime(self._script_not_a_generator, **_COMMON_ENGINE_KWARGS)
+            execute_scripted_runtime(
+                self._script_not_a_generator, **_COMMON_ENGINE_KWARGS
+            )
         self.assertIn("must be a generator", str(ctx.exception))
 
     @staticmethod
@@ -189,7 +195,9 @@ class TestScriptedRuntimeFunctional(CustomTestCase):
 
     def test_api_smoke_r_finished(self):
         """ReqHandle.finished returns True once the req completes."""
-        execute_scripted_runtime(self._script_api_smoke_r_finished, **_COMMON_ENGINE_KWARGS)
+        execute_scripted_runtime(
+            self._script_api_smoke_r_finished, **_COMMON_ENGINE_KWARGS
+        )
 
     @staticmethod
     def _script_api_smoke_r_finished(t: ScriptedRuntime):
@@ -241,7 +249,9 @@ class TestScriptedRuntimeFunctional(CustomTestCase):
 
     def test_api_smoke_r_logprobs(self):
         """ReqHandle.logprobs is readable when return_logprob=True."""
-        execute_scripted_runtime(self._script_api_smoke_r_logprobs, **_COMMON_ENGINE_KWARGS)
+        execute_scripted_runtime(
+            self._script_api_smoke_r_logprobs, **_COMMON_ENGINE_KWARGS
+        )
 
     @staticmethod
     def _script_api_smoke_r_logprobs(t: ScriptedRuntime):
@@ -267,7 +277,9 @@ class TestScriptedRuntimeFunctional(CustomTestCase):
 
     def test_api_smoke_t_is_idle(self):
         """ScriptedRuntime.is_idle is readable as a bool."""
-        execute_scripted_runtime(self._script_api_smoke_t_is_idle, **_COMMON_ENGINE_KWARGS)
+        execute_scripted_runtime(
+            self._script_api_smoke_t_is_idle, **_COMMON_ENGINE_KWARGS
+        )
 
     @staticmethod
     def _script_api_smoke_t_is_idle(t: ScriptedRuntime):
