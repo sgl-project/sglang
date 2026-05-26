@@ -131,18 +131,50 @@ class TestScriptedRegression(CustomTestCase):
             ),
         )
 
-    # b823c16e60 "Include PP microbatch reqs in abort_request
-    # batch_rids dedup".
-    # Bug: abort_request's dedup set did not include PP cross-mb in-flight
-    # reqs, leading to double-abort under PP last-chunk-in-flight timing.
+    # [b-b823c16e60] Include PP microbatch reqs in abort_request
+    # batch_rids dedup.
+    # Bug shape: under PP=2 with the v2 scheduler, a chunked-resume req
+    # can simultaneously sit in (a) mbs[0].reqs (admitting next chunk),
+    # (b) mbs[1].reqs (last-chunk output in flight in the other mb),
+    # and (c) waiting_queue (cross-iter holding). Pre-fix
+    # abort_request's dedup set was built only from the local mb's
+    # batch.reqs, so the rid appeared 3 times in the abort iteration —
+    # triggering 3 finish events, 3 release_kv_cache calls (two of
+    # which underflow), and 3 send_output calls. The fix collects rids
+    # across ALL microbatches AND waiting_queue into a set before
+    # dispatch.
+    # Verification: drive r into all three states, abort. The dedup
+    # set t.batch_rids() (computed across the union of locations) must
+    # contain exactly 1 entry for r, not 3.
     @staticmethod
     def _script_pp_abort_dedup(t: ScriptedRuntime):
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4)
+
+        # Drive r into the dual-mb + waiting_queue state. With PP=2 and
+        # chunked admission, a long-output req will naturally pass
+        # through (mbs[0].reqs, mbs[1].reqs, waiting_queue) on the
+        # last-chunk admit iter.
         yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
 
+        # Pre-fix: abort here would issue 3 finish events because the
+        # dedup set was per-mb and missed cross-mb / waiting-queue
+        # occurrences.
         t.abort(r)
         yield
 
+        # NEW API NEEDED: t.batch_rids() must return a *set* computed
+        # over the union of (mbs[0].reqs ∪ mbs[1].reqs ∪ waiting_queue)
+        # — i.e. the dedup set abort_request consults.
+        rids_after_abort = t.batch_rids()
+        occurrences = sum(1 for rid in rids_after_abort if rid == r.rid)
+        # Bug-shape assertion: dedup set must be a set (1 entry per
+        # rid), not a list with the same rid 3 times.
+        assert occurrences <= 1, (
+            f"b823c16e60: batch_rids must dedup across mbs + "
+            f"waiting_queue; got {occurrences} occurrences of rid="
+            f"{r.rid} (pre-fix bug would yield 3)"
+        )
+        # Always-runnable: exactly one finish event must have fired.
         assert r.finish_event_count == 1, (
             f"PP abort must dedup across microbatches; "
             f"got {r.finish_event_count} finish events"
@@ -213,30 +245,76 @@ class TestScriptedRegression(CustomTestCase):
             ),
         )
 
-    # 69ef71edc4 "Conditionally exclude in-flight other-mb
-    # chunked-resume reqs (PP, max_new_tokens > 1)".
-    # Bug: under PP, chunked-resume reqs in another microbatch leaked
-    # into the local batch's filter, leading to double-admission.
-    # Verification: run two chunked reqs concurrently under PP=2,
-    # different microbatches; both must complete cleanly without
-    # double-admit symptoms (extend_input_len mismatch or
-    # chunked_in_flight_count > 1 momentarily).
+    # [b-69ef71edc4] Conditionally exclude in-flight other-mb
+    # chunked-resume reqs (PP, max_new_tokens > 1).
+    # Bug shape: under PP=2, when one microbatch is mid-chunk on a
+    # multi-output req (max_new_tokens > 1), the OTHER microbatch's
+    # scheduling pass would happily admit the same chunked-resume req
+    # into its own running batch — because the cross-mb in-flight
+    # marker was not consulted. The fix conditionally excludes any
+    # chunked-resume req present in another microbatch's in-flight set
+    # from the local admission scan, but ONLY when max_new_tokens > 1
+    # (max_new_tokens == 1 is the degenerate case where there is no
+    # output stash to dedupe across mb's).
+    # Verification: drive a long chunked req with max_new_tokens > 1
+    # under PP=2 and observe at each cross-mb iter that the req appears
+    # in t.in_flight_other_mb_rids() but NOT in t.running_rids() — i.e.
+    # the exclude path engaged. For the max_new_tokens == 1 control,
+    # the exclude must NOT engage (the req can co-occur in running).
     @staticmethod
     def _script_pp_other_mb_chunked_exclude(t: ScriptedRuntime):
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r_long = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r_ctrl = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=1)
 
-        # PP=2 + two 4096 prompts at chunk_size=256 → ~32 chunks total.
-        # Give the loop generous headroom.
+        # NEW API NEEDED: t.in_flight_other_mb_rids() returning the set
+        # of rids currently held in another microbatch's in-flight
+        # marker; t.running_rids() returning the local running batch's
+        # rid set.
+        long_exclude_engaged = False
+        ctrl_exclude_engaged = False
         for _ in range(2000):
+            in_flight_other_mb = t.in_flight_other_mb_rids()
+            running = t.running_rids()
+            # Bug-shape sample: when r_long is in another mb's in-flight
+            # set, it must NOT simultaneously appear in the local
+            # running set. Pre-fix it would appear in both.
+            if r_long.rid in in_flight_other_mb:
+                long_exclude_engaged = True
+                assert r_long.rid not in running, (
+                    f"69ef71edc4: max_new_tokens > 1 chunked-resume req "
+                    f"must be excluded from local running while held in "
+                    f"another mb's in-flight set; rid={r_long.rid}"
+                )
+            # Control: max_new_tokens == 1 — exclude must NOT engage.
+            if r_ctrl.rid in in_flight_other_mb and r_ctrl.rid in running:
+                ctrl_exclude_engaged = True
             in_flight = t.chunked_in_flight_count()
             assert (
                 in_flight <= 1
             ), f"PP cross-mb chunked exclusion broken: in_flight={in_flight}"
-            if r1.finished and r2.finished:
-                return
+            if r_long.finished and r_ctrl.finished:
+                break
             yield
-        raise AssertionError("reqs did not finish")
+        else:
+            raise AssertionError("reqs did not finish")
+
+        # Always-runnable smoke: both reqs completed under PP cross-mb.
+        assert r_long.finished and r_ctrl.finished
+        assert r_long.chunks_done >= 2 and r_ctrl.chunks_done >= 2
+        # Wishlist-dependent: the exclude path must have engaged at
+        # least once for r_long (positive), and the max_new_tokens == 1
+        # control must NOT have been excluded.
+        assert long_exclude_engaged, (
+            "69ef71edc4: never observed r_long in another mb's in-flight "
+            "set — cross-mb exclude path was not exercised"
+        )
+        # Control negative-engagement check: r_ctrl can legitimately
+        # co-appear in running + other-mb in-flight when the exclude
+        # path is intentionally skipped for max_new_tokens == 1.
+        assert ctrl_exclude_engaged or not long_exclude_engaged, (
+            "69ef71edc4: max_new_tokens == 1 control must NOT trigger "
+            "the cross-mb exclude (no output-stash dedupe needed)"
+        )
 
     def test_pdmux_filter_chunked(self):
         """34c02d6a67 "Filter chunked-resume reqs from split_prefill_batch before pdmux merge"."""
@@ -398,13 +476,42 @@ class TestScriptedRegression(CustomTestCase):
 
     @staticmethod
     def _script_revert_bump_pending_middle_outputs(t: ScriptedRuntime):
-        # e875cd36e4: revert of pending_middle_outputs bump.
-        # After last chunk admit, pending_middle_outputs should not double-count.
+        # [b-e875cd36e4] Revert of pending_middle_outputs bump.
+        # Bug shape: a transient fix wrongly bumped pending_middle_outputs
+        # a second time when crossing the last-chunk admit boundary, so
+        # the counter would briefly reach 2 (one for the prior middle
+        # output stash + one accidentally re-added on the last admit).
+        # That broke the decrement-first invariant downstream — output
+        # proc would decrement once and leave the counter stuck at 1
+        # post-finish. The revert restores the invariant that
+        # pending_middle_outputs is a 0/1 latch (it counts only the
+        # single pending middle output between admit and proc), never 2.
+        # Verification: drive a multi-chunk req across the last-chunk
+        # admit boundary and sample pending_middle_outputs on EVERY
+        # yield. The max observed value must be exactly 1; pre-fix it
+        # would hit 2 at the boundary iter.
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4)
-        yield from run_until(r, lambda h: h.chunks_done >= 1)
-        assert r.pending_middle_outputs <= 1
-        yield from run_until_finished(r)
+
+        observed_max = 0
+        # Walk across the full chunked lifecycle, sampling the counter
+        # at every iter boundary so the boundary-bump bug cannot hide.
+        for _ in range(DEFAULT_MAX_STEPS):
+            observed_max = max(observed_max, r.pending_middle_outputs)
+            if r.finished:
+                break
+            yield
+        else:
+            raise AssertionError("req did not finish within DEFAULT_MAX_STEPS")
+
+        # Always-runnable bug-shape assertion: pre-fix this would be 2.
+        assert observed_max == 1, (
+            f"e875cd36e4: pending_middle_outputs must be a 0/1 latch; "
+            f"observed max={observed_max} (pre-fix bug would bump to 2 "
+            f"at the last-chunk admit boundary)"
+        )
+        # Post-finish invariant (proc decremented the single pending).
         assert r.pending_middle_outputs == 0
+        assert r.finished and r.chunks_done >= 2
 
     def test_filter_batch_exclude_in_flight_other_mb(self):
         """5c523049db / 45347ca3a3: exclude in-flight other-mb reqs in filter_batch."""
@@ -415,11 +522,57 @@ class TestScriptedRegression(CustomTestCase):
 
     @staticmethod
     def _script_filter_batch_exclude_in_flight_other_mb(t: ScriptedRuntime):
-        # 5c523049db / 45347ca3a3: exclude in-flight other-mb reqs in
-        # filter_batch. Single-engine smoke (multi-mb requires PP).
+        # [b-5c523049db / b-45347ca3a3] Exclude in-flight other-mb reqs
+        # in filter_batch.
+        # Bug shape: filter_batch's keep-set logic did not consult the
+        # cross-mb in-flight marker. After a step where another mb
+        # picked up a chunked-resume req's output, the local mb's
+        # filter_batch could either (a) drop the req from BOTH places
+        # — causing it to disappear mid-flight — or (b) keep it in
+        # running while the other mb still owned the output stash —
+        # causing double admission. The fix routes such reqs into the
+        # in-flight-other-mb tracking set instead of the local running
+        # set during filter_batch.
+        # Verification (mirror of test_pp_other_mb_chunked_exclude but
+        # observed via filter_batch): after a filter_batch step on a
+        # long chunked req with max_new_tokens > 1, the rid must appear
+        # in t.in_flight_other_mb_rids() and must NOT appear in
+        # t.running_rids().
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
-        yield from run_until_finished(r)
-        assert r.finished
+
+        # NEW API NEEDED: t.in_flight_other_mb_rids(), t.running_rids().
+        observed_in_flight_other_mb = False
+        observed_excluded_from_running = False
+        for _ in range(DEFAULT_MAX_STEPS):
+            in_flight_other_mb = t.in_flight_other_mb_rids()
+            running = t.running_rids()
+            if r.rid in in_flight_other_mb:
+                observed_in_flight_other_mb = True
+                # Pre-fix bug: rid would appear in BOTH sets after a
+                # filter_batch run; fix routes to other-mb tracking
+                # only.
+                assert r.rid not in running, (
+                    f"5c523049db: after filter_batch, chunked-resume "
+                    f"req held in another mb must be excluded from "
+                    f"local running set; rid={r.rid}"
+                )
+                observed_excluded_from_running = True
+            if r.finished:
+                break
+            yield
+        else:
+            raise AssertionError("req did not finish within DEFAULT_MAX_STEPS")
+
+        # Always-runnable: req completed despite filter_batch cycling.
+        assert r.finished and r.chunks_done >= 2
+        # Wishlist-dependent: the filter_batch -> other-mb route must
+        # have fired at least once across the lifecycle (single-engine
+        # smoke without real PP cannot guarantee this — gate softly).
+        if observed_in_flight_other_mb:
+            assert observed_excluded_from_running, (
+                "5c523049db: filter_batch must exclude in-flight "
+                "other-mb reqs from local running set"
+            )
 
     def test_chunked_req_marker_pp_filter_exclusion(self):
         """33f981ce93 / 11db3a4192: re-add ScheduleBatch.chunked_req marker for PP cross-mb filter exclusion."""
@@ -462,17 +615,98 @@ class TestScriptedRegression(CustomTestCase):
 
     @staticmethod
     def _script_stage_a_chunk_stash_iter_boundary(t: ScriptedRuntime):
-        # 678bba26f0: Stage A chunk-stash runs at iter boundary, not
-        # mid-iter. Verifies pending_middle_outputs is consistent at the
-        # boundary between iters.
+        # [b-678bba26f0] Stage A chunk-stash runs at iter boundary,
+        # BEFORE adder.build on the next iter (not mid-iter, not after
+        # adder.build).
+        # Bug shape: the chunk-stash path (Stage A — cache_unfinished_req
+        # + write the middle output) was previously invoked mid-iter,
+        # interleaved with the adder.build pass that constructs the
+        # next batch. Result: adder.build could see a half-stashed
+        # state — chunked-resume reqs whose radix lock_ref had been
+        # acquired by the stash but whose req_to_token row write was
+        # not yet visible. The fix moves stash to the iter boundary,
+        # so on every iter the strict ordering is:
+        #     (iter N end)   scheduler_path = "...stash..."
+        #     (iter N+1 start) admission_path = "adder.build..."
+        # i.e. on any iter that has both a stash event and an admit
+        # event, stash fires first.
+        # Verification: sample t.last_scheduler_path() and
+        # t.last_admission_path() on every yield across a multi-chunk
+        # lifecycle. On any iter where scheduler_path contains "stash"
+        # AND admission_path is set, the stash event must be recorded
+        # at iter boundary BEFORE the build event (i.e. their relative
+        # ordering across consecutive iters must hold).
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+
+        # NEW API NEEDED: t.last_scheduler_path() returning the
+        # scheduler subpath taken on the most recently completed iter
+        # (e.g. "stage_a_stash" / "adder_build" / "idle"); and
+        # t.last_admission_path() returning the admission subpath
+        # taken on the most recent iter (e.g. "adder.build" / "reuse"
+        # / None).
+        stash_seen_before_build = False
+        build_seen_in_same_iter_as_stash = False
+
+        prev_scheduler_path = None
         for _ in range(DEFAULT_MAX_STEPS):
-            # Snapshot at iter boundary.
+            scheduler_path = t.last_scheduler_path()
+            admission_path = t.last_admission_path()
+
+            # Always-runnable invariant: pending_middle_outputs > 0
+            # implies the req is mid-chunking.
             if r.pending_middle_outputs > 0:
                 assert r.is_chunking
+
+            # Bug-shape check: if the previous iter's scheduler_path
+            # included "stash" AND this iter's admission_path is set,
+            # the ordering is correct (stash at boundary, build next).
+            if (
+                prev_scheduler_path is not None
+                and "stash" in prev_scheduler_path
+                and admission_path is not None
+            ):
+                stash_seen_before_build = True
+            # Pre-fix bug: if scheduler_path AND admission_path both
+            # fire on the SAME iter with stash sandwiched into the
+            # middle of adder.build, that is the regression.
+            if (
+                scheduler_path is not None
+                and "stash" in scheduler_path
+                and admission_path is not None
+                and "build" in admission_path
+            ):
+                build_seen_in_same_iter_as_stash = True
+
+            prev_scheduler_path = scheduler_path
+
             if r.finished:
-                return
+                break
             yield
+        else:
+            raise AssertionError("req did not finish within DEFAULT_MAX_STEPS")
+
+        # Always-runnable: req completed across multiple chunks.
+        assert r.finished and r.chunks_done >= 2
+        # Bug-shape assertion: stash must precede build across iter
+        # boundary; the two must NOT co-occur within one iter.
+        assert not build_seen_in_same_iter_as_stash, (
+            "678bba26f0: stash and adder.build must not fire in the "
+            "same iter — stash belongs at iter boundary BEFORE the "
+            "next iter's build"
+        )
+        # If the wishlist API exposed any stash events at all, the
+        # before-build ordering must have been observed (otherwise the
+        # API never reported a stash and the test is vacuous on this
+        # axis — covered by the build-co-occurrence negative above).
+        if any(
+            "stash" in p
+            for p in (prev_scheduler_path,)
+            if p is not None
+        ):
+            assert stash_seen_before_build, (
+                "678bba26f0: stash event recorded but never observed "
+                "preceding a subsequent build event"
+            )
 
     def test_chunked_resume_tail_counted_page_size_gt1(self):
         """B433e1ea35: count chunked-resume tail in runtime mem check when page_size > 1."""
@@ -659,13 +893,72 @@ class TestScriptedRegression(CustomTestCase):
 
     @staticmethod
     def _script_waiting_queue_pending_tokens_subtract_prefix(t: ScriptedRuntime):
-        # c79a73bec4: subtract prefix_indices from waiting_queue pending
-        # tokens sum. Verifies waiting_queue pending tokens excludes
-        # already-cached prefix.
-        r_warm = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE * 2, max_new_tokens=1)
-        yield from run_until_finished(r_warm)
-        r = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE * 4, max_new_tokens=2)
-        yield from run_until_finished(r)
+        # [b-c79a73bec4] Subtract prefix_indices from waiting_queue
+        # pending tokens sum.
+        # Bug shape: load_inquirer (the admission-budget probe used by
+        # the scheduler to decide whether to admit a new req in this
+        # iter) summed total_tokens of every waiting_queue entry.
+        # For chunked-resume reqs (force-retracted mid-flight or
+        # holding across iters) this double-counts the already-cached
+        # prefix: the req still has kv_committed_len > 0 worth of KV
+        # already in the pool, and prefix_indices_len > 0 worth of
+        # radix prefix that will be reused. The fix subtracts
+        # prefix_indices_len from each waiting_queue entry's
+        # contribution, so the budget probe reflects the *actual*
+        # extension work still to do.
+        # Verification: force-retract a long chunked R1 into the
+        # waiting_queue (kv_committed_len > 0, prefix_indices_len > 0).
+        # Submit short R2. The load_inquirer's reported pending-tokens
+        # value must equal:
+        #     R1.total_tokens - R1.prefix_indices_len + R2.total_tokens
+        # NOT the pre-fix sum:
+        #     R1.total_tokens + R2.total_tokens
+        r1 = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE * 4, max_new_tokens=2)
+        yield from run_until(r1, lambda h: h.is_chunking and h.chunks_done >= 1)
+
+        # Force-retract R1 into waiting_queue with non-zero
+        # kv_committed_len AND non-zero prefix_indices_len — this is
+        # the precondition for the bug.
+        t.force_retract(r1)
+        yield
+        yield from run_until(r1, lambda h: h.status == "waiting")
+
+        # NEW API NEEDED: r.prefix_indices_len exposing the stashed
+        # radix prefix length (already in the v2 ReqHandle wishlist).
+        r1_prefix = r1.prefix_indices_len
+        r1_committed = r1.kv_committed_len
+        assert r1_committed > 0, "R1 must hold committed KV in waiting_queue"
+        assert r1_prefix > 0, "R1 must have a non-zero stashed prefix"
+
+        # Submit short R2 as a co-pending entry in waiting_queue.
+        r2 = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE, max_new_tokens=2)
+        yield  # one iter to settle R2 into waiting_queue
+
+        # NEW API NEEDED: t.load_inquirer_num_pending_tokens() — the
+        # admission-budget probe's pending-tokens count over the
+        # current waiting_queue. Implemented inside Scheduler's
+        # load_inquirer subsystem; exposed via ScriptedRuntime.
+        observed_pending = t.load_inquirer_num_pending_tokens()
+
+        r1_total = r1.total_tokens
+        r2_total = r2.total_tokens
+        expected_post_fix = (r1_total - r1_prefix) + r2_total
+        pre_fix_bad = r1_total + r2_total
+
+        assert observed_pending == expected_post_fix, (
+            f"c79a73bec4: load_inquirer must subtract prefix_indices_len "
+            f"from each waiting_queue entry's contribution; "
+            f"observed={observed_pending}, expected_post_fix="
+            f"{expected_post_fix}, pre_fix_bad={pre_fix_bad}"
+        )
+        assert observed_pending != pre_fix_bad, (
+            f"c79a73bec4: observed pending tokens matches the pre-fix "
+            f"(no-subtraction) sum — fix is regressed"
+        )
+
+        yield from run_until_all_finished([r1, r2])
+        # Always-runnable: both reqs completed cleanly.
+        assert r1.finished and r2.finished
 
     def test_abort_dedup_dual_queue_holding(self):
         """De3859646b: abort_request dedup for chunked-resume dual-queue holding."""
