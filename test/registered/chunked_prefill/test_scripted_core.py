@@ -144,8 +144,8 @@ class TestScriptedCorePrefillOnly(ScriptedRuntimeTestCase):
 
 class TestScriptedPpChunkSweep(ScriptedRuntimeTestCase):
     # pp_async_batch_depth=2 makes pp_loop_size = pp_size + depth = 6,
-    # so the loop size strictly exceeds pp_size — the user-reported
-    # "队列深度还不是 num gpu 还会更大" scenario.
+    # so the loop size strictly exceeds pp_size — the regime where the
+    # PP queue depth is larger than the GPU count.
     ENGINE_KWARGS = base_engine_kwargs(
         model_path=SMALL_MODEL,
         tp_size=1,
