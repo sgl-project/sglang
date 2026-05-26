@@ -7,7 +7,6 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -65,7 +64,7 @@ class DFlashDraftInputV2(SpecInput):
     _prepare_nxt_kv_lens_gpu_buf: Optional[torch.Tensor] = None
 
     # Filled by scheduler after dispatch.
-    future_indices: Optional[FutureIndices] = None
+    future_indices: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
@@ -137,9 +136,9 @@ class DFlashDraftInputV2(SpecInput):
         the overallocated mapping.
         """
         plan_stream, plan_stream_ctx = _get_overlap_plan_stream(batch.device)
-        if plan_stream is None:
+        if plan_stream is None and self.verify_done is not None:
             # Ensure previous forward is completed before mutating shared buffers.
-            batch.maybe_wait_verify_done()
+            self.verify_done.synchronize()
 
         bs = batch.batch_size()
         if bs == 0:
@@ -290,7 +289,7 @@ class DFlashDraftInputV2(SpecInput):
             self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
 
         if self.future_indices is not None:
-            self.future_indices.indices = self.future_indices.indices[new_indices]
+            self.future_indices = self.future_indices[new_indices]
             return
 
         self.topk_p = self.topk_p[new_indices]
@@ -330,10 +329,8 @@ class DFlashDraftInputV2(SpecInput):
 
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
-            self.future_indices = FutureIndices(
-                indices=torch.cat(
-                    [self.future_indices.indices, spec_info.future_indices.indices]
-                )
+            self.future_indices = torch.cat(
+                [self.future_indices, spec_info.future_indices]
             )
             return
 

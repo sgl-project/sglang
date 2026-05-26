@@ -79,7 +79,7 @@ import { GLM51Deployment } from '/src/snippets/autoregressive/glm-51-deployment.
   </tbody>
 </table>
 
-- **AMD GPUs**: Both BF16 and FP8 checkpoints are supported on MI300X/MI325X/MI355X at tp=8. Use `--nsa-prefill-backend tilelang --nsa-decode-backend tilelang` for the NSA attention backend. Add `--chunked-prefill-size 131072` and `--watchdog-timeout 1200` (20 minutes for weight loading). FP8 uses approximately half the memory of BF16 (~89 GB/GPU vs ~175 GB/GPU). EAGLE speculative decoding is not currently supported on AMD for GLM-5.1.
+- **AMD GPUs**: Both BF16 and FP8 checkpoints are supported on MI300X/MI325X/MI355X at tp=8. Use `--dsa-prefill-backend tilelang --dsa-decode-backend tilelang` for the DSA attention backend. Add `--chunked-prefill-size 131072` and `--watchdog-timeout 1200` (20 minutes for weight loading). FP8 uses approximately half the memory of BF16 (~89 GB/GPU vs ~175 GB/GPU). EAGLE speculative decoding is not currently supported on AMD for GLM-5.1.
 - **GB300**: Only the FP8 checkpoint is recommended on GB300, with `tp=4`. For high-throughput DP attention on GB300, use `--dp 4`.
 - For other configuration tips, please refer to [DeepSeek V3.2 documentation](../../../docs/basic_usage/deepseek_v32). GLM-5.1 and DeepSeek V3.2 share the same model structure, so the optimization techniques between these two models are also common (MTP, DSA kernel, Context Parallel...).
 - Use `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` for GLM-5.1-FP8 if you want to enable the [IndexCache](https://github.com/THUDM/IndexCache) method. This feature is supported through [this PR](https://github.com/sgl-project/sglang/pull/21405) and introduces only a small accuracy loss. However, if you are running rigorous accuracy evaluations, it is not recommended to enable this feature.
@@ -116,8 +116,8 @@ sglang serve \
   --trust-remote-code \
   --tool-call-parser glm47 \
   --reasoning-parser glm45 \
-  --nsa-prefill-backend tilelang \
-  --nsa-decode-backend tilelang \
+  --dsa-prefill-backend tilelang \
+  --dsa-decode-backend tilelang \
   --chunked-prefill-size 131072 \
   --mem-fraction-static 0.80 \
   --watchdog-timeout 1200 \
@@ -132,8 +132,8 @@ sglang serve \
   --model-path zai-org/GLM-5.1 \
   --tp 8 \
   --trust-remote-code \
-  --nsa-prefill-backend tilelang \
-  --nsa-decode-backend tilelang \
+  --dsa-prefill-backend tilelang \
+  --dsa-decode-backend tilelang \
   --chunked-prefill-size 131072 \
   --mem-fraction-static 0.80 \
   --watchdog-timeout 1200 \
@@ -627,7 +627,7 @@ Average accuracy: 0.877
 
 #### 5.3.1 GSM8K Benchmark (MI325/MI35x)
 
-- MI325/MI35x Test (GLM-5.1 BF16, `tp=8`, TileLang NSA backends)
+- MI325/MI35x Test (GLM-5.1 BF16, `tp=8`, TileLang DSA backends)
 
 ```bash Command
 python3 benchmark/gsm8k/bench_sglang.py --num-questions 200

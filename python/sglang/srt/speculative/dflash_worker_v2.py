@@ -3,7 +3,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
@@ -17,8 +17,8 @@ from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
-    compute_dflash_accept_len_and_bonus,
-    compute_dflash_sampling_accept_len_and_bonus,
+    compute_dflash_correct_drafts_and_bonus,
+    compute_dflash_sampling_correct_drafts_and_bonus,
     is_dflash_sampling_verify_available,
 )
 from sglang.srt.speculative.dflash_worker import DFlashWorker
@@ -72,7 +72,7 @@ class DFlashWorkerV2(DFlashWorker):
         self._use_triton_accept_bonus = supports_gpu_triton
 
     def _validate_phase1_sampling_support(
-        self, model_worker_batch: ModelWorkerBatch
+        self, model_worker_batch: ScheduleBatch
     ) -> None:
         sampling_info = model_worker_batch.sampling_info
         if sampling_info is None or sampling_info.is_all_greedy:
@@ -131,8 +131,8 @@ class DFlashWorkerV2(DFlashWorker):
 
     def forward_batch_generation(
         self,
-        model_worker_batch: ModelWorkerBatch,
-        **kwargs,
+        model_worker_batch: ScheduleBatch,
+        on_publish=None,
     ) -> GenerationBatchResult:
         if getattr(model_worker_batch, "return_logprob", False):
             raise ValueError(
@@ -147,13 +147,16 @@ class DFlashWorkerV2(DFlashWorker):
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
             batch_output = self.target_worker.forward_batch_generation(
-                model_worker_batch, **kwargs
+                model_worker_batch
             )
 
             logits_output, next_token_ids = (
                 batch_output.logits_output,
                 batch_output.next_token_ids,
             )
+            batch_output.new_seq_lens = model_worker_batch.seq_lens
+            if on_publish is not None:
+                on_publish(batch_output.new_seq_lens)
 
             if logits_output.hidden_states is None:
                 raise RuntimeError(
@@ -162,11 +165,11 @@ class DFlashWorkerV2(DFlashWorker):
                 )
 
             if (
-                model_worker_batch.extend_seq_lens is None
-                or model_worker_batch.extend_prefix_lens is None
+                model_worker_batch.extend_lens is None
+                or model_worker_batch.prefix_lens is None
             ):
                 raise RuntimeError(
-                    "DFLASH expected extend_seq_lens / extend_prefix_lens to be populated in extend mode, "
+                    "DFLASH expected extend_lens / prefix_lens to be populated in extend mode, "
                     "but got None."
                 )
 
@@ -174,10 +177,10 @@ class DFlashWorkerV2(DFlashWorker):
             # for radix cache safety (the scheduler may update radix after prefill returns).
             device = next_token_ids.device
             ctx_lens = torch.tensor(
-                model_worker_batch.extend_seq_lens, dtype=torch.int32, device=device
+                model_worker_batch.extend_lens, dtype=torch.int32, device=device
             )
             draft_seq_lens = torch.tensor(
-                model_worker_batch.extend_prefix_lens, dtype=torch.int32, device=device
+                model_worker_batch.prefix_lens, dtype=torch.int32, device=device
             )
 
             if model_worker_batch.out_cache_loc is None:
@@ -188,7 +191,7 @@ class DFlashWorkerV2(DFlashWorker):
                 self.model_runner.server_args.attention_backend,
                 draft_seq_lens,
                 ctx_lens,
-                int(sum(model_worker_batch.extend_seq_lens)),
+                int(sum(model_worker_batch.extend_lens)),
             )
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
@@ -228,6 +231,8 @@ class DFlashWorkerV2(DFlashWorker):
                 verified_id=torch.empty((0,), device=self.device, dtype=torch.int32),
                 new_seq_lens=torch.empty((0,), device=self.device, dtype=torch.int32),
             )
+            if on_publish is not None:
+                on_publish(next_draft_input.new_seq_lens)
             verify_done = torch.get_device_module(self.device).Event()
             verify_done.record()
             next_draft_input.verify_done = verify_done
@@ -382,7 +387,11 @@ class DFlashWorkerV2(DFlashWorker):
                 draft_seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
             elif model_worker_batch.seq_lens_cpu is not None:
                 seq_lens_cpu.copy_(model_worker_batch.seq_lens_cpu)
-                draft_seq_lens_sum = int(model_worker_batch.seq_lens_sum)
+                draft_seq_lens_sum = (
+                    int(model_worker_batch.seq_lens_sum)
+                    if model_worker_batch.seq_lens_sum is not None
+                    else int(model_worker_batch.seq_lens_cpu.sum())
+                )
             else:
                 seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
                 draft_seq_lens_sum = int(prefix_lens.sum().item())
@@ -397,9 +406,6 @@ class DFlashWorkerV2(DFlashWorker):
             seq_lens_sum=draft_seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
-            req_to_token_pool=self.draft_model_runner.req_to_token_pool,
-            token_to_kv_pool=self.draft_model_runner.token_to_kv_pool,
-            attn_backend=self.draft_model_runner.attn_backend,
             input_embeds=input_embeds,
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             spec_info=self._draft_block_spec_info,
@@ -463,11 +469,10 @@ class DFlashWorkerV2(DFlashWorker):
         model_worker_batch.seq_lens_sum = seq_lens_sum_backup
 
         target_out = self.target_worker.forward_batch_generation(
-            model_worker_batch=None,
+            batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True,
-            **kwargs,
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
@@ -485,7 +490,7 @@ class DFlashWorkerV2(DFlashWorker):
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()
         ):
-            accept_len, bonus = compute_dflash_sampling_accept_len_and_bonus(
+            accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -528,7 +533,7 @@ class DFlashWorkerV2(DFlashWorker):
                         "DFLASH Triton accept/bonus failed; falling back to eager path: %s",
                         e,
                     )
-                    accept_len, bonus = compute_dflash_accept_len_and_bonus(
+                    accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
                         candidates=candidates,
                         target_predict=target_predict,
                     )
@@ -545,7 +550,7 @@ class DFlashWorkerV2(DFlashWorker):
                         1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                     )
             else:
-                accept_len, bonus = compute_dflash_accept_len_and_bonus(
+                accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
                     candidates=candidates,
                     target_predict=target_predict,
                 )
@@ -568,6 +573,10 @@ class DFlashWorkerV2(DFlashWorker):
                 commit_lens=commit_lens,
             )
 
+        new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+        if on_publish is not None:
+            on_publish(new_seq_lens)
+
         # --- 3) Materialize committed verify-input tokens into draft KV cache.
         hidden = logits_output.hidden_states
         if hidden is None:
@@ -587,7 +596,6 @@ class DFlashWorkerV2(DFlashWorker):
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
 
-        new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         next_draft_input = self._make_next_draft_input_decode(
             verified_id=bonus,
             new_seq_lens=new_seq_lens,
