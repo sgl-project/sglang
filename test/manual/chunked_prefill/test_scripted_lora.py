@@ -41,7 +41,7 @@ def _script_naive_lora_chunked(t: ScriptedRuntime):
     assert r.chunks_done >= 2
 
 
-class TestFeatureLoRAChunked(CustomTestCase):
+class TestScriptedLoRA(CustomTestCase):
     def test_naive_lora_chunked(self):
         execute_scripted_runtime(
             _script_naive_lora_chunked,

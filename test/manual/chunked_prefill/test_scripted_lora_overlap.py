@@ -36,7 +36,7 @@ def _script_naive_lora_overlap_chunked(t: ScriptedRuntime):
     assert r.chunks_done >= 2
 
 
-class TestFeatureLoRAOverlapChunked(CustomTestCase):
+class TestScriptedLoRAOverlap(CustomTestCase):
     def test_naive_lora_overlap_chunked(self):
         execute_scripted_runtime(
             _script_naive_lora_overlap_chunked,

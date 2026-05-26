@@ -34,7 +34,7 @@ def _script_naive_swa_chunked(t: ScriptedRuntime):
     assert r.chunks_done >= 2
 
 
-class TestFeatureHybridSWAChunked(CustomTestCase):
+class TestScriptedHybridSWA(CustomTestCase):
     def test_naive_swa_chunked(self):
         execute_scripted_runtime(
             _script_naive_swa_chunked,

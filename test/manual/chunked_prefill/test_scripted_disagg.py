@@ -32,7 +32,7 @@ def _script_naive_disagg_chunked(t: ScriptedRuntime):
     assert r.chunks_done >= 2
 
 
-class TestFeatureDisaggChunked(CustomTestCase):
+class TestScriptedDisagg(CustomTestCase):
     def test_naive_disagg_chunked(self):
         # When ScriptedRuntime grows disagg topology support, the
         # decode-side engine kwargs go through ``decode_engine_kwargs=``

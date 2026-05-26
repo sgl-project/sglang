@@ -29,7 +29,7 @@ def _script_naive_spec_chunked(t: ScriptedRuntime):
     assert r.chunks_done >= 2
 
 
-class TestFeatureSpecChunked(CustomTestCase):
+class TestScriptedSpec(CustomTestCase):
     def test_naive_spec_chunked(self):
         execute_scripted_runtime(
             _script_naive_spec_chunked,

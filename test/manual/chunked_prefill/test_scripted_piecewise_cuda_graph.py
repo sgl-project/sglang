@@ -25,7 +25,7 @@ def _script_naive_piecewise_cg_chunked(t: ScriptedRuntime):
     assert r.chunks_done >= 2
 
 
-class TestFeaturePiecewiseCGChunked(CustomTestCase):
+class TestScriptedPiecewiseCG(CustomTestCase):
     def test_naive_piecewise_cg_chunked(self):
         # Note: deliberately *do not* pass disable_cuda_graph=True so
         # piecewise capture runs; ``base_engine_kwargs`` defaults it off

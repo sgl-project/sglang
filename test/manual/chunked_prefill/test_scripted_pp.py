@@ -33,7 +33,7 @@ def _script_naive_pp_chunked(t: ScriptedRuntime):
     assert r.chunks_done >= 2, f"expected ≥2 chunks, got {r.chunks_done}"
 
 
-class TestFeaturePPChunked(CustomTestCase):
+class TestScriptedPP(CustomTestCase):
     def test_naive_pp_chunked(self):
         execute_scripted_runtime(
             _script_naive_pp_chunked,

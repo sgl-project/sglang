@@ -28,7 +28,7 @@ def _script_naive_dp_attention_chunked(t: ScriptedRuntime):
     assert r.chunks_done >= 2
 
 
-class TestFeatureDPAttentionChunked(CustomTestCase):
+class TestScriptedDPAttention(CustomTestCase):
     def test_naive_dp_attention_chunked(self):
         execute_scripted_runtime(
             _script_naive_dp_attention_chunked,

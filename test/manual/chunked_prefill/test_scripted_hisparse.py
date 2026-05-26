@@ -33,7 +33,7 @@ def _script_naive_hisparse_chunked(t: ScriptedRuntime):
     assert r.chunks_done >= 2
 
 
-class TestFeatureHiSparseChunked(CustomTestCase):
+class TestScriptedHiSparse(CustomTestCase):
     def test_naive_hisparse_chunked(self):
         execute_scripted_runtime(
             _script_naive_hisparse_chunked,
