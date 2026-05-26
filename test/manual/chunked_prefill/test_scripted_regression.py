@@ -276,10 +276,14 @@ class TestScriptedRegression(CustomTestCase):
     # not include r1 in its prefix match.
     @staticmethod
     def _script_priority_skips_chunked_in_prefix_match(t: ScriptedRuntime):
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="low")
+        r1 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="low"
+        )
         yield from run_until(r1, lambda h: h.is_chunking)
 
-        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="high")
+        r2 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="high"
+        )
 
         yield from run_until_all_finished([r1, r2])
         assert r1.finished and r2.finished
@@ -1068,8 +1072,7 @@ class TestScriptedRegression(CustomTestCase):
 
         # has_pending_chunk reqs must be immune.
         assert not getattr(r, "aborted", False), (
-            f"359e5ed7bd: chunked-resume must be immune to waiting "
-            f"timeout abort"
+            f"359e5ed7bd: chunked-resume must be immune to waiting " f"timeout abort"
         )
         assert r.kv_pages > 0 or r.chunks_done > 0
         yield from run_until_finished(r)
@@ -1113,15 +1116,15 @@ class TestScriptedRegression(CustomTestCase):
         yield
 
         # All three released, together.
-        assert r.row_idx is None, (
-            f"96d4749094: abort must release row; got row_idx={r.row_idx!r}"
-        )
-        assert r.kv_pages == 0, (
-            f"96d4749094: abort must release KV; got kv_pages={r.kv_pages}"
-        )
-        assert r.lock_refs == 0, (
-            f"96d4749094: abort must release lock_ref; got lock_refs={r.lock_refs}"
-        )
+        assert (
+            r.row_idx is None
+        ), f"96d4749094: abort must release row; got row_idx={r.row_idx!r}"
+        assert (
+            r.kv_pages == 0
+        ), f"96d4749094: abort must release KV; got kv_pages={r.kv_pages}"
+        assert (
+            r.lock_refs == 0
+        ), f"96d4749094: abort must release lock_ref; got lock_refs={r.lock_refs}"
         # has_pending_chunk + pending_middle_outputs are defensively
         # cleared so the iter-end stash path cannot revive the dead req.
         assert not r.has_pending_chunk
