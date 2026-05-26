@@ -293,18 +293,14 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 
 logger = logging.getLogger(__name__)
 
-
-_DEFAULT_WEIGHT_SYNC_P2P_OPS_PER_BATCH = 64
-_DEFAULT_MAX_PENDING_RELAY_BYTES = 8 * 1024 * 1024 * 1024
+WEIGHT_SYNC_P2P_OPS_PER_BATCH = int(os.environ.get("WEIGHT_SYNC_P2P_OPS_PER_BATCH", 64))
+WEIGHT_SYNC_MAX_PENDING_RELAY_BYTES = int(
+    os.environ.get("WEIGHT_SYNC_MAX_PENDING_RELAY_BYTES", 8 * 1024 * 1024 * 1024)
+)
 
 
 def _run_weight_sync_p2p_ops(ops):
-    ops_per_batch = int(
-        os.environ.get(
-            "WEIGHT_SYNC_P2P_OPS_PER_BATCH",
-            _DEFAULT_WEIGHT_SYNC_P2P_OPS_PER_BATCH,
-        )
-    )
+    ops_per_batch = WEIGHT_SYNC_P2P_OPS_PER_BATCH
 
     batch = []
 
@@ -2045,11 +2041,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             len(ports_list) == self.tp_size
         ), f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
         group_port = ports_list[self.tp_rank]
-        custom_group_name = f"{group_name}_{group_port}_{self.tp_rank}"
+        process_group_name = f"{group_name}_{group_port}_{self.tp_rank}"
 
         logger.info(
             f"init custom process group: tp_rank={self.tp_rank}, gpu_id={self.gpu_id}, master_address={master_address}, master_port={group_port}, "
-            f"group_rank={group_rank}, world_size={world_size}, group_name={custom_group_name}, backend={backend}"
+            f"group_rank={group_rank}, world_size={world_size}, group_name={process_group_name}, backend={backend}"
         )
 
         torch.cuda.empty_cache()
@@ -2057,18 +2053,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         message = ""
         try:
             na = NetworkAddress(master_address, group_port)
-            self._weights_send_group[group_name] = init_custom_process_group(
+            send_group = init_custom_process_group(
                 backend=backend,
                 init_method=na.to_tcp(),
                 world_size=world_size,
                 rank=group_rank,
-                group_name=custom_group_name,
+                group_name=process_group_name,
                 device_id=torch.device("cuda", self.gpu_id),
             )
-            dist.barrier(group=self._weights_send_group[group_name])
+            self._weights_send_group[group_name] = send_group
+            dist.barrier(group=send_group)
             success = True
             message = f"Succeeded to init group through {na.to_host_port_str()} group."
         except Exception as e:
+            self._weights_send_group.pop(group_name, None)
             message = f"Failed to init group: {e}."
             logger.error(message)
 
@@ -2119,6 +2117,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         torch.cuda.empty_cache()
         return success, message
 
+    def _broadcast_flattened_tensor_bucket(self, named_tensors, group):
+        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        torch.distributed.broadcast(
+            bucket.get_flattened_tensor(),
+            src=0,
+            group=group,
+        )
+        return bucket
+
     def destroy_weights_send_group_for_remote_instance(self, group_name):
         assert (
             torch.distributed.is_initialized()
@@ -2145,12 +2152,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             device=self.device,
             gpu_id=self.gpu_id,
             tp_rank=self.tp_rank,
-            max_pending_bytes=int(
-                os.environ.get(
-                    "WEIGHT_SYNC_MAX_PENDING_RELAY_BYTES",
-                    _DEFAULT_MAX_PENDING_RELAY_BYTES,
-                )
-            ),
+            max_pending_bytes=WEIGHT_SYNC_MAX_PENDING_RELAY_BYTES,
             apply_update=self._apply_relay_weight_update,
         )
         return self._relay_weight_loader
@@ -2434,12 +2436,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 named_tensors.append(
                     (name, torch.empty(shape, dtype=target_dtype, device=self.device))
                 )
-            bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-            flattened_tensor = bucket.get_flattened_tensor()
-            torch.distributed.broadcast(
-                flattened_tensor,
-                src=0,
-                group=self._model_update_group[group_name],
+            bucket = self._broadcast_flattened_tensor_bucket(
+                named_tensors,
+                self._model_update_group[group_name],
             )
             reconstructed_tensors = bucket.reconstruct_tensors()
             self.model.load_weights(reconstructed_tensors)
