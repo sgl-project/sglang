@@ -14,8 +14,15 @@ def attach_dsv4(
     read_bytes: int,
     kv_token_id_vs_position_offset: int,
 ) -> tuple[CanaryBufferGroup, ...]:
-    # DSV4 stores 584 B/token (not 16-aligned); RealKvSource requires
-    # num_bytes_per_token % 16 == 0, so real-KV fingerprint is disabled.
+    """Attach canary buffers to a DeepSeekV4TokenToKVPool.
+
+    TODO: only the swa_kv_pool sub-pool is wired; c4_kv_pool / c128_kv_pool /
+    c4_indexer_kv_pool / compress state pools are left uncovered.
+    TODO: even on swa_kv_pool, real-KV fingerprint is disabled (read_bytes is
+    ignored). DSV4 stores 584 B/token which is not 16-aligned, and the current
+    RealKvSource conflates per-slot stride with fingerprint width; enabling
+    real-KV here needs a separate slot_stride_bytes field on RealKvSource.
+    """
     del read_bytes
 
     sub_pool = pool.swa_kv_pool
