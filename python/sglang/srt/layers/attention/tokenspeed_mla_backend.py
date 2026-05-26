@@ -134,8 +134,9 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                     # branch, which always asks for the LSE.
                     if is_causal is False and return_lse is False:
                         continue
+                    # Runtime feeds fp8_e4m3fn q/k/v
                     config = (
-                        torch.bfloat16,
+                        torch.float8_e4m3fn,
                         head_dim_qk,
                         self.v_head_dim,
                         is_causal,
@@ -146,7 +147,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                     if config in _compiled_kernels:
                         continue
                     _compiled_kernels[config] = _compile_prefill_kernel(
-                        torch.bfloat16,
+                        torch.float8_e4m3fn,
                         head_dim_qk,
                         self.v_head_dim,
                         is_causal,

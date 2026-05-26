@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
+from array import array
 from collections import OrderedDict, defaultdict
 from enum import IntEnum
 from http import HTTPStatus
@@ -440,6 +441,7 @@ class WaitingImageRequest:
         recv_req: TokenizedGenerateReqInput,
         mm_processor,
         encoder_urls,
+        model_type,
         host_name,
         receive_count,
     ):
@@ -450,6 +452,7 @@ class WaitingImageRequest:
         self.thread = None
         self.mm_processor = mm_processor
         self.encoder_urls = encoder_urls
+        self.model_type = model_type
         self.host_name = host_name
         self.receive_count = receive_count
         self.num_items_assigned = recv_req.num_items_assigned
@@ -588,7 +591,7 @@ class WaitingImageRequest:
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
         self.recv_req.mm_inputs = mm_inputs
-        self.recv_req.input_ids = mm_inputs.input_ids
+        self.recv_req.input_ids = array("q", mm_inputs.input_ids)
         self.status = WaitingImageRequestStatus.SUCCESS
         self.recv_socket.close()
 
@@ -925,6 +928,7 @@ class MMReceiverBase(ABC):
                     recv_req=recv_req,
                     mm_processor=self.mm_processor,
                     encoder_urls=self.encode_urls,
+                    model_type=self.model_type,
                     host_name=self.hostname,
                     receive_count=self.tp_size,
                 )
