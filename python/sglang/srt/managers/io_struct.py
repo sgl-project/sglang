@@ -1550,6 +1550,17 @@ class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq):
 
 
 @dataclass
+class DestroyWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
+    group_name: str = "weight_send_group"
+
+
+@dataclass
+class DestroyWeightsSendGroupForRemoteInstanceReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
 class PostProcessWeightsReqInput(BaseReq):
     # Whether to restore weights before loading new weights
     restore_weights_before_load: bool = False

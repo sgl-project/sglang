@@ -27,6 +27,8 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    DestroyWeightsSendGroupForRemoteInstanceReqInput,
+    DestroyWeightsSendGroupForRemoteInstanceReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
@@ -102,6 +104,10 @@ _COMMUNICATOR_SPECS = [
     (
         "init_weights_send_group_for_remote_instance",
         InitWeightsSendGroupForRemoteInstanceReqOutput,
+    ),
+    (
+        "destroy_weights_send_group_for_remote_instance",
+        DestroyWeightsSendGroupForRemoteInstanceReqOutput,
     ),
     ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
     ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
@@ -496,6 +502,21 @@ class TokenizerControlMixin:
             self.server_args.dp_size == 1
         ), "dp_size must be 1 for send_weights_to_remote_instance"
         result = (await self.send_weights_to_remote_instance_communicator(obj))[0]
+        return result.success, result.message
+
+    async def destroy_weights_send_group_for_remote_instance(
+        self: TokenizerManager,
+        obj: DestroyWeightsSendGroupForRemoteInstanceReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        # TODO: support DP
+        assert (
+            self.server_args.dp_size == 1
+        ), "dp_size must be 1 for destroy_weights_send_group_for_remote_instance"
+        result = (
+            await self.destroy_weights_send_group_for_remote_instance_communicator(obj)
+        )[0]
         return result.success, result.message
 
     async def update_weights_from_tensor(

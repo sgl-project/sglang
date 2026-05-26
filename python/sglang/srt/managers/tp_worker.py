@@ -24,6 +24,7 @@ import torch
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.managers.io_struct import (
     DestroyRelayWeightsUpdateGroupReqInput,
+    DestroyWeightsSendGroupForRemoteInstanceReqInput,
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
     InitRelayWeightsUpdateGroupReqInput,
@@ -162,6 +163,16 @@ class BaseTpWorker(ABC):
             recv_req.master_address,
             recv_req.ports,
             recv_req.group_name,
+        )
+        return success, message
+
+    def destroy_weights_send_group_for_remote_instance(
+        self, recv_req: DestroyWeightsSendGroupForRemoteInstanceReqInput
+    ):
+        success, message = (
+            self.model_runner.destroy_weights_send_group_for_remote_instance(
+                recv_req.group_name,
+            )
         )
         return success, message
 

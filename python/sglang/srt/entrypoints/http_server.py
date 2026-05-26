@@ -116,6 +116,7 @@ from sglang.srt.managers.io_struct import (
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyRelayWeightsUpdateGroupReqInput,
+    DestroyWeightsSendGroupForRemoteInstanceReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
@@ -1089,6 +1090,23 @@ async def send_weights_to_remote_instance(
 ):
     success, message = (
         await _global_state.tokenizer_manager.send_weights_to_remote_instance(
+            obj, request
+        )
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/destroy_weights_send_group_for_remote_instance")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def destroy_weights_send_group_for_remote_instance(
+    obj: DestroyWeightsSendGroupForRemoteInstanceReqInput, request: Request
+):
+    success, message = (
+        await _global_state.tokenizer_manager.destroy_weights_send_group_for_remote_instance(
             obj, request
         )
     )

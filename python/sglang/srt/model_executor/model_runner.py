@@ -2045,11 +2045,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             len(ports_list) == self.tp_size
         ), f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
         group_port = ports_list[self.tp_rank]
-        group_name = f"{group_name}_{group_port}_{self.tp_rank}"
+        custom_group_name = f"{group_name}_{group_port}_{self.tp_rank}"
 
         logger.info(
             f"init custom process group: tp_rank={self.tp_rank}, gpu_id={self.gpu_id}, master_address={master_address}, master_port={group_port}, "
-            f"group_rank={group_rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
+            f"group_rank={group_rank}, world_size={world_size}, group_name={custom_group_name}, backend={backend}"
         )
 
         torch.cuda.empty_cache()
@@ -2062,7 +2062,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 init_method=na.to_tcp(),
                 world_size=world_size,
                 rank=group_rank,
-                group_name=group_name,
+                group_name=custom_group_name,
                 device_id=torch.device("cuda", self.gpu_id),
             )
             dist.barrier(group=self._weights_send_group[group_name])
@@ -2092,7 +2092,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             len(ports_list) == self.tp_size
         ), f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
         group_port = ports_list[self.tp_rank]
-        group_name = f"{group_name}_{group_port}_{self.tp_rank}"
 
         send_group = self._weights_send_group.get(group_name)
         if send_group is None:
@@ -2117,11 +2116,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             message = f"Failed to send weights: {e}."
             logger.error(message)
 
-        # destroy the process group after sending weights
-        del self._weights_send_group[group_name]
-        torch.distributed.distributed_c10d.destroy_process_group(send_group)
         torch.cuda.empty_cache()
         return success, message
+
+    def destroy_weights_send_group_for_remote_instance(self, group_name):
+        assert (
+            torch.distributed.is_initialized()
+        ), "Default torch process group must be initialized"
+        assert group_name != "", "Group name cannot be empty"
+
+        try:
+            send_group = self._weights_send_group.pop(group_name, None)
+            if send_group is None:
+                return False, "The weights send group to be destroyed does not exist."
+            torch.distributed.distributed_c10d.destroy_process_group(send_group)
+            return True, "Succeeded to destroy weights send group."
+        except Exception as e:
+            message = f"Failed to destroy weights send group: {e}."
+            logger.error(message)
+            return False, message
 
     def _get_relay_weight_loader(self) -> _RelayWeightUpdateLoader:
         """Get the relay-only async update loader, creating it on first use."""

@@ -97,6 +97,8 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
     ContinueGenerationReqInput,
+    DestroyWeightsSendGroupForRemoteInstanceReqInput,
+    DestroyWeightsSendGroupForRemoteInstanceReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
@@ -1444,6 +1446,10 @@ class Scheduler(
                 (
                     InitWeightsSendGroupForRemoteInstanceReqInput,
                     self.init_weights_send_group_for_remote_instance,
+                ),
+                (
+                    DestroyWeightsSendGroupForRemoteInstanceReqInput,
+                    self.destroy_weights_send_group_for_remote_instance,
                 ),
                 (
                     SendWeightsToRemoteInstanceReqInput,
@@ -3825,6 +3831,15 @@ class Scheduler(
         """Send the seed instance weights to the destination instance."""
         success, message = self.tp_worker.send_weights_to_remote_instance(recv_req)
         return SendWeightsToRemoteInstanceReqOutput(success, message)
+
+    def destroy_weights_send_group_for_remote_instance(
+        self, recv_req: DestroyWeightsSendGroupForRemoteInstanceReqInput
+    ):
+        """Destroy the seed and client instance communication group."""
+        success, message = (
+            self.tp_worker.destroy_weights_send_group_for_remote_instance(recv_req)
+        )
+        return DestroyWeightsSendGroupForRemoteInstanceReqOutput(success, message)
 
     def slow_down(self, recv_req: SlowDownReqInput):
         t = recv_req.forward_sleep_time
