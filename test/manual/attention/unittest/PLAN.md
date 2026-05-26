@@ -132,6 +132,8 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+  - Ran 31 tests in 21.303s after adding FA3, FA4, and Flex dense coverage.
 - `python -m py_compile python/sglang/srt/layers/attention/torch_flex_backend.py test/manual/attention/unittest/dense/test_flex_attention.py`
 - `python test/manual/attention/unittest/dense/test_flex_attention.py -v`
 - `python -m py_compile test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/dense/test_fa3.py test/manual/attention/unittest/dense/test_fa4.py`
