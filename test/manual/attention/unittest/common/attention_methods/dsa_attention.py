@@ -238,6 +238,8 @@ class DSAMockModelRunner(ModelRunner):
         disable_cuda_graph: bool = True,
         disable_piecewise_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
+        dsa_prefill_backend: str = "flashmla_auto",
+        dsa_decode_backend: str = "flashmla_kv",
     ):
         pool_batch_size = runner_batch_size or case.batch_size
         self.device = device
@@ -258,9 +260,9 @@ class DSAMockModelRunner(ModelRunner):
             dllm_algorithm=None,
             dllm_algorithm_config=None,
             dp_size=1,
-            dsa_decode_backend="flashmla_kv",
+            dsa_decode_backend=dsa_decode_backend,
             dsa_prefill_cp_mode="round-robin-split",
-            dsa_prefill_backend="flashmla_auto",
+            dsa_prefill_backend=dsa_prefill_backend,
             device=device,
             enable_deterministic_inference=False,
             enable_dp_attention=False,
@@ -506,6 +508,8 @@ def build_dsa_attention_fixture(
     disable_cuda_graph: bool = True,
     disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
+    dsa_prefill_backend: str = "flashmla_auto",
+    dsa_decode_backend: str = "flashmla_kv",
 ) -> DSAAttentionFixture:
     max_context_len = max(max_context_len, max(case.seq_lens))
     if max_context_len % case.page_size:
@@ -533,6 +537,8 @@ def build_dsa_attention_fixture(
         disable_cuda_graph=disable_cuda_graph,
         disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
         runner_batch_size=runner_batch_size,
+        dsa_prefill_backend=dsa_prefill_backend,
+        dsa_decode_backend=dsa_decode_backend,
     )
     try:
         backend = ATTENTION_BACKENDS[case.backend](runner)
@@ -645,6 +651,8 @@ def build_dsa_sparse_attention_fixture(
     disable_cuda_graph: bool = True,
     disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
+    dsa_prefill_backend: str = "flashmla_auto",
+    dsa_decode_backend: str = "flashmla_kv",
 ) -> DSASparseAttentionFixture:
     max_context_len = max(max_context_len, max(case.seq_lens))
     if max_context_len % case.page_size:
@@ -678,6 +686,8 @@ def build_dsa_sparse_attention_fixture(
         disable_cuda_graph=disable_cuda_graph,
         disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
         runner_batch_size=runner_batch_size,
+        dsa_prefill_backend=dsa_prefill_backend,
+        dsa_decode_backend=dsa_decode_backend,
     )
     try:
         backend = ATTENTION_BACKENDS[case.backend](runner)
@@ -866,6 +876,8 @@ def run_dsa_sparse_attention_case(
     max_context_len: int = DSA_PAGE_SIZE,
     dtype: torch.dtype = torch.bfloat16,
     device: str = DEFAULT_DEVICE,
+    dsa_prefill_backend: str = "flashmla_auto",
+    dsa_decode_backend: str = "flashmla_kv",
 ) -> None:
     fixture = build_dsa_sparse_attention_fixture(
         testcase,
@@ -874,11 +886,211 @@ def run_dsa_sparse_attention_case(
         max_context_len=max_context_len,
         dtype=dtype,
         device=device,
+        dsa_prefill_backend=dsa_prefill_backend,
+        dsa_decode_backend=dsa_decode_backend,
     )
     actual = run_dsa_sparse_fixture_eager(fixture, testcase)
     expected = expected_dsa_sparse_fixture_output(fixture)
     torch.testing.assert_close(
         actual, expected, atol=DSA_SPARSE_ATOL, rtol=DSA_SPARSE_RTOL
+    )
+
+
+# ---------------------------------------------------------------------------
+# Implementation-variant matrix
+# ---------------------------------------------------------------------------
+#
+# DSA exposes multiple kernel implementations selectable via
+# `--dsa-prefill-backend` and `--dsa-decode-backend`. Production picks one of:
+#
+#   `flashmla_sparse`, `flashmla_kv`, `fa3`, `tilelang`, `trtllm`, `aiter`
+#
+# (`flashmla_auto` resolves to `flashmla_sparse` or `flashmla_kv` per the
+# `dsa_kv_cache_store_fp8` flag; see `set_dsa_prefill_impl`.) Each impl maps
+# to a distinct kernel path in `dsa_backend.py`; the hardware/SDK
+# availability differs and is gated below.
+#
+# `dsa_impl_capability(impl)` returns `(supported: bool, skip_reason: str)`
+# so test methods can iterate over a flat list of impls and emit `skipTest`
+# per impl on hardware that doesn't expose it. Capability is independent of
+# whether the fixture's specific shape (topk, dtype, num_heads) matches the
+# impl's accepted inputs — that is documented at the per-impl call site.
+
+# Hardware/SDK availability for each DSA implementation variant.
+# Values are `(supported: bool, reason: str)` — `reason` is shown in
+# `skipTest` when `supported=False`.
+def dsa_impl_capability(impl: str) -> tuple[bool, str]:
+    """Return `(supported, reason)` for a DSA prefill/decode implementation.
+
+    Capability checks are conservative: a returned `supported=True` means
+    the kernel can be constructed and dispatched on this device; the
+    fixture must still match the impl's shape contract (e.g., tilelang's
+    `topk == 2048` requirement)."""
+    import torch as _torch
+
+    from sglang.srt.utils import is_hip
+
+    major, _ = _torch.cuda.get_device_capability()
+
+    if impl == "flashmla_sparse" or impl == "flashmla_kv":
+        try:
+            from sgl_kernel.flash_mla import (  # noqa: F401
+                flash_mla_sparse_fwd,
+                flash_mla_with_kvcache,
+            )
+        except ImportError as exc:
+            return False, f"sgl_kernel.flash_mla unavailable: {exc}"
+        if major < 9:
+            return False, f"{impl} requires SM>=9.0, got SM{major}.x"
+        return True, ""
+
+    if impl == "fa3":
+        try:
+            from sglang.jit_kernel.flash_attention import (  # noqa: F401
+                flash_attn_with_kvcache,
+            )
+        except ImportError as exc:
+            return False, f"sglang.jit_kernel.flash_attention unavailable: {exc}"
+        if major < 9:
+            return False, f"fa3 requires SM>=9.0, got SM{major}.x"
+        return True, ""
+
+    if impl == "tilelang":
+        try:
+            from sglang.srt.layers.attention.dsa.tilelang_kernel import (  # noqa: F401
+                tilelang_sparse_fwd,
+            )
+        except ImportError as exc:
+            return False, f"tilelang_kernel unavailable: {exc}"
+        # `tilelang_sparse_fwd` asserts `topk == 2048`; our existing sparse
+        # fixture uses `DSA_SPARSE_INDEX_TOPK=128`. Tests requesting the
+        # tilelang variant must build a topk=2048 fixture variant.
+        return True, ""
+
+    if impl == "trtllm":
+        # TRT-LLM Gen FMHA / MLA require Blackwell (SM100+).
+        if major < 10:
+            return False, f"trtllm requires SM>=10.0 (Blackwell), got SM{major}.x"
+        try:
+            import flashinfer  # noqa: F401
+        except ImportError as exc:
+            return False, f"flashinfer unavailable: {exc}"
+        return True, ""
+
+    if impl == "aiter":
+        if not is_hip():
+            return False, "aiter is HIP/AMD only"
+        try:
+            from aiter.mla import (  # noqa: F401
+                mla_decode_fwd,
+                mla_prefill_fwd,
+            )
+        except ImportError as exc:
+            return False, f"aiter unavailable: {exc}"
+        return True, ""
+
+    if impl == "flashmla_auto":
+        # `flashmla_auto` resolves to flashmla_sparse / flashmla_kv at
+        # forward time depending on `dsa_kv_cache_store_fp8`; both leaf
+        # impls share the same SDK requirement, so flag based on those.
+        return dsa_impl_capability("flashmla_sparse")
+
+    return False, f"unknown DSA impl `{impl}`"
+
+
+# Sets of impls covered by the variant matrix. Test methods iterate over
+# these and `skipTest` per impl when the capability gate trips.
+DSA_PREFILL_IMPL_VARIANTS: tuple[str, ...] = (
+    "flashmla_sparse",
+    "flashmla_kv",
+    "fa3",
+    "tilelang",
+    "trtllm",
+    "aiter",
+)
+DSA_DECODE_IMPL_VARIANTS: tuple[str, ...] = (
+    "flashmla_sparse",
+    "flashmla_kv",
+    "fa3",
+    "tilelang",
+    "trtllm",
+    "aiter",
+)
+
+
+def run_dsa_sparse_prefill_impl_variant_case(
+    testcase,
+    case: DSAAttentionCase,
+    impl: str,
+    *,
+    hidden_size: int = DEFAULT_HIDDEN_SIZE,
+    max_context_len: int = DSA_PAGE_SIZE,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = DEFAULT_DEVICE,
+) -> None:
+    """Run a sparse-prefill case under a forced `dsa_prefill_backend=impl`.
+
+    `tilelang` requires `topk == 2048`, which the default sparse fixture
+    (`DSA_SPARSE_INDEX_TOPK=128`) does not satisfy; the call site skips
+    tilelang explicitly with that reason so the gate does not silently
+    pass.
+    """
+    supported, reason = dsa_impl_capability(impl)
+    if not supported:
+        testcase.skipTest(f"DSA prefill impl `{impl}` not supported: {reason}")
+    if impl == "tilelang":
+        testcase.skipTest(
+            "DSA tilelang prefill requires topk=2048; the shared sparse fixture "
+            f"uses topk={DSA_SPARSE_INDEX_TOPK}. A topk=2048 fixture variant is "
+            "needed to exercise this path."
+        )
+    if not case.forward_mode.is_extend_without_speculative():
+        raise ValueError(
+            "run_dsa_sparse_prefill_impl_variant_case expects an EXTEND case."
+        )
+    run_dsa_sparse_attention_case(
+        testcase,
+        case,
+        hidden_size=hidden_size,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        dsa_prefill_backend=impl,
+    )
+
+
+def run_dsa_sparse_decode_impl_variant_case(
+    testcase,
+    case: DSAAttentionCase,
+    impl: str,
+    *,
+    hidden_size: int = DEFAULT_HIDDEN_SIZE,
+    max_context_len: int = DSA_PAGE_SIZE,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = DEFAULT_DEVICE,
+) -> None:
+    """Run a sparse-decode case under a forced `dsa_decode_backend=impl`."""
+    supported, reason = dsa_impl_capability(impl)
+    if not supported:
+        testcase.skipTest(f"DSA decode impl `{impl}` not supported: {reason}")
+    if impl == "tilelang":
+        testcase.skipTest(
+            "DSA tilelang decode requires topk=2048; the shared sparse fixture "
+            f"uses topk={DSA_SPARSE_INDEX_TOPK}. A topk=2048 fixture variant is "
+            "needed to exercise this path."
+        )
+    if not case.forward_mode.is_decode():
+        raise ValueError(
+            "run_dsa_sparse_decode_impl_variant_case expects a DECODE case."
+        )
+    run_dsa_sparse_attention_case(
+        testcase,
+        case,
+        hidden_size=hidden_size,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        dsa_decode_backend=impl,
     )
 
 

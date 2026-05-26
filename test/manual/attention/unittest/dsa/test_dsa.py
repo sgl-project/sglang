@@ -10,12 +10,16 @@ from sglang.test.test_utils import CustomTestCase
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from common.attention_methods.dsa_attention import (
+    DSA_DECODE_IMPL_VARIANTS,
     DSA_PAGE_SIZE,
+    DSA_PREFILL_IMPL_VARIANTS,
     DSAAttentionCase,
     make_dsa_dense_fallback_cases,
     make_dsa_sparse_cases,
     run_dsa_attention_case,
     run_dsa_sparse_attention_case,
+    run_dsa_sparse_decode_impl_variant_case,
+    run_dsa_sparse_prefill_impl_variant_case,
 )
 from common.runner_modes.cuda_graph_decode_runner import (
     run_dsa_sparse_cuda_graph_decode_case,
@@ -67,6 +71,51 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
         for case in self.CUDA_GRAPH_DECODE_CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_dsa_sparse_cuda_graph_decode_case(self, case)
+
+    # DSA implementation-variant matrix. DSA exposes multiple kernel
+    # implementations (`flashmla_sparse`, `flashmla_kv`, `fa3`, `tilelang`,
+    # `trtllm`, `aiter`) selected by `--dsa-prefill-backend` /
+    # `--dsa-decode-backend`. Each variant maps to a distinct kernel path
+    # in `dsa_backend.py`; `dsa_impl_capability` gates per hardware/SDK so
+    # impls unavailable on the test box (e.g., `trtllm` requires SM100+,
+    # `aiter` requires HIP) emit a clean `skipTest` with a reason rather
+    # than spuriously failing.
+    PREFILL_IMPL_CASE = DSAAttentionCase(
+        name="dsa_sparse_prefill_impl_variant",
+        backend="dsa",
+        forward_mode=ForwardMode.EXTEND,
+        num_heads=4,
+        num_kv_heads=1,
+        page_size=DSA_PAGE_SIZE,
+        # Long prefix keeps the backend on the MLA path (above the
+        # MHA_ONE_SHOT short-sequence threshold) so the impl override
+        # actually routes through `dsa_prefill_impl`.
+        prefix_lens=(2048,),
+        extend_lens=(1,),
+    )
+    DECODE_IMPL_CASE = DSAAttentionCase(
+        name="dsa_sparse_decode_impl_variant",
+        backend="dsa",
+        forward_mode=ForwardMode.DECODE,
+        num_heads=4,
+        num_kv_heads=1,
+        page_size=DSA_PAGE_SIZE,
+        prefix_lens=(128,),
+    )
+
+    def test_sparse_prefill_impl_variants(self):
+        for impl in DSA_PREFILL_IMPL_VARIANTS:
+            with self.subTest(impl=impl):
+                run_dsa_sparse_prefill_impl_variant_case(
+                    self, self.PREFILL_IMPL_CASE, impl
+                )
+
+    def test_sparse_decode_impl_variants(self):
+        for impl in DSA_DECODE_IMPL_VARIANTS:
+            with self.subTest(impl=impl):
+                run_dsa_sparse_decode_impl_variant_case(
+                    self, self.DECODE_IMPL_CASE, impl
+                )
 
 
 if __name__ == "__main__":
