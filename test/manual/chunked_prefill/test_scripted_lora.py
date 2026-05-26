@@ -48,7 +48,7 @@ class TestLoRASingleAdapter(ScriptedRuntimeTestCase):
     )
 
     def test_naive_lora_chunked(self):
-        """Chunked prefill path runs with LoRA enabled at engine level."""
+        """LoRA chunked prefill: req finishes on the requested adapter and releases resources cleanly."""
         self.runtime.run(self._script_naive_lora_chunked)
 
     @staticmethod
@@ -65,6 +65,12 @@ class TestLoRASingleAdapter(ScriptedRuntimeTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
+        # Adapter pin must hold across chunk boundaries.
+        assert r.lora_path == _LORA_ADAPTER
+        # Resource release sanity for LoRA + chunked.
+        assert r.kv_pages == 0
+        assert r.lock_refs == 0
+        assert len(r.output_tokens) == 4
 
     def test_lora_logprob_chunked_pass_idx(self):
         """LoRA + return_logprob + chunked: lm_head_pass_idx accumulates across chunks."""
@@ -210,6 +216,17 @@ class TestLoRAAllDistinctAdapters(ScriptedRuntimeTestCase):
         ]
         yield from run_until_all_finished(handles=reqs, max_steps=2000)
         assert all(r.finished for r in reqs)
+        # Each req's adapter pin must be preserved across the rotation
+        # — that's the actual deadlock-avoidance invariant the pool
+        # protects: no req can drift onto a different adapter mid-prefill.
+        for r, adapter in zip(reqs, adapters):
+            assert r.lora_path == adapter, (
+                f"adapter drift under rotation; expected {adapter}, got "
+                f"{r.lora_path}"
+            )
+            assert r.kv_pages == 0
+            assert r.lock_refs == 0
+            assert r.chunks_done >= 2
 
 
 class TestLoRAAdapterEviction(ScriptedRuntimeTestCase):
@@ -281,8 +298,20 @@ class TestLoRAAdapterEviction(ScriptedRuntimeTestCase):
         assert r_a.status in ("finished", "unknown")
         assert r_a.kv_pages == 0
         assert r_a.lock_refs == 0
+        # W3: triple-race abort across the LoRA drainer must not double-
+        # release; aborting a chunked-resume in flight is the exact path
+        # commit de3859646b protects.
+        assert r_a.abort_double_release_count == 0, (
+            f"W3 violation in LoRA + chunked + abort triple-race; got "
+            f"{r_a.abort_double_release_count}"
+        )
         yield from run_until_finished(r_b)
         assert r_b.finished
+        # r_b stays pinned to adapter B — eviction churn must not strand
+        # it on the wrong adapter mid-prefill.
+        assert r_b.lora_path == _LORA_ADAPTER_B
+        assert r_b.kv_pages == 0
+        assert r_b.lock_refs == 0
 
 
 if __name__ == "__main__":
