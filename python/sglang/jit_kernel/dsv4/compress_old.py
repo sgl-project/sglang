@@ -11,11 +11,11 @@ from sglang.jit_kernel.utils import (
     make_cpp_args,
 )
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda_alike
 
 from .utils import make_name
 
-_is_cuda = is_cuda()
+_is_cuda_alike = is_cuda_alike()
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -139,7 +139,7 @@ class CompressorPrefillPlan(NamedTuple):
             pin_memory=seq_lens.is_cpu,
         )
         is_overlap = compress_ratio == 4
-        if _is_cuda:
+        if _is_cuda_alike:
             module = _jit_common_module()
             plan_lens = module.plan_compress_prefill(
                 extend_lens,
