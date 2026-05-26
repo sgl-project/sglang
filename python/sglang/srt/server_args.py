@@ -266,6 +266,8 @@ DSA_CHOICES = [
 ]
 NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
+DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
+
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
@@ -557,6 +559,7 @@ class ServerArgs:
     dsa_decode_backend: Optional[str] = (
         None  # auto-detect based on hardware/kv_cache_dtype
     )
+    dsa_topk_backend: str = "sgl-kernel"
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
 
@@ -729,7 +732,6 @@ class ServerArgs:
     piecewise_cuda_graph_tokens: Optional[List[int]] = None
     piecewise_cuda_graph_compiler: str = "eager"
     torchao_config: str = ""
-    enable_nan_detection: bool = False
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
     triton_attention_num_kv_splits: int = 8
@@ -1106,14 +1108,6 @@ class ServerArgs:
                 f"The tool_call_parser '{self.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[self.tool_call_parser]}' instead."
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
-
-        if self.enable_nan_detection:
-            logger.warning(
-                "--enable-nan-detection is deprecated. "
-                "Use SGLANG_SPEC_NAN_DETECTION=1 and SGLANG_SPEC_OOB_DETECTION=1 instead."
-            )
-            envs.SGLANG_SPEC_NAN_DETECTION.set(True)
-            envs.SGLANG_SPEC_OOB_DETECTION.set(True)
 
         # Deprecated attention-backend alias: "compressed" -> "dsv4".
         for attr in (
@@ -2453,8 +2447,6 @@ class ServerArgs:
         ]:
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
-                support_mamba_cache=True,
-                support_mamba_cache_extra_buffer=False,
                 sm100_default_attention_backend="triton",
             )
 
@@ -2467,8 +2459,7 @@ class ServerArgs:
             if has_mamba:
                 self._handle_mamba_radix_cache(
                     model_arch=model_arch,
-                    support_mamba_cache_extra_buffer=False,
-                    sm100_default_attention_backend="triton",
+                    sm100_default_attention_backend="flashinfer",
                 )
 
         elif model_arch in ["Lfm2ForCausalLM"]:
@@ -2553,6 +2544,7 @@ class ServerArgs:
         support_mamba_cache: bool = True,
         support_mamba_cache_extra_buffer: bool = True,
         sm100_default_attention_backend: str = None,
+        fallback_attention_backend: str = "triton",
     ):
         if (
             is_sm100_supported()
@@ -2579,7 +2571,7 @@ class ServerArgs:
         if self.enable_mamba_extra_buffer():  # extra_buffer
             if self.disable_radix_cache:
                 raise ValueError(
-                    "mamba extra_buffer is not compatible with --disable-radix-cache "
+                    "mamba extra_buffer is not compatible with --disable-radix-cache. "
                     "Overlap scheduling is already supported with no_buffer + disable_radix_cache. "
                     "Please use --mamba-scheduler-strategy no_buffer instead."
                 )
@@ -2596,11 +2588,7 @@ class ServerArgs:
                 assert (
                     self.mamba_track_interval % self.page_size == 0
                 ), f"mamba_track_interval {self.mamba_track_interval} must be divisible by page_size {self.page_size}"
-                assert (
-                    max(FLA_CHUNK_SIZE, self.page_size)
-                    % min(FLA_CHUNK_SIZE, self.page_size)
-                    == 0
-                ), f"For SSM models with extra buffer, either FLA_CHUNK_SIZE or page_size must be divisible by the other, got {FLA_CHUNK_SIZE=}, {self.page_size=}"
+                assert self.mamba_cache_chunk_size is not None
         elif not self.disable_radix_cache:  # no_buffer
             if self.page_size is not None and self.page_size != 1:
                 logger.warning(
@@ -2618,7 +2606,7 @@ class ServerArgs:
                 if self.attention_backend == "trtllm_mha":
                     logger.warning(
                         "Disabling radix cache since trtllm_mha does not support page_size = 1, which is required by MambaRadixCache. "
-                        "Try to use --attention-backend triton if radix cache is necessary."
+                        f"Try to use --attention-backend {fallback_attention_backend} if radix cache is necessary."
                     )
                     self.disable_radix_cache = True
                     self.disable_overlap_schedule = False
@@ -5495,6 +5483,15 @@ class ServerArgs:
             help="[Deprecated] Use --dsa-decode-backend instead.",
         )
         parser.add_argument(
+            "--dsa-topk-backend",
+            dest="dsa_topk_backend",
+            default=ServerArgs.dsa_topk_backend,
+            type=str,
+            choices=DSA_TOPK_BACKEND_CHOICES,
+            help="DSA indexer top-k backend. Options: 'sgl-kernel', 'torch', 'flashinfer'. "
+            "The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
+        )
+        parser.add_argument(
             "--fp8-gemm-backend",
             type=str,
             choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
@@ -6382,11 +6379,6 @@ class ServerArgs:
             help="Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row",
         )
         parser.add_argument(
-            "--enable-nan-detection",
-            action="store_true",
-            help="[Deprecated] Use SGLANG_SPEC_NAN_DETECTION=1 and SGLANG_SPEC_OOB_DETECTION=1 instead.",
-        )
-        parser.add_argument(
             "--enable-p2p-check",
             action="store_true",
             help="Enable P2P check for GPU access, otherwise the p2p access is allowed by default.",
@@ -7035,9 +7027,17 @@ class ServerArgs:
 
     @property
     def mamba_cache_chunk_size(self) -> int:
-        # For mamba cache with extra buffer, the chunk size is the max of FLA_CHUNK_SIZE and page_size.
+        # For mamba cache with extra buffer, the chunk size is the max of FLA_CHUNK_SIZE
+        # (or mamba_chunk_size if it is defined in the model's config) and page_size.
         # It is used to determine the caching point in a sequence during prefill.
-        return max(FLA_CHUNK_SIZE, self.page_size)
+        if not hasattr(self, "_mamba_cache_chunk_size"):
+            hf_config = self.get_model_config().hf_config
+            chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
+            assert (
+                max(chunk_size, self.page_size) % min(chunk_size, self.page_size) == 0
+            ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {self.page_size=}"
+            self._mamba_cache_chunk_size = max(chunk_size, self.page_size)
+        return self._mamba_cache_chunk_size
 
     def check_server_args(self):
         # Check parallel size constraints
