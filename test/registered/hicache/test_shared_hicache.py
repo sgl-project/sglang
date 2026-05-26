@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.shared_hicache.source import (
 from sglang.srt.mem_cache.shared_hicache.target import SharedHiCacheTarget
 from sglang.srt.mem_cache.shared_hicache.transfer import (
     MooncakeSharedHiCacheTransferBackend,
+    NixlSharedHiCacheTransferBackend,
     SharedHiCacheTransferBackend,
     _get_or_init_mooncake_transfer_engine,
     make_shared_hicache_transfer_backend,
@@ -191,6 +192,55 @@ class FakeMooncakeEngine:
     def batch_transfer_sync(self, session_id, src_addrs, dst_addrs, lengths):
         self.transfers.append((session_id, src_addrs, dst_addrs, lengths))
         return 0
+
+
+class FakeNixlAgent:
+    def __init__(self, name="agent", metadata=b"agent-metadata"):
+        self.name = name
+        self.metadata = metadata
+        self.backends = []
+        self.registered = []
+        self.remote_agents = []
+        self.xfer_desc_calls = []
+        self.initialized = []
+        self.transfers = []
+        self.released = []
+
+    def get_plugin_list(self):
+        return ["UCX"]
+
+    def create_backend(self, backend, backend_params):
+        self.backends.append((backend, dict(backend_params)))
+
+    def register_memory(self, addrs, mem_type=None):
+        normalized = [tuple(int(x) if isinstance(x, int) else x for x in item) for item in addrs]
+        self.registered.append((mem_type, normalized))
+        return [("registered", mem_type, normalized)]
+
+    def get_agent_metadata(self):
+        return self.metadata
+
+    def add_remote_agent(self, metadata):
+        self.remote_agents.append(metadata)
+
+    def get_xfer_descs(self, reqs, mem_type=None):
+        rows = reqs.tolist() if hasattr(reqs, "tolist") else reqs
+        self.xfer_desc_calls.append((mem_type, rows))
+        return ("descs", mem_type, rows)
+
+    def initialize_xfer(self, *args):
+        self.initialized.append(args)
+        return f"handle-{len(self.initialized)}"
+
+    def transfer(self, handle):
+        self.transfers.append(handle)
+        return "DONE"
+
+    def check_xfer_state(self, handle):
+        return "DONE"
+
+    def release_xfer_handle(self, handle):
+        self.released.append(handle)
 
 
 class FakePrometheusMetric:
@@ -628,6 +678,69 @@ class TestSharedHiCache(unittest.TestCase):
             source_v.view(torch.uint8).reshape(-1)[item_len : item_len * 3].tolist(),
         )
 
+    def test_nixl_backend_registers_source_and_transfers_pages(self):
+        page_size = 2
+        source_k = torch.zeros((20, 4), dtype=torch.uint8)
+        source_v = torch.zeros((20, 4), dtype=torch.uint8)
+        host_buffer = torch.zeros((64,), dtype=torch.uint8)
+        item_len = source_k[0].nbytes * page_size
+        tree = SimpleNamespace(
+            page_size=page_size,
+            cache_controller=SimpleNamespace(
+                mem_pool_host=SimpleNamespace(
+                    layout="layer_first",
+                    kv_buffer=host_buffer,
+                    k_data_refs=[source_k],
+                    v_data_refs=[source_v],
+                )
+            ),
+        )
+        source_agent = FakeNixlAgent("source-agent", b"source-metadata")
+        target_agent = FakeNixlAgent("target-agent", b"target-metadata")
+        source_backend = NixlSharedHiCacheTransferBackend(
+            agent=source_agent,
+            agent_name="source-agent",
+            backend_name="UCX",
+            tree_cache=tree,
+            target_kv_ptrs=[1_000_000, 2_000_000],
+            target_kv_item_lens=[item_len, item_len],
+            target_registered=True,
+            gpu_id=1,
+            transfer_parallelism=1,
+        )
+        target_backend = NixlSharedHiCacheTransferBackend(
+            agent=target_agent,
+            agent_name="target-agent",
+            backend_name="UCX",
+            tree_cache=tree,
+            target_kv_ptrs=[1_000_000, 2_000_000],
+            target_kv_item_lens=[item_len, item_len],
+            target_registered=True,
+            gpu_id=2,
+            transfer_parallelism=1,
+        )
+        source_backend._register_source_host_pool()
+
+        source_backend.transfer_pages(
+            target_session_id=target_backend.target_session_id,
+            source_page_indices=torch.tensor([1, 2], dtype=torch.int32).numpy(),
+            target_page_indices=torch.tensor([3, 4], dtype=torch.int32).numpy(),
+            target_kv_ptrs=target_backend.target_kv_ptrs,
+            target_kv_item_lens=target_backend.target_kv_item_lens,
+            target_metadata=target_backend.target_descriptor(),
+        )
+
+        self.assertTrue(source_backend.enabled)
+        self.assertEqual(source_agent.remote_agents, [b"target-metadata"])
+        self.assertEqual(source_agent.xfer_desc_calls[0][0], "DRAM")
+        self.assertEqual(source_agent.xfer_desc_calls[1][0], "VRAM")
+        self.assertEqual(source_agent.xfer_desc_calls[0][1][0][2], 0)
+        self.assertEqual(source_agent.xfer_desc_calls[1][1][0][2], 2)
+        self.assertEqual(source_agent.initialized[0][0], "WRITE")
+        self.assertEqual(source_agent.initialized[0][3], "target-agent")
+        self.assertEqual(source_agent.transfers, ["handle-1"])
+        self.assertEqual(source_agent.released, ["handle-1"])
+
     def test_mooncake_transfer_protocol_uses_nvlink_env(self):
         with patch.dict(
             "os.environ",
@@ -960,7 +1073,7 @@ class TestSharedHiCache(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "static endpoint maps"):
             ServerArgs.from_cli_args(static_peers)
 
-        bad_backend = parser.parse_args(
+        nixl_backend = parser.parse_args(
             [
                 "--model-path",
                 "dummy",
@@ -969,6 +1082,22 @@ class TestSharedHiCache(unittest.TestCase):
                 "7",
                 "--shared-hicache-config",
                 json.dumps({"transfer_backend": "nixl"}),
+            ]
+        )
+        self.assertEqual(
+            ServerArgs.from_cli_args(nixl_backend).shared_hicache_config.transfer_backend,
+            "nixl",
+        )
+
+        bad_backend = parser.parse_args(
+            [
+                "--model-path",
+                "dummy",
+                "--enable-hierarchical-cache",
+                "--shared-hicache-worker-id",
+                "7",
+                "--shared-hicache-config",
+                json.dumps({"transfer_backend": "bogus"}),
             ]
         )
         with self.assertRaisesRegex(ValueError, "transfer_backend"):

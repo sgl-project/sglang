@@ -8,7 +8,7 @@ from typing import Any, Dict, Mapping, Optional, Union
 from sglang.srt.mem_cache.shared_hicache.plan import normalize_endpoint
 
 
-SHARED_HICACHE_TRANSFER_BACKEND_CHOICES = ["auto", "mooncake"]
+SHARED_HICACHE_TRANSFER_BACKEND_CHOICES = ["auto", "mooncake", "nixl"]
 
 
 @dataclass(frozen=True)

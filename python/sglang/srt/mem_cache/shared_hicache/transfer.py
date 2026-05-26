@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import threading
 import time
+import uuid
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Mapping, Optional
@@ -12,7 +15,7 @@ import torch
 
 from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
-from sglang.srt.environ import default_shared_hicache_transfer_parallelism
+from sglang.srt.environ import default_shared_hicache_transfer_parallelism, envs
 from sglang.srt.mem_cache.shared_hicache.config import (
     shared_hicache_transfer_backend_name,
 )
@@ -153,6 +156,59 @@ def _get_or_init_mooncake_transfer_engine(scheduler):
     )
 
 
+def _scheduler_gpu_id(scheduler) -> int:
+    gpu_id = getattr(scheduler, "gpu_id", None)
+    if gpu_id is None:
+        gpu_id = getattr(getattr(scheduler, "ps", None), "gpu_id", None)
+    return int(gpu_id if gpu_id is not None else 0)
+
+
+def _nixl_backend_params(backend: str, transfer_parallelism: int) -> dict[str, str]:
+    backend_params = json.loads(envs.SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS.get())
+    if not isinstance(backend_params, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in backend_params.items()
+    ):
+        raise ValueError(
+            "SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS must be a JSON object "
+            "with string keys and string values"
+        )
+    if transfer_parallelism > 0:
+        if backend in {"UCX", "OBJ"}:
+            backend_params.setdefault("num_threads", str(transfer_parallelism))
+        elif backend == "GDS_MT":
+            backend_params.setdefault("thread_count", str(transfer_parallelism))
+        elif backend == "UCCL":
+            backend_params.setdefault("num_cpus", str(transfer_parallelism))
+    return backend_params
+
+
+def _create_nixl_agent(*, transfer_parallelism: int):
+    try:
+        from nixl._api import nixl_agent, nixl_agent_config
+    except ImportError as err:
+        raise ImportError(
+            "Please install NIXL by following the instructions at "
+            "https://github.com/ai-dynamo/nixl/blob/main/README.md "
+            "to use SharedHiCache NIXL direct transfer."
+        ) from err
+
+    backend = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get()
+    backend_params = _nixl_backend_params(backend, transfer_parallelism)
+    agent_config = nixl_agent_config(
+        backends=[], num_threads=max(0, int(transfer_parallelism))
+    )
+    agent_name = f"shared_hicache_nixl_{uuid.uuid4()}"
+    agent = nixl_agent(agent_name, agent_config)
+    agent.create_backend(backend, backend_params)
+    available_plugins = agent.get_plugin_list()
+    if backend not in available_plugins:
+        raise RuntimeError(
+            f"NIXL backend {backend!r} not found. Available: {available_plugins}"
+        )
+    return agent, agent_name, backend
+
+
 def _source_host_buf_infos(tree_cache) -> tuple[list[int], list[int]]:
     refs = _source_host_tensors(tree_cache)
     page_size = tree_cache.page_size
@@ -246,6 +302,18 @@ def _build_grouped_transfer_arrays(
     ).reshape(-1)
     lengths = (src_item_lens[:, None] * block_lens[None, :]).reshape(-1)
     return src_addrs, dst_addrs, lengths, len(src_blocks)
+
+
+def _nixl_req_array(addrs: np.ndarray, lengths: np.ndarray, gpu_id: int) -> np.ndarray:
+    if addrs.size == 0:
+        return np.empty((0, 3), dtype=np.uint64)
+    return np.column_stack(
+        (
+            addrs.astype(np.uint64, copy=False),
+            lengths.astype(np.uint64, copy=False),
+            np.full(addrs.shape, int(gpu_id), dtype=np.uint64),
+        )
+    )
 
 
 class MooncakeSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
@@ -668,6 +736,267 @@ class MooncakeSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
                 raise RuntimeError(f"Mooncake direct KV transfer failed with ret={ret}")
 
 
+class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
+    """NIXL-backed source-HiCache-host to target-GPU-device transfer helper."""
+
+    name = "nixl"
+
+    def __init__(
+        self,
+        *,
+        agent,
+        agent_name: str,
+        backend_name: str,
+        tree_cache,
+        target_kv_ptrs,
+        target_kv_item_lens,
+        target_registered: bool,
+        gpu_id: int,
+        parallel_metadata: Optional[Mapping[str, int]] = None,
+        transfer_parallelism: Optional[int] = None,
+    ):
+        super().__init__(
+            target_session_id=agent_name,
+            target_kv_ptrs=target_kv_ptrs,
+            target_kv_item_lens=target_kv_item_lens,
+            parallel_metadata=parallel_metadata,
+        )
+        self.agent = agent
+        self.agent_name = agent_name
+        self.backend_name = backend_name
+        self.tree_cache = tree_cache
+        self._target_registered = bool(target_registered)
+        self._source_registered = False
+        self._source_registered_ptrs: list[int] = []
+        self._remote_agents: set[str] = set()
+        self._gpu_id = int(gpu_id)
+        if transfer_parallelism is None:
+            transfer_parallelism = default_shared_hicache_transfer_parallelism()
+        self._transfer_parallelism = max(1, int(transfer_parallelism))
+        self._shutdown = False
+
+    @classmethod
+    def from_scheduler(cls, scheduler) -> Optional["NixlSharedHiCacheTransferBackend"]:
+        server_args = scheduler.server_args
+        backend = shared_hicache_transfer_backend_name(server_args)
+        if backend not in {"auto", "nixl"}:
+            return None
+        topology_rejection = _direct_topology_rejection(scheduler)
+        if topology_rejection is not None:
+            if backend == "nixl":
+                logger.warning(
+                    "SharedHiCache NIXL direct transfer disabled: %s",
+                    topology_rejection,
+                )
+            else:
+                logger.debug(
+                    "SharedHiCache NIXL direct transfer disabled: %s",
+                    topology_rejection,
+                )
+            return None
+
+        try:
+            transfer_parallelism = default_shared_hicache_transfer_parallelism()
+            agent, agent_name, backend_name = _create_nixl_agent(
+                transfer_parallelism=transfer_parallelism
+            )
+            target_pool = _target_kv_pool_from_scheduler(scheduler)
+            target_kv_ptrs, target_kv_lens, target_kv_item_lens = (
+                target_pool.get_contiguous_buf_infos()
+            )
+            gpu_id = _scheduler_gpu_id(scheduler)
+            target_descs = agent.register_memory(
+                [
+                    (int(ptr), int(length), gpu_id, "")
+                    for ptr, length in zip(target_kv_ptrs, target_kv_lens)
+                ],
+                "VRAM",
+            )
+            if not target_descs:
+                logger.warning(
+                    "SharedHiCache NIXL disabled: target KV registration failed"
+                )
+                return None
+            transfer = cls(
+                agent=agent,
+                agent_name=agent_name,
+                backend_name=backend_name,
+                tree_cache=scheduler.tree_cache,
+                target_kv_ptrs=target_kv_ptrs,
+                target_kv_item_lens=target_kv_item_lens,
+                target_registered=True,
+                gpu_id=gpu_id,
+                parallel_metadata=scheduler_parallel_metadata(scheduler),
+                transfer_parallelism=transfer_parallelism,
+            )
+            transfer._register_source_host_pool()
+            if transfer.enabled:
+                transfer._log_ready()
+                return transfer
+            transfer.shutdown()
+            return None
+        except Exception:
+            if backend == "nixl":
+                logger.exception(
+                    "SharedHiCache NIXL direct transfer initialization failed"
+                )
+            else:
+                logger.debug(
+                    "SharedHiCache NIXL direct transfer unavailable; using fallback",
+                    exc_info=True,
+                )
+            return None
+
+    @property
+    def enabled(self) -> bool:
+        return self._target_registered and self._source_registered
+
+    def target_descriptor(self) -> dict[str, Any]:
+        descriptor = super().target_descriptor()
+        descriptor.update(
+            {
+                "agent_name": self.agent_name,
+                "agent_metadata": base64.b64encode(
+                    self.agent.get_agent_metadata()
+                ).decode("ascii"),
+                "gpu_id": self._gpu_id,
+                "transport": {
+                    "backend": self.backend_name,
+                    "transfer_parallelism": self._transfer_parallelism,
+                },
+            }
+        )
+        return descriptor
+
+    def _log_ready(self) -> None:
+        logger.info(
+            "SharedHiCache NIXL direct transfer enabled agent=%s backend=%s "
+            "gpu_id=%d parallelism=%d",
+            self.agent_name,
+            self.backend_name,
+            self._gpu_id,
+            self._transfer_parallelism,
+        )
+
+    def _register_source_host_pool(self) -> None:
+        host_pool = self.tree_cache.cache_controller.mem_pool_host
+        if getattr(host_pool, "layout", None) != "layer_first":
+            logger.info(
+                "SharedHiCache NIXL direct transfer disabled for HiCache layout=%s; "
+                "source host pool must be layer_first",
+                getattr(host_pool, "layout", None),
+            )
+            return
+        if not hasattr(host_pool, "kv_buffer"):
+            logger.info("SharedHiCache NIXL direct transfer disabled: no host kv_buffer")
+            return
+        try:
+            _, source_kv_item_lens = _source_host_buf_infos(self.tree_cache)
+            _validate_kv_item_lens_match(
+                source_kv_item_lens, self.target_kv_item_lens
+            )
+        except RuntimeError as err:
+            logger.info("SharedHiCache NIXL direct transfer disabled: %s", err)
+            return
+        source_descs = self.agent.register_memory(
+            [(int(host_pool.kv_buffer.data_ptr()), int(host_pool.kv_buffer.nbytes), 0, "")],
+            "DRAM",
+        )
+        if not source_descs:
+            logger.warning(
+                "SharedHiCache NIXL direct transfer disabled: host registration failed"
+            )
+            return
+        self._source_registered = True
+        self._source_registered_ptrs = [int(host_pool.kv_buffer.data_ptr())]
+
+    def _add_remote_target(self, target_metadata: Optional[Mapping[str, Any]]) -> tuple[str, int]:
+        if not isinstance(target_metadata, Mapping):
+            raise RuntimeError("NIXL target metadata must be an object")
+        target_agent_name = str(target_metadata.get("agent_name") or "")
+        encoded_metadata = target_metadata.get("agent_metadata")
+        if not target_agent_name:
+            raise RuntimeError("NIXL target metadata missing agent_name")
+        if not isinstance(encoded_metadata, str) or not encoded_metadata:
+            raise RuntimeError("NIXL target metadata missing agent_metadata")
+        if target_agent_name not in self._remote_agents:
+            self.agent.add_remote_agent(base64.b64decode(encoded_metadata))
+            self._remote_agents.add(target_agent_name)
+        return target_agent_name, int(target_metadata.get("gpu_id", 0))
+
+    def _wait_for_transfer(self, handle) -> None:
+        state = self.agent.transfer(handle)
+        while state != "DONE":
+            if state == "ERR":
+                raise RuntimeError("NIXL direct KV transfer failed")
+            state = self.agent.check_xfer_state(handle)
+            time.sleep(0.0001)
+        release = getattr(self.agent, "release_xfer_handle", None)
+        if callable(release):
+            release(handle)
+
+    def _source_host_buf_infos(self) -> tuple[list[int], list[int]]:
+        return _source_host_buf_infos(self.tree_cache)
+
+    def transfer_pages(
+        self,
+        *,
+        target_session_id: str,
+        source_page_indices: np.ndarray,
+        target_page_indices: np.ndarray,
+        target_kv_ptrs: list[int],
+        target_kv_item_lens: list[int],
+        target_metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        target_agent_name, target_gpu_id = self._add_remote_target(target_metadata)
+        source_kv_ptrs, source_kv_item_lens = self._source_host_buf_infos()
+        src_addrs, dst_addrs, lengths, num_blocks = _build_grouped_transfer_arrays(
+            source_page_indices=source_page_indices,
+            target_page_indices=target_page_indices,
+            source_kv_ptrs=source_kv_ptrs,
+            target_kv_ptrs=target_kv_ptrs,
+            source_kv_item_lens=source_kv_item_lens,
+            target_kv_item_lens=target_kv_item_lens,
+        )
+        if src_addrs.size == 0:
+            return
+
+        src_descs = self.agent.get_xfer_descs(
+            _nixl_req_array(src_addrs, lengths, 0), "DRAM"
+        )
+        dst_descs = self.agent.get_xfer_descs(
+            _nixl_req_array(dst_addrs, lengths, target_gpu_id), "VRAM"
+        )
+        if src_descs is None or dst_descs is None:
+            raise RuntimeError("NIXL direct KV transfer descriptor creation failed")
+        start = time.perf_counter()
+        handle = self.agent.initialize_xfer(
+            "WRITE",
+            src_descs,
+            dst_descs,
+            target_agent_name,
+        )
+        if not handle:
+            raise RuntimeError("NIXL direct KV transfer initialization failed")
+        self._wait_for_transfer(handle)
+        transfer_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "SharedHiCache NIXL transferred blocks=%d slices=%d bytes=%d ms=%.3f",
+            num_blocks,
+            len(src_addrs),
+            int(lengths.sum()),
+            transfer_ms,
+        )
+
+    def shutdown(self) -> None:
+        if self._shutdown:
+            return
+        self._shutdown = True
+        self._source_registered_ptrs = []
+        self._source_registered = False
+        self._target_registered = False
+
+
 def make_shared_hicache_transfer_backend(scheduler) -> Optional[SharedHiCacheTransferBackend]:
     backend = shared_hicache_transfer_backend_name(scheduler.server_args)
     topology_rejection = _direct_topology_rejection(scheduler)
@@ -676,6 +1005,14 @@ def make_shared_hicache_transfer_backend(scheduler) -> Optional[SharedHiCacheTra
             raise RuntimeError(topology_rejection)
         logger.warning("SharedHiCache direct transfer unavailable: %s", topology_rejection)
         return None
+
+    if backend == "nixl":
+        transfer = NixlSharedHiCacheTransferBackend.from_scheduler(scheduler)
+        if transfer is None:
+            raise RuntimeError(
+                "SharedHiCache NIXL transfer backend was requested but unavailable"
+            )
+        return transfer
 
     if backend == "mooncake":
         transfer = MooncakeSharedHiCacheTransferBackend.from_scheduler(scheduler)
@@ -688,9 +1025,12 @@ def make_shared_hicache_transfer_backend(scheduler) -> Optional[SharedHiCacheTra
     if backend != "auto":
         raise RuntimeError(
             f"SharedHiCache transfer backend {backend!r} is not supported; "
-            "this path supports only 'mooncake'"
+            "this path supports only 'mooncake' and 'nixl'"
         )
 
+    transfer = NixlSharedHiCacheTransferBackend.from_scheduler(scheduler)
+    if transfer is not None:
+        return transfer
     transfer = MooncakeSharedHiCacheTransferBackend.from_scheduler(scheduler)
     if transfer is not None:
         return transfer
