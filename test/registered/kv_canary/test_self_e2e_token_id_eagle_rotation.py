@@ -64,8 +64,10 @@ class _EagleChunkedRotationBase(CanaryE2EBase):
         # is unpredictable enough to make ``next_token_ids[0] != prompt[K1]``
         # at every chunk boundary.
         rng = random.Random(0)
+        # ~3K tokens after BPE — long enough to span 2+ chunked-prefill chunks
+        # at chunked_prefill_size=2048, short enough to stay under context_length.
         body = "".join(
-            rng.choices(string.ascii_letters + string.digits + " ", k=40000)
+            rng.choices(string.ascii_letters + string.digits + " ", k=8000)
         )
         return [body] * n
 
