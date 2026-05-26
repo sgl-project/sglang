@@ -46,10 +46,11 @@ def apply_dim_names(tensor: torch.Tensor, dim_names: list[str]) -> torch.Tensor:
             f"but dims string specifies {len(dim_names)} names {dim_names}. "
             f"Please fix the dims string in the dumper.dump() call to match the actual tensor shape."
         )
-    tensor._dim_names = tuple(dim_names)
-    return tensor
+    view = torch.ops.aten.alias(tensor)
+    view._dim_names = tuple(dim_names)
+    return view
 
 
 def without_dim_names(tensor: torch.Tensor) -> torch.Tensor:
     # Returns a new view without _dim_names; the original tensor is not modified.
-    return tensor.view_as(tensor)
+    return torch.ops.aten.alias(tensor)

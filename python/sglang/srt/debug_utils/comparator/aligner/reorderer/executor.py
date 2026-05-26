@@ -76,7 +76,7 @@ def _reorder_zigzag_to_natural_thd(
     result: torch.Tensor = torch.cat(reordered_segments, dim=dim)
 
     if names[0] is not None:
-        apply_dim_names(result, list(names))
+        result = apply_dim_names(result, list(names))
     return result
 
 
@@ -99,5 +99,5 @@ def _reorder_zigzag_to_natural(
     result: torch.Tensor = torch.cat([chunks[i] for i in order], dim=dim)
 
     if names[0] is not None:
-        apply_dim_names(result, list(names))
+        result = apply_dim_names(result, list(names))
     return result

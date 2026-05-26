@@ -86,7 +86,7 @@ def _collapse_bs_to_t(
     result: dict[int, torch.Tensor] = {}
     for step, tensor in tensor_of_step.items():
         collapsed: torch.Tensor = rearrange(tensor, f"{lhs_pattern} -> {rhs_pattern}")
-        apply_dim_names(collapsed, [n for n in new_names if n is not None])
+        collapsed = apply_dim_names(collapsed, [n for n in new_names if n is not None])
         result[step] = collapsed
 
     return result

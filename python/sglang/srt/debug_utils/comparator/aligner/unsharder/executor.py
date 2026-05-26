@@ -71,7 +71,7 @@ def _apply_unshard(
         names: tuple[Optional[str], ...] = get_dim_names(ordered_tensors[0])
         result = torch.cat(ordered_tensors, dim=dim)
         if names[0] is not None:
-            apply_dim_names(result, list(names))
+            result = apply_dim_names(result, list(names))
         return result, []
 
     if isinstance(params, CpThdConcatParams):
@@ -90,7 +90,7 @@ def _apply_unshard(
         stripped: list[torch.Tensor] = [without_dim_names(t) for t in ordered_tensors]
         result: torch.Tensor = torch.stack(stripped).sum(dim=0)
         if names[0] is not None:
-            apply_dim_names(result, list(names))
+            result = apply_dim_names(result, list(names))
         return result, []
 
     raise ValueError(f"Unsupported unshard operation: {type(params).__name__}")
@@ -186,5 +186,5 @@ def _thd_concat(
     )
 
     if names[0] is not None:
-        apply_dim_names(result, list(names))
+        result = apply_dim_names(result, list(names))
     return result
