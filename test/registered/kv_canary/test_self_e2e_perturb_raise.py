@@ -31,7 +31,7 @@ class TestPerturbRaiseMha(CanaryE2EBase):
         except Exception:
             pass
         self.assert_per_forward_violation_reported(
-            fail_reason="real_kv_hash",
+            fail_reason="verify_real_kv_hash",
             target_group=TargetGroupKind.FULL,
             flush_wait_seconds=3.0,
         )

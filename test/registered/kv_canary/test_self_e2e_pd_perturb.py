@@ -41,7 +41,7 @@ class _PDPerturbBase(CanaryPDFixture):
         # D-side: first decode forward re-verifies the transferred prefix slots,
         # so the flip MUST surface as real_kv_hash violation.
         self.assert_per_forward_violation_reported(
-            fail_reason="real_kv_hash",
+            fail_reason="verify_real_kv_hash",
             target_group=self.target_group,
             side="decode",
             flush_wait_seconds=4.0,

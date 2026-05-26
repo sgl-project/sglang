@@ -34,7 +34,7 @@ class _PerturbRealKvUsedBase(CanaryE2EBase):
         for _ in range(self.workload_n_batches):
             self.send_parallel_requests()
         self.assert_per_forward_violation_reported(
-            fail_reason="real_kv_hash",
+            fail_reason="verify_real_kv_hash",
             target_group=self.target_group,
         )
         self.maybe_assert_swa_divergence_observed()

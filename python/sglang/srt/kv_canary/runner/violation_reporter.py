@@ -11,14 +11,10 @@ logger = logging.getLogger(__name__)
 
 _WRITE_BITS = FailReason.WRITE_TOKEN_MISMATCH | FailReason.WRITE_POSITION_MISMATCH
 _TOKEN_BITS = FailReason.WRITE_TOKEN_MISMATCH | FailReason.VERIFY_TOKEN_MISMATCH
-_REASON_LABELS: dict[FailReason, str] = {
-    FailReason.VERIFY_CHAIN_HASH_MISMATCH: "chain_hash",
-    FailReason.VERIFY_POSITION_MISMATCH: "position",
-    FailReason.VERIFY_REAL_KV_HASH_MISMATCH: "real_kv_hash",
-    FailReason.WRITE_TOKEN_MISMATCH: "write_token",
-    FailReason.WRITE_POSITION_MISMATCH: "write_position",
-    FailReason.VERIFY_TOKEN_MISMATCH: "verify_token",
-}
+
+
+def _reason_label(bit: FailReason) -> str:
+    return bit.name.lower().removesuffix("_mismatch")
 
 
 class ViolationReporter:
@@ -107,7 +103,7 @@ def _format_violation(
         tag_label = f"unknown({int(kernel_kind)})"
         canary_kind = tag_label
     bits_int = int(fail_reason_bits)
-    reasons = [label for bit, label in _REASON_LABELS.items() if bits_int & int(bit)]
+    reasons = [_reason_label(bit) for bit in FailReason if bits_int & int(bit)]
     is_write = bool(bits_int & int(_WRITE_BITS))
     u64_mask = (1 << 64) - 1
 

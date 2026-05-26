@@ -68,7 +68,7 @@ class _EaglePositionsBase(CanaryE2EBase):
         if self.revert_pr:
             self.assert_violation_logged_any(
                 launch_tag_patterns=("*",),
-                fail_reason="position",
+                fail_reason="verify_position",
                 flush_wait_seconds=0.0,
             )
         else:
