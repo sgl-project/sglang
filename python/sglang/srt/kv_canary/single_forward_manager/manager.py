@@ -143,11 +143,12 @@ class SingleForwardManager:
                 f"CanaryLaunchCapacities.from_args"
             )
 
-        self._populate_verify_token_pool(forward_batch=maybe_inaccurate_forward_batch)
+        if self._config.enable_verify_token_assert:
+            self._populate_verify_token_pool(
+                forward_batch=maybe_inaccurate_forward_batch
+            )
 
     def _populate_verify_token_pool(self, *, forward_batch: "ForwardBatch") -> None:
-        if not self._config.enable_verify_token_assert:
-            return
         req_all_ids_flat_cpu = forward_batch.req_all_ids_flat
         req_all_ids_lens_cpu = forward_batch.req_all_ids_lens
         if req_all_ids_flat_cpu is None or req_all_ids_lens_cpu is None:
