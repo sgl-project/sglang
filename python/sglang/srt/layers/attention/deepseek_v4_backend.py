@@ -1142,16 +1142,17 @@ class DeepseekV4AttnBackend(
             swa_page_indices = core_attn_metadata.swa_page_indices
             swa_topk_lengths = core_attn_metadata.swa_topk_lengths
 
-            if self.mtp_enabled:
-                if swa_page_indices.shape[0] != q.shape[0]:
-                    swa_page_indices = _pad_tensor_to_size(
-                        swa_page_indices, q.shape[0], value=0
-                    )
+            def match_num_queries(x, value):
+                if x is None or x.shape[0] == q.shape[0]:
+                    return x
+                if x.shape[0] > q.shape[0]:
+                    return x[: q.shape[0]]
+                return _pad_tensor_to_size(x, q.shape[0], value=value)
 
-                if swa_topk_lengths.shape[0] != q.shape[0]:
-                    swa_topk_lengths = _pad_tensor_to_size(
-                        swa_topk_lengths, q.shape[0], value=1
-                    )
+            swa_page_indices = match_num_queries(swa_page_indices, value=0)
+            swa_topk_lengths = match_num_queries(swa_topk_lengths, value=1)
+            extra_indices = match_num_queries(extra_indices, value=-1)
+            extra_topk_lengths = match_num_queries(extra_topk_lengths, value=1)
 
             if q.ndim == 3:
                 q = q.unsqueeze(1)
