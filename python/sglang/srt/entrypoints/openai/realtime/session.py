@@ -9,7 +9,6 @@ commit-only delta emission.
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 import logging
 import math
@@ -18,7 +17,6 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pybase64
-import soundfile as sf
 from fastapi import WebSocket, WebSocketDisconnect
 from openai.types.realtime import (
     ConversationItemCreatedEvent,
@@ -99,11 +97,11 @@ def _resample_to_target_rate(pcm: bytes, src_rate: int, target_rate: int) -> byt
     return (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
 
 
-def _pcm_to_wav(pcm: bytes, sample_rate: int) -> bytes:
-    samples = np.frombuffer(pcm, dtype=np.int16)
-    buf = io.BytesIO()
-    sf.write(buf, samples, sample_rate, format="WAV")
-    return buf.getvalue()
+def _pcm_to_float_samples(pcm: bytes) -> np.ndarray:
+    # Match soundfile.read default normalization for signed 16-bit PCM
+    # (divide by 32768.0) so callers see the same float values they used to
+    # get from the PCM -> WAV (sf.write) -> WAV (sf.read) round trip.
+    return np.frombuffer(pcm, dtype=np.int16).astype(np.float64) / 32768.0
 
 
 _CLIENT_EVENT_TYPES: Dict[str, type] = {
@@ -582,15 +580,15 @@ class RealtimeConnection:
         """Run ASR on the current cumulative buffer. Returns False on failure:
         commit-time emits transcription.failed and rolls the item; append-time
         emits a generic error envelope and closes the WebSocket."""
-        wav_data = await asyncio.to_thread(
-            _pcm_to_wav, bytes(self.audio.pcm_buffer), self.model_sample_rate
+        audio_samples = await asyncio.to_thread(
+            _pcm_to_float_samples, bytes(self.audio.pcm_buffer)
         )
         try:
             delta = await process_asr_chunk(
                 tokenizer_manager=self.tokenizer_manager,
                 adapter=self.adapter,
                 state=self.audio.state,
-                audio_data=wav_data,
+                audio_data=audio_samples,
                 sampling_params=self.config.sampling_params,
                 is_last=is_last,
             )
