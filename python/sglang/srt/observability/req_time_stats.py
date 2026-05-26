@@ -1009,7 +1009,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     ), f"bootstrap_queue_duration={bootstrap_queue_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
 
             # Break down bootstrap_queue_duration into sub-phases
-            if self.bootstrap_done_time > 0:
+            if (
+                self.bootstrap_done_time > 0
+                and self.prefill_bootstrap_queue_entry_time > 0
+            ):
                 bootstrap_duration = self.duration_between(
                     self.prefill_bootstrap_queue_entry_time, self.bootstrap_done_time
                 )
@@ -1024,6 +1027,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     f"bootstrap_duration={self.format_duration(bootstrap_duration)}, "
                     f"alloc_wait_duration={self.format_duration(alloc_wait_duration)}, "
                 )
+            elif self.bootstrap_done_time > 0:
+                bootstrap_fields = f"bootstrap_done_time={self.format_wallclock(self.bootstrap_done_time)}, "
             else:
                 bootstrap_fields = f"bootstrap_queue_duration={self.format_duration(bootstrap_queue_duration)}, "
 

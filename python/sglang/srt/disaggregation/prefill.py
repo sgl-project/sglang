@@ -533,6 +533,27 @@ class SchedulerDisaggregationPrefillMixin:
                     v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
                 ]
 
+        # Pre-poll optimistic requests with TP/CP consensus
+        optimistic_polls = {}
+        optimistic_senders = []
+        optimistic_indices = []
+        for i, req in enumerate(batch.reqs):
+            if (
+                req.optimistic_prefill
+                and req.metadata_buffer_index < 0
+                and req.inflight_middle_chunks <= 0
+            ):
+                optimistic_senders.append(req.disagg_kv_sender)
+                optimistic_indices.append(i)
+        if optimistic_senders:
+            polls = poll_and_all_reduce_attn_cp_tp_group(
+                optimistic_senders,
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+            )
+            for idx, poll in zip(optimistic_indices, polls):
+                optimistic_polls[idx] = poll
+
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
@@ -540,14 +561,15 @@ class SchedulerDisaggregationPrefillMixin:
                 req.time_stats.set_prefill_finished_time()
 
                 # For optimistic requests, check bootstrap before irreversible side effects
-                if req.optimistic_prefill and req.metadata_buffer_index < 0:
-                    poll = req.disagg_kv_sender.poll()
+                if i in optimistic_polls:
+                    poll = optimistic_polls[i]
+                    optimistic_skip = False
                     if poll == KVPoll.WaitingForInput:
                         if not self.disagg_prefill_bootstrap_queue.finalize_bootstrap(
                             req
                         ):
                             self.optimistic_release_and_requeue(req)
-                            continue
+                            optimistic_skip = True
                     elif poll == KVPoll.Failed:
                         error_message = (
                             f"Optimistic prefill bootstrap failed for request {req.rid}"
@@ -557,6 +579,9 @@ class SchedulerDisaggregationPrefillMixin:
                         except Exception as e:
                             error_message += f" with exception {e}"
                         logger.warning(error_message)
+                        req.time_stats.trace_ctx.abort(
+                            abort_info={"reason": error_message}
+                        )
                         release_kv_cache(req, self.tree_cache)
                         prepare_abort(
                             req,
@@ -564,9 +589,21 @@ class SchedulerDisaggregationPrefillMixin:
                             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                         )
                         self.output_streamer.stream_output([req], req.return_logprob)
-                        continue
+                        if self.metrics_reporter.enable_metrics:
+                            self.metrics_collector.increment_bootstrap_failed_reqs()
+                        if self.enable_hicache_storage:
+                            self.tree_cache.release_aborted_request(req.rid)
+                        optimistic_skip = True
                     else:
                         self.optimistic_release_and_requeue(req)
+                        optimistic_skip = True
+                    if optimistic_skip:
+                        if req.return_logprob and extend_input_len_per_req is not None:
+                            extend_logprob_start_len = extend_logprob_start_len_per_req[
+                                i
+                            ]
+                            extend_input_len = extend_input_len_per_req[i]
+                            logprob_pt += extend_input_len - extend_logprob_start_len
                         continue
 
                 req.output_ids.append(next_token_id)
@@ -616,6 +653,11 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # Overlap deferred release for optimistic requests stopped in process_prefill_chunk
                 if req.optimistic_stop:
+                    if req.return_logprob and extend_input_len_per_req is not None:
+                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
+                        extend_input_len = extend_input_len_per_req[i]
+                        if extend_logprob_start_len < extend_input_len:
+                            logprob_pt += extend_input_len - extend_logprob_start_len
                     self.optimistic_release_and_requeue(req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
@@ -781,7 +823,12 @@ class SchedulerDisaggregationPrefillMixin:
         """Check bootstrap status for an optimistic request.
         Returns True if the request should continue normal chunked flow,
         False if it was stopped/aborted (chunked_req should be set to None)."""
-        poll = req.disagg_kv_sender.poll()
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+        poll = polls[0]
         if poll == KVPoll.WaitingForInput:
             if self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req):
                 return True
@@ -794,11 +841,16 @@ class SchedulerDisaggregationPrefillMixin:
             except Exception as e:
                 error_message += f" with exception {e}"
             logger.warning(error_message)
+            req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
             release_kv_cache(req, self.tree_cache)
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
             self.output_streamer.stream_output([req], req.return_logprob)
+            if self.metrics_reporter.enable_metrics:
+                self.metrics_collector.increment_bootstrap_failed_reqs()
+            if self.enable_hicache_storage:
+                self.tree_cache.release_aborted_request(req.rid)
             return False
         else:
             # Still bootstrapping — stop chunking

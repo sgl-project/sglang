@@ -3794,6 +3794,11 @@ class ServerArgs:
 
             self.disable_cuda_graph = True
 
+        if self.optimistic_prefill_retries < 0:
+            raise ValueError(
+                "--optimistic-prefill-retries must be non-negative, "
+                f"got {self.optimistic_prefill_retries}"
+            )
         if self.optimistic_prefill_retries > 0:
             if self.disaggregation_mode != "prefill":
                 raise ValueError(
