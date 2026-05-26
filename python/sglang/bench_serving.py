@@ -2406,8 +2406,11 @@ if __name__ == "__main__":
             "and group index 0 is the hottest. Requires --gsp-zipf-alpha "
             "(a finite float > 0) when set to 'zipf'. Total request count is "
             "still num_groups * prompts_per_group, identical to uniform mode; "
-            "only the per-request group assignment changes. In 'zipf' mode the "
-            "on-disk dataset cache is bypassed."
+            "only the per-request group assignment changes. The on-disk "
+            "dataset cache uses a distinct key per (group_distribution, "
+            "zipf_alpha), so uniform-mode caches are never mixed with "
+            "zipf-mode caches and zipf runs with different alpha use "
+            "separate files."
         ),
     )
     group.add_argument(

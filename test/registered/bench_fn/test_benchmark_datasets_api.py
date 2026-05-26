@@ -22,6 +22,7 @@ from sglang.benchmark.datasets import DATASET_MAPPING, get_dataset
 from sglang.benchmark.datasets.common import DatasetRow
 from sglang.benchmark.datasets.custom import sample_custom_requests
 from sglang.benchmark.datasets.generated_shared_prefix import (
+    GeneratedSharedPrefixDataset,
     _zipf_group_probs,
     get_gen_prefix_cache_path,
     sample_generated_shared_prefix_requests,
@@ -806,6 +807,26 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
     # ------------------------------------------------------------------
     # CLI / from_args validation
     # ------------------------------------------------------------------
+
+    def test_from_args_rejects_invalid_distribution_and_alpha(self):
+        # Defensive validation in from_args protects in-process callers
+        # that build a Namespace by hand and bypass the argparse boundary
+        # in bench_serving.py. Covers: unknown distribution, zipf without
+        # alpha, uniform with alpha, and non-finite/non-positive alpha.
+        cases = [
+            {"gsp_group_distribution": "not-a-distribution", "gsp_zipf_alpha": None},
+            {"gsp_group_distribution": "zipf", "gsp_zipf_alpha": None},
+            {"gsp_group_distribution": "uniform", "gsp_zipf_alpha": 1.0},
+            {"gsp_group_distribution": "zipf", "gsp_zipf_alpha": 0.0},
+            {"gsp_group_distribution": "zipf", "gsp_zipf_alpha": -0.5},
+            {"gsp_group_distribution": "zipf", "gsp_zipf_alpha": float("nan")},
+            {"gsp_group_distribution": "zipf", "gsp_zipf_alpha": float("inf")},
+            {"gsp_group_distribution": "zipf", "gsp_zipf_alpha": float("-inf")},
+        ]
+        for case in cases:
+            args = make_args(dataset_name="generated-shared-prefix", **case)
+            with self.assertRaises(ValueError, msg=f"case={case}"):
+                GeneratedSharedPrefixDataset.from_args(args)
 
     def test_bench_serving_help_and_invalid_choice_argparse(self):
         # Subprocess-driven coverage of the live CLI: --help advertises both

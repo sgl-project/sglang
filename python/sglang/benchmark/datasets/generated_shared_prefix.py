@@ -1,3 +1,4 @@
+import math
 import pickle
 import random
 import uuid
@@ -54,6 +55,34 @@ class GeneratedSharedPrefixDataset(BaseDataset):
     @classmethod
     def from_args(cls, args: Namespace) -> "GeneratedSharedPrefixDataset":
         assert not getattr(args, "tokenize_prompt", False)
+        group_distribution = args.gsp_group_distribution
+        zipf_alpha = args.gsp_zipf_alpha
+
+        # Defensive validation for in-process callers that construct a
+        # Namespace by hand and bypass the argparse boundary in
+        # bench_serving.py. The CLI hook enforces the same rules first.
+        if group_distribution not in ("uniform", "zipf"):
+            raise ValueError(
+                f"--gsp-group-distribution must be 'uniform' or 'zipf', "
+                f"got {group_distribution!r}"
+            )
+        if group_distribution == "zipf":
+            if zipf_alpha is None:
+                raise ValueError(
+                    "--gsp-group-distribution=zipf requires --gsp-zipf-alpha "
+                    "(a finite float > 0)"
+                )
+            if not math.isfinite(zipf_alpha) or zipf_alpha <= 0:
+                raise ValueError(
+                    f"--gsp-zipf-alpha must be a finite float > 0, got {zipf_alpha!r}"
+                )
+        elif zipf_alpha is not None:
+            raise ValueError(
+                "--gsp-zipf-alpha is only meaningful with "
+                "--gsp-group-distribution=zipf; remove --gsp-zipf-alpha "
+                "or set --gsp-group-distribution=zipf"
+            )
+
         return cls(
             num_groups=args.gsp_num_groups,
             prompts_per_group=args.gsp_prompts_per_group,
@@ -66,8 +95,8 @@ class GeneratedSharedPrefixDataset(BaseDataset):
             send_routing_key=getattr(args, "gsp_send_routing_key", False),
             num_turns=getattr(args, "gsp_num_turns", 1),
             ordered=getattr(args, "gsp_ordered", False),
-            group_distribution=args.gsp_group_distribution,
-            zipf_alpha=args.gsp_zipf_alpha,
+            group_distribution=group_distribution,
+            zipf_alpha=zipf_alpha,
         )
 
     def load(
@@ -151,8 +180,9 @@ def sample_generated_shared_prefix_requests(
     Zipf mode is cached on disk under a distinct key per (group_distribution,
     zipf_alpha) value.
 
-    Validation of group_distribution / zipf_alpha is enforced at the CLI parse
-    boundary in bench_serving.py.
+    Validation of group_distribution / zipf_alpha is enforced at the CLI
+    parse boundary in bench_serving.py and in
+    GeneratedSharedPrefixDataset.from_args for in-process callers.
     """
     cache_path = get_gen_prefix_cache_path(
         seed,
