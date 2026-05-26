@@ -76,6 +76,13 @@ def populate_req_to_expected_token_ids(
         device=device, dtype=torch.int64
     )
 
+    # Invalidate every active req's whole row to the -1 sentinel before the scatter
+    # repopulates [0, len(req)). Otherwise a pool slot reused by a shorter req keeps
+    # the previous req's tail tokens at positions past the new snapshot, and the
+    # verify kernel reads them as if they were ground truth and fires a false
+    # mismatch on the current step's draft / verify positions.
+    req_to_verify_expected_tokens.index_fill_(0, req_pool_indices_dev, -1)
+
     launch_scatter_req_token_ids_kernel(
         flat_in=req_all_ids_flat_dev,
         offsets=offsets_dev,
