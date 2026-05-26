@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=700, stage="base-c", runner_config="dsv4-4-gpu-b200")
+register_cuda_ci(est_time=465, stage="base-c", runner_config="dsv4-4-gpu-b200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
@@ -120,12 +120,10 @@ class TestDSV4FlashFP4B200Balanced(
             kill_process_tree(cls.process.pid)
 
 
-class TestDSV4FlashFP4B200Balanced_CP(
-    BasicDecodeCorrectnessMixin,
-    GSM8KMixin,
-    CustomTestCase,
+class TestDSV4FlashFP4NonMTPB200(
+    BasicDecodeCorrectnessMixin, GSM8KMixin, CustomTestCase
 ):
-    """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
+    """Non-MTP recipe: TP=4, DP=4, DeepEP, no speculative decoding."""
 
     gsm8k_accuracy_thres = 0.93
 
@@ -141,22 +139,11 @@ class TestDSV4FlashFP4B200Balanced_CP(
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--attn-cp-size",
+                "--dp",
                 "4",
                 "--enable-dp-attention",
                 "--moe-a2a-backend",
                 "deepep",
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "1",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "2",
-                "--enable-dsa-prefill-context-parallel",
-                "--dsa-prefill-cp-mode",
-                "round-robin-split",
                 "--deepep-config",
                 DEEPEP_CONFIG,
             ],
