@@ -39,8 +39,10 @@ Implemented:
   initial KDA (Kimi Delta Attention) linear-attention fixture under `kda/` with
   an eager EXTEND Triton case, plus an initial Lightning (Bailing-style
   segmented linear attention) fixture under `lightning/` with an eager EXTEND
-  Triton case. `dsv4/` remains a deferred method fixture
-  because it needs a DeepSeekV4-specific packed-cache reference.
+  Triton case, plus an initial Mamba2 state-space-model fixture under `mamba/`
+  with an eager EXTEND case that drives `Mamba2AttnBackend` end-to-end through
+  a real `MambaMixer2`. `dsv4/` remains a deferred method fixture because it
+  needs a DeepSeekV4-specific packed-cache reference.
 - Phase 3 dense runner integration is implemented for representative attention
   backends: eager mode for `torch_native`, and CUDA-graph metadata capture/replay
   decode mode for `triton` and `flashinfer`. Runner coverage now includes MHA,
@@ -262,6 +264,17 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Added initial Mamba2 SSM Phase 2 fixture that constructs a real
+  `MambaMixer2` and drives it through `Mamba2AttnBackend` via `ForwardContext`,
+  with a pure-PyTorch per-token SSM scan reference (`state_t = exp(A*dt_t) * state_{t-1} + dt_t * B_t * x_t`,
+  `y_t = C_t * state_t + D * x_t`) that reuses the actual `in_proj` /
+  `conv1d` / `norm` / `out_proj` modules through shared random weights but
+  recomputes the SSM core entirely in pure torch. Tolerance loosened to
+  `5e-2` (vs 3e-2 for delta-rule fixtures) to absorb chunked-scan reordering
+  and bf16 `out_proj` accumulation depth.
+- `python -m py_compile test/manual/attention/unittest/common/attention_methods/mamba2_attention.py test/manual/attention/unittest/mamba/test_mamba2.py`
+- `python test/manual/attention/unittest/mamba/test_mamba2.py -v`
+  - Ran 1 test in 0.860s after adding eager Mamba2 EXTEND coverage.
 - Added initial Lightning (Bailing-style segmented linear attention) Phase 2
   fixture with a `ProjectedLightningAttention` actual module (wraps
   `RadixAttention` and installs `LightningAttentionBackend` directly via
@@ -538,6 +551,7 @@ test/manual/attention/unittest/
       gdn_attention.py
       kda_attention.py
       lightning_attention.py
+      mamba2_attention.py
       mla_attention.py
     runner_modes/
       cuda_graph_decode_runner.py
@@ -560,6 +574,8 @@ test/manual/attention/unittest/
     test_triton.py
   lightning/
     test_triton.py
+  mamba/
+    test_mamba2.py
   swa/
     test_triton.py
     test_flashinfer.py
