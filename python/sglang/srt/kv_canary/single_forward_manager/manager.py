@@ -144,16 +144,21 @@ class SingleForwardManager:
             )
 
         if self._config.enable_verify_token_assert:
-            self._populate_verify_token_pool(
-                forward_batch=maybe_inaccurate_forward_batch
+            self._populate_req_to_expected_token_ids(
+                forward_batch=maybe_inaccurate_forward_batch,
+                req_to_verify_expected_tokens=self._device_state.req_to_verify_expected_tokens,
             )
 
-    def _populate_verify_token_pool(self, *, forward_batch: "ForwardBatch") -> None:
+    @staticmethod
+    def _populate_req_to_expected_token_ids(
+        *,
+        forward_batch: "ForwardBatch",
+        req_to_verify_expected_tokens: Optional[torch.Tensor],
+    ) -> None:
         req_all_ids_flat_cpu = forward_batch.req_all_ids_flat
         req_all_ids_lens_cpu = forward_batch.req_all_ids_lens
         if req_all_ids_flat_cpu is None or req_all_ids_lens_cpu is None:
             return
-        req_to_verify_expected_tokens = self._device_state.req_to_verify_expected_tokens
         if req_to_verify_expected_tokens is None:
             return
 
