@@ -177,8 +177,9 @@ def deepseek_v4_attention_with_output(
     original_out_cache_loc = forward_batch.out_cache_loc
     forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
 
+    attn_backend = get_attn_backend()
     try:
-        ret = forward_batch.attn_backend.forward(
+        ret = attn_backend.forward(
             q=query,
             k=key_value,
             v=key_value,
