@@ -14,6 +14,7 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_launch_pd_server,
     popen_with_error_check,
+    start_subprocess_fail_fast_watcher,
 )
 from sglang.utils import wait_for_http_ready
 
@@ -39,6 +40,7 @@ class PDDisaggregationServerBase(CustomTestCase):
             f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=} {cls.bootstrap_port=}"
         )
         cls.process_lb, cls.process_decode, cls.process_prefill = None, None, None
+        cls._fail_fast_stop = None
 
         # config transfer backend and rdma devices
         if is_in_ci():
@@ -110,6 +112,13 @@ class PDDisaggregationServerBase(CustomTestCase):
         cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
         cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
         cls.launch_lb()
+        cls._fail_fast_stop = start_subprocess_fail_fast_watcher(
+            [
+                ("prefill", cls.process_prefill),
+                ("decode", cls.process_decode),
+                ("lb", cls.process_lb),
+            ]
+        )
 
     @classmethod
     def launch_lb(cls):
@@ -141,6 +150,11 @@ class PDDisaggregationServerBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # Stop the watcher BEFORE killing processes: kill_process_tree
+        # below makes them exit with a negative signal rc, which would
+        # otherwise trip the watcher and os._exit out of pytest mid-teardown.
+        if cls._fail_fast_stop is not None:
+            cls._fail_fast_stop.set()
         os.environ.pop("MC_TCP_ENABLE_CONNECTION_POOL")
         for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
             if process:
