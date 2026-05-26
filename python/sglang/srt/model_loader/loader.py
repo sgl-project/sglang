@@ -583,10 +583,12 @@ class DefaultModelLoader(BaseModelLoader):
     @classmethod
     def _filter_mtp_weights(
         cls, weights_iterator, prefix: str, draft_model_idx: int
-    ) -> Tuple[Tuple[str, torch.Tensor], ...]:
-        """Filter MTP (Multi-Token Prediction) weights to keep only the
-        specified draft model layer and remap it to layer 0."""
-        filtered_weights = []
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        """Filter MTP weights to keep only the specified draft model layer
+        and remap it to layer 0. Yields lazily so the upstream buffered
+        iterator's sliding window actually bounds CPU memory — eager
+        materialization caused page-reclaim hangs on large MoE checkpoints
+        with multi-layer EAGLE."""
         for name, tensor in weights_iterator:
             match = cls._MTP_PATTERN.match(name)
             if match is not None:
@@ -596,8 +598,7 @@ class DefaultModelLoader(BaseModelLoader):
                 new_name = name.replace(match.group(), "model.mtp.layers.0.")
             else:
                 new_name = name
-            filtered_weights.append((prefix + new_name, tensor))
-        return tuple(filtered_weights)
+            yield (prefix + new_name, tensor)
 
     def _get_all_weights(
         self,
