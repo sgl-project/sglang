@@ -42,7 +42,6 @@ from sglang.srt.speculative.spec_utils import (
     generate_simulated_accept_index,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
-    maybe_detect_inf,
     maybe_detect_nan,
     maybe_detect_oob,
 )
@@ -359,7 +358,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 logits_output.next_token_logits / expanded_temperature, dim=-1
             )  # (bs * draft_token_num, vocab_size)
             maybe_detect_nan(target_probs, "verify: target_probs after softmax")
-            maybe_detect_inf(target_probs, "verify: target_probs after softmax")
             target_probs = top_k_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(

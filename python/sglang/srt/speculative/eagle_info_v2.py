@@ -37,7 +37,6 @@ from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
-    maybe_detect_inf,
     maybe_detect_nan,
     maybe_detect_oob,
 )
@@ -414,7 +413,6 @@ class EagleVerifyInputV2Mixin:
                 next_token_logits / expanded_temperature, dim=-1
             )  # (bs * num_draft_tokens, vocab_size)
             maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-            maybe_detect_inf(target_probs, "v2 verify: target_probs after softmax")
             target_probs = top_k_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(
