@@ -776,27 +776,10 @@ class TestScriptedSpecialCase(CustomTestCase):
             t.row_pool_used() <= baseline_rows
         ), f"row leak under forced chunked admission: baseline={baseline_rows}, after={t.row_pool_used()}"
 
-    def test_swa_early_return_does_not_double_free(self):
-        """SWA pool boundary + add_chunked_req early-return: _chunked_req_scheduled_last_iter stays False, stash not double-freed."""
-        execute_scripted_runtime(
-            self._script_swa_early_return_does_not_double_free,
-            **base_engine_kwargs(
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-                model_path="openai/gpt-oss-20b",
-                mem_fraction_static=0.70,
-                disable_piecewise_cuda_graph=True,
-            ),
-        )
-
-    @staticmethod
-    def _script_swa_early_return_does_not_double_free(t: ScriptedRuntime):
-        # scheduler.py: when SWA budget forces add_chunked_req
-        # to early-return, the flag _chunked_req_scheduled_last_iter must
-        # stay False so the next iter does not double-free the stash. Drive
-        # by exhausting the SWA window via a long competitor req.
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
+    # SWA add_chunked_req early-return + stash double-free regression is
+    # covered by test_swa_chunked_req_early_return_no_double_free in
+    # test_scripted_hybrid_swa.py (full assertion suite: flag transitions,
+    # early-return path was hit, double-free counter == 0).
 
     def test_stage_a_pending_middle_outputs_sync_invariant(self):
         """Cross-iteration invariant: pending_middle_outputs > 0 implies is_chunking == True."""
