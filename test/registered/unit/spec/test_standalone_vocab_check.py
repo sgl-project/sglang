@@ -26,11 +26,13 @@ def _tok(vocab: dict):
 
 
 def _validate(target_size, draft_size, target_tok, draft_tok):
+    fake_self = MagicMock()
+    fake_self.draft_model_runner.model_config.vocab_size = draft_size
+    fake_self.tokenizer = draft_tok
     StandaloneWorker._validate_vocab_compatibility(
+        fake_self,
         target_vocab_size=target_size,
-        draft_vocab_size=draft_size,
         target_tokenizer=target_tok,
-        draft_tokenizer=draft_tok,
     )
 
 

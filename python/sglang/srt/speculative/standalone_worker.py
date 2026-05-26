@@ -104,11 +104,9 @@ class StandaloneWorker(EAGLEWorker):
         # can have the same vocab_size with different token strings.  We also compare the
         # full token-to-id mapping of both tokenizers (the same approach used by
         # HuggingFace Transformers to detect homogeneous vs heterogeneous vocabularies).
-        StandaloneWorker._validate_vocab_compatibility(
+        self._validate_vocab_compatibility(
             target_vocab_size=target_worker.model_runner.model_config.vocab_size,
-            draft_vocab_size=self.draft_model_runner.model_config.vocab_size,
             target_tokenizer=target_worker.tokenizer,
-            draft_tokenizer=self.tokenizer,
         )
 
         # Init attention backend and cuda graphs
@@ -132,12 +130,10 @@ class StandaloneWorker(EAGLEWorker):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
-    @staticmethod
     def _validate_vocab_compatibility(
+        self,
         target_vocab_size: int,
-        draft_vocab_size: int,
         target_tokenizer,
-        draft_tokenizer,
     ) -> None:
         """Raise ValueError if the draft and target vocabularies are incompatible.
 
@@ -155,6 +151,8 @@ class StandaloneWorker(EAGLEWorker):
         startup; on a 256 k-token vocabulary it takes ~300 ms, which is
         negligible relative to model-loading time.
         """
+        draft_vocab_size = self.draft_model_runner.model_config.vocab_size
+        draft_tokenizer = self.tokenizer
         if target_vocab_size != draft_vocab_size:
             raise ValueError(
                 f"STANDALONE speculative decoding requires the draft model to share the "
