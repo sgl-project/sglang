@@ -5,6 +5,7 @@ from sglang.test.chunked_prefill_test_utils import ChunkedTestBase
 
 class TestChunkedFeatureLoRAOverlap(ChunkedTestBase):
     model = "meta-llama/Llama-2-7b-hf"
+    gsm8k_threshold = 0.50
     feature_args = [
         "--enable-lora",
         "--enable-lora-overlap-loading",

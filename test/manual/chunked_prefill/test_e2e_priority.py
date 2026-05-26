@@ -6,6 +6,7 @@ from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 class TestChunkedFeaturePriority(ChunkedTestBase):
     model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+    gsm8k_threshold = 0.50
     feature_args = [
         "--enable-priority-scheduling",
         # Keep concurrency moderate so the priority queue actually fills and

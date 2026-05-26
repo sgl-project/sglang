@@ -10,6 +10,7 @@ class TestChunkedFeatureHiSparse(ChunkedTestBase):
     model = "deepseek-ai/DeepSeek-V4-Flash"
     num_shots = LONG_PROMPT_NUM_SHOTS
     max_tokens = 4000
+    gsm8k_threshold = 0.50
     feature_args = [
         "--trust-remote-code",
         "--tp",

@@ -6,6 +6,7 @@ from sglang.test.test_utils import DEFAULT_DRAFT_MODEL_EAGLE, DEFAULT_TARGET_MOD
 
 class TestChunkedFeatureSpec(ChunkedTestBase):
     model = DEFAULT_TARGET_MODEL_EAGLE
+    gsm8k_threshold = 0.50
     feature_args = [
         "--speculative-algorithm",
         "EAGLE",

@@ -9,6 +9,7 @@ from sglang.test.chunked_prefill_test_utils import (
 class TestChunkedFeatureHybridSWA(ChunkedTestBase):
     model = "openai/gpt-oss-20b"
     num_shots = LONG_PROMPT_NUM_SHOTS
+    gsm8k_threshold = 0.50
     feature_args = [
         "--mem-fraction-static",
         "0.70",
