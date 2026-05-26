@@ -317,6 +317,29 @@ class TestFlux2FinetunedVaeEncodePreprocess(unittest.TestCase):
 
         self.assertIs(output, image)
 
+    def test_custom_vae_already_patchified_encode_latents_stay_128_channels(self):
+        config = Flux2FinetunedPipelineConfig()
+        vae = MagicMock()
+        vae.bn = None
+
+        image_latents = torch.zeros(1, config.dit_config.arch_config.in_channels, 8, 8)
+        output = config.postprocess_vae_encode(image_latents, vae)
+
+        self.assertIs(output, image_latents)
+
+    def test_standard_flux2_vae_encode_latents_are_patchified(self):
+        config = Flux2FinetunedPipelineConfig()
+        vae = MagicMock()
+        vae.bn = object()
+
+        image_latents = torch.zeros(1, 32, 8, 8)
+        output = config.postprocess_vae_encode(image_latents, vae)
+
+        self.assertEqual(
+            tuple(output.shape),
+            (1, config.dit_config.arch_config.in_channels, 4, 4),
+        )
+
 
 class TestImageVaeEncodingLatentRetrieval(unittest.TestCase):
     def test_encode_scale_and_shift_allows_missing_shift(self):
