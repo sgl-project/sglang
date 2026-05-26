@@ -185,7 +185,7 @@ class CompletionTokensDetails(BaseModel):
 
     ``accepted_prediction_tokens`` / ``rejected_prediction_tokens`` mirror
     OpenAI's Predicted Outputs feature and are populated from speculative
-    decoding when ``--speculative-algorithm`` is set: accepted = drafts the
+    decoding when ``--enable-spec-decode-usage`` is set: accepted = drafts the
     target model verified (no bonus); rejected = drafts proposed but not
     verified.
     """
@@ -201,7 +201,8 @@ class UsageInfo(BaseModel):
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
-    # Populated when speculative decoding is enabled. See CompletionTokensDetails.
+    # Used to return speculative-decoding counters when --enable-spec-decode-usage
+    # is set. None for non-spec requests and for spec requests when the flag is off.
     completion_tokens_details: Optional[CompletionTokensDetails] = None
 
 
