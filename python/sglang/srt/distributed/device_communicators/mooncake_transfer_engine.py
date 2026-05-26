@@ -29,10 +29,19 @@ def parse_ib_device_config(
         try:
             with open(normalized_input, "r", encoding="utf-8") as file:
                 mapping = json.load(file)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Failed to parse JSON content from file {normalized_input}"
+            ) from exc
         except (IOError, OSError) as exc:
-            raise RuntimeError(f"Failed to read JSON file {normalized_input}: {exc}") from exc
+            raise RuntimeError(
+                f"Failed to read JSON file {normalized_input}: {exc}"
+            ) from exc
     else:
-        mapping = json.loads(normalized_input)
+        try:
+            mapping = json.loads(normalized_input)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON mapping: {normalized_input}") from exc
 
     if not isinstance(mapping, dict):
         raise ValueError(
