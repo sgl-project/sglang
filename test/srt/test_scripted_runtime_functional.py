@@ -168,9 +168,7 @@ class TestScriptedRuntimeFunctional(CustomTestCase):
 
     def test_script_raises_assertion_surfaces_to_caller(self):
         with self.assertRaises(AssertionError) as ctx:
-            execute_scripted_runtime(
-                _script_assertion_failure, **_COMMON_ENGINE_KWARGS
-            )
+            execute_scripted_runtime(_script_assertion_failure, **_COMMON_ENGINE_KWARGS)
         self.assertIn("boom", str(ctx.exception))
 
     def test_script_raises_runtime_error_surfaces_to_caller(self):
@@ -184,9 +182,7 @@ class TestScriptedRuntimeFunctional(CustomTestCase):
 
     def test_non_generator_script_function_errors_cleanly(self):
         with self.assertRaises(AssertionError) as ctx:
-            execute_scripted_runtime(
-                _script_not_a_generator, **_COMMON_ENGINE_KWARGS
-            )
+            execute_scripted_runtime(_script_not_a_generator, **_COMMON_ENGINE_KWARGS)
         # The runtime rejects non-generator script functions with a clear
         # TypeError mentioning "must be a generator". That traceback bubbles
         # up via the traceback file and execute_scripted_runtime wraps it as
