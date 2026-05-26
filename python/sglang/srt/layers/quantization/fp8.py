@@ -1957,9 +1957,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 block_shape = self.quant_config.weight_block_size
                 w13_scale = layer.w13_weight_scale_inv
                 w2_scale = layer.w2_weight_scale_inv
-            elif (
-                hasattr(layer, "w13_weight_scale_inv")
-                and getattr(layer.w13_weight_scale_inv, "format_ue8m0", False)
+            elif hasattr(layer, "w13_weight_scale_inv") and getattr(
+                layer.w13_weight_scale_inv, "format_ue8m0", False
             ):
                 # Per-tensor FP8 on Blackwell: weights were already requantized to
                 # per-block UE8M0 format during process_weights_after_loading.
