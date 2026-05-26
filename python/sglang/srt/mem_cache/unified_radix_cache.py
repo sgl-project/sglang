@@ -35,7 +35,6 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.utils import split_node_hash_value
 from sglang.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
     BASE_COMPONENT_TYPE,
@@ -2047,9 +2046,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         entry = self.ongoing_write_through.pop(ack_id, None)
                         if entry is not None:
                             node, params = entry
-                            self._record_store_event(
-                                node, medium=StorageMedium.CPU
-                            )
+                            self._record_store_event(node, medium=StorageMedium.CPU)
                             if params is not None:
                                 self.dec_lock_ref(node, params)
                             if self.enable_storage:

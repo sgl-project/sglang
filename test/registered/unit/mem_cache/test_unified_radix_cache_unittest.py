@@ -309,9 +309,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         tree.loading_check()
 
     def test_kv_events_store_and_remove_full_blocks(self):
-        tree, allocator, _ = build_fixture(
-            self.cfg, enable_kv_cache_events=True
-        )
+        tree, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
         tree.take_events()  # Clear the reset event.
 
         seq = [1, 2, 3, 4]
@@ -327,9 +325,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertCountEqual([e.block_hashes[0] for e in removed], stored_hashes)
 
     def test_kv_events_split_preserves_block_hash_parentage(self):
-        tree, allocator, _ = build_fixture(
-            self.cfg, enable_kv_cache_events=True
-        )
+        tree, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
         tree.take_events()  # Clear the reset event.
 
         self._insert(tree, allocator, [1, 2, 3, 4])
@@ -351,9 +347,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertEqual(len(split_child.hash_value), 1)
 
     def test_hicache_kv_events_track_gpu_cpu_transitions(self):
-        tree, allocator, _ = build_fixture(
-            self.cfg, enable_kv_cache_events=True
-        )
+        tree, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
         self._init_hicache(tree)
         tree.take_events()  # Clear reset / init events.
 
@@ -383,9 +377,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertCountEqual([e.block_hashes[0] for e in removed_cpu], stored_hashes)
 
     def test_hicache_reinsert_evicted_node_emits_gpu_store(self):
-        tree, allocator, _ = build_fixture(
-            self.cfg, enable_kv_cache_events=True
-        )
+        tree, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
         self._init_hicache(tree)
         tree.take_events()  # Clear reset / init events.
 
