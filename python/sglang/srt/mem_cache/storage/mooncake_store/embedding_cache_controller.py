@@ -198,7 +198,6 @@ class EmbeddingCacheController:
             sorted_hashes = self.access_order.items()
 
         for image_hash, _ in sorted_hashes:
-        for image_hash, _ in sorted_hashes:
             if image_hash not in self.hash_to_metadata:
                 with self.access_lock:
                     self.access_order.pop(image_hash, None)
