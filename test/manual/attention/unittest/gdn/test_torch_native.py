@@ -1,0 +1,62 @@
+import sys
+import unittest
+from pathlib import Path
+
+import torch
+
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.test.test_utils import CustomTestCase
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from common.gdn_attention import (
+    GDNAttentionCase,
+    make_gdn_cases,
+    run_gdn_attention_case,
+)
+from common.split_op_runner import run_gdn_split_op_extend_case
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
+class TestTorchNativeGDNBackendCorrectness(CustomTestCase):
+    CASES = make_gdn_cases("torch_native")
+    SPLIT_OP_CASES = (
+        (
+            GDNAttentionCase(
+                name="runner_split_op_gdn_extend_ragged_page_boundary",
+                backend="torch_native",
+                forward_mode=ForwardMode.EXTEND,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(0, 8, 16),
+                extend_lens=(15, 8, 1),
+            ),
+            32,
+        ),
+    )
+
+    def test_projected_gdn_attention_cases(self):
+        for case in self.CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_gdn_attention_case(self, case)
+
+    def test_runner_mode_split_op_extend_cases(self):
+        for case, static_num_tokens in self.SPLIT_OP_CASES:
+            for breakable in (False, True):
+                runner = "bcg" if breakable else "pcg"
+                with self.subTest(
+                    case=case.name,
+                    backend=case.backend,
+                    runner=runner,
+                ):
+                    run_gdn_split_op_extend_case(
+                        self,
+                        case,
+                        breakable=breakable,
+                        static_num_tokens=static_num_tokens,
+                    )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -21,11 +21,11 @@ Implemented:
   separate HF-style PyTorch reference module with copied random weights and no
   `RadixAttention` or backend calls.
 - GDN hybrid-linear attention backend correctness exists under
-  `test/manual/attention/unittest/gdn/` for full-attention backends `triton` and
-  `flashinfer` with linear-attention kernel backend `triton`; its expected path is
-  now a separate reference module plus pure PyTorch gated-delta recurrence, not the
-  Triton/FLA GDN kernels. The FlashInfer GDN file uses 64-dim heads to satisfy
-  FlashInfer SM90 prefill kernel constraints.
+  `test/manual/attention/unittest/gdn/` for full-attention backends `torch_native`,
+  `triton`, and `flashinfer` with linear-attention kernel backend `triton`; its
+  expected path is now a separate reference module plus pure PyTorch gated-delta
+  recurrence, not the Triton/FLA GDN kernels. The FlashInfer GDN file uses 64-dim
+  heads to satisfy FlashInfer SM90 prefill kernel constraints.
 - Phase 3 dense runner integration is implemented for representative attention
   backends: eager mode for `torch_native`, and CUDA-graph metadata capture/replay
   decode mode for `triton` and `flashinfer`. Runner coverage now includes MHA,
@@ -140,6 +140,10 @@ Next implementation steps:
 
 Latest verification:
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+  - Ran 41 tests in 21.629s after adding GDN torch-native coverage.
+- `python -m py_compile test/manual/attention/unittest/gdn/test_torch_native.py`
+- `python test/manual/attention/unittest/gdn/test_torch_native.py -v`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
   - Ran 39 tests in 21.608s after adding GDN FlashInfer coverage.
 - `python -m py_compile test/manual/attention/unittest/gdn/test_flashinfer.py`
 - `python test/manual/attention/unittest/gdn/test_flashinfer.py -v`
@@ -223,6 +227,7 @@ test/manual/attention/unittest/
     test_flashmla.py
     test_trtllm_mla.py
   gdn/
+    test_torch_native.py
     test_triton.py
     test_flashinfer.py
 ```
