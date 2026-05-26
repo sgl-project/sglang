@@ -28,7 +28,7 @@ class TestRunaiModelLoader(CustomTestCase):
             cls.engine = sgl.Engine(
                 model_path=TEST_GCS_MODEL,
                 load_format="runai_streamer",
-                cuda_graph_max_bs=1,
+                cuda_graph_max_bs_decode=1,
                 max_total_tokens=64,
             )
 

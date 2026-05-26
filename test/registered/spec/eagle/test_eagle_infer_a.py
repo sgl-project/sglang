@@ -25,7 +25,7 @@ class TestEAGLEEngine(CustomTestCase):
         "speculative_eagle_topk": 4,
         "speculative_num_draft_tokens": 8,
         "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 5,
+        "cuda_graph_max_bs_decode": 5,
         "trust_remote_code": True,
     }
     NUM_CONFIGS = 2
@@ -48,7 +48,7 @@ class TestEAGLEEngine(CustomTestCase):
         self.sampling_params = {"temperature": 0, "max_new_tokens": 8}
 
         ref_engine = sgl.Engine(
-            model_path=self.BASE_CONFIG["model_path"], cuda_graph_max_bs=1
+            model_path=self.BASE_CONFIG["model_path"], cuda_graph_max_bs_decode=1
         )
         self.ref_output = ref_engine.generate(self.prompt, self.sampling_params)["text"]
         ref_engine.shutdown()
@@ -170,7 +170,7 @@ class TestEAGLEEngineTokenMap(TestEAGLEEngine):
         "speculative_num_draft_tokens": 8,
         "speculative_token_map": "thunlp/LLaMA3-Instruct-8B-FR-Spec/freq_32768.pt",
         "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 5,
+        "cuda_graph_max_bs_decode": 5,
         "dtype": "float16",
     }
     NUM_CONFIGS = 1
@@ -189,7 +189,7 @@ class TestEAGLE3Engine(TestEAGLEEngine):
         "speculative_eagle_topk": 16,
         "speculative_num_draft_tokens": 64,
         "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 5,
+        "cuda_graph_max_bs_decode": 5,
         "dtype": "float16",
     }
     NUM_CONFIGS = 1
