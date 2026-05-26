@@ -176,7 +176,7 @@ def _script_kv_pressure_with_radix_evict(t: ScriptedRuntime):
     yield from run_until(r2, lambda h: h.finished, max_steps=2000)
 
 
-class TestEdgeKvPressure(CustomTestCase):
+class TestScriptedKVPressure(CustomTestCase):
     def test_kv_almost_empty_then_abort(self):
         execute_scripted_runtime(
             _script_kv_almost_empty_then_abort,
