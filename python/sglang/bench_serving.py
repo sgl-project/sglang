@@ -1931,6 +1931,33 @@ def run_benchmark(args_: argparse.Namespace):
     )
 
 
+def _validate_parsed_gsp_args(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Reject malformed GSP distribution/alpha combinations at parse time.
+
+    This is invoked from the CLI entry point right after ``parser.parse_args()``
+    so users see a clear argparse-style error before any server, model, or
+    tokenizer setup runs and masks the real cause with an unrelated network
+    failure. The equivalent defensive checks in
+    ``GeneratedSharedPrefixDataset.from_args`` remain in place for in-process
+    callers that bypass this entry point.
+    """
+    distribution = getattr(args, "gsp_group_distribution", None)
+    alpha = getattr(args, "gsp_zipf_alpha", None)
+    if distribution == "zipf" and alpha is None:
+        parser.error(
+            "--gsp-group-distribution=zipf requires --gsp-zipf-alpha "
+            "(a finite float > 0)"
+        )
+    if distribution == "uniform" and alpha is not None:
+        parser.error(
+            "--gsp-zipf-alpha is only meaningful with "
+            "--gsp-group-distribution=zipf; remove --gsp-zipf-alpha "
+            "or set --gsp-group-distribution=zipf"
+        )
+
+
 class LoRAPathAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         setattr(namespace, self.dest, [])
@@ -2428,4 +2455,5 @@ if __name__ == "__main__":
         help="Custom HTTP headers in Key=Value format. Example: --header MyHeader=MY_VALUE MyAnotherHeader=myanothervalue",
     )
     args = parser.parse_args()
+    _validate_parsed_gsp_args(parser, args)
     run_benchmark(args)

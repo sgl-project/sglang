@@ -508,7 +508,8 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         return [(r.prompt, r.prompt_len, r.output_len, r.routing_key) for r in rows]
 
     def test_gsp_uniform_default_unchanged(self):
-        # AC-1: uniform mode shape + reproducibility under fixed seed.
+        # Uniform mode returns the documented number of rows and is
+        # bit-reproducible under fixed seeding of the global RNGs.
         rows_a = self._run_gsp(
             mode="uniform", num_groups=3, prompts_per_group=4, seed=7
         )
@@ -519,7 +520,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertEqual(self._row_fields(rows_a), self._row_fields(rows_b))
 
     def test_gsp_uniform_cache_path_format_unchanged(self):
-        # AC-1 / AC-6: the uniform-mode cache filename keeps the stable
+        # The uniform-mode cache filename keeps its existing
         # gen_shared_prefix_<seed>_<N>_<P>_<sysL>_<qL>_<outL>_<TokenizerCls>.pkl
         # shape. The trailing class name is a transformers/tokenizers internal
         # detail (TokenizersBackend / PreTrainedTokenizerFast depending on
@@ -538,7 +539,8 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertEqual(path.parent, Path.home() / ".cache" / "sglang" / "benchmark")
 
     def test_zipf_group_probs_helper(self):
-        # AC-3 positive: rank-based math.
+        # Rank-based probability vector: weight(rank) = 1 / rank ** alpha,
+        # normalized to sum to 1, with rank starting at 1.
         probs_n3_a1 = _zipf_group_probs(3, 1.0)
         expected_n3_a1 = np.array([6.0, 3.0, 2.0]) / 11.0
         np.testing.assert_allclose(probs_n3_a1, expected_n3_a1, atol=1e-12)
@@ -557,8 +559,8 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         )
 
     def test_zipf_group_probs_not_lora_skewed_formula(self):
-        # AC-3 negative: helper must NOT use the LoRA alpha**-i exponential
-        # formula. For alpha=1.5, N=4 the two formulas differ noticeably.
+        # The helper must NOT use the LoRA `skewed` alpha**-i exponential
+        # formula; for alpha=1.5, N=4 the two formulas differ noticeably.
         actual = _zipf_group_probs(4, 1.5)
         lora_weights = np.array([1.5**-i for i in range(4)], dtype=np.float64)
         lora_probs = lora_weights / lora_weights.sum()
@@ -568,7 +570,8 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         )
 
     def test_zipf_reproducible_with_seed(self):
-        # AC-4 positive: same seed + same args -> identical rows (incl. order).
+        # Same seed + same args -> identical rows, including order, under
+        # both the in-order and shuffled paths.
         kwargs = dict(
             mode="zipf", alpha=1.7, seed=11, num_groups=4, prompts_per_group=10
         )
@@ -583,7 +586,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertEqual(self._row_fields(rows_c), self._row_fields(rows_d))
 
     def test_zipf_different_seeds_differ(self):
-        # AC-4 negative: different seeds -> at least one differing slot.
+        # Different seeds -> at least one differing slot under Zipf sampling.
         base = dict(mode="zipf", alpha=1.7, num_groups=4, prompts_per_group=10)
         rows_a = self._run_gsp(seed=11, **base)
         rows_b = self._run_gsp(seed=12, **base)
@@ -591,8 +594,8 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertNotEqual(self._row_fields(rows_a), self._row_fields(rows_b))
 
     def test_zipf_does_not_perturb_global_random_state(self):
-        # AC-4: the Zipf branch must consume zero draws from the global random
-        # / numpy.random state. Therefore the per-slot generated questions and
+        # The Zipf branch must consume zero draws from the global random /
+        # numpy.random state. Therefore the per-slot generated questions and
         # system prompts under uniform and Zipf modes for the same args and
         # the same global seed are byte-equal.
         common = dict(
@@ -637,7 +640,9 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         )
 
     def test_zipf_deterministic_per_group_counts(self):
-        # AC-5: per-group counts are pinned for a known (N, P, alpha, seed).
+        # The per-group counts are deterministic and pinned for a known
+        # (num_groups, prompts_per_group, alpha, seed) tuple. Any drift in
+        # the Zipf sampling implementation will trip this assertion.
         rows = self._run_gsp(
             mode="zipf",
             alpha=2.0,
@@ -657,12 +662,13 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             dict(per_group),
             {0: 63, 1: 18, 2: 12, 3: 7},
         )
-        # AC-5 independent: rank-1 (hottest) strictly hotter than rank-N.
+        # Independent skew sanity check: rank-1 (hottest) > rank-N (coldest).
         self.assertGreater(per_group[0], per_group[3])
 
     def test_zipf_bypasses_cache(self):
-        # AC-6: Zipf neither reads nor writes the on-disk cache; uniform mode
-        # still reads and writes it. Patch Path.home so we control the cache.
+        # Zipf neither reads nor writes the on-disk dataset cache; uniform
+        # mode still reads and writes it. Patch Path.home so the test owns
+        # the cache directory.
         from sglang.benchmark.datasets import generated_shared_prefix as gsp_mod
 
         fake_home = self.tmpdir_path / "fakehome"
@@ -723,7 +729,9 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             )
 
     def test_zipf_total_rows_and_unique_prompts(self):
-        # AC-7: total rows match uniform; prompts are unique.
+        # Total returned row count under Zipf equals num_groups *
+        # prompts_per_group (identical to uniform mode) and every prompt
+        # string is unique even when groups repeat.
         rows = self._run_gsp(
             mode="zipf",
             alpha=2.5,
@@ -736,7 +744,8 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertEqual(len({r.prompt for r in rows}), len(rows))
 
     def test_zipf_ordered_preserves_generation_order(self):
-        # AC-8 positive: with ordered=True, output mirrors the sampled order.
+        # With ordered=True, output preserves the sampled order and matches
+        # an independently re-derived group sequence from default_rng(seed).
         rows = self._run_gsp(
             mode="zipf",
             alpha=1.5,
@@ -759,10 +768,10 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertEqual(observed_groups, expected_groups)
 
     def test_zipf_shuffle_path_matches_uniform_shuffle(self):
-        # AC-8: when ordered=False, both modes go through random.shuffle on a
-        # list of equal length, so the same global RNG seed yields the same
-        # permutation pattern. Verified indirectly: two calls with the same
-        # global seed under Zipf produce identical orderings.
+        # When ordered=False, both modes go through random.shuffle on a list
+        # of equal length, so the same global RNG seed yields the same
+        # permutation. Verified indirectly: two Zipf calls with the same
+        # global seed produce identical orderings.
         kwargs = dict(
             mode="zipf",
             alpha=1.2,
@@ -782,7 +791,8 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_finite_positive_float_validator(self):
-        # AC-2.3 (alpha-bound) at argparse-type level.
+        # The argparse-type validator accepts strictly positive finite floats
+        # and rejects zero, negatives, NaN, infinities, and unparsable input.
         for good in ["0.001", "0.5", "1.5", "10", "1e3"]:
             self.assertEqual(_finite_positive_float(good), float(good))
         for bad in ["0", "-0.5", "nan", "inf", "-inf", "abc", ""]:
@@ -790,7 +800,8 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
                 _finite_positive_float(bad)
 
     def test_from_args_zipf_requires_alpha(self):
-        # AC-2.3
+        # from_args rejects zipf-without-alpha for in-process callers that
+        # bypass the CLI entry point.
         args = make_args(
             dataset_name="generated-shared-prefix",
             gsp_group_distribution="zipf",
@@ -800,7 +811,8 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             GeneratedSharedPrefixDataset.from_args(args)
 
     def test_from_args_uniform_rejects_alpha(self):
-        # AC-2.3
+        # from_args rejects uniform-with-alpha for in-process callers that
+        # bypass the CLI entry point.
         args = make_args(
             dataset_name="generated-shared-prefix",
             gsp_group_distribution="uniform",
@@ -810,7 +822,8 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             GeneratedSharedPrefixDataset.from_args(args)
 
     def test_from_args_rejects_bad_alpha(self):
-        # AC-2.3: 0, negative, NaN, inf
+        # from_args defensively rejects bad alpha values (0, negative, NaN,
+        # ±inf) even when the CLI type validator is bypassed.
         for bad in [0.0, -0.5, float("nan"), float("inf"), float("-inf")]:
             args = make_args(
                 dataset_name="generated-shared-prefix",
@@ -830,7 +843,9 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             GeneratedSharedPrefixDataset.from_args(args)
 
     def test_bench_serving_help_and_invalid_choice_argparse(self):
-        # AC-2.1 / AC-2.2 / AC-9: subprocess-driven coverage of the live CLI.
+        # Subprocess-driven coverage of the live CLI: --help advertises both
+        # flags with the rank-based Zipf formula and the alpha constraint,
+        # and argparse rejects an unknown distribution choice.
         help_res = subprocess.run(
             [sys.executable, "-m", "sglang.bench_serving", "--help"],
             capture_output=True,
@@ -864,6 +879,76 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         )
         self.assertNotEqual(bad_choice_res.returncode, 0)
         self.assertIn("invalid choice", (bad_choice_res.stderr + bad_choice_res.stdout))
+
+    def test_bench_serving_cli_rejects_zipf_without_alpha_before_server(self):
+        # Malformed CLI combinations (zipf with no alpha) must fail at
+        # argparse time so users see the GSP-flag error directly, not a
+        # downstream connection or model-fetch failure.
+        res = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sglang.bench_serving",
+                "--dataset-name",
+                "generated-shared-prefix",
+                "--gsp-group-distribution",
+                "zipf",
+                "--ready-check-timeout-sec",
+                "0",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        # parser.error() exits with code 2 (argparse convention).
+        self.assertEqual(res.returncode, 2, res.stderr)
+        stderr = res.stderr + res.stdout
+        self.assertIn("--gsp-group-distribution", stderr)
+        self.assertIn("--gsp-zipf-alpha", stderr)
+        # The error must mention the GSP flags directly, not a network or
+        # model-discovery problem masquerading as the failure.
+        for forbidden in [
+            "HTTPConnectionPool",
+            "HTTPSConnectionPool",
+            "Connection refused",
+            "Failed to fetch model",
+            "Traceback",
+        ]:
+            self.assertNotIn(forbidden, stderr)
+
+    def test_bench_serving_cli_rejects_uniform_with_alpha_before_server(self):
+        # The complementary malformation: uniform distribution with an
+        # explicit alpha value. Must also fail at argparse time.
+        res = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sglang.bench_serving",
+                "--dataset-name",
+                "generated-shared-prefix",
+                "--gsp-group-distribution",
+                "uniform",
+                "--gsp-zipf-alpha",
+                "1.0",
+                "--ready-check-timeout-sec",
+                "0",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        self.assertEqual(res.returncode, 2, res.stderr)
+        stderr = res.stderr + res.stdout
+        self.assertIn("--gsp-group-distribution", stderr)
+        self.assertIn("--gsp-zipf-alpha", stderr)
+        for forbidden in [
+            "HTTPConnectionPool",
+            "HTTPSConnectionPool",
+            "Connection refused",
+            "Failed to fetch model",
+            "Traceback",
+        ]:
+            self.assertNotIn(forbidden, stderr)
 
 
 if __name__ == "__main__":
