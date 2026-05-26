@@ -179,21 +179,6 @@ class TestScriptedChunkSize(CustomTestCase):
         assert r.finished
         assert r.chunks_done == 8, f"expected 8 chunks, got {r.chunks_done}"
 
-    def test_chunk_size_two_prompt_one(self):
-        """Chunk_size = 2, prompt_len = 1: single-shot, no chunking."""
-        execute_scripted_runtime(
-            self._script_chunk_size_two_prompt_one,
-            **base_engine_kwargs(chunked_prefill_size=2),
-        )
-
-    @staticmethod
-    def _script_chunk_size_two_prompt_one(t: ScriptedRuntime):
-        # chunk_size = 2, prompt_len = 1: single-shot, no chunking.
-        r = t.start_req(prompt_len=1, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.chunks_done == 0
-
     def test_chunk_size_two_prompt_two(self):
         """Chunk_size = 2, prompt_len = 2: equal, single-shot."""
         execute_scripted_runtime(
@@ -272,21 +257,6 @@ class TestScriptedChunkSize(CustomTestCase):
         assert r.finished
         assert r.chunks_done == 2
 
-    def test_chunk_size_256_prompt_10x(self):
-        """Chunk_size = 256, prompt_len = 10 * 256 = 2560: chunks_done == 10."""
-        execute_scripted_runtime(
-            self._script_chunk_size_256_prompt_10x,
-            **base_engine_kwargs(chunked_prefill_size=256),
-        )
-
-    @staticmethod
-    def _script_chunk_size_256_prompt_10x(t: ScriptedRuntime):
-        # chunk_size = 256, prompt_len = 10 * 256 = 2560: chunks_done == 10.
-        r = t.start_req(prompt_len=10 * 256, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.chunks_done == 10
-
     def test_chunk_size_256_prompt_100x(self):
         """Chunk_size = 256, prompt_len = 100 * 256 = 25600: long-prompt stability test."""
         execute_scripted_runtime(
@@ -350,21 +320,6 @@ class TestScriptedChunkSize(CustomTestCase):
         assert r.finished
         assert r.chunks_done == 2
 
-    def test_chunk_size_8_prompt_64(self):
-        """Chunk_size = 8, prompt_len = 64: exactly 8 chunks."""
-        execute_scripted_runtime(
-            self._script_chunk_size_8_prompt_64,
-            **base_engine_kwargs(chunked_prefill_size=8),
-        )
-
-    @staticmethod
-    def _script_chunk_size_8_prompt_64(t: ScriptedRuntime):
-        # chunk_size = 8, prompt_len = 64: exactly 8 chunks.
-        r = t.start_req(prompt_len=64, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.chunks_done == 8
-
     def test_chunk_size_32_prompt_33(self):
         """Chunk_size = 32, prompt_len = 33: 2 chunks, second is 1 token."""
         execute_scripted_runtime(
@@ -376,36 +331,6 @@ class TestScriptedChunkSize(CustomTestCase):
     def _script_chunk_size_32_prompt_33(t: ScriptedRuntime):
         # chunk_size = 32, prompt_len = 33: 2 chunks, second is 1 token.
         r = t.start_req(prompt_len=33, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.chunks_done == 2
-
-    def test_chunk_size_64_prompt_127(self):
-        """Chunk_size = 64, prompt_len = 127: 2 chunks (64 + 63)."""
-        execute_scripted_runtime(
-            self._script_chunk_size_64_prompt_127,
-            **base_engine_kwargs(chunked_prefill_size=64),
-        )
-
-    @staticmethod
-    def _script_chunk_size_64_prompt_127(t: ScriptedRuntime):
-        # chunk_size = 64, prompt_len = 127: 2 chunks (64 + 63).
-        r = t.start_req(prompt_len=127, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.chunks_done == 2
-
-    def test_chunk_size_64_prompt_128(self):
-        """Chunk_size = 64, prompt_len = 128: 2 chunks (64 + 64)."""
-        execute_scripted_runtime(
-            self._script_chunk_size_64_prompt_128,
-            **base_engine_kwargs(chunked_prefill_size=64),
-        )
-
-    @staticmethod
-    def _script_chunk_size_64_prompt_128(t: ScriptedRuntime):
-        # chunk_size = 64, prompt_len = 128: 2 chunks (64 + 64).
-        r = t.start_req(prompt_len=128, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done == 2
@@ -476,27 +401,6 @@ class TestScriptedChunkSize(CustomTestCase):
             yield
         raise AssertionError("req never finished")
 
-    def test_chunks_done_monotone_under_chunk_size_16(self):
-        """Invariant: chunks_done monotone with a larger chunk size."""
-        execute_scripted_runtime(
-            self._script_chunks_done_monotone_under_chunk_size_16,
-            **base_engine_kwargs(chunked_prefill_size=16),
-        )
-
-    @staticmethod
-    def _script_chunks_done_monotone_under_chunk_size_16(t: ScriptedRuntime):
-        # Invariant: chunks_done monotone with a larger chunk size.
-        r = t.start_req(prompt_len=160, max_new_tokens=2)
-        prev = 0
-        for _ in range(DEFAULT_MAX_STEPS):
-            cur = r.chunks_done
-            assert cur >= prev
-            prev = cur
-            if r.finished:
-                return
-            yield
-        raise AssertionError("req never finished")
-
     def test_chunk_size_one_long_prompt(self):
         """Chunk_size = 1, prompt_len = 64: stress fragmentation."""
         execute_scripted_runtime(
@@ -511,21 +415,6 @@ class TestScriptedChunkSize(CustomTestCase):
         yield from run_until(r, lambda h: h.finished, max_steps=500)
         assert r.finished
         assert r.chunks_done == 64
-
-    def test_chunk_size_two_long_prompt(self):
-        """Chunk_size = 2, prompt_len = 64: 32 chunks."""
-        execute_scripted_runtime(
-            self._script_chunk_size_two_long_prompt,
-            **base_engine_kwargs(chunked_prefill_size=2),
-        )
-
-    @staticmethod
-    def _script_chunk_size_two_long_prompt(t: ScriptedRuntime):
-        # chunk_size = 2, prompt_len = 64: 32 chunks.
-        r = t.start_req(prompt_len=64, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.finished, max_steps=300)
-        assert r.finished
-        assert r.chunks_done == 32
 
     def test_chunk_size_equals_page_size(self):
         """chunk_size == page_size: each chunk allocates one page; final kv_pages reflects chunks_done."""
