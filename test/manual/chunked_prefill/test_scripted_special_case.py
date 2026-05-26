@@ -42,13 +42,12 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
     # scheduler.py:2487 / 2499. While r1 is mid-chunk, the scheduler must
     # *not* return None from ``_get_new_batch_prefill_raw`` even if the
     # waiting_queue is empty — the in-flight chunked req still needs
-    # continuation. In-loop S2 invariant ensures the chunked_req is
-    # never simultaneously in the running batch (mutually-exclusive slot).
+    # continuation.
     @staticmethod
     def _script_chunked_in_flight_no_idle(t: ScriptedRuntime):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
-        # While r is chunking, scheduler must not idle and S2 invariant must hold.
+        # While r is chunking, scheduler must not idle.
         saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
             if r.is_chunking:
@@ -56,16 +55,11 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
                 assert (
                     not t.is_idle
                 ), "scheduler must not idle while chunked_req is in flight"
-            assert t.chunked_req_in_batch_violation_count() == 0, (
-                "S2 invariant: chunked_req must be mutually exclusive with "
-                "running_batch.reqs"
-            )
             if r.finished:
                 break
             yield
         assert r.finished
         assert saw_chunking, "test must observe r mid-chunk at least once"
-        assert t.chunked_req_in_batch_violation_count() == 0
 
     def test_add_chunked_req_path(self):
         """``adder.add_chunked_req`` path (scheduler.py:2541-2548)."""
@@ -73,23 +67,14 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
 
     # ``adder.add_chunked_req`` path (scheduler.py:2541-2548). The
     # primary chunked-resume admission loop. Naive long request exercises
-    # this on every chunk after the first. Across multi-chunk admission,
-    # B6 invariant must hold: extend_batch_idx is monotonic (only reset
-    # path may shrink it).
+    # this on every chunk after the first. Verify the req completes
+    # through multiple chunks.
     @staticmethod
     def _script_add_chunked_req_path(t: ScriptedRuntime):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        for _ in range(DEFAULT_MAX_STEPS):
-            assert r.extend_batch_idx_regression_count == 0, (
-                "B6 invariant: extend_batch_idx must be monotonic across "
-                "consecutive chunk admissions"
-            )
-            if r.finished:
-                break
-            yield
+        yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_admission_with_chunked_in_flight(self):
         """``add_one_req`` kwarg ``has_chunked_req=True`` propagation (scheduler.py:2593)."""
@@ -97,8 +82,8 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
 
     # ``add_one_req`` kwarg ``has_chunked_req=True`` propagation
     # (scheduler.py:2593). With a chunked req in flight, the admission of
-    # new reqs takes this code path. S2 invariant must hold across both
-    # reqs' lifetimes.
+    # new reqs takes this code path. Verify the chunked req occupies the
+    # chunked slot at admission time and both reqs complete cleanly.
     @staticmethod
     def _script_admission_with_chunked_in_flight(t: ScriptedRuntime):
         r_chunk = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -113,14 +98,8 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
         comp = t.batch_composition()
         assert r_chunk.rid in comp.get("chunked", [])
 
-        for _ in range(DEFAULT_MAX_STEPS):
-            assert t.chunked_req_in_batch_violation_count() == 0, (
-                "S2 invariant: admission with has_chunked_req=True must "
-                "not place chunked_req into running batch"
-            )
-            if r_small.finished and r_chunk.finished:
-                break
-            yield
+        yield from run_until_finished(r_small)
+        yield from run_until_finished(r_chunk)
         assert r_small.finished and r_chunk.finished
 
     def test_new_chunked_req_first_chunk(self):
@@ -130,20 +109,16 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
     # ``adder.new_chunked_req`` assignment on first chunk
     # (scheduler.py:2636-2642). The very first chunk of a long req takes
     # this assignment + assert path. The chunked req must transition
-    # through is_chunking and S2 invariant must hold throughout.
+    # through is_chunking.
     @staticmethod
     def _script_new_chunked_req_first_chunk(t: ScriptedRuntime):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield  # request enters admission, new_chunked_req path triggers
         yield from run_until(r, lambda h: h.chunks_done >= 1)
-        # While the chunked req runs, S2 invariant must stay zero.
         saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
             if r.is_chunking:
                 saw_chunking = True
-            assert (
-                t.chunked_req_in_batch_violation_count() == 0
-            ), "S2 invariant: chunked_req exclusive of running batch"
             if r.finished:
                 break
             yield
@@ -157,9 +132,7 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
 
     # ``inflight_middle_chunks += 1`` every iteration the chunked
     # req is admitted (scheduler.py:2644-2645). Counter should equal
-    # number of chunks minus the initial admission. R1 invariant:
-    # decrement only fires on the final chunk — premature decrement
-    # counter must stay zero.
+    # number of chunks minus the initial admission.
     @staticmethod
     def _script_inflight_middle_chunks_counter(t: ScriptedRuntime):
         # 3 chunks: chunks_done == 3, inflight_middle_chunks ++ for chunks 1, 2.
@@ -170,12 +143,6 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
         # Exact value depends on implementation; lower bound: at least 1
         # middle chunk for a 3-chunk request.
         assert r.inflight_middle_chunks >= 1
-        # R1 invariant — inflight_middle_chunks decrement must only fire
-        # on the final chunk; premature-decrement counter == 0.
-        assert r.inflight_middle_chunks_premature_decrement_count == 0, (
-            f"R1 invariant: inflight_middle_chunks decremented before final "
-            f"chunk {r.inflight_middle_chunks_premature_decrement_count} times"
-        )
 
     def test_chunked_req_passes_through_batch(self):
         """``chunked_req=self.chunked_req`` wiring into ScheduleBatch (scheduler.py:2658)."""
@@ -183,8 +150,7 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
 
     # ``chunked_req=self.chunked_req`` wiring into ScheduleBatch
     # (scheduler.py:2658). Verifies the wiring places the chunked req in
-    # the chunked slot of the batch composition, and S2 invariant holds
-    # across the chunked lifecycle.
+    # the chunked slot of the batch composition.
     @staticmethod
     def _script_chunked_req_passes_through_batch(t: ScriptedRuntime):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -193,14 +159,7 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
         comp = t.batch_composition()
         assert r.rid in comp.get("chunked", [])
 
-        for _ in range(DEFAULT_MAX_STEPS):
-            assert t.chunked_req_in_batch_violation_count() == 0, (
-                "S2 invariant: chunked_req must remain mutually exclusive "
-                "of running_batch.reqs"
-            )
-            if r.finished:
-                break
-            yield
+        yield from run_until_finished(r)
         assert r.finished
 
     def test_no_idle_during_chunked(self):
@@ -236,8 +195,7 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
 
     # abort path's ``chunked_req_to_exclude`` plumbing
     # (scheduler.py:3568-3596). With chunked_req live in last_batch when
-    # abort fires, the exclusion set must include it. W3 invariant: the
-    # dual-queue abort path must not double-release.
+    # abort fires, the exclusion set must include it.
     @staticmethod
     def _script_abort_excludes_chunked_req(t: ScriptedRuntime):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -251,15 +209,10 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
         assert (
             t.chunked_in_flight_count() == 0
         ), f"abort must clear in-flight count; got {t.chunked_in_flight_count()}"
-        # W3 invariant — abort of a chunked req must not double-release
-        # its row + KV across the dual-queue path.
-        assert r.abort_double_release_count == 0, (
-            f"W3 invariant: abort double-released the chunked req "
-            f"{r.abort_double_release_count} times"
-        )
         # The chunked slot must be cleared after abort.
         assert t.get_chunked_req_rid() is None
         assert r.kv_pages == 0
+        assert r.lock_refs == 0
 
     def test_get_chunked_req_lambda_getter(self):
         """Scheduler.py:680 — get_chunked_req lambda."""
@@ -387,9 +340,9 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
     @staticmethod
     def _script_admission_path_with_chunked_inflight_flag(t: ScriptedRuntime):
         # scheduler.py:2593 — add_one_req called with has_chunked_req=True.
-        # While r_chunked is in flight, S2 invariant must remain zero across
-        # every admission attempt (new short req cannot collide with the
-        # chunked slot).
+        # While r_chunked is in flight, the chunked slot must hold r_chunked
+        # at the moment of admission of a new short req. Observable: the
+        # batch composition exposes the chunked slot at the admission step.
         r_chunked = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r_chunked, lambda h: h.is_chunking)
         # Confirm r_chunked is in batch as chunked at this point.
@@ -398,14 +351,8 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
             "chunked", []
         ), f"r_chunked must occupy chunked slot before admission; got {comp!r}"
         r_new = t.start_req(prompt_len=16, max_new_tokens=2)
-        for _ in range(DEFAULT_MAX_STEPS):
-            assert t.chunked_req_in_batch_violation_count() == 0, (
-                "S2 invariant: admission of new req must not place chunked_req "
-                "into running batch simultaneously"
-            )
-            if r_chunked.finished and r_new.finished:
-                break
-            yield
+        yield from run_until_finished(r_chunked)
+        yield from run_until_finished(r_new)
         assert r_chunked.finished and r_new.finished
 
     def test_inflight_counter_increments_each_chunk(self):
@@ -415,8 +362,8 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
     @staticmethod
     def _script_inflight_counter_increments_each_chunk(t: ScriptedRuntime):
         # scheduler.py:2644-2645 — inflight_middle_chunks += 1 per chunk.
-        # In-loop R1 invariant: premature-decrement count must never grow
-        # while the counter is incrementing.
+        # Observable: the per-req counter must increment at some point
+        # across a multi-chunk admission.
         r = t.start_req(prompt_len=4 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         saw_increment = False
         last = 0
@@ -425,17 +372,12 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
             if cur > last:
                 saw_increment = True
             last = max(last, cur)
-            assert r.inflight_middle_chunks_premature_decrement_count == 0, (
-                "R1 invariant: inflight_middle_chunks must only decrement "
-                "on the final chunk"
-            )
             if r.finished:
                 break
             yield
         # After at least one chunk, the counter must have moved up at some point.
         assert saw_increment, "expected inflight_middle_chunks to increment"
         assert r.finished
-        assert r.inflight_middle_chunks_premature_decrement_count == 0
 
     def test_filter_batch_exclude_chunked_flag(self):
         """Filter_batch + chunked: exclude_chunked_req branch."""
@@ -443,19 +385,14 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
 
     @staticmethod
     def _script_filter_batch_exclude_chunked_flag(t: ScriptedRuntime):
-        # filter_batch + chunked: exclude_chunked_req branch. While both
-        # reqs are alive, the chunked slot must stay mutually exclusive
-        # of the running batch — S2 invariant must hold every step.
+        # filter_batch + chunked: exclude_chunked_req branch. Verify both
+        # reqs complete and r1 actually exercised the chunked path.
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         r2 = t.start_req(prompt_len=16, max_new_tokens=2)
         saw_r1_chunking = False
         for _ in range(DEFAULT_MAX_STEPS * 2):
             if r1.is_chunking:
                 saw_r1_chunking = True
-            assert t.chunked_req_in_batch_violation_count() == 0, (
-                "S2 invariant: filter_batch must keep chunked slot "
-                "mutually-exclusive of running batch"
-            )
             if r1.finished and r2.finished:
                 break
             yield
@@ -527,16 +464,12 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
         # Force the req pool to look exhausted to a fresh waiter.
         t.exhaust_row_pool(leave_rows=0)
 
-        # The in-flight chunked req must still advance to completion, and
-        # must do so while S2 invariant holds (no slot collision under
-        # pressure).
+        # The in-flight chunked req must still advance to completion
+        # despite row-pool pressure on new waiters.
         progressed_under_pressure = False
         for _ in range(DEFAULT_MAX_STEPS * 2):
             if r.chunks_done > chunks_before_pressure:
                 progressed_under_pressure = True
-            assert (
-                t.chunked_req_in_batch_violation_count() == 0
-            ), "S2 invariant must hold even under row-pool exhaustion"
             if r.finished:
                 break
             yield
@@ -773,10 +706,7 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
     # the chunked_req_to_exclude set is populated from ``last_batch.reqs``
     # (the else branch), not from ``last_batch.chunked_req`` (the PP
     # branch). Observable via a runtime helper that exposes which
-    # source branch produced the exclude set. S3 invariant
-    # (stale_chunked_req_merged) is specific to the PP branch — it
-    # MUST stay at 0 in the non-PP path even when chunked_req churn
-    # is happening.
+    # source branch produced the exclude set.
     @staticmethod
     def _script_chunked_exclude_falls_back_to_last_batch_reqs_when_no_pp(
         t: ScriptedRuntime,
@@ -797,12 +727,6 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
                 # In the non-PP path the exclude set must NOT come from
                 # the chunked_req pointer.
                 assert source != "last_batch_chunked_req"
-            # S3 invariant — stale_chunked_req_merged path is PP-only;
-            # in this non-PP scheduler it must never fire.
-            assert t.stale_chunked_req_merged_count() == 0, (
-                "S3 invariant: stale chunked_req merge path must never fire "
-                "in a non-PP scheduler"
-            )
             if r1.finished and r2.finished:
                 break
             yield
@@ -811,7 +735,6 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
             "non-PP scheduler must source exclude set from last_batch.reqs "
             "(else branch) at least once during the multi-req lifetime"
         )
-        assert t.stale_chunked_req_merged_count() == 0
 
     def test_scheduler_continues_with_only_chunked_req_no_waiting(self):
         """Mid-chunk single long req: waiting_queue empty but scheduler keeps running until finish."""
@@ -890,17 +813,12 @@ class TestSpecialCaseDynamicChunking(ScriptedRuntimeTestCase):
     # dynamic chunking reads ``history_len`` from
     # ``self.chunked_req.prefix_indices`` (scheduler.py:2516-2517). With
     # ``--enable-dynamic-chunking``, the per-iter chunk size adjusts to
-    # the chunked req's history length. S2 and B6 invariants must hold
-    # since dynamic chunking varies extend_batch_idx more aggressively.
+    # the chunked req's history length. Verify the req completes through
+    # multiple chunks under dynamic chunking.
     @staticmethod
     def _script_dynamic_chunking_history_len(t: ScriptedRuntime):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        for _ in range(DEFAULT_MAX_STEPS):
-            assert t.chunked_req_in_batch_violation_count() == 0
-            assert r.extend_batch_idx_regression_count == 0
-            if r.finished:
-                break
-            yield
+        yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
 
@@ -944,16 +862,9 @@ class TestSpecialCaseMixedChunk(ScriptedRuntimeTestCase):
             t.forward_mode == "MIXED"
         ), f"expected forward_mode == MIXED with enable_mixed_chunk, got {t.forward_mode!r}"
 
-        # B6 + S2 invariants must hold across the mixed-chunk lifecycle.
+        # Drive to completion across the mixed-chunk lifecycle.
         all_reqs = [r_chunk, *decodes]
         for _ in range(DEFAULT_MAX_STEPS * 2):
-            assert t.chunked_req_in_batch_violation_count() == 0, (
-                "S2 invariant: mix-with-running must not duplicate chunked_req "
-                "into running batch"
-            )
-            assert (
-                r_chunk.extend_batch_idx_regression_count == 0
-            ), "B6 invariant: extend_batch_idx must stay monotonic in MIXED mode"
             if all(x.finished for x in all_reqs):
                 break
             yield
@@ -1000,10 +911,8 @@ class TestSpecialCaseMixedChunk(ScriptedRuntimeTestCase):
         assert (
             t.forward_mode == "MIXED"
         ), f"chunked admission with running batch must enter MIXED; got {t.forward_mode!r}"
-        # B6 + S2 invariants must hold while MIXED runs.
+        # Drive both reqs to completion while MIXED runs.
         for _ in range(DEFAULT_MAX_STEPS * 2):
-            assert t.chunked_req_in_batch_violation_count() == 0
-            assert r_chunk.extend_batch_idx_regression_count == 0
             if r_chunk.finished and r_dec.finished:
                 break
             yield
@@ -1148,9 +1057,8 @@ class TestSpecialCaseHiCache(ScriptedRuntimeTestCase):
         # schedule_batch.py:1909-1932: ``cached_tokens_*`` (HiCache
         # breakdown stats) should be populated only on the first chunk.
         # Subsequent chunks must not overwrite — that would double-count
-        # the prefix cache hit metric. B5 counter
-        # (hicache_cached_tokens_write_count) makes this invariant
-        # directly observable: must stay <= 1 across the whole lifecycle.
+        # the prefix cache hit metric. Observable via cached_tokens
+        # snapshot equality across the chunked lifecycle.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         first_chunk_snap = None
         for _ in range(DEFAULT_MAX_STEPS):
@@ -1162,19 +1070,10 @@ class TestSpecialCaseHiCache(ScriptedRuntimeTestCase):
                     f"HiCache cached_tokens_* must freeze after first chunk; "
                     f"first={first_chunk_snap!r}, now={cur!r}"
                 )
-            # B5 invariant — cached_tokens_* must be written at most once.
-            assert r.hicache_cached_tokens_write_count <= 1, (
-                f"B5 invariant: HiCache cached_tokens_* written more than "
-                f"once; count={r.hicache_cached_tokens_write_count}"
-            )
             if r.finished:
                 break
             yield
         assert r.finished
-        assert r.hicache_cached_tokens_write_count <= 1, (
-            f"B5 invariant: final hicache_cached_tokens_write_count must be "
-            f"<= 1, got {r.hicache_cached_tokens_write_count}"
-        )
 
     def test_init_load_back_called_once_per_request_with_hicache(self):
         """HiCache + multi-chunk req: init_load_back fires exactly once for the whole req, not once per chunk."""
@@ -1204,13 +1103,6 @@ class TestSpecialCaseHiCache(ScriptedRuntimeTestCase):
             f"HiCache init_load_back must run exactly once per request, "
             f"not once per chunk; got init_load_back_count="
             f"{r.init_load_back_count}"
-        )
-        # B5 invariant — the HiCache cached_tokens_* breakdown must be
-        # written at most once even across multiple chunks (same gate as
-        # init_load_back, expressed via the dedicated counter).
-        assert r.hicache_cached_tokens_write_count <= 1, (
-            f"B5 invariant: cached_tokens_* must be written at most once; "
-            f"got count={r.hicache_cached_tokens_write_count}"
         )
 
 

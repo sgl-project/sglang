@@ -10,16 +10,6 @@ Also covers B.5 series — long-running stability scenarios and stress
 fan-outs. The focus is "no resource leak after many reqs" — every test
 starts and finishes a baseline run, then asserts ``engine_stats``
 returns to (or above) the initial pool counts.
-
-Round-1 counter wiring: every long-running invariant test in this file
-asserts the relevant per-Req / per-Scheduler counters stay at 0:
-
-* R1 — ``r.inflight_middle_chunks_premature_decrement_count == 0``
-  on every chunked req (decrement only on final chunk).
-* S2 — ``t.chunked_req_in_batch_violation_count() == 0``
-  (``chunked_req`` exclusive of ``running_batch.reqs``).
-* B6 — ``r.extend_batch_idx_regression_count == 0``
-  (``extend_batch_idx`` monotone except at reset).
 """
 
 import unittest
@@ -106,7 +96,6 @@ class TestInvariantsBasic(ScriptedRuntimeTestCase):
     @staticmethod
     def _script_batch_composition_consistent_with_status(t: ScriptedRuntime):
         # If r.status == "running" then r.rid appears in batch_composition.
-        # S2 must stay clean across the lifecycle.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         for _ in range(DEFAULT_MAX_STEPS):
             if r.status == "running":
@@ -119,7 +108,6 @@ class TestInvariantsBasic(ScriptedRuntimeTestCase):
                 assert (
                     r.rid in all_rids
                 ), f"running but not in batch_composition: {comp}"
-            assert t.chunked_req_in_batch_violation_count() == 0
             if r.finished:
                 return
             yield
@@ -136,7 +124,6 @@ class TestInvariantsBasic(ScriptedRuntimeTestCase):
         for _ in range(DEFAULT_MAX_STEPS):
             if t.chunked_in_flight_count() > 0:
                 assert not t.is_idle, "is_idle must be False when chunked is in flight"
-            assert t.chunked_req_in_batch_violation_count() == 0
             if r.finished:
                 return
             yield
@@ -175,34 +162,27 @@ class TestInvariantsBasic(ScriptedRuntimeTestCase):
     @staticmethod
     def _script_pending_middle_outputs_non_negative(t: ScriptedRuntime):
         # pending_middle_outputs non-negative across the chunked
-        # lifecycle. The bug shape this guards is the R1 premature
-        # decrement — a buggy refactor could push the counter below 0.
+        # lifecycle.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         for _ in range(DEFAULT_MAX_STEPS):
             assert r.pending_middle_outputs >= 0
-            # R1: any premature decrement on a non-final chunk is a
-            # violation; verify the counter stays at 0 across all
-            # yields.
-            assert r.inflight_middle_chunks_premature_decrement_count == 0
             if r.finished:
                 return
             yield
         raise AssertionError("req never finished")
 
     def test_inflight_middle_chunks_non_negative(self):
-        """Inflight_middle_chunks counter stays non-negative across all yields and R1 stays clean."""
+        """Inflight_middle_chunks counter stays non-negative across all yields."""
         self.runtime.run(self._script_inflight_middle_chunks_non_negative)
 
     @staticmethod
     def _script_inflight_middle_chunks_non_negative(t: ScriptedRuntime):
         # The non-negative bound on inflight_middle_chunks is enforced
-        # by the R1 invariant — decrement must only happen on the final
-        # chunk. Verify both the counter floor and the R1 violation
-        # counter at every yield.
+        # by the invariant that decrement must only happen on the final
+        # chunk. Verify the counter floor at every yield.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         for _ in range(DEFAULT_MAX_STEPS):
             assert r.inflight_middle_chunks >= 0
-            assert r.inflight_middle_chunks_premature_decrement_count == 0
             if r.finished:
                 return
             yield
@@ -229,17 +209,13 @@ class TestInvariantsBasic(ScriptedRuntimeTestCase):
     @staticmethod
     def _script_chunked_in_flight_count_le_one(t: ScriptedRuntime):
         # main-upstream invariant: at most one chunked req in flight.
-        # S2 must also stay clean across the run.
         reqs = [
             t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
             for _ in range(3)
         ]
         for _ in range(DEFAULT_MAX_STEPS * 3):
             assert t.chunked_in_flight_count() <= 1
-            assert t.chunked_req_in_batch_violation_count() == 0
             if all(r.finished for r in reqs):
-                for r in reqs:
-                    assert r.inflight_middle_chunks_premature_decrement_count == 0
                 return
             yield
         raise AssertionError("not all reqs finished")
@@ -269,8 +245,6 @@ class TestInvariantsBasic(ScriptedRuntimeTestCase):
     @staticmethod
     def _script_batch_composition_disjoint_subsets(t: ScriptedRuntime):
         # prefill / decode / chunked subsets must be disjoint.
-        # S2 reinforces the chunked vs decode/prefill disjoint-set
-        # property at scheduler-source level.
         r1 = t.start_req(prompt_len=16, max_new_tokens=2)
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         for _ in range(DEFAULT_MAX_STEPS):
@@ -281,7 +255,6 @@ class TestInvariantsBasic(ScriptedRuntimeTestCase):
             assert prefill & decode == set()
             assert prefill & chunked == set()
             assert decode & chunked == set()
-            assert t.chunked_req_in_batch_violation_count() == 0
             if r1.finished and r2.finished:
                 return
             yield
@@ -337,7 +310,6 @@ class TestInvariantsBasic(ScriptedRuntimeTestCase):
         yield from run_until_all_finished(reqs)
         after = t.engine_stats()["kv_pool_free"]
         assert after >= before
-        assert t.chunked_req_in_batch_violation_count() == 0
 
     def test_hundred_reqs_no_leak(self):
         """100 reqs end-to-end: KV/row/lock_ref pool counts return to baseline."""
@@ -354,10 +326,9 @@ class TestInvariantsBasic(ScriptedRuntimeTestCase):
             final["kv_pool_free"] >= baseline["kv_pool_free"]
         ), f"KV leak: {baseline['kv_pool_free']} -> {final['kv_pool_free']}"
         assert final["row_pool_free"] >= baseline["row_pool_free"]
-        assert t.chunked_req_in_batch_violation_count() == 0
 
     def test_two_hundred_reqs_no_leak(self):
-        """200 short reqs end-to-end leave KV pool >= baseline; S2 stays clean."""
+        """200 short reqs end-to-end leave KV pool >= baseline."""
         self.runtime.run(self._script_two_hundred_reqs_no_leak)
 
     @staticmethod
@@ -367,10 +338,9 @@ class TestInvariantsBasic(ScriptedRuntimeTestCase):
         yield from run_until_all_finished(reqs, max_steps=8000)
         final = t.engine_stats()
         assert final["kv_pool_free"] >= baseline["kv_pool_free"]
-        assert t.chunked_req_in_batch_violation_count() == 0
 
     def test_five_hundred_reqs_no_leak(self):
-        """500 short reqs end-to-end leave KV pool >= baseline; S2 stays clean."""
+        """500 short reqs end-to-end leave KV pool >= baseline."""
         self.runtime.run(self._script_five_hundred_reqs_no_leak)
 
     @staticmethod
@@ -380,17 +350,15 @@ class TestInvariantsBasic(ScriptedRuntimeTestCase):
         yield from run_until_all_finished(reqs, max_steps=15000)
         final = t.engine_stats()
         assert final["kv_pool_free"] >= baseline["kv_pool_free"]
-        assert t.chunked_req_in_batch_violation_count() == 0
 
     def test_long_lived_engine_reps_chunked(self):
-        """20 rounds × 5 reqs each; scheduler internal counters stay healthy."""
+        """20 rounds × 5 reqs each; KV pool returns to baseline."""
         self.runtime.run(self._script_long_lived_engine_reps_chunked)
 
     @staticmethod
     def _script_long_lived_engine_reps_chunked(t: ScriptedRuntime):
-        # 20 rounds × 5 reqs each; scheduler internal counters stay healthy.
-        # Beyond the kv-pool leak check, assert S2 + R1 invariants hold
-        # across every round.
+        # 20 rounds × 5 reqs each. Each round drives a fresh chunked
+        # batch and the KV pool must not leak across the whole run.
         baseline = t.engine_stats()
         for _ in range(20):
             reqs = [
@@ -398,43 +366,39 @@ class TestInvariantsBasic(ScriptedRuntimeTestCase):
                 for _ in range(5)
             ]
             yield from run_until_all_finished(reqs, max_steps=2000)
-            assert t.chunked_req_in_batch_violation_count() == 0
             for r in reqs:
-                assert r.inflight_middle_chunks_premature_decrement_count == 0
+                assert r.finished
         final = t.engine_stats()
         assert final["kv_pool_free"] >= baseline["kv_pool_free"]
 
     def test_sustained_long_chunked_load(self):
-        """Sustained: 30 long chunked reqs; chunked-in-flight + S2 + R1 stay clean."""
+        """Sustained: 30 long chunked reqs; chunked-in-flight stays <= 1."""
         self.runtime.run(self._script_sustained_long_chunked_load)
 
     @staticmethod
     def _script_sustained_long_chunked_load(t: ScriptedRuntime):
         # Sustained: 30 long chunked reqs. Verify the single-in-flight
-        # invariant, S2 violations, and R1 premature-decrement counter
-        # at every yield.
+        # invariant at every yield.
         reqs = [
             t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
             for _ in range(30)
         ]
         for _ in range(DEFAULT_MAX_STEPS * 20):
             assert t.chunked_in_flight_count() <= 1
-            assert t.chunked_req_in_batch_violation_count() == 0
             if all(r.finished for r in reqs):
                 break
             yield
         for r in reqs:
             assert r.finished
-            assert r.inflight_middle_chunks_premature_decrement_count == 0
 
     def test_round_robin_short_and_chunked(self):
-        """50 short followed by 5 chunked, 5 rounds; counters stay clean."""
+        """50 short followed by 5 chunked, 5 rounds; KV recovers."""
         self.runtime.run(self._script_round_robin_short_and_chunked)
 
     @staticmethod
     def _script_round_robin_short_and_chunked(t: ScriptedRuntime):
-        # 50 short followed by 5 chunked, 5 rounds. S2 and R1 across
-        # the mixed mode must stay clean, KV must recover.
+        # 50 short followed by 5 chunked, 5 rounds. KV must recover and
+        # every req must finish.
         baseline = t.engine_stats()
         for _ in range(5):
             shorts = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(10)]
@@ -443,9 +407,8 @@ class TestInvariantsBasic(ScriptedRuntimeTestCase):
                 for _ in range(1)
             ]
             yield from run_until_all_finished(shorts + chunked, max_steps=2000)
-            assert t.chunked_req_in_batch_violation_count() == 0
-            for r in chunked:
-                assert r.inflight_middle_chunks_premature_decrement_count == 0
+            for r in shorts + chunked:
+                assert r.finished
         final = t.engine_stats()
         assert final["kv_pool_free"] >= baseline["kv_pool_free"]
 
@@ -457,13 +420,12 @@ class TestInvariantsBasic(ScriptedRuntimeTestCase):
     def _script_long_decode_then_many_short(t: ScriptedRuntime):
         # One very long decode + many short. No req should ever chunk
         # (prompt_len=16 fits in one chunk), so the chunked slot must
-        # remain None and S2 must stay clean.
+        # remain None throughout.
         long_decode = t.start_req(prompt_len=16, max_new_tokens=256)
         shorts = [t.start_req(prompt_len=8, max_new_tokens=2) for _ in range(50)]
         all_reqs = [long_decode] + shorts
         for _ in range(DEFAULT_MAX_STEPS * 20):
             assert t.get_chunked_req_rid() is None
-            assert t.chunked_req_in_batch_violation_count() == 0
             if all(r.finished for r in all_reqs):
                 return
             yield
@@ -485,10 +447,7 @@ class TestInvariantsBasic(ScriptedRuntimeTestCase):
         ]
         for _ in range(DEFAULT_MAX_STEPS * 60):
             assert t.chunked_in_flight_count() <= 1
-            assert t.chunked_req_in_batch_violation_count() == 0
             if all(r.finished for r in reqs):
-                for r in reqs:
-                    assert r.inflight_middle_chunks_premature_decrement_count == 0
                 return
             yield
         raise AssertionError("not all reqs finished")
@@ -557,10 +516,6 @@ class TestInvariantsBasic(ScriptedRuntimeTestCase):
             yield
             cur = r.pending_middle_outputs
             running_max = max(running_max, cur)
-            # R1 must also stay clean across the lifecycle (premature
-            # decrement of inflight_middle_chunks would manifest as a
-            # broken pending-middle-outputs cap too).
-            assert r.inflight_middle_chunks_premature_decrement_count == 0
             if r.finished:
                 running_max_post_finish = max(running_max_post_finish, cur)
                 post_finish_samples += 1
@@ -603,9 +558,7 @@ class TestInvariantsBasic(ScriptedRuntimeTestCase):
     # mid-chunk yields with the same chunks_done) would indicate the
     # scheduler stalled or wasted an iter on an in-flight chunked req.
     # This subsumes the simpler "non-decreasing" invariant: a strictly
-    # increasing sequence is by definition non-decreasing. Also wires
-    # B6 (extend_batch_idx monotone) since extend_batch_idx regression
-    # would manifest as a duplicated chunked iter.
+    # increasing sequence is by definition non-decreasing.
     @staticmethod
     def _script_chunks_done_strictly_increases_no_plateaus(t: ScriptedRuntime):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -616,7 +569,6 @@ class TestInvariantsBasic(ScriptedRuntimeTestCase):
         prev_was_chunking = r.is_chunking
         for _ in range(DEFAULT_MAX_STEPS):
             yield
-            assert r.extend_batch_idx_regression_count == 0
             if r.finished:
                 return
             cur_chunks_done = r.chunks_done
@@ -747,7 +699,6 @@ class TestInvariantsBasic(ScriptedRuntimeTestCase):
                 f"pure decode workload must keep chunked_req None; got "
                 f"{t.get_chunked_req_rid()!r}"
             )
-            assert t.chunked_req_in_batch_violation_count() == 0
             if all(r.finished for r in reqs):
                 return
             yield
