@@ -21,10 +21,11 @@ Implemented:
   separate HF-style PyTorch reference module with copied random weights and no
   `RadixAttention` or backend calls.
 - GDN hybrid-linear attention backend correctness exists under
-  `test/manual/attention/unittest/gdn/` for full-attention backend `triton` with
-  linear-attention kernel backend `triton`; its expected path is now a separate
-  reference module plus pure PyTorch gated-delta recurrence, not the Triton/FLA
-  GDN kernels.
+  `test/manual/attention/unittest/gdn/` for full-attention backends `triton` and
+  `flashinfer` with linear-attention kernel backend `triton`; its expected path is
+  now a separate reference module plus pure PyTorch gated-delta recurrence, not the
+  Triton/FLA GDN kernels. The FlashInfer GDN file uses 64-dim heads to satisfy
+  FlashInfer SM90 prefill kernel constraints.
 - Phase 3 dense runner integration is implemented for representative attention
   backends: eager mode for `torch_native`, and CUDA-graph metadata capture/replay
   decode mode for `triton` and `flashinfer`. Runner coverage now includes MHA,
@@ -32,15 +33,15 @@ Implemented:
   decode batch and replay distinct request metadata/input tensors, so capture data
   is not identical to forward data.
 - Phase 3 CUDA graph decode replay now also covers SWA for `triton` and
-  `flashinfer`, plus GDN for `triton`. The SWA graph cases currently use decode
-  lengths within the configured window; an above-window Triton SWA decode case
-  exposes a backend/reference semantic mismatch before graph replay and should be
-  investigated separately from runner coverage.
+  `flashinfer`, plus GDN for `triton` and `flashinfer`. The SWA graph cases
+  currently use decode lengths within the configured window; an above-window Triton
+  SWA decode case exposes a backend/reference semantic mismatch before graph replay
+  and should be investigated separately from runner coverage.
 - Phase 3 PCG/BCG split-op replay now covers representative dense MHA/GQA
   extend for `triton`, `flashinfer`, `fa3`, `fa4`, and `flex_attention`, plus SWA
-  extend, MLA extend, and GDN extend paths. These tests use live backend metadata
-  with a larger static token buffer to verify `num_token_non_padded_cpu` slicing,
-  not just exact-shape eager behavior.
+  extend, MLA extend, and GDN extend paths for both `triton` and `flashinfer`.
+  These tests use live backend metadata with a larger static token buffer to verify
+  `num_token_non_padded_cpu` slicing, not just exact-shape eager behavior.
 - MLA split-op coverage exercises the absorb-MLA cached-KV path where
   `RadixAttention` receives `k/v=None`; the split-op wrapper now preserves that
   contract instead of assuming materialized K/V tensors.
@@ -139,6 +140,10 @@ Next implementation steps:
 
 Latest verification:
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+  - Ran 39 tests in 21.608s after adding GDN FlashInfer coverage.
+- `python -m py_compile test/manual/attention/unittest/gdn/test_flashinfer.py`
+- `python test/manual/attention/unittest/gdn/test_flashinfer.py -v`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
   - Ran 36 tests in 21.417s after adding FlashInfer draft-extend CUDA-graph-style replay.
 - `python -m py_compile test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/common/spec_runner.py test/manual/attention/unittest/dense/test_flashinfer.py`
 - `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
@@ -219,6 +224,7 @@ test/manual/attention/unittest/
     test_trtllm_mla.py
   gdn/
     test_triton.py
+    test_flashinfer.py
 ```
 
 Each `test_<attn_backend>.py` file verifies one attention method against one
