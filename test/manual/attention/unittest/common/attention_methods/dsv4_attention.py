@@ -429,113 +429,14 @@ def _write_swa_cache(
     )
 
 
-def _unpack_packed_kv_at_locs(
-    buf: torch.Tensor,
-    page_size: int,
-    locs: torch.Tensor,
-) -> torch.Tensor:
-    """Unpack the production packed FP8-nope + BF16-rope + UE8M0-scale layout
-    from a single sub-pool's kv_buffer at the given flat locs.
-
-    `buf` is `[num_pages, bytes_per_page]` (the padded page bytes layout used
-    by `DeepSeekV4SingleKVPool.create_buffer`). `locs[i] = page_idx * page_size
-    + tok_in_page` selects one slot per request token. Returns
-    `[num_locs, DSV4_HEAD_DIM]` bfloat16.
-
-    Both the SWA pool and the C4 / C128 extra pools use the same layout,
-    differing only in `page_size` and the resulting `bytes_per_page`.
-    """
-    num_pages, bytes_per_page = buf.shape
-
-    nope_dim = DSV4_QK_NOPE_HEAD_DIM
-    rope_dim = DSV4_QK_ROPE_HEAD_DIM
-    nope_rope_bytes = nope_dim + rope_dim * 2  # 448 + 128 = 576
-    s_offset_nbytes_in_page = page_size * nope_rope_bytes
-    scale_dim = nope_dim // 64  # 7 tiles of 64 elems
-    padded_scale = scale_dim + 1  # 8 bytes/token incl. pad
-
-    fp8_dtype = torch.float8_e4m3fn
-    buf_fp8 = buf.view(fp8_dtype)
-    buf_bf16 = buf.view(torch.bfloat16)
-    buf_u8 = buf.view(torch.uint8)
-
-    locs64 = locs.to(torch.int64)
-    num_locs = locs64.shape[0]
-    device = buf.device
-
-    page_idx = locs64 // page_size
-    tok_in_page = locs64 % page_size
-
-    nope_byte_base = page_idx * bytes_per_page + tok_in_page * nope_rope_bytes
-    nope_byte_offsets = nope_byte_base.unsqueeze(1) + torch.arange(
-        nope_dim, device=device, dtype=torch.int64
-    ).unsqueeze(0)
-    nope_fp8 = buf_fp8.flatten()[nope_byte_offsets.flatten()].view(num_locs, nope_dim)
-
-    rope_bf16_base = (
-        page_idx * (bytes_per_page // 2)
-        + tok_in_page * (nope_rope_bytes // 2)
-        + (nope_dim // 2)
-    )
-    rope_bf16_offsets = rope_bf16_base.unsqueeze(1) + torch.arange(
-        rope_dim, device=device, dtype=torch.int64
-    ).unsqueeze(0)
-    rope_bf16 = buf_bf16.flatten()[rope_bf16_offsets.flatten()].view(num_locs, rope_dim)
-
-    scale_byte_base = (
-        page_idx * bytes_per_page + s_offset_nbytes_in_page + tok_in_page * padded_scale
-    )
-    scale_byte_offsets = scale_byte_base.unsqueeze(1) + torch.arange(
-        scale_dim, device=device, dtype=torch.int64
-    ).unsqueeze(0)
-    scale_u8 = buf_u8.flatten()[scale_byte_offsets.flatten()].view(num_locs, scale_dim)
-    scale = torch.pow(2.0, (scale_u8.to(torch.float32) - 127.0))
-
-    nope_f32 = nope_fp8.float().view(num_locs, scale_dim, 64)
-    nope_dequant = nope_f32 * scale.unsqueeze(-1)
-    nope_dequant = nope_dequant.view(num_locs, nope_dim).to(torch.bfloat16)
-
-    return torch.cat([nope_dequant, rope_bf16], dim=-1)
-
-
-def _unpack_swa_cache(
-    runner: MockDSV4ModelRunner,
-    layer_id: int,
-    full_locs: torch.Tensor,
-) -> torch.Tensor:
-    """Read back FP8 nope + BF16 rope from the SWA buffer at `full_locs` and
-    dequantize to bfloat16. Returns `[num_tokens, DSV4_HEAD_DIM]`.
-
-    Mirrors the page layout written by `_set_k_and_s_triton` in
-    `sglang/srt/layers/attention/dsv4/index_buf_accessor.py`.
-    """
-    pool = runner.token_to_kv_pool
-    swa_locs = pool.translate_loc_from_full_to_swa(full_locs).to(torch.int64)
-    swa_kv_pool = pool.swa_kv_pool
-    return _unpack_packed_kv_at_locs(
-        swa_kv_pool.kv_buffer[layer_id], swa_kv_pool.page_size, swa_locs
-    )
-
-
-def _unpack_extra_cache(
-    runner: MockDSV4ModelRunner,
-    layer_id: int,
-    extra_locs: torch.Tensor,
-) -> torch.Tensor:
-    """Unpack K from the layer's extra (C4 or C128) sub-pool at `extra_locs`.
-    `extra_locs[i] = page_idx * extra_page_size + tok_in_page`, matching the
-    flat-index encoding flash_mla expects for `extra_indices_in_kvcache`.
-    """
-    pool = runner.token_to_kv_pool
-    _, compress_layer_id, compress_kv_pool = pool.layer_mapping[layer_id]
-    assert compress_kv_pool is not None, (
-        f"layer {layer_id} has no extra (C4/C128) sub-pool"
-    )
-    return _unpack_packed_kv_at_locs(
-        compress_kv_pool.kv_buffer[compress_layer_id],
-        compress_kv_pool.page_size,
-        extra_locs,
-    )
+# The previous version of this fixture had `_unpack_swa_cache` /
+# `_unpack_extra_cache` helpers that read FP8 bytes back from the production
+# pool's `kv_buffer` and dequantized them. The reference now reads BF16 K
+# directly from the per-request stash on the fixture (see
+# `_populate_swa_kv_cache` / `_populate_extra_kv_cache`), so the reference
+# math is independent of `quant_to_nope_fp8_rope_bf16_pack_triton` and
+# `set_swa_key_buffer_radix` — a silent bug in those production write
+# functions can no longer corrupt both paths identically.
 
 
 @dataclass
@@ -700,24 +601,30 @@ def _pure_torch_dsv4_swa_reference(
     *,
     case: DSV4AttentionCase | None = None,
 ) -> torch.Tensor:
-    """Independent reference: unpack same-quantized K from the SWA cache, run
-    standard softmax(q @ k.T) with sliding-window-causal mask + attention sink.
+    """Vanilla DSV4 SWA reference. Reads K directly from the BF16 tensor that
+    `_populate_swa_kv_cache` stashed on the fixture, so the math is
+    independent of the FP8 pack/unpack roundtrip the production
+    `set_swa_key_buffer_radix` path uses. (The HF reference at
+    `deepseek-ai/DeepSeek-V4-Pro/blob/main/inference/model.py` likewise
+    skips the FP8 quantization in the unit-test-suitable form — the
+    quantization is only a QAT-simulation artifact, not part of the math.)
 
-    `q` has shape `[num_q, num_heads, DSV4_HEAD_DIM]`. `full_kv_locs_per_req[r]`
-    are the **full-pool** locs of all KV tokens for request r in causal order.
-    `case` overrides `fixture.case` — needed by runner-mode integrations where
-    the replay/capture case has a different batch shape than the fixture's
-    construction-time case.
+    `q` has shape `[num_q, num_heads, DSV4_HEAD_DIM]`. `full_kv_locs_per_req`
+    is kept as a parameter for compatibility but the per-request BF16 K
+    sourced from `fixture._swa_bf16_k_per_req` is what the math actually
+    uses. `case` overrides `fixture.case` when runner-mode integrations use
+    a padded variant case.
     """
+    del full_kv_locs_per_req  # kept for backward-compat; not used now
     if case is None:
         case = fixture.case
+    swa_k_per_req: list[torch.Tensor] = fixture._swa_bf16_k_per_req  # type: ignore[attr-defined]
     scaling = DSV4_HEAD_DIM**-0.5
     attn_sink = fixture.actual_module.attn_sink.detach()
     outputs = []
     q_idx = 0
     for req_idx in range(case.batch_size):
-        kv_locs = full_kv_locs_per_req[req_idx]
-        kv_full = _unpack_swa_cache(fixture.runner, 0, kv_locs).float()
+        kv_full = swa_k_per_req[req_idx].float()  # [seq_len, head_dim] BF16->FP32
         for offset in range(case.input_lens[req_idx]):
             query_pos = case.prefix_lens[req_idx] + offset
             kv_start = max(0, query_pos - DSV4_SWA_WINDOW + 1)
@@ -741,22 +648,39 @@ def _populate_swa_kv_cache(
     *,
     max_context_len: int,
     device: str,
+    inputs: dict[str, Any] | None = None,
 ) -> list[torch.Tensor]:
     """Project K for every kv token (prefix + input) and write the packed
     FP8 nope + BF16 rope representation into the SWA pool via the production
-    pack+set path. Returns the full-pool token locs per request in causal order.
+    pack+set path. ALSO stashes the projected per-request BF16 K on the
+    fixture as `fixture._swa_bf16_k_per_req` so the reference can read K
+    directly from BF16 instead of unpacking quantized bytes back from the
+    pool — that keeps the reference math independent of
+    `quant_to_nope_fp8_rope_bf16_pack_triton` / `set_swa_key_buffer_radix`
+    (otherwise a silent pack/write bug would corrupt both paths
+    identically). Returns the full-pool token locs per request in causal
+    order.
     """
     case = fixture.case
+    prefix_hidden = (
+        inputs["prefix_hidden"] if inputs is not None else fixture.prefix_hidden
+    )
+    input_hidden = (
+        inputs["input_hidden"] if inputs is not None else fixture.input_hidden
+    )
     full_kv_locs_per_req: list[torch.Tensor] = []
     all_k_bf16_parts: list[torch.Tensor] = []
     all_k_locs_parts: list[torch.Tensor] = []
-    for req_idx, prefix in enumerate(fixture.prefix_hidden):
-        input_part = fixture.input_hidden[
+    per_req_bf16_k: list[torch.Tensor] = []
+    for req_idx, prefix in enumerate(prefix_hidden):
+        input_part = input_hidden[
             sum(case.input_lens[:req_idx]) : sum(case.input_lens[: req_idx + 1])
         ]
         req_hidden = torch.cat([prefix, input_part], dim=0)
         _, k_req = fixture.actual_module.project(req_hidden)
-        all_k_bf16_parts.append(k_req.view(-1, DSV4_HEAD_DIM))
+        k_req_flat = k_req.view(-1, DSV4_HEAD_DIM)  # [seq_len, head_dim]
+        per_req_bf16_k.append(k_req_flat)
+        all_k_bf16_parts.append(k_req_flat)
         seq_len = case.seq_lens[req_idx]
         req_locs = torch.tensor(
             [
@@ -771,6 +695,8 @@ def _populate_swa_kv_cache(
     all_k = torch.cat(all_k_bf16_parts, dim=0)
     all_k_locs = torch.cat(all_k_locs_parts, dim=0)
     _write_swa_cache(fixture.runner, layer_id=0, loc=all_k_locs, k_bf16=all_k)
+    fixture._swa_bf16_k_per_req = per_req_bf16_k  # type: ignore[attr-defined]
+    fixture._swa_full_locs_per_req = full_kv_locs_per_req  # type: ignore[attr-defined]
     return full_kv_locs_per_req
 
 
@@ -949,12 +875,14 @@ def prepare_dsv4_runner_inputs(
     """Project K for prefix + input hidden in `inputs` and write the packed
     FP8 nope + BF16 rope representation into the SWA cache. For
     `case.compress_ratio in (4, 128)` also populate the corresponding C4/C128
-    extra cache so the flash_mla `extra_k_cache` read path sees valid
-    quantized K values.
+    extra cache. Stashes the per-request BF16 K on the fixture so the
+    reference reads K from BF16 (independent of the FP8 pack/unpack
+    roundtrip).
     """
     del batch
     all_k_parts: list[torch.Tensor] = []
     all_locs_parts: list[torch.Tensor] = []
+    per_req_bf16_k: list[torch.Tensor] = []
     input_hidden = inputs["input_hidden"]
     for req_idx, prefix in enumerate(inputs["prefix_hidden"]):
         input_part = input_hidden[
@@ -962,7 +890,9 @@ def prepare_dsv4_runner_inputs(
         ]
         req_hidden = torch.cat([prefix, input_part], dim=0)
         _, k_req = fixture.actual_module.project(req_hidden)
-        all_k_parts.append(k_req.view(-1, DSV4_HEAD_DIM))
+        k_req_flat = k_req.view(-1, DSV4_HEAD_DIM)
+        per_req_bf16_k.append(k_req_flat)
+        all_k_parts.append(k_req_flat)
         seq_len = case.seq_lens[req_idx]
         all_locs_parts.append(
             torch.tensor(
@@ -980,6 +910,7 @@ def prepare_dsv4_runner_inputs(
         loc=torch.cat(all_locs_parts, dim=0),
         k_bf16=torch.cat(all_k_parts, dim=0),
     )
+    fixture._swa_bf16_k_per_req = per_req_bf16_k  # type: ignore[attr-defined]
     if case.compress_ratio in (4, 128):
         _populate_extra_kv_cache(fixture, layer_id=0, num_entries=_DSV4_EXTRA_ENTRIES)
 
@@ -1088,17 +1019,15 @@ def _populate_extra_kv_cache(
     num_entries: int = 32,
 ) -> int:
     """Write `num_entries` packed FP8-nope/BF16-rope K vectors into the C4 or
-    C128 extra cache via the production `set_extra_key_buffer` path. Uses a
-    case-derived seed for the random K so eager / capture / replay fixtures
-    (rebuilt with the same case name) populate the same extra cache. Returns
-    `num_entries` so callers can use the same count when manually populating
-    `c4_sparse_page_indices` to point at the entries we just wrote.
+    C128 extra cache via the production `set_extra_key_buffer` path. ALSO
+    stashes the same BF16 K on the fixture as `fixture._extra_bf16_k` so the
+    reference reads K from BF16 instead of unpacking quantized bytes back
+    from the pool. The case-derived seed makes the random K reproducible
+    across eager/capture/replay rebuilds; the save/restore of the global
+    RNG prevents perturbing downstream Q/K projection randomness.
     """
     pool = fixture.runner.token_to_kv_pool
     device = fixture.runner.device
-    # Save/restore the global RNG state so we don't perturb downstream Q/K
-    # projection randomness that build_dsv4_attention_fixture deliberately
-    # seeded.
     cpu_state = torch.random.get_rng_state()
     cuda_state = torch.cuda.get_rng_state(device=device)
     try:
@@ -1114,6 +1043,7 @@ def _populate_extra_kv_cache(
     pack = quant_to_nope_fp8_rope_bf16_pack_triton(rand_k)
     loc = torch.arange(num_entries, dtype=torch.int64, device=device)
     pool.set_extra_key_buffer(layer_id=layer_id, loc=loc, cache_nope_fp8_rope_bf16_pack=pack)
+    fixture._extra_bf16_k = rand_k  # type: ignore[attr-defined]
     return num_entries
 
 
@@ -1137,18 +1067,29 @@ def _pure_torch_dsv4_combined_reference(
     *,
     layer_id: int = 0,
 ) -> torch.Tensor:
-    """Pure-PyTorch reference that mirrors what `flash_mla.flash_mla_with_kvcache`
-    does on the SWA + extra (C4/C128) caches. Reads the upgraded
-    `DSV4AttnMetadata` to discover which cache slots each q token attends to,
-    unpacks K from those slots through `_unpack_packed_kv_at_locs`, then runs
-    softmax(q @ k.T) * scaling with the attention-sink virtual-key correction.
+    """Vanilla DSV4 SWA + C4 / C128 reference. Sources K from BF16 tensors
+    that `_populate_swa_kv_cache` / `_populate_extra_kv_cache` stashed on the
+    fixture, NOT from the production quantized cache bytes. This keeps the
+    reference math independent of `quant_to_nope_fp8_rope_bf16_pack_triton` /
+    `set_extra_key_buffer` — a silent pack/write bug in those paths would
+    diverge the actual flash_mla output from this BF16 reference instead of
+    corrupting both identically.
+
+    The reference reproduces the structure of the HF
+    `deepseek-ai/DeepSeek-V4-Pro/inference/model.py` attention forward:
+    per-query SWA window + optional compressed extra entries, combined into
+    one softmax with the per-head attention sink as a virtual-key score.
+    (HF likewise skips the FP8 quantization for the test-suitable form;
+    quantization is a QAT-simulation artifact, not part of the math.)
 
     Forces the lazy `DSV4RawDecodeMetadata → DSV4Metadata` upgrade before
-    reading metadata so this works both pre-forward (where the upgrade has
-    not happened) and post-`on_after_cuda_graph_warmup` (which intentionally
-    rolls `forward_metadata` back to the captured raw to be re-upgraded
-    inside the CUDA graph).
+    reading per-q-token `swa_page_indices` / `cN_page_indices` so this works
+    both pre-forward and post-`on_after_cuda_graph_warmup` (which rolls
+    `forward_metadata` back to the captured raw to be re-upgraded inside
+    the CUDA graph).
     """
+    del layer_id  # K is sourced from the fixture's BF16 stash, not from
+    # a layer-indexed pool buffer.
     case = fixture.case
     # Re-apply the C4 seeding too, since `on_after_cuda_graph_warmup` rolls
     # `forward_metadata` back to the raw captured value (which clears
@@ -1157,12 +1098,10 @@ def _pure_torch_dsv4_combined_reference(
     _seed_c4_if_needed(fixture)
     fixture.backend._maybe_upgrade_forward_metadata()
     md = fixture.backend.forward_metadata.core_metadata
-    pool = fixture.runner.token_to_kv_pool
-    swa_kv_pool = pool.swa_kv_pool
-    swa_buf = swa_kv_pool.kv_buffer[layer_id]
-    swa_page_size = swa_kv_pool.page_size
+    runner = fixture.runner
+    max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
 
-    swa_indices = md.swa_page_indices  # [num_q, padded_window]
+    swa_indices = md.swa_page_indices  # [num_q, padded_window], full-pool locs
     swa_topk_lengths = md.swa_topk_lengths  # [num_q]
 
     if case.compress_ratio in (4, 128):
@@ -1172,30 +1111,42 @@ def _pure_torch_dsv4_combined_reference(
     else:
         extra_indices, extra_topk_lengths = None, None
 
+    swa_k_per_req: list[torch.Tensor] = fixture._swa_bf16_k_per_req  # type: ignore[attr-defined]
+    extra_k_bf16 = getattr(fixture, "_extra_bf16_k", None)
+
     scaling = DSV4_HEAD_DIM**-0.5
     attn_sink = fixture.actual_module.attn_sink.detach()
     outputs = []
 
     num_q = q.shape[0]
     for q_idx in range(num_q):
+        # Map full-pool locs back to (req_idx, position) using
+        # `_token_loc(req_idx, pos, max_context_len) = 1 + req_idx * max + pos`,
+        # then index into the BF16 per-request K stash.
         swa_len = int(swa_topk_lengths[q_idx].item())
         swa_locs_q = swa_indices[q_idx, :swa_len]
-        swa_locs_q = swa_locs_q[swa_locs_q >= 0]
+        swa_locs_q = swa_locs_q[swa_locs_q >= 0].to(torch.int64)
         if swa_locs_q.numel() > 0:
-            swa_k = _unpack_packed_kv_at_locs(
-                swa_buf, swa_page_size, swa_locs_q
-            ).float()
+            req_ids = (swa_locs_q - 1) // max_context_len
+            positions = (swa_locs_q - 1) % max_context_len
+            swa_k_parts = [
+                swa_k_per_req[int(req_ids[i].item())][int(positions[i].item())]
+                for i in range(swa_locs_q.shape[0])
+            ]
+            swa_k = torch.stack(swa_k_parts, dim=0).float()
         else:
             swa_k = torch.zeros((0, DSV4_HEAD_DIM), dtype=torch.float32, device=q.device)
 
         if extra_indices is not None:
+            assert extra_k_bf16 is not None, (
+                "compress_ratio in {4, 128} requires `_populate_extra_kv_cache` "
+                "to have stashed `fixture._extra_bf16_k`."
+            )
             extra_len = int(extra_topk_lengths[q_idx].item())
             extra_locs_q = extra_indices[q_idx, :extra_len]
-            extra_locs_q = extra_locs_q[extra_locs_q >= 0]
+            extra_locs_q = extra_locs_q[extra_locs_q >= 0].to(torch.int64)
             if extra_locs_q.numel() > 0:
-                extra_k = _unpack_extra_cache(
-                    fixture.runner, layer_id, extra_locs_q
-                ).float()
+                extra_k = extra_k_bf16[extra_locs_q].float()
                 keys = torch.cat([swa_k, extra_k], dim=0)
             else:
                 keys = swa_k
