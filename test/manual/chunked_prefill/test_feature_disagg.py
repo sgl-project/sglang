@@ -34,7 +34,6 @@ class TestChunkedFeatureDisagg(PDDisaggregationServerBase, ChunkedRefactorTestBa
         cls.extra_prefill_args = [
             "--chunked-prefill-size",
             str(cls.chunked_prefill_size),
-            "--disable-overlap-schedule",
         ] + list(KV_CANARY_ARGS)
         cls.extra_decode_args = list(KV_CANARY_ARGS)
 
