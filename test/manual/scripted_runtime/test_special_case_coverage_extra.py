@@ -86,6 +86,8 @@ def _script_chunked_req_reset_to_none(t: ScriptedRuntime):
 def _script_disagg_prefill_chunked_path(t: ScriptedRuntime):
     # disaggregation/prefill.py — chunked req in disagg prefill mode.
     # Single-engine smoke (disagg topology requires P3 multi-engine).
+    # TODO(round-3): recreate the specific bug shape; this currently
+    # is a forward-pointing smoke.
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     yield from run_until_finished(r)
 
@@ -93,6 +95,8 @@ def _script_disagg_prefill_chunked_path(t: ScriptedRuntime):
 def _script_disagg_decode_waiting_queue_kv_held(t: ScriptedRuntime):
     # disaggregation/decode.py — waiting_queue reqs hold KV in decode mode.
     # Smoke: chunked req traverses decode-side waiting state cleanly.
+    # TODO(round-3): recreate the specific bug shape; this currently
+    # is a forward-pointing smoke.
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     yield from run_until_finished(r)
 
@@ -101,24 +105,32 @@ def _script_dllm_staging_double_pending_middle_outputs(t: ScriptedRuntime):
     # dllm/mixin/scheduler.py — DLLM staging AND chunked admission both
     # incrementing pending_middle_outputs (double-source).
     # Single-engine smoke (DLLM model required for full coverage).
+    # TODO(round-3): recreate the specific bug shape; this currently
+    # is a forward-pointing smoke.
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     yield from run_until_finished(r)
 
 
 def _script_staging_handler_chunked(t: ScriptedRuntime):
     # disaggregation/common/staging_handler.py — chunked interaction.
+    # TODO(round-3): recreate the specific bug shape; this currently
+    # is a forward-pointing smoke.
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     yield from run_until_finished(r)
 
 
 def _script_mooncake_conn_chunked(t: ScriptedRuntime):
     # disaggregation/mooncake/conn.py — chunked path in conn layer.
+    # TODO(round-3): recreate the specific bug shape; this currently
+    # is a forward-pointing smoke.
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     yield from run_until_finished(r)
 
 
 def _script_nixl_conn_chunked(t: ScriptedRuntime):
     # disaggregation/nixl/conn.py — chunked path.
+    # TODO(round-3): recreate the specific bug shape; this currently
+    # is a forward-pointing smoke.
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     yield from run_until_finished(r)
 
@@ -126,7 +138,10 @@ def _script_nixl_conn_chunked(t: ScriptedRuntime):
 def _script_idle_path_chunked_req_none(t: ScriptedRuntime):
     # scheduler.py:3174 — idle path checks chunked_req is None.
     # If we have no in-flight req, scheduler is idle.
-    yield  # nothing happening
+    # Give the scheduler a few yields to settle into the idle state
+    # (initial setup may keep is_idle False for one or two iterations).
+    for _ in range(5):
+        yield
     assert t.is_idle
 
 
@@ -159,6 +174,7 @@ def _script_inflight_counter_increments_each_chunk(t: ScriptedRuntime):
             break
         yield
     # After at least one chunk, the counter must have moved up at some point.
+    assert saw_increment, "expected inflight_middle_chunks to increment"
 
 
 def _script_filter_batch_exclude_chunked_flag(t: ScriptedRuntime):
@@ -171,12 +187,16 @@ def _script_filter_batch_exclude_chunked_flag(t: ScriptedRuntime):
 def _script_pdmux_split_prefill_batch(t: ScriptedRuntime):
     # 34c02d6a67: filter chunked-resume from split_prefill_batch.
     # pdmux-specific; single-engine smoke.
+    # TODO(round-3): recreate the specific bug shape; this currently
+    # is a forward-pointing smoke.
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     yield from run_until_finished(r)
 
 
 def _script_streaming_session_kv_committed_bound(t: ScriptedRuntime):
     # 116584e8fa: bound streaming-session chunked stash by kv_committed_len.
+    # TODO(round-3): recreate the specific bug shape; this currently
+    # is a forward-pointing smoke.
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     yield from run_until_finished(r)
 
@@ -184,6 +204,8 @@ def _script_streaming_session_kv_committed_bound(t: ScriptedRuntime):
 def _script_mamba_pool_idx_cleanup_skip_chunked_resume(t: ScriptedRuntime):
     # dbdcdde245: skip mamba_pool_idx cleanup for chunked-resume on
     # NO_TOKEN. Mamba-specific; single-engine smoke.
+    # TODO(round-3): recreate the specific bug shape; this currently
+    # is a forward-pointing smoke.
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     yield from run_until_finished(r)
 
