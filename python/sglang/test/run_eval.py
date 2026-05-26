@@ -185,8 +185,7 @@ def run_eval(args):
             num_examples=args.num_examples,
             num_threads=args.num_threads,
             num_shots=args.num_shots,
-            num_clusters=args.mixed_prefix_gsm8k_num_clusters,
-            random_pool_size=args.mixed_prefix_gsm8k_random_pool_size,
+            secondary_pool_size=args.mixed_prefix_gsm8k_secondary_pool_size,
             data_path=args.gsm8k_data_path,
             seed=args.mixed_prefix_gsm8k_seed,
         )
@@ -380,16 +379,10 @@ if __name__ == "__main__":
         help="Path to GSM8K data file (e.g., test.jsonl)",
     )
     parser.add_argument(
-        "--mixed-prefix-gsm8k-num-clusters",
+        "--mixed-prefix-gsm8k-secondary-pool-size",
         type=int,
-        default=5,
-        help="Number of cluster prefixes for eval_name=mixed_prefix_gsm8k (default: 5)",
-    )
-    parser.add_argument(
-        "--mixed-prefix-gsm8k-random-pool-size",
-        type=int,
-        default=50,
-        help="Random-sample pool size for eval_name=mixed_prefix_gsm8k (default: 50)",
+        default=15,
+        help="Size of secondary example pool for eval_name=mixed_prefix_gsm8k (default: 15)",
     )
     parser.add_argument(
         "--mixed-prefix-gsm8k-seed",

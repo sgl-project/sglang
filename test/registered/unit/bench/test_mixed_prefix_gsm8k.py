@@ -1,8 +1,8 @@
 """Unit tests for MixedPrefixGSM8KEval prefix construction.
 
-These tests do not hit any server; they exercise only the deterministic
-prefix-selection logic of ``MixedPrefixGSM8KEval``. A small synthetic jsonl
-file stands in for the GSM8K dataset to keep the test hermetic.
+Exercises only the deterministic prefix-selection logic; no server needed.
+A small synthetic jsonl stands in for the GSM8K dataset to keep the test
+hermetic.
 """
 
 import json
@@ -23,10 +23,8 @@ except ModuleNotFoundError:
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-from sglang.test.simple_eval_mixed_prefix_gsm8k import (
-    _MODE_LABELS,
-    MixedPrefixGSM8KEval,
-)
+from sglang.test.simple_eval_gsm8k import get_one_example
+from sglang.test.simple_eval_mixed_prefix_gsm8k import MixedPrefixGSM8KEval
 
 
 def _write_synthetic_dataset(path: str, n: int) -> None:
@@ -46,18 +44,16 @@ def _write_synthetic_dataset(path: str, n: int) -> None:
 
 class TestMixedPrefixGSM8KEval(CustomTestCase):
     NUM_SHOTS = 4
-    NUM_CLUSTERS = 3
-    RANDOM_POOL_SIZE = 12
+    SECONDARY_POOL_SIZE = 12
     NUM_EXAMPLES = 40
 
     @classmethod
     def setUpClass(cls):
         cls._tmpdir = tempfile.TemporaryDirectory()
         cls._data_path = os.path.join(cls._tmpdir.name, "synthetic.jsonl")
-        # Pool reservation = num_shots (standard) + num_shots*num_clusters
-        # (clusters) + random_pool_size = 4 + 12 + 12 = 28. We write 100
-        # records so the trailing 72 lines act as the test pool; the eval
-        # then slices it down to ``num_examples`` (40 by default below).
+        # Pool reservation = num_shots + secondary_pool_size = 4 + 12 = 16.
+        # 100 records overall leaves 84 for the test pool, which the eval
+        # truncates to NUM_EXAMPLES=40.
         _write_synthetic_dataset(cls._data_path, 100)
 
     @classmethod
@@ -71,45 +67,49 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
             ),
             num_threads=1,
             num_shots=self.NUM_SHOTS,
-            num_clusters=self.NUM_CLUSTERS,
-            random_pool_size=self.RANDOM_POOL_SIZE,
+            secondary_pool_size=self.SECONDARY_POOL_SIZE,
             data_path=self._data_path,
             seed=seed,
         )
 
-    def test_mode_0_all_share_standard_prefix(self):
-        evaluator = self._make_eval()
-        mode0_prefixes = {
-            evaluator._build_prefix(i) for i in range(self.NUM_EXAMPLES) if i % 4 == 0
-        }
-        self.assertEqual(len(mode0_prefixes), 1)
-        # Standard prefix must be non-empty.
-        self.assertTrue(next(iter(mode0_prefixes)))
+    def _primary_question_set(self, evaluator):
+        return {item["question"] for item in evaluator._primary_shots}
 
-    def test_mode_1_uses_n_distinct_cluster_prefixes(self):
-        evaluator = self._make_eval()
-        mode1_prefixes = {
-            evaluator._build_prefix(i) for i in range(self.NUM_EXAMPLES) if i % 4 == 1
-        }
-        # With NUM_EXAMPLES=40 (10 questions in mode 1) and NUM_CLUSTERS=3,
-        # we must see exactly NUM_CLUSTERS distinct prefixes (cycling).
-        self.assertEqual(len(mode1_prefixes), self.NUM_CLUSTERS)
+    def _secondary_question_set(self, evaluator):
+        return {item["question"] for item in evaluator._secondary_pool}
 
-    def test_mode_2_all_prefixes_unique(self):
+    def test_primary_then_secondary_layout(self):
+        # Every produced prefix decomposes into a (possibly empty) prefix of
+        # primary_shots followed by some subset of secondary_pool.
         evaluator = self._make_eval()
-        mode2_prefixes = [
-            evaluator._build_prefix(i) for i in range(self.NUM_EXAMPLES) if i % 4 == 2
-        ]
-        # With NUM_SHOTS=4 sampled from a pool of 12, the chance of two
-        # 4-element samples being identical (in order) is astronomically low.
-        # We assert strict uniqueness here as the deterministic seed is fixed.
-        self.assertEqual(len(set(mode2_prefixes)), len(mode2_prefixes))
+        primary_qs = [item["question"] for item in evaluator._primary_shots]
+        secondary_qs = self._secondary_question_set(evaluator)
 
-    def test_mode_3_all_zero_shot(self):
-        evaluator = self._make_eval()
         for i in range(self.NUM_EXAMPLES):
-            if i % 4 == 3:
-                self.assertEqual(evaluator._build_prefix(i), "")
+            prefix = evaluator._build_prefix(i)
+            # Walk down primary_shots tokens in order; whatever matches at
+            # the start is the chosen primary segment.
+            k = 0
+            for shot_idx in range(len(primary_qs)):
+                shot_line = (
+                    get_one_example(
+                        evaluator._primary_shots, shot_idx, include_answer=True
+                    )
+                    + "\n\n"
+                )
+                if prefix[: len(shot_line)] == shot_line:
+                    prefix = prefix[len(shot_line) :]
+                    k += 1
+                else:
+                    break
+            # Anything left must come from secondary_pool only.
+            remaining_questions = []
+            for line in prefix.strip().split("Question: ")[1:]:
+                # 'foo?\nAnswer: ...' -> we just need to recover the question text
+                q = "Question: " + line.split("\nAnswer:")[0]
+                remaining_questions.append(q)
+            for q in remaining_questions:
+                self.assertIn(q, {f"Question: {x}" for x in secondary_qs})
 
     def test_build_prefix_is_deterministic(self):
         a = self._make_eval(seed=42)
@@ -117,31 +117,45 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
         for i in range(self.NUM_EXAMPLES):
             self.assertEqual(a._build_prefix(i), b._build_prefix(i))
 
-    def test_mode_2_seed_actually_matters(self):
-        # Changing the seed must change at least one mode-2 prefix.
+    def test_seed_actually_matters(self):
         a = self._make_eval(seed=42)
         b = self._make_eval(seed=43)
-        mode2_indices = [i for i in range(self.NUM_EXAMPLES) if i % 4 == 2]
         differences = sum(
-            1 for i in mode2_indices if a._build_prefix(i) != b._build_prefix(i)
+            1
+            for i in range(self.NUM_EXAMPLES)
+            if a._build_prefix(i) != b._build_prefix(i)
         )
-        self.assertGreater(differences, 0)
-        # Modes 0/1/3 are seed-independent.
-        for i in range(self.NUM_EXAMPLES):
-            if i % 4 != 2:
-                self.assertEqual(a._build_prefix(i), b._build_prefix(i))
+        self.assertGreater(differences, self.NUM_EXAMPLES // 2)
 
-    def test_random_pool_disjoint_from_test_lines(self):
+    def test_primary_and_secondary_disjoint_from_test_lines(self):
         evaluator = self._make_eval(num_examples=None)
-        train_questions = {item["question"] for item in evaluator._random_pool}
-        test_questions = {item["question"] for item in evaluator._lines}
-        self.assertEqual(train_questions & test_questions, set())
+        primary_qs = self._primary_question_set(evaluator)
+        secondary_qs = self._secondary_question_set(evaluator)
+        test_qs = {item["question"] for item in evaluator._lines}
+        self.assertEqual(primary_qs & test_qs, set())
+        self.assertEqual(secondary_qs & test_qs, set())
+        self.assertEqual(primary_qs & secondary_qs, set())
 
-    def test_per_mode_metric_key(self):
+    def test_num_primary_distribution_spans_range(self):
+        # Across the 40 questions, num_primary should sample most of {0..N};
+        # bare minimum: not all zero and not all NUM_SHOTS.
         evaluator = self._make_eval()
-        for i in range(20):
-            metrics = evaluator._extra_sample_metrics(i, 1.0)
-            self.assertEqual(metrics, {f"score_{_MODE_LABELS[i % 4]}": 1.0})
+        primary_lines = [
+            (get_one_example(evaluator._primary_shots, i, include_answer=True) + "\n\n")
+            for i in range(self.NUM_SHOTS)
+        ]
+        chosen_ks = []
+        for i in range(self.NUM_EXAMPLES):
+            prefix = evaluator._build_prefix(i)
+            k = 0
+            for line in primary_lines:
+                if prefix[: len(line)] == line:
+                    prefix = prefix[len(line) :]
+                    k += 1
+                else:
+                    break
+            chosen_ks.append(k)
+        self.assertGreater(len(set(chosen_ks)), 1)
 
     def test_insufficient_dataset_raises(self):
         tiny = os.path.join(self._tmpdir.name, "tiny.jsonl")
@@ -151,8 +165,7 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
                 num_examples=1,
                 num_threads=1,
                 num_shots=self.NUM_SHOTS,
-                num_clusters=self.NUM_CLUSTERS,
-                random_pool_size=self.RANDOM_POOL_SIZE,
+                secondary_pool_size=self.SECONDARY_POOL_SIZE,
                 data_path=tiny,
             )
 
