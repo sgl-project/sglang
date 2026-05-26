@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PrefetchTimeoutConfig,
 )
+from sglang.srt.managers.cache_controller import timing_event_supported
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation,
 )
@@ -383,9 +384,9 @@ class HiMambaRadixCache(MambaRadixCache):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
-                for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                    finish_event.synchronize()
-                    for ack_id in ack_list:
+                for ack in self.cache_controller.ack_write_queue:
+                    ack.finish_event.synchronize()
+                    for ack_id in ack.node_ids:
                         backuped_node = self.ongoing_write_through.pop(ack_id)
                         self._record_store_event(
                             backuped_node, medium=StorageMedium.CPU
@@ -400,8 +401,8 @@ class HiMambaRadixCache(MambaRadixCache):
             return
 
         finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-            if not finish_event.query():
+        for ack in self.cache_controller.ack_write_queue:
+            if not ack.finish_event.query():
                 break
             finish_count += 1
 
@@ -415,9 +416,9 @@ class HiMambaRadixCache(MambaRadixCache):
         finish_count = int(queue_size.item())
 
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
+            ack = self.cache_controller.ack_write_queue.pop(0)
+            ack.finish_event.synchronize()
+            for ack_id in ack.node_ids:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
                 self._record_store_event(backuped_node, medium=StorageMedium.CPU)
                 self.dec_lock_ref(backuped_node)
@@ -427,14 +428,22 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def loading_check(self):
         finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
-            if not finish_event.query():
+        for ack in self.cache_controller.ack_load_queue:
+            if not ack.finish_event.query():
                 # the KV cache loading is still ongoing
                 break
             finish_count += 1
-            for ack_id in ack_list:
+            for ack_id in ack.node_ids:
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
+
+            if self.metrics_collector is not None:
+                self.metrics_collector.increment_load_back_num_tokens(ack.num_tokens)
+                if timing_event_supported():
+                    duration_ms = ack.start_event.elapsed_time(ack.finish_event)
+                    self.metrics_collector.observe_load_back_duration(
+                        duration_ms / 1000.0
+                    )
 
         del self.cache_controller.ack_load_queue[:finish_count]
 
