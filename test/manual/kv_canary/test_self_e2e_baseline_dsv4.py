@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from test.registered.kv_canary.test_self_e2e_baseline import _BaselineBase
 
-from sglang.test.kv_canary.dsv4_consts import (
+from sglang.test.kv_canary.consts import (
     DSV4_POOL_SERVER_ARGS,
     DSV4_POOL_SERVER_ENV,
 )
