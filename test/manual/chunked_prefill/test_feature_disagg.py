@@ -1,20 +1,3 @@
-"""PD disaggregation + chunked prefill.
-
-Disagg has its own setup (separate prefill + decode servers + load balancer),
-so this fixture overrides ``setUpClass`` to use ``PDDisaggregationServerBase``
-instead of the single-server pattern in ChunkedRefactorTestBase. The eval
-runs against the LB URL.
-
-Server arg template borrowed from
-``test/registered/disaggregation/test_disaggregation_pp.py::TestDisaggregationPrefillPPAccuracy``.
-
-GPU requirement: at least 2 GPUs (prefill on gpu 0, decode on gpu 1; LB on
-host). Multi-node disagg works too but isn't required.
-
-Not registered with CI. Run by hand from
-``test/manual/chunked_prefill/``.
-"""
-
 import unittest
 from typing import ClassVar
 

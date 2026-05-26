@@ -1,29 +1,8 @@
-"""
-Mixed-prefix GSM8K evaluation for chunked-prefill testing.
+"""GSM8K with a deterministic 4-way mix of few-shot prefix patterns.
 
-Standard GSM8K uses a single shared few-shot prefix for every question. Under
-chunked prefill + radix cache, that means only the first batch of concurrent
-requests actually does the long chunked prefill — subsequent requests hit the
-cache and only chunk the ~50 token unshared suffix. The chunked-prefill code
-path is therefore exercised on a *single* prefix pattern, repeated.
-
-This eval routes each question into one of four modes (deterministic by
-question index), producing controlled diversity in the prefix:
-
-    mode 0 (25%): a single shared standard prefix      -- radix hot path
-    mode 1 (25%): one of N cluster prefixes            -- radix branching
-    mode 2 (25%): per-question unique random sample    -- radix miss
-    mode 3 (25%): zero-shot, no prefix                 -- short prefill
-
-This way a single 100-question run exercises radix hit, miss, branching, and
-short-prefill paths simultaneously — every question still chunks (except
-mode 3) but on diverse content.
-
-Per-mode scores are returned as separate metrics (`score_standard`,
-`score_cluster`, `score_random`, `score_zero_shot`) alongside the overall
-`score`. Mixed-prefix scores will be lower than standard GSM8K — callers
-should use a conservative threshold or rely on a different primary detector
-(KV canary).
+idx % 4: 0=standard / 1=cluster / 2=random sample / 3=zero-shot.
+Per-mode scores reported as score_standard / score_cluster / score_random /
+score_zero_shot in addition to overall score.
 """
 
 import random
@@ -49,16 +28,6 @@ _MODE_LABELS = ("standard", "cluster", "random", "zero_shot")
 
 
 class MixedPrefixGSM8KEval(GSM8KEval):
-    """GSM8K with a deterministic 4-way mix of few-shot prefix patterns.
-
-    See module docstring for motivation. The per-question prefix is chosen by
-    ``idx % 4`` (mode) and, for mode 1, ``(idx // 4) % num_clusters``.
-
-    Determinism: given the same ``seed``, ``num_shots``, ``num_clusters``,
-    ``random_pool_size`` and dataset, ``_pick_prefix(i)`` returns the same
-    string across processes.
-    """
-
     def __init__(
         self,
         num_examples: Optional[int] = 100,
@@ -69,9 +38,9 @@ class MixedPrefixGSM8KEval(GSM8KEval):
         data_path: Optional[str] = None,
         seed: int = 42,
     ):
-        # Intentionally bypass GSM8KEval.__init__: it constructs a single
-        # ``_few_shot_prompt`` we won't use, and slices the training prefix
-        # off ``_lines`` in a way that conflicts with our reservation scheme.
+        # Bypass GSM8KEval.__init__: it builds a single ``_few_shot_prompt``
+        # we don't use, and its training-prefix slicing conflicts with our
+        # multi-block pool reservation.
         self._num_threads = num_threads
         self._num_shots = num_shots
         self._num_clusters = num_clusters
@@ -84,11 +53,6 @@ class MixedPrefixGSM8KEval(GSM8KEval):
 
         all_lines = list(read_jsonl(filename))
 
-        # Reserve a contiguous training pool at the head of the dataset:
-        #   [0, num_shots)                       -> standard prefix
-        #   [num_shots, num_shots * (1 + N))     -> N cluster prefixes
-        #   [num_shots * (1 + N), pool_size)     -> random sample pool
-        # The test questions come after the pool to avoid label leakage.
         cluster_block = num_shots * num_clusters
         pool_size = num_shots + cluster_block + random_pool_size
         if len(all_lines) < pool_size + 1:
@@ -102,7 +66,6 @@ class MixedPrefixGSM8KEval(GSM8KEval):
         if num_examples is not None:
             self._lines = self._lines[:num_examples]
 
-        # Precompute mode 0 and mode 1 prefixes.
         self._standard_prefix = get_few_shot_examples(
             self._train_pool[:num_shots], num_shots
         )
@@ -115,11 +78,9 @@ class MixedPrefixGSM8KEval(GSM8KEval):
             )
             for k in range(num_clusters)
         ]
-        # Pool used for mode 2 sampling.
         self._random_pool = self._train_pool[num_shots + cluster_block :]
 
     def _pick_prefix(self, idx: int) -> str:
-        """Return the few-shot prefix string for question ``idx``."""
         mode = idx % 4
         if mode == 0:
             return self._standard_prefix
@@ -133,7 +94,6 @@ class MixedPrefixGSM8KEval(GSM8KEval):
                 get_one_example(self._random_pool, i, include_answer=True) + "\n\n"
                 for i in sampled_indices
             )
-        # mode == 3
         return ""
 
     @staticmethod
@@ -170,9 +130,8 @@ class MixedPrefixGSM8KEval(GSM8KEval):
             )
             convo = prompt_messages + [dict(content=response_text, role="assistant")]
 
-            # ``aggregate_results`` averages each metric across the subset of
-            # samples that reported it. By tagging only one per-mode key per
-            # sample, ``score_<mode>`` becomes a clean per-mode mean.
+            # One per-mode key per sample so aggregate_results averages each
+            # ``score_<mode>`` only over samples in that mode.
             return SingleEvalResult(
                 html=html,
                 score=score,
