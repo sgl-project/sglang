@@ -125,10 +125,7 @@ class TestGLM51MXFP4TP2GSM8KMI35x(unittest.TestCase):
             "| Model | TP | Questions | Accuracy | Invalid | Threshold | Status |\n"
             "| ----- | -- | --------- | -------- | ------- | --------- | ------ |\n"
         )
-        passed = (
-            accuracy >= GSM8K_ACCURACY_THRESHOLD
-            and invalid <= GSM8K_INVALID_THRESHOLD
-        )
+        passed = accuracy >= GSM8K_ACCURACY_THRESHOLD and invalid <= GSM8K_INVALID_THRESHOLD
         status = "PASS" if passed else "FAIL"
         summary += (
             f"| {self.model} | 2 | {num_questions} | {accuracy:.3f} | "
