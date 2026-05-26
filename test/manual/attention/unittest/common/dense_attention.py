@@ -266,6 +266,12 @@ class MockModelRunner(ModelRunner):
         self.gpu_id = 0
         self.page_size = case.page_size
         self.model_config = model_config
+        speculative_num_draft_tokens = (
+            case.input_lens[0]
+            if case.forward_mode.is_target_verify()
+            or case.forward_mode.is_draft_extend()
+            else 0
+        )
         self.server_args = SimpleNamespace(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
@@ -279,8 +285,8 @@ class MockModelRunner(ModelRunner):
             model_path=None,
             revision=None,
             speculative_algorithm=None,
-            speculative_num_draft_tokens=0,
-            speculative_num_steps=0,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_num_steps=max(0, speculative_num_draft_tokens - 1),
             triton_attention_num_kv_splits=8,
             triton_attention_split_tile_size=None,
         )
@@ -604,6 +610,55 @@ def _dense_attention_reference(
             values = _expand_gqa(
                 req_v[key_start : query_pos + 1].movedim(0, 1), case.num_heads
             )
+            query = query.float()
+            keys = keys.float()
+            scores = torch.einsum("hd,hkd->hk", query, keys) * module.scaling
+            probs = torch.softmax(scores, dim=-1)
+            out = torch.einsum("hk,hkd->hd", probs, values.float())
+            outputs.append(out.reshape(-1))
+
+    attn_output = torch.stack(outputs, dim=0).to(dtype)
+    return module.reconstruct_output(attn_output)
+
+
+def dense_attention_reference_with_custom_mask(
+    module: ReferenceDenseAttention,
+    case: DenseAttentionCase,
+    prefix_hidden: list[torch.Tensor],
+    input_hidden: torch.Tensor,
+    custom_mask_by_req: list[torch.Tensor],
+) -> torch.Tensor:
+    dtype = input_hidden.dtype
+    q, k, v = module.project_qkv(input_hidden)
+    q_parts = _split_by_lens(
+        q.view(-1, case.num_heads, module.head_dim), case.input_lens
+    )
+    k_parts = _split_by_lens(
+        k.view(-1, case.num_kv_heads, module.head_dim), case.input_lens
+    )
+    v_parts = _split_by_lens(
+        v.view(-1, case.num_kv_heads, module.head_dim), case.input_lens
+    )
+    outputs = []
+
+    for req_idx, prefix in enumerate(prefix_hidden):
+        _, prefix_k, prefix_v = module.project_qkv(prefix)
+        prefix_k = prefix_k.view(-1, case.num_kv_heads, module.head_dim)
+        prefix_v = prefix_v.view(-1, case.num_kv_heads, module.head_dim)
+        req_k = torch.cat([prefix_k, k_parts[req_idx]], dim=0)
+        req_v = torch.cat([prefix_v, v_parts[req_idx]], dim=0)
+        req_mask = custom_mask_by_req[req_idx].to(torch.bool)
+
+        for offset, query in enumerate(q_parts[req_idx]):
+            allowed = req_mask[offset, : req_k.shape[0]]
+            if case.sliding_window_size is not None:
+                query_pos = case.prefix_lens[req_idx] + offset
+                window_allowed = torch.arange(
+                    req_k.shape[0], device=req_k.device
+                ) >= max(0, query_pos - case.sliding_window_size)
+                allowed = allowed & window_allowed
+            keys = _expand_gqa(req_k[allowed].movedim(0, 1), case.num_heads)
+            values = _expand_gqa(req_v[allowed].movedim(0, 1), case.num_heads)
             query = query.float()
             keys = keys.float()
             scores = torch.einsum("hd,hkd->hk", query, keys) * module.scaling

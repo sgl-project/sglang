@@ -204,6 +204,12 @@ class MockGDNModelRunner(ModelRunner):
         self.gpu_id = 0
         self.page_size = case.page_size
         self.model_config = model_config
+        speculative_num_draft_tokens = (
+            case.input_lens[0]
+            if case.forward_mode.is_target_verify()
+            or case.forward_mode.is_draft_extend()
+            else 0
+        )
         self.server_args = SimpleNamespace(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
@@ -221,9 +227,9 @@ class MockGDNModelRunner(ModelRunner):
             model_path=None,
             revision=None,
             speculative_algorithm=None,
-            speculative_eagle_topk=0,
-            speculative_num_draft_tokens=0,
-            speculative_num_steps=0,
+            speculative_eagle_topk=1 if case.forward_mode.is_target_verify() else 0,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_num_steps=max(0, speculative_num_draft_tokens - 1),
             triton_attention_num_kv_splits=8,
             triton_attention_split_tile_size=None,
         )

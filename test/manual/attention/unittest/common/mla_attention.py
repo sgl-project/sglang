@@ -193,6 +193,12 @@ class MockMLAModelRunner(ModelRunner):
         self.gpu_id = 0
         self.page_size = case.page_size
         self.model_config = model_config
+        speculative_num_draft_tokens = (
+            case.input_lens[0]
+            if case.forward_mode.is_target_verify()
+            or case.forward_mode.is_draft_extend()
+            else 0
+        )
         self.server_args = SimpleNamespace(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
@@ -206,8 +212,8 @@ class MockMLAModelRunner(ModelRunner):
             model_path=None,
             revision=None,
             speculative_algorithm=None,
-            speculative_num_draft_tokens=0,
-            speculative_num_steps=0,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_num_steps=max(0, speculative_num_draft_tokens - 1),
             triton_attention_num_kv_splits=8,
             triton_attention_split_tile_size=None,
         )
@@ -594,6 +600,38 @@ def _mla_attention_reference(
             scores = torch.einsum("hd,dk->hk", query, keys) * module.scaling
             probs = torch.softmax(scores, dim=-1)
             out = torch.einsum("hk,kd->hd", probs, req_k[: query_pos + 1].float())
+            outputs.append(out)
+
+    attn_output = torch.stack(outputs, dim=0).to(dtype)
+    return module.reconstruct_output(attn_output)
+
+
+def mla_attention_reference_with_custom_mask(
+    module: ReferenceDeepseekMLAAttention,
+    case: MLAAttentionCase,
+    prefix_hidden: list[torch.Tensor],
+    input_hidden: torch.Tensor,
+    custom_mask_by_req: list[torch.Tensor],
+) -> torch.Tensor:
+    dtype = input_hidden.dtype
+    q, k = module.project_latent_qk(input_hidden)
+    q_parts = _split_by_lens(q, case.input_lens)
+    k_parts = _split_by_lens(k, case.input_lens)
+    outputs = []
+
+    for req_idx, prefix in enumerate(prefix_hidden):
+        _, prefix_k = module.project_latent_qk(prefix)
+        req_k = torch.cat([prefix_k, k_parts[req_idx]], dim=0).squeeze(1)
+        req_mask = custom_mask_by_req[req_idx].to(torch.bool)
+
+        for offset, query in enumerate(q_parts[req_idx]):
+            allowed = req_mask[offset, : req_k.shape[0]]
+            keys = req_k[allowed].movedim(0, 1)
+            query = query.float()
+            keys = keys.float()
+            scores = torch.einsum("hd,dk->hk", query, keys) * module.scaling
+            probs = torch.softmax(scores, dim=-1)
+            out = torch.einsum("hk,kd->hd", probs, req_k[allowed].float())
             outputs.append(out)
 
     attn_output = torch.stack(outputs, dim=0).to(dtype)

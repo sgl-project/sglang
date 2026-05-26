@@ -43,6 +43,21 @@ Implemented:
 - MLA split-op coverage exercises the absorb-MLA cached-KV path where
   `RadixAttention` receives `k/v=None`; the split-op wrapper now preserves that
   contract instead of assuming materialized K/V tensors.
+- Phase 4 synthetic EAGLE metadata coverage has started for representative
+  backends. Dense `triton` and `flashinfer` now cover `TARGET_VERIFY` chain
+  (`topk=1`) and tree (`topk=2`) masks. Dense `flashinfer` also covers
+  `DRAFT_EXTEND` with ragged accepted-token counts. MLA `triton` covers
+  `TARGET_VERIFY` chain masks.
+- The synthetic EAGLE verify helper uses realistic target-verify semantics:
+  `ForwardBatch.seq_lens` represents prefix KV lengths, while `spec_info`
+  supplies the draft tokens, positions, retrieve indices, and custom tree mask.
+  The expected path is an HF-style PyTorch custom-mask reference, not a second
+  backend call.
+- Triton `DRAFT_EXTEND` is intentionally not enabled yet. The current fixture
+  exposes a mismatch against the HF-style reference even for narrow accepted-token
+  layouts, while FlashInfer `DRAFT_EXTEND` passes. Keep this as a focused follow-up
+  on Triton draft-extend metadata/reference semantics rather than weakening Phase 4
+  checks.
 - Dense input-config cases now cover page size 1, zero-prefix exact page,
   zero-prefix input lengths below/equal/above a page, prefix-length exact page,
   total-length exact page, total-length crossing a page boundary, ragged
@@ -80,8 +95,8 @@ Implemented:
   orthogonal to runner/backend metadata compatibility.
 
 In progress:
-- Phase 4 speculative/EAGLE-style metadata coverage is next for representative
-  valid attention backends.
+- Phase 4 speculative/EAGLE-style metadata coverage is being expanded beyond the
+  initial EAGLE synthetic cases.
 
 Next implementation steps:
 - Finish Phase 4 speculative metadata coverage for representative valid backends
@@ -95,6 +110,13 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
+- `python -m py_compile test/manual/attention/unittest/common/spec_runner.py test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/mla/test_triton.py`
+- `python test/manual/attention/unittest/dense/test_triton.py -v`
+- `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
+- `python test/manual/attention/unittest/mla/test_triton.py -v`
+- `python test/manual/attention/unittest/gdn/test_triton.py -v`
+- `python test/manual/attention/unittest/swa/test_triton.py -v`
+- `python test/manual/attention/unittest/swa/test_flashinfer.py -v`
 - `python -m py_compile test/manual/attention/unittest/common/cuda_graph_runner.py test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/mla/test_triton.py test/manual/attention/unittest/gdn/test_triton.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/swa/test_flashinfer.py`
 - `python test/manual/attention/unittest/dense/test_triton.py -v`
 - `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
@@ -126,6 +148,7 @@ test/manual/attention/unittest/
     gdn_attention.py
     mla_attention.py
     split_op_runner.py
+    spec_runner.py
   dense/
     test_torch_native.py
     test_triton.py
@@ -467,10 +490,9 @@ Representative Phase 3 status:
 - GDN is covered in CUDA graph decode replay for the representative `triton`
   hybrid-linear backend path, including recurrent cache restore between capture and
   replay.
-- Still required before Phase 4: representative PCG and BCG coverage. At unit-test
-  scope this means exercising the PCG/BCG split-op path with active forward context
-  and comparing against eager/reference output; full server-level PCG/BCG capture can
-  remain in registered integration tests.
+- PCG and BCG are covered at unit-test scope through split-op replay paths with
+  active forward context and reference/eager comparison. Full server-level PCG/BCG
+  capture can remain in registered integration tests.
 - `hybrid_attn` and TBO composition should be added as focused Phase 3 cases after
   the base backend graph paths are stable.
 
@@ -503,6 +525,14 @@ Also test:
 - `get_verify_buffers_to_fill_after_draft()` shape and dtype.
 - `update_verify_buffers_to_fill_after_draft(spec_info, cuda_graph_bs)` contents.
 - Tree-mask equivalence for `topk=1` chain draft and `topk=4` tree draft.
+
+Current Layer A status:
+- Dense `triton` and `flashinfer`: `TARGET_VERIFY` chain/tree custom-mask coverage.
+- Dense `flashinfer`: `DRAFT_EXTEND` ragged accepted-token coverage.
+- MLA `triton`: `TARGET_VERIFY` chain custom-mask coverage.
+- Deferred: Triton `DRAFT_EXTEND` until the fixture/reference semantics are
+  clarified; GDN speculative verify until recurrent speculative-state setup is
+  represented faithfully.
 
 #### Layer B: worker and draft-runner integration tests
 
