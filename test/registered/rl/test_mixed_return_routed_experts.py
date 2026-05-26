@@ -28,6 +28,7 @@ class TestMixedReturnRoutedExperts(CustomTestCase):
                 2,
                 "--enable-return-routed-experts",
                 "--disable-cuda-graph",
+                "--disable-piecewise-cuda-graph",
                 *other_args,
             ],
         )
