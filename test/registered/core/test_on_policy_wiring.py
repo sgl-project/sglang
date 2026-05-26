@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.true_on_policy import (
     QWEN3_DENSE_TRUE_ON_POLICY_V1,
     QWEN3_MOE_TRUE_ON_POLICY_V1,
@@ -375,6 +377,280 @@ class TestOnPolicyHelpers(unittest.TestCase):
 
         self.assertIn("is_true_on_policy_enabled", qwen3_moe_source)
         self.assertIn("moe_expert_parallel_tree_all_reduce", qwen3_moe_source)
+
+    def test_true_on_policy_dp_attention_uses_max_len_padding(self):
+        try:
+            from sglang.srt.layers import dp_attention
+        except ModuleNotFoundError as exc:
+            if exc.name == "openai":
+                self.skipTest(
+                    "openai dependency is unavailable in this CPU test environment"
+                )
+            raise
+
+        with (
+            patch(
+                "sglang.srt.layers.dp_attention.get_attention_dp_size",
+                return_value=4,
+            ),
+            patch(
+                "sglang.srt.true_on_policy.is_true_on_policy_enabled",
+                return_value=True,
+            ),
+        ):
+            mode = dp_attention.DpPaddingMode.get_dp_padding_mode(
+                is_extend_in_batch=True,
+                global_num_tokens=[128, 0, 0, 0],
+            )
+
+        self.assertEqual(mode, dp_attention.DpPaddingMode.MAX_LEN)
+
+    def test_dp_attention_decode_post_forward_trims_sampling_positions(self):
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        from sglang.srt.model_executor.forward_batch_info import (
+            ForwardBatch,
+            ForwardMode,
+        )
+
+        batch = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=1,
+            input_ids=torch.tensor([10, 0, 0], dtype=torch.int64),
+            req_pool_indices=torch.tensor([7, 0, 0], dtype=torch.int64),
+            seq_lens=torch.tensor([12, 0, 0], dtype=torch.int64),
+            out_cache_loc=torch.tensor([3, 0, 0], dtype=torch.int64),
+            seq_lens_sum=12,
+            seq_lens_cpu=torch.tensor([12, 0, 0], dtype=torch.int64),
+            positions=torch.tensor([11, 0, 0], dtype=torch.int32),
+            global_num_tokens_cpu=[3],
+            global_num_tokens_for_logprob_cpu=[3],
+        )
+        batch._original_batch_size = 1
+        logits_output = LogitsProcessorOutput(
+            next_token_logits=torch.randn(3, 8),
+            hidden_states=torch.randn(3, 4),
+        )
+
+        batch.post_forward_mlp_sync_batch(logits_output)
+
+        self.assertEqual(batch.positions.shape[0], 1)
+        self.assertEqual(batch.seq_lens.shape[0], 1)
+        self.assertEqual(batch.req_pool_indices.shape[0], 1)
+        self.assertEqual(batch.seq_lens_cpu.shape[0], 1)
+        self.assertEqual(logits_output.next_token_logits.shape[0], 1)
+        self.assertEqual(logits_output.hidden_states.shape[0], 1)
+
+    def test_empty_idle_rank_stays_idle_under_max_len_mlp_sync(self):
+        try:
+            from sglang.srt.layers.dp_attention import DpPaddingMode
+            from sglang.srt.model_executor.forward_batch_info import (
+                ForwardBatch,
+                ForwardMode,
+            )
+        except ModuleNotFoundError as exc:
+            if exc.name == "openai":
+                self.skipTest(
+                    "openai dependency is unavailable in this CPU test environment"
+                )
+            raise
+
+        batch = ForwardBatch(
+            forward_mode=ForwardMode.IDLE,
+            batch_size=0,
+            input_ids=torch.empty(0, dtype=torch.int64),
+            req_pool_indices=torch.empty(0, dtype=torch.int64),
+            seq_lens=torch.empty(0, dtype=torch.int64),
+            out_cache_loc=torch.empty(0, dtype=torch.int64),
+            seq_lens_sum=0,
+            seq_lens_cpu=torch.empty(0, dtype=torch.int64),
+            positions=torch.empty(0, dtype=torch.int32),
+            global_num_tokens_cpu=[16, 0, 0, 0],
+            global_num_tokens_gpu=torch.zeros(4, dtype=torch.int64),
+            global_num_tokens_for_logprob_cpu=[16, 0, 0, 0],
+            global_num_tokens_for_logprob_gpu=torch.zeros(4, dtype=torch.int64),
+            is_extend_in_batch=True,
+            lora_ids=[],
+        )
+        model_runner = SimpleNamespace(
+            attn_backend=SimpleNamespace(get_cuda_graph_seq_len_fill_value=lambda: 1),
+            is_draft_worker=False,
+        )
+
+        with (
+            patch(
+                "sglang.srt.model_executor.forward_batch_info.get_attention_tp_size",
+                return_value=1,
+            ),
+            patch(
+                "sglang.srt.model_executor.forward_batch_info.get_attention_cp_size",
+                return_value=1,
+            ),
+            patch(
+                "sglang.srt.model_executor.forward_batch_info.get_attention_dp_rank",
+                return_value=1,
+            ),
+            patch(
+                "sglang.srt.model_executor.forward_batch_info.DpPaddingMode.get_dp_padding_mode",
+                return_value=DpPaddingMode.MAX_LEN,
+            ),
+            patch(
+                "sglang.srt.batch_overlap.two_batch_overlap.TboForwardBatchPreparer.prepare"
+            ),
+        ):
+            batch.prepare_mlp_sync_batch(model_runner)
+
+        self.assertTrue(batch.forward_mode.is_idle())
+        self.assertEqual(batch.batch_size, 16)
+        self.assertEqual(batch.seq_lens_cpu.shape[0], 16)
+        self.assertFalse(hasattr(batch, "_original_forward_mode"))
+
+    def test_layer_postprocess_honors_on_policy_reduce_scatter_disable(self):
+        try:
+            from sglang.srt.layers.communicator import (
+                LayerCommunicator,
+                LayerScatterModes,
+                ScatterMode,
+            )
+            from sglang.srt.layers.dp_attention import DpPaddingMode
+        except ModuleNotFoundError as exc:
+            if exc.name == "openai":
+                self.skipTest(
+                    "openai dependency is unavailable in this CPU test environment"
+                )
+            raise
+
+        communicator = object.__new__(LayerCommunicator)
+        communicator.allow_reduce_scatter = True
+        communicator.is_last_layer = False
+        communicator.layer_scatter_modes = LayerScatterModes(
+            layer_input_mode=ScatterMode.TP_ATTN_FULL,
+            attn_mode=ScatterMode.TP_ATTN_FULL,
+            mlp_mode=ScatterMode.FULL,
+            middle_residual_mode=ScatterMode.TP_ATTN_FULL,
+            layer_output_mode=ScatterMode.TP_ATTN_FULL,
+        )
+        communicator._context = SimpleNamespace()
+        communicator._communicate_summable_tensor_pair_fn = lambda **kwargs: kwargs[
+            "allow_reduce_scatter"
+        ]
+        forward_batch = SimpleNamespace(
+            dp_padding_mode=DpPaddingMode.MAX_LEN,
+        )
+
+        with patch(
+            "sglang.srt.layers.communicator.should_disable_reduce_scatter_for_on_policy",
+            return_value=True,
+        ):
+            allow_reduce_scatter = communicator.postprocess_layer(
+                hidden_states=torch.empty(1, 1),
+                residual=torch.empty(1, 1),
+                forward_batch=forward_batch,
+            )
+
+        self.assertFalse(allow_reduce_scatter)
+
+    def test_reduce_scatter_and_fusion_are_disabled_for_contract(self):
+        self.assertTrue(
+            should_disable_reduce_scatter_for_on_policy(self._contract_args(tp_size=1))
+        )
+        self.assertTrue(
+            should_disable_mlp_allreduce_fusion_for_on_policy(
+                self._contract_args(tp_size=2)
+            )
+        )
+        self.assertFalse(
+            should_disable_reduce_scatter_for_on_policy(
+                SimpleNamespace(true_on_policy_contract=None, tp_size=1)
+            )
+        )
+
+    def test_tree_all_reduce_selection_requires_tp_rollout_and_no_accl(self):
+        self.assertTrue(
+            should_use_tp_invariant_tree_all_reduce(
+                server_args=self._contract_args(tp_size=2),
+                accl_binary_tree_enabled=False,
+            )
+        )
+        self.assertFalse(
+            should_use_tp_invariant_tree_all_reduce(
+                server_args=self._contract_args(tp_size=2),
+                accl_binary_tree_enabled=True,
+            )
+        )
+        self.assertFalse(
+            should_use_tp_invariant_tree_all_reduce(
+                server_args=self._contract_args(tp_size=1),
+                accl_binary_tree_enabled=False,
+            )
+        )
+
+    def test_tree_all_reduce_selection_is_contract_owned(self):
+        with patch.dict(os.environ, {"ACCL_BINARY_TREE_ENABLE": "1"}):
+            self.assertTrue(
+                should_use_tp_invariant_tree_all_reduce(
+                    server_args=self._contract_args(tp_size=2),
+                )
+            )
+
+    def test_attention_handoff_tree_reduce_uses_attention_tp_group(self):
+        from sglang.srt.layers.communicator import (
+            CommunicateWithAllReduceAndLayerNormFn,
+        )
+
+        hidden_states = torch.ones(2, 4)
+        residual = torch.full((2, 4), 3.0)
+
+        class FakeNorm:
+            def __call__(self, x, residual):
+                return x + residual, residual
+
+        with (
+            patch(
+                "sglang.srt.layers.communicator.get_attn_tp_context",
+                return_value=SimpleNamespace(input_scattered=False),
+            ),
+            patch(
+                "sglang.srt.layers.communicator.apply_aiter_all_reduce_fusion",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.communicator.apply_flashinfer_allreduce_fusion",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.distributed.communication_op.should_use_tp_invariant_tree_all_reduce",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.distributed.communication_op.attention_tensor_model_parallel_tree_all_reduce",
+                side_effect=lambda x: x + 10.0,
+            ) as attn_tree_reduce,
+            patch(
+                "sglang.srt.distributed.communication_op.tensor_model_parallel_tree_all_reduce",
+                side_effect=AssertionError(
+                    "generic TP tree reduce must not handle attention output"
+                ),
+                create=True,
+            ),
+        ):
+            output, output_residual = (
+                CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual(
+                    hidden_states,
+                    residual,
+                    forward_batch=SimpleNamespace(
+                        forward_mode=SimpleNamespace(
+                            is_decode_or_idle=lambda: True,
+                        ),
+                    ),
+                    layernorm=FakeNorm(),
+                    context=SimpleNamespace(attn_dp_size=1, cache=None),
+                    residual_input_mode=None,
+                )
+            )
+
+        attn_tree_reduce.assert_called_once()
+        torch.testing.assert_close(output, hidden_states + 10.0 + residual)
+        torch.testing.assert_close(output_residual, residual)
 
 
 if __name__ == "__main__":
