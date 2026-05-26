@@ -1513,6 +1513,13 @@ def load_audio(
     if sr is None:
         sr = 16000
 
+    # Caller must pre-resample to `sr`. Multi-channel layout assumed
+    # (n_samples, n_channels) per soundfile.read.
+    if isinstance(audio_file, np.ndarray):
+        if mono and audio_file.ndim > 1:
+            return np.mean(audio_file, axis=1)
+        return audio_file
+
     # Normalize input: resolve URL / base64 / file:// to bytes or path
     if isinstance(audio_file, bytes):
         source = audio_file
