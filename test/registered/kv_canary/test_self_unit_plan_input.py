@@ -122,9 +122,13 @@ class TestSelfUnitPlanInput(CustomTestCase):
         plan = _make_static_plan_input(bs_capacity=4, device=self.device)
         plan.fill_from_forward_batch(forward_batch=fb)
         torch.cuda.synchronize()
-        self.assertEqual(plan.req_to_verify_expected_tokens_valid_lens[:2].tolist(), [7, 9])
+        self.assertEqual(
+            plan.req_to_verify_expected_tokens_valid_lens[:2].tolist(), [7, 9]
+        )
         # Padding tail stays at zero so the plan kernel reads "no in-range positions" for it.
-        self.assertEqual(plan.req_to_verify_expected_tokens_valid_lens[2:].tolist(), [0, 0])
+        self.assertEqual(
+            plan.req_to_verify_expected_tokens_valid_lens[2:].tolist(), [0, 0]
+        )
 
     def test_plan_input_padding_dummy_sentinel(self):
         """Verify padding sentinel rows remain valid plan input entries."""

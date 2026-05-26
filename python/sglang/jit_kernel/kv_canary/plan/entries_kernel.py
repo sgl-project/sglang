@@ -44,7 +44,10 @@ def launch_plan_entries_kernel(
 ) -> None:
     has_swa_lut = full_to_swa_index_mapping is not None
     has_verify_expected_token_pool = req_to_verify_expected_tokens is not None
-    if has_verify_expected_token_pool and req_to_verify_expected_tokens_valid_lens is None:
+    if (
+        has_verify_expected_token_pool
+        and req_to_verify_expected_tokens_valid_lens is None
+    ):
         raise ValueError(
             "kv-canary: launch_plan_entries_kernel requires "
             "req_to_verify_expected_tokens_valid_lens when req_to_verify_expected_tokens is set"
