@@ -460,7 +460,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--scheduler-recv-interval` | The interval to poll requests in scheduler. Can be set to >1 to reduce the overhead of this. | `1` | Type: int |
 | `--numa-node` | Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess. | `None` | List[int] |
 | `--enable-deterministic-inference` | Enable deterministic inference mode with batch invariant ops. | `False` | bool flag (set to enable) |
-| `--rl-on-policy-target` | The training system that SGLang needs to match for true on-policy. | `None` | `fsdp` |
+| `--true-on-policy-contract` | The typed true-on-policy runtime contract SGLang should follow. | `None` | Type: str |
 | `--enable-attn-tp-input-scattered` | Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent. | `False` | bool flag (set to enable) |
 | `--enable-nsa-prefill-context-parallel` | Enable context parallelism used in the long sequence prefill phase of DeepSeek v3.2. | `False` | bool flag (set to enable) |
 | `--nsa-prefill-cp-mode` | Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: `round-robin-split`(default),`in-seq-split`. `round-robin-split` distributes tokens across ranks based on `token_idx % cp_size`. It supports multi-batch prefill, fused MoE, and FP8 KV cache. | `in-seq-split` | `in-seq-split`, `round-robin-split` |
