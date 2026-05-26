@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import msgspec.msgpack
 import msgspec.structs
+
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -237,9 +238,7 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     queue_retracted: int = 0
 
     @classmethod
-    def from_get_loads_output(
-        cls, output: GetLoadsReqOutput
-    ) -> LoadSnapshot:
+    def from_get_loads_output(cls, output: GetLoadsReqOutput) -> LoadSnapshot:
         snapshot: dict = {}
         for name in CORE_METRIC_FIELDS:
             value = getattr(output, name)
@@ -389,7 +388,7 @@ class ShmLoadSnapshotWriter:
         if snapshot.dp_rank != self.dp_rank:
             raise ValueError(
                 f"snapshot dp_rank={snapshot.dp_rank} does not match writer dp_rank={self.dp_rank}"
-        )
+            )
 
         with file_lock(self.fd, fcntl.LOCK_EX):
             self._write_payload(snapshot)

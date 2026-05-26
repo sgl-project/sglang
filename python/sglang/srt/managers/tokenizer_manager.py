@@ -80,9 +80,7 @@ from sglang.srt.managers.multimodal_processor import get_mm_processor, import_pr
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
-from sglang.srt.managers.tokenizer_manager_score_mixin import (
-    TokenizerManagerScoreMixin,
-)
+from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
 from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
@@ -379,7 +377,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
 
         self.load_snapshot_reader = create_load_snapshot_reader(
-            self.server_args, port_args, caller="tokenizer",
+            self.server_args,
+            port_args,
+            caller="tokenizer",
         )
 
     def init_running_status(self):

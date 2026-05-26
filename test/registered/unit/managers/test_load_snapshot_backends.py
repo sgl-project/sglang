@@ -6,10 +6,6 @@ import time
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
-
-maybe_stub_sgl_kernel()
-
 from sglang.srt.managers.load_snapshot import (
     LoadSnapshot,
     ShmLoadSnapshotReader,
@@ -22,6 +18,10 @@ from sglang.srt.managers.load_snapshot import (
     should_use_zmq,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -46,9 +46,7 @@ def _warmup_zmq(writers, reader, attempts=20, interval=0.05):
     received = set()
     for _ in range(attempts):
         for w in writers:
-            w.write(
-                LoadSnapshot(dp_rank=w.dp_rank, timestamp=-1.0, num_running_reqs=0)
-            )
+            w.write(LoadSnapshot(dp_rank=w.dp_rank, timestamp=-1.0, num_running_reqs=0))
         time.sleep(interval)
         for rank in expected:
             load = reader.read(rank)
@@ -56,9 +54,7 @@ def _warmup_zmq(writers, reader, attempts=20, interval=0.05):
                 received.add(rank)
         if received >= expected:
             return
-    raise RuntimeError(
-        f"warmup failed: expected {expected}, received {received}"
-    )
+    raise RuntimeError(f"warmup failed: expected {expected}, received {received}")
 
 
 class TestShmRoundTrip(CustomTestCase):
@@ -151,9 +147,7 @@ class TestZmqRoundTrip(CustomTestCase):
 
             for rank, w in enumerate(writers):
                 w.write(
-                    LoadSnapshot(
-                        dp_rank=rank, num_running_reqs=rank + 1, timestamp=3.0
-                    )
+                    LoadSnapshot(dp_rank=rank, num_running_reqs=rank + 1, timestamp=3.0)
                 )
             time.sleep(0.05)
 
@@ -199,14 +193,14 @@ class TestZmqRoundTrip(CustomTestCase):
             writer.write(LoadSnapshot(dp_rank=0, num_running_reqs=1, timestamp=1.0))
         finally:
             writer.close()
-            ipc_path = addr[len("ipc://"):]
+            ipc_path = addr[len("ipc://") :]
             if os.path.exists(ipc_path):
                 os.unlink(ipc_path)
 
     def test_reader_ipc_cleanup(self):
         addr = _ipc_addr()
         shm_path = _temp_path()
-        ipc_path = addr[len("ipc://"):]
+        ipc_path = addr[len("ipc://") :]
         reader = ZmqShmLoadSnapshotReader(addr, shm_path, dp_size=1)
         self.assertTrue(os.path.exists(ipc_path))
         reader.close()
@@ -218,8 +212,11 @@ class TestZmqRoundTrip(CustomTestCase):
 class TestFactoryFunctions(CustomTestCase):
     def test_shm_mode(self):
         server_args = SimpleNamespace(
-            enable_dp_attention=False, nnodes=1, dp_size=1,
-            load_balance_method="round_robin", node_rank=0,
+            enable_dp_attention=False,
+            nnodes=1,
+            dp_size=1,
+            load_balance_method="round_robin",
+            node_rank=0,
         )
         port_args = SimpleNamespace(instance_id="test_shm_factory")
         writer = create_load_snapshot_writer(
@@ -231,14 +228,18 @@ class TestFactoryFunctions(CustomTestCase):
         reader.close()
         writer.close()
         from sglang.srt.managers.load_snapshot import shm_path_for
+
         path = shm_path_for("test_shm_factory")
         if os.path.exists(path):
             os.unlink(path)
 
     def test_zmq_mode_via_env(self):
         server_args = SimpleNamespace(
-            enable_dp_attention=False, nnodes=1, dp_size=1,
-            load_balance_method="round_robin", node_rank=0,
+            enable_dp_attention=False,
+            nnodes=1,
+            dp_size=1,
+            load_balance_method="round_robin",
+            node_rank=0,
         )
         port_args = SimpleNamespace(instance_id="test_zmq_factory")
         os.environ["SGLANG_LOAD_SNAPSHOT_USE_ZMQ"] = "1"
@@ -278,6 +279,7 @@ class TestZmqAddr(CustomTestCase):
 
     def test_tcp_from_port_args(self):
         from sglang.srt.utils.network import NetworkAddress
+
         port_args = SimpleNamespace(
             instance_id="myinstance",
             load_collector_ipc_name=NetworkAddress("10.0.0.1", 29506).to_tcp(),

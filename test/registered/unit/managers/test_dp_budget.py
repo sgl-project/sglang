@@ -47,8 +47,12 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         budget = DPBudget(dp_size=2)
         budget.update_budget(
             [
-                _load(dp_rank=0, timestamp=1.0, num_used_tokens=100, num_total_tokens=150),
-                _load(dp_rank=1, timestamp=1.0, num_used_tokens=80, num_total_tokens=80),
+                _load(
+                    dp_rank=0, timestamp=1.0, num_used_tokens=100, num_total_tokens=150
+                ),
+                _load(
+                    dp_rank=1, timestamp=1.0, num_used_tokens=80, num_total_tokens=80
+                ),
             ]
         )
         self.assertEqual(budget.total_tokens, [150, 80])
@@ -57,9 +61,15 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         budget = DPBudget(dp_size=3)
         budget.update_budget(
             [
-                _load(dp_rank=0, timestamp=1.0, num_running_reqs=10, num_total_tokens=100),
-                _load(dp_rank=1, timestamp=1.0, num_running_reqs=20, num_total_tokens=200),
-                _load(dp_rank=2, timestamp=1.0, num_running_reqs=30, num_total_tokens=300),
+                _load(
+                    dp_rank=0, timestamp=1.0, num_running_reqs=10, num_total_tokens=100
+                ),
+                _load(
+                    dp_rank=1, timestamp=1.0, num_running_reqs=20, num_total_tokens=200
+                ),
+                _load(
+                    dp_rank=2, timestamp=1.0, num_running_reqs=30, num_total_tokens=300
+                ),
             ]
         )
         budget.update_budget(

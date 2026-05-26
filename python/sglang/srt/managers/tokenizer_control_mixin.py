@@ -4,14 +4,7 @@ import asyncio
 import logging
 import time
 import uuid
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Dict,
-    List,
-    Optional,
-    Tuple,
-)
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
 
@@ -821,9 +814,7 @@ class TokenizerControlMixin:
             List of LoadSnapshot, one per scheduler (filtered by dp_rank if specified)
         """
         self.auto_create_handle_loop()
-        if dp_rank is not None and (
-            dp_rank < 0 or dp_rank >= self.server_args.dp_size
-        ):
+        if dp_rank is not None and (dp_rank < 0 or dp_rank >= self.server_args.dp_size):
             return []
 
         reader = self.load_snapshot_reader

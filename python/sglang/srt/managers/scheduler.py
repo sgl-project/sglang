@@ -27,10 +27,6 @@ from functools import partial
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
-from sglang.srt.utils.common import suppress_noisy_warnings
-
-suppress_noisy_warnings()
-
 import psutil
 import setproctitle
 import torch
@@ -144,10 +140,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.load_snapshot import (
-    LoadSnapshot,
-    create_load_snapshot_writer,
-)
+from sglang.srt.managers.load_snapshot import LoadSnapshot, create_load_snapshot_writer
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
@@ -167,26 +160,18 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.managers.scheduler_components.dp_attn import (
-    SchedulerDPAttnAdapter,
-)
-from sglang.srt.managers.scheduler_components.flush_wrapper import (
-    SchedulerFlushWrapper,
-)
+from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
+from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
     create_scheduler_watchdog,
 )
-from sglang.srt.managers.scheduler_components.ipc_channels import (
-    SchedulerIpcChannels,
-)
+from sglang.srt.managers.scheduler_components.ipc_channels import SchedulerIpcChannels
 from sglang.srt.managers.scheduler_components.kv_events_publisher import (
     SchedulerKvEventsPublisher,
 )
-from sglang.srt.managers.scheduler_components.load_inquirer import (
-    SchedulerLoadInquirer,
-)
+from sglang.srt.managers.scheduler_components.load_inquirer import SchedulerLoadInquirer
 from sglang.srt.managers.scheduler_components.logprob_result_processor import (
     SchedulerLogprobResultProcessor,
 )
@@ -256,7 +241,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import is_npu, suppress_noisy_warnings
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -266,6 +251,9 @@ from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+
+suppress_noisy_warnings()
+
 
 if is_mps():
     CudaStreamContext = nullcontext
@@ -650,9 +638,7 @@ class Scheduler(
                 return
         writer.publish_counter = 0
         try:
-            result = self.load_inquirer.get_loads(
-                GetLoadsReqInput(include=["all"])
-            )
+            result = self.load_inquirer.get_loads(GetLoadsReqInput(include=["all"]))
             writer.write(LoadSnapshot.from_get_loads_output(result))
         except Exception as e:
             logger.warning("load snapshot publish failed: %s", e)
@@ -3776,6 +3762,7 @@ class Scheduler(
         self, schedule_batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
         pass
+
 
 def dispatch_event_loop(scheduler: Scheduler):
     # Dispatch to the appropriate event loop based on the disaggregation mode

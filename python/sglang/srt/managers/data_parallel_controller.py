@@ -19,12 +19,13 @@ import multiprocessing as mp
 import signal
 import threading
 import time
-from enum import auto, Enum
+from enum import Enum, auto
 from typing import Callable, List, Optional
 
 import psutil
 import setproctitle
 import zmq
+
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
@@ -54,14 +55,14 @@ from sglang.srt.utils.common import (
     maybe_reindex_device_id,
 )
 from sglang.srt.utils.network import (
+    NetworkAddress,
     bind_port,
     get_zmq_socket,
     get_zmq_socket_on_host,
-    NetworkAddress,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
-from sglang.utils import get_exception_traceback, TypeBasedDispatcher
+from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +163,9 @@ class DataParallelController:
         # Load balance budget
         self.dp_budget = DPBudget(server_args.dp_size)
         self.load_snapshot_reader = create_load_snapshot_reader(
-            server_args, port_args, caller="dp_controller",
+            server_args,
+            port_args,
+            caller="dp_controller",
         )
         self._last_refresh_time = 0.0
 
