@@ -14,6 +14,7 @@ from sglang.srt.kv_canary.pool_patch.adapters.mha import attach_mha
 from sglang.srt.kv_canary.pool_patch.adapters.swa import attach_swa
 from sglang.srt.kv_canary.pool_patch.api import register_pool_attacher
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 DEFAULT_DEVICE: torch.device = torch.device("cuda")
 
@@ -193,21 +194,16 @@ def make_forward_batch(
     if out_cache_loc is None:
         out_cache_loc = torch.zeros(bs, dtype=torch.int32, device=device)
 
-    is_decode_or_idle = not (is_extend or is_target_verify or is_draft_extend_v2)
-    mode = SimpleNamespace(
-        is_extend=lambda include_draft_extend_v2=False: is_extend
-        or (include_draft_extend_v2 and is_draft_extend_v2),
-        is_extend_or_draft_extend_or_mixed=lambda include_draft_extend_v2=False: is_extend
-        or (include_draft_extend_v2 and is_draft_extend_v2),
-        is_mixed=lambda: False,
-        is_decode=lambda: is_decode_or_idle,
-        is_decode_or_idle=lambda: is_decode_or_idle,
-        is_target_verify=lambda: is_target_verify,
-        is_draft_extend=lambda include_v2=False: include_v2 and is_draft_extend_v2,
-        is_draft_extend_v2=lambda: is_draft_extend_v2,
-    )
+    if is_extend:
+        forward_mode = ForwardMode.EXTEND
+    elif is_target_verify:
+        forward_mode = ForwardMode.TARGET_VERIFY
+    elif is_draft_extend_v2:
+        forward_mode = ForwardMode.DRAFT_EXTEND_V2
+    else:
+        forward_mode = ForwardMode.DECODE
     return SimpleNamespace(
-        forward_mode=mode,
+        forward_mode=forward_mode,
         batch_size=bs,
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens,
