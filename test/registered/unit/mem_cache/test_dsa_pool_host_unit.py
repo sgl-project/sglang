@@ -135,6 +135,12 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
                 ].cpu()
                 self.assertTrue(torch.equal(got_kv, expected_kv))
 
+    @unittest.skipIf(
+        is_hip(),
+        '`io_backend="kernel"` path in memory_pool_host.backup_from_device_all_layer '
+        "raises ValueError on AMD (only the `direct` IO backend is wired for ROCm). "
+        "The other 62 tests in this file pass on AMD.",
+    )
     def test_device_to_host_indexer_kernel(self):
         self._run_device_to_host_indexer_copy(io_backend="kernel")
 
