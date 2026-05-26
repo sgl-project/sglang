@@ -239,9 +239,9 @@ In progress:
   representative valid backends listed above. Remaining Phase 4 work is limited
   to backend-specific blockers and hardware-gated paths documented in the
   implemented/deferred bullets.
-- Locally runnable Phase 2 expansion now covers the non-sparse and dense-fallback
-  method fixtures identified in this pass. Remaining Phase 2 work is sparse,
-  compressed, or hardware-gated.
+- Locally runnable Phase 2 expansion now covers the non-sparse, dense-fallback,
+  and torch-native SWA method fixtures identified in this pass. Remaining Phase 2
+  work is sparse, compressed, or hardware-gated.
 
 Next implementation steps:
 - Expand Phase 2 to additional attention methods/backends with method-specific
@@ -249,12 +249,17 @@ Next implementation steps:
   hardware-gated MLA kernels (`cutlass_mla`, `trtllm_mla`/`tokenspeed_mla` where
   hardware and KV dtype support them), dual-chunk sparse layouts, DSA
   sparse/indexer paths, and DSV4-style methods.
-- Keep `torch_native` SWA out of the matrix until the backend honors
-  `RadixAttention.sliding_window_size`.
 - Defer Phase 2 expansion for additional backends until representative Phase 3 and
   Phase 4 tests are passing.
 
 Latest verification:
+- Added torch-native SWA Phase 2 coverage and updated `TorchNativeAttnBackend` to
+  pass an explicit finite-window mask to PyTorch SDPA.
+- `python -m py_compile python/sglang/srt/layers/attention/torch_native_backend.py test/manual/attention/unittest/swa/test_torch_native.py`
+- `python test/manual/attention/unittest/swa/test_torch_native.py -v`
+  - Ran 1 test in 1.222s after adding torch-native SWA coverage.
+- `python test/manual/attention/unittest/dense/test_torch_native.py -v`
+  - Ran 2 tests in 1.273s as the torch-native dense regression check.
 - Documented the DSV4 unit-fixture blocker after checking the backend and memory
   pool shape contracts.
 - Added DSA MHA_ONE_SHOT dense prefill fallback Phase 2 coverage with a real
@@ -1143,6 +1148,8 @@ Initial implementation slice:
   boundary cases. Prefix+SWA for FlashInfer is intentionally not enabled yet
   because the current synthetic metadata fixture does not faithfully match that
   production path.
+- `swa/test_torch_native.py` covers torch-native eager SWA extend, prefix extend,
+  decode, and GQA decode window boundaries using an explicit SDPA attention mask.
 - FlashInfer cases use `head_dim=64` to match FlashInfer kernel constraints.
 - `mla/test_triton.py` and `gdn/test_triton.py` cover the representative dense-style
   input edge cases for method-specific Triton paths.
