@@ -17,6 +17,12 @@ class _PerturbReqToTokenBase(CanaryE2EBase):
     extra_env = {
         "SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB": "0.1",
         "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
+        # req_to_token perturbation deliberately corrupts the slot mapping
+        # by design, which the scheduler's on-idle invariant checker reports
+        # as a pool memory leak (perturbed slot is freed, original slot
+        # still looks busy). That's expected for this test; disable strict
+        # mode so the leak warning doesn't crash the scheduler.
+        "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "0",
     }
 
     def test_req_to_token_perturbation_reports_chain_hash_violation(self) -> None:
