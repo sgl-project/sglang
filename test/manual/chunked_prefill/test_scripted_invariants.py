@@ -14,9 +14,9 @@ returns to (or above) the initial pool counts.
 
 import unittest
 
-from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
 from sglang.test.scripted_runtime.req_handle import ReqHandle
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
+from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
@@ -26,16 +26,14 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until_all_finished,
     run_until_finished,
 )
-from sglang.test.test_utils import CustomTestCase
 
 
-class TestScriptedInvariants(CustomTestCase):
+class TestInvariantsBasic(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
+
     def test_status_unknown_before_submit(self):
         """A bare ReqHandle whose rid was never submitted reports "unknown"."""
-        execute_scripted_runtime(
-            self._script_status_unknown_before_submit,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_status_unknown_before_submit)
 
     @staticmethod
     def _script_status_unknown_before_submit(t: ScriptedRuntime):
@@ -46,10 +44,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_status_finished_after_done(self):
         """After finish, r.status == "finished" (not unknown)."""
-        execute_scripted_runtime(
-            self._script_status_finished_after_done,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_status_finished_after_done)
 
     @staticmethod
     def _script_status_finished_after_done(t: ScriptedRuntime):
@@ -60,10 +55,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_chunks_done_monotone_invariant(self):
         """Chunks_done is non-decreasing across yield steps."""
-        execute_scripted_runtime(
-            self._script_chunks_done_monotone_invariant,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_chunks_done_monotone_invariant)
 
     @staticmethod
     def _script_chunks_done_monotone_invariant(t: ScriptedRuntime):
@@ -81,10 +73,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_kv_pages_zero_after_finish(self):
         """Kv_pages drops to 0 after the req finishes."""
-        execute_scripted_runtime(
-            self._script_kv_pages_zero_after_finish,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_kv_pages_zero_after_finish)
 
     @staticmethod
     def _script_kv_pages_zero_after_finish(t: ScriptedRuntime):
@@ -95,10 +84,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_kv_pages_positive_mid_chunk(self):
         """Mid-chunked, kv_pages > 0."""
-        execute_scripted_runtime(
-            self._script_kv_pages_positive_mid_chunk,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_kv_pages_positive_mid_chunk)
 
     @staticmethod
     def _script_kv_pages_positive_mid_chunk(t: ScriptedRuntime):
@@ -110,10 +96,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_batch_composition_consistent_with_status(self):
         """If r.status == "running" then r.rid appears in batch_composition."""
-        execute_scripted_runtime(
-            self._script_batch_composition_consistent_with_status,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_batch_composition_consistent_with_status)
 
     @staticmethod
     def _script_batch_composition_consistent_with_status(t: ScriptedRuntime):
@@ -137,10 +120,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_is_idle_excludes_chunked_in_flight(self):
         """T.is_idle and chunked_in_flight_count > 0 are mutually exclusive."""
-        execute_scripted_runtime(
-            self._script_is_idle_excludes_chunked_in_flight,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_is_idle_excludes_chunked_in_flight)
 
     @staticmethod
     def _script_is_idle_excludes_chunked_in_flight(t: ScriptedRuntime):
@@ -156,10 +136,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_finish_event_count_exactly_one(self):
         """Every normally-completed req emits exactly one finish event."""
-        execute_scripted_runtime(
-            self._script_finish_event_count_exactly_one,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_finish_event_count_exactly_one)
 
     @staticmethod
     def _script_finish_event_count_exactly_one(t: ScriptedRuntime):
@@ -170,10 +147,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_kv_pages_non_negative(self):
         """Kv_pages never negative."""
-        execute_scripted_runtime(
-            self._script_kv_pages_non_negative,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_kv_pages_non_negative)
 
     @staticmethod
     def _script_kv_pages_non_negative(t: ScriptedRuntime):
@@ -188,10 +162,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_pending_middle_outputs_non_negative(self):
         """Pending_middle_outputs non-negative invariant."""
-        execute_scripted_runtime(
-            self._script_pending_middle_outputs_non_negative,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_pending_middle_outputs_non_negative)
 
     @staticmethod
     def _script_pending_middle_outputs_non_negative(t: ScriptedRuntime):
@@ -205,10 +176,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_inflight_middle_chunks_non_negative(self):
         """Inflight_middle_chunks counter stays non-negative across all yields."""
-        execute_scripted_runtime(
-            self._script_inflight_middle_chunks_non_negative,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_inflight_middle_chunks_non_negative)
 
     @staticmethod
     def _script_inflight_middle_chunks_non_negative(t: ScriptedRuntime):
@@ -221,10 +189,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_lock_refs_non_negative(self):
         """Lock_refs counter stays non-negative across all yields."""
-        execute_scripted_runtime(
-            self._script_lock_refs_non_negative,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_lock_refs_non_negative)
 
     @staticmethod
     def _script_lock_refs_non_negative(t: ScriptedRuntime):
@@ -237,10 +202,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_chunked_in_flight_count_le_one(self):
         """Main-upstream invariant: at most one chunked req in flight."""
-        execute_scripted_runtime(
-            self._script_chunked_in_flight_count_le_one,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_chunked_in_flight_count_le_one)
 
     @staticmethod
     def _script_chunked_in_flight_count_le_one(t: ScriptedRuntime):
@@ -257,10 +219,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_status_transition_monotone(self):
         """Chunks_done is non-decreasing across the chunked req's lifetime."""
-        execute_scripted_runtime(
-            self._script_status_transition_monotone,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_status_transition_monotone)
 
     @staticmethod
     def _script_status_transition_monotone(t: ScriptedRuntime):
@@ -283,10 +242,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_active_reqs_listing(self):
         """NEW API NEEDED: t.list_active_reqs() returns the currently-running set of ReqHandle objects."""
-        execute_scripted_runtime(
-            self._script_active_reqs_listing,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_active_reqs_listing)
 
     @staticmethod
     def _script_active_reqs_listing(t: ScriptedRuntime):
@@ -304,10 +260,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_batch_composition_disjoint_subsets(self):
         """Prefill / decode / chunked subsets must be disjoint."""
-        execute_scripted_runtime(
-            self._script_batch_composition_disjoint_subsets,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_batch_composition_disjoint_subsets)
 
     @staticmethod
     def _script_batch_composition_disjoint_subsets(t: ScriptedRuntime):
@@ -328,10 +281,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_finished_means_chunks_done_stable(self):
         """Once finished, chunks_done value should not change."""
-        execute_scripted_runtime(
-            self._script_finished_means_chunks_done_stable,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_finished_means_chunks_done_stable)
 
     @staticmethod
     def _script_finished_means_chunks_done_stable(t: ScriptedRuntime):
@@ -345,10 +295,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_finished_means_kv_pages_stays_zero(self):
         """After finish, kv_pages remains 0 across subsequent yields."""
-        execute_scripted_runtime(
-            self._script_finished_means_kv_pages_stays_zero,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_finished_means_kv_pages_stays_zero)
 
     @staticmethod
     def _script_finished_means_kv_pages_stays_zero(t: ScriptedRuntime):
@@ -360,10 +307,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_engine_stats_keys_present(self):
         """Engine_stats returns a dict with expected keys."""
-        execute_scripted_runtime(
-            self._script_engine_stats_keys_present,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_engine_stats_keys_present)
 
     @staticmethod
     def _script_engine_stats_keys_present(t: ScriptedRuntime):
@@ -376,10 +320,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_kv_pool_recovers_to_baseline(self):
         """Full lifecycle: pool counts return to baseline after all done."""
-        execute_scripted_runtime(
-            self._script_kv_pool_recovers_to_baseline,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_kv_pool_recovers_to_baseline)
 
     @staticmethod
     def _script_kv_pool_recovers_to_baseline(t: ScriptedRuntime):
@@ -392,10 +333,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_hundred_reqs_no_leak(self):
         """100 reqs end-to-end: KV/row/lock_ref pool counts return to baseline."""
-        execute_scripted_runtime(
-            self._script_hundred_reqs_no_leak,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_hundred_reqs_no_leak)
 
     @staticmethod
     def _script_hundred_reqs_no_leak(t: ScriptedRuntime):
@@ -411,10 +349,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_two_hundred_reqs_no_leak(self):
         """200 short reqs end-to-end leave KV pool >= baseline."""
-        execute_scripted_runtime(
-            self._script_two_hundred_reqs_no_leak,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_two_hundred_reqs_no_leak)
 
     @staticmethod
     def _script_two_hundred_reqs_no_leak(t: ScriptedRuntime):
@@ -426,10 +361,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_five_hundred_reqs_no_leak(self):
         """500 short reqs end-to-end leave KV pool >= baseline."""
-        execute_scripted_runtime(
-            self._script_five_hundred_reqs_no_leak,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_five_hundred_reqs_no_leak)
 
     @staticmethod
     def _script_five_hundred_reqs_no_leak(t: ScriptedRuntime):
@@ -441,10 +373,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_long_lived_engine_reps_chunked(self):
         """20 rounds × 5 reqs each; scheduler internal counters stay healthy."""
-        execute_scripted_runtime(
-            self._script_long_lived_engine_reps_chunked,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_long_lived_engine_reps_chunked)
 
     @staticmethod
     def _script_long_lived_engine_reps_chunked(t: ScriptedRuntime):
@@ -461,10 +390,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_sustained_long_chunked_load(self):
         """Sustained: 30 long chunked reqs."""
-        execute_scripted_runtime(
-            self._script_sustained_long_chunked_load,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_sustained_long_chunked_load)
 
     @staticmethod
     def _script_sustained_long_chunked_load(t: ScriptedRuntime):
@@ -477,10 +403,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_round_robin_short_and_chunked(self):
         """50 short followed by 5 chunked, 5 rounds."""
-        execute_scripted_runtime(
-            self._script_round_robin_short_and_chunked,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_round_robin_short_and_chunked)
 
     @staticmethod
     def _script_round_robin_short_and_chunked(t: ScriptedRuntime):
@@ -495,10 +418,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_long_decode_then_many_short(self):
         """One very long decode + many short."""
-        execute_scripted_runtime(
-            self._script_long_decode_then_many_short,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_long_decode_then_many_short)
 
     @staticmethod
     def _script_long_decode_then_many_short(t: ScriptedRuntime):
@@ -509,10 +429,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_chunked_in_flight_count_never_above_one_long_run(self):
         """50 chunked reqs over many yields; verify invariant at every step."""
-        execute_scripted_runtime(
-            self._script_chunked_in_flight_count_never_above_one_long_run,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_chunked_in_flight_count_never_above_one_long_run)
 
     @staticmethod
     def _script_chunked_in_flight_count_never_above_one_long_run(t: ScriptedRuntime):
@@ -532,10 +449,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_engine_stats_monotone_after_each_batch(self):
         """After each batch finishes, kv_pool_free non-decreasing vs end-of-prev-batch."""
-        execute_scripted_runtime(
-            self._script_engine_stats_monotone_after_each_batch,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_engine_stats_monotone_after_each_batch)
 
     @staticmethod
     def _script_engine_stats_monotone_after_each_batch(t: ScriptedRuntime):
@@ -551,10 +465,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_chunked_status_never_mid_chunk_running(self):
         """Long chunked req's status only ever takes legal values across the chunked lifecycle."""
-        execute_scripted_runtime(
-            self._script_chunked_status_never_mid_chunk_running,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_chunked_status_never_mid_chunk_running)
 
     # chunked status legal-set — during chunked admission a
     # req's externally observable status must remain in {waiting, running}
@@ -580,10 +491,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_pending_middle_outputs_caps_at_one(self):
         """Long chunked req's pending_middle_outputs is capped at 1 across its lifetime."""
-        execute_scripted_runtime(
-            self._script_pending_middle_outputs_caps_at_one,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_pending_middle_outputs_caps_at_one)
 
     # pending_middle_outputs cap — at any
     # iteration there must be at most one pending middle output; the
@@ -620,10 +528,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_status_never_finished_to_waiting(self):
         """After finish, status never rolls back to waiting / running / unknown."""
-        execute_scripted_runtime(
-            self._script_status_never_finished_to_waiting,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_status_never_finished_to_waiting)
 
     # finished is terminal — once a req has finished, its
     # observable status must never roll back to waiting / running /
@@ -641,10 +546,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_chunks_done_strictly_increases_no_plateaus(self):
         """Across consecutive non-finished yields while chunking, chunks_done is strictly increasing (no plateaus)."""
-        execute_scripted_runtime(
-            self._script_chunks_done_strictly_increases_no_plateaus,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_chunks_done_strictly_increases_no_plateaus)
 
     # chunks_done should make forward progress on every iter
     # the chunked req is actively chunking — a plateau (two consecutive
@@ -678,10 +580,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_output_tokens_len_equals_max_new_tokens_chunked(self):
         """Ignore_eos + chunked: len(output_tokens) == max_new_tokens after finish."""
-        execute_scripted_runtime(
-            self._script_output_tokens_len_equals_max_new_tokens_chunked,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_output_tokens_len_equals_max_new_tokens_chunked)
 
     # output-state contract: when ignore_eos=True forces decode
     # to run to completion across max_new_tokens iters, the recorded
@@ -710,10 +609,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_num_input_tokens_equals_prompt_len_for_chunked(self):
         """Chunked req's num_input_tokens equals prompt_len even after multi-chunk admission."""
-        execute_scripted_runtime(
-            self._script_num_input_tokens_equals_prompt_len_for_chunked,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_num_input_tokens_equals_prompt_len_for_chunked)
 
     # output-state contract: r.num_input_tokens must reflect the
     # original prompt length regardless of how many chunks the prefill
@@ -734,10 +630,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_chunked_in_flight_count_exactly_zero_after_finish(self):
         """After finish, chunked_in_flight_count() stays exactly 0 for several idle yields."""
-        execute_scripted_runtime(
-            self._script_chunked_in_flight_count_exactly_zero_after_finish,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_chunked_in_flight_count_exactly_zero_after_finish)
 
     # post-finish invariant: a long chunked req must observe
     # chunked_in_flight_count() == 1 while in flight, then == 0 for at
@@ -761,10 +654,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_pending_middle_outputs_zero_at_idle_yields(self):
         """After finish + 5 idle yields, pending_middle_outputs is 0."""
-        execute_scripted_runtime(
-            self._script_pending_middle_outputs_zero_at_idle_yields,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_pending_middle_outputs_zero_at_idle_yields)
 
     # post-finish invariant: once a chunked req finishes, the
     # pending_middle_outputs counter on the handle must drain to 0 and
@@ -783,10 +673,7 @@ class TestScriptedInvariants(CustomTestCase):
 
     def test_decode_side_chunked_req_always_none(self):
         """Pure decode workload: get_chunked_req_rid() is always None."""
-        execute_scripted_runtime(
-            self._script_decode_side_chunked_req_always_none,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_decode_side_chunked_req_always_none)
 
     # scheduler.py decode-side branch: when the workload
     # is pure decode (no req with a chunked prefill), the scheduler's
