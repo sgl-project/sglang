@@ -995,7 +995,6 @@ class TestScriptedSpecialCase(CustomTestCase):
             yield
         raise AssertionError("chunked req did not finish")
 
-
     def test_init_next_round_input_resets_chunk_state(self):
         """[c-S16] Across two chunks of one req, fill_ids_len is reset to prefix_indices_len before next admit."""
         execute_scripted_runtime(
@@ -1166,9 +1165,9 @@ class TestScriptedSpecialCase(CustomTestCase):
         prev_chunks_done = r.chunks_done
         progressed = False
         for _ in range(DEFAULT_MAX_STEPS):
-            assert not t.is_idle, (
-                "scheduler must not go idle while a chunked req is in flight"
-            )
+            assert (
+                not t.is_idle
+            ), "scheduler must not go idle while a chunked req is in flight"
             cur_chunks_done = r.chunks_done
             if cur_chunks_done > prev_chunks_done:
                 progressed = True
