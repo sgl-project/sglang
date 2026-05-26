@@ -1104,9 +1104,7 @@ class TestExpectedTokenPool:
         triton_v = plans[0][0]
         n_valid = int(triton_v.verify_num_valid[0].item())
         assert n_valid == 8
-        sentinel = torch.full(
-            (n_valid,), -1, dtype=torch.int64, device=_DEVICE
-        )
+        sentinel = torch.full((n_valid,), -1, dtype=torch.int64, device=_DEVICE)
         assert torch.equal(triton_v.verify_expected_tokens[:n_valid], sentinel)
 
     def test_pool_enabled_target_offset_0_byte_equal(self) -> None:
