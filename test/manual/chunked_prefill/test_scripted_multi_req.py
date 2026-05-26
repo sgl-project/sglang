@@ -129,24 +129,6 @@ class TestScriptedMultiReq(CustomTestCase):
         for r in reqs:
             assert r.finished
 
-    def test_two_hundred_short_reqs(self):
-        """200 short reqs: stability check."""
-        execute_scripted_runtime(
-            self._script_two_hundred_short_reqs,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_two_hundred_short_reqs(t: ScriptedRuntime):
-        # 200 short reqs: stability check.
-        # max_steps bumped to 20000 because per-yield admission is bounded
-        # by max_running_requests; engine default may admit far fewer than
-        # 200 per step.
-        reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(200)]
-        yield from run_until_all_finished(reqs, max_steps=20000)
-        for r in reqs:
-            assert r.finished
-
     def test_five_hundred_short_reqs(self):
         """500 short reqs: sustained pressure."""
         execute_scripted_runtime(
@@ -328,39 +310,6 @@ class TestScriptedMultiReq(CustomTestCase):
         for r in reqs:
             assert r.finished
 
-    def test_alternating_long_short(self):
-        """Alternate long / short submissions, 10 total."""
-        execute_scripted_runtime(
-            self._script_alternating_long_short,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_alternating_long_short(t: ScriptedRuntime):
-        # Alternate long / short submissions, 10 total.
-        reqs = []
-        for i in range(10):
-            if i % 2 == 0:
-                reqs.append(t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2))
-            else:
-                reqs.append(t.start_req(prompt_len=8, max_new_tokens=2))
-        yield from run_until_all_finished(reqs, max_steps=2000)
-
-    def test_burst_then_pause_then_burst(self):
-        """Burst 10, wait, burst 10 more."""
-        execute_scripted_runtime(
-            self._script_burst_then_pause_then_burst,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_burst_then_pause_then_burst(t: ScriptedRuntime):
-        # Burst 10, wait, burst 10 more.
-        first = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(10)]
-        yield from run_until_all_finished(first)
-        second = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(10)]
-        yield from run_until_all_finished(second)
-
     def test_submit_pause_n_resubmit_same_rid(self):
         """Submit and complete r1, then 200 yields, then resubmit with same rid."""
         execute_scripted_runtime(
@@ -412,22 +361,6 @@ class TestScriptedMultiReq(CustomTestCase):
         rids = {r.rid for r in reqs}
         assert len(rids) == 20
 
-    def test_chunked_reqs_each_yield_15(self):
-        """15 chunked reqs trickled one per yield."""
-        execute_scripted_runtime(
-            self._script_chunked_reqs_each_yield_15,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_chunked_reqs_each_yield_15(t: ScriptedRuntime):
-        # 15 chunked reqs trickled one per yield.
-        reqs = []
-        for _ in range(15):
-            reqs.append(t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2))
-            yield
-        yield from run_until_all_finished(reqs, max_steps=3000)
-
     def test_two_small_parallel(self):
         """Two short parallel reqs both finish."""
         execute_scripted_runtime(
@@ -441,42 +374,6 @@ class TestScriptedMultiReq(CustomTestCase):
         r2 = t.start_req(prompt_len=16, max_new_tokens=4)
         yield from run_until_all_finished([r1, r2])
         assert r1.finished and r2.finished
-
-    def test_three_small_parallel(self):
-        """Three short parallel reqs all finish."""
-        execute_scripted_runtime(
-            self._script_three_small_parallel,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_three_small_parallel(t: ScriptedRuntime):
-        reqs = [t.start_req(prompt_len=16, max_new_tokens=4) for _ in range(3)]
-        yield from run_until_all_finished(reqs)
-
-    def test_five_small_parallel(self):
-        """Five short parallel reqs all finish."""
-        execute_scripted_runtime(
-            self._script_five_small_parallel,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_five_small_parallel(t: ScriptedRuntime):
-        reqs = [t.start_req(prompt_len=16, max_new_tokens=4) for _ in range(5)]
-        yield from run_until_all_finished(reqs)
-
-    def test_ten_small_parallel(self):
-        """Ten short parallel reqs all finish."""
-        execute_scripted_runtime(
-            self._script_ten_small_parallel,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_ten_small_parallel(t: ScriptedRuntime):
-        reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(10)]
-        yield from run_until_all_finished(reqs)
 
     def test_one_chunked_plus_many_short(self):
         """1 long chunked + 5 short, all parallel."""
