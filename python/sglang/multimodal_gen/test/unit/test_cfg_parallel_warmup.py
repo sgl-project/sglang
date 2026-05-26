@@ -13,6 +13,7 @@ All tests are CPU-only; no model loading, no distributed init.
 
 import unittest
 from collections import deque
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -24,6 +25,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
+    ImageVAEEncodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
 )
@@ -312,6 +316,22 @@ class TestFlux2FinetunedVaeEncodePreprocess(unittest.TestCase):
         output = config.preprocess_vae_encode(image, vae)
 
         self.assertIs(output, image)
+
+
+class TestImageVaeEncodingLatentRetrieval(unittest.TestCase):
+    def test_retrieve_latents_accepts_encoder_output_latents(self):
+        stage = object.__new__(ImageVAEEncodingStage)
+        latents = torch.zeros(1, 32, 8, 8)
+        encoder_output = SimpleNamespace(latents=latents)
+
+        self.assertIs(
+            stage.retrieve_latents(encoder_output, sample_mode="argmax"),
+            latents,
+        )
+        self.assertIs(
+            stage.retrieve_latents(encoder_output, sample_mode="sample"),
+            latents,
+        )
 
 
 class TestInputValidationCfgParallelGuard(unittest.TestCase):
