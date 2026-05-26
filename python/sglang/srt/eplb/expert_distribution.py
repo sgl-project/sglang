@@ -329,8 +329,6 @@ class _SinglePassGatherer(ABC):
                 return _DeepepLowLatencySinglePassGatherer(
                     expert_location_metadata, rank
                 )
-            elif server_args.deepep_mode == "auto":
-                return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
 
