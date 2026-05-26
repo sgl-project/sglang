@@ -2348,7 +2348,11 @@ class ServerArgs:
                 model_arch=model_arch,
                 support_mamba_cache=False,
             )
-        elif model_arch in ["NemotronHForCausalLM"]:
+        elif model_arch in [
+            "NemotronHForCausalLM",
+            "NemotronH_Nano_VL_V2",
+            "NemotronH_Nano_Omni_Reasoning_V3",
+        ]:
             from sglang.srt.arg_groups.nemotron_h_hook import (
                 apply_nemotron_h_defaults,
             )

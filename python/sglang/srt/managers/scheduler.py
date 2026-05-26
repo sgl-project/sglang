@@ -677,10 +677,14 @@ class Scheduler(
         initialize_mamba_selective_state_update_backend(self.server_args)
 
     def init_moe_gemm_config(self):
-        # For the MM models, check the text_config for MoE settings
-        config_to_check = getattr(
-            self.model_config.hf_config, "text_config", self.model_config.hf_config
-        )
+        # For multimodal wrappers, the LLM sub-config may live under any of
+        # `text_config`, `llm_config`, `language_config`, or `thinker_config`.
+        # `hf_text_config` already resolves the right one via `get_hf_text_config`.
+        # Using the ad-hoc `text_config` fallback here misses e.g. NemotronH
+        # VL/Omni wrappers (which nest under `llm_config`), causing
+        # `initialize_moe_config` to be skipped and the runtime MoE backend
+        # global to stay None -> AUTO.
+        config_to_check = self.model_config.hf_text_config
 
         # Different MoE architectures expose the per-token expert count under
         # different attribute names (e.g. Gemma4 uses ``top_k_experts``).
