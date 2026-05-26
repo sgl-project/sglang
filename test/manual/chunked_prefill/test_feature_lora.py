@@ -1,4 +1,4 @@
-"""Feature (i): LoRA + chunked prefill.
+"""LoRA + chunked prefill.
 
 Manual fixture for the chunked-prefill refactor accuracy net. The
 LoRA-drainer × chunked-resume deadlock fixed in commit 5ed4faf0ab lives
@@ -21,7 +21,7 @@ import unittest
 from test.manual.chunked_prefill.common import ChunkedRefactorTestBase
 
 
-class TestChunkedFeatureI_LoRA(ChunkedRefactorTestBase):
+class TestChunkedFeatureLoRA(ChunkedRefactorTestBase):
     model = "meta-llama/Llama-2-7b-hf"
     feature_args = [
         "--enable-lora",

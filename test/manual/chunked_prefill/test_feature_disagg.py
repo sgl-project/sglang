@@ -1,4 +1,4 @@
-"""Feature (b): PD disaggregation + chunked prefill.
+"""PD disaggregation + chunked prefill.
 
 Disagg has its own setup (separate prefill + decode servers + load balancer),
 so this fixture overrides ``setUpClass`` to use ``PDDisaggregationServerBase``
@@ -28,7 +28,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, try_cached_model
 
 
-class TestChunkedFeatureB_Disagg(PDDisaggregationServerBase, ChunkedRefactorTestBase):
+class TestChunkedFeatureDisagg(PDDisaggregationServerBase, ChunkedRefactorTestBase):
     """Disagg PD with chunked prefill on the prefill side.
 
     Multiple inheritance: PDDisaggregationServerBase provides server launch

@@ -1,4 +1,4 @@
-"""Feature (a): pipeline parallelism + dynamic chunking + chunked prefill.
+"""pipeline parallelism + dynamic chunking + chunked prefill.
 
 Manual fixture for the chunked-prefill refactor accuracy net. Combines
 ``--pp-size 2 --tp-size 2`` (template borrowed from
@@ -19,7 +19,7 @@ from test.manual.chunked_prefill.common import ChunkedRefactorTestBase
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 
 
-class TestChunkedFeatureA_PP(ChunkedRefactorTestBase):
+class TestChunkedFeaturePP(ChunkedRefactorTestBase):
     model = DEFAULT_MODEL_NAME_FOR_TEST
     feature_args = [
         "--tp-size",

@@ -1,4 +1,4 @@
-"""Feature (j): LoRA overlap loading + chunked prefill.
+"""LoRA overlap loading + chunked prefill.
 
 LoRA overlap loading enables async adapter weight transfer. The
 interaction surface with chunked prefill is the in-flight loading state
@@ -6,8 +6,13 @@ when a chunked-resume request needs an adapter that's still being loaded
 — this fixture stresses that with multiple adapters available and
 ``--enable-lora-overlap-loading``.
 
-Reuses the same adapters as feature (i) but adds the overlap-loading
-flag. Bug surface includes the cancellation path fixed in PR #25413.
+Reference config sources:
+  - LoRA base + adapter set: ``python/sglang/test/lora_utils.py``
+    (``CI_MULTI_LORA_MODELS``), same as ``test_feature_lora.py``
+  - Overlap-loading flag and unit-level coverage:
+    ``test/registered/lora/test_lora_overlap_loading.py``
+  - Cancellation-path bug surface: PR #25413
+    ("[lora] Fix overlap loading for cancelled requests")
 
 GPU requirement: 1 GPU (large).
 
@@ -19,7 +24,7 @@ import unittest
 from test.manual.chunked_prefill.common import ChunkedRefactorTestBase
 
 
-class TestChunkedFeatureJ_LoRAOverlap(ChunkedRefactorTestBase):
+class TestChunkedFeatureLoRAOverlap(ChunkedRefactorTestBase):
     model = "meta-llama/Llama-2-7b-hf"
     feature_args = [
         "--enable-lora",

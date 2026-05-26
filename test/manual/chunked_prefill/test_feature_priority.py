@@ -1,4 +1,4 @@
-"""Feature (g): priority scheduling + chunked prefill.
+"""priority scheduling + chunked prefill.
 
 The early-exit guards in the chunked admission loop have explicit
 ``not self.enable_priority_preemption`` branches (see scheduler.py
@@ -22,7 +22,7 @@ from test.manual.chunked_prefill.common import ChunkedRefactorTestBase
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
-class TestChunkedFeatureG_Priority(ChunkedRefactorTestBase):
+class TestChunkedFeaturePriority(ChunkedRefactorTestBase):
     model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
     feature_args = [
         "--enable-priority-scheduling",

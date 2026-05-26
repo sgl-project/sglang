@@ -1,4 +1,4 @@
-"""Feature (k): DP attention + chunked prefill.
+"""DP attention + chunked prefill.
 
 DP attention runs per-rank scheduler instances synchronized via DP
 broadcast. The interaction with chunked prefill lives in the per-rank
@@ -20,7 +20,7 @@ from test.manual.chunked_prefill.common import ChunkedRefactorTestBase
 from sglang.test.test_utils import DEFAULT_MLA_MODEL_NAME_FOR_TEST
 
 
-class TestChunkedFeatureK_DPAttention(ChunkedRefactorTestBase):
+class TestChunkedFeatureDPAttention(ChunkedRefactorTestBase):
     model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
     feature_args = [
         "--trust-remote-code",

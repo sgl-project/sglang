@@ -1,4 +1,4 @@
-"""Feature (e): speculative decoding (EAGLE) + chunked prefill.
+"""speculative decoding (EAGLE) + chunked prefill.
 
 Manual fixture for the chunked-prefill refactor accuracy net. Spec verify
 forms the canonical last-chunk-in-flight scenario alongside the target
@@ -21,7 +21,7 @@ from test.manual.chunked_prefill.common import ChunkedRefactorTestBase
 from sglang.test.test_utils import DEFAULT_DRAFT_MODEL_EAGLE, DEFAULT_TARGET_MODEL_EAGLE
 
 
-class TestChunkedFeatureE_Spec(ChunkedRefactorTestBase):
+class TestChunkedFeatureSpec(ChunkedRefactorTestBase):
     model = DEFAULT_TARGET_MODEL_EAGLE
     feature_args = [
         "--speculative-algorithm",

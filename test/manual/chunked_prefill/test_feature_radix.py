@@ -1,4 +1,4 @@
-"""Feature (f): radix cache prefix match + chunked prefill.
+"""radix cache prefix match + chunked prefill.
 
 Mixed-prefix gsm8k is the perfect workload for this feature: mode 0 (25%
 of requests) all share a single prefix, mode 1 (25%) shares within
@@ -21,7 +21,7 @@ from test.manual.chunked_prefill.common import ChunkedRefactorTestBase
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
-class TestChunkedFeatureF_Radix(ChunkedRefactorTestBase):
+class TestChunkedFeatureRadix(ChunkedRefactorTestBase):
     model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
     feature_args = [
         "--max-total-tokens",

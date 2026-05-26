@@ -1,4 +1,4 @@
-"""Feature (c): hybrid SWA + chunked prefill.
+"""hybrid SWA + chunked prefill.
 
 Sliding-window attention is only exercised when the prompt exceeds the
 window size; below that, SWA degenerates to full attention and we measure
@@ -24,7 +24,7 @@ from test.manual.chunked_prefill.common import (
 )
 
 
-class TestChunkedFeatureC_HybridSWA(ChunkedRefactorTestBase):
+class TestChunkedFeatureHybridSWA(ChunkedRefactorTestBase):
     model = "openai/gpt-oss-20b"
     num_shots = LONG_PROMPT_NUM_SHOTS
     feature_args = [
