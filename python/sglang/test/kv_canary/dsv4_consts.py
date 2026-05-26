@@ -2,11 +2,6 @@ from __future__ import annotations
 
 from typing import Final
 
-# DSV4 server args for the kv_canary manual baseline test. Mirrors the
-# minimal TP=4 + DP=4 + deepep + EAGLE-MTP set from
-# ``test/manual/dsv4/test_dsv4_flash_sanity_dp4.py``. The kv_canary baseline
-# only needs the smallest viable launch — no chunked prefill tuning, no
-# alternate EP / TP layout.
 DSV4_DEEPEP_CONFIG: Final[str] = (
     '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 )
@@ -38,8 +33,6 @@ DSV4_POOL_SERVER_ARGS: Final[tuple[str, ...]] = (
     "4",
 )
 
-# DSV4 server environment toggles that the kv_canary baseline test needs;
-# mirrors ``DSV4_FLASH_ENV`` in the manual dsv4 sanity tests.
 DSV4_POOL_SERVER_ENV: Final[dict[str, str]] = {
     "SGLANG_DSV4_FP4_EXPERTS": "0",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",

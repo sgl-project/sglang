@@ -1,21 +1,3 @@
-"""DSV4 baseline kv_canary e2e (manual, not registered in CUDA CI).
-
-Runs the kv_canary baseline against ``sgl-project/DeepSeek-V4-Flash-FP8`` on
-a 4-GPU host. Not registered with ``register_cuda_ci`` because no CI runner
-class fits DSV4 (the model requires TP=4 minimum and there is no DSV4 tiny
-variant).
-
-Invocation:
-
-    cd /Users/tom/main/workspaces/ws-main/worktrees/sglang-dev-a
-    python -m unittest test.manual.kv_canary.test_self_e2e_baseline_dsv4 -v
-
-The DSV4 adapter degrades to slot-lifecycle-only canary (no real-KV
-fingerprint) because ``DeepSeekV4SingleKVPool`` stores 584 bytes/token which
-is not 16-aligned. See ``sglang.srt.kv_canary.pool_patch.adapters.dsv4`` for
-the explanation.
-"""
-
 from __future__ import annotations
 
 import unittest
