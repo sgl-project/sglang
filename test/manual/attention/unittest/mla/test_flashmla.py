@@ -227,36 +227,9 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
                     **MLA_SHAPE_KWARGS,
                 )
 
-    # ------------------------------------------------------------------
-    # Direct FlashMLA target_verify metadata assertions for M14/M15/M16.
-    #
-    # The earlier eager + replay verify tests went green even when the
-    # production code:
-    #   - added `+1` to seq_lens (M14),
-    #   - dropped `+ num_draft_tokens` in eager target_verify (M15), or
-    #   - dropped `+ num_draft_tokens` in replay target_verify (M16).
-    # The reason was twofold:
-    #   1. For the existing `prefix_lens=(4, 7)` + `draft=3` case, the
-    #      "correct" and "mutated" `seq_lens` both fit comfortably inside
-    #      a single PAGE_SIZE=64 block, so the constructed
-    #      `block_kv_indices` was identical.
-    #   2. `forward_extend` recomputes its own `cache_seqlens =
-    #      forward_batch.seq_lens + num_draft_tokens` from the
-    #      *unmutated* batch fields and only reads the first
-    #      `cdiv(cache_seqlens, PAGE_SIZE)` block entries, so any extra
-    #      entries M14 might add are never read by the kernel.
-    # The reliable signal is therefore the *shape* and per-row
-    # population of `block_kv_indices`, which directly encodes the
-    # mutated `seq_lens` regardless of what `forward_extend` later does.
-    # We choose `prefix_lens=(61, 63)` with `draft=3` so:
-    #   - correct: seq_lens+draft = (64, 66) -> per-row valid pages
-    #     (1, 2), `max_seqlen_pad = 2`.
-    #   - M14: seq_lens+draft+1 = (65, 67) -> (2, 2), pad = 2 (same
-    #     overall pad, but row 0's valid count differs).
-    #   - M15/M16: seq_lens = prefix = (61, 63) -> (1, 1), pad = 1
-    #     (overall shape changes).
-    # ------------------------------------------------------------------
-
+    # `prefix_lens=(61, 63)` with `draft=3` straddles PAGE_SIZE=64 so the
+    # constructed `block_kv_indices` shape/population differs between
+    # correct, +1, and dropped-draft variants.
     METADATA_VERIFY_CASE = MLAAttentionCase(
         name="metadata_eagle_verify_flashmla_page_boundary",
         backend="flashmla",
@@ -330,30 +303,15 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
         )
 
     def test_replay_target_verify_block_kv_indices_metadata(self):
-        # M16 only exists in `init_forward_metadata_replay_cuda_graph`,
-        # so we drive the same metadata assertion through a capture+replay
-        # cycle.
+        # Replay-only assertion: the `cuda_graph_kv_indices` buffer is
+        # initialised to `1` (not `-1`), so we can only check the slice
+        # shape, not per-row populated counts.
         case = self.METADATA_VERIFY_CASE
         num_draft_tokens = case.extend_lens[0]
         bs, expected_pad, _ = self._expected_block_kv_layout(
             case.prefix_lens, num_draft_tokens
         )
 
-        # FlashMLA's verify replay path indexes into a pre-allocated 2D
-        # `cuda_graph_kv_indices` shaped `(max_bs, ceil(max_ctx + PAGE) /
-        # PAGE)` and slices it down to `[:bs, :max_seqlen_pad]`. The
-        # *sliced* metadata is what the FlashMLA kernel sees, so we
-        # assert its column count: that's `cdiv(max(seq_lens +
-        # num_draft_tokens) / PAGE_SIZE)`. Dropping `+ num_draft_tokens`
-        # (M16) shrinks this column count for the configured
-        # page-boundary prefix lens (61+3=64 stays at 1 page, 63+3=66
-        # crosses into 2 pages, so the correct column count is 2; M16
-        # collapses to max(cdiv(61,64), cdiv(63,64))=1).
-        # NOTE: This assertion intentionally uses *only* the slice shape
-        # because the underlying `cuda_graph_kv_indices` buffer is
-        # initialised to `1` (not `-1`), so "populated" entries cannot
-        # be counted by sentinel comparison the way the eager path
-        # allows.
         fixture = self._build_target_verify_metadata_fixture(case)
         backend = fixture.backend
         with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):

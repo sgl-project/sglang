@@ -149,44 +149,17 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend, topk=topk):
                 run_gdn_eagle_verify_cuda_graph_case(self, case, topk=topk)
 
-    # ------------------------------------------------------------------
-    # Focused HybridLinearAttnBackend dispatch tests (M19, M20).
-    #
-    # The GDN fixture already wraps the linear backend in
-    # `HybridLinearAttnBackend`, but the dispatch-layer mutations
-    # `attn_backend_list[1:]` (M20, eager) and `attn_backend_list[:1]`
-    # (M19, replay) escaped detection because:
-    #   - The GDN fixture sets `full_attn_layers=[]`, so all real
-    #     forward calls go through the linear backend; skipping the
-    #     full backend's `init_forward_metadata` is therefore a no-op
-    #     for the actual attention output.
-    #   - The cuda-graph capture batch and replay batch use the same
-    #     `req_pool_indices` shape and arange, so the linear backend's
-    #     `state_indices_list[bs - 1]` ends up holding the same values
-    #     whether or not the replay path runs. Skipping the linear
-    #     backend's replay therefore leaves a metadata buffer that
-    #     *coincidentally* matches the replay-time mamba indices.
-    # These two test methods avoid the coincidence-driven invisibility
-    # by spying directly on each sub-backend's
-    # `init_forward_metadata*` methods. Any dispatch-layer slice
-    # mutation will reduce the call count for at least one sub-backend
-    # and the assertion will trip.
-    # ------------------------------------------------------------------
+    # Spy directly on each sub-backend's `init_forward_metadata*` so
+    # dispatch-layer slice mutations show up as a missing call, which
+    # forward-output assertions can miss when the fixture happens to
+    # use identical capture/replay metadata.
 
     def _make_dispatch_spy_backend(self):
-        # Use plain MagicMock subclasses of the production
-        # AttentionBackend / MambaAttnBackendBase types so the
-        # HybridLinearAttnBackend constructor accepts them. We only
-        # need spy semantics on the `init_forward_metadata*` family;
-        # everything else can stay as the default mock.
         full_attn_backend = MagicMock(name="full_attn_backend")
-        # Use plain attributes for the buffer refs the wrapper aliases
-        # in `__init__`.
+        # `HybridLinearAttnBackend.__init__` aliases these buffer refs.
         full_attn_backend.token_to_kv_pool = object()
         full_attn_backend.req_to_token_pool = object()
 
-        # MambaAttnBackendBase isinstance check is loose; a MagicMock
-        # passes through the wrapper unchanged.
         linear_attn_backend = MagicMock(
             spec=MambaAttnBackendBase, name="linear_attn_backend"
         )
@@ -252,9 +225,8 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
         )
 
     def test_hybrid_dispatch_capture_init_forward_metadata_fan_out(self):
-        # Capture isn't on the mutation list directly, but the wrapper
-        # mirrors the same `for ... in attn_backend_list` shape, so a
-        # similar slice mutation would silently miss without a spy.
+        # Capture mirrors the eager/replay loop shape; a slice mutation
+        # there would silently miss without a spy.
         backend, full_attn_backend, linear_attn_backend = (
             self._make_dispatch_spy_backend()
         )

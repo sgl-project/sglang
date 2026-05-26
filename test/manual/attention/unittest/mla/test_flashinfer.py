@@ -220,41 +220,6 @@ class TestFlashInferMLAAttentionBackendCorrectness(CustomTestCase):
                     **MLA_SHAPE_KWARGS,
                 )
 
-    # M12 (mutation journal): mutating
-    # `flashinfer_mla_backend.py:318` from `prefix_lens=None` to
-    # `prefix_lens=forward_batch.seq_lens` in the eager target_verify
-    # branch was MISSED. After tracing the call chain:
-    #
-    #   `FlashInferMLAAttnBackend.init_forward_metadata`
-    #     -> `FlashInferMLAIndicesUpdaterPrefill.update`
-    #     -> `FlashInferMLAIndicesUpdaterPrefill.call_begin_forward`
-    #
-    # `call_begin_forward` branches on `spec_info is None`. The
-    # target_verify branch always supplies a non-None `spec_info`
-    # (built by `_make_eagle_verify_input`), which means the
-    # `spec_info` branch is taken and `paged_kernel_lens` /
-    # `kv_indptr` are derived from `spec_info.generate_attn_arg_prefill`
-    # alone. The `prefix_lens` parameter is *never* consumed in that
-    # branch (see `python/sglang/srt/layers/attention/flashinfer_mla_backend.py`
-    # around lines 853-863), so the M12 mutation truly has no
-    # observable effect.
-    #
-    # We deliberately do not add a test that "catches" M12: doing so
-    # would require an artificial dependency on `prefix_lens` that the
-    # production code does not actually have, which would make the
-    # test fragile against legitimate refactors. Instead we record the
-    # finding here and in `MUTATION_FIXES.md`.
-    @unittest.skip(
-        "M12 is a no-op in production: the `prefix_lens=None` argument at "
-        "flashinfer_mla_backend.py:318 (eager target_verify) flows to "
-        "FlashInferMLAIndicesUpdaterPrefill.call_begin_forward, which only "
-        "uses prefix_lens in the `spec_info is None` branch. Target_verify "
-        "always supplies a non-None spec_info, so the mutation is "
-        "structurally undetectable."
-    )
-    def test_eager_target_verify_prefix_lens_is_noop(self):
-        raise AssertionError("documentation-only skip; see docstring above")
-
 
 if __name__ == "__main__":
     unittest.main()
