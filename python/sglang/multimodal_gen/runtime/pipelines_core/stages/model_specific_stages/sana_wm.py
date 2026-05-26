@@ -16,9 +16,10 @@
 # Text encoding is handled upstream by the standard TextEncodingStage (Gemma-2).
 # After this stage, the Req batch contains all fields needed by DenoisingStage.
 
-from typing import Optional
+from typing import Any
 
 import numpy as np
+import os
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
@@ -33,6 +34,77 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+_SANA_WM_DIAGNOSTICS_ENVS = (
+    "SGLANG_SANA_WM_DIAGNOSTICS",
+    "SGLANG_SANA_WM_LOG_TENSOR_STATS",
+)
+
+
+def sana_wm_diagnostics_enabled() -> bool:
+    """Whether to emit detailed SANA-WM tensor-quality diagnostics."""
+    return any(
+        os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on", "debug"}
+        for name in _SANA_WM_DIAGNOSTICS_ENVS
+    )
+
+
+def log_sana_wm_tensor_stats(label: str, tensor: torch.Tensor | None) -> None:
+    """Log compact tensor statistics for reference-quality alignment.
+
+    Enable with ``SGLANG_SANA_WM_DIAGNOSTICS=1``. The fingerprint is a strided
+    sum over at most ~4096 values, useful for spotting deterministic drift
+    without dumping full tensors.
+    """
+    if not sana_wm_diagnostics_enabled():
+        return
+    if tensor is None:
+        logger.info("[SANA-WM diagnostics] %s: None", label)
+        return
+    if not isinstance(tensor, torch.Tensor):
+        logger.info(
+            "[SANA-WM diagnostics] %s: non-tensor type=%s",
+            label,
+            type(tensor).__name__,
+        )
+        return
+
+    with torch.no_grad():
+        data = tensor.detach()
+        if data.numel() == 0:
+            logger.info(
+                "[SANA-WM diagnostics] %s: shape=%s dtype=%s device=%s empty",
+                label,
+                tuple(data.shape),
+                data.dtype,
+                data.device,
+            )
+            return
+
+        stats = data.float()
+        finite = torch.isfinite(stats)
+        finite_ratio = float(finite.float().mean().item())
+        finite_stats = stats[finite] if bool(finite.any().item()) else stats.reshape(-1)
+        flat = finite_stats.reshape(-1)
+        stride = max(1, flat.numel() // 4096)
+        fingerprint = float(flat[::stride].sum().item())
+        std = float(finite_stats.std(unbiased=False).item())
+        logger.info(
+            "[SANA-WM diagnostics] %s: shape=%s dtype=%s device=%s "
+            "finite=%.6f min=%.6g max=%.6g mean=%.6g std=%.6g "
+            "l2=%.6g fingerprint=%.6g",
+            label,
+            tuple(data.shape),
+            data.dtype,
+            data.device,
+            finite_ratio,
+            float(finite_stats.min().item()),
+            float(finite_stats.max().item()),
+            float(finite_stats.mean().item()),
+            std,
+            float(torch.linalg.vector_norm(finite_stats).item()),
+            fingerprint,
+        )
 
 
 class SanaWMBeforeDenoisingStage(PipelineStage):
@@ -68,8 +140,14 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
     ) -> torch.Tensor:
         """Encode a single image frame through the VAE encoder."""
         vae = self.vae
-        vae_dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
-        vae_dtype = vae_dtype_map.get(self.pipeline_config.vae_precision, torch.bfloat16)
+        vae_dtype_map = {
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+            "fp32": torch.float32,
+        }
+        vae_dtype = vae_dtype_map.get(
+            self.pipeline_config.vae_precision, torch.bfloat16
+        )
 
         # Normalize image to [-1, 1] range expected by the VAE
         if image.max() > 1.01:
@@ -80,20 +158,83 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         if image.dim() == 4:
             image = image.unsqueeze(2)
 
-        z = vae.encode(image).mean.float()
+        log_sana_wm_tensor_stats("first_frame.pixel_input_normalized", image)
+        z = self._extract_vae_latents(vae.encode(image)).float()
 
-        # Apply shift and scaling factors if present
-        if hasattr(vae, "shift_factor") and vae.shift_factor is not None:
-            sf = vae.shift_factor
-            z = z - (sf.to(z.device, z.dtype) if isinstance(sf, torch.Tensor) else sf)
-
-        scale = vae.scaling_factor if hasattr(vae, "scaling_factor") else 1.0
-        if isinstance(scale, torch.Tensor):
-            z = z * scale.to(z.device, z.dtype)
+        latents_mean = getattr(vae, "latents_mean", None)
+        latents_std = getattr(vae, "latents_std", None)
+        scaling_factor = self._get_vae_scaling_factor(vae)
+        if sana_wm_diagnostics_enabled():
+            logger.info(
+                "[SANA-WM diagnostics] VAE encode normalization: "
+                "has_latents_mean_std=%s scaling_factor=%.6g",
+                isinstance(latents_mean, torch.Tensor)
+                and isinstance(latents_std, torch.Tensor),
+                scaling_factor,
+            )
+        if isinstance(latents_mean, torch.Tensor) and isinstance(
+            latents_std, torch.Tensor
+        ):
+            latents_mean = latents_mean.to(device=z.device, dtype=z.dtype).view(
+                1, -1, 1, 1, 1
+            )
+            latents_std = latents_std.to(device=z.device, dtype=z.dtype).view(
+                1, -1, 1, 1, 1
+            )
+            z = (z - latents_mean) * scaling_factor / latents_std
         else:
-            z = z * scale
+            # Legacy VAE convention: encode applies shift before scaling.
+            shift_factor = getattr(vae, "shift_factor", None)
+            if shift_factor is not None:
+                z = z - (
+                    shift_factor.to(z.device, z.dtype)
+                    if isinstance(shift_factor, torch.Tensor)
+                    else shift_factor
+                )
+            z = z * scaling_factor
 
+        log_sana_wm_tensor_stats("first_frame.latent_normalized", z)
         return z.to(dtype=dtype)  # (1, 128, 1, H_sp, W_sp)
+
+    @staticmethod
+    def _extract_vae_latents(encoded: Any) -> torch.Tensor:
+        """Return deterministic VAE latents from common Diffusers outputs."""
+        latent_dist = getattr(encoded, "latent_dist", None)
+        if latent_dist is not None:
+            if hasattr(latent_dist, "mode"):
+                return latent_dist.mode()
+            mean = getattr(latent_dist, "mean", None)
+            if isinstance(mean, torch.Tensor):
+                return mean
+            if callable(mean):
+                return mean()
+            if hasattr(latent_dist, "sample"):
+                return latent_dist.sample()
+
+        if isinstance(encoded, tuple) and encoded:
+            return SanaWMBeforeDenoisingStage._extract_vae_latents(encoded[0])
+        if isinstance(encoded, torch.Tensor):
+            return encoded
+        raise TypeError(
+            "Unsupported VAE encode output for SANA-WM first-frame conditioning: "
+            f"{type(encoded).__name__}"
+        )
+
+    def _get_vae_scaling_factor(self, vae) -> float:
+        scaling_factor = (
+            getattr(getattr(vae, "config", None), "scaling_factor", None)
+            or getattr(vae, "scaling_factor", None)
+            or getattr(
+                self.pipeline_config.vae_config.arch_config,
+                "scaling_factor",
+                None,
+            )
+            or 1.0
+        )
+        if isinstance(scaling_factor, torch.Tensor):
+            return float(scaling_factor.item())
+        scaling_factor = float(scaling_factor)
+        return 1.0 if scaling_factor == 0.0 else scaling_factor
 
     # -----------------------------------------------------------------------
     # Helper: initialize noise latents
@@ -123,6 +264,14 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         """Replace latents[:, :, 0] with VAE-encoded first frame."""
         import PIL.Image
 
+        if isinstance(condition_image, list):
+            if len(condition_image) == 0:
+                logger.warning(
+                    "condition_image list is empty; skipping first-frame splice."
+                )
+                return latents
+            condition_image = condition_image[0]
+
         # Convert PIL to tensor if needed
         if isinstance(condition_image, PIL.Image.Image):
             import torchvision.transforms.functional as TF
@@ -131,6 +280,8 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             img_tensor = condition_image.float()
             if img_tensor.dim() == 3:
                 img_tensor = img_tensor.unsqueeze(0)
+            elif img_tensor.dim() == 5 and img_tensor.shape[2] == 1:
+                img_tensor = img_tensor.squeeze(2)
         else:
             logger.warning("condition_image type unsupported; skipping first-frame splice.")
             return latents
@@ -147,6 +298,11 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                 mode="bilinear",
                 align_corners=False,
             )
+            self.log_info(
+                "First-frame condition image resized to %dx%d for VAE encode.",
+                target_w,
+                target_h,
+            )
 
         first_frame_z = self._vae_encode_image(img_tensor, dtype, device)
         # first_frame_z: (1, 128, 1, H_sp, W_sp) — expand to batch
@@ -155,6 +311,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         # Splice: replace the first temporal latent frame
         latents = latents.clone()
         latents[:, :, 0:1] = first_frame_z
+        log_sana_wm_tensor_stats("latents.after_first_frame_splice", latents)
         return latents
 
     # -----------------------------------------------------------------------
@@ -188,6 +345,15 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
         timesteps = scheduler.timesteps
         sigmas = scheduler.sigmas.tolist()
+        if sigmas:
+            self.log_info(
+                "FlowMatch timesteps prepared: steps=%d, flow_shift=%.4f, "
+                "sigma_start=%.6f, sigma_end=%.6f",
+                num_inference_steps,
+                flow_shift,
+                float(sigmas[0]),
+                float(sigmas[-1]),
+            )
 
         batch.timesteps = timesteps
         batch.sigmas = sigmas
@@ -212,6 +378,16 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         num_frames = batch.num_frames or 49
         num_frames = self.pipeline_config.adjust_num_frames(num_frames)
         batch.num_frames = num_frames
+        self.log_info(
+            "SANA-WM prepare: seed=%s, size=%dx%d, frames=%d, "
+            "vae_stride=%s, diagnostics=%s",
+            getattr(batch, "seed", None),
+            batch.width,
+            batch.height,
+            num_frames,
+            self.pipeline_config.vae_stride,
+            "on" if sana_wm_diagnostics_enabled() else "off",
+        )
 
         # --- 1. Generator for reproducibility ---
         seed = batch.seed if hasattr(batch, "seed") and batch.seed is not None else 0
@@ -223,6 +399,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         latent_shape = self.pipeline_config.prepare_latent_shape(batch, batch_size, num_frames)
         # latent_shape: (B, 128, T_latent, H_sp, W_sp)
         latents = self._prepare_noise_latents(latent_shape, dtype, device, generator)
+        log_sana_wm_tensor_stats("latents.initial_noise", latents)
 
         # Store raw shape for DecodingStage
         batch.raw_latent_shape = latent_shape
@@ -339,8 +516,12 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
 
         if camera_conditions is not None:
             batch.extra["camera_conditions"] = camera_conditions.to(device=device, dtype=dtype)
+            log_sana_wm_tensor_stats(
+                "camera_conditions", batch.extra["camera_conditions"]
+            )
         if chunk_plucker is not None:
             batch.extra["chunk_plucker"] = chunk_plucker.to(device=device, dtype=dtype)
+            log_sana_wm_tensor_stats("chunk_plucker", batch.extra["chunk_plucker"])
 
         # --- 5. Prepare timesteps and sigmas ---
         batch = self._prepare_timesteps(batch, server_args, device)

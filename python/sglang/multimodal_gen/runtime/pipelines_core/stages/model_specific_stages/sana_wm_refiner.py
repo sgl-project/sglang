@@ -41,6 +41,10 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_refiner_transformer impor
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
+    log_sana_wm_tensor_stats,
+    sana_wm_diagnostics_enabled,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
@@ -217,14 +221,22 @@ class SanaWMLTX2RefinerStage(PipelineStage):
             )
         stacked = torch.stack(per_layer_hidden, dim=-1)  # (B, L, D, n_layers)
         seq_lengths = attention_mask.sum(dim=-1)
+        log_sana_wm_tensor_stats("refiner.text_hidden_states_stacked", stacked)
         prompt_embeds = _pack_text_embeds(
             stacked,
             seq_lengths,
             padding_side=tokenizer.padding_side,
         ).to(dtype=self.dtype)
+        log_sana_wm_tensor_stats("refiner.prompt_embeds_packed", prompt_embeds)
 
         video_text_embedding, _, video_attention_mask = self.connectors(
             prompt_embeds, attention_mask
+        )
+        log_sana_wm_tensor_stats(
+            "refiner.video_text_embedding", video_text_embedding
+        )
+        log_sana_wm_tensor_stats(
+            "refiner.video_attention_mask", video_attention_mask
         )
         return (
             video_text_embedding.to(device=device, dtype=self.dtype),
@@ -247,6 +259,17 @@ class SanaWMLTX2RefinerStage(PipelineStage):
             raise ValueError(
                 f"Stage-1 latent has {z.shape[2]} frames but sink_size={sink_size}."
             )
+        self.log_info(
+            "SANA-WM refiner start: latent=%s, fps=%.3f, seed=%d, "
+            "sink_size=%d, sigmas=%s, diagnostics=%s",
+            tuple(z.shape),
+            fps,
+            seed,
+            sink_size,
+            STAGE_2_DISTILLED_SIGMA_VALUES,
+            "on" if sana_wm_diagnostics_enabled() else "off",
+        )
+        log_sana_wm_tensor_stats("refiner.input_latent", z)
 
         prompt_embeds, prompt_attention_mask = self._encode_prompt(prompt, device)
         # Reshape mask to additive bias the same way `_forward_video_only` did.
@@ -262,11 +285,14 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         start_sigma = float(sigmas[0])
         sink = z[:, :, :sink_size].contiguous()
         current = z[:, :, sink_size:].contiguous()
+        log_sana_wm_tensor_stats("refiner.sink_latent", sink)
+        log_sana_wm_tensor_stats("refiner.current_latent_clean", current)
         gen = torch.Generator(device=device).manual_seed(int(seed))
         eps = torch.randn(
             current.shape, generator=gen, device=device, dtype=self.dtype
         )
         noisy = (1.0 - start_sigma) * current + start_sigma * eps
+        log_sana_wm_tensor_stats("refiner.current_latent_noisy_initial", noisy)
 
         patch_size = int(self.transformer.patch_size)
         patch_size_t = int(self.transformer.patch_size_t)
@@ -322,8 +348,16 @@ class SanaWMLTX2RefinerStage(PipelineStage):
             velocity_current = velocity_5d[:, :, sink_size:].to(self.dtype)
             dt = (sigmas[step_idx + 1] - sigma).to(self.dtype)
             noisy = noisy + velocity_current * dt
+            log_sana_wm_tensor_stats(
+                f"refiner.step_{step_idx}.velocity_current", velocity_current
+            )
+            log_sana_wm_tensor_stats(
+                f"refiner.step_{step_idx}.current_latent", noisy
+            )
 
-        return torch.cat([sink, noisy], dim=2)
+        refined = torch.cat([sink, noisy], dim=2)
+        log_sana_wm_tensor_stats("refiner.output_latent", refined)
+        return refined
 
     @torch.inference_mode()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
@@ -379,6 +413,7 @@ class SanaWMRefinerDecodingStage(DecodingStage):
         vae_dtype: torch.dtype,
     ) -> torch.Tensor:
         frames = super().decode(latents, server_args, vae_dtype=vae_dtype)
+        log_sana_wm_tensor_stats("refiner.decode.frames_with_sink", frames)
         if frames.ndim != 5:
             raise ValueError(
                 "SANA-WM refiner decoding expects decoded video shaped "
@@ -391,4 +426,6 @@ class SanaWMRefinerDecodingStage(DecodingStage):
             )
         # Match NVlabs `inference_sana_wm.py`: decode with the clean sink anchor,
         # then drop the first frame from the returned video.
-        return frames[:, :, 1:].contiguous()
+        frames = frames[:, :, 1:].contiguous()
+        log_sana_wm_tensor_stats("refiner.decode.frames_output", frames)
+        return frames

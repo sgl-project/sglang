@@ -103,7 +103,6 @@ class _ShortConvolution(nn.Module):
 
     Mirrors FLA's ``ShortConvolution(hidden_size, kernel_size=K)``:
       * weight shape: ``(hidden_size, 1, K)`` (groups=hidden_size)
-      * bias shape:   ``(hidden_size,)``
 
     Input is ``(B, T, C)``.  Causal padding of ``K-1`` on the left.
     """
@@ -113,8 +112,8 @@ class _ShortConvolution(nn.Module):
         self.hidden_size = hidden_size
         self.kernel_size = kernel_size
         self.weight = nn.Parameter(torch.zeros(hidden_size, 1, kernel_size))
-        self.bias = nn.Parameter(torch.zeros(hidden_size))
-        # identity init: last tap = 1, biases zero
+        # identity init: last tap = 1. The released SANA-WM checkpoint has no
+        # ShortConvolution bias tensors, so keep this module bias-free.
         with torch.no_grad():
             self.weight[:, 0, -1] = 1.0
 
@@ -122,7 +121,7 @@ class _ShortConvolution(nn.Module):
         # x: (B, T, C) -> (B, C, T) for conv1d
         x_bct = x.transpose(1, 2)
         x_pad = F.pad(x_bct, (self.kernel_size - 1, 0))
-        y = F.conv1d(x_pad, self.weight, self.bias, groups=self.hidden_size)
+        y = F.conv1d(x_pad, self.weight, bias=None, groups=self.hidden_size)
         return y.transpose(1, 2), None
 
 
@@ -1446,28 +1445,12 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     def post_load_weights(self) -> None:
         # FSDP loader initializes the model on meta and only materializes
-        # tensors that appear in the checkpoint. Two classes of state here
-        # are NOT in the upstream checkpoint and so stay on meta:
-        #   1. WanRotaryPosEmbed._freqs -- registered with persistent=False;
-        #      a derived constant that we recompute deterministically here.
-        #   2. _ShortConvolution.bias  -- the upstream NVlabs checkpoint
-        #      omits these biases (they are always zero by design, see the
-        #      ``# identity init: ... biases zero`` comment in
-        #      _ShortConvolution.__init__).
-        # Materialize both so the meta-device safety check in fsdp_load.py
-        # passes.
+        # tensors that appear in the checkpoint. WanRotaryPosEmbed._freqs is a
+        # derived, non-persistent constant, so recompute it deterministically.
         for module in self.modules():
             if isinstance(module, WanRotaryPosEmbed):
                 if module._freqs.is_meta:
                     module._init_freqs_buffer()
-            elif isinstance(module, _ShortConvolution):
-                if module.bias.is_meta:
-                    zeros = torch.zeros(
-                        module.hidden_size,
-                        dtype=module.weight.dtype,
-                        device=module.weight.device,
-                    )
-                    module.bias = nn.Parameter(zeros, requires_grad=False)
 
     # ------------------------------------------------------------------ #
     # Forward

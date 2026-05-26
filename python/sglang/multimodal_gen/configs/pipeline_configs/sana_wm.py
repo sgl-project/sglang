@@ -214,3 +214,41 @@ class SanaWMPipelineConfig(PipelineConfig):
 
     def gather_latents_for_sp(self, latents):
         return latents
+
+    def get_decode_scale_and_shift(self, device, dtype, vae):
+        """Invert the LTX-2 latent normalization used before denoising.
+
+        SANA-WM uses the LTX-2 VAE. Upstream encodes as
+        ``(z - latents_mean) * scaling_factor / latents_std`` and decodes by
+        applying the inverse transform.
+        """
+        latents_mean = getattr(vae, "latents_mean", None)
+        latents_std = getattr(vae, "latents_std", None)
+
+        scaling_factor = (
+            getattr(getattr(vae, "config", None), "scaling_factor", None)
+            or getattr(vae, "scaling_factor", None)
+            or getattr(self.vae_config.arch_config, "scaling_factor", None)
+            or 1.0
+        )
+        if isinstance(scaling_factor, (int, float)) and float(scaling_factor) == 0.0:
+            scaling_factor = 1.0
+
+        if isinstance(latents_mean, torch.Tensor) and isinstance(
+            latents_std, torch.Tensor
+        ):
+            latents_mean = latents_mean.to(device=device, dtype=dtype).view(
+                1, -1, 1, 1, 1
+            )
+            latents_std = latents_std.to(device=device, dtype=dtype).view(
+                1, -1, 1, 1, 1
+            )
+            sf = torch.tensor(float(scaling_factor), device=device, dtype=dtype).view(
+                1, 1, 1, 1, 1
+            )
+            return sf / latents_std, latents_mean
+
+        sf = torch.tensor(float(scaling_factor), device=device, dtype=dtype).view(
+            1, 1, 1, 1, 1
+        )
+        return sf, None

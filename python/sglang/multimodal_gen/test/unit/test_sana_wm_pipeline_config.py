@@ -19,6 +19,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     SanaWMLTX2RefinerStage,
     SanaWMRefinerDecodingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
+    SanaWMBeforeDenoisingStage,
+)
 from sglang.multimodal_gen.runtime.utils.model_overlay import (
     resolve_model_overlay_target,
 )
@@ -85,6 +88,23 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         self.assertIn("encoder_attention_mask", kwargs)
         self.assertNotIn("camera_conditions", kwargs)
         self.assertNotIn("chunk_plucker", kwargs)
+
+    def test_decode_scale_and_shift_uses_ltx2_latent_stats(self) -> None:
+        vae = SimpleNamespace(
+            config=SimpleNamespace(scaling_factor=2.0),
+            latents_mean=torch.tensor([1.0, 2.0]),
+            latents_std=torch.tensor([2.0, 4.0]),
+        )
+        scale, shift = self.config.get_decode_scale_and_shift(
+            torch.device("cpu"), torch.float32, vae
+        )
+
+        self.assertTrue(
+            torch.equal(scale, torch.tensor([1.0, 0.5]).view(1, 2, 1, 1, 1))
+        )
+        self.assertTrue(
+            torch.equal(shift, torch.tensor([1.0, 2.0]).view(1, 2, 1, 1, 1))
+        )
 
 
 class TestSanaWMSamplingParams(unittest.TestCase):
@@ -161,6 +181,66 @@ class TestSanaWMTwoStagePipeline(unittest.TestCase):
         refiner_root, refiner_gemma_root = pipeline._resolve_refiner_paths(server_args)
         self.assertEqual(refiner_root, "/custom/refiner")
         self.assertEqual(refiner_gemma_root, "/custom/refiner/text_encoder")
+
+    def test_refiner_text_encoder_config_is_scoped_to_manual_load(self) -> None:
+        config = SanaWMPipelineConfig()
+        server_args = SimpleNamespace(pipeline_config=config)
+        original_configs = config.text_encoder_configs
+        original_precisions = config.text_encoder_precisions
+
+        saved = SanaWMTwoStagePipeline._ensure_refiner_text_encoder_config(server_args)
+        try:
+            self.assertEqual(len(config.text_encoder_configs), 2)
+            self.assertEqual(len(config.text_encoder_precisions), 2)
+            self.assertEqual(config.text_encoder_precisions[1], "bf16")
+            refiner_config = config.text_encoder_configs[1]
+            refiner_config.update_model_arch(
+                {
+                    "architectures": ["Gemma3ForConditionalGeneration"],
+                    "text_config": {"vocab_size": 10},
+                    "vision_config": {"hidden_size": 20},
+                }
+            )
+            self.assertEqual(refiner_config.text_config.vocab_size, 10)
+            self.assertEqual(refiner_config.vision_config.hidden_size, 20)
+        finally:
+            config.text_encoder_configs, config.text_encoder_precisions = saved
+
+        self.assertIs(config.text_encoder_configs, original_configs)
+        self.assertIs(config.text_encoder_precisions, original_precisions)
+
+
+class TestSanaWMBeforeDenoisingStage(unittest.TestCase):
+    def test_vae_encode_image_extracts_latent_dist_and_normalizes_ltx2(self) -> None:
+        class DummyLatentDist:
+            def mode(self):
+                return torch.tensor([[[[[3.0]]], [[[10.0]]]]])
+
+        class DummyVAE:
+            dtype = torch.float32
+            device = torch.device("cpu")
+            config = SimpleNamespace(scaling_factor=2.0)
+            latents_mean = torch.tensor([1.0, 2.0])
+            latents_std = torch.tensor([2.0, 4.0])
+
+            def encode(self, image):
+                return SimpleNamespace(latent_dist=DummyLatentDist())
+
+        stage = SanaWMBeforeDenoisingStage(
+            vae=DummyVAE(),
+            transformer=None,
+            scheduler=None,
+            pipeline_config=SanaWMPipelineConfig(),
+        )
+
+        encoded = stage._vae_encode_image(
+            torch.ones(1, 3, 1, 1),
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+
+        expected = torch.tensor([[[[[2.0]]], [[[4.0]]]]])
+        self.assertTrue(torch.equal(encoded, expected))
 
 
 class TestSanaWMRefinerStage(unittest.TestCase):

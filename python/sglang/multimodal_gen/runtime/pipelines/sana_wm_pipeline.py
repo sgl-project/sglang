@@ -10,6 +10,9 @@
 #     ... -> Denoising -> SanaWMLTX2RefinerStage
 #       -> refiner decoding (LTX-2 VAE + drop clean sink anchor frame)
 #
+import os
+from types import SimpleNamespace
+
 # Stage-2 refiner sub-modules live under `<model_path>/refiner/...` rather
 # than at the model root. We load them manually in `initialize_pipeline`
 # (mirroring how `LTX2TwoStagePipeline._initialize_premerged_stage2_transformer`
@@ -20,6 +23,7 @@
 from sglang.multimodal_gen.configs.models.dits.sana_wm_refiner import (
     SanaWMRefinerConfig,
 )
+from sglang.multimodal_gen.configs.models.encoders.gemma_3 import Gemma3Config
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
@@ -43,6 +47,26 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     default_sana_wm_refiner_dtype,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+
+class _SanaWMRefinerGemma3Config(Gemma3Config):
+    """Gemma-3 config adapter for the SANA-WM refiner text encoder.
+
+    TextEncoderLoader supports multiple encoders by suffix, but only the first
+    encoder receives the Transformers AutoConfig object. The refiner Gemma-3
+    config is available as JSON, so convert nested dicts to attribute objects
+    here and keep the workaround local to SANA-WM.
+    """
+
+    def update_model_arch(self, source_model_dict):
+        super().update_model_arch(source_model_dict)
+        for key in ("text_config", "vision_config"):
+            value = getattr(self.arch_config, key, None)
+            if isinstance(value, dict):
+                setattr(self.arch_config, key, SimpleNamespace(**value))
 
 
 class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
@@ -131,10 +155,76 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
         super().initialize_pipeline(server_args)
         self._load_refiner_modules(server_args)
 
+    def _resolve_refiner_paths(self, server_args: ServerArgs) -> tuple[str, str]:
+        component_paths = getattr(server_args, "component_paths", {}) or {}
+        refiner_root = component_paths.get(
+            "refiner", os.path.join(self.model_path, "refiner")
+        )
+        refiner_gemma_root = component_paths.get(
+            "refiner_text_encoder",
+            component_paths.get(
+                "text_encoder_2", os.path.join(refiner_root, "text_encoder")
+            ),
+        )
+        return refiner_root, refiner_gemma_root
+
+    def _resolve_refiner_component_path(
+        self, server_args: ServerArgs, module_name: str, subpath: str
+    ) -> str:
+        component_paths = getattr(server_args, "component_paths", {}) or {}
+        if module_name in component_paths:
+            return self._resolve_component_path(server_args, module_name, subpath)
+
+        if (
+            "refiner" not in component_paths
+            and "refiner_text_encoder" not in component_paths
+        ):
+            return self._resolve_component_path(server_args, module_name, subpath)
+
+        refiner_root, refiner_gemma_root = self._resolve_refiner_paths(server_args)
+        if module_name in ("text_encoder_2", "tokenizer_2"):
+            return refiner_gemma_root
+
+        rel_subpath = subpath.removeprefix("refiner/")
+        return os.path.join(refiner_root, rel_subpath)
+
+    @staticmethod
+    def _ensure_refiner_text_encoder_config(server_args: ServerArgs):
+        """Temporarily expose the refiner Gemma-3 config to TextEncoderLoader.
+
+        The stage-1 SANA-WM pipeline has one Gemma-2 text encoder. The
+        stage-2 LTX-2 refiner carries its own Gemma-3 encoder under
+        refiner/text_encoder, loaded manually as text_encoder_2. The generic
+        TextEncoderLoader indexes configs by component suffix, so provide the
+        second config only for this manual load instead of making the stage-1
+        TextEncodingStage believe it owns two encoders.
+        """
+        pipeline_config = server_args.pipeline_config
+        saved = (
+            pipeline_config.text_encoder_configs,
+            pipeline_config.text_encoder_precisions,
+        )
+
+        configs = list(pipeline_config.text_encoder_configs)
+        while len(configs) <= 1:
+            configs.append(_SanaWMRefinerGemma3Config())
+        pipeline_config.text_encoder_configs = tuple(configs)
+
+        precisions = list(pipeline_config.text_encoder_precisions)
+        while len(precisions) <= 1:
+            precisions.append("bf16")
+        pipeline_config.text_encoder_precisions = tuple(precisions)
+        return saved
+
     def _load_refiner_modules(self, server_args: ServerArgs) -> None:
         for module_name, subpath, library in self._REFINER_SUB_MODULES:
-            component_path = self._resolve_component_path(
+            component_path = self._resolve_refiner_component_path(
                 server_args, module_name, subpath
+            )
+            logger.info(
+                "SANA-WM loading refiner component %s from %s",
+                module_name,
+                component_path,
             )
             # `transformer_2` is a different model class
             # (`SanaWMLTX2VideoRefiner`) than stage-1's
@@ -150,9 +240,14 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
             # `pipeline_config.dit_config_2` for `transformer_2`) once that
             # exists. See the SANA-WM PR's follow-up notes.
             saved_dit_config = None
+            saved_text_encoder_config = None
             if module_name == "transformer_2":
                 saved_dit_config = server_args.pipeline_config.dit_config
                 server_args.pipeline_config.dit_config = SanaWMRefinerConfig()
+            elif module_name == "text_encoder_2":
+                saved_text_encoder_config = (
+                    self._ensure_refiner_text_encoder_config(server_args)
+                )
             try:
                 module, memory_usage = PipelineComponentLoader.load_component(
                     component_name=module_name,
@@ -163,6 +258,11 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
             finally:
                 if saved_dit_config is not None:
                     server_args.pipeline_config.dit_config = saved_dit_config
+                if saved_text_encoder_config is not None:
+                    (
+                        server_args.pipeline_config.text_encoder_configs,
+                        server_args.pipeline_config.text_encoder_precisions,
+                    ) = saved_text_encoder_config
 
             self.modules[module_name] = module
             self.memory_usages[module_name] = memory_usage
