@@ -6,9 +6,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.scatter_req_token_ids import (
-    launch_scatter_req_token_ids_kernel,
-)
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag, VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
@@ -16,6 +13,9 @@ from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.plan_input import PlanInput
+from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
+    populate_req_to_expected_token_ids,
+)
 from sglang.srt.kv_canary.runner.enable_warner import _CanaryEnableWarner
 from sglang.srt.kv_canary.runner.kernel_launch import (
     invoke_plan,
@@ -144,61 +144,10 @@ class SingleForwardManager:
             )
 
         if self._config.enable_verify_token_assert:
-            self._populate_req_to_expected_token_ids(
+            populate_req_to_expected_token_ids(
                 forward_batch=maybe_inaccurate_forward_batch,
                 req_to_verify_expected_tokens=self._device_state.req_to_verify_expected_tokens,
             )
-
-    @staticmethod
-    def _populate_req_to_expected_token_ids(
-        *,
-        forward_batch: "ForwardBatch",
-        req_to_verify_expected_tokens: Optional[torch.Tensor],
-    ) -> None:
-        req_all_ids_flat_cpu = forward_batch.req_all_ids_flat
-        req_all_ids_lens_cpu = forward_batch.req_all_ids_lens
-        if req_all_ids_flat_cpu is None or req_all_ids_lens_cpu is None:
-            return
-        if req_to_verify_expected_tokens is None:
-            return
-
-        bs = int(forward_batch.req_pool_indices.shape[0])
-        if bs == 0:
-            return
-        if int(req_all_ids_lens_cpu.shape[0]) != bs:
-            raise RuntimeError(
-                f"kv-canary: req_all_ids_lens length {int(req_all_ids_lens_cpu.shape[0])} != "
-                f"batch_size {bs}; ForwardBatch snapshot diverged"
-            )
-
-        # Host cumsum (small bs); produces ``[bs + 1]`` int64 offsets. ``pin_memory=True``
-        # is required so the subsequent non_blocking H2D actually overlaps with compute.
-        offsets_cpu = torch.zeros(bs + 1, dtype=torch.int64, pin_memory=True)
-        offsets_cpu[1:] = torch.cumsum(req_all_ids_lens_cpu, dim=0)
-        total_tokens = int(offsets_cpu[bs].item())
-        if total_tokens != int(req_all_ids_flat_cpu.shape[0]):
-            raise RuntimeError(
-                f"kv-canary: cumsum(req_all_ids_lens)={total_tokens} != "
-                f"req_all_ids_flat.numel()={int(req_all_ids_flat_cpu.shape[0])}; snapshot inconsistent"
-            )
-        if total_tokens == 0:
-            return
-
-        device = req_to_verify_expected_tokens.device
-        # ForwardBatch.init_new already allocates ``req_all_ids_flat`` / ``req_all_ids_lens``
-        # as pinned-CPU tensors, so non_blocking H2D here is safe (and actually async).
-        req_all_ids_flat_dev = req_all_ids_flat_cpu.to(device, non_blocking=True)
-        offsets_dev = offsets_cpu.to(device, non_blocking=True)
-        req_pool_indices_dev = forward_batch.req_pool_indices.to(
-            device=device, dtype=torch.int64
-        )
-
-        launch_scatter_req_token_ids_kernel(
-            flat_in=req_all_ids_flat_dev,
-            offsets=offsets_dev,
-            req_pool_indices=req_pool_indices_dev,
-            pool_out=req_to_verify_expected_tokens,
-        )
 
     def pre_ops_maybe_inside_graph(
         self, forward_batch: "ForwardBatch"

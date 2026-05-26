@@ -62,7 +62,7 @@ from sglang.srt.utils import (
     is_npu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align, flatten_arrays_to_int64_tensor
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -564,21 +564,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.bootstrap_room_ids_int = bootstrap_room_ids
 
         if envs.SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT.get():
-            # Snapshot req sequences as pinned CPU int64 tensors so the canary
-            # outside-graph pre-op can H2D into a device staging buffer without
-            # racing the overlap-schedule sampler thread mutating Req.output_ids.
-            parts = [
-                arr
-                for req in batch.reqs
-                for arr in (req.origin_input_ids, req.output_ids)
-            ]
-            ret.req_all_ids_flat = flatten_arrays_to_int64_tensor(
-                parts, device=torch.device("cpu"), pin=True
+            from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
+                compute_req_all_ids_info,
             )
-            ret.req_all_ids_lens = torch.tensor(
-                [len(req.origin_input_ids) + len(req.output_ids) for req in batch.reqs],
-                dtype=torch.int64,
-                pin_memory=True,
+
+            ret.req_all_ids_flat, ret.req_all_ids_lens = compute_req_all_ids_info(
+                batch.reqs
             )
 
         if batch.extend_input_logprob_token_ids is not None:
