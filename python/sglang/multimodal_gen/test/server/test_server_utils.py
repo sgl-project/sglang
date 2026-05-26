@@ -53,6 +53,7 @@ globally_suppress_loggers()
 FIRST_DENOISE_STEP_TOLERANCE = 4.0
 FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS = 80.0
 DECODING_STAGE_MIN_ABS_TOLERANCE_MS = 450.0
+VIDEO_DENOISE_STEP_MIN_ABS_TOLERANCE_MS = 160.0
 
 # Tracks mesh output file paths from generate_mesh for later correctness validation.
 # Keyed by case_id, cleaned up after use.
@@ -658,6 +659,32 @@ class VideoPerformanceValidator(PerformanceValidator):
     """Extended validator for video diffusion with frame-level metrics."""
 
     is_video_gen = True
+
+    def _validate_denoise_steps(self, summary: PerformanceSummary) -> None:
+        """Validate individual denoising steps."""
+        for idx, actual in summary.sampled_steps.items():
+            expected = self.scenario.denoise_step_ms.get(idx)
+            if expected is None:
+                continue
+            if idx == 0:
+                self._assert_le(
+                    f"Denoise Step {idx}",
+                    actual,
+                    expected,
+                    FIRST_DENOISE_STEP_TOLERANCE,
+                    min_abs_tolerance_ms=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
+                )
+                continue
+
+            # video per-step samples can catch one-off scheduling/offload jitter;
+            # avg and median denoise checks remain the steady-state guard
+            self._assert_le(
+                f"Denoise Step {idx}",
+                actual,
+                expected,
+                self.tolerances.denoise_step,
+                min_abs_tolerance_ms=VIDEO_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
+            )
 
     def validate(
         self,
