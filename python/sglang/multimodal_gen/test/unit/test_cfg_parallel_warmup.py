@@ -319,6 +319,16 @@ class TestFlux2FinetunedVaeEncodePreprocess(unittest.TestCase):
 
 
 class TestImageVaeEncodingLatentRetrieval(unittest.TestCase):
+    def test_encode_scale_and_shift_allows_missing_shift(self):
+        latents = torch.ones(1, 4, 2, 2)
+        scaling_factor = torch.full((1, 1, 1, 1), 2.0)
+
+        output = ImageVAEEncodingStage.scale_and_shift_encode_latents(
+            latents, scaling_factor, None
+        )
+
+        self.assertTrue(torch.equal(output, torch.full_like(latents, 2.0)))
+
     def test_retrieve_latents_accepts_encoder_output_latent(self):
         stage = object.__new__(ImageVAEEncodingStage)
         latents = torch.zeros(1, 32, 8, 8)
