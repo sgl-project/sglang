@@ -2195,6 +2195,15 @@ class Scheduler(
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
+                # Invariant W2: the watchdog must not abort a req that is
+                # mid-chunked-prefill. Chunked-resume reqs sit in
+                # waiting_queue across iters while actively prefilling
+                # (their entry_time is from original arrival, so a long
+                # prefill would falsely trip the timeout). The counter
+                # records any such abort so ScriptedRuntime tests can
+                # assert it stays 0; see commit 359e5ed7bd.
+                if req.inflight_middle_chunks > 0:
+                    req.watchdog_aborted_while_chunked_resume_count += 1
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)

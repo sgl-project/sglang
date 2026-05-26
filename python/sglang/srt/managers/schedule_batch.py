@@ -856,6 +856,13 @@ class Req(ReqDllmMixin):
         # context.
         self.inflight_middle_chunks_premature_decrement_count: int = 0
 
+        # Regression instrumentation for invariant W2: the
+        # _abort_on_waiting_timeout watchdog must not abort a req that is
+        # mid-chunked-prefill (i.e., has chunks in flight). See commit
+        # 359e5ed7bd "Skip chunked-resume reqs in
+        # _abort_on_waiting_timeout" for the original fix.
+        self.watchdog_aborted_while_chunked_resume_count: int = 0
+
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
         # processed.
