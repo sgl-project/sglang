@@ -62,7 +62,7 @@ from sglang.srt.utils import (
     is_npu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, flatten_arrays_to_int64_tensor
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -436,8 +436,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # kv-canary token-id validator snapshot: per-req (origin_input_ids + output_ids)
     # captured at init_new time, so the validator does not race the overlap-schedule
-    # sampler thread mutating Req.output_ids.
-    req_truth_seqs: Optional[List[List[int]]] = None
+    # sampler thread mutating Req.output_ids. ``req_all_ids_flat`` is a pinned CPU
+    # int64 tensor flattening ``[cat(r.origin_input_ids, r.output_ids) for r in reqs]``;
+    # ``req_all_ids_lens`` is a pinned CPU int64 tensor of per-req lengths
+    # (``len(origin_input_ids) + len(output_ids)``).
+    req_all_ids_flat: Optional[torch.Tensor] = None
+    req_all_ids_lens: Optional[torch.Tensor] = None
 
     @classmethod
     def init_new(
@@ -565,9 +569,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.bootstrap_room_ids_int = bootstrap_room_ids
 
         if envs.SGLANG_KV_CANARY_ENABLE_REQ_TOKEN_IDS_CHECK.get():
-            ret.req_truth_seqs = [
-                list(req.origin_input_ids) + list(req.output_ids) for req in batch.reqs
+            # Snapshot req sequences as pinned CPU int64 tensors so the canary
+            # outside-graph pre-op can H2D into a device staging buffer without
+            # racing the overlap-schedule sampler thread mutating Req.output_ids.
+            parts = [
+                arr
+                for req in batch.reqs
+                for arr in (req.origin_input_ids, req.output_ids)
             ]
+            ret.req_all_ids_flat = flatten_arrays_to_int64_tensor(
+                parts, device=torch.device("cpu"), pin=True
+            )
+            ret.req_all_ids_lens = torch.tensor(
+                [len(req.origin_input_ids) + len(req.output_ids) for req in batch.reqs],
+                dtype=torch.int64,
+                pin_memory=True,
+            )
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
