@@ -1091,18 +1091,12 @@ class MHATokenToKVPool(KVCache):
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        if envs.SGLANG_SPEC_OOB_DETECTION.get() and tgt_loc.numel() > 0:
-            # Catch stale indices here instead of as illegal-addr or silent KV corruption.
-            size_limit = self.size + self.page_size
-            torch._assert_async(
-                (
-                    (tgt_loc >= 0)
-                    & (tgt_loc < size_limit)
-                    & (src_loc >= 0)
-                    & (src_loc < size_limit)
-                ).all(),
-                f"move_kv_cache OOB: size_limit={size_limit}",
-            )
+        # Catch stale indices here instead of as illegal-addr or silent KV corruption.
+        from sglang.srt.speculative.spec_utils import maybe_detect_oob
+
+        size_limit = self.size + self.page_size
+        maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
+        maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
 
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
