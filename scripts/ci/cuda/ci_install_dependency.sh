@@ -207,6 +207,13 @@ setup_pip_toolchain() {
     PIP_UNINSTALL_CMD="uv pip uninstall"
     PIP_UNINSTALL_SUFFIX=""
 
+    # uv venv --seed only ships pip + setuptools; older legacy setup.py
+    # builds (e.g. the human-eval clone in install_test_tools) need wheel
+    # so `bdist_wheel` resolves under --no-build-isolation.
+    if [ "$USE_VENV" = "true" ]; then
+        $PIP_CMD install wheel $PIP_INSTALL_SUFFIX
+    fi
+
     $PIP_UNINSTALL_CMD sgl-kernel sglang-kernel sglang sgl-fa4 flash-attn-4 $PIP_UNINSTALL_SUFFIX || true
 
     mark_step_done "${FUNCNAME[0]}"
