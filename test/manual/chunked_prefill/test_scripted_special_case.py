@@ -209,15 +209,26 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
 
     # idle path bypass — ``chunked_req is None`` check in
     # ``check_idle`` (scheduler.py:3174). The scheduler must not enter
-    # idle state while a chunked req is in flight.
+    # idle state while a chunked req is in flight. Verify across the
+    # whole mid-chunk window, not just at one boundary.
     @staticmethod
     def _script_no_idle_during_chunked(t: ScriptedRuntime):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
 
         # If the scheduler had idled, the chunked req would not progress.
-        assert not t.is_idle
-        yield from run_until_finished(r)
+        saw_chunking = False
+        for _ in range(DEFAULT_MAX_STEPS):
+            if r.is_chunking:
+                saw_chunking = True
+                assert (
+                    not t.is_idle
+                ), "scheduler must not idle while chunked_req is in flight"
+            if r.finished:
+                break
+            yield
+        assert r.finished
+        assert saw_chunking, "test must observe r.is_chunking at least once"
 
     def test_abort_excludes_chunked_req(self):
         """Abort path's ``chunked_req_to_exclude`` plumbing (scheduler.py:3568-3596)."""
@@ -225,7 +236,8 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
 
     # abort path's ``chunked_req_to_exclude`` plumbing
     # (scheduler.py:3568-3596). With chunked_req live in last_batch when
-    # abort fires, the exclusion set must include it.
+    # abort fires, the exclusion set must include it. W3 invariant: the
+    # dual-queue abort path must not double-release.
     @staticmethod
     def _script_abort_excludes_chunked_req(t: ScriptedRuntime):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -239,6 +251,15 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
         assert (
             t.chunked_in_flight_count() == 0
         ), f"abort must clear in-flight count; got {t.chunked_in_flight_count()}"
+        # W3 invariant — abort of a chunked req must not double-release
+        # its row + KV across the dual-queue path.
+        assert r.abort_double_release_count == 0, (
+            f"W3 invariant: abort double-released the chunked req "
+            f"{r.abort_double_release_count} times"
+        )
+        # The chunked slot must be cleared after abort.
+        assert t.get_chunked_req_rid() is None
+        assert r.kv_pages == 0
 
     def test_get_chunked_req_lambda_getter(self):
         """Scheduler.py:680 — get_chunked_req lambda."""
@@ -611,15 +632,27 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
         r = t.start_req(prompt_len=3 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         # Drive to the boundary between chunk 1 and chunk 2.
         yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
-        # At the boundary, the scheduler's fill_ids buffer for r must
-        # have been reset to its prefix_indices length (no residue from
-        # chunk 1).
-        assert r.fill_ids_len == r.prefix_indices_len, (
-            f"init_next_round_input must reset fill_ids to prefix_indices; "
-            f"fill_ids_len={r.fill_ids_len}, "
-            f"prefix_indices_len={r.prefix_indices_len}"
-        )
-        yield from run_until_finished(r)
+        # Verify the reset invariant holds at EVERY mid-chunk yield,
+        # not just at the first chunk boundary — pre-fix a residual
+        # fill_ids could regrow across consecutive chunks.
+        saw_mid_chunk = False
+        for _ in range(DEFAULT_MAX_STEPS):
+            if r.is_chunking and r.chunks_done >= 1:
+                saw_mid_chunk = True
+                assert r.fill_ids_len == r.prefix_indices_len, (
+                    f"init_next_round_input must reset fill_ids to "
+                    f"prefix_indices at every chunk boundary; "
+                    f"fill_ids_len={r.fill_ids_len}, "
+                    f"prefix_indices_len={r.prefix_indices_len}, "
+                    f"chunks_done={r.chunks_done}"
+                )
+            if r.finished:
+                break
+            yield
+        assert r.finished
+        assert (
+            saw_mid_chunk
+        ), "test must observe the fill_ids reset boundary at least once"
         assert r.finished
 
     def test_chunked_req_scheduled_last_iter_false_when_chunk_completes(self):
@@ -702,7 +735,10 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
     # the chunked_req_to_exclude set is populated from ``last_batch.reqs``
     # (the else branch), not from ``last_batch.chunked_req`` (the PP
     # branch). Observable via a runtime helper that exposes which
-    # source branch produced the exclude set.
+    # source branch produced the exclude set. S3 invariant
+    # (stale_chunked_req_merged) is specific to the PP branch — it
+    # MUST stay at 0 in the non-PP path even when chunked_req churn
+    # is happening.
     @staticmethod
     def _script_chunked_exclude_falls_back_to_last_batch_reqs_when_no_pp(
         t: ScriptedRuntime,
@@ -723,6 +759,12 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
                 # In the non-PP path the exclude set must NOT come from
                 # the chunked_req pointer.
                 assert source != "last_batch_chunked_req"
+            # S3 invariant — stale_chunked_req_merged path is PP-only;
+            # in this non-PP scheduler it must never fire.
+            assert t.stale_chunked_req_merged_count() == 0, (
+                "S3 invariant: stale chunked_req merge path must never fire "
+                "in a non-PP scheduler"
+            )
             if r1.finished and r2.finished:
                 break
             yield
@@ -731,6 +773,7 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
             "non-PP scheduler must source exclude set from last_batch.reqs "
             "(else branch) at least once during the multi-req lifetime"
         )
+        assert t.stale_chunked_req_merged_count() == 0
 
     def test_scheduler_continues_with_only_chunked_req_no_waiting(self):
         """Mid-chunk single long req: waiting_queue empty but scheduler keeps running until finish."""
