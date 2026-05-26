@@ -10,7 +10,7 @@ once the gRPC request manager is ready, regardless of whether --enable-metrics
 is set.
 """
 
-import inspect
+import asyncio
 import json
 import logging
 import time
@@ -221,37 +221,13 @@ async def serve_grpc(server_args, model_info=None):
                 exc_info=True,
             )
 
-    # Older smg-grpc-servicer releases (≤ 0.5.2) accept only (server_args,
-    # model_info) and reject the on_request_manager_ready hook. The hook is
-    # what calls _start_sidecar_server, so dropping the kwarg disables the
-    # entire HTTP sidecar (Prometheus /metrics and /start_profile +
-    # /stop_profile). Core gRPC serving still works without it.
-    serve_kwargs: dict = {}
-    sidecar_supported = (
-        "on_request_manager_ready" in inspect.signature(_serve_grpc).parameters
-    )
-    if sidecar_supported:
-        serve_kwargs["on_request_manager_ready"] = _on_request_manager_ready
-    elif server_args.enable_metrics:
-        # User explicitly asked for metrics but the installed servicer can't
-        # start the sidecar that serves them — fail loud rather than silently
-        # produce a server with no /metrics endpoint.
-        raise RuntimeError(
-            "--enable-metrics requires smg-grpc-servicer ≥ 0.5.3 (the version "
-            "that accepts 'on_request_manager_ready'); installed version "
-            "lacks the hook so the HTTP sidecar would never start. Upgrade "
-            "smg-grpc-servicer or remove --enable-metrics."
-        )
-    else:
-        logger.warning(
-            "Installed smg-grpc-servicer does not accept "
-            "'on_request_manager_ready'; HTTP sidecar disabled "
-            "(no /metrics, /start_profile, /stop_profile). "
-            "Upgrade smg-grpc-servicer to ≥ 0.5.3 to enable it."
-        )
-
     try:
-        await _serve_grpc(server_args, model_info, **serve_kwargs)
+        # Start gRPC service without callback.
+        grpc_task = asyncio.create_task(_serve_grpc(server_args, model_info))
+        # Start HTTP sidecar directly without relying on smg callback.
+        await _on_request_manager_ready(None, server_args, None)
+        # Wait for gRPC service to complete.
+        await grpc_task
     finally:
         if sidecar_runner is not None:
             try:
