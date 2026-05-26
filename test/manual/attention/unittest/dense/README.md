@@ -17,8 +17,8 @@ Columns are runner modes; rows are attention backends. Cells use:
 | `torch_native` | ✓ full MHA/GQA/MQA input sweep + decode/extend runner-eager cases | — (no `init_cuda_graph_state` / capture / replay hooks) | — (no CG path) | — (no CG path) | deferred: extend-metadata mismatch in `TARGET_VERIFY` reference | — | — | — | — | — | — | — |
 | `triton` | ✓ MHA/GQA/MQA + 10 input layouts (page 1/16/32, prefix/decode edges) | ✓ MHA/GQA/MQA decode page-boundary | ✓ MHA ragged, GQA cross-page | ✓ MHA ragged, GQA cross-page | ✓ EAGLE chain+tree, Frozen-KV-MTP chain, DFlash chain, NGRAM chain | ✓ EAGLE tree, DFlash chain, NGRAM chain | deferred: Triton `DRAFT_EXTEND` HF-ref mismatch on narrow accept layouts | — (V1 not enabled; Triton uses V2) | ✓ fixed-tokens-per-req | ✓ chain (topk=1) + tree (topk=2) | ✓ via `DRAFT_EXTEND_V2` graph runner | — (production dispatcher only wires Frozen-KV-MTP through FlashInfer-style draft backends) |
 | `flashinfer` | ✓ MHA/GQA/MQA + 10 input layouts (`head_dim=64` for SM90 prefill constraints) | ✓ MHA/GQA/MQA decode page-boundary | ✓ MHA ragged, GQA cross-page | ✓ MHA ragged, GQA cross-page | ✓ EAGLE chain+tree, Frozen-KV-MTP chain, DFlash chain, NGRAM chain | ✓ EAGLE tree, Frozen-KV-MTP chain, DFlash chain | ✓ EAGLE ragged-accept, Frozen-KV-MTP ragged-accept | ✓ EAGLE ragged-accept, Frozen-KV-MTP ragged-accept | blocked: `is_draft_extend()` default `include_v2=False` → `raise ValueError` (`flashinfer_backend.py:651,748`) | ✓ chain (topk=1) + tree (topk=2) | ✓ EAGLE ragged-accept (V1) | ✓ chain (topk=1) |
-| `fa3` | ✓ MHA/GQA/MQA input sweep (FA-friendly `head_dim=64`) | deferred: graph replay mismatches HF-ref | ✓ MHA ragged, GQA cross-page | ✓ MHA ragged, GQA cross-page | deferred: not enabled (EAGLE `TARGET_VERIFY` mismatches ~0.115) | deferred: same EAGLE/DFlash mismatch on replay | — | — | deferred: `DRAFT_EXTEND_V2` graph replay mismatches HF-ref (~0.618) | — | — | — |
-| `fa4` | ✓ MHA/GQA/MQA input sweep (FA-friendly `head_dim=64`) | deferred: same FA graph-replay mismatch as fa3 | ✓ MHA ragged, GQA cross-page | ✓ MHA ragged, GQA cross-page | deferred: same FA mismatch | deferred: same FA mismatch | — | — | deferred: same FA mismatch | — | — | — |
+| `fa3` | ✓ MHA/GQA/MQA input sweep (FA-friendly `head_dim=64`) | ✓ MHA decode page-boundary — see "FA capture-replay note" below | ✓ MHA ragged, GQA cross-page | ✓ MHA ragged, GQA cross-page | deferred: EAGLE tree (topk=2) replay diffs ~0.13 vs the bf16 HF reference (~4x the `5e-2` tree tolerance) | deferred: same kernel-level drift | — | — | deferred: `DRAFT_EXTEND_V2` graph replay still mismatches ~0.618 vs HF-ref; needs separate investigation | — | — | — |
+| `fa4` | ✓ MHA/GQA/MQA input sweep (FA-friendly `head_dim=64`) | ✓ MHA decode page-boundary — see "FA capture-replay note" below | ✓ MHA ragged, GQA cross-page | ✓ MHA ragged, GQA cross-page | deferred: same EAGLE tree replay drift as fa3 | deferred: same | — | — | deferred: same `DRAFT_EXTEND_V2` mismatch as fa3 | — | — | — |
 | `flex_attention` | ✓ MHA/GQA/MQA input sweep | blocked: no `init_cuda_graph_state` / capture / replay hooks (`torch_flex_backend.py`) | ✓ MHA ragged, GQA cross-page | ✓ MHA ragged, GQA cross-page | blocked: no CG capture/replay path | blocked: no CG capture/replay path | — | blocked: no CG capture/replay path | blocked: no CG capture/replay path | blocked: no CG capture/replay path | blocked: no CG capture/replay path | blocked: no CG capture/replay path |
 | `trtllm_mha` | ✓ decode-only MHA/GQA/MQA + page-32 boundary (prefill blocked by `Unsupported architecture`) | deferred: replay mismatches HF-ref on SM90 | — (no extend backend) | — (no extend backend) | blocked: `topk=1` only (`server_args.py:2391-2392`, `trtllm_mha_backend.py:459,492`) | blocked: same `topk=1` constraint | — | — | — | deferred: requires chain-only graph capture wiring | — | — |
 
@@ -53,9 +53,31 @@ Columns are runner modes; rows are attention backends. Cells use:
   Triton through the FlashInfer-style draft path; the dedicated runner case is
   only enabled where production routes that draft worker.
 
+## FA capture-replay note
+
+FlashAttention v3/v4 backends populate metadata buffers in
+`init_forward_metadata_replay_cuda_graph` only — their
+`init_forward_metadata_capture_cuda_graph` assigns buffer *slices* to
+metadata fields but doesn't write valid `cache_seqlens` / `page_table` /
+`cu_seqlens_k` values (unlike Triton/FlashInfer, which populate at
+capture via `create_flashinfer_kv_indices_triton`). In production the
+capture-time forward is a JIT warmup whose output is discarded, so the
+divergence never reaches a user-visible path. But the unit test asserts
+capture-time output against the HF reference, so the runner shim
+`_backend_needs_capture_replay_init` invokes
+`init_forward_metadata_replay_cuda_graph` *immediately after*
+`init_forward_metadata_capture_cuda_graph` for FA backends to populate
+the buffers before the capture forward runs. This is gated on backend
+class so non-FA backends (which populate at capture and would be
+perturbed by an extra replay-init) are unaffected.
+
 ## Next Work
 
 - Debug torch-native target-verify extend metadata.
 - Debug Triton `DRAFT_EXTEND` metadata/reference mismatch.
-- Debug FA3/FA4 CUDA graph replay and speculative graph mismatches.
+- Debug remaining FA3/FA4 speculative graph mismatches: EAGLE tree
+  verify CG (~0.13 diff vs the bf16 HF reference, ~4x the `5e-2`
+  tree tolerance) and `DRAFT_EXTEND_V2` graph replay (~0.618).
+  CG decode replay is unblocked by the
+  `_backend_needs_capture_replay_init` shim above.
 - Add backend-specific graph coverage for `trtllm_mha` once local hardware and metadata behavior allow it.
