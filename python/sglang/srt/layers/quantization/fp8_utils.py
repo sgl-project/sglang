@@ -369,14 +369,65 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
     """Dispatch MXFP8 linear kernel by --fp8-gemm-backend.
 
     For MXFP8, Triton remains the default path. We only route to FlashInfer
-    when backend is explicitly set to flashinfer_cutlass or flashinfer_trtllm.
+    when backend is explicitly set to deepgemm, flashinfer_cutlass or flashinfer_trtllm.
     """
     backend = get_fp8_gemm_runner_backend()
-    if backend.is_flashinfer_trtllm():
+    if backend.is_deep_gemm():
+        return _deepgemm_w8a8_mxfp8_linear_with_fallback
+    elif backend.is_flashinfer_trtllm():
         return flashinfer_mxfp8_blockscaled_linear
     elif backend.is_flashinfer_cutlass():
         return flashinfer_mxfp8_blockscaled_linear
     return triton_mxfp8_blockscaled_linear
+
+
+def _deepgemm_w8a8_mxfp8_linear_with_fallback(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    weight_scale_fallback: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """MXFP8 dense linear via DeepGemm fp8_fp4_gemm_nt with recipe."""
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+        w8a8_mxfp8_matmul_deepgemm,
+    )
+
+    assert input_scale is None
+    output_dtype = input.dtype
+
+    shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
+    dtype_supported = output_dtype == torch.bfloat16
+
+    if not (shape_supported and dtype_supported):
+        return triton_mxfp8_blockscaled_linear(
+            input, weight, weight_scale_fallback, input_scale, bias
+        )
+
+    input_2d = input.view(-1, input.shape[-1])
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    q_input, x_scale = sglang_per_token_group_quant_fp8(
+        input_2d,
+        32,
+        column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
+
+    # weight_scale is pre-processed in _process_mxfp8_linear_weight_scale:
+    # - DeepGemm Blackwell: int32 packed MN-major TMA-aligned (use disable_ue8m0_cast=True)
+    # - DeepGemm Hopper: float32
+    # - Triton: uint8 (handled by triton_mxfp8_blockscaled_linear fallback above)
+
+    output = w8a8_mxfp8_matmul_deepgemm(
+        q_input, weight, x_scale, weight_scale, output_dtype=output_dtype
+    )
+    if bias is not None:
+        output += bias
+    return output.to(dtype=output_dtype).view(*output_shape)
 
 
 def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:

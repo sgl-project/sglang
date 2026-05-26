@@ -119,6 +119,16 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     block_shape: Optional[List[int]] = None
     # DSV4 mxfp4 layout flag; selects recipe_a=(1,128)/recipe_b=(1,32) downstream.
     is_fp4_experts: bool = False
+    use_mxfp8: bool = False
+
+    def __post_init__(self):
+        if self.use_mxfp8:
+            assert self.block_shape == [1, 32], (
+                f"MXFP8 requires block_shape [1, 32], got {self.block_shape}"
+            )
+            assert deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0, (
+                "MXFP8 requires DEEPGEMM_SCALE_UE8M0=True"
+            )
 
 
 class DeepGemmRunnerCore(MoeRunnerCore):
@@ -378,11 +388,18 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         w13_scale = quant_info.w13_scale
         w2_scale = quant_info.w2_scale
 
-        recipe_a, recipe_b = (
-            ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
-        )
-
         hidden_states_device = running_state["hidden_states_device"]
+
+        use_mxfp8 = quant_info.use_mxfp8
+        scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
+
+        if use_mxfp8:
+            recipe_a = tuple(quant_info.block_shape)
+            recipe_b = tuple(quant_info.block_shape)
+        elif quant_info.is_fp4_experts:
+            recipe_a, recipe_b = (1, 128), (1, 32)
+        else:
+            recipe_a, recipe_b = None, None
 
         # GroupGemm-0
         if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
@@ -437,24 +454,36 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     gateup_output, swiglu_limit=self.swiglu_limit
                 )
                 gateup_output = einops.rearrange(
-                    gateup_output, "(grp tok) hidden -> grp tok hidden", grp=num_groups
+                    gateup_output,
+                    "(grp tok) hidden -> grp tok hidden",
+                    grp=num_groups,
                 )
 
         # Act
         down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant(
             gateup_output,
             masked_m,
-            group_size=128,
+            group_size=scale_block_size,
             topk=self.config.top_k,
             swiglu_limit=swiglu_limit_arg,
             swizzle=self.use_swizzle,
+            gemm1_alpha=self.config.gemm1_alpha,
+            gemm1_clamp_limit=self.config.gemm1_clamp_limit,
         )
         del gateup_output
 
         # GroupGemm-1
         n = w2_weight.shape[1]
 
-        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        if use_mxfp8 and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            import deep_gemm.utils.layout
+
+            down_input_scale = (
+                deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+                    down_input_scale
+                )
+            )
+        elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 down_input_scale
             )
@@ -593,6 +622,7 @@ def pre_permute_standard_to_deep_gemm(
             hidden_states,
             runner_config.top_k,
             quant_info.block_shape,
+            use_mxfp8=quant_info.use_mxfp8,
         )
     )
 
@@ -826,6 +856,8 @@ def _varlen_deep_gemm_silu_mul_quant(
     topk: int,
     swiglu_limit: Optional[float] = None,
     swizzle: bool = False,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_clamp_limit: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
     from sglang.srt.layers.quantization.fp8_kernel import (
@@ -833,6 +865,9 @@ def _varlen_deep_gemm_silu_mul_quant(
     )
 
     if _MASKED_GEMM_FAST_ACT:
+        assert gemm1_alpha is None, (
+            "gemm1_alpha is not supported with SGLANG_MASKED_GEMM_FAST_ACT"
+        )
         assert not swizzle, (
             "SGLANG_OPT_FIX_MEGA_MOE_MEMORY is incompatible with "
             "SGLANG_MASKED_GEMM_FAST_ACT (swizzled layout only supported by JIT act)"
@@ -864,7 +899,7 @@ def _varlen_deep_gemm_silu_mul_quant(
         dtype=torch.float8_e4m3fn,
     )
 
-    if envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get():
+    if envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get() and gemm1_alpha is None:
         assert N % 4 == 0 and G % 4 == 0
         packed_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         down_input_scale = torch.empty(
@@ -887,12 +922,18 @@ def _varlen_deep_gemm_silu_mul_quant(
         if packed_ue8m0:
             down_input_scale = down_input_scale.transpose(-1, -2)
     else:
-        assert (
-            swiglu_limit is None
-        ), "swiglu_limit (DeepSeek V4) requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
-        assert (
-            not swizzle
-        ), "SGLANG_OPT_FIX_MEGA_MOE_MEMORY requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+        if gemm1_alpha is not None:
+            assert swiglu_limit is None, (
+                "swiglu_limit and gemm1_alpha are mutually exclusive"
+            )
+            assert not swizzle, "swizzle is not supported with gemm1_alpha"
+        else:
+            assert (
+                swiglu_limit is None
+            ), "swiglu_limit (DeepSeek V4) requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+            assert (
+                not swizzle
+            ), "SGLANG_OPT_FIX_MEGA_MOE_MEMORY requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
         down_input_scale = torch.empty(
             (E, N, G),
             device=hidden_states_device,
@@ -905,6 +946,8 @@ def _varlen_deep_gemm_silu_mul_quant(
             group_size,
             masked_m,
             scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            gemm1_alpha=gemm1_alpha or 0.0,
+            gemm1_clamp_limit=gemm1_clamp_limit or 0.0,
         )
     return down_input, down_input_scale
 

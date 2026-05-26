@@ -143,6 +143,17 @@ def deep_gemm_fp8_fp8_bf16_nt(
     deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
 
 
+@register_custom_op(mutates_args=["C"])
+def deep_gemm_mxfp8_fp8_bf16_nt(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+) -> None:
+    deep_gemm_wrapper.gemm_nt_mxfp8_f8f8bf16((A, As), (B, Bs), C)
+
+
 @triton.jit
 def _per_token_group_quant_8bit(
     # Pointers to inputs and output
@@ -331,7 +342,6 @@ def _per_token_group_quant_8bit_raw(
     if scale_ue8m0:
         from deep_gemm import transform_sf_into_required_layout
 
-        assert group_size == 128
         x_s = transform_sf_into_required_layout(
             x_s,
             num_groups=None,
@@ -401,7 +411,6 @@ def _per_token_group_quant_8bit_fuse_silu_and_mul(
         scale_ue8m0=scale_ue8m0,
     )
 
-    assert group_size == 128
     output_scale = transform_sf_into_required_layout(
         output_scale_for_kernel,
         num_groups=output.shape[0],
@@ -462,7 +471,7 @@ def create_per_token_group_quant_fp8_output_scale(
     if scale_ue8m0:
         assert column_major_scales and scale_tma_aligned
         *x_batch, x_q_mn, x_q_k = x_shape
-        x_s_mn, x_s_k = x_q_mn, x_q_k // 128
+        x_s_mn, x_s_k = x_q_mn, x_q_k // group_size
         aligned_mn = ceil_align(x_s_mn, 4)
         aligned_k = ceil_align(x_s_k, 4)
         # TODO(FIXME): Fix cuda kernel and recover here to empty.
@@ -1194,6 +1203,26 @@ def w8a8_block_fp8_matmul_deepgemm(
     assert C.dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
 
     deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
+
+    return C
+
+
+def w8a8_mxfp8_matmul_deepgemm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """MXFP8 GEMM via DeepGemm fp8_fp4_gemm_nt with recipe_a=(1,32), recipe_b=(1,32)."""
+    assert A.is_contiguous() and B.is_contiguous()
+    assert output_dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+
+    M = A.numel() // A.shape[-1]
+    N, K = B.shape
+    C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
+
+    deep_gemm_mxfp8_fp8_bf16_nt(A, As, B, Bs, C)
 
     return C
 
