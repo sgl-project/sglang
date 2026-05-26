@@ -2518,6 +2518,10 @@ class Scheduler(
                     self.running_batch.reqs,
                 )
 
+        shared_hicache_pending_rids = self._prepare_shared_hicache_for_schedule_batch(
+            self._shared_hicache_schedule_candidates(self.waiting_queue, running_bs)
+        )
+
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -2549,7 +2553,7 @@ class Scheduler(
                     req.rid
                 )
 
-            if not self._prepare_shared_hicache_for_schedule(req):
+            if str(req.rid) in shared_hicache_pending_rids:
                 continue
 
             self._init_next_round_input_with_shared_hicache_tp_sync(req)

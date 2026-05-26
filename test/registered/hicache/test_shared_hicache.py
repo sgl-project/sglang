@@ -30,6 +30,9 @@ from sglang.srt.mem_cache.shared_hicache.plan import (
     SHARED_HICACHE_DIRECT_TIMEOUT_REASON,
     SharedHiCachePlan,
 )
+from sglang.srt.mem_cache.shared_hicache.scheduler_mixin import (
+    SharedHiCacheSchedulerMixin,
+)
 from sglang.srt.mem_cache.shared_hicache.service import format_control_endpoint
 from sglang.srt.mem_cache.shared_hicache.source import (
     ResolvedHostPage,
@@ -229,6 +232,66 @@ class FakeTokenizerManager:
             yield {"ok": True}
 
         return _gen()
+
+
+class FakeSharedHiCacheReq:
+    def __init__(self, rid, shared_hicache_plan=True):
+        self.rid = rid
+        self.shared_hicache_plan = shared_hicache_plan
+        self.shared_hicache_max_prefix_len = None
+        self.init_calls = []
+
+    def init_next_round_input(self, tree_cache=None, cow_mamba=None):
+        self.init_calls.append(
+            {
+                "tree_cache": tree_cache,
+                "cow_mamba": cow_mamba,
+                "max_prefix_len": self.shared_hicache_max_prefix_len,
+            }
+        )
+
+
+class FakeSharedHiCacheScheduler(SharedHiCacheSchedulerMixin):
+    def __init__(
+        self,
+        manager,
+        tp_size=2,
+        *,
+        allocatable_reqs=2,
+        prefill_max_requests=None,
+    ):
+        self.shared_hicache_manager = manager
+        self.ps = SimpleNamespace(tp_size=tp_size)
+        self.tp_cpu_group = object()
+        self.tree_cache = object()
+        self.server_args = SimpleNamespace(prefill_max_requests=prefill_max_requests)
+        self.allocatable_reqs = allocatable_reqs
+        self.chunked_req = None
+        self.enable_priority_preemption = False
+
+    def get_num_allocatable_reqs(self, running_bs):
+        return self.allocatable_reqs
+
+
+class FakeSharedHiCacheScheduleManager:
+    def __init__(self, *, plans, results):
+        self.plans = dict(plans)
+        self.results = dict(results)
+        self.prepared = []
+        self.released = []
+
+    def has_reuse_plan(self, req):
+        return self.plans.get(req.rid, False)
+
+    def prepare_reuse(self, req):
+        self.prepared.append(req.rid)
+        result = self.results[req.rid]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def release_request(self, rid):
+        self.released.append(str(rid))
 
 
 def _make_manager(tree=None):
@@ -901,6 +964,104 @@ class TestSharedHiCache(unittest.TestCase):
 
         self.assertEqual(result, {"ok": True})
         self.assertEqual(engine.tokenizer_manager.requests[0].shared_hicache_plan, plan)
+
+    def test_scheduler_batches_shared_hicache_tp_coordination(self):
+        manager = FakeSharedHiCacheScheduleManager(
+            plans={"rid-1": True, "rid-2": True, "rid-3": False},
+            results={
+                "rid-1": SimpleNamespace(pending=False, prefix_len=8),
+                "rid-2": SimpleNamespace(pending=True, prefix_len=0),
+            },
+        )
+        scheduler = FakeSharedHiCacheScheduler(manager, tp_size=2)
+        reqs = [
+            FakeSharedHiCacheReq("rid-1"),
+            FakeSharedHiCacheReq("rid-2"),
+            FakeSharedHiCacheReq("rid-3"),
+        ]
+        all_reduce_shapes = []
+
+        def all_reduce(tensor, op, group):
+            self.assertIs(group, scheduler.tp_cpu_group)
+            all_reduce_shapes.append(tuple(tensor.shape))
+            if op == torch.distributed.ReduceOp.SUM:
+                tensor.mul_(scheduler.ps.tp_size)
+            elif op == torch.distributed.ReduceOp.MIN:
+                tensor[0] = 6
+            else:
+                raise AssertionError(f"unexpected op: {op}")
+
+        with patch("torch.distributed.all_reduce", side_effect=all_reduce):
+            pending_rids = scheduler._prepare_shared_hicache_for_schedule_batch(reqs)
+
+        self.assertEqual(pending_rids, {"rid-2"})
+        self.assertEqual(all_reduce_shapes, [(3,), (2,), (1,)])
+        self.assertEqual(manager.prepared, ["rid-1", "rid-2"])
+        self.assertEqual(reqs[0].shared_hicache_max_prefix_len, 6)
+        self.assertEqual(reqs[1].shared_hicache_max_prefix_len, 0)
+        self.assertIsNone(reqs[2].shared_hicache_max_prefix_len)
+
+        with patch(
+            "torch.distributed.all_reduce",
+            side_effect=AssertionError("final init should not all-reduce"),
+        ):
+            scheduler._init_next_round_input_with_shared_hicache_tp_sync(reqs[0])
+
+        self.assertEqual(reqs[0].init_calls[-1]["max_prefix_len"], 6)
+        self.assertIsNone(reqs[0].shared_hicache_max_prefix_len)
+
+    def test_scheduler_bounds_shared_hicache_prepare_to_candidate_prefix(self):
+        manager = FakeSharedHiCacheScheduleManager(
+            plans={f"rid-{i}": True for i in range(5)},
+            results={
+                f"rid-{i}": SimpleNamespace(pending=False, prefix_len=8)
+                for i in range(5)
+            },
+        )
+        scheduler = FakeSharedHiCacheScheduler(manager, tp_size=1, allocatable_reqs=2)
+        reqs = [FakeSharedHiCacheReq(f"rid-{i}") for i in range(5)]
+
+        candidates = scheduler._shared_hicache_schedule_candidates(reqs, running_bs=0)
+        pending_rids = scheduler._prepare_shared_hicache_for_schedule_batch(candidates)
+
+        self.assertEqual(pending_rids, set())
+        self.assertEqual([req.rid for req in candidates], ["rid-0", "rid-1", "rid-2"])
+        self.assertEqual(manager.prepared, ["rid-0", "rid-1", "rid-2"])
+        self.assertEqual(reqs[3].init_calls, [])
+        self.assertEqual(reqs[4].init_calls, [])
+
+    def test_scheduler_uses_prefill_max_requests_for_shared_hicache_prefix(self):
+        scheduler = FakeSharedHiCacheScheduler(
+            FakeSharedHiCacheScheduleManager(plans={}, results={}),
+            tp_size=1,
+            allocatable_reqs=8,
+            prefill_max_requests=2,
+        )
+        reqs = [FakeSharedHiCacheReq(f"rid-{i}") for i in range(5)]
+
+        candidates = scheduler._shared_hicache_schedule_candidates(reqs, running_bs=0)
+
+        self.assertEqual([req.rid for req in candidates], ["rid-0", "rid-1", "rid-2"])
+
+    def test_scheduler_falls_back_on_divergent_shared_hicache_plan(self):
+        manager = FakeSharedHiCacheScheduleManager(
+            plans={"rid-1": True},
+            results={"rid-1": SimpleNamespace(pending=False, prefix_len=8)},
+        )
+        scheduler = FakeSharedHiCacheScheduler(manager, tp_size=2)
+        req = FakeSharedHiCacheReq("rid-1")
+
+        def all_reduce(tensor, op, group):
+            self.assertEqual(op, torch.distributed.ReduceOp.SUM)
+            self.assertEqual(tensor.tolist(), [1])
+
+        with patch("torch.distributed.all_reduce", side_effect=all_reduce):
+            pending_rids = scheduler._prepare_shared_hicache_for_schedule_batch([req])
+
+        self.assertEqual(pending_rids, set())
+        self.assertIsNone(req.shared_hicache_plan)
+        self.assertEqual(manager.prepared, [])
+        self.assertEqual(manager.released, ["rid-1"])
 
 
 if __name__ == "__main__":
