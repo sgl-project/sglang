@@ -22,14 +22,22 @@ struct PlanEntriesParams {
   const int64_t* __restrict__ full_to_swa_lut;         // [lut_len] int64, may be nullptr when !HAS_SWA_LUT
   const int64_t* __restrict__ verify_offsets_scratch;  // [bs_padded + 1] int64 (cumulative prefix sum)
   const int32_t* __restrict__ verify_enable;           // [1] int32 — 0 ⇒ skip scatter entirely
+  // ``req_to_expected_token_ids`` is the static source-of-truth pool managed by
+  // CanaryDeviceState; nullptr / HAS_EXPECTED_TOKEN_POOL=false disables the gather and writes
+  // the ``-1`` sentinel into every active entry.
+  const int32_t* __restrict__ req_to_expected_token_ids;  // [max_reqs, max_context_len] int32, may be nullptr
   // Outputs.
   int64_t* __restrict__ out_verify_slot_indices;        // [verify_capacity] int64
   int64_t* __restrict__ out_verify_expected_positions;  // [verify_capacity] int64
+  int64_t* __restrict__ out_verify_expected_input_ids;  // [verify_capacity] int64
   int64_t* __restrict__ out_verify_prev_slot_indices;   // [verify_capacity] int64
   // Sizes / strides.
   int32_t bs_padded;
   int64_t verify_capacity;  // out_verify_*[verify_capacity]; scatter is clamped to this length.
   int64_t req_to_token_stride0;
+  int64_t req_to_expected_token_ids_stride0;
+  int64_t req_to_expected_token_ids_max_context_len;
+  int32_t expected_token_ids_offset;  // 0 for target pools; +1 for EAGLE draft.
   int32_t swa_window_size;
 };
 
@@ -64,7 +72,9 @@ SGL_DEVICE int64_t swa_translate(const int64_t* __restrict__ lut, int64_t lut_le
 
 // Persistent grid; one thread = one verify entry (with stride). Template parameter HAS_SWA_LUT switches
 // the SWA-translate path off entirely in the FULL pool variant.
-template <bool HAS_SWA_LUT>
+// HAS_EXPECTED_TOKEN_POOL toggles the source-of-truth token gather; when off, every active entry
+// writes the ``-1`` sentinel so the verify kernel skips the token-mismatch check.
+template <bool HAS_SWA_LUT, bool HAS_EXPECTED_TOKEN_POOL>
 __global__ void plan_entries_persistent_kernel(
     const PlanEntriesParams __grid_constant__ params,
     int64_t lut_len  // only meaningful when HAS_SWA_LUT
@@ -132,9 +142,23 @@ __global__ void plan_entries_persistent_kernel(
       out_prev_slot = -1;
     }
 
+    // Gather the source-of-truth token from req_to_expected_token_ids when available.
+    // Out-of-range positions (e.g. EAGLE draft's slot-N-1 rotating in a bonus token, or padding
+    // past the per-req length where the pool row is zero) write the ``-1`` sentinel so the
+    // verify kernel skips the token-mismatch check.
+    int64_t out_expected_input_id = -1;
+    if constexpr (HAS_EXPECTED_TOKEN_POOL) {
+      const int64_t sot_pos = out_position + static_cast<int64_t>(params.expected_token_ids_offset);
+      if (sot_pos >= 0 && sot_pos < params.req_to_expected_token_ids_max_context_len) {
+        const int32_t token = params.req_to_expected_token_ids[rp * params.req_to_expected_token_ids_stride0 + sot_pos];
+        out_expected_input_id = static_cast<int64_t>(token);
+      }
+    }
+
     // 4) Scatter. out_idx == tid since verify_offsets[req_id] + entry_idx == tid by construction.
     params.out_verify_slot_indices[tid] = out_slot;
     params.out_verify_expected_positions[tid] = out_position;
+    params.out_verify_expected_input_ids[tid] = out_expected_input_id;
     params.out_verify_prev_slot_indices[tid] = out_prev_slot;
   }
 }
@@ -155,9 +179,12 @@ struct PlanEntriesKernel {
       const tvm::ffi::Optional<tvm::ffi::TensorView> full_to_swa_index_mapping,
       const tvm::ffi::TensorView verify_offsets_scratch,
       const tvm::ffi::TensorView verify_enable,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> req_to_expected_token_ids,
       const tvm::ffi::TensorView out_verify_slot_indices,
       const tvm::ffi::TensorView out_verify_expected_positions,
+      const tvm::ffi::TensorView out_verify_expected_input_ids,
       const tvm::ffi::TensorView out_verify_prev_slot_indices,
+      int32_t expected_token_ids_offset,
       int32_t swa_window_size) {
     using namespace host;
 
@@ -167,6 +194,8 @@ struct PlanEntriesKernel {
     SymbolicSize Nmax_reqs = {"max_reqs"};
     SymbolicSize Nmax_seq_len = {"max_seq_len"};
     SymbolicSize Nlut = {"lut_len"};
+    SymbolicSize Npool_rows = {"req_to_expected_token_ids_rows"};
+    SymbolicSize Npool_cols = {"req_to_expected_token_ids_cols"};
     SymbolicDevice device_;
     device_.set_options<kDLCUDA>();
 
@@ -188,6 +217,7 @@ struct PlanEntriesKernel {
         .with_device<kDLCUDA>(device_)
         .verify(out_verify_slot_indices)
         .verify(out_verify_expected_positions)
+        .verify(out_verify_expected_input_ids)
         .verify(out_verify_prev_slot_indices);
     TensorMatcher({Nmax_reqs, Nmax_seq_len})  //
         .with_dtype<int32_t>()
@@ -200,6 +230,13 @@ struct PlanEntriesKernel {
           .with_device<kDLCUDA>(device_)
           .verify(full_to_swa_index_mapping.value());
     }
+    const bool has_expected_token_pool = req_to_expected_token_ids.has_value();
+    if (has_expected_token_pool) {
+      TensorMatcher({Npool_rows, Npool_cols})  //
+          .with_dtype<int32_t>()
+          .with_device<kDLCUDA>(device_)
+          .verify(req_to_expected_token_ids.value());
+    }
     RuntimeCheck(Nscratch.unwrap() >= Nbs.unwrap() + 1, "verify_offsets_scratch length must be >= bs_padded + 1");
 
     const int64_t bs_padded = Nbs.unwrap();
@@ -211,6 +248,12 @@ struct PlanEntriesKernel {
         has_swa_lut ? static_cast<const int64_t*>(full_to_swa_index_mapping.value().data_ptr()) : nullptr;
     const int64_t lut_len = has_swa_lut ? static_cast<int64_t>(Nlut.unwrap()) : 0;
 
+    const int32_t* expected_token_ids_ptr =
+        has_expected_token_pool ? static_cast<const int32_t*>(req_to_expected_token_ids.value().data_ptr()) : nullptr;
+    const int64_t expected_token_ids_stride0 = has_expected_token_pool ? static_cast<int64_t>(Npool_cols.unwrap()) : 0;
+    const int64_t expected_token_ids_max_context_len =
+        has_expected_token_pool ? static_cast<int64_t>(Npool_cols.unwrap()) : 0;
+
     const PlanEntriesParams params = PlanEntriesParams{
         .req_pool_indices = static_cast<const int64_t*>(req_pool_indices.data_ptr()),
         .prefix_lens = static_cast<const int64_t*>(prefix_lens.data_ptr()),
@@ -218,12 +261,17 @@ struct PlanEntriesKernel {
         .full_to_swa_lut = lut_ptr,
         .verify_offsets_scratch = static_cast<const int64_t*>(verify_offsets_scratch.data_ptr()),
         .verify_enable = static_cast<const int32_t*>(verify_enable.data_ptr()),
+        .req_to_expected_token_ids = expected_token_ids_ptr,
         .out_verify_slot_indices = static_cast<int64_t*>(out_verify_slot_indices.data_ptr()),
         .out_verify_expected_positions = static_cast<int64_t*>(out_verify_expected_positions.data_ptr()),
+        .out_verify_expected_input_ids = static_cast<int64_t*>(out_verify_expected_input_ids.data_ptr()),
         .out_verify_prev_slot_indices = static_cast<int64_t*>(out_verify_prev_slot_indices.data_ptr()),
         .bs_padded = static_cast<int32_t>(bs_padded),
         .verify_capacity = static_cast<int64_t>(Ncap.unwrap()),
         .req_to_token_stride0 = static_cast<int64_t>(Nmax_seq_len.unwrap()),
+        .req_to_expected_token_ids_stride0 = expected_token_ids_stride0,
+        .req_to_expected_token_ids_max_context_len = expected_token_ids_max_context_len,
+        .expected_token_ids_offset = expected_token_ids_offset,
         .swa_window_size = swa_window_size,
     };
 
@@ -235,9 +283,17 @@ struct PlanEntriesKernel {
     const dim3 block(kBlockSize);
 
     if (has_swa_lut) {
-      LaunchKernel(grid, block, device)(plan_entries_persistent_kernel<true>, params, lut_len);
+      if (has_expected_token_pool) {
+        LaunchKernel(grid, block, device)(plan_entries_persistent_kernel<true, true>, params, lut_len);
+      } else {
+        LaunchKernel(grid, block, device)(plan_entries_persistent_kernel<true, false>, params, lut_len);
+      }
     } else {
-      LaunchKernel(grid, block, device)(plan_entries_persistent_kernel<false>, params, lut_len);
+      if (has_expected_token_pool) {
+        LaunchKernel(grid, block, device)(plan_entries_persistent_kernel<false, true>, params, lut_len);
+      } else {
+        LaunchKernel(grid, block, device)(plan_entries_persistent_kernel<false, false>, params, lut_len);
+      }
     }
   }
 };

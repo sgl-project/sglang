@@ -26,6 +26,8 @@ def launch_canary_plan_kernels(
     swa_window_size: int,
     full_to_swa_index_mapping: Optional[torch.Tensor],
     verify_capacity: int,
+    req_to_expected_token_ids: Optional[torch.Tensor] = None,
+    expected_token_ids_offset: int = 0,
 ) -> None:
     """Fill verify_plan_out + write_plan_out from normalized canary plan inputs.
 
@@ -135,8 +137,11 @@ def launch_canary_plan_kernels(
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_offsets_scratch=verify_offsets_scratch,
         verify_enable=verify_plan_out.enable,
+        req_to_expected_token_ids=req_to_expected_token_ids,
         out_verify_slot_indices=verify_plan_out.verify_slot_indices,
         out_verify_expected_positions=verify_plan_out.verify_expected_positions,
+        out_verify_expected_input_ids=verify_plan_out.verify_expected_input_ids,
         out_verify_prev_slot_indices=verify_plan_out.verify_prev_slot_indices,
+        expected_token_ids_offset=int(expected_token_ids_offset),
         swa_window_size=int(swa_window_size),
     )

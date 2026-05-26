@@ -29,9 +29,12 @@ def launch_plan_entries_kernel(
     full_to_swa_index_mapping: Optional[torch.Tensor],
     verify_offsets_scratch: torch.Tensor,
     verify_enable: torch.Tensor,
+    req_to_expected_token_ids: Optional[torch.Tensor],
     out_verify_slot_indices: torch.Tensor,
     out_verify_expected_positions: torch.Tensor,
+    out_verify_expected_input_ids: torch.Tensor,
     out_verify_prev_slot_indices: torch.Tensor,
+    expected_token_ids_offset: int,
     swa_window_size: int,
 ) -> None:
     module = _jit_plan_entries_module()
@@ -42,8 +45,11 @@ def launch_plan_entries_kernel(
         full_to_swa_index_mapping,
         verify_offsets_scratch,
         verify_enable,
+        req_to_expected_token_ids,
         out_verify_slot_indices,
         out_verify_expected_positions,
+        out_verify_expected_input_ids,
         out_verify_prev_slot_indices,
+        int(expected_token_ids_offset),
         int(swa_window_size),
     )
