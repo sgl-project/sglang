@@ -47,7 +47,10 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
-from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
+from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
+    should_skip_post_experts_all_reduce,
+)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -300,10 +303,9 @@ class ExaoneMoESparseMoEBlock(nn.Module):
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
-        if (
-            self.tp_size > 1
-            and not use_reduce_scatter
-            and not should_use_dp_reduce_scatterv()
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 

@@ -127,6 +127,7 @@
 
  GEN_VECTYPE(float16_t, Half8, 16, 8);
  GEN_VECTYPE(bfloat16_t, Bhalf8, 16, 8);
+ GEN_VECTYPE(float, float8, 32, 8);
  template <typename type>
  class Dtype;
 
@@ -309,6 +310,7 @@
  DEF_VECT(bfloat16_t, Bhalf8);
  DEF_VECT(float16_t, Half8);
  DEF_VECT(float, float4);
+ DEF_VECT(float, float8);
 
  enum class VarUpdateMode { WELFORD, WELFORD_ONLY_MEAN, CHAN, CHAN_ONLY_MEAN };
 
@@ -396,7 +398,10 @@
     size_t n_idx = tx * vlen;
     size_t n_step = (size_t)blockDim.x * vlen;
 
+    extern __shared__ ComputeType smem[];
+
     using SrcVec = VecType<SrcDtype, vlen * sizeof(SrcDtype) * 8>;
+    using ComputeVec = VecType<ComputeType, vlen * sizeof(ComputeType) * 8>;
 
     ComputeType var = 0;
     const SrcDtype* __restrict p_src = input + m_idx * N;
@@ -406,6 +411,7 @@
     bool m_valid = m_idx < M;
     if (m_valid) {
       for (size_t j = n_idx; j < N; j += n_step) {
+        ComputeVec x_vec;
         SrcVec curr, res_vec, fused_vec;
         #if ((defined __MUSA_ARCH__) && (__MUSA_ARCH__ == 220))
             curr = *(SrcVec *)(p_src+j);
@@ -416,10 +422,13 @@
         #endif
         #pragma unroll
         for (int k = 0; k < vlen; k++) {
-         fused_vec.val_.elem[k] = curr.val_.elem[k] + res_vec.val_.elem[k];
-         var += (ComputeType)fused_vec.val_.elem[k] * (ComputeType)fused_vec.val_.elem[k];
+          ComputeType x = (ComputeType)curr.val_.elem[k] + (ComputeType)res_vec.val_.elem[k];
+          var += x * x;
+          fused_vec.val_.elem[k] = (SrcDtype)x;
+          x_vec.val_.elem[k] = x;
         }
         *(SrcVec*)(p_res + j) = fused_vec;
+        *(ComputeVec*)(smem + j) = x_vec;
       }
     }
     AllReduceOp<ComputeType, BLOCK_X, BLOCK_Y, 1> all_reduce_op;
@@ -430,17 +439,17 @@
       bool with_weight = (weight != NULL);
       if (with_weight) {
         for (size_t j = n_idx; j < N; j += n_step) {
-          SrcVec fused_vec, weight_val, dst;
+          SrcVec weight_val, dst;
+          ComputeVec x_vec;
+          x_vec = *(ComputeVec *)(smem + j);
           #if ((defined __MUSA_ARCH__) && (__MUSA_ARCH__ == 220))
-            fused_vec = *(SrcVec *)(p_res+j);
-            weight_val = *(SrcVec *)(weight+j);
+            weight_val = *(SrcVec *)(weight + j);
           #elif ((defined __MUSA_ARCH__) && (__MUSA_ARCH__ == 310))
-            fused_vec = SrcVec::load_byp_slc(p_res, j);
             weight_val = SrcVec::load_byp_slc(weight, j);
           #endif
   #pragma unroll
           for (int k = 0; k < vlen; k++) {
-             dst.val_.elem[k] = (SrcDtype)((ComputeType)fused_vec.val_.elem[k] * inv_var *
+             dst.val_.elem[k] = (SrcDtype)(x_vec.val_.elem[k] * inv_var *
                              (ComputeType)weight_val.val_.elem[k]);
           }
           *(SrcVec*)(p_dst + j) = dst;
@@ -458,7 +467,7 @@
      dim3 grid_size{nr_blocks, 1, 1};                                          \
      LayerNorm##_KERN##KernelVlen<_SRC_DTYPE, float,                           \
                                       block_x, block_y, _VLEN>                 \
-             <<<grid_size, block_size, 0, stream>>>(                           \
+             <<<grid_size, block_size, n * sizeof(float), stream>>>(           \
                  static_cast<_SRC_DTYPE*>(input),                              \
                  static_cast<_SRC_DTYPE*>(residual),                           \
                  static_cast<_SRC_DTYPE*>(weight),                             \

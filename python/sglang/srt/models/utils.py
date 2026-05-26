@@ -31,7 +31,9 @@ from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -274,11 +276,11 @@ class AutoWeightsLoader:
 
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
+    pool = get_token_to_kv_pool()
     return (
         _is_cuda
-        and hasattr(forward_batch.token_to_kv_pool, "dtype")
-        and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
-        and not isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
+        and pool.dtype == torch.bfloat16
+        and not isinstance(pool, SWAKVPool)
         and not is_prefill_context_parallel_enabled()
     ) or (_is_hip and not is_prefill_context_parallel_enabled())
 
@@ -291,7 +293,7 @@ def create_fused_set_kv_buffer_arg(
     from sglang.jit_kernel.rope import FusedSetKVBufferArg
 
     layer_id = layer.layer_id
-    token_to_kv_pool = forward_batch.token_to_kv_pool
+    token_to_kv_pool = get_token_to_kv_pool()
 
     k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
     v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
@@ -390,6 +392,28 @@ class RotaryPosMixin:
         return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
 
 
+def _reshape_for_qk_norm(x: torch.Tensor, head_dim: int) -> torch.Tensor:
+    """Reshape a (..., H*D) tensor into (..., H, D) ahead of QK RMSNorm.
+
+    On CUDA with the inductor piecewise-cuda-graph compiler, return a
+    stride-preserving view so inductor can fuse this reshape with the
+    subsequent RMSNorm (and any upstream/downstream FP8 quant) into a
+    single triton kernel -- the original motivation of #21734.
+
+    Everywhere else (ROCm, or CUDA with the eager PCG fallback), use the
+    flat 2D reshape that forces a copy when the input is a non-contiguous
+    QKV-split stride-trick view. ROCm's RMSNorm kernels assume contiguous
+    inputs and fault on strided tensors (root cause of the #21734 revert
+    in #23159).
+    """
+    if (
+        _is_cuda
+        and get_global_server_args().piecewise_cuda_graph_compiler == "inductor"
+    ):
+        return x.view(*x.shape[:-1], -1, head_dim)
+    return x.reshape(-1, head_dim)
+
+
 def apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -424,6 +448,8 @@ def apply_qk_norm(
         and allow_inplace  # TODO(dark): this can be relaxed if needed
         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        and get_global_server_args().piecewise_cuda_graph_compiler
+        != "inductor"  # let inductor fuse QK norm
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(
@@ -439,16 +465,16 @@ def apply_qk_norm(
     if alt_stream is not None and get_is_capture_mode():
         current_stream = get_current_device_stream_fast()
         alt_stream.wait_stream(current_stream)
-        q_by_head = q.reshape(-1, head_dim)
+        q_by_head = _reshape_for_qk_norm(q, head_dim)
         q_by_head = q_norm(q_by_head)
         with torch.cuda.stream(alt_stream):
-            k_by_head = k.reshape(-1, head_dim)
+            k_by_head = _reshape_for_qk_norm(k, head_dim)
             k_by_head = k_norm(k_by_head)
         current_stream.wait_stream(alt_stream)
     else:
-        q_by_head = q.reshape(-1, head_dim)
+        q_by_head = _reshape_for_qk_norm(q, head_dim)
         q_by_head = q_norm(q_by_head)
-        k_by_head = k.reshape(-1, head_dim)
+        k_by_head = _reshape_for_qk_norm(k, head_dim)
         k_by_head = k_norm(k_by_head)
     q = q_by_head.view(q.shape)
     k = k_by_head.view(k.shape)

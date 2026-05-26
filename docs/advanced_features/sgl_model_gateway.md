@@ -593,6 +593,17 @@ Response:
 
 ## Reliability and Flow Control
 
+### HTTP Client
+
+Configure upstream HTTP client connection settings:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--pool-idle-timeout-secs` | 50 | Idle timeout in seconds for pooled upstream HTTP connections. Can also be set with `SMG_POOL_IDLE_TIMEOUT_SECS`. |
+| `--connect-timeout-secs` | 10 | Timeout in seconds for new upstream HTTP connections. Can also be set with `SMG_CONNECT_TIMEOUT_SECS`. |
+| `--pool-max-idle-per-host` | 500 | Maximum idle upstream HTTP connections to keep per host. Can also be set with `SMG_POOL_MAX_IDLE_PER_HOST`. |
+| `--tcp-keepalive-secs` | 30 | TCP keepalive idle time in seconds for upstream HTTP connections. Can also be set with `SMG_TCP_KEEPALIVE_SECS`. |
+
 ### Retries
 
 Configure exponential backoff retries:

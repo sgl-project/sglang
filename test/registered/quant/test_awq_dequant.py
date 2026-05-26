@@ -12,7 +12,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.quantization.awq_triton import (
+from sglang.srt.layers.quantization.awq.awq_triton import (
     AWQ_TRITON_SUPPORTED_GROUP_SIZES,
     awq_dequantize_triton,
     awq_gemm_triton,

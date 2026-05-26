@@ -550,14 +550,16 @@ void fused_experts_int8_kernel_impl(
       const float* __restrict__ Bs0 = w1s + expert_id * 2 * N + nb_upper * BLOCK_N;
       const float* __restrict__ Bs1 = w1s + expert_id * 2 * N + nb_lower * BLOCK_N;
 
-      // 1.a load A
-      const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
       int64_t m_size = offsets[mb + 1] - offsets[mb];
 
-      for (int64_t m = 0; m < m_size; ++m) {
-        int32_t index = A_ids[m] / topk;
-        copy_stub(A + m * K, Aq_tmp + index * K, K);
-        As[m] = As_tmp[index];
+      if (nb_offset == 0) {
+        // 1.a load A
+        const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
+        for (int64_t m = 0; m < m_size; ++m) {
+          int32_t index = A_ids[m] / topk;
+          copy_stub(A + m * K, Aq_tmp + index * K, K);
+          As[m] = As_tmp[index];
+        }
       }
 
       if (use_brgemm) {
