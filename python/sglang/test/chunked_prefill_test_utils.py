@@ -23,7 +23,7 @@ DEFAULT_NUM_THREADS: int = 128
 DEFAULT_MAX_TOKENS: int = 512
 DEFAULT_SEED: int = 42
 
-KV_CANARY_ARGS: List[str] = []
+KV_CANARY_ARGS: List[str] = ["--enable-kv-canary"]
 
 
 class ChunkedRefactorTestBase(CustomTestCase):
