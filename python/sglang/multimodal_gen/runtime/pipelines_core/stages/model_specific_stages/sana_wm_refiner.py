@@ -162,9 +162,7 @@ def _pack_text_embeds(
         start_indices = seq_len - sequence_lengths[:, None]
         mask = token_indices >= start_indices
     else:
-        raise ValueError(
-            f"padding_side must be 'left' or 'right', got {padding_side}"
-        )
+        raise ValueError(f"padding_side must be 'left' or 'right', got {padding_side}")
     mask = mask[:, :, None, None]
 
     masked = text_hidden_states.masked_fill(~mask, 0.0)
@@ -294,8 +292,8 @@ def _forward_diffusers_video_block(
     ada_values = block.scale_shift_table[None, None].to(temb.device) + temb.reshape(
         batch_size, temb.size(1), num_ada_params, -1
     )
-    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-        ada_values.unbind(dim=2)
+    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = ada_values.unbind(
+        dim=2
     )
     norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
 
@@ -344,11 +342,11 @@ def _streaming_diffusers_self_attention(
         apply_split_rotary_emb,
     )
 
-    gate_logits = (
-        attn.to_gate_logits(hidden_states)
-        if attn.to_gate_logits is not None
-        else None
-    )
+    # Diffusers 0.38+ always defines `to_gate_logits`, while 0.37 only has it
+    # on gated variants. The public SANA-WM refiner config is ungated, so a
+    # missing attribute means the same thing as `None`.
+    to_gate_logits = getattr(attn, "to_gate_logits", None)
+    gate_logits = to_gate_logits(hidden_states) if to_gate_logits is not None else None
 
     query = attn.to_q(hidden_states)
     key = attn.to_k(hidden_states)
@@ -455,9 +453,8 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         return [
             ComponentUse(
                 stage_name=stage_name,
-                component_name="transformer_2",
+                component_name="text_encoder_2",
                 target_dtype=self.dtype,
-                memory_intensive=True,
             ),
             ComponentUse(
                 stage_name=stage_name,
@@ -466,8 +463,9 @@ class SanaWMLTX2RefinerStage(PipelineStage):
             ),
             ComponentUse(
                 stage_name=stage_name,
-                component_name="text_encoder_2",
+                component_name="transformer_2",
                 target_dtype=self.dtype,
+                memory_intensive=True,
             ),
         ]
 
@@ -513,12 +511,15 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         # Diffusers-backed official path loads HF Gemma3ForConditionalGeneration.
         # NVlabs encodes through `.model`; the fallback SGLang-native encoder is
         # still callable directly, so keep both surfaces.
-        text_backbone = getattr(self.text_encoder, "model", self.text_encoder)
-        outputs = text_backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-        )
+        with self.use_declared_component(
+            component_name="text_encoder_2", module=self.text_encoder
+        ):
+            text_backbone = getattr(self.text_encoder, "model", self.text_encoder)
+            outputs = text_backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+            )
         per_layer_hidden = getattr(outputs, "hidden_states", None)
         if per_layer_hidden is None:
             raise RuntimeError(
@@ -534,15 +535,14 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         ).to(dtype=self.dtype)
         log_sana_wm_tensor_stats("refiner.prompt_embeds_packed", prompt_embeds)
 
-        video_text_embedding, _, video_attention_mask = self.connectors(
-            prompt_embeds, attention_mask
-        )
-        log_sana_wm_tensor_stats(
-            "refiner.video_text_embedding", video_text_embedding
-        )
-        log_sana_wm_tensor_stats(
-            "refiner.video_attention_mask", video_attention_mask
-        )
+        with self.use_declared_component(
+            component_name="connectors", module=self.connectors
+        ):
+            video_text_embedding, _, video_attention_mask = self.connectors(
+                prompt_embeds, attention_mask
+            )
+        log_sana_wm_tensor_stats("refiner.video_text_embedding", video_text_embedding)
+        log_sana_wm_tensor_stats("refiner.video_attention_mask", video_attention_mask)
         return (
             video_text_embedding.to(device=device, dtype=self.dtype),
             video_attention_mask.to(device=device),
@@ -575,43 +575,44 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         )
         raw_timestep[:, n_context_tokens:, 0] = sigma.float()
 
-        if _uses_diffusers_ltx2_refiner(self.transformer):
-            model_timestep = raw_timestep.squeeze(-1) * float(
-                _refiner_config_value(
-                    self.transformer, "timestep_scale_multiplier"
+        with self.use_declared_component(
+            component_name="transformer_2", module=self.transformer
+        ):
+            if _uses_diffusers_ltx2_refiner(self.transformer):
+                model_timestep = raw_timestep.squeeze(-1) * float(
+                    _refiner_config_value(self.transformer, "timestep_scale_multiplier")
                 )
-            )
-            velocity_tokens = _forward_diffusers_video_only(
-                self.transformer,
-                hidden_states=latent_tokens.to(self.dtype),
-                encoder_hidden_states=prompt_embeds,
-                timestep=model_timestep,
-                encoder_attention_mask=prompt_attention_mask,
-                num_frames=num_frames,
-                height=height,
-                width=width,
-                fps=fps,
-                n_context_tokens=n_context_tokens,
-            )
-        else:
-            additive_mask = _as_additive_attention_mask(
-                prompt_attention_mask, self.dtype
-            )
-            with set_forward_context(
-                current_timestep=step_idx,
-                attn_metadata=None,
-            ):
-                velocity_tokens = self.transformer(
+                velocity_tokens = _forward_diffusers_video_only(
+                    self.transformer,
                     hidden_states=latent_tokens.to(self.dtype),
                     encoder_hidden_states=prompt_embeds,
-                    timestep=raw_timestep.squeeze(-1),
-                    encoder_attention_mask=additive_mask,
+                    timestep=model_timestep,
+                    encoder_attention_mask=prompt_attention_mask,
                     num_frames=num_frames,
                     height=height,
                     width=width,
                     fps=fps,
                     n_context_tokens=n_context_tokens,
                 )
+            else:
+                additive_mask = _as_additive_attention_mask(
+                    prompt_attention_mask, self.dtype
+                )
+                with set_forward_context(
+                    current_timestep=step_idx,
+                    attn_metadata=None,
+                ):
+                    velocity_tokens = self.transformer(
+                        hidden_states=latent_tokens.to(self.dtype),
+                        encoder_hidden_states=prompt_embeds,
+                        timestep=raw_timestep.squeeze(-1),
+                        encoder_attention_mask=additive_mask,
+                        num_frames=num_frames,
+                        height=height,
+                        width=width,
+                        fps=fps,
+                        n_context_tokens=n_context_tokens,
+                    )
 
         denoised = latent_tokens.float() - velocity_tokens.float() * raw_timestep
         return denoised[:, n_context_tokens:, :].to(self.dtype)
@@ -655,9 +656,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         log_sana_wm_tensor_stats("refiner.sink_latent", sink)
         log_sana_wm_tensor_stats("refiner.current_latent_clean", current)
         gen = torch.Generator(device=device).manual_seed(int(seed))
-        eps = torch.randn(
-            current.shape, generator=gen, device=device, dtype=self.dtype
-        )
+        eps = torch.randn(current.shape, generator=gen, device=device, dtype=self.dtype)
         noisy = (1.0 - start_sigma) * current + start_sigma * eps
         log_sana_wm_tensor_stats("refiner.current_latent_noisy_initial", noisy)
 
@@ -705,9 +704,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
                 f"refiner.step_{step_idx}.velocity_current",
                 velocity_5d.to(self.dtype),
             )
-            log_sana_wm_tensor_stats(
-                f"refiner.step_{step_idx}.current_latent", noisy
-            )
+            log_sana_wm_tensor_stats(f"refiner.step_{step_idx}.current_latent", noisy)
 
         refined = torch.cat([sink, noisy], dim=2)
         log_sana_wm_tensor_stats("refiner.output_latent", refined)
@@ -770,9 +767,7 @@ class SanaWMRefinerDecodingStage(SanaWMDecodingStage):
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs):
         self._drop_refiner_sink = bool(
-            (getattr(batch, "extra", None) or {}).get(
-                "sana_wm_refiner_applied", True
-            )
+            (getattr(batch, "extra", None) or {}).get("sana_wm_refiner_applied", True)
         )
         try:
             return super().forward(batch, server_args)

@@ -1,5 +1,7 @@
 import os
+import sys
 import tempfile
+import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -22,12 +24,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     SanaWMLTX2RefinerStage,
     SanaWMRefinerDecodingStage,
     _refiner_config_value,
+    _streaming_diffusers_self_attention,
     _uses_diffusers_ltx2_refiner,
     sana_wm_skip_refiner_enabled,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
     SanaWMBeforeDenoisingStage,
-    SanaWMDenoisingStage,
     SanaWMTextEncodingStage,
     _align_sana_wm_cfg_text_conditions,
     configure_sana_wm_ltx2_vae_for_long_video,
@@ -118,7 +120,9 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         self.assertTrue(deployment.auto_dit_layerwise_offload)
 
     def test_text_encoder_padding_matches_cfg_concat_contract(self) -> None:
-        self.assertEqual(self.config.text_encoder_extra_args[0]["padding"], "max_length")
+        self.assertEqual(
+            self.config.text_encoder_extra_args[0]["padding"], "max_length"
+        )
         self.assertTrue(self.config.text_encoder_extra_args[0]["return_attention_mask"])
         self.assertTrue(self.config.chi_prompt)
 
@@ -189,9 +193,7 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
             def enable_tiling(self, **kwargs):
                 self.use_tiling = True
                 self.enable_tiling_kwargs = kwargs
-                self.tile_sample_min_num_frames = kwargs[
-                    "tile_sample_min_num_frames"
-                ]
+                self.tile_sample_min_num_frames = kwargs["tile_sample_min_num_frames"]
                 self.tile_sample_stride_num_frames = kwargs[
                     "tile_sample_stride_num_frames"
                 ]
@@ -257,8 +259,12 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         self.assertEqual(neg_mask.shape, (1, 173))
         self.assertTrue(torch.equal(neg[:, :1], torch.ones(1, 1, 4) * 2))
         self.assertTrue(torch.equal(neg[:, 1:], torch.zeros(1, 172, 4)))
-        self.assertTrue(torch.equal(neg_mask[:, :1], torch.ones(1, 1, dtype=torch.long)))
-        self.assertTrue(torch.equal(neg_mask[:, 1:], torch.zeros(1, 172, dtype=torch.long)))
+        self.assertTrue(
+            torch.equal(neg_mask[:, :1], torch.ones(1, 1, dtype=torch.long))
+        )
+        self.assertTrue(
+            torch.equal(neg_mask[:, 1:], torch.zeros(1, 172, dtype=torch.long))
+        )
 
 
 class TestSanaWMSamplingParams(unittest.TestCase):
@@ -305,9 +311,7 @@ class TestSanaWMRegistry(unittest.TestCase):
 
     def test_overlay_resolver_matches_hf_cache_snapshot_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            snapshot_dir = (
-                f"{tmp_dir}/hub/models--Lightricks--LTX-2.3/snapshots/abc123"
-            )
+            snapshot_dir = f"{tmp_dir}/hub/models--Lightricks--LTX-2.3/snapshots/abc123"
             os.makedirs(snapshot_dir)
             target = resolve_model_overlay_target(snapshot_dir)
         self.assertIsNotNone(target)
@@ -402,7 +406,9 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         self.assertEqual(source, "default_static")
         self.assertEqual(camera_conditions.shape, (1, 3, 20))
         self.assertEqual(chunk_plucker.shape, (1, 48, 3, 12, 20))
-        self.assertTrue(torch.equal(camera_conditions[0, 0, :16], torch.eye(4).reshape(-1)))
+        self.assertTrue(
+            torch.equal(camera_conditions[0, 0, :16], torch.eye(4).reshape(-1))
+        )
         self.assertTrue(
             torch.allclose(
                 camera_conditions[0, 0, 16:],
@@ -515,6 +521,93 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
             OfficialGemma3TextEncoderModule.layer_names,
         )
 
+    def test_refiner_component_uses_follow_execution_order(self) -> None:
+        stage = SanaWMLTX2RefinerStage(
+            transformer=torch.nn.Identity(),
+            connectors=torch.nn.Identity(),
+            text_encoder=torch.nn.Identity(),
+            tokenizer=SimpleNamespace(pad_token="<pad>", eos_token="<eos>"),
+            dtype=torch.bfloat16,
+        )
+
+        names = [
+            use.component_name
+            for use in stage.component_uses(
+                SimpleNamespace(), stage_name="sana_wm_refiner"
+            )
+        ]
+
+        self.assertEqual(names, ["text_encoder_2", "connectors", "transformer_2"])
+
+    def test_streaming_diffusers_attention_accepts_ungated_ltx2_attention(self) -> None:
+        """Diffusers 0.37 LTX2Attention omits `to_gate_logits` for ungated configs."""
+
+        class IdentityLinear(torch.nn.Module):
+            def forward(self, x):
+                return x
+
+        class FakeProcessor:
+            _attention_backend = None
+            _parallel_config = None
+
+        class UngatedAttention(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.to_q = IdentityLinear()
+                self.to_k = IdentityLinear()
+                self.to_v = IdentityLinear()
+                self.norm_q = IdentityLinear()
+                self.norm_k = IdentityLinear()
+                self.to_out = torch.nn.ModuleList(
+                    [IdentityLinear(), torch.nn.Identity()]
+                )
+                self.heads = 2
+                self.rope_type = "split"
+                self.processor = FakeProcessor()
+
+        def dispatch_attention_fn(
+            query,
+            key,
+            value,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+            backend=None,
+            parallel_config=None,
+        ):
+            return query
+
+        attention_dispatch = types.ModuleType("diffusers.models.attention_dispatch")
+        attention_dispatch.dispatch_attention_fn = dispatch_attention_fn
+        transformer_ltx2 = types.ModuleType(
+            "diffusers.models.transformers.transformer_ltx2"
+        )
+        transformer_ltx2.apply_interleaved_rotary_emb = lambda x, _rope: x
+        transformer_ltx2.apply_split_rotary_emb = lambda x, _rope: x
+
+        with patch.dict(
+            sys.modules,
+            {
+                "diffusers": types.ModuleType("diffusers"),
+                "diffusers.models": types.ModuleType("diffusers.models"),
+                "diffusers.models.attention_dispatch": attention_dispatch,
+                "diffusers.models.transformers": types.ModuleType(
+                    "diffusers.models.transformers"
+                ),
+                "diffusers.models.transformers.transformer_ltx2": transformer_ltx2,
+            },
+        ):
+            hidden_states = torch.randn(1, 3, 4)
+            rotary = (torch.empty(0), torch.empty(0))
+            out = _streaming_diffusers_self_attention(
+                attn=UngatedAttention(),
+                hidden_states=hidden_states,
+                query_rotary_emb=rotary,
+                n_context_tokens=1,
+            )
+
+        self.assertEqual(out.shape, hidden_states.shape)
+
     def test_skip_refiner_flag_accepts_request_extra(self) -> None:
         batch = SimpleNamespace(extra={"diffusers_kwargs": {"skip_refiner": True}})
         self.assertTrue(sana_wm_skip_refiner_enabled(batch))
@@ -558,18 +651,22 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
 
             def __call__(self, **kwargs):
                 self.called = True
-                raise AssertionError("Gemma3ForConditionalGeneration.model was not used")
+                raise AssertionError(
+                    "Gemma3ForConditionalGeneration.model was not used"
+                )
 
         class DummyConnectors:
             def __call__(self, prompt_embeds, attention_mask):
                 return prompt_embeds, None, attention_mask
 
-        stage = object.__new__(SanaWMLTX2RefinerStage)
-        stage.tokenizer = DummyTokenizer()
-        stage.text_encoder = DummyTextEncoder()
-        stage.connectors = DummyConnectors()
-        stage.dtype = torch.float32
-        stage.text_max_sequence_length = 4
+        stage = SanaWMLTX2RefinerStage(
+            transformer=torch.nn.Identity(),
+            connectors=DummyConnectors(),
+            text_encoder=DummyTextEncoder(),
+            tokenizer=DummyTokenizer(),
+            dtype=torch.float32,
+            text_max_sequence_length=4,
+        )
 
         prompt_embeds, attention_mask = stage._encode_prompt(
             "drive forward", torch.device("cpu")
