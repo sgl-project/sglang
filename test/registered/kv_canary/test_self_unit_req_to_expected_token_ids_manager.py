@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unittest
 from array import array
 from types import SimpleNamespace
 
@@ -163,3 +164,7 @@ class TestPopulateReqToExpectedTokenIds(CustomTestCase):
                 torch.equal(pool_cpu[untouched], original[untouched].cpu()),
                 f"row {untouched} was unexpectedly modified",
             )
+
+
+if __name__ == "__main__":
+    unittest.main()
