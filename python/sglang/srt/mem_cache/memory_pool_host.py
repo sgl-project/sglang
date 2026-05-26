@@ -2523,6 +2523,15 @@ class HostPoolGroup:
     def get_page_buffer_meta(self, indices):
         return self.anchor_entry.host_pool.get_page_buffer_meta(indices)
 
+    def get_index_k_with_scale_page_buffer_meta(self, indices):
+        """Return indexer page (ptr, size) metadata when the sidecar pool exists."""
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        indexer_entry = self.entry_map.get(PoolName.INDEXER)
+        if indexer_entry is None:
+            raise AttributeError("HostPoolGroup has no INDEXER sidecar pool.")
+        return indexer_entry.host_pool.get_page_buffer_meta(indices)
+
     def clear(self) -> None:
         for entry in self.entries:
             entry.host_pool.clear()
@@ -2897,3 +2906,7 @@ class DSAIndexerPoolHost(HostKVCache):
             page_index = int(indices[i]) // self.page_size
             ptr_list.append(base_ptr + page_index * page_stride_bytes)
         return ptr_list, [page_stride_bytes] * len(ptr_list)
+
+    def get_index_k_with_scale_page_buffer_meta(self, indices):
+        """Compatibility alias used by storage backends that expect an explicit API name."""
+        return self.get_page_buffer_meta(indices)

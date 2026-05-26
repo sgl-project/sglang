@@ -246,6 +246,7 @@ class MooncakeBaseStore:
     def __init__(self):
         self.store = None
         self.config = None
+        self._registered_buffer_ptrs = set()
 
     def _import_mooncake_store(self):
         try:
@@ -284,7 +285,11 @@ class MooncakeBaseStore:
     def register_buffer(self, tensor: torch.Tensor):
         if self.store is None:
             raise RuntimeError("Mooncake store is not initialized.")
+        if not hasattr(self, "_registered_buffer_ptrs"):
+            self._registered_buffer_ptrs = set()
         ptr = tensor.data_ptr()
+        if ptr in self._registered_buffer_ptrs:
+            return
         size = tensor.numel() * tensor.element_size()
         ret_code = self.store.register_buffer(ptr, size)
         if ret_code != 0:
@@ -292,6 +297,7 @@ class MooncakeBaseStore:
             raise RuntimeError(
                 f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
             )
+        self._registered_buffer_ptrs.add(ptr)
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
@@ -550,6 +556,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        self.has_mla_indexer_sidecar = False
         assert self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
@@ -562,6 +569,25 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
+
+        # Compatibility path for DSA/NSA on v1 storage APIs:
+        # if host pool also exposes indexer page metadata, register indexer buffers
+        # and persist indexer sidecar keys together with MLA _k keys.
+        if self.is_mla_backend and hasattr(
+            self.mem_pool_host, "get_index_k_with_scale_page_buffer_meta"
+        ):
+            self.has_mla_indexer_sidecar = True
+            if hasattr(self.mem_pool_host, "get_pool"):
+                try:
+                    indexer_pool = self.mem_pool_host.get_pool(PoolName.INDEXER)
+                    for buf in indexer_pool.get_hybrid_pool_buffer():
+                        super().register_buffer(buf)
+                except Exception:
+                    logger.debug(
+                        "Detected MLA indexer metadata API but failed to register "
+                        "explicit INDEXER buffers from host pool.",
+                        exc_info=True,
+                    )
 
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
@@ -738,11 +764,35 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return key_list, ptr_list, element_size_list
 
     def _get_mla_buffer_meta(self, keys, indices):
-        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
+        kv_ptr_list, kv_element_size_list = self.mem_pool_host.get_page_buffer_meta(
+            indices
+        )
+        if not getattr(self, "has_mla_indexer_sidecar", False):
+            key_list = [f"{key_}_{self.mla_suffix}_k" for key_ in keys]
+            assert len(key_list) == len(kv_ptr_list)
+            return key_list, kv_ptr_list, kv_element_size_list
+
+        index_ptr_list, index_element_size_list = (
+            self.mem_pool_host.get_index_k_with_scale_page_buffer_meta(indices)
+        )
+        if len(index_ptr_list) != len(kv_ptr_list):
+            raise ValueError(
+                "MLA indexer metadata length mismatch: "
+                f"kv={len(kv_ptr_list)}, indexer={len(index_ptr_list)}"
+            )
+
         key_list = []
-        for key_ in keys:
+        ptr_list = []
+        element_size_list = []
+        for i, key_ in enumerate(keys):
             key_list.append(f"{key_}_{self.mla_suffix}_k")
-        assert len(key_list) == len(ptr_list)
+            ptr_list.append(kv_ptr_list[i])
+            element_size_list.append(kv_element_size_list[i])
+
+            key_list.append(f"{key_}_{self.mla_suffix}_{PoolName.INDEXER}")
+            ptr_list.append(index_ptr_list[i])
+            element_size_list.append(index_element_size_list[i])
+
         return key_list, ptr_list, element_size_list
 
     def _batch_preprocess(self, keys, host_indices):
@@ -768,7 +818,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         """
         if key_multiplier is None:
             if self.is_mla_backend:
-                key_multiplier = 1
+                key_multiplier = (
+                    2 if getattr(self, "has_mla_indexer_sidecar", False) else 1
+                )
             else:
                 key_multiplier = 2
                 if self.storage_config.should_split_heads:
@@ -961,7 +1013,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         end_time = time.perf_counter()
 
         if self.is_mla_backend:
-            key_multiplier = 1
+            key_multiplier = 2 if getattr(self, "has_mla_indexer_sidecar", False) else 1
         else:
             key_multiplier = 2
 
@@ -987,8 +1039,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys = self._tag_keys(keys)
 
         if self.is_mla_backend:
-            query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
-            key_multiplier = 1
+            if getattr(self, "has_mla_indexer_sidecar", False):
+                query_keys = []
+                for key in keys:
+                    query_keys.append(f"{key}_{self.mla_suffix}_k")
+                    query_keys.append(f"{key}_{self.mla_suffix}_{PoolName.INDEXER}")
+                key_multiplier = 2
+            else:
+                query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
+                key_multiplier = 1
         else:
             query_keys = []
             if self.storage_config.should_split_heads:
