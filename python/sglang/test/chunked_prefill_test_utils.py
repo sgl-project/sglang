@@ -81,17 +81,8 @@ class ChunkedRefactorTestBase(CustomTestCase):
         )
         tic = time.perf_counter()
         metrics = run_eval(args)
-        elapsed = time.perf_counter() - tic
-
-        print(
-            f"[{type(self).__name__}] gsm8k_mixed score={metrics.get('score', float('nan')):.4f}",
-            f"score_standard={metrics.get('score_standard', float('nan')):.4f}",
-            f"score_cluster={metrics.get('score_cluster', float('nan')):.4f}",
-            f"score_random={metrics.get('score_random', float('nan')):.4f}",
-            f"score_zero_shot={metrics.get('score_zero_shot', float('nan')):.4f}",
-            f"elapsed={elapsed:.1f}s",
-            sep=" | ",
-        )
+        metrics["elapsed_sec"] = time.perf_counter() - tic
+        print(f"[{type(self).__name__}] {metrics}")
         return metrics
 
     def test_gsm8k_mixed_chunked(self):
