@@ -18,6 +18,7 @@ already finished, and idempotent on repeated calls.
 
 import unittest
 
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.test.scripted_runtime.req_handle import ReqHandle
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
@@ -635,6 +636,104 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
         yield from run_until_finished(r2)
         assert r2.finished, "baton handoff must let r2 complete"
         assert r2.lock_refs == 0
+
+
+class TestAbortDualQueueInvariant(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
+
+    def test_dual_queue_abort_no_double_release_invariant(self):
+        """Invariant W3: a chunked-resume req simultaneously in waiting_queue and running_batch.reqs must be released exactly once by abort_request (de3859646b dedup gate).
+
+        Direct access to ``_scheduler`` internals is intentional; this is an
+        invariant-tier test (see direct-internals-access plan).
+        """
+        self.runtime.run(self._script_dual_queue_abort_no_double_release_invariant)
+
+    # W3 — abort_request dual-queue dedup gate. Manually inject a
+    # chunked req into both ``waiting_queue`` and ``running_batch.reqs``
+    # (the edge state the stateless-scheduler refactor produces, which
+    # the scheduler usually closes within a single iter). Call
+    # abort_request directly. The dedup gate must skip the waiting_queue
+    # pop branch when the rid is also in batch — so the req stays in
+    # waiting_queue (not popped twice) and only the ``to_finish``
+    # branch fires. Without the gate, the rid would be popped AND have
+    # ``to_finish`` set, causing duplicate ``send_output`` (and in
+    # disagg-DECODE mode, duplicate ``release_kv_cache``).
+    @staticmethod
+    def _script_dual_queue_abort_no_double_release_invariant(t: ScriptedRuntime):
+        s = t._scheduler
+        allocator = s.token_to_kv_pool_allocator
+
+        # Drive a real chunked req so we have a fully-initialised Req
+        # object with allocated KV / row / lock_ref to manipulate.
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+
+        # Locate the real Req object. It currently lives in chunked_req
+        # / running_batch.reqs depending on iter phase. We need a concrete
+        # Req to inject into the waiting_queue.
+        live_req = s.chunked_req
+        if live_req is None or live_req.rid != r.rid:
+            # Fall back to scanning running_batch (mid-iter, the chunked
+            # req may have already advanced into running_batch.reqs).
+            for candidate in s.running_batch.reqs:
+                if candidate.rid == r.rid:
+                    live_req = candidate
+                    break
+        assert (
+            live_req is not None and live_req.rid == r.rid
+        ), "could not locate live Req object to drive W3 dual-queue scenario"
+
+        # Manually force the dual-queue state: ensure the req appears in
+        # both waiting_queue and running_batch.reqs at the moment we
+        # invoke abort_request. We do not remove existing references —
+        # we only add the missing one.
+        if live_req not in s.waiting_queue:
+            s.waiting_queue.append(live_req)
+        if live_req not in s.running_batch.reqs:
+            s.running_batch.reqs.append(live_req)
+
+        waiting_count_before: int = sum(1 for q in s.waiting_queue if q.rid == r.rid)
+        batch_count_before: int = sum(1 for q in s.running_batch.reqs if q.rid == r.rid)
+        assert waiting_count_before == 1, (
+            f"dual-queue setup failed: waiting_queue should contain rid "
+            f"exactly once, got {waiting_count_before}"
+        )
+        assert batch_count_before == 1, (
+            f"dual-queue setup failed: running_batch.reqs should contain "
+            f"rid exactly once, got {batch_count_before}"
+        )
+        free_before: int = allocator.available_size()
+
+        # Drive the real abort_request entry point. The dedup gate at
+        # de3859646b must skip the waiting_queue pop because the rid is
+        # also in batch_rids.
+        s.abort_request(AbortReq(rid=r.rid))
+
+        waiting_count_after: int = sum(1 for q in s.waiting_queue if q.rid == r.rid)
+        # The dedup gate's behaviour: waiting_queue must NOT pop the
+        # req (because the rid is also in batch). If the gate were
+        # broken, the rid would be popped → 0 entries.
+        assert waiting_count_after == waiting_count_before, (
+            f"W3 dedup gate broken: waiting_queue rid count went from "
+            f"{waiting_count_before} to {waiting_count_after} after "
+            f"abort_request; gate at scheduler.abort_request must skip "
+            f"waiting_queue removal when rid is also in batch"
+        )
+
+        # In non-disagg mode, abort_request itself does not release KV
+        # synchronously (release happens later via the to_finish decode
+        # path). So the allocator's free count must not change *from
+        # the abort_request call itself*. A delta > 0 would prove the
+        # waiting_queue's disagg-DECODE release path fired — which is
+        # exactly the double-release the gate prevents.
+        free_after_abort: int = allocator.available_size()
+        assert free_after_abort == free_before, (
+            f"abort_request triggered a KV release on a dual-queue rid; "
+            f"free_before={free_before}, free_after={free_after_abort}; "
+            f"the dedup gate must skip the waiting_queue release branch"
+        )
+        yield
 
 
 class TestAbortPP(ScriptedRuntimeTestCase):
