@@ -319,6 +319,7 @@ class TestFlux2FinetunedVaeEncodePreprocess(unittest.TestCase):
 
     def test_custom_vae_already_patchified_encode_latents_stay_128_channels(self):
         config = Flux2FinetunedPipelineConfig()
+        config.dit_config.arch_config.in_channels = 128
         vae = MagicMock()
         vae.bn = None
 
@@ -337,7 +338,7 @@ class TestFlux2FinetunedVaeEncodePreprocess(unittest.TestCase):
 
         self.assertEqual(
             tuple(output.shape),
-            (1, config.dit_config.arch_config.in_channels, 4, 4),
+            (1, image_latents.shape[1] * 4, 4, 4),
         )
 
 
