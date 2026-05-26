@@ -12,29 +12,6 @@ logger = logging.getLogger(__name__)
 _mooncake_transfer_engine: Optional["MooncakeTransferEngine"] = None
 
 
-def _normalize_mooncake_custom_mem_pool(custom_pool: Optional[str]) -> Optional[str]:
-    if custom_pool is None:
-        return None
-    custom_pool = custom_pool.strip().upper()
-    if custom_pool == "TRUE":
-        return "NVLINK"
-    return custom_pool or None
-
-
-def _get_mooncake_transfer_protocol() -> str:
-    protocol = envs.SGLANG_MOONCAKE_TE_PROTOCOL.get()
-    if protocol:
-        return protocol.strip().lower()
-
-    custom_pool = _normalize_mooncake_custom_mem_pool(
-        envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get()
-    )
-    if custom_pool == "NVLINK":
-        return "nvlink"
-
-    return "rdma"
-
-
 def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optional[str]:
     """
     Parse IB device string and get IB devices for a specific GPU ID.
@@ -135,7 +112,6 @@ class MooncakeTransferEngine:
         self.hostname = hostname
         self.gpu_id = gpu_id if gpu_id is not None else 0
         self.ib_device = get_ib_devices_for_gpu(ib_device, self.gpu_id)
-        self.protocol = "rdma"
 
         self.initialize(
             hostname=self.hostname,
@@ -182,37 +158,6 @@ class MooncakeTransferEngine:
             logger.debug("Mooncake batch memory registration failed.")
         return ret_value
 
-    def register_regions_checked(
-        self, ptrs: List[int], lengths: List[int], *, prefer_scalar: bool = True
-    ) -> tuple[bool, str]:
-        """Register memory regions and report the first concrete failure."""
-        ptrs = [int(ptr) for ptr in ptrs]
-        lengths = [int(length) for length in lengths]
-        if len(ptrs) != len(lengths):
-            return (
-                False,
-                f"registration_length_mismatch:ptrs={len(ptrs)}:lengths={len(lengths)}",
-            )
-
-        # Mooncake 0.3.10 can report batch success even when individual CUDA
-        # registrations fail. Prefer scalar registration where available so
-        # callers do not advertise unusable addresses.
-        register_memory = getattr(self.engine, "register_memory", None)
-        if prefer_scalar and callable(register_memory):
-            for index, (ptr, length) in enumerate(zip(ptrs, lengths)):
-                try:
-                    ret = int(register_memory(ptr, length))
-                except Exception as err:
-                    return False, f"register_memory_exception:index={index}:error={err}"
-                if ret != 0:
-                    return False, f"register_memory_failed:index={index}:ret={ret}"
-            return True, "ok"
-
-        ret = int(self.batch_register(ptrs, lengths))
-        if ret != 0:
-            return False, f"batch_register_failed:ret={ret}"
-        return True, "ok"
-
     def batch_deregister(self, ptrs: List[int]) -> int:
         """Batch deregister multiple memory regions."""
         try:
@@ -232,7 +177,6 @@ class MooncakeTransferEngine:
     ) -> None:
         """Initialize the mooncake instance."""
         if envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get():
-            self.protocol = "ascend"
             npu_phy_id = envs.ASCEND_NPU_PHY_ID.get()
             if npu_phy_id == -1:
                 hostname += f":{get_free_port()}:npu_{self.gpu_id}"
@@ -245,11 +189,10 @@ class MooncakeTransferEngine:
                 device_name if device_name is not None else "",
             )
         else:
-            self.protocol = _get_mooncake_transfer_protocol()
             ret_value = self.engine.initialize(
                 hostname,
                 "P2PHANDSHAKE",
-                self.protocol,
+                "rdma",
                 device_name if device_name is not None else "",
             )
         if ret_value != 0:
@@ -319,25 +262,6 @@ class MooncakeTransferEngine:
 
     def get_ib_device(self):
         return self.ib_device
-
-    def get_protocol(self):
-        return self.protocol
-
-    def get_path_hint(self) -> str:
-        if self.protocol == "rdma":
-            return (
-                "explicit_ib_device"
-                if self.ib_device is not None
-                else "no_explicit_ib_device"
-            )
-        return self.protocol
-
-    def get_transport_info(self) -> dict[str, Optional[str]]:
-        return {
-            "protocol": self.get_protocol(),
-            "ib_device": self.get_ib_device(),
-            "path_hint": self.get_path_hint(),
-        }
 
 
 def init_mooncake_transfer_engine(
