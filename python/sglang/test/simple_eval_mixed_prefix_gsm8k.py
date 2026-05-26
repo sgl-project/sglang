@@ -52,10 +52,19 @@ class MixedPrefixGSM8KEval(GSM8KEval):
     def _build_prefix(self, idx: int) -> str:
         rng = random.Random(self._seed + idx)
         num_primary = rng.randint(0, self._num_shots)
-        primary = self._primary_shots[:num_primary]
         secondary_size = rng.randint(0, self._secondary_pool_size)
-        secondary = rng.sample(self._secondary_pool, secondary_size)
+        secondary_indices = rng.sample(
+            range(len(self._secondary_pool)), secondary_size
+        )
+        primary = self._primary_shots[:num_primary]
+        secondary = [self._secondary_pool[i] for i in secondary_indices]
         combined = primary + secondary
+        # Print the per-query example indices (absolute into all_lines: primary
+        # lives at [0, num_shots), secondary at [num_shots, overall_pool_size)).
+        combined_indices = list(range(num_primary)) + [
+            self._num_shots + i for i in secondary_indices
+        ]
+        print(f"[mixed_prefix_gsm8k idx={idx}] combined={combined_indices}")
         return "".join(
             get_one_example(combined, i, include_answer=True) + "\n\n"
             for i in range(len(combined))
