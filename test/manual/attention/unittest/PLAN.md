@@ -33,6 +33,10 @@ Implemented:
   heads to satisfy FlashInfer SM90 prefill kernel constraints. GDN tree-verify
   tests use a scoped `5e-2` absolute tolerance for bf16 recurrent-kernel
   accumulation differences; chain verify and non-spec GDN paths keep `3e-2`.
+- Each attention-method folder now has a local `README.md` capability matrix and
+  progress summary. Implemented folders are `dense/`, `swa/`, `mla/`, and `gdn/`.
+  Placeholder folders now exist for not-yet-implemented method fixtures:
+  `dual_chunk/`, `dsa/`, and `dsv4/`.
 - Phase 3 dense runner integration is implemented for representative attention
   backends: eager mode for `torch_native`, and CUDA-graph metadata capture/replay
   decode mode for `triton` and `flashinfer`. Runner coverage now includes MHA,
@@ -192,6 +196,13 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
+- Added per-attention-method capability summaries:
+  - `dense/README.md`, `swa/README.md`, `mla/README.md`, `gdn/README.md`
+  - Placeholder method packages: `dual_chunk/`, `dsa/`, `dsv4/`
+- `python -m py_compile test/manual/attention/unittest/dual_chunk/__init__.py test/manual/attention/unittest/dsa/__init__.py test/manual/attention/unittest/dsv4/__init__.py`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+  - Ran 61 tests in 22.442s after adding per-method summary files and placeholder
+    method folders.
 - `python -m py_compile test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/common/spec_runner.py test/manual/attention/unittest/mla/test_flashinfer.py test/manual/attention/unittest/mla/test_flashmla.py`
 - `python test/manual/attention/unittest/mla/test_flashinfer.py -v`
   - Ran 7 tests in 1.304s after adding FlashInfer MLA `DRAFT_EXTEND`
