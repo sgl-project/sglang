@@ -220,7 +220,6 @@ class ModelConfig:
                 "Gemma3ForConditionalGeneration",
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
-                "Step3p7ForConditionalGeneration",
             ]
             if (
                 self.hf_config.architectures[0] in mm_disabled_models
