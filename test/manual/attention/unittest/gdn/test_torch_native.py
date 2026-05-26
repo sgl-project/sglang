@@ -14,7 +14,7 @@ from common.attention_methods.gdn_attention import (
     make_gdn_cases,
     run_gdn_attention_case,
 )
-from common.graph_runners.split_op_runner import run_gdn_split_op_extend_case
+from common.runner_modes.split_op_runner import run_gdn_split_op_extend_case
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")

@@ -14,12 +14,12 @@ from common.attention_methods.gdn_attention import (
     make_gdn_cases,
     run_gdn_attention_case,
 )
-from common.graph_runners.cuda_graph_decode_runner import run_gdn_cuda_graph_decode_case
-from common.graph_runners.speculative_target_verify_graph_runner import (
+from common.runner_modes.cuda_graph_decode_runner import run_gdn_cuda_graph_decode_case
+from common.runner_modes.speculative_target_verify_runner import (
     run_gdn_eagle_verify_case,
     run_gdn_eagle_verify_cuda_graph_case,
 )
-from common.graph_runners.split_op_runner import run_gdn_split_op_extend_case
+from common.runner_modes.split_op_runner import run_gdn_split_op_extend_case
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")

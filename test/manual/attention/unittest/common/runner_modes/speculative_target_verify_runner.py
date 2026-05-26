@@ -95,9 +95,9 @@ from ..attention_methods.mla_attention import (
     prepare_mla_runner_inputs,
     run_mla_forward,
 )
-from .cuda_graph_decode_runner import (
-    _init_cuda_graph_capture_metadata,
-    _init_cuda_graph_replay_metadata,
+from .speculative_cuda_graph_runner import (
+    SpeculativeCudaGraphAdapter,
+    run_speculative_cuda_graph_case,
 )
 
 SpecVerifyKind = Literal["eagle", "frozen_kv_mtp", "dflash", "ngram"]
@@ -338,167 +338,50 @@ def _run_spec_verify_cuda_graph_case(
     rtol: float,
 ):
     draft_token_num = _check_target_verify_case(case)
-    if case.batch_size > capture_batch_size:
-        raise ValueError("Spec verify CUDA graph capture must cover replay batch size.")
-
-    graph_fixture = build_fixture(
+    adapter = SpeculativeCudaGraphAdapter(
+        build_fixture=build_fixture,
+        make_capture_case=lambda base, name, capture_prefix_len, bs: (
+            make_case_with_prefix_lens(base, name, (capture_prefix_len,) * bs)
+        ),
+        make_replay_case=lambda base, name, pad_prefix_lens: (
+            make_case_with_prefix_lens(base, name, base.prefix_lens + pad_prefix_lens)
+        ),
+        make_forward_batch=make_forward_batch,
+        fixture_inputs=fixture_inputs,
+        make_capture_inputs=make_capture_inputs,
+        make_replay_inputs=make_replay_inputs,
+        prepare_batch=lambda spec_case, batch: _prepare_spec_verify_batch(
+            spec_case,
+            batch,
+            topk=topk,
+            spec_kind=spec_kind,
+            device=device,
+        ),
+        prepare_inputs=prepare_inputs,
+        run_forward=run_forward,
+        expected_output=lambda fixture, spec_case, inputs, _state: (
+            _target_verify_expected_output(
+                reference_fn=reference_fn,
+                fixture=fixture,
+                case=spec_case,
+                inputs=inputs,
+                topk=topk,
+                device=device,
+            )
+        ),
+        max_num_tokens=lambda _case, bs: bs * draft_token_num,
+        atol=atol,
+        rtol=rtol,
+    )
+    run_speculative_cuda_graph_case(
         testcase,
         case,
-        **build_kwargs,
-        disable_cuda_graph=False,
-        runner_batch_size=capture_batch_size,
-    )
-    backend = graph_fixture.backend
-    backend.init_cuda_graph_state(
-        max_bs=capture_batch_size,
-        max_num_tokens=capture_batch_size * draft_token_num,
-    )
-
-    graph_batch = graph_fixture.forward_batch
-    _prepare_spec_verify_batch(
-        case,
-        graph_batch,
-        topk=topk,
-        spec_kind=spec_kind,
-        device=device,
-    )
-    graph_inputs = fixture_inputs(graph_fixture)
-    graph_expected = _target_verify_expected_output(
-        reference_fn=reference_fn,
-        fixture=graph_fixture,
-        case=case,
-        inputs=graph_inputs,
-        topk=topk,
-        device=device,
-    )
-
-    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
-        backend.init_forward_metadata(graph_batch)
-        graph_eager_actual = run_forward(graph_fixture, graph_batch, graph_inputs)
-
-    torch.testing.assert_close(
-        graph_eager_actual,
-        graph_expected,
-        atol=atol,
-        rtol=rtol,
-    )
-
-    capture_prefix_len = backend.get_cuda_graph_seq_len_fill_value()
-    capture_case = make_case_with_prefix_lens(
-        case,
-        f"{case.name}_cuda_graph_capture",
-        (capture_prefix_len,) * capture_batch_size,
-    )
-    capture_inputs = make_capture_inputs(
-        capture_case,
-        graph_fixture,
+        adapter=adapter,
+        build_kwargs=build_kwargs,
+        capture_batch_size=capture_batch_size,
+        max_context_len=max_context_len,
         dtype=dtype,
         device=device,
-    )
-    capture_batch = make_forward_batch(
-        capture_case,
-        graph_fixture.runner,
-        max_context_len=max_context_len,
-        device=device,
-    )
-    _prepare_spec_verify_batch(
-        capture_case,
-        capture_batch,
-        topk=topk,
-        spec_kind=spec_kind,
-        device=device,
-    )
-    prepare_inputs(
-        graph_fixture,
-        capture_case,
-        capture_batch,
-        capture_inputs,
-        max_context_len=max_context_len,
-    )
-    capture_expected = _target_verify_expected_output(
-        reference_fn=reference_fn,
-        fixture=graph_fixture,
-        case=capture_case,
-        inputs=capture_inputs,
-        topk=topk,
-        device=device,
-    )
-
-    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
-        _init_cuda_graph_capture_metadata(
-            backend,
-            capture_batch_size,
-            capture_batch,
-        )
-        capture_actual = run_forward(graph_fixture, capture_batch, capture_inputs)
-        backend.on_after_cuda_graph_warmup()
-
-    replay_pad_prefix_lens = (capture_prefix_len,) * (
-        capture_batch_size - case.batch_size
-    )
-    replay_case = make_case_with_prefix_lens(
-        case,
-        f"{case.name}_cuda_graph_replay",
-        case.prefix_lens + replay_pad_prefix_lens,
-    )
-    replay_inputs = make_replay_inputs(
-        replay_case,
-        graph_fixture,
-        replay_pad_prefix_lens,
-        graph_inputs,
-        dtype=dtype,
-        device=device,
-    )
-    replay_batch = make_forward_batch(
-        replay_case,
-        graph_fixture.runner,
-        max_context_len=max_context_len,
-        device=device,
-    )
-    _prepare_spec_verify_batch(
-        replay_case,
-        replay_batch,
-        topk=topk,
-        spec_kind=spec_kind,
-        device=device,
-    )
-    prepare_inputs(
-        graph_fixture,
-        replay_case,
-        replay_batch,
-        replay_inputs,
-        max_context_len=max_context_len,
-    )
-    replay_expected = _target_verify_expected_output(
-        reference_fn=reference_fn,
-        fixture=graph_fixture,
-        case=replay_case,
-        inputs=replay_inputs,
-        topk=topk,
-        device=device,
-    )
-
-    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
-        _init_cuda_graph_replay_metadata(backend, capture_batch_size, replay_batch)
-        replay_actual = run_forward(graph_fixture, replay_batch, replay_inputs)
-
-    torch.testing.assert_close(
-        capture_actual,
-        capture_expected,
-        atol=atol,
-        rtol=rtol,
-    )
-    torch.testing.assert_close(
-        replay_actual,
-        replay_expected,
-        atol=atol,
-        rtol=rtol,
-    )
-    torch.testing.assert_close(
-        replay_actual[: case.num_input_tokens],
-        graph_eager_actual,
-        atol=atol,
-        rtol=rtol,
     )
 
 
@@ -683,119 +566,61 @@ def run_gdn_eagle_verify_cuda_graph_case(
     cuda_graph_capture_batch_size: int | None = None,
 ):
     cuda_graph_capture_batch_size = cuda_graph_capture_batch_size or case.batch_size
-    if case.batch_size != cuda_graph_capture_batch_size:
-        raise ValueError("GDN verify graph coverage currently uses unpadded replay.")
-
-    graph_fixture = build_gdn_attention_fixture(
+    atol = GDN_TREE_ATOL if topk > 1 else GDN_ATOL
+    adapter = SpeculativeCudaGraphAdapter(
+        build_fixture=build_gdn_attention_fixture,
+        make_capture_case=lambda base, name, capture_prefix_len, bs: (
+            make_gdn_case_with_prefix_lens(base, name, (capture_prefix_len,) * bs)
+        ),
+        make_replay_case=lambda base, name, _pad_prefix_lens: (
+            make_gdn_case_with_prefix_lens(base, name, base.prefix_lens)
+        ),
+        make_forward_batch=_make_gdn_forward_batch,
+        fixture_inputs=gdn_fixture_inputs,
+        make_capture_inputs=make_gdn_random_inputs,
+        make_replay_inputs=lambda _case, fixture, *_args, **_kwargs: (
+            gdn_fixture_inputs(fixture)
+        ),
+        prepare_batch=lambda spec_case, batch: _prepare_gdn_verify_batch(
+            spec_case,
+            batch,
+            topk=topk,
+            device=device,
+        ),
+        prepare_inputs=prepare_gdn_runner_inputs,
+        run_forward=run_gdn_forward,
+        expected_output=lambda fixture, spec_case, inputs, state: (
+            expected_gdn_verify_output_from_inputs(
+                fixture,
+                spec_case,
+                inputs,
+                state,
+                topk=topk,
+            )
+        ),
+        clone_state=_clone_gdn_cache,
+        restore_state=_restore_gdn_cache,
+        allow_padding=False,
+        run_graph_eager=False,
+        compare_replay_to_graph_eager=False,
+        atol=atol,
+        rtol=GDN_RTOL,
+    )
+    run_speculative_cuda_graph_case(
         testcase,
         case,
-        head_k_dim=head_k_dim,
-        head_v_dim=head_v_dim,
+        adapter=adapter,
+        build_kwargs=dict(
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
+            max_context_len=max_context_len,
+            dtype=dtype,
+            device=device,
+        ),
+        capture_batch_size=cuda_graph_capture_batch_size,
         max_context_len=max_context_len,
         dtype=dtype,
         device=device,
-        disable_cuda_graph=False,
-        runner_batch_size=cuda_graph_capture_batch_size,
-    )
-    backend = graph_fixture.backend
-    initial_state = _clone_gdn_cache(graph_fixture)
-
-    capture_prefix_len = backend.get_cuda_graph_seq_len_fill_value()
-    capture_case = make_gdn_case_with_prefix_lens(
-        case,
-        f"{case.name}_cuda_graph_capture",
-        (capture_prefix_len,) * cuda_graph_capture_batch_size,
-    )
-    capture_inputs = make_gdn_random_inputs(
-        capture_case,
-        graph_fixture,
-        dtype=dtype,
-        device=device,
-    )
-    capture_batch = _make_gdn_forward_batch(
-        capture_case,
-        graph_fixture.runner,
-        max_context_len=max_context_len,
-        device=device,
-    )
-    _prepare_gdn_verify_batch(capture_case, capture_batch, topk=topk, device=device)
-    prepare_gdn_runner_inputs(
-        graph_fixture,
-        capture_case,
-        capture_batch,
-        capture_inputs,
-        max_context_len=max_context_len,
-    )
-    capture_expected = expected_gdn_verify_output_from_inputs(
-        graph_fixture,
-        capture_case,
-        capture_inputs,
-        initial_state,
-        topk=topk,
-    )
-
-    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
-        _init_cuda_graph_capture_metadata(
-            backend,
-            cuda_graph_capture_batch_size,
-            capture_batch,
-        )
-        capture_actual = run_gdn_forward(
-            graph_fixture,
-            capture_batch,
-            capture_inputs,
-        )
-        backend.on_after_cuda_graph_warmup()
-
-    _restore_gdn_cache(graph_fixture, initial_state)
-    replay_case = make_gdn_case_with_prefix_lens(
-        case,
-        f"{case.name}_cuda_graph_replay",
-        case.prefix_lens,
-    )
-    replay_inputs = gdn_fixture_inputs(graph_fixture)
-    replay_batch = _make_gdn_forward_batch(
-        replay_case,
-        graph_fixture.runner,
-        max_context_len=max_context_len,
-        device=device,
-    )
-    _prepare_gdn_verify_batch(replay_case, replay_batch, topk=topk, device=device)
-    prepare_gdn_runner_inputs(
-        graph_fixture,
-        replay_case,
-        replay_batch,
-        replay_inputs,
-        max_context_len=max_context_len,
-    )
-    replay_expected = expected_gdn_verify_output_from_inputs(
-        graph_fixture,
-        replay_case,
-        replay_inputs,
-        initial_state,
-        topk=topk,
-    )
-
-    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
-        _init_cuda_graph_replay_metadata(
-            backend,
-            cuda_graph_capture_batch_size,
-            replay_batch,
-        )
-        replay_actual = run_gdn_forward(graph_fixture, replay_batch, replay_inputs)
-
-    atol = GDN_TREE_ATOL if topk > 1 else GDN_ATOL
-    torch.testing.assert_close(
-        capture_actual,
-        capture_expected,
-        atol=atol,
-        rtol=GDN_RTOL,
-    )
-    torch.testing.assert_close(
-        replay_actual,
-        replay_expected,
-        atol=atol,
-        rtol=GDN_RTOL,
     )
 
 

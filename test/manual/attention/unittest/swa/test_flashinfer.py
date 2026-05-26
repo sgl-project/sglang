@@ -15,10 +15,10 @@ from common.attention_methods.dense_attention import (
     make_swa_no_prefix_input_config_cases,
     run_dense_attention_case,
 )
-from common.graph_runners.cuda_graph_decode_runner import (
+from common.runner_modes.cuda_graph_decode_runner import (
     run_dense_cuda_graph_decode_case,
 )
-from common.graph_runners.split_op_runner import run_dense_split_op_extend_case
+from common.runner_modes.split_op_runner import run_dense_split_op_extend_case
 
 
 @unittest.skipIf(

@@ -14,7 +14,7 @@ from common.attention_methods.dense_attention import (
     make_dense_cases,
     run_dense_attention_case,
 )
-from common.graph_runners.split_op_runner import run_dense_split_op_extend_case
+from common.runner_modes.split_op_runner import run_dense_split_op_extend_case
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")

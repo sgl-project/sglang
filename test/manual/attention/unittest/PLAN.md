@@ -164,21 +164,26 @@ Implemented:
   SGLang kernel helpers.
 - Shared helpers are split by responsibility. Attention-method fixtures live
   under `common/attention_methods/` and build modules, inputs, references, and
-  metadata. Runner orchestration lives under `common/graph_runners/` and owns
+  metadata. Runner orchestration lives under `common/runner_modes/` and owns
   CUDA graph/PCG/BCG/speculative capture and replay flows.
-  `common/graph_runners/cuda_graph_decode_runner.py` now uses one CUDA graph
+  The folder is intentionally named `runner_modes`, not `graph_runners`, because
+  it also hosts eager-style and split-op runner coverage rather than only CUDA
+  graph execution.
+  `common/runner_modes/cuda_graph_decode_runner.py` now uses one CUDA graph
   decode lifecycle for dense/SWA, MLA, and GDN through attention-family adapters.
   Reusable family-specific callbacks such as case cloning, random capture inputs,
   padded replay inputs, forward calls, and reference-output adapters live in the
   attention-method helper files rather than in the CUDA graph runner. GDN only
   supplies the recurrent-cache snapshot and restore hooks from the runner side.
 - Speculative runner helpers are split by speculative forward mode:
-  `common/graph_runners/speculative_target_verify_graph_runner.py` owns
+  `common/runner_modes/speculative_target_verify_runner.py` owns
   `TARGET_VERIFY` custom-mask/retrieve-index metadata and verify graph replay,
-  while `common/graph_runners/speculative_draft_extend_graph_runner.py` owns
+  while `common/runner_modes/speculative_draft_extend_runner.py` owns
   `DRAFT_EXTEND`/`DRAFT_EXTEND_V2` accepted-token metadata and draft graph
-  replay. There is no root-level speculative runner shim; in-tree tests import
-  the graph-runner modules directly.
+  replay. Their CUDA graph capture/replay lifecycle is de-duplicated in
+  `common/runner_modes/speculative_cuda_graph_runner.py`, following the
+  adapter-based shape of `cuda_graph_decode_runner.py`. There is no root-level
+  speculative runner shim; in-tree tests import the runner-mode modules directly.
 - RoPE is intentionally omitted from the current unit-level runner x attention
   tests. These tests feed post-RoPE-equivalent Q/K tensors because rotary math is
   orthogonal to runner/backend metadata compatibility.
@@ -211,14 +216,23 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
-- Moved shared helpers into two folders:
-  - `common/attention_methods/` for dense, MLA, and GDN attention-method fixtures.
-  - `common/graph_runners/` for decode CUDA graph, PCG/BCG split-op, and
-    speculative graph-runner helpers.
-- Renamed speculative graph helpers:
-  - `common/graph_runners/speculative_target_verify_graph_runner.py`
-  - `common/graph_runners/speculative_draft_extend_graph_runner.py`
+- Renamed runner orchestration helpers from `common/graph_runners/` to
+  `common/runner_modes/` because the folder includes eager-style, PCG/BCG
+  split-op, speculative, and CUDA graph runner modes.
+- Renamed speculative files to remove misleading graph-only names:
+  - `common/runner_modes/speculative_target_verify_runner.py`
+  - `common/runner_modes/speculative_draft_extend_runner.py`
+- Added `common/runner_modes/speculative_cuda_graph_runner.py` so
+  `speculative_target_verify_runner.py` and `speculative_draft_extend_runner.py`
+  share one fixed-capture-batch CUDA graph capture/replay lifecycle instead of
+  duplicating `run_*_cuda_graph_case` logic.
 - `python -m py_compile $(find test/manual/attention/unittest/common test/manual/attention/unittest/dense test/manual/attention/unittest/swa test/manual/attention/unittest/mla test/manual/attention/unittest/gdn -name '*.py' -not -path '*/__pycache__/*')`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+  - Ran 61 tests in 22.570s after renaming runner helpers and de-duplicating the
+    speculative CUDA graph lifecycle.
+- Previous broad verification after moving shared helpers into
+  `common/attention_methods/` and `common/runner_modes/`:
+  `python -m py_compile $(find test/manual/attention/unittest/common test/manual/attention/unittest/dense test/manual/attention/unittest/swa test/manual/attention/unittest/mla test/manual/attention/unittest/gdn -name '*.py' -not -path '*/__pycache__/*')`
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
   - Ran 61 tests in 22.504s after moving attention methods and graph runners into
     separate folders.
@@ -229,7 +243,7 @@ Latest verification:
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
   - Ran 61 tests in 22.442s after adding per-method summary files and placeholder
     method folders.
-- `python -m py_compile test/manual/attention/unittest/common/attention_methods/mla_attention.py test/manual/attention/unittest/common/graph_runners/speculative_target_verify_graph_runner.py test/manual/attention/unittest/common/graph_runners/speculative_draft_extend_graph_runner.py test/manual/attention/unittest/mla/test_flashinfer.py test/manual/attention/unittest/mla/test_flashmla.py`
+- `python -m py_compile test/manual/attention/unittest/common/attention_methods/mla_attention.py test/manual/attention/unittest/common/runner_modes/speculative_target_verify_runner.py test/manual/attention/unittest/common/runner_modes/speculative_draft_extend_runner.py test/manual/attention/unittest/mla/test_flashinfer.py test/manual/attention/unittest/mla/test_flashmla.py`
 - `python test/manual/attention/unittest/mla/test_flashinfer.py -v`
   - Ran 7 tests in 1.304s after adding FlashInfer MLA `DRAFT_EXTEND`
     CUDA-graph replay coverage.
@@ -244,14 +258,14 @@ Latest verification:
     for both FA3 and FA4 (`max abs diff ~= 0.618`).
   - `run_dense_spec_verify_cuda_graph_case(..., topk=2, spec_kind="eagle")`
     mismatched the HF-style reference for both FA3 and FA4 (`max abs diff ~= 0.115`).
-- `python -m py_compile test/manual/attention/unittest/common/attention_methods/gdn_attention.py test/manual/attention/unittest/common/graph_runners/speculative_target_verify_graph_runner.py test/manual/attention/unittest/common/graph_runners/speculative_draft_extend_graph_runner.py test/manual/attention/unittest/gdn/test_triton.py test/manual/attention/unittest/gdn/test_flashinfer.py`
+- `python -m py_compile test/manual/attention/unittest/common/attention_methods/gdn_attention.py test/manual/attention/unittest/common/runner_modes/speculative_target_verify_runner.py test/manual/attention/unittest/common/runner_modes/speculative_draft_extend_runner.py test/manual/attention/unittest/gdn/test_triton.py test/manual/attention/unittest/gdn/test_flashinfer.py`
 - `python test/manual/attention/unittest/gdn/test_triton.py -v`
   - Ran 5 tests in 1.228s after adding GDN EAGLE tree verify/replay coverage.
 - `python test/manual/attention/unittest/gdn/test_flashinfer.py -v`
   - Ran 5 tests in 1.329s after adding GDN EAGLE tree verify/replay coverage.
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
   - Ran 60 tests in 22.611s after adding GDN EAGLE tree verify/replay coverage.
-- `python -m py_compile test/manual/attention/unittest/common/attention_methods/gdn_attention.py test/manual/attention/unittest/common/graph_runners/speculative_target_verify_graph_runner.py test/manual/attention/unittest/common/graph_runners/speculative_draft_extend_graph_runner.py test/manual/attention/unittest/gdn/test_triton.py test/manual/attention/unittest/gdn/test_flashinfer.py`
+- `python -m py_compile test/manual/attention/unittest/common/attention_methods/gdn_attention.py test/manual/attention/unittest/common/runner_modes/speculative_target_verify_runner.py test/manual/attention/unittest/common/runner_modes/speculative_draft_extend_runner.py test/manual/attention/unittest/gdn/test_triton.py test/manual/attention/unittest/gdn/test_flashinfer.py`
 - `python test/manual/attention/unittest/gdn/test_triton.py -v`
   - Ran 5 tests in 1.179s after adding GDN EAGLE chain verify and CUDA-graph
     replay coverage.
@@ -267,7 +281,7 @@ Latest verification:
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
   - Ran 56 tests in 22.370s after adding decode-only dense `trtllm_mha`
     coverage.
-- `python -m py_compile test/manual/attention/unittest/common/graph_runners/speculative_target_verify_graph_runner.py test/manual/attention/unittest/common/graph_runners/speculative_draft_extend_graph_runner.py test/manual/attention/unittest/mla/test_triton.py`
+- `python -m py_compile test/manual/attention/unittest/common/runner_modes/speculative_target_verify_runner.py test/manual/attention/unittest/common/runner_modes/speculative_draft_extend_runner.py test/manual/attention/unittest/mla/test_triton.py`
 - `python test/manual/attention/unittest/mla/test_triton.py -v`
   - Ran 6 tests in 1.012s after adding MLA Triton `DRAFT_EXTEND_V2`
     CUDA-graph replay coverage.
@@ -286,12 +300,12 @@ Latest verification:
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
   - Ran 54 tests in 22.393s after adding FlashMLA coverage and switching the MLA
     actual fixture to pass full `[latent, rope]` query tensors.
-- `python -m py_compile test/manual/attention/unittest/common/attention_methods/dense_attention.py test/manual/attention/unittest/common/attention_methods/mla_attention.py test/manual/attention/unittest/common/attention_methods/gdn_attention.py test/manual/attention/unittest/common/graph_runners/speculative_target_verify_graph_runner.py test/manual/attention/unittest/common/graph_runners/speculative_draft_extend_graph_runner.py test/manual/attention/unittest/dense/test_triton.py`
+- `python -m py_compile test/manual/attention/unittest/common/attention_methods/dense_attention.py test/manual/attention/unittest/common/attention_methods/mla_attention.py test/manual/attention/unittest/common/attention_methods/gdn_attention.py test/manual/attention/unittest/common/runner_modes/speculative_target_verify_runner.py test/manual/attention/unittest/common/runner_modes/speculative_draft_extend_runner.py test/manual/attention/unittest/dense/test_triton.py`
 - `python test/manual/attention/unittest/dense/test_triton.py -v`
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
   - Ran 48 tests in 22.022s after adding dense Triton `DRAFT_EXTEND_V2`
     CUDA-graph replay coverage.
-- `python -m py_compile test/manual/attention/unittest/common/attention_methods/mla_attention.py test/manual/attention/unittest/common/graph_runners/cuda_graph_decode_runner.py test/manual/attention/unittest/common/graph_runners/split_op_runner.py test/manual/attention/unittest/common/graph_runners/speculative_target_verify_graph_runner.py test/manual/attention/unittest/common/graph_runners/speculative_draft_extend_graph_runner.py test/manual/attention/unittest/mla/test_flashinfer.py`
+- `python -m py_compile test/manual/attention/unittest/common/attention_methods/mla_attention.py test/manual/attention/unittest/common/runner_modes/cuda_graph_decode_runner.py test/manual/attention/unittest/common/runner_modes/split_op_runner.py test/manual/attention/unittest/common/runner_modes/speculative_target_verify_runner.py test/manual/attention/unittest/common/runner_modes/speculative_draft_extend_runner.py test/manual/attention/unittest/mla/test_flashinfer.py`
 - `python test/manual/attention/unittest/mla/test_triton.py -v`
 - `python test/manual/attention/unittest/mla/test_flashinfer.py -v`
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
@@ -307,11 +321,11 @@ Latest verification:
 - `python test/manual/attention/unittest/gdn/test_flashinfer.py -v`
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
   - Ran 36 tests in 21.417s after adding FlashInfer draft-extend CUDA-graph-style replay.
-- `python -m py_compile test/manual/attention/unittest/common/attention_methods/dense_attention.py test/manual/attention/unittest/common/attention_methods/mla_attention.py test/manual/attention/unittest/common/graph_runners/speculative_target_verify_graph_runner.py test/manual/attention/unittest/common/graph_runners/speculative_draft_extend_graph_runner.py test/manual/attention/unittest/dense/test_flashinfer.py`
+- `python -m py_compile test/manual/attention/unittest/common/attention_methods/dense_attention.py test/manual/attention/unittest/common/attention_methods/mla_attention.py test/manual/attention/unittest/common/runner_modes/speculative_target_verify_runner.py test/manual/attention/unittest/common/runner_modes/speculative_draft_extend_runner.py test/manual/attention/unittest/dense/test_flashinfer.py`
 - `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
   - Ran 35 tests in 21.392s after adding Phase 4 target-verify CUDA-graph-style replay.
-- `python -m py_compile test/manual/attention/unittest/common/graph_runners/speculative_target_verify_graph_runner.py test/manual/attention/unittest/common/graph_runners/speculative_draft_extend_graph_runner.py test/manual/attention/unittest/common/attention_methods/dense_attention.py test/manual/attention/unittest/common/attention_methods/mla_attention.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/mla/test_triton.py`
+- `python -m py_compile test/manual/attention/unittest/common/runner_modes/speculative_target_verify_runner.py test/manual/attention/unittest/common/runner_modes/speculative_draft_extend_runner.py test/manual/attention/unittest/common/attention_methods/dense_attention.py test/manual/attention/unittest/common/attention_methods/mla_attention.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/mla/test_triton.py`
 - `python test/manual/attention/unittest/dense/test_triton.py -v`
 - `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
 - `python test/manual/attention/unittest/swa/test_triton.py -v`
@@ -324,27 +338,27 @@ Latest verification:
 - `python test/manual/attention/unittest/dense/test_fa3.py -v`
 - `python test/manual/attention/unittest/dense/test_fa4.py -v`
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
-- `python -m py_compile test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/common/graph_runners/speculative_target_verify_graph_runner.py test/manual/attention/unittest/common/graph_runners/speculative_draft_extend_graph_runner.py`
+- `python -m py_compile test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/common/runner_modes/speculative_target_verify_runner.py test/manual/attention/unittest/common/runner_modes/speculative_draft_extend_runner.py`
 - `python test/manual/attention/unittest/swa/test_triton.py -v`
-- `python -m py_compile test/manual/attention/unittest/common/graph_runners/speculative_target_verify_graph_runner.py test/manual/attention/unittest/common/graph_runners/speculative_draft_extend_graph_runner.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py`
+- `python -m py_compile test/manual/attention/unittest/common/runner_modes/speculative_target_verify_runner.py test/manual/attention/unittest/common/runner_modes/speculative_draft_extend_runner.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py`
 - `python test/manual/attention/unittest/dense/test_triton.py -v`
 - `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
 - `python test/manual/attention/unittest/mla/test_triton.py -v`
-- `python -m py_compile test/manual/attention/unittest/common/graph_runners/speculative_target_verify_graph_runner.py test/manual/attention/unittest/common/graph_runners/speculative_draft_extend_graph_runner.py test/manual/attention/unittest/common/attention_methods/dense_attention.py test/manual/attention/unittest/common/attention_methods/mla_attention.py test/manual/attention/unittest/common/attention_methods/gdn_attention.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/mla/test_triton.py`
-- `python test/manual/attention/unittest/dense/test_triton.py -v`
-- `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
-- `python test/manual/attention/unittest/mla/test_triton.py -v`
-- `python test/manual/attention/unittest/gdn/test_triton.py -v`
-- `python test/manual/attention/unittest/swa/test_triton.py -v`
-- `python test/manual/attention/unittest/swa/test_flashinfer.py -v`
-- `python -m py_compile test/manual/attention/unittest/common/graph_runners/cuda_graph_decode_runner.py test/manual/attention/unittest/common/attention_methods/dense_attention.py test/manual/attention/unittest/common/attention_methods/mla_attention.py test/manual/attention/unittest/common/attention_methods/gdn_attention.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/mla/test_triton.py test/manual/attention/unittest/gdn/test_triton.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/swa/test_flashinfer.py`
+- `python -m py_compile test/manual/attention/unittest/common/runner_modes/speculative_target_verify_runner.py test/manual/attention/unittest/common/runner_modes/speculative_draft_extend_runner.py test/manual/attention/unittest/common/attention_methods/dense_attention.py test/manual/attention/unittest/common/attention_methods/mla_attention.py test/manual/attention/unittest/common/attention_methods/gdn_attention.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/mla/test_triton.py`
 - `python test/manual/attention/unittest/dense/test_triton.py -v`
 - `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
 - `python test/manual/attention/unittest/mla/test_triton.py -v`
 - `python test/manual/attention/unittest/gdn/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_flashinfer.py -v`
-- `python -m py_compile python/sglang/srt/layers/radix_attention.py test/manual/attention/unittest/common/graph_runners/split_op_runner.py test/manual/attention/unittest/common/attention_methods/dense_attention.py test/manual/attention/unittest/common/attention_methods/mla_attention.py test/manual/attention/unittest/common/attention_methods/gdn_attention.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/mla/test_triton.py test/manual/attention/unittest/gdn/test_triton.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/swa/test_flashinfer.py`
+- `python -m py_compile test/manual/attention/unittest/common/runner_modes/cuda_graph_decode_runner.py test/manual/attention/unittest/common/attention_methods/dense_attention.py test/manual/attention/unittest/common/attention_methods/mla_attention.py test/manual/attention/unittest/common/attention_methods/gdn_attention.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/mla/test_triton.py test/manual/attention/unittest/gdn/test_triton.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/swa/test_flashinfer.py`
+- `python test/manual/attention/unittest/dense/test_triton.py -v`
+- `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
+- `python test/manual/attention/unittest/mla/test_triton.py -v`
+- `python test/manual/attention/unittest/gdn/test_triton.py -v`
+- `python test/manual/attention/unittest/swa/test_triton.py -v`
+- `python test/manual/attention/unittest/swa/test_flashinfer.py -v`
+- `python -m py_compile python/sglang/srt/layers/radix_attention.py test/manual/attention/unittest/common/runner_modes/split_op_runner.py test/manual/attention/unittest/common/attention_methods/dense_attention.py test/manual/attention/unittest/common/attention_methods/mla_attention.py test/manual/attention/unittest/common/attention_methods/gdn_attention.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/mla/test_triton.py test/manual/attention/unittest/gdn/test_triton.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/swa/test_flashinfer.py`
 - `python test/manual/attention/unittest/dense/test_triton.py -v`
 - `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
 - `python test/manual/attention/unittest/mla/test_triton.py -v`
@@ -367,11 +381,12 @@ test/manual/attention/unittest/
       dense_attention.py
       gdn_attention.py
       mla_attention.py
-    graph_runners/
+    runner_modes/
       cuda_graph_decode_runner.py
       split_op_runner.py
-      speculative_draft_extend_graph_runner.py
-      speculative_target_verify_graph_runner.py
+      speculative_cuda_graph_runner.py
+      speculative_draft_extend_runner.py
+      speculative_target_verify_runner.py
   dense/
     test_fa3.py
     test_fa4.py
@@ -994,7 +1009,7 @@ Optional dispatch-path cases:
 Initial implementation slice:
 - `common/attention_methods/dense_attention.py` contains a projected attention target that owns
   Q/K/V/O projections and dispatches through `RadixAttention`.
-- `common/graph_runners/cuda_graph_decode_runner.py` owns CUDA graph capture/replay helpers for dense/SWA,
+- `common/runner_modes/cuda_graph_decode_runner.py` owns CUDA graph capture/replay helpers for dense/SWA,
   MLA, and GDN. Attention-method files only enumerate cases and call runner helpers.
   Dense/SWA and MLA share one projected-attention graph helper; GDN uses a dedicated
   graph helper because capture/replay mutates recurrent cache state.
