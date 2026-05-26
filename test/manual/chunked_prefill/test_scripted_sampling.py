@@ -655,6 +655,58 @@ class TestScriptedSampling(CustomTestCase):
             f"got {r.stream_events!r}"
         )
 
+    def test_finish_reason_value_eos_vs_length_chunked(self):
+        """Chunked req's finish_reason matches EOS (stop) vs length cap (length) per sampling kwargs."""
+        execute_scripted_runtime(
+            self._script_finish_reason_value_eos_vs_length_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-NEW] output-state contract: a chunked req that decodes to its
+    # natural EOS should report finish_reason == "stop"; one capped by
+    # max_new_tokens under ignore_eos should report "length". Both code
+    # paths must produce a populated finish_reason after a chunked
+    # prefill — pre-fix the chunked path could leave it None.
+    @staticmethod
+    def _script_finish_reason_value_eos_vs_length_chunked(t: ScriptedRuntime):
+        # NEW API NEEDED: r.finish_reason — the engine-reported reason
+        # string ("stop" | "length" | "abort" | None until finalized).
+        # NEW API NEEDED: start_req(..., ignore_eos=).
+
+        # Scenario 1: long chunked req with ignore_eos=False and a
+        # generous max_new_tokens — decode should hit EOS naturally.
+        r_eos = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN,
+            max_new_tokens=999,
+            ignore_eos=False,
+        )
+        yield from run_until_finished(r_eos, max_steps=2000)
+        assert r_eos.finished
+        assert r_eos.chunks_done >= 2, (
+            f"scenario 1 should chunk; got chunks_done={r_eos.chunks_done}"
+        )
+        assert r_eos.finish_reason == "stop", (
+            f"ignore_eos=False + max_new_tokens=999 chunked must finish via "
+            f"EOS (stop); got {r_eos.finish_reason!r}"
+        )
+
+        # Scenario 2: long chunked req with ignore_eos=True and a tiny
+        # max_new_tokens — decode is forced to the length cap.
+        r_length = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN,
+            max_new_tokens=4,
+            ignore_eos=True,
+        )
+        yield from run_until_finished(r_length)
+        assert r_length.finished
+        assert r_length.chunks_done >= 2, (
+            f"scenario 2 should chunk; got chunks_done={r_length.chunks_done}"
+        )
+        assert r_length.finish_reason == "length", (
+            f"ignore_eos=True + max_new_tokens=4 chunked must finish via "
+            f"length cap; got {r_length.finish_reason!r}"
+        )
+
     def test_seed_chunked_bit_identical_runs(self):
         """Same seed + same prompt + chunked, run twice sequentially: identical output tokens."""
         execute_scripted_runtime(
