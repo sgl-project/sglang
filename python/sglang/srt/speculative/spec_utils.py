@@ -824,6 +824,25 @@ def maybe_detect_oob(indices: torch.Tensor, low: int, high: int, msg: str):
     )
 
 
+def maybe_detect_inf(tensor: torch.Tensor, msg: str = ""):
+    """Async Inf check — fp16 overflow surfaces as Inf before NaN."""
+    if not envs.SGLANG_SPEC_NAN_DETECTION.get():
+        return
+    torch._assert_async(~torch.any(torch.isinf(tensor)), f"Inf detected! {msg}")
+
+
+def maybe_detect_page_aligned(indices: torch.Tensor, page_size: int, msg: str):
+    """Async page-alignment check on slot ids."""
+    if not envs.SGLANG_SPEC_OOB_DETECTION.get():
+        return
+    if indices.numel() == 0 or page_size <= 1:
+        return
+    torch._assert_async(
+        (indices % page_size == 0).all(),
+        f"page-misaligned indices (page_size={page_size}): {msg}",
+    )
+
+
 # Disable torch.compile for this function because it will be
 # even slower.
 # @torch.compile(dynamic=True)

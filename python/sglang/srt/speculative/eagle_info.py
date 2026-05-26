@@ -42,6 +42,8 @@ from sglang.srt.speculative.spec_utils import (
     generate_simulated_accept_index,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
+    maybe_detect_inf,
+    maybe_detect_nan,
     maybe_detect_oob,
 )
 from sglang.srt.utils import is_cuda, is_musa, next_power_of_2
@@ -356,12 +358,15 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             target_probs = F.softmax(
                 logits_output.next_token_logits / expanded_temperature, dim=-1
             )  # (bs * draft_token_num, vocab_size)
+            maybe_detect_nan(target_probs, "verify: target_probs after softmax")
+            maybe_detect_inf(target_probs, "verify: target_probs after softmax")
             target_probs = top_k_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ks, self.draft_token_num, dim=0
                 ),
             )  # (bs * draft_token_num, vocab_size)
+            maybe_detect_nan(target_probs, "verify: target_probs after top_k_renorm")
             if sampling_info.need_top_p_sampling:
                 target_probs = top_p_renorm_prob(
                     target_probs,
@@ -432,6 +437,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             -1,
             bs * self.draft_token_num,
             "eagle verify accept_index post-sampling",
+        )
+        maybe_detect_oob(
+            num_correct_drafts,
+            0,
+            self.draft_token_num + 1,
+            "eagle verify num_correct_drafts post-sampling",
         )
 
         unfinished_index = []
