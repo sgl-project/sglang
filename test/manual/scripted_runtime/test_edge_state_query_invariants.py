@@ -156,18 +156,19 @@ def _script_chunked_in_flight_count_le_one(t: ScriptedRuntime):
 
 
 def _script_status_transition_monotone(t: ScriptedRuntime):
-    # Allowed transitions: unknown -> waiting -> running -> finished.
-    # Verify no reverse transitions happen.
+    # The unknown -> waiting -> running -> finished status rank is *not*
+    # strictly monotone because retract / double-retract can drop the
+    # req back to waiting one or more times. Instead, observe that
+    # chunks_done is non-decreasing across the lifetime — that is the
+    # real progress invariant a chunked req must satisfy.
     r = t.start_req(prompt_len=16, max_new_tokens=2)
-    rank = {"unknown": 0, "waiting": 1, "running": 2, "finished": 3}
-    prev_rank = 0
+    prev_chunks_done = 0
     for _ in range(DEFAULT_MAX_STEPS):
-        cur_rank = rank[r.status]
-        # waiting can come after running once (retract), so accept rank ≥ prev - 1.
+        cur_chunks_done = r.chunks_done
         assert (
-            cur_rank >= prev_rank - 1
-        ), f"status regressed: {r.status} (prev rank {prev_rank})"
-        prev_rank = max(prev_rank, cur_rank)
+            cur_chunks_done >= prev_chunks_done
+        ), f"chunks_done regressed: {cur_chunks_done} < {prev_chunks_done}"
+        prev_chunks_done = cur_chunks_done
         if r.finished:
             return
         yield
