@@ -9,6 +9,90 @@ from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
 
 
+def launch_plan_write_expected_tokens_kernel_torch_reference(
+    *,
+    req_pool_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    write_offsets: torch.Tensor,
+    expected_token_pool: Optional[torch.Tensor],
+    expected_token_valid_lens: Optional[torch.Tensor],
+    out_expected_input_tokens: torch.Tensor,
+    slot_token_offset: int,
+) -> None:
+    """Python reference for ``launch_plan_write_expected_tokens_kernel``. Byte-equal semantics."""
+    bs = int(req_pool_indices.shape[0])
+    work_device = torch.device("cpu")
+
+    write_offsets_host = write_offsets.detach().to(
+        device=work_device, dtype=torch.int64
+    )
+    total_write = int(write_offsets_host[bs].item())
+
+    write_entry_capacity = int(out_expected_input_tokens.shape[0])
+    if total_write > write_entry_capacity:
+        raise ValueError(
+            f"kv-canary: launch_plan_write_expected_tokens_kernel_torch_reference total_write="
+            f"{total_write} exceeds write_entry_capacity={write_entry_capacity}"
+        )
+    if total_write <= 0:
+        return
+
+    has_pool = expected_token_pool is not None and expected_token_valid_lens is not None
+    if expected_token_pool is None and expected_token_valid_lens is not None:
+        raise ValueError(
+            "kv-canary: expected_token_pool and expected_token_valid_lens must both be "
+            "provided or both be None"
+        )
+    if expected_token_valid_lens is None and expected_token_pool is not None:
+        raise ValueError(
+            "kv-canary: expected_token_pool and expected_token_valid_lens must both be "
+            "provided or both be None"
+        )
+
+    req_pool_indices_host = req_pool_indices.detach().to(
+        device=work_device, dtype=torch.int64
+    )
+    prefix_lens_host = prefix_lens.detach().to(device=work_device, dtype=torch.int64)
+
+    if has_pool:
+        pool_host = expected_token_pool.detach().to(
+            device=work_device, dtype=torch.int32
+        )
+        valid_lens_host = expected_token_valid_lens.detach().to(
+            device=work_device, dtype=torch.int32
+        )
+        pool_max_context_len = int(pool_host.shape[1])
+    else:
+        pool_host = None
+        valid_lens_host = None
+        pool_max_context_len = 0
+
+    out_host = torch.full((total_write,), -1, dtype=torch.int64, device=work_device)
+
+    if has_pool:
+        for r in range(bs):
+            entry_start = int(write_offsets_host[r].item())
+            entry_end = int(write_offsets_host[r + 1].item())
+            entry_count = entry_end - entry_start
+            if entry_count <= 0:
+                continue
+            rp = int(req_pool_indices_host[r].item())
+            prefix_len = int(prefix_lens_host[r].item())
+            valid_len = int(valid_lens_host[rp].item())
+            for entry_offset in range(entry_count):
+                tid = entry_start + entry_offset
+                write_pos = prefix_len + entry_offset
+                sot_pos = write_pos + int(slot_token_offset)
+                if 0 <= sot_pos < valid_len and sot_pos < pool_max_context_len:
+                    out_host[tid] = int(pool_host[rp, sot_pos].item())
+
+    out_expected_input_tokens[:total_write].copy_(
+        out_host.to(out_expected_input_tokens.dtype).to(
+            out_expected_input_tokens.device
+        )
+    )
+
+
 def launch_canary_plan_kernels_torch_reference(
     *,
     verify_plan_out: VerifyPlan,
