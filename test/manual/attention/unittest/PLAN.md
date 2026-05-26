@@ -72,10 +72,12 @@ Implemented:
   EAGLE and Frozen-KV MTP `DRAFT_EXTEND` with ragged accepted-token counts. The
   capture batch uses a fixed max accepted-token count per request, while replay
   uses distinct ragged request metadata/input tensors.
-- Phase 4 `DRAFT_EXTEND_V2` CUDA-graph-style replay now covers dense `triton`
-  with a fixed token count per request, matching the multi-layer EAGLE v2 graph
-  contract where attention metadata receives prefix lengths and the draft token
-  count is carried separately by the graph/spec buffers.
+- Phase 4 `DRAFT_EXTEND_V2` CUDA-graph-style replay now covers dense and MLA
+  `triton` with a fixed token count per request, matching the multi-layer EAGLE
+  v2 graph contract where attention metadata receives prefix lengths and the
+  draft token count is carried separately by the graph/spec buffers. The MLA case
+  exercises the absorb-MLA cached-KV path with distinct capture/replay metadata
+  and input tensors.
 - The synthetic EAGLE verify helper uses realistic target-verify semantics:
   `ForwardBatch.seq_lens` represents prefix KV lengths, while `spec_info`
   supplies the draft tokens, positions, retrieve indices, and custom tree mask.
@@ -151,9 +153,9 @@ Implemented:
 In progress:
 - Phase 4 multi-step draft-runner coverage remains open. `DRAFT_EXTEND` replay
   now has a fixed-capture-batch unit helper for FlashInfer, and
-  `DRAFT_EXTEND_V2` has a representative Triton CUDA graph replay case; the next
-  draft-runner slice should model multi-step draft backends and per-step buffer
-  handoff more directly.
+  `DRAFT_EXTEND_V2` has representative dense/MLA Triton CUDA graph replay cases;
+  the next draft-runner slice should model multi-step draft backends and per-step
+  buffer handoff more directly.
 
 Next implementation steps:
 - Finish Phase 4 `DRAFT_EXTEND_V2` / multi-layer draft-runner coverage for
@@ -169,6 +171,13 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
+- `python -m py_compile test/manual/attention/unittest/common/spec_runner.py test/manual/attention/unittest/mla/test_triton.py`
+- `python test/manual/attention/unittest/mla/test_triton.py -v`
+  - Ran 6 tests in 1.012s after adding MLA Triton `DRAFT_EXTEND_V2`
+    CUDA-graph replay coverage.
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+  - Ran 55 tests in 22.229s after adding MLA Triton `DRAFT_EXTEND_V2`
+    CUDA-graph replay coverage.
 - Probed additional backend candidates after FlashMLA: `cutlass_mla` decode is
   unavailable on local SM90 because it requires compute capability 10.0;
   `trtllm_mla` decode is unavailable because FlashInfer's XQA MLA path requires

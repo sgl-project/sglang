@@ -1054,6 +1054,158 @@ def run_dense_draft_extend_v2_cuda_graph_case(
     )
 
 
+def run_mla_draft_extend_v2_cuda_graph_case(
+    testcase,
+    case: MLAAttentionCase,
+    *,
+    kv_lora_rank: int = DEFAULT_KV_LORA_RANK,
+    qk_rope_head_dim: int = DEFAULT_QK_ROPE_HEAD_DIM,
+    hidden_size: int = MLA_DEFAULT_HIDDEN_SIZE,
+    max_context_len: int = MLA_DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = MLA_DEFAULT_DTYPE,
+    device: str = MLA_DEFAULT_DEVICE,
+    cuda_graph_capture_batch_size: int = 4,
+):
+    if not case.forward_mode.is_draft_extend_v2():
+        raise ValueError("Draft-extend-v2 CUDA graph coverage expects DRAFT_EXTEND_V2.")
+    if case.batch_size > cuda_graph_capture_batch_size:
+        raise ValueError("Draft-extend-v2 capture batch must cover replay batch size.")
+    if len(set(case.input_lens)) != 1:
+        raise ValueError(
+            "Draft-extend-v2 CUDA graph coverage uses a fixed token count per request."
+        )
+
+    num_tokens_per_req = case.input_lens[0]
+    graph_fixture = build_mla_attention_fixture(
+        testcase,
+        case,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        hidden_size=hidden_size,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        disable_cuda_graph=False,
+        runner_batch_size=cuda_graph_capture_batch_size,
+    )
+    backend = graph_fixture.backend
+
+    capture_prefix_len = backend.get_cuda_graph_seq_len_fill_value()
+    capture_case = make_mla_case_with_prefix_lens(
+        case,
+        f"{case.name}_cuda_graph_capture",
+        (capture_prefix_len,) * cuda_graph_capture_batch_size,
+    )
+    capture_inputs = make_mla_random_inputs(
+        capture_case,
+        graph_fixture,
+        dtype=dtype,
+        device=device,
+    )
+    capture_batch = _make_mla_forward_batch(
+        capture_case,
+        graph_fixture.runner,
+        max_context_len=max_context_len,
+        device=device,
+    )
+    _set_draft_extend_v2_prefix_lens(capture_batch, capture_case, device=device)
+    capture_batch.spec_info = _make_eagle_draft_extend_v2_input(
+        capture_case,
+        capture_batch,
+        device=device,
+    )
+    prepare_mla_runner_inputs(
+        graph_fixture,
+        capture_case,
+        capture_batch,
+        capture_inputs,
+        max_context_len=max_context_len,
+    )
+    capture_expected = expected_mla_output_from_inputs(
+        graph_fixture,
+        capture_case,
+        capture_inputs,
+        None,
+    )
+
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
+        _init_cuda_graph_capture_metadata(
+            backend,
+            cuda_graph_capture_batch_size,
+            capture_batch,
+        )
+        capture_actual = run_mla_forward(
+            graph_fixture,
+            capture_batch,
+            capture_inputs,
+        )
+        backend.on_after_cuda_graph_warmup()
+
+    replay_pad_prefix_lens = (capture_prefix_len,) * (
+        cuda_graph_capture_batch_size - case.batch_size
+    )
+    replay_case = make_mla_case_with_prefix_lens(
+        case,
+        f"{case.name}_cuda_graph_replay",
+        case.prefix_lens + replay_pad_prefix_lens,
+    )
+    graph_inputs = mla_fixture_inputs(graph_fixture)
+    replay_inputs = make_mla_padded_replay_inputs(
+        replay_case,
+        graph_fixture,
+        replay_pad_prefix_lens,
+        graph_inputs,
+        dtype=dtype,
+        device=device,
+    )
+    replay_batch = _make_mla_forward_batch(
+        replay_case,
+        graph_fixture.runner,
+        max_context_len=max_context_len,
+        device=device,
+    )
+    _set_draft_extend_v2_prefix_lens(replay_batch, replay_case, device=device)
+    replay_batch.spec_info = _make_eagle_draft_extend_v2_input(
+        replay_case,
+        replay_batch,
+        device=device,
+    )
+    prepare_mla_runner_inputs(
+        graph_fixture,
+        replay_case,
+        replay_batch,
+        replay_inputs,
+        max_context_len=max_context_len,
+    )
+    replay_expected = expected_mla_output_from_inputs(
+        graph_fixture,
+        replay_case,
+        replay_inputs,
+        None,
+    )
+
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
+        _init_cuda_graph_replay_metadata(
+            backend,
+            cuda_graph_capture_batch_size,
+            replay_batch,
+        )
+        replay_actual = run_mla_forward(graph_fixture, replay_batch, replay_inputs)
+
+    torch.testing.assert_close(
+        capture_actual,
+        capture_expected,
+        atol=MLA_ATOL,
+        rtol=MLA_RTOL,
+    )
+    torch.testing.assert_close(
+        replay_actual,
+        replay_expected,
+        atol=MLA_ATOL,
+        rtol=MLA_RTOL,
+    )
+
+
 def run_mla_eagle_verify_case(
     testcase,
     case: MLAAttentionCase,

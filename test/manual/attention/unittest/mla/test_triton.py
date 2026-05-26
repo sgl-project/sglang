@@ -16,6 +16,7 @@ from common.mla_attention import (
     run_mla_attention_case,
 )
 from common.spec_runner import (
+    run_mla_draft_extend_v2_cuda_graph_case,
     run_mla_eagle_verify_case,
     run_mla_eagle_verify_cuda_graph_case,
 )
@@ -77,6 +78,17 @@ class TestTritonMLAAttentionBackendCorrectness(CustomTestCase):
             2,
         ),
     )
+    DRAFT_EXTEND_V2_CUDA_GRAPH_CASES = (
+        MLAAttentionCase(
+            name="runner_cuda_graph_eagle_draft_extend_v2_mla_fixed_tokens",
+            backend="triton",
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            num_heads=4,
+            page_size=16,
+            prefix_lens=(4, 7),
+            extend_lens=(3, 3),
+        ),
+    )
 
     def test_tiny_deepseek_mla_attention_cases(self):
         for case in self.CASES:
@@ -113,6 +125,11 @@ class TestTritonMLAAttentionBackendCorrectness(CustomTestCase):
         for case, topk in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:
             with self.subTest(case=case.name, backend=case.backend, topk=topk):
                 run_mla_eagle_verify_cuda_graph_case(self, case, topk=topk)
+
+    def test_runner_mode_eagle_draft_extend_v2_cuda_graph_cases(self):
+        for case in self.DRAFT_EXTEND_V2_CUDA_GRAPH_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_mla_draft_extend_v2_cuda_graph_case(self, case)
 
 
 if __name__ == "__main__":
