@@ -9,8 +9,8 @@
 #   - flow_shift = 9.95 (linear_flow schedule, from config.yaml)
 #   - Two-stage optional: Stage-1 (SANA-WM) + Stage-2 (LTX-2 Refiner)
 #
-# The DiT forward receives camera_to_world + intrinsics (or plucker) via
-# prepare_pos_cond_kwargs. Set them to None for text-only (T2V without camera).
+# The SANA-WM pre-denoising stage converts camera_to_world + intrinsics into
+# the latent-frame raymap and chunk Pluecker tensors consumed by the DiT.
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -39,6 +39,27 @@ logger = init_logger(__name__)
 def sana_wm_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
     """Extract Gemma-2 last hidden state as text conditioning (same as SANA T2I)."""
     return outputs.last_hidden_state
+
+
+SANA_WM_CHI_PROMPT: tuple[str, ...] = (
+    'Given a user prompt, generate an "Enhanced prompt" that provides detailed '
+    "visual descriptions suitable for image generation. Evaluate the level of "
+    "detail in the user prompt:",
+    "- If the prompt is simple, focus on adding specifics about colors, shapes, "
+    "sizes, textures, and spatial relationships to create vivid and concrete scenes.",
+    "- If the prompt is already detailed, refine and enhance the existing details "
+    "slightly without overcomplicating.",
+    "Here are examples of how to transform or refine prompts:",
+    "- User Prompt: A cat sleeping -> Enhanced: A small, fluffy white cat curled "
+    "up in a round shape, sleeping peacefully on a warm sunny windowsill, "
+    "surrounded by pots of blooming red flowers.",
+    "- User Prompt: A busy city street -> Enhanced: A bustling city street scene "
+    "at dusk, featuring glowing street lamps, a diverse crowd of people in "
+    "colorful clothing, and a double-decker bus passing by towering glass skyscrapers.",
+    "Please generate only the enhanced description for the prompt below and "
+    "avoid including any additional commentary or evaluations:",
+    "User Prompt: ",
+)
 
 
 @dataclass
@@ -116,6 +137,7 @@ class SanaWMPipelineConfig(PipelineConfig):
             }
         ]
     )
+    chi_prompt: tuple[str, ...] = SANA_WM_CHI_PROMPT
     preprocess_text_funcs: tuple[Callable | None, ...] = field(
         default_factory=lambda: (None,)
     )
@@ -183,7 +205,7 @@ class SanaWMPipelineConfig(PipelineConfig):
           * encoder_hidden_states  -- Gemma-2 embeddings (set by DenoisingStage)
           * timestep               -- diffusion step (set by DenoisingStage)
           * encoder_attention_mask -- text padding mask
-          * camera_conditions      -- (B, F_orig, 20) UCPE input
+          * camera_conditions      -- (B, T_lat, 20) latent-frame UCPE raymap
           * chunk_plucker          -- (B, 48, T_lat, H, W) packed Plücker raymap
         """
         out = {}

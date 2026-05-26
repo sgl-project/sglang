@@ -22,9 +22,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
     SanaWMBeforeDenoisingStage,
     SanaWMDenoisingStage,
+    SanaWMTextEncodingStage,
     _align_sana_wm_cfg_text_conditions,
     configure_sana_wm_ltx2_vae_for_long_video,
 )
+from sglang.multimodal_gen.runtime.models.dits.sana_wm import compute_chunk_plucker
 from sglang.multimodal_gen.runtime.utils.model_overlay import (
     resolve_model_overlay_target,
 )
@@ -48,11 +50,11 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         self.assertEqual(shape, (1, 128, 7, 22, 40))
 
     def test_prepare_pos_cond_kwargs_passes_camera_from_batch_extra(self) -> None:
-        # SanaWMBeforeDenoisingStage flattens c2w + intrinsics into the upstream
-        # (B, F_orig, 20) camera_conditions tensor, and packs Plücker into a
-        # (B, 48, T_lat, H, W) ``chunk_plucker``. The pipeline config just
-        # forwards those tensors verbatim.
-        camera_conditions = torch.zeros(1, 49, 20)
+        # SanaWMBeforeDenoisingStage packs c2w + intrinsics into the upstream
+        # latent-frame (B, T_lat, 20) raymap plus a (B, 48, T_lat, H, W)
+        # ``chunk_plucker`` tensor. The pipeline config just forwards those
+        # tensors verbatim.
+        camera_conditions = torch.zeros(1, 7, 20)
         chunk_plucker = torch.zeros(1, 48, 7, 22, 40)
         batch = SimpleNamespace(
             prompt_attention_mask=torch.ones(1, 16),
@@ -77,9 +79,10 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
     def test_text_encoder_padding_matches_cfg_concat_contract(self) -> None:
         self.assertEqual(self.config.text_encoder_extra_args[0]["padding"], "max_length")
         self.assertTrue(self.config.text_encoder_extra_args[0]["return_attention_mask"])
+        self.assertTrue(self.config.chi_prompt)
 
     def test_prepare_neg_cond_kwargs_keeps_camera_for_cfg(self) -> None:
-        camera_conditions = torch.zeros(1, 49, 20)
+        camera_conditions = torch.zeros(1, 7, 20)
         chunk_plucker = torch.zeros(1, 48, 7, 22, 40)
         batch = SimpleNamespace(
             negative_attention_mask=torch.ones(1, 16),
@@ -344,6 +347,74 @@ class TestSanaWMBeforeDenoisingStage(unittest.TestCase):
 
         expected = torch.tensor([[[[[2.0]]], [[[4.0]]]]])
         self.assertTrue(torch.equal(encoded, expected))
+
+    def test_default_static_camera_builds_latent_raymap_and_chunk_plucker(self) -> None:
+        stage = SanaWMBeforeDenoisingStage(
+            vae=None,
+            transformer=None,
+            scheduler=None,
+            pipeline_config=SanaWMPipelineConfig(),
+        )
+        batch = SimpleNamespace(extra={}, height=384, width=640)
+
+        camera_conditions, chunk_plucker, source = stage._build_camera_conditioning(
+            batch,
+            batch_size=1,
+            num_frames=17,
+            latent_shape=(1, 128, 3, 12, 20),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+        self.assertEqual(source, "default_static")
+        self.assertEqual(camera_conditions.shape, (1, 3, 20))
+        self.assertEqual(chunk_plucker.shape, (1, 48, 3, 12, 20))
+        self.assertTrue(torch.equal(camera_conditions[0, 0, :16], torch.eye(4).reshape(-1)))
+        self.assertTrue(
+            torch.allclose(
+                camera_conditions[0, 0, 16:],
+                torch.tensor([16.0, 16.0, 10.0, 6.0]),
+            )
+        )
+
+    def test_latent_frame_camera_conditions_samples_stride_indices(self) -> None:
+        original = torch.arange(1 * 17 * 20, dtype=torch.float32).reshape(1, 17, 20)
+
+        sampled = SanaWMBeforeDenoisingStage._latent_frame_camera_conditions(
+            original,
+            num_frames=17,
+            latent_frames=3,
+            vae_temporal_stride=8,
+        )
+
+        self.assertTrue(torch.equal(sampled[:, 0], original[:, 0]))
+        self.assertTrue(torch.equal(sampled[:, 1], original[:, 8]))
+        self.assertTrue(torch.equal(sampled[:, 2], original[:, 16]))
+
+    def test_chunk_plucker_accepts_ltx_frame_count(self) -> None:
+        camera_conditions = torch.zeros(1, 17, 20)
+        camera_conditions[..., :16] = torch.eye(4).reshape(1, 1, 16)
+        camera_conditions[..., 16:] = torch.tensor([16.0, 16.0, 10.0, 6.0])
+
+        chunk_plucker = compute_chunk_plucker(
+            camera_conditions,
+            HW=(3, 12, 20),
+            vae_temporal_stride=8,
+            patch_size=(1, 1, 1),
+        )
+
+        self.assertEqual(chunk_plucker.shape, (1, 48, 3, 12, 20))
+
+
+class TestSanaWMTextEncodingStage(unittest.TestCase):
+    def test_official_prompt_window_keeps_bos_and_tail(self) -> None:
+        tensor = torch.arange(5).reshape(1, 5, 1)
+
+        selected = SanaWMTextEncodingStage._select_official_prompt_window(
+            tensor, max_length=3
+        )
+
+        self.assertTrue(torch.equal(selected.squeeze(-1), torch.tensor([[0, 3, 4]])))
 
 
 class TestSanaWMRefinerStage(unittest.TestCase):

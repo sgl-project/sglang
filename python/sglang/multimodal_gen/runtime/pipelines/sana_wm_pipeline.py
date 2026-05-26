@@ -35,12 +35,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     InputValidationStage,
-    TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
     SanaWMBeforeDenoisingStage,
     SanaWMDecodingStage,
     SanaWMDenoisingStage,
+    SanaWMTextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_refiner import (
     SanaWMLTX2RefinerStage,
@@ -89,7 +89,7 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(InputValidationStage())
 
         self.add_stage(
-            TextEncodingStage(
+            SanaWMTextEncodingStage(
                 text_encoders=[self.get_module("text_encoder")],
                 tokenizers=[self.get_module("tokenizer")],
             ),
@@ -205,7 +205,7 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
         refiner/text_encoder, loaded manually as text_encoder_2. The generic
         TextEncoderLoader indexes configs by component suffix, so provide the
         second config only for this manual load instead of making the stage-1
-        TextEncodingStage believe it owns two encoders.
+        SanaWMTextEncodingStage believe it owns two encoders.
         """
         pipeline_config = server_args.pipeline_config
         saved = (

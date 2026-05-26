@@ -27,8 +27,8 @@ class SanaWMSamplingParams(SamplingParams):
     Camera conditioning (optional):
         camera_to_world: (T, 4, 4) extrinsic matrices, one per output frame.
         intrinsics:      (T, 3, 3) pinhole intrinsics, one per output frame.
-        If either is None, the camera branch is bypassed and SANA-WM runs in
-        plain TI2V mode (text + first-frame image only).
+        If camera_to_world is omitted, SGLang uses a static identity camera.
+        If intrinsics is omitted, SGLang uses centered heuristic intrinsics.
     """
 
     data_type: DataType = DataType.VIDEO

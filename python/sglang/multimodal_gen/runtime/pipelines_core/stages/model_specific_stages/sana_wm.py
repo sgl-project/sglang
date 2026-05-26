@@ -7,20 +7,19 @@
 #   2. Initialize random noise latents (5D: B, 128, T_latent, H_sp, W_sp)
 #   3. VAE-encode the first-frame conditioning image and splice into noisy latents
 #      (replaces latent[:, :, 0] with the encoded first-frame latent)
-#   4. Build the (B, F_orig, 20) ``camera_conditions`` tensor consumed by the
-#      UCPE camera branch (16 c2w flat + 4 intrinsics ``fx,fy,cx,cy``).
+#   4. Build the (B, T_latent, 20) latent-frame ``camera_conditions`` raymap
+#      consumed by the UCPE camera branch.
 #   5. Compute the 48-channel packed Plücker raymap consumed by the
 #      ``plucker_embedder`` (one chunk = vae_temporal_stride original frames).
 #   6. Prepare FlowMatch timesteps and sigmas (uses flow_shift=9.95).
 #
-# Text encoding is handled upstream by the standard TextEncodingStage (Gemma-2).
-# After this stage, the Req batch contains all fields needed by DenoisingStage.
+# Text encoding is handled by SanaWMTextEncodingStage so it can mirror the
+# official chi-prompt token window without changing the shared text stage.
 
-from typing import Any
-
-import numpy as np
 import os
 import time
+from typing import Any
+
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
@@ -35,6 +34,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineSta
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
+    TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -308,6 +310,170 @@ def _align_sana_wm_cfg_text_conditions(
     return pos_embeds, neg_embeds, pos_mask, neg_mask
 
 
+class SanaWMTextEncodingStage(TextEncodingStage):
+    """Gemma-2 text encoding that mirrors NVlabs SANA-WM inference.
+
+    The official script prepends a long ``chi_prompt`` only to the positive
+    branch, tokenizes that longer string, then keeps token 0 and the last
+    299 tokens. The negative branch remains a normal 300-token padded prompt.
+    Keeping this local avoids bending the shared TextEncodingStage around a
+    model-specific prompt-window contract.
+    """
+
+    @staticmethod
+    def _text_encoder_max_length(server_args: ServerArgs) -> int:
+        encoder_cfg = server_args.pipeline_config.text_encoder_configs[0]
+        arch_config = getattr(encoder_cfg, "arch_config", None)
+        return int(getattr(arch_config, "text_len", 300) or 300)
+
+    @staticmethod
+    def _chi_prompt(server_args: ServerArgs) -> str:
+        parts = getattr(server_args.pipeline_config, "chi_prompt", ()) or ()
+        return "\n".join(parts)
+
+    @staticmethod
+    def _select_official_prompt_window(
+        tensor: torch.Tensor | None,
+        max_length: int,
+    ) -> torch.Tensor | None:
+        if tensor is None:
+            return None
+        seq_dim = _text_sequence_dim(tensor)
+        if tensor.shape[seq_dim] <= max_length:
+            return tensor
+        index = [slice(None)] * tensor.ndim
+        tail_start = tensor.shape[seq_dim] - max_length + 1
+        select = torch.cat(
+            [
+                torch.zeros(1, device=tensor.device, dtype=torch.long),
+                torch.arange(
+                    tail_start,
+                    tensor.shape[seq_dim],
+                    device=tensor.device,
+                    dtype=torch.long,
+                ),
+            ],
+            dim=0,
+        )
+        index[seq_dim] = select
+        return tensor[tuple(index)]
+
+    @staticmethod
+    def _seq_lens_from_masks(masks: list[torch.Tensor | None]) -> list[list[int]]:
+        seq_lens = []
+        for mask in masks:
+            if mask is None:
+                seq_lens.append([])
+            else:
+                seq_lens.append([int(x) for x in mask.long().sum(dim=-1).tolist()])
+        return seq_lens
+
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        if len(self.text_encoders) != 1:
+            raise ValueError(
+                "SANA-WM stage-1 expects exactly one Gemma-2 text encoder."
+            )
+        assert batch.prompt is not None
+
+        max_length = self._text_encoder_max_length(server_args)
+        chi_prompt = self._chi_prompt(server_args)
+        prompt_text = batch.prompt
+        if isinstance(prompt_text, str):
+            prompt_text = [prompt_text]
+        else:
+            prompt_text = list(prompt_text)
+
+        tokenizer = self.tokenizers[0]
+        if chi_prompt:
+            prompt_text = [chi_prompt + text for text in prompt_text]
+            max_length_all = len(tokenizer.encode(chi_prompt)) + max_length - 2
+        else:
+            max_length_all = max_length
+
+        (
+            prompt_embeds_list,
+            prompt_masks_list,
+            pooler_embeds_list,
+            prompt_embeds_masks_list,
+            _prompt_seq_lens_list,
+        ) = self.encode_text(
+            prompt_text,
+            server_args,
+            encoder_index=[0],
+            return_attention_mask=True,
+            max_length=max_length_all,
+            padding="max_length",
+            truncation=True,
+        )
+
+        prompt_embeds_list = [
+            self._select_official_prompt_window(tensor, max_length)
+            for tensor in prompt_embeds_list
+        ]
+        prompt_masks_list = [
+            self._select_official_prompt_window(tensor, max_length)
+            for tensor in prompt_masks_list
+        ]
+        prompt_embeds_masks_list = [
+            self._select_official_prompt_window(tensor, max_length)
+            for tensor in prompt_embeds_masks_list
+        ]
+        prompt_seq_lens_list = self._seq_lens_from_masks(prompt_masks_list)
+
+        if batch.do_classifier_free_guidance:
+            assert isinstance(batch.negative_prompt, str)
+            (
+                neg_embeds_list,
+                neg_masks_list,
+                neg_pooler_embeds_list,
+                neg_embeds_masks_list,
+                _neg_seq_lens_list,
+            ) = self.encode_text(
+                batch.negative_prompt,
+                server_args,
+                encoder_index=[0],
+                return_attention_mask=True,
+                max_length=max_length,
+                padding="max_length",
+                truncation=True,
+            )
+            neg_seq_lens_list = self._seq_lens_from_masks(neg_masks_list)
+
+        self._append_positive_text_outputs(
+            batch,
+            prompt_embeds_list,
+            prompt_masks_list,
+            pooler_embeds_list,
+            prompt_embeds_masks_list,
+            prompt_seq_lens_list,
+        )
+
+        if batch.do_classifier_free_guidance:
+            self._append_negative_text_outputs(
+                batch,
+                prompt_embeds_list,
+                neg_embeds_list,
+                neg_masks_list,
+                neg_pooler_embeds_list,
+                neg_embeds_masks_list,
+                neg_seq_lens_list,
+            )
+
+        self.log_info(
+            "SANA-WM text encoded with chi_prompt=%s, prompt_window=%d, "
+            "positive_raw_window=%d",
+            "yes" if chi_prompt else "no",
+            max_length,
+            max_length_all,
+        )
+        log_sana_wm_tensor_stats("text.prompt_embeds", prompt_embeds_list[0])
+        if batch.do_classifier_free_guidance:
+            log_sana_wm_tensor_stats("text.negative_prompt_embeds", neg_embeds_list[0])
+
+        return batch
+
+
 class SanaWMDenoisingStage(DenoisingStage):
     """SANA-WM stage-1 sampler matching NVlabs ``flow_euler_ltx``.
 
@@ -514,7 +680,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
     """
     Monolithic pre-processing stage for SANA-WM TI2V inference.
 
-    Must run AFTER TextEncodingStage (which populates batch.prompt_embeds).
+    Must run after SanaWMTextEncodingStage, which populates batch.prompt_embeds.
     """
 
     def __init__(
@@ -719,6 +885,384 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         return latents
 
     # -----------------------------------------------------------------------
+    # Helper: camera conditioning
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _pad_or_trim_frames(tensor: torch.Tensor, num_frames: int) -> torch.Tensor:
+        current = tensor.shape[1]
+        if current == num_frames:
+            return tensor
+        if current > num_frames:
+            return tensor[:, :num_frames]
+        if current == 0:
+            raise ValueError("camera trajectory must contain at least one frame")
+        pad = num_frames - current
+        last = tensor[:, -1:].repeat(1, pad, *([1] * (tensor.ndim - 2)))
+        return torch.cat([tensor, last], dim=1)
+
+    @staticmethod
+    def _coerce_camera_to_world(
+        value: Any,
+        *,
+        batch_size: int,
+        num_frames: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        camera = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+        if camera.dim() == 3:
+            camera = camera.unsqueeze(0)
+        if camera.dim() != 4 or camera.shape[-2:] != (4, 4):
+            raise ValueError(
+                "camera_to_world must have shape (F,4,4) or (B,F,4,4), "
+                f"got {tuple(camera.shape)}"
+            )
+        camera = camera.to(device=device, dtype=dtype)
+        if camera.shape[0] == 1 and batch_size > 1:
+            camera = camera.expand(batch_size, -1, -1, -1)
+        elif camera.shape[0] != batch_size:
+            raise ValueError(
+                f"camera_to_world batch {camera.shape[0]} does not match {batch_size}"
+            )
+        return SanaWMBeforeDenoisingStage._pad_or_trim_frames(camera, num_frames)
+
+    @staticmethod
+    def _intrinsics_matrix_to_vec4(intrinsics: torch.Tensor) -> torch.Tensor:
+        return torch.stack(
+            [
+                intrinsics[..., 0, 0],
+                intrinsics[..., 1, 1],
+                intrinsics[..., 0, 2],
+                intrinsics[..., 1, 2],
+            ],
+            dim=-1,
+        )
+
+    @staticmethod
+    def _coerce_intrinsics_vec4(
+        value: Any,
+        *,
+        batch_size: int,
+        num_frames: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        intrinsics = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+        intrinsics = intrinsics.to(device=device, dtype=dtype)
+
+        if intrinsics.dim() == 1 and intrinsics.shape[0] == 4:
+            intrinsics = intrinsics.view(1, 1, 4)
+        elif intrinsics.dim() == 2 and intrinsics.shape == (3, 3):
+            intrinsics = SanaWMBeforeDenoisingStage._intrinsics_matrix_to_vec4(
+                intrinsics
+            ).view(1, 1, 4)
+        elif intrinsics.dim() == 2 and intrinsics.shape[-1] == 4:
+            intrinsics = intrinsics.unsqueeze(0)
+        elif intrinsics.dim() == 3 and intrinsics.shape[-2:] == (3, 3):
+            vec4 = SanaWMBeforeDenoisingStage._intrinsics_matrix_to_vec4(intrinsics)
+            if intrinsics.shape[0] == num_frames:
+                intrinsics = vec4.unsqueeze(0)
+            elif intrinsics.shape[0] == batch_size:
+                intrinsics = vec4.unsqueeze(1)
+            else:
+                raise ValueError(
+                    "intrinsics with shape (N,3,3) must use N=num_frames or "
+                    f"N=batch_size, got N={intrinsics.shape[0]}"
+                )
+        elif intrinsics.dim() == 3 and intrinsics.shape[-1] == 4:
+            pass
+        elif intrinsics.dim() == 4 and intrinsics.shape[-2:] == (3, 3):
+            intrinsics = SanaWMBeforeDenoisingStage._intrinsics_matrix_to_vec4(
+                intrinsics
+            )
+        else:
+            raise ValueError(
+                "intrinsics must have shape (4,), (F,4), (B,F,4), "
+                "(3,3), (F,3,3), or (B,F,3,3); "
+                f"got {tuple(intrinsics.shape)}"
+            )
+
+        if intrinsics.shape[0] == 1 and batch_size > 1:
+            intrinsics = intrinsics.expand(batch_size, -1, -1)
+        elif intrinsics.shape[0] != batch_size:
+            raise ValueError(
+                f"intrinsics batch {intrinsics.shape[0]} does not match {batch_size}"
+            )
+        if intrinsics.shape[1] == 1 and num_frames > 1:
+            intrinsics = intrinsics.expand(-1, num_frames, -1)
+        return SanaWMBeforeDenoisingStage._pad_or_trim_frames(
+            intrinsics, num_frames
+        )
+
+    @staticmethod
+    def _relative_camera_poses(camera_to_world: torch.Tensor) -> torch.Tensor:
+        input_dtype = camera_to_world.dtype
+        camera_to_world = camera_to_world.float()
+        first_inv = torch.linalg.inv(camera_to_world[:, :1])
+        poses = torch.matmul(first_inv, camera_to_world)
+        eye = torch.eye(
+            4,
+            device=camera_to_world.device,
+            dtype=camera_to_world.dtype,
+        )
+        poses[:, 0] = eye
+        return poses.to(dtype=input_dtype)
+
+    @staticmethod
+    def _scale_intrinsics_to_latent(
+        intrinsics_vec4: torch.Tensor,
+        *,
+        pixel_h: int,
+        pixel_w: int,
+        latent_h: int,
+        latent_w: int,
+    ) -> torch.Tensor:
+        intrinsics_latent = intrinsics_vec4.clone()
+        intrinsics_latent[..., [0, 2]] *= latent_w / float(pixel_w)
+        intrinsics_latent[..., [1, 3]] *= latent_h / float(pixel_h)
+        return intrinsics_latent
+
+    @staticmethod
+    def _flatten_camera_conditions(
+        camera_to_world: torch.Tensor,
+        intrinsics_vec4: torch.Tensor,
+    ) -> torch.Tensor:
+        c2w_flat = camera_to_world.reshape(
+            camera_to_world.shape[0],
+            camera_to_world.shape[1],
+            16,
+        )
+        return torch.cat(
+            [c2w_flat, intrinsics_vec4],
+            dim=-1,
+        )
+
+    @staticmethod
+    def _latent_frame_camera_conditions(
+        camera_conditions: torch.Tensor,
+        *,
+        num_frames: int,
+        latent_frames: int,
+        vae_temporal_stride: int,
+    ) -> torch.Tensor:
+        time_indices = torch.arange(
+            0,
+            num_frames,
+            vae_temporal_stride,
+            device=camera_conditions.device,
+            dtype=torch.long,
+        )
+        if time_indices.numel() < latent_frames:
+            pad = latent_frames - int(time_indices.numel())
+            time_indices = torch.cat(
+                [time_indices, time_indices[-1:].repeat(pad)], dim=0
+            )
+        time_indices = time_indices[:latent_frames]
+        return camera_conditions.index_select(1, time_indices)
+
+    def _default_static_camera(
+        self,
+        *,
+        batch_size: int,
+        num_frames: int,
+        pixel_h: int,
+        pixel_w: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        camera_to_world = torch.eye(4, device=device, dtype=dtype).view(1, 1, 4, 4)
+        camera_to_world = camera_to_world.repeat(batch_size, num_frames, 1, 1)
+        focal = 0.8 * float(max(pixel_h, pixel_w))
+        intrinsics = torch.tensor(
+            [focal, focal, pixel_w / 2.0, pixel_h / 2.0],
+            device=device,
+            dtype=dtype,
+        ).view(1, 1, 4)
+        intrinsics = intrinsics.repeat(batch_size, num_frames, 1)
+        return camera_to_world, intrinsics
+
+    def _build_camera_conditioning(
+        self,
+        batch: Req,
+        *,
+        batch_size: int,
+        num_frames: int,
+        latent_shape: tuple,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, str]:
+        if not hasattr(batch, "extra") or batch.extra is None:
+            batch.extra = {}
+        if not self.pipeline_config.camera_conditioning:
+            return None, None, "disabled"
+
+        extra = batch.extra
+        T_lat = latent_shape[2]
+        sp_h = latent_shape[3]
+        sp_w = latent_shape[4]
+        vae_temporal_stride = self.pipeline_config.vae_stride[0]
+        camera_compute_dtype = torch.float32
+
+        camera_conditions = extra.get("camera_conditions", None)
+        chunk_plucker = extra.get("chunk_plucker", None)
+        if camera_conditions is not None:
+            camera_conditions = (
+                camera_conditions
+                if isinstance(camera_conditions, torch.Tensor)
+                else torch.as_tensor(camera_conditions)
+            ).to(device=device, dtype=camera_compute_dtype)
+            if camera_conditions.dim() == 2:
+                camera_conditions = camera_conditions.unsqueeze(0)
+            if camera_conditions.shape[0] == 1 and batch_size > 1:
+                camera_conditions = camera_conditions.expand(batch_size, -1, -1)
+            if camera_conditions.shape[-1] != 20:
+                raise ValueError(
+                    "camera_conditions must have last dimension 20, got "
+                    f"{tuple(camera_conditions.shape)}"
+                )
+            if camera_conditions.shape[1] == T_lat:
+                source = "prepacked"
+            else:
+                source = "prebuilt_original_frames"
+                original_camera_conditions = self._pad_or_trim_frames(
+                    camera_conditions, num_frames
+                )
+                camera_conditions = self._latent_frame_camera_conditions(
+                    original_camera_conditions,
+                    num_frames=num_frames,
+                    latent_frames=T_lat,
+                    vae_temporal_stride=vae_temporal_stride,
+                )
+                if chunk_plucker is None:
+                    from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
+                        compute_chunk_plucker,
+                    )
+
+                    chunk_plucker = compute_chunk_plucker(
+                        camera_conditions=original_camera_conditions,
+                        HW=(T_lat, sp_h, sp_w),
+                        vae_temporal_stride=vae_temporal_stride,
+                        patch_size=(1, 1, 1),
+                    )
+        else:
+            camera_to_world = extra.get("camera_to_world", None)
+            intrinsics = extra.get("intrinsics", None)
+            if camera_to_world is not None:
+                source = (
+                    "request"
+                    if intrinsics is not None
+                    else "request_default_intrinsics"
+                )
+                camera_to_world = self._coerce_camera_to_world(
+                    camera_to_world,
+                    batch_size=batch_size,
+                    num_frames=num_frames,
+                    device=device,
+                    dtype=camera_compute_dtype,
+                )
+                if intrinsics is None:
+                    _, intrinsics_vec4 = self._default_static_camera(
+                        batch_size=batch_size,
+                        num_frames=num_frames,
+                        pixel_h=batch.height,
+                        pixel_w=batch.width,
+                        device=device,
+                        dtype=camera_compute_dtype,
+                    )
+                    self.log_info(
+                        "No intrinsics provided; using heuristic centered "
+                        "intrinsics for the request camera trajectory."
+                    )
+                else:
+                    intrinsics_vec4 = self._coerce_intrinsics_vec4(
+                        intrinsics,
+                        batch_size=batch_size,
+                        num_frames=num_frames,
+                        device=device,
+                        dtype=camera_compute_dtype,
+                    )
+            elif intrinsics is not None:
+                source = "default_static_request_intrinsics"
+                camera_to_world, _ = self._default_static_camera(
+                    batch_size=batch_size,
+                    num_frames=num_frames,
+                    pixel_h=batch.height,
+                    pixel_w=batch.width,
+                    device=device,
+                    dtype=camera_compute_dtype,
+                )
+                intrinsics_vec4 = self._coerce_intrinsics_vec4(
+                    intrinsics,
+                    batch_size=batch_size,
+                    num_frames=num_frames,
+                    device=device,
+                    dtype=camera_compute_dtype,
+                )
+                self.log_info(
+                    "No camera trajectory provided; using static identity "
+                    "poses with request intrinsics."
+                )
+            else:
+                source = "default_static"
+                self.log_info(
+                    "No camera trajectory provided; using a static identity "
+                    "camera with heuristic centered intrinsics. Pass "
+                    "camera_to_world/intrinsics for camera-controlled output."
+                )
+                camera_to_world, intrinsics_vec4 = self._default_static_camera(
+                    batch_size=batch_size,
+                    num_frames=num_frames,
+                    pixel_h=batch.height,
+                    pixel_w=batch.width,
+                    device=device,
+                    dtype=camera_compute_dtype,
+                )
+
+            camera_to_world = self._relative_camera_poses(camera_to_world)
+            intrinsics_vec4 = self._scale_intrinsics_to_latent(
+                intrinsics_vec4,
+                pixel_h=batch.height,
+                pixel_w=batch.width,
+                latent_h=sp_h,
+                latent_w=sp_w,
+            )
+            original_camera_conditions = self._flatten_camera_conditions(
+                camera_to_world, intrinsics_vec4
+            )
+            camera_conditions = self._latent_frame_camera_conditions(
+                original_camera_conditions,
+                num_frames=num_frames,
+                latent_frames=T_lat,
+                vae_temporal_stride=vae_temporal_stride,
+            )
+            if chunk_plucker is None:
+                from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
+                    compute_chunk_plucker,
+                )
+
+                chunk_plucker = compute_chunk_plucker(
+                    camera_conditions=original_camera_conditions,
+                    HW=(T_lat, sp_h, sp_w),
+                    vae_temporal_stride=vae_temporal_stride,
+                    patch_size=(1, 1, 1),
+                )
+
+        if chunk_plucker is not None:
+            chunk_plucker = (
+                chunk_plucker
+                if isinstance(chunk_plucker, torch.Tensor)
+                else torch.as_tensor(chunk_plucker)
+            ).to(device=device, dtype=dtype)
+            if chunk_plucker.shape[0] == 1 and batch_size > 1:
+                chunk_plucker = chunk_plucker.expand(batch_size, -1, -1, -1, -1)
+
+        if camera_conditions is not None:
+            camera_conditions = camera_conditions.to(device=device, dtype=dtype)
+
+        return camera_conditions, chunk_plucker, source
+
+    # -----------------------------------------------------------------------
     # Helper: compute timesteps and sigmas for FlowMatch scheduling
     # -----------------------------------------------------------------------
 
@@ -773,7 +1317,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         """
         Pre-process everything needed by DenoisingStage for SANA-WM.
 
-        Expects batch to already have prompt_embeds set by TextEncodingStage.
+        Expects batch to already have prompt_embeds set by SanaWMTextEncodingStage.
         """
         device = get_local_torch_device()
         dtype = torch.bfloat16  # SANA-WM runs in bf16
@@ -822,110 +1366,40 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         batch.latents = latents
 
         # --- 4. Camera conditioning ---
-        # The DiT consumes two tensors:
-        #   * ``camera_conditions``: (B, F_orig, 20) -- 16 c2w flat + (fx, fy, cx, cy).
-        #     This drives the UCPE camera-branch attention.
-        #   * ``chunk_plucker``:      (B, 48, T_lat, H_sp, W_sp) -- packed Plücker
-        #     coords for the post-attention plucker_embedder.
-        #
-        # Inputs from the user (via batch.extra) may be:
-        #   - camera_conditions: pre-built (B, F_orig, 20) tensor
-        #   - OR camera_to_world (B, F_orig, 4, 4) + intrinsics (B, F_orig, 3, 3)
-        if not hasattr(batch, "extra") or batch.extra is None:
-            batch.extra = {}
-
-        camera_conditions = batch.extra.get("camera_conditions", None)
-        camera_to_world = batch.extra.get("camera_to_world", None)
-        intrinsics = batch.extra.get("intrinsics", None)
-
-        # Build ``camera_conditions`` from c2w + intrinsics if not already provided.
-        if (
-            camera_conditions is None
-            and camera_to_world is not None
-            and intrinsics is not None
-        ):
-            try:
-                if not isinstance(camera_to_world, torch.Tensor):
-                    camera_to_world = torch.as_tensor(camera_to_world)
-                if not isinstance(intrinsics, torch.Tensor):
-                    intrinsics = torch.as_tensor(intrinsics)
-                if camera_to_world.dim() == 3:        # (F, 4, 4) -> (1, F, 4, 4)
-                    camera_to_world = camera_to_world.unsqueeze(0)
-                if intrinsics.dim() == 2:             # (3, 3) -> (1, 1, 3, 3)
-                    intrinsics = intrinsics.unsqueeze(0).unsqueeze(0)
-                elif intrinsics.dim() == 3:           # (F, 3, 3) or (B, 3, 3)?
-                    # if matches F, treat as per-frame; else broadcast
-                    F_dim = camera_to_world.shape[1]
-                    if intrinsics.shape[0] == F_dim:
-                        intrinsics = intrinsics.unsqueeze(0)
-                    else:
-                        intrinsics = intrinsics.unsqueeze(1)
-                # Broadcast intrinsics across frames if single per batch
-                if intrinsics.shape[1] == 1 and camera_to_world.shape[1] > 1:
-                    intrinsics = intrinsics.expand(-1, camera_to_world.shape[1], -1, -1)
-
-                camera_to_world = camera_to_world.to(device=device, dtype=dtype)
-                intrinsics = intrinsics.to(device=device, dtype=dtype)
-
-                B = camera_to_world.shape[0]
-                F_dim = camera_to_world.shape[1]
-                c2w_flat = camera_to_world.reshape(B, F_dim, 16)
-                fx = intrinsics[..., 0, 0]
-                fy = intrinsics[..., 1, 1]
-                cx = intrinsics[..., 0, 2]
-                cy = intrinsics[..., 1, 2]
-                camera_conditions = torch.cat([
-                    c2w_flat,
-                    torch.stack([fx, fy, cx, cy], dim=-1),
-                ], dim=-1)
-            except Exception as e:
-                logger.warning(f"Failed to build camera_conditions from c2w+intrinsics: {e}.")
-                camera_conditions = None
-
-        # Optionally compute the chunk-packed Plücker raymap. This is what
-        # the plucker_embedder consumes -- shape (B, 48, T_lat, H_sp, W_sp).
-        chunk_plucker = batch.extra.get("chunk_plucker", None)
-        if (
-            chunk_plucker is None
-            and camera_conditions is not None
-            and self.pipeline_config.camera_conditioning
-        ):
-            try:
-                from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
-                    compute_chunk_plucker,
+        # The released SANA-WM checkpoint is camera-conditioned. Official
+        # inference requires a camera trajectory or action DSL. If the SGLang
+        # request omits one, use a static identity trajectory so the UCPE path
+        # remains active instead of silently dropping all camera conditioning.
+        try:
+            camera_conditions, chunk_plucker, camera_source = (
+                self._build_camera_conditioning(
+                    batch,
+                    batch_size=batch_size,
+                    num_frames=num_frames,
+                    latent_shape=latent_shape,
+                    device=device,
+                    dtype=dtype,
                 )
-                T_lat = latent_shape[2]
-                sp_h = latent_shape[3]
-                sp_w = latent_shape[4]
-                vae_temporal_stride = self.pipeline_config.vae_stride[0]
-                F_orig = camera_conditions.shape[1]
-                if F_orig != T_lat * vae_temporal_stride:
-                    logger.warning(
-                        f"camera_conditions has {F_orig} frames but expected "
-                        f"T_lat*stride = {T_lat}*{vae_temporal_stride} = "
-                        f"{T_lat * vae_temporal_stride}. Disabling Plücker."
-                    )
-                    chunk_plucker = None
-                else:
-                    chunk_plucker = compute_chunk_plucker(
-                        camera_conditions=camera_conditions.to(dtype),
-                        HW=(T_lat, sp_h, sp_w),
-                        vae_temporal_stride=vae_temporal_stride,
-                        patch_size=(1, 1, 1),
-                    )
-                    self.log_info("Plücker raymaps computed: shape %s", str(chunk_plucker.shape))
-            except Exception as e:
-                logger.warning(f"chunk_plucker computation failed: {e}. Disabling Plücker mixing.")
-                chunk_plucker = None
+            )
+        except Exception as e:
+            logger.warning(
+                "SANA-WM camera conditioning failed: %s. Disabling camera branch.",
+                e,
+            )
+            camera_conditions, chunk_plucker, camera_source = None, None, "error"
 
         if camera_conditions is not None:
-            batch.extra["camera_conditions"] = camera_conditions.to(device=device, dtype=dtype)
-            log_sana_wm_tensor_stats(
-                "camera_conditions", batch.extra["camera_conditions"]
-            )
+            batch.extra["camera_conditions"] = camera_conditions
+            log_sana_wm_tensor_stats("camera_conditions", camera_conditions)
         if chunk_plucker is not None:
-            batch.extra["chunk_plucker"] = chunk_plucker.to(device=device, dtype=dtype)
-            log_sana_wm_tensor_stats("chunk_plucker", batch.extra["chunk_plucker"])
+            batch.extra["chunk_plucker"] = chunk_plucker
+            log_sana_wm_tensor_stats("chunk_plucker", chunk_plucker)
+        self.log_info(
+            "SANA-WM camera conditioning: source=%s, raymap=%s, chunk_plucker=%s",
+            camera_source,
+            None if camera_conditions is None else tuple(camera_conditions.shape),
+            None if chunk_plucker is None else tuple(chunk_plucker.shape),
+        )
 
         # --- 5. Prepare timesteps and sigmas ---
         batch = self._prepare_timesteps(batch, server_args, device)

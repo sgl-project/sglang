@@ -422,23 +422,25 @@ def process_camera_conditions_ucpe(
 
 def compute_chunk_plucker(
     camera_conditions: torch.Tensor,   # (B, F_orig, 20)
-    HW: Tuple[int, int, int],          # latent (T, H, W) where T = F_orig // vae_temporal_stride
+    HW: Tuple[int, int, int],          # latent (T, H, W)
     vae_temporal_stride: int = 8,
     patch_size: Tuple[int, int, int] = (1, 1, 1),
 ) -> torch.Tensor:
     """Compute the 48-channel packed Plücker raymap consumed by
     ``plucker_embedder``.
 
-    Each latent frame packs ``vae_temporal_stride`` original frames'
-    Plücker coords ``[d, o×d]`` (6D each) into 48 channels.  Output shape
+    Official SANA-WM centers each chunk on the latent-frame timestamp:
+    ``0, stride, 2*stride, ...``. For timestamp 0 the chunk is clamped to the
+    first ``stride`` frames; for later timestamps it uses the preceding
+    ``stride - 1`` frames plus the current frame. Short tail chunks are padded
+    by repeating the final available frame.
+
+    Each latent frame packs ``vae_temporal_stride`` original-frame Plücker
+    coords ``[d, o x d]`` (6D each) into 48 channels. Output shape is
     ``(B, 48, T, H, W)`` for direct consumption by Conv3d.
     """
     B, F_orig, _ = camera_conditions.shape
     T, H, W = HW
-    assert F_orig == T * vae_temporal_stride, (
-        f"camera_conditions has {F_orig} frames but expected T*stride = "
-        f"{T}*{vae_temporal_stride} = {T * vae_temporal_stride}"
-    )
     device = camera_conditions.device
     dtype = camera_conditions.dtype
 
@@ -466,10 +468,32 @@ def compute_chunk_plucker(
     moment = torch.cross(o_exp, d_world, dim=-1)
     plucker = torch.cat([d_world, moment], dim=-1)  # (B, F_orig, H, W, 6)
 
-    # Pack `vae_temporal_stride` orig frames into one latent frame ->
-    # 48 channels.
-    plucker = plucker.view(B, T, vae_temporal_stride, H, W, 6)
-    plucker = plucker.permute(0, 1, 3, 4, 2, 5).reshape(B, T, H, W, vae_temporal_stride * 6)
+    time_indices = torch.arange(
+        0, F_orig, vae_temporal_stride, device=device, dtype=torch.long
+    )
+    if time_indices.numel() < T:
+        pad = T - int(time_indices.numel())
+        last = time_indices[-1:] if time_indices.numel() else torch.zeros(
+            1, device=device, dtype=torch.long
+        )
+        time_indices = torch.cat([time_indices, last.repeat(pad)], dim=0)
+    time_indices = time_indices[:T]
+
+    chunks = []
+    for time_index in time_indices.tolist():
+        start = max(0, int(time_index) - vae_temporal_stride + 1)
+        end = min(start + vae_temporal_stride, F_orig)
+        chunk = plucker[:, start:end]
+        if chunk.shape[1] < vae_temporal_stride:
+            pad = vae_temporal_stride - chunk.shape[1]
+            pad_chunk = chunk[:, -1:].repeat(1, pad, 1, 1, 1)
+            chunk = torch.cat([chunk, pad_chunk], dim=1)
+        chunks.append(chunk)
+
+    plucker = torch.stack(chunks, dim=1)  # (B, T, stride, H, W, 6)
+    plucker = plucker.permute(0, 1, 3, 4, 2, 5).reshape(
+        B, T, H, W, vae_temporal_stride * 6
+    )
     # (B, 48, T, H, W) for Conv3d
     plucker = plucker.permute(0, 4, 1, 2, 3).contiguous()
     return plucker
@@ -1382,7 +1406,8 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         encoder_hidden_states:   (B, L, 2304)           Gemma-2 embeddings
         timestep:                (B,)
         encoder_attention_mask:  (B, L) optional bool
-        camera_conditions:       (B, F_orig, 20)        16 c2w + (fx,fy,cx,cy)
+        camera_conditions:       (B, T, 20)             latent-frame raymap:
+                                                        16 c2w + (fx,fy,cx,cy)
         chunk_plucker:           (B, 48, T, H, W)       optional, computed
                                                         from camera_conditions
                                                         if absent.
@@ -1571,6 +1596,12 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         # --- 5. Camera conditioning: compute UCPE prope_fns + Plücker ---
         prope_fns = None
         if camera_conditions is not None:
+            if camera_conditions.shape[1] != T:
+                raise ValueError(
+                    "SANA-WM camera_conditions must be sampled at latent "
+                    f"frames: got {camera_conditions.shape[1]} frames, "
+                    f"expected T={T}."
+                )
             head_dim = self.attention_head_dim
             raymats = process_camera_conditions_ucpe(
                 camera_conditions, HW=(T, H, W), patch_size=self.patch_size,
