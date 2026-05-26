@@ -90,11 +90,14 @@ def _script_long_decode_then_many_short(t: ScriptedRuntime):
 
 def _script_chunked_in_flight_count_never_above_one_long_run(t: ScriptedRuntime):
     # 50 chunked reqs over many yields; verify invariant at every step.
+    # Step budget bumped to DEFAULT_MAX_STEPS * 60 because 50 chunked
+    # reqs with VERY_LONG_PROMPT_LEN each can take many chunk
+    # iterations and the original *30 budget was borderline-tight.
     reqs = [
         t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         for _ in range(50)
     ]
-    for _ in range(DEFAULT_MAX_STEPS * 30):
+    for _ in range(DEFAULT_MAX_STEPS * 60):
         assert t.chunked_in_flight_count() <= 1
         if all(r.finished for r in reqs):
             return
