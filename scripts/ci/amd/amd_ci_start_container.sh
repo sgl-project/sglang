@@ -280,6 +280,54 @@ else
     CACHE_VOLUME=""
 fi
 
+echo "=========================================="
+echo "Host cache mount diagnostics"
+echo "=========================================="
+echo "Hostname:        $(hostname)"
+echo "Expected cache:  ${CACHE_HOST}"
+if [[ -d "$CACHE_HOST" ]]; then
+    echo "Status:          PRESENT - will mount ${CACHE_HOST} -> /sgl-data"
+    ls -ld "$CACHE_HOST" 2>/dev/null || true
+    df -h "$CACHE_HOST" 2>/dev/null || true
+    echo "Top-level entries (first 20):"
+    ls -la "$CACHE_HOST" 2>/dev/null | head -20 || true
+else
+    echo "Status:          MISSING - /sgl-data inside container will be ephemeral"
+    echo "                 HF models / MIOPEN cache will NOT persist between runs"
+fi
+
+echo ""
+echo "Other candidate cache locations on host:"
+for candidate in \
+    /home/runner/sgl-data \
+    /home/runner/sglang-data \
+    /sgl-data \
+    /sglang-data \
+    /mnt/sgl-data \
+    /mnt/sglang-data \
+    /data/sgl-data \
+    /data/sglang-data; do
+    if [[ -e "$candidate" ]]; then
+        if [[ -d "$candidate" ]]; then
+            size=$(du -sh "$candidate" 2>/dev/null | cut -f1)
+            echo "  EXISTS  ${candidate} (dir, size=${size:-?})"
+        else
+            echo "  EXISTS  ${candidate} (not a dir)"
+        fi
+    fi
+done
+
+echo ""
+echo "Host /home contents:"
+ls -la /home 2>/dev/null || echo "  (cannot list /home)"
+echo ""
+echo "Host /mnt contents:"
+ls -la /mnt 2>/dev/null || echo "  (cannot list /mnt)"
+echo ""
+echo "Host filesystem usage:"
+df -h 2>/dev/null | head -20 || true
+echo "=========================================="
+
 echo "Launching container: ci_sglang"
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   --ulimit nofile=65536:65536 \
@@ -324,6 +372,39 @@ docker exec ci_sglang bash -lc '
   fi
 
   echo "kernel.numa_balancing=$(cat "${numa_balancing_path}")"
+'
+
+docker exec ci_sglang bash -lc '
+  echo "=========================================="
+  echo "In-container /sgl-data mount diagnostics"
+  echo "=========================================="
+
+  if [[ ! -e /sgl-data ]]; then
+    echo "WARNING: /sgl-data does NOT exist inside container"
+    echo "         HF / MIOPEN cache paths will fail or be created in container layer"
+  else
+    is_mount=0
+    if command -v mountpoint >/dev/null 2>&1 && mountpoint -q /sgl-data 2>/dev/null; then
+      is_mount=1
+    elif [[ "$(stat -c %d / 2>/dev/null)" != "$(stat -c %d /sgl-data 2>/dev/null)" ]]; then
+      is_mount=1
+    fi
+
+    if [[ "$is_mount" == "1" ]]; then
+      echo "Status: /sgl-data IS a host volume mount (cache will persist)"
+    else
+      echo "WARNING: /sgl-data is NOT a host mount (same device as /)"
+      echo "         Cache is ephemeral - HF downloads will repeat every run"
+    fi
+
+    ls -ld /sgl-data 2>/dev/null || true
+    df -h /sgl-data 2>/dev/null || true
+    echo "Top-level entries (first 20):"
+    ls -la /sgl-data 2>/dev/null | head -20 || true
+    echo "HF hub cache (first 20):"
+    ls -la /sgl-data/hf-cache/hub 2>/dev/null | head -20 || echo "  (hf-cache/hub not present)"
+  fi
+  echo "=========================================="
 '
 
 # The checkout is owned by the runner (non-root) but the container runs as
