@@ -1949,12 +1949,10 @@ def _validate_parsed_gsp_args(
 ) -> None:
     """Reject malformed GSP distribution/alpha combinations at parse time.
 
-    This is invoked from the CLI entry point right after ``parser.parse_args()``
-    so users see a clear argparse-style error before any server, model, or
+    Invoked from the CLI entry point right after ``parser.parse_args()`` so
+    users see a clear argparse-style error before any server, model, or
     tokenizer setup runs and masks the real cause with an unrelated network
-    failure. The equivalent defensive checks in
-    ``GeneratedSharedPrefixDataset.from_args`` remain in place for in-process
-    callers that bypass this entry point.
+    failure.
     """
     distribution = getattr(args, "gsp_group_distribution", None)
     alpha = getattr(args, "gsp_zipf_alpha", None)

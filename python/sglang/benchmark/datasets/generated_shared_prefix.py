@@ -179,10 +179,6 @@ def sample_generated_shared_prefix_requests(
     stays byte-identical to uniform mode for the same seed and other args.
     Zipf mode is cached on disk under a distinct key per (group_distribution,
     zipf_alpha) value.
-
-    Validation of group_distribution / zipf_alpha is enforced at the CLI
-    parse boundary in bench_serving.py and in
-    GeneratedSharedPrefixDataset.from_args for in-process callers.
     """
     cache_path = get_gen_prefix_cache_path(
         seed,
@@ -200,7 +196,6 @@ def sample_generated_shared_prefix_requests(
     # meaningless to cache. Bypass for these pre-existing reasons only.
     should_cache = range_ratio == 1 and not send_routing_key and num_turns == 1
 
-    # Try to load from cache first (only when caching is enabled).
     if should_cache and cache_path.exists():
         print(f"\nLoading cached generated input data from {cache_path}")
         with open(cache_path, "rb") as f:
@@ -238,12 +233,11 @@ def sample_generated_shared_prefix_requests(
     ).reshape(num_groups, prompts_per_group)
     del system_prompt_len, question_len, output_len
 
-    # Generate system prompts for each group
     system_prompts = [
         gen_prompt(tokenizer, system_prompt_lens[i]) for i in range(num_groups)
     ]
 
-    # Generate questions: shape (num_groups, prompts_per_group, num_turns)
+    # shape: (num_groups, prompts_per_group, num_turns)
     questions = [
         [
             [
@@ -306,7 +300,6 @@ def sample_generated_shared_prefix_requests(
     if not ordered:
         random.shuffle(input_requests)
 
-    # Print statistics
     print(f"\nGenerated shared prefix dataset statistics:")
     print(f"Number of groups: {num_groups}")
     print(f"Prompts per group: {prompts_per_group}")
@@ -326,7 +319,6 @@ def sample_generated_shared_prefix_requests(
             f"Average question length: {sum(len(tokenizer.encode(q)) for q in all_questions) / len(all_questions):.1f} tokens\n"
         )
 
-    # Save to cache (only when caching is enabled).
     if should_cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"Caching generated input data to {cache_path}")
