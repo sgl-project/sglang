@@ -164,14 +164,20 @@ class WanRotaryPosEmbed(nn.Module):
         self.attention_head_dim = attention_head_dim
         self.patch_size = patch_size
         self.max_seq_len = max_seq_len
+        self.theta = theta
+        self._init_freqs_buffer()
 
-        h_dim = w_dim = 2 * (attention_head_dim // 6)
-        t_dim = attention_head_dim - h_dim - w_dim
+    def _init_freqs_buffer(self) -> None:
+        # Extracted so SanaWMTransformer3DModel.post_load_weights can re-run
+        # it: this is a persistent=False buffer, so it is not in the upstream
+        # checkpoint and stays on meta after FSDP weight load.
+        h_dim = w_dim = 2 * (self.attention_head_dim // 6)
+        t_dim = self.attention_head_dim - h_dim - w_dim
 
         freqs = []
         for dim in [t_dim, h_dim, w_dim]:
             freq = get_1d_rotary_pos_embed(
-                dim, max_seq_len, theta,
+                dim, self.max_seq_len, self.theta,
                 use_real=False, repeat_interleave_real=False,
                 freqs_dtype=torch.float64,
             )
@@ -1437,6 +1443,31 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         # FSDP shard targets
         self.layer_names = ["blocks"]
+
+    def post_load_weights(self) -> None:
+        # FSDP loader initializes the model on meta and only materializes
+        # tensors that appear in the checkpoint. Two classes of state here
+        # are NOT in the upstream checkpoint and so stay on meta:
+        #   1. WanRotaryPosEmbed._freqs -- registered with persistent=False;
+        #      a derived constant that we recompute deterministically here.
+        #   2. _ShortConvolution.bias  -- the upstream NVlabs checkpoint
+        #      omits these biases (they are always zero by design, see the
+        #      ``# identity init: ... biases zero`` comment in
+        #      _ShortConvolution.__init__).
+        # Materialize both so the meta-device safety check in fsdp_load.py
+        # passes.
+        for module in self.modules():
+            if isinstance(module, WanRotaryPosEmbed):
+                if module._freqs.is_meta:
+                    module._init_freqs_buffer()
+            elif isinstance(module, _ShortConvolution):
+                if module.bias.is_meta:
+                    zeros = torch.zeros(
+                        module.hidden_size,
+                        dtype=module.weight.dtype,
+                        device=module.weight.device,
+                    )
+                    module.bias = nn.Parameter(zeros, requires_grad=False)
 
     # ------------------------------------------------------------------ #
     # Forward
