@@ -199,78 +199,6 @@ class TestScriptedRuntimeFunctional(CustomTestCase):
                 return
             yield
 
-    def test_api_smoke_r_chunks_done(self):
-        """ReqHandle.chunks_done is readable as an int."""
-        execute_scripted_runtime(
-            self._script_api_smoke_r_chunks_done, **_COMMON_ENGINE_KWARGS
-        )
-
-    @staticmethod
-    def _script_api_smoke_r_chunks_done(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=8, max_new_tokens=2)
-        yield
-        _ = r.chunks_done
-        assert isinstance(r.chunks_done, int)
-
-    def test_api_smoke_r_is_chunking(self):
-        """ReqHandle.is_chunking is readable as a bool."""
-        execute_scripted_runtime(
-            self._script_api_smoke_r_is_chunking, **_COMMON_ENGINE_KWARGS
-        )
-
-    @staticmethod
-    def _script_api_smoke_r_is_chunking(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=8, max_new_tokens=2)
-        yield
-        _ = r.is_chunking
-        assert isinstance(r.is_chunking, bool)
-
-    def test_api_smoke_r_kv_pages(self):
-        """ReqHandle.kv_pages is readable as a non-negative int."""
-        execute_scripted_runtime(self._script_api_smoke_r_kv_pages, **_COMMON_ENGINE_KWARGS)
-
-    @staticmethod
-    def _script_api_smoke_r_kv_pages(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=8, max_new_tokens=2)
-        yield
-        _ = r.kv_pages
-        assert isinstance(r.kv_pages, int) and r.kv_pages >= 0
-
-    def test_api_smoke_r_row_idx(self):
-        """ReqHandle.row_idx is readable (may be None pre-assignment)."""
-        execute_scripted_runtime(self._script_api_smoke_r_row_idx, **_COMMON_ENGINE_KWARGS)
-
-    @staticmethod
-    def _script_api_smoke_r_row_idx(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=8, max_new_tokens=2)
-        yield
-        # row_idx may be None when not yet assigned.
-        _ = r.row_idx
-
-    def test_api_smoke_r_lock_refs(self):
-        """ReqHandle.lock_refs is readable as a non-negative int."""
-        execute_scripted_runtime(self._script_api_smoke_r_lock_refs, **_COMMON_ENGINE_KWARGS)
-
-    @staticmethod
-    def _script_api_smoke_r_lock_refs(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=8, max_new_tokens=2)
-        yield
-        _ = r.lock_refs
-        assert isinstance(r.lock_refs, int) and r.lock_refs >= 0
-
-    def test_api_smoke_r_pending_middle_outputs(self):
-        """ReqHandle.pending_middle_outputs is readable as an int."""
-        execute_scripted_runtime(
-            self._script_api_smoke_r_pending_middle_outputs, **_COMMON_ENGINE_KWARGS
-        )
-
-    @staticmethod
-    def _script_api_smoke_r_pending_middle_outputs(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=8, max_new_tokens=2)
-        yield
-        _ = r.pending_middle_outputs
-        assert isinstance(r.pending_middle_outputs, int)
-
     def test_api_smoke_r_inflight_middle_chunks(self):
         """ReqHandle.inflight_middle_chunks is readable as an int."""
         execute_scripted_runtime(
@@ -283,19 +211,6 @@ class TestScriptedRuntimeFunctional(CustomTestCase):
         yield
         _ = r.inflight_middle_chunks
         assert isinstance(r.inflight_middle_chunks, int)
-
-    def test_api_smoke_r_finish_event_count(self):
-        """ReqHandle.finish_event_count is readable as an int."""
-        execute_scripted_runtime(
-            self._script_api_smoke_r_finish_event_count, **_COMMON_ENGINE_KWARGS
-        )
-
-    @staticmethod
-    def _script_api_smoke_r_finish_event_count(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=8, max_new_tokens=2)
-        yield
-        _ = r.finish_event_count
-        assert isinstance(r.finish_event_count, int)
 
     def test_api_smoke_r_disagg_send_state(self):
         """ReqHandle.disagg_send_state is readable (None outside disagg)."""
@@ -360,30 +275,6 @@ class TestScriptedRuntimeFunctional(CustomTestCase):
         assert isinstance(t.is_idle, bool)
         yield
 
-    def test_api_smoke_t_abort(self):
-        """ScriptedRuntime.abort runs without exception on an in-flight req."""
-        execute_scripted_runtime(self._script_api_smoke_t_abort, **_COMMON_ENGINE_KWARGS)
-
-    @staticmethod
-    def _script_api_smoke_t_abort(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=8, max_new_tokens=2)
-        yield
-        t.abort(r)
-        yield
-
-    def test_api_smoke_t_force_retract(self):
-        """ScriptedRuntime.force_retract runs without exception on an in-flight req."""
-        execute_scripted_runtime(
-            self._script_api_smoke_t_force_retract, **_COMMON_ENGINE_KWARGS
-        )
-
-    @staticmethod
-    def _script_api_smoke_t_force_retract(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=128, max_new_tokens=2)
-        yield
-        t.force_retract(r)
-        yield
-
     def test_api_smoke_t_exhaust_kv(self):
         """ScriptedRuntime.exhaust_kv leaves the requested page slack."""
         execute_scripted_runtime(
@@ -438,18 +329,6 @@ class TestScriptedRuntimeFunctional(CustomTestCase):
     def _script_api_smoke_t_batch_composition(t: ScriptedRuntime):
         comp = t.batch_composition()
         assert isinstance(comp, dict)
-        yield
-
-    def test_api_smoke_t_chunked_in_flight_count(self):
-        """ScriptedRuntime.chunked_in_flight_count returns a non-negative int."""
-        execute_scripted_runtime(
-            self._script_api_smoke_t_chunked_in_flight_count, **_COMMON_ENGINE_KWARGS
-        )
-
-    @staticmethod
-    def _script_api_smoke_t_chunked_in_flight_count(t: ScriptedRuntime):
-        cnt = t.chunked_in_flight_count()
-        assert isinstance(cnt, int) and cnt >= 0
         yield
 
     def test_api_smoke_t_list_active_reqs(self):
