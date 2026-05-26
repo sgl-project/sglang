@@ -434,12 +434,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
 
-    # kv-canary token-id validator snapshot: per-req (origin_input_ids + output_ids)
-    # captured at init_new time, so the validator does not race the overlap-schedule
-    # sampler thread mutating Req.output_ids. ``req_all_ids_flat`` is a pinned CPU
-    # int64 tensor flattening ``[cat(r.origin_input_ids, r.output_ids) for r in reqs]``;
-    # ``req_all_ids_lens`` is a pinned CPU int64 tensor of per-req lengths
-    # (``len(origin_input_ids) + len(output_ids)``).
+    # kv-canary token-id validator snapshot
     req_all_ids_flat: Optional[torch.Tensor] = None
     req_all_ids_lens: Optional[torch.Tensor] = None
 
