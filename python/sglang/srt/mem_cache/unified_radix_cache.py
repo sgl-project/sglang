@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from array import array
 from collections import defaultdict
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional
@@ -257,7 +258,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
         self.root_node = UnifiedTreeNode(self.tree_components)
-        self.root_node.key = RadixKey([], None)
+        self.root_node.key = RadixKey(array("q"), None)
         self.root_node.component_data[BASE_COMPONENT_TYPE].value = []
         for ct in self.tree_components:
             self.root_node.component_data[ct].lock_ref = 1
@@ -1169,7 +1170,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if not write_back and (
             node.parent is not self.root_node and not node.parent.backuped
         ):
-            return 0
+            if self.write_backup(node.parent) <= 0:
+                return 0
 
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
         kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
