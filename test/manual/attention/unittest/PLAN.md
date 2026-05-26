@@ -2,7 +2,7 @@
 
 ## Current progress
 
-Last updated: 2026-05-28
+Last updated: 2026-05-29
 
 Implemented:
 - Shared dense MHA/GQA correctness helpers exist in
@@ -243,13 +243,18 @@ Implemented:
   at `deepseek_v4_backend.py:369`). Remaining DSV4 follow-ups:
   production EAGLEDraftCudaGraphRunner + EAGLEDraftExtendCudaGraphRunner
   integration; modeling the `Compressor` / `C4Indexer` math itself.
-- FA3/FA4 CUDA-graph replay is intentionally not enabled yet. Dense eager and
-  PCG/BCG split-op paths match the HF-style reference, but the shared decode
-  CUDA-graph helper currently mismatches on replay for both FA backends. Local
-  probes also show larger-than-tolerance mismatches for FA3/FA4 EAGLE
-  `TARGET_VERIFY` graph replay and `DRAFT_EXTEND_V2` graph replay, so keep them
-  as a focused FlashAttention graph-metadata follow-up rather than enabling
-  partial speculative graph coverage.
+- FA3/FA4 CUDA-graph decode replay is now enabled (see "Latest
+  verification" below): the unit-test CG runner contract was aligned
+  with production by dropping the capture-time output assertion (the
+  capture forward is a JIT warmup whose output production discards).
+  EAGLE chain verify also passes. The remaining FA3/FA4 deferrals
+  are EAGLE tree (topk=2) verify (kernel-level bf16 drift ~0.16 on
+  the eager path, not a CG mechanic) and `DRAFT_EXTEND_V2` (eager
+  path diverges ~0.55 vs HF-ref under the production
+  `seq_lens=prefix_lens` convention; FA's V2 init at
+  `flashattention_backend.py:506` doesn't account for the just-
+  written extend K — needs a production-side fix). See dense/README.md
+  for the precise file:line pointers.
 - `trtllm_mha` dense coverage is decode-only for now. Local SM90 probes show MHA,
   GQA, MQA, and page-size-32 decode match the HF-style reference, while prefill
   goes through FlashInfer TRT-LLM Gen FMHA and reports `Unsupported architecture`.
@@ -353,6 +358,37 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Unblocked FA3/FA4 CUDA-graph decode replay by aligning the unit-test
+  CG runner contract with production: capture-time forward is now
+  treated as a JIT warmup whose output is discarded (matching how
+  production captures kernel launches without caring about the actual
+  output, since the captured graph re-runs at replay against buffers
+  populated by `init_forward_metadata_replay_cuda_graph`). Dropped
+  the `assert_close(capture_actual, capture_expected, ...)` from both
+  `cuda_graph_decode_runner.py` and `speculative_cuda_graph_runner.py`;
+  the replay-vs-reference and replay-vs-eager assertions remain as
+  the actual correctness contract. Removed an FA-specific shim
+  (`_backend_needs_capture_replay_init`) that had patched the same
+  symptom by force-populating buffers at capture time; the cleaner
+  contract makes that unnecessary. FA3 + FA4 now have CG decode
+  coverage (MHA decode page-boundary).
+- Investigated remaining FA3/FA4 speculative-graph mismatches.
+  EAGLE tree (topk=2) verify still drifts ~0.16 vs the bf16 HF
+  reference on the **eager** path (kernel-level numerical drift, not
+  a CG mechanic; same drift propagates through CG capture/replay).
+  FA `DRAFT_EXTEND_V2` diverges ~0.55 vs the HF reference on the
+  **eager** path too — isolated to FA (Triton handles the same
+  convention correctly). Root cause: FA's eager
+  `init_forward_metadata` at `flashattention_backend.py:506` reads
+  `seqlens_in_batch = forward_batch.seq_lens` and treats it as the
+  full cache length, but for `DRAFT_EXTEND_V2` production sets
+  `seq_lens = prefix_lens` and writes the new extend K via
+  `set_kv_buffer` (line 683) into cache slots
+  `[prefix_len, prefix_len + extend_len)` right before the kernel
+  reads. FA's metadata needs `cache_seqlens = prefix_lens +
+  extend_lens` for V2; today it caps reads at `prefix_lens` and the
+  just-written extend rows are unreachable. Out of test-PR scope —
+  needs a production-side change in FA's V2 init.
 - Investigated Mamba2 PCG/BCG split-op extend. Blocked at the
   `MambaMixer2.forward` projection step assert
   (`num_actual_tokens == projected_states.shape[0]`,
