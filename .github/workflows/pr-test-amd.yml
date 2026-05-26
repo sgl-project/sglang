@@ -38,7 +38,7 @@ on:
           - stage-c-test-4-gpu-amd
           - stage-c-test-large-8-gpu-amd
           - stage-c-test-large-8-gpu-amd-mi35x
-          - stage-b-test-large-8-gpu-35x-disaggregation-amd
+          - stage-b-test-large-8-gpu-mi35x-disaggregation-amd
       target_stage:
         description: "Or type comma-separated stage names (overrides dropdown if non-empty)"
         required: false
@@ -67,6 +67,11 @@ on:
         options:
           - mi300
           - mi325
+      run_all_tests:
+        description: 'Run all tests (skip change detection). Ignored when target_stage / target_stage_select is set.'
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       ref:
@@ -316,7 +321,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-gpu-small-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
@@ -1028,12 +1033,12 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   # =============================================== Disaggregation ====================================================
-  stage-b-test-large-8-gpu-35x-disaggregation-amd:
+  stage-b-test-large-8-gpu-mi35x-disaggregation-amd:
     needs: [check-changes, wait-for-stage-a-amd]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-8-gpu-35x-disaggregation-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-8-gpu-mi35x-disaggregation-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -1137,7 +1142,7 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh \
             -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
-            -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+            -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-mi35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   pr-test-amd-finish:
     needs:
@@ -1159,7 +1164,7 @@ jobs:
         stage-b-test-1-gpu-small-amd-mi35x,
         stage-b-test-1-gpu-large-amd,
         stage-b-test-2-gpu-large-amd,
-        stage-b-test-large-8-gpu-35x-disaggregation-amd,
+        stage-b-test-large-8-gpu-mi35x-disaggregation-amd,
         stage-c-test-4-gpu-amd,
         stage-c-test-large-8-gpu-amd,
         stage-c-test-large-8-gpu-amd-mi35x,

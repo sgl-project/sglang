@@ -1,0 +1,12 @@
+{
+  "model_id": "deepseek-ai/DeepSeek-V3",
+  "shape": "short",
+  "prompt_text": "Hello, world!",
+  "expected_token_ids": [
+    19923,
+    14,
+    2058,
+    3
+  ],
+  "skip_special_tokens": false
+}

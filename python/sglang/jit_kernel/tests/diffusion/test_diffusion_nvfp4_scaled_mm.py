@@ -136,11 +136,17 @@ def _build_layer(
     weight_global_scale: torch.Tensor,
     *,
     weight_scale_device: torch.device | str | None = None,
+    checkpoint_weight_scale_layout: str = "linear",
 ) -> tuple[ModelOptFp4LinearMethod, torch.nn.Module]:
     output_size, input_size_half = weight_fp4.shape
     input_size = input_size_half * 2
     method = ModelOptFp4LinearMethod(
-        ModelOptFp4Config(is_checkpoint_nvfp4_serialized=True, group_size=BLOCK_SIZE)
+        ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=BLOCK_SIZE,
+            swap_weight_nibbles=True,
+            checkpoint_weight_scale_layout=checkpoint_weight_scale_layout,
+        )
     )
     layer = torch.nn.Module()
     method.create_weights(
@@ -175,7 +181,11 @@ def _build_layer(
         expected_weight, _ = pad_nvfp4_weight(
             weight_fp4, n_alignment=128, k_alignment=0
         )
-        expected_scale = weight_scale_linear
+        expected_scale = (
+            _swizzled_to_linear(weight_scale_linear, output_size, input_size)
+            if checkpoint_weight_scale_layout == "swizzled"
+            else weight_scale_linear
+        )
         if expected_scale.shape[0] != expected_weight.shape[0]:
             pad_n = expected_weight.shape[0] - expected_scale.shape[0]
             expected_scale = torch.nn.functional.pad(expected_scale, (0, 0, 0, pad_n))
@@ -363,6 +373,57 @@ def test_flux2_shape_correctness_flashinfer_trtllm(
     )
 
     diff = _calc_diff(actual, expected.to(dtype=DTYPE))
+    assert diff < DEEPGEMM_FP4_MAX_DIFF, f"{m=}, {n=}, {k=}, {diff=:.6f}"
+
+
+@pytest.mark.skipif(
+    not _nvfp4_supported(),
+    reason="Diffusion NVFP4 scaled mm correctness requires Blackwell GPUs",
+)
+def test_flux2_swizzled_scale_checkpoint_flashinfer_trtllm_matches_cudnn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_diffusion_fp4_backend(monkeypatch, "flashinfer_trtllm")
+
+    m, n, k = FLUX2_PROJECTION_SHAPE
+    generator = torch.Generator(device=DEVICE)
+    generator.manual_seed(20260517 + m + n + k)
+
+    x = torch.randn((m, k), device=DEVICE, dtype=DTYPE, generator=generator)
+    weight = torch.randn((n, k), device=DEVICE, dtype=DTYPE, generator=generator)
+    input_global_scale = _make_global_scale(x)
+    weight_global_scale = _make_global_scale(weight)
+    alpha = (1.0 / (input_global_scale * weight_global_scale)).to(torch.float32)
+
+    x_fp4, x_scale_swizzled = flashinfer.fp4_quantize(x, input_global_scale)
+    weight_fp4, weight_scale_swizzled = flashinfer.fp4_quantize(
+        weight, weight_global_scale
+    )
+    if x_scale_swizzled.dtype == torch.uint8:
+        x_scale_swizzled = x_scale_swizzled.view(torch.float8_e4m3fn)
+    if weight_scale_swizzled.dtype == torch.uint8:
+        weight_scale_swizzled = weight_scale_swizzled.view(torch.float8_e4m3fn)
+
+    method, layer = _build_layer(
+        weight_fp4,
+        weight_scale_swizzled,
+        input_global_scale,
+        weight_global_scale,
+        checkpoint_weight_scale_layout="swizzled",
+    )
+    actual = method.apply(layer, x)
+
+    expected = flashinfer.mm_fp4(
+        x_fp4,
+        weight_fp4.t(),
+        x_scale_swizzled,
+        weight_scale_swizzled.t(),
+        alpha,
+        DTYPE,
+        backend="cudnn",
+    )
+
+    diff = _calc_diff(actual, expected)
     assert diff < DEEPGEMM_FP4_MAX_DIFF, f"{m=}, {n=}, {k=}, {diff=:.6f}"
 
 

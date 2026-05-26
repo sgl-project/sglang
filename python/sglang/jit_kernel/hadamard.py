@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable
 import torch
 
 from sglang.jit_kernel.utils import KERNEL_PATH, cache_once, load_jit, make_cpp_args
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -56,6 +57,14 @@ def _hadamard_transform_impl(
     return out.reshape(shapes_og)
 
 
+def _hadamard_transform_fake_impl(
+    x: torch.Tensor,
+    scale: float = 1.0,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+@register_custom_op(fake_impl=_hadamard_transform_fake_impl)
 def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     module = _jit_hadamard_module(x.dtype)
     return _hadamard_transform_impl(x, scale, 8, module.hadamard_transform)

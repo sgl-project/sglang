@@ -1,4 +1,4 @@
-name: Cancel PR Workflows on Merge
+name: Cancel PR Workflows on Close
 
 on:
   pull_request_target:
@@ -10,7 +10,6 @@ permissions:
 
 jobs:
   cancel:
-    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
       - name: Cancel Previous Runs

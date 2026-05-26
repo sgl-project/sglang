@@ -53,7 +53,26 @@ _flashinfer_layernorm_available = False
 if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
         try:
-            from flashinfer.norm import layernorm
+            import flashinfer.norm
+
+            from sglang.srt.utils.custom_op import register_custom_op
+
+            def _layernorm_fake_impl(
+                input: torch.Tensor,
+                gamma: torch.Tensor,
+                beta: torch.Tensor,
+                eps: float = 1e-6,
+            ) -> torch.Tensor:
+                return torch.empty_like(input)
+
+            @register_custom_op(fake_impl=_layernorm_fake_impl)
+            def layernorm(
+                input: torch.Tensor,
+                gamma: torch.Tensor,
+                beta: torch.Tensor,
+                eps: float = 1e-6,
+            ) -> torch.Tensor:
+                return flashinfer.norm.layernorm(input, gamma, beta, eps)
 
             _flashinfer_layernorm_available = True
         except (ImportError, AttributeError):
@@ -284,6 +303,12 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # Fix dsv4 dp attenton issue
+        # the symptom is torch.AcceleratorError: HIP error: invalid configuration argument
+        if x.shape[0] == 0:
+            if residual is not None:
+                return x, residual
+            return x
         # Aiter's RMSNorm kernels expect 2D contiguous inputs. Keep the
         # already-safe layout as a zero-copy path, and only normalize strided or
         # higher-rank views such as Q/K slices from packed QKV projections.

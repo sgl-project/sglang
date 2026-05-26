@@ -90,20 +90,22 @@ void decode_attention_cpu(
     at::Tensor& k_cache,
     at::Tensor& v_cache,
     at::Tensor& output,
-    at::Tensor& key,
-    at::Tensor& value,
+    const std::optional<at::Tensor>& key,
+    const std::optional<at::Tensor>& value,
     at::Tensor& loc,
     at::Tensor& attn_logits,
     at::Tensor& req_to_token,
     at::Tensor& req_pool_indices,
     at::Tensor& seq_lens,
     double sm_scale,
-    double logit_cap);
+    double logit_cap,
+    bool is_cross_attn,
+    std::optional<at::Tensor> encoder_lens);
 
 void extend_attention_cpu(
     at::Tensor& q_extend,
-    at::Tensor& k_extend,
-    at::Tensor& v_extend,
+    const std::optional<at::Tensor>& k_extend,
+    const std::optional<at::Tensor>& v_extend,
     at::Tensor& o_extend,
     at::Tensor& k_buffer,
     at::Tensor& v_buffer,
@@ -114,7 +116,9 @@ void extend_attention_cpu(
     at::Tensor& extend_start_loc,
     int64_t max_len_extend,
     double sm_scale,
-    double logit_cap);
+    double logit_cap,
+    bool is_cross_attn,
+    std::optional<at::Tensor> encoder_lens);
 
 // flash attention
 at::Tensor flash_attn_varlen_func(
@@ -406,6 +410,15 @@ std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
     bool disable_grouping,
     at::ScalarType out_dtype);
 
+// kvcache
+void store_cache_cpu(
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& indices,
+    std::optional<int64_t> row_dim);
+
 // [NOTE] When registering kernels, we should accurately describe the in-place information.
 // Taking fused_add_rmsnorm_cpu as an example, add `Tensor(a!)` modifier to all tensors that
 // will be modified in-place to avoid incorrect fusing and execution order on graph mode.
@@ -462,16 +475,18 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // decode
   m.def(
-      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, Tensor(a!) output, Tensor key, Tensor value, "
+      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, Tensor(a!) output, Tensor? key, Tensor? "
+      "value, "
       "Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, "
-      "float logit_cap) -> ()");
+      "float logit_cap, bool is_cross_attn, Tensor? encoder_lens) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
 
   // extend
   m.def(
-      "extend_attention_cpu(Tensor q_extend, Tensor k_extend, Tensor v_extend, Tensor(a!) o_extend, Tensor k_buffer, "
+      "extend_attention_cpu(Tensor q_extend, Tensor? k_extend, Tensor? v_extend, Tensor(a!) o_extend, Tensor k_buffer, "
       "Tensor v_buffer, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor extend_seq_lens, Tensor "
-      "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap) -> ()");
+      "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, bool is_cross_attn, Tensor? "
+      "encoder_lens) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
   // flash attn
@@ -652,6 +667,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "image_std, int patch_size, int temporal_patch_size, int merge_size, bool disable_grouping, ScalarType "
       "out_dtype) -> (Tensor, Tensor)");
   m.impl("image_preprocess_cpu", torch::kCPU, &image_preprocess_cpu);
+
+  // kvcache
+  m.def(
+      "store_cache_cpu(Tensor k, Tensor v, Tensor(a!) k_cache, Tensor(a!) v_cache, Tensor indices, int? row_dim) -> "
+      "()");
+  m.impl("store_cache_cpu", torch::kCPU, &store_cache_cpu);
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {

@@ -31,11 +31,11 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
 from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
     KVCache,
     MambaPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
-    NSATokenToKVPool,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -2608,14 +2608,14 @@ class HostPoolGroup:
             )
 
 
-class NSAIndexerPoolHost(HostKVCache):
-    """Host-side NSA index buffers only. Slot layout matches the anchor MLA host pool."""
+class DSAIndexerPoolHost(HostKVCache):
+    """Host-side DSA index buffers only. Slot layout matches the anchor MLA host pool."""
 
-    device_pool: NSATokenToKVPool
+    device_pool: DSATokenToKVPool
 
     def __init__(
         self,
-        device_pool: NSATokenToKVPool,
+        device_pool: DSATokenToKVPool,
         anchor_host: MLATokenToKVPoolHost,
         layout: str,
         pin_memory: bool = True,
@@ -2635,7 +2635,7 @@ class NSAIndexerPoolHost(HostKVCache):
 
         self.index_head_dim = device_pool.index_head_dim
         self.indexer_quant_block_size = device_pool.quant_block_size
-        self.indexer_dtype = NSATokenToKVPool.index_k_with_scale_buffer_dtype
+        self.indexer_dtype = DSATokenToKVPool.index_k_with_scale_buffer_dtype
         self.indexer_size_per_token = (
             self.index_head_dim
             + self.index_head_dim // self.indexer_quant_block_size * 4
@@ -2658,12 +2658,12 @@ class NSAIndexerPoolHost(HostKVCache):
         available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
         if requested_bytes > available_bytes:
             raise ValueError(
-                f"Not enough host memory for NSA indexer hierarchical cache. "
+                f"Not enough host memory for DSA indexer hierarchical cache. "
                 f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free."
             )
         logger.info(
-            "Allocating %.2f GB host memory for NSA indexer (layout=%s).",
+            "Allocating %.2f GB host memory for DSA indexer (layout=%s).",
             requested_bytes / 1e9,
             layout,
         )
@@ -2726,7 +2726,7 @@ class NSAIndexerPoolHost(HostKVCache):
             return host_indices, device_indices
         if host_indices.numel() % self.page_size != 0:
             raise ValueError(
-                "Index buffer transfer expects page-aligned indices for NSA."
+                "Index buffer transfer expects page-aligned indices for DSA."
             )
         host_page_indices = (
             host_indices.reshape(-1, self.page_size)[:, 0] // self.page_size

@@ -61,8 +61,8 @@ class SRTPlatform(DeviceMixin):
         """Return the MLA KV pool class for this platform."""
         raise NotImplementedError
 
-    def get_nsa_kv_pool_cls(self) -> type:
-        """Return the NSA KV pool class for this platform (DeepSeek V3.2)."""
+    def get_dsa_kv_pool_cls(self) -> type:
+        """Return the DSA KV pool class for this platform (DeepSeek V3.2)."""
         raise NotImplementedError
 
     def get_paged_allocator_cls(self) -> type:

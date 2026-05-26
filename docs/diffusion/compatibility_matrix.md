@@ -66,6 +66,8 @@ default parameters when initializing and generating videos.
 | FLUX.2-dev-NVFP4          | `black-forest-labs/FLUX.2-dev-NVFP4`                     |
 | FLUX.2-Klein-4B           | `black-forest-labs/FLUX.2-klein-4B`                      |
 | FLUX.2-Klein-9B           | `black-forest-labs/FLUX.2-klein-9B`                      |
+| FLUX.2-Klein-Base-4B      | `black-forest-labs/FLUX.2-klein-base-4B`                 |
+| FLUX.2-Klein-Base-9B      | `black-forest-labs/FLUX.2-klein-base-9B`                 |
 | Z-Image                   | `Tongyi-MAI/Z-Image`                                    |
 | Z-Image-Turbo             | `Tongyi-MAI/Z-Image-Turbo`                              |
 | GLM-Image                 | `zai-org/GLM-Image`                                     |

@@ -39,7 +39,6 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.triton_utils import fused_moe
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -50,13 +49,22 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
+
 if _is_cpu and _is_cpu_amx_available:
     import sgl_kernel  # noqa: F401
+
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+        fused_moe_npu as fused_moe,
+    )
+else:
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
 
 
 class DeepseekMLP(nn.Module):
@@ -202,7 +210,7 @@ class DeepseekMoE(nn.Module):
                 True,  # is_vnni
             )
         else:
-            final_hidden_states = fused_moe.fused_moe(
+            final_hidden_states = fused_moe(
                 hidden_states,
                 w1=self.w1,
                 w2=self.w2,

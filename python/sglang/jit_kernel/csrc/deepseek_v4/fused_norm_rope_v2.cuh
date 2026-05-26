@@ -163,7 +163,11 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
     for (uint32_t mask = 1; mask < kWarpThreads; mask <<= 1) {
 #pragma unroll
       for (int i = 0; i < kVecSize; ++i) {
-        const float other = __shfl_xor_sync(0xFFFFFFFFu, data[i], mask, kWarpThreads);
+#ifndef USE_ROCM
+        const float other = __shfl_xor_sync(kFullMask, data[i], mask, kWarpThreads);
+#else
+        const float other = __shfl_xor(data[i], mask, kWarpThreads);
+#endif
         data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
       }
     }
@@ -307,8 +311,10 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
     reinterpret_cast<bf16x2_t*>(rope_ptr)[lane_id] = result;
   } else {
     // Non-rope warp: per-warp UE8M0 group (64 elems -> 64 fp8 + 1 scale byte).
-    const auto x = data[0];
-    const auto y = data[1];
+    // BF16 round-trip to match the precision of the non-fused path
+    // (which goes through quant_to_nope_fp8_rope_bf16_pack_triton with bf16 input).
+    const auto x = cast<float>(cast<bf16_t>(data[0]));
+    const auto y = cast<float>(cast<bf16_t>(data[1]));
     const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
     const auto scale_raw = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
     const auto scale_ue8m0 = cast_to_ue8m0(scale_raw);
@@ -359,7 +365,7 @@ struct FusedNormRopeKernel {
 
     auto N = SymbolicSize{"num_tokens"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({N, kHeadDim})  // input
         .with_dtype<DType>()

@@ -468,7 +468,7 @@ def cutlass_moe_fp4(
     )
     del rep_a_fp4, rep_a_blockscale
 
-    # hidden size dimension is split to one halfpytho sized tensor.
+    # hidden size dimension is split to one half sized tensor.
     intermediate = torch.empty(
         (m_a * num_topk, w1_fp4.shape[1] // 2), device=device, dtype=out_dtype
     )

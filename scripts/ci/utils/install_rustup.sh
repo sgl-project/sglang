@@ -8,7 +8,11 @@ set -euxo pipefail
 # GitHub Actions steps in the same job.
 export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
 if [ -n "${GITHUB_PATH:-}" ]; then
-    echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "${GITHUB_PATH}"
+    # Self-heal if _runner_file_commands/ disappears mid-job on some self-hosted
+    # runners; the runner reads this file by its registered UUID at step end, so
+    # recreating the path keeps PATH propagation working for subsequent steps.
+    mkdir -p "$(dirname "${GITHUB_PATH}")" 2>/dev/null || true
+    echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "${GITHUB_PATH}" || true
 fi
 
 if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then

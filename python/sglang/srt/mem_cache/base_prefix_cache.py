@@ -17,7 +17,11 @@ import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
+from sglang.srt.observability.metrics_collector import (
+    STAT_LOGGER_ROLE_RADIX_CACHE,
+    RadixCacheMetricsCollector,
+    resolve_collector_class,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -207,7 +211,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         labels = {"cache_type": self.__class__.__name__}
         if server_args.extra_metric_labels:
             labels.update(server_args.extra_metric_labels)
-        self.metrics_collector = RadixCacheMetricsCollector(labels=labels)
+        radix_cache_cls = resolve_collector_class(
+            server_args,
+            STAT_LOGGER_ROLE_RADIX_CACHE,
+            RadixCacheMetricsCollector,
+        )
+        self.metrics_collector = radix_cache_cls(labels=labels)
 
     def update_eviction_metrics(self, num_evicted: int, start_time: float):
         if self.metrics_collector is not None and num_evicted > 0:

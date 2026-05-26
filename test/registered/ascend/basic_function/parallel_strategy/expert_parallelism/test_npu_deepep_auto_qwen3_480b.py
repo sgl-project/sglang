@@ -81,6 +81,7 @@ class TestDeepEpQwen(CustomTestCase):
                 "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
                 "HCCL_BUFFSIZE": "2100",
                 "HCCL_OP_EXPANSION_MODE": "AIV",
+                "TRANSFORMERS_VERBOSITY": "error",
                 **os.environ,
             },
         )

@@ -41,6 +41,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyOutput,
 )
 from sglang.srt.speculative.eagle_utils import (
+    apply_eagle_prefill_input_rotation,
     build_tree_kernel_efficient,
     organize_draft_results,
 )
@@ -651,7 +652,7 @@ class MultiLayerEagleWorker(TpModelWorker):
             num_tokens_for_logprob_per_req=1,
         )
         batch.return_hidden_states = False
-        batch.spec_info.prepare_for_extend(batch)
+        apply_eagle_prefill_input_rotation(batch, next_token_ids)
         capture_mode = (
             CaptureHiddenMode.NULL
             if self.speculative_algorithm.is_standalone()

@@ -28,6 +28,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2MLP, Qwen2Model
 from sglang.srt.utils import add_prefix
@@ -258,11 +259,9 @@ class JetBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        assert isinstance(forward_batch.attn_backend, HybridLinearAttnBackend)
-        assert isinstance(
-            forward_batch.attn_backend.linear_attn_backend, MambaAttnBackendBase
-        )
-        linear_attn_backend = forward_batch.attn_backend.linear_attn_backend
+        assert isinstance(get_attn_backend(), HybridLinearAttnBackend)
+        assert isinstance(get_attn_backend().linear_attn_backend, MambaAttnBackendBase)
+        linear_attn_backend = get_attn_backend().linear_attn_backend
         forward_metadata = linear_attn_backend.forward_metadata
         layer_cache = linear_attn_backend.req_to_token_pool.mamba2_layer_cache(
             self.layer_id

@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 class StateType(str, enum.Enum):
     MAMBA = "mamba"
     SWA = "swa"
-    NSA = "nsa"
+    DSA = "dsa"
 
 
 @dataclasses.dataclass

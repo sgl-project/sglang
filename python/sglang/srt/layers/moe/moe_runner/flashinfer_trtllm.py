@@ -509,18 +509,26 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     layer.intermediate_size_per_partition = intermediate_size
 
 
-def get_activation_type(activation: str) -> int:
+def get_activation_type(activation: str, is_gated: bool = True) -> int:
     """Map SGLang activation string to FlashInfer ActivationType int value."""
     from flashinfer.fused_moe.core import ActivationType
 
-    _ACTIVATION_STR_TO_TYPE = {
-        "silu": ActivationType.Swiglu,
-        "relu2": ActivationType.Relu2,
-    }
+    if is_gated:
+        _ACTIVATION_STR_TO_TYPE = {
+            "silu": ActivationType.Swiglu,
+            "gelu": ActivationType.Geglu,
+        }
+    else:
+        _ACTIVATION_STR_TO_TYPE = {
+            "silu": ActivationType.Silu,
+            "gelu": ActivationType.Gelu,
+            "relu2": ActivationType.Relu2,
+        }
     act = _ACTIVATION_STR_TO_TYPE.get(activation)
     if act is None:
         raise ValueError(
-            f"Unsupported activation '{activation}' for TRTLLM MoE. "
+            f"Unsupported activation '{activation}' for TRTLLM MoE "
+            f"(is_gated={is_gated}). "
             f"Expected one of {list(_ACTIVATION_STR_TO_TYPE.keys())}."
         )
     return act.value
@@ -690,11 +698,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             assert TopKOutputChecker.format_is_bypassed(topk_output)
 
             output = trtllm_fp8_block_scale_moe_wrapper(
-                routing_logits=(
-                    router_logits.to(torch.float32)
-                    if routing_method_type == RoutingMethodType.DeepSeekV3
-                    else router_logits
-                ),
+                routing_logits=router_logits,
                 routing_bias=correction_bias,
                 hidden_states=a_q,
                 hidden_states_scale=a_sf_t,
@@ -750,11 +754,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         # during torch.compile for piecewise cuda graph.
         # Use custom op wrapper for torch.compile compatibility.
 
-        # The DeepSeekV3 routing method requires float32 router logits.
-        if routing_method_type == RoutingMethodType.DeepSeekV3:
-            router_logits = router_logits.to(torch.float32)
-        else:
-            router_logits = router_logits.to(torch.bfloat16)
+        router_logits = router_logits.to(torch.bfloat16)
 
         output = trtllm_fp8_per_tensor_scale_moe_wrapper(
             routing_logits=router_logits,
@@ -863,7 +863,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
-    _SUPPORTED_FP4_ACTIVATIONS = {"silu", "relu2"}
+    _SUPPORTED_FP4_ACTIVATIONS = {"silu", "relu2", "gelu"}
     assert runner_config.activation in _SUPPORTED_FP4_ACTIVATIONS, (
         f"Only {_SUPPORTED_FP4_ACTIVATIONS} are supported for FP4 MoE, "
         f"got '{runner_config.activation}'."
@@ -896,7 +896,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     hs_scale = hs_scale_linear.view(torch.float8_e4m3fn).reshape(
         *hs_scale_linear.shape[:-1], -1
     )
-    activation_type = get_activation_type(runner_config.activation)
+    activation_type = get_activation_type(
+        runner_config.activation, is_gated=runner_config.is_gated
+    )
 
     num_tokens = hs_fp4.shape[0]
     hidden_size = (
@@ -966,10 +968,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         router_logits = topk_output.router_logits
         topk_config = topk_output.topk_config
         routing_method_type = quant_info.routing_method_type
-
-        # DeepSeekV3 style routing requires float32 router logits
-        if routing_method_type == RoutingMethodType.DeepSeekV3:
-            router_logits = router_logits.to(torch.float32)
 
         correction_bias = (
             None
@@ -1070,7 +1068,9 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
     assert (
         runner_config.num_fused_shared_experts == 0
     ), "Fused shared experts are not supported for flashinfer trtllm moe"
-    activation_type = get_activation_type(runner_config.activation)
+    activation_type = get_activation_type(
+        runner_config.activation, is_gated=runner_config.is_gated
+    )
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output

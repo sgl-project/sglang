@@ -1,10 +1,25 @@
+import ctypes
+import dataclasses
 import struct
 import threading
 from collections import deque
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
+
+
+@dataclasses.dataclass
+class TransferKVChunk:
+    """Work unit for KV cache transfer from prefill to decode."""
+
+    room: int
+    prefill_kv_indices: npt.NDArray[np.int32]
+    index_slice: slice
+    is_last_chunk: bool
+    prefill_aux_index: Optional[int]
+    state_indices: Optional[List]
+    chunk_id: Optional[int] = None
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
@@ -57,6 +72,26 @@ class FastQueue:
             while not self._buf:
                 self._cond.wait()
             return self._buf.popleft()
+
+
+class AuxDataCodec:
+    """Handles serialization and deserialization of auxiliary data buffers."""
+
+    @staticmethod
+    def serialize_data_from_buffer(src_addr, data_length):
+        """Serialize data from memory buffer to bytes."""
+        buffer = (ctypes.c_byte * data_length).from_address(src_addr)
+        return bytes(buffer)
+
+    @staticmethod
+    def deserialize_data_to_buffer(kv_args, buffer_index, aux_index, data):
+        """Deserialize bytes into target memory buffer."""
+        dst_aux_ptr = kv_args.aux_data_ptrs[buffer_index]
+        item_len = kv_args.aux_item_lens[buffer_index]
+        dst_addr = dst_aux_ptr + item_len * aux_index
+        buffer = (ctypes.c_byte * len(data)).from_address(dst_addr)
+        buffer[:] = data
+        return
 
 
 def group_concurrent_contiguous(

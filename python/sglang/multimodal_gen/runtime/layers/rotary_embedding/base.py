@@ -61,6 +61,9 @@ class RotaryEmbedding(CustomOp):
     def forward_cuda(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
 
+    def forward_xpu(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
     def forward_native(
         self,
         positions: torch.Tensor,

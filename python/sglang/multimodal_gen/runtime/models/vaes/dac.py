@@ -20,14 +20,25 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
 )
 
 
-# Scripting this brings model speed up 1.4x
-@torch.jit.script
-def snake(x, alpha):
+def _snake(x, alpha):
     shape = x.shape
     x = x.reshape(shape[0], shape[1], -1)
     x = x + (alpha + 1e-9).reciprocal() * torch.sin(alpha * x).pow(2)
     x = x.reshape(shape)
     return x
+
+
+# Scripting this brings model speed up 1.4x
+snake = torch.jit.script(_snake)
+
+
+# ROCm HIPRTC can fail to compile the scripted bf16 Snake kernel.
+def _should_use_eager_snake_on_rocm_bf16(x: torch.Tensor, alpha: torch.Tensor) -> bool:
+    return (
+        torch.version.hip is not None
+        and (x.is_cuda or alpha.is_cuda)
+        and (x.dtype == torch.bfloat16 or alpha.dtype == torch.bfloat16)
+    )
 
 
 class Snake1d(nn.Module):
@@ -36,6 +47,8 @@ class Snake1d(nn.Module):
         self.alpha = nn.Parameter(torch.ones(1, channels, 1))
 
     def forward(self, x):
+        if _should_use_eager_snake_on_rocm_bf16(x, self.alpha):
+            return _snake(x, self.alpha)
         return snake(x, self.alpha)
 
 

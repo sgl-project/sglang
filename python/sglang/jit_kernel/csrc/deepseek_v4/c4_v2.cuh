@@ -309,7 +309,7 @@ struct FlashCompress4Kernel {
 
     auto N = SymbolicSize{"batch_size"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({-1, 4, Trait::kElementSize})  // kv score
         .with_dtype<InFloat>()
@@ -356,7 +356,7 @@ struct FlashCompress4Kernel {
     auto C = SymbolicSize{"num_c_plans"};
     auto W = SymbolicSize{"num_w_plans"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({-1, 4, Trait::kElementSize})  // kv score
         .with_dtype<InFloat>()

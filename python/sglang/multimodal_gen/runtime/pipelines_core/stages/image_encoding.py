@@ -803,9 +803,15 @@ class ImageVAEEncodingStage(PipelineStage):
         "vae_image_sizes",
     )
 
-    def __init__(self, vae: ParallelTiledVAE, **kwargs) -> None:
+    def __init__(
+        self,
+        vae: ParallelTiledVAE,
+        component_name: str = "vae",
+        **kwargs,
+    ) -> None:
         super().__init__()
         self.vae: ParallelTiledVAE = vae
+        self.component_name = component_name
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -815,7 +821,7 @@ class ImageVAEEncodingStage(PipelineStage):
         return [
             ComponentUse(
                 stage_name,
-                "vae",
+                self.component_name,
                 target_dtype=vae_dtype,
             )
         ]
@@ -851,7 +857,10 @@ class ImageVAEEncodingStage(PipelineStage):
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast
 
-        with self.use_declared_component(component_name="vae", module=self.vae) as vae:
+        with self.use_declared_component(
+            component_name=self.component_name,
+            module=self.vae,
+        ) as vae:
             assert vae is not None
             self.vae = vae
 

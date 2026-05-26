@@ -36,12 +36,12 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-    attach_hybrid_nsa_pool_to_hiradix_cache,
+    attach_hybrid_dsa_pool_to_hiradix_cache,
 )
 from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
-    NSATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
@@ -56,7 +56,11 @@ from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
     split_node_hash_value,
 )
-from sglang.srt.observability.metrics_collector import StorageMetricsCollector
+from sglang.srt.observability.metrics_collector import (
+    STAT_LOGGER_ROLE_STORAGE,
+    StorageMetricsCollector,
+    resolve_collector_class,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -82,8 +86,8 @@ class HiRadixCache(RadixCache):
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
             )
-        elif isinstance(self.kv_cache, NSATokenToKVPool):
-            # Filled by attach_hybrid_nsa_pool_to_hiradix_cache after storage extra_config is parsed.
+        elif isinstance(self.kv_cache, DSATokenToKVPool):
+            # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
@@ -95,9 +99,7 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         else:
-            raise ValueError(
-                "HiRadixCache only supports MHA, MLA, and NSA (DSA) models"
-            )
+            raise ValueError("HiRadixCache only supports MHA, MLA, and DSA models")
 
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
@@ -122,8 +124,8 @@ class HiRadixCache(RadixCache):
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
-        if isinstance(self.kv_cache, NSATokenToKVPool):
-            attach_hybrid_nsa_pool_to_hiradix_cache(
+        if isinstance(self.kv_cache, DSATokenToKVPool):
+            attach_hybrid_dsa_pool_to_hiradix_cache(
                 self,
                 params,
                 server_args,
@@ -250,7 +252,14 @@ class HiRadixCache(RadixCache):
                 labels.update(extra_metric_labels)
             existing_collector = getattr(self, "storage_metrics_collector", None)
             if existing_collector is None:
-                self.storage_metrics_collector = StorageMetricsCollector(labels=labels)
+                from sglang.srt.server_args import get_global_server_args
+
+                storage_cls = resolve_collector_class(
+                    get_global_server_args(),
+                    STAT_LOGGER_ROLE_STORAGE,
+                    StorageMetricsCollector,
+                )
+                self.storage_metrics_collector = storage_cls(labels=labels)
             elif set(existing_collector.labels.keys()) == set(labels.keys()):
                 existing_collector.labels = labels
             else:
@@ -643,7 +652,7 @@ class HiRadixCache(RadixCache):
     def _get_extra_pools(self) -> dict:
         if not isinstance(self.cache_controller, HybridCacheController):
             return {}
-        if isinstance(self.kv_cache, NSATokenToKVPool):
+        if isinstance(self.kv_cache, DSATokenToKVPool):
             pool = PoolTransfer(
                 name=PoolName.INDEXER,
                 hit_policy=PoolHitPolicy.ALL_PAGES,
@@ -805,10 +814,6 @@ class HiRadixCache(RadixCache):
 
     def evictable_size(self):
         return self.evictable_size_
-
-    def _to_radix_key(self, token_ids: List[int]) -> RadixKey:
-        """Convert raw token_ids to a RadixKey; must be list (not tuple) for paged match."""
-        return RadixKey(token_ids=list(token_ids))
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:

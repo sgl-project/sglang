@@ -1,4 +1,4 @@
-"""Archived test classes split out of test/registered/models/test_nvidia_nemotron_3_nano.py.
+"""Archived test classes split out of test/registered/models_e2e/test_nvidia_nemotron_3_nano.py.
 
 Originally registered with `register_cuda_ci(...)`. Moved here as part of
 the per-commit pruning effort to keep the code reachable manually.

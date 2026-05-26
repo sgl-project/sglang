@@ -19,9 +19,21 @@ on:
         required: false
         type: string
 
+# Bound the API cost when the same ref pushes repeatedly. See note in
+# runner-utilization.yml for the original incident this guards against.
+concurrency:
+  group: amd-ci-job-monitor-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   fetch-actions-data:
     name: Fetch Actions Snapshot
+    # Skip fork PRs entirely, and require the `run-ci` label on same-repo PRs.
+    # schedule and workflow_dispatch always run.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -49,10 +61,12 @@ jobs:
       - name: Fetch Actions data snapshot
         timeout-minutes: 30
         run: |
+          # PR-trigger is just a script smoke check; scan a 20-minute window
+          # (0.34h) to bound API cost. schedule / dispatch run the full report.
           python scripts/ci/utils/query_job_status.py \
             --repo ${{ github.repository }} \
             --workflow "${{ steps.select-workflows.outputs.workflows }}" \
-            --hours ${{ inputs.hours || '24' }} \
+            --hours ${{ (github.event_name == 'pull_request' && '0.34') || inputs.hours || '24' }} \
             --dump-data-file actions-job-snapshot.json
 
       - name: Upload Actions data snapshot

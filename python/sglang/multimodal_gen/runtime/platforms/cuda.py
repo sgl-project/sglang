@@ -124,7 +124,7 @@ class CudaPlatformBase(Platform):
     @lru_cache(maxsize=1)
     def get_modelopt_flashinfer_fp4_backend(cls) -> str:
         backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
-        default_backend = "cudnn" if cls.is_blackwell() else "auto"
+        default_backend = "trtllm"
         if backend is None:
             return default_backend
 
@@ -151,35 +151,23 @@ class CudaPlatformBase(Platform):
     @lru_cache(maxsize=1)
     def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
         requested_backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
-        prefer_flashinfer = requested_backend is not None
-
-        # TODO: Remove this explicit FlashInfer preference once the sm100 CUTLASS
-        # LargeM dispatch grows a validated fallback for Blackwell NVFP4 shapes
-        # such as Wan2.2's large-M attention projections.
-        if prefer_flashinfer:
-            try:
-                from flashinfer import mm_fp4 as flashinfer_mm_fp4
-
-                return flashinfer_mm_fp4, cls.get_modelopt_flashinfer_fp4_backend()
-            except ImportError:
-                logger.warning(
-                    "Requested SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=%r "
-                    "but flashinfer.mm_fp4 is unavailable. Falling back to "
-                    "cutlass.",
-                    requested_backend,
-                )
-
-        try:
-            from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
-
-            return cutlass_fp4_gemm, None
-        except ImportError:
-            pass
 
         try:
             from flashinfer import mm_fp4 as flashinfer_mm_fp4
 
             return flashinfer_mm_fp4, cls.get_modelopt_flashinfer_fp4_backend()
+        except ImportError:
+            logger.warning(
+                "Requested SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=%r "
+                "but flashinfer.mm_fp4 is unavailable. Falling back to "
+                "cutlass.",
+                requested_backend or "flashinfer_trtllm (default)",
+            )
+
+        try:
+            from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
+
+            return cutlass_fp4_gemm, None
         except ImportError:
             return None, None
 

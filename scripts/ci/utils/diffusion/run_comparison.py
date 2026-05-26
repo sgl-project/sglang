@@ -43,9 +43,7 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 30000
 SGLANG_MASTER_PORT_OFFSET = 5
 SGLANG_SCHEDULER_PORT_OFFSET = 55
-HEALTH_TIMEOUT = (
-    2400  # seconds (40 min — FLUX.2-dev needs ~10 min download + torch.compile)
-)
+HEALTH_TIMEOUT = 2400  # seconds (40 min — keep large model download/warmup headroom)
 REQUEST_TIMEOUT = 1200  # seconds
 GPU_CLEAR_WAIT = 15  # seconds between framework runs
 SERVER_FATAL_ERROR_PATTERNS = (

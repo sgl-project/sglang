@@ -1,0 +1,252 @@
+name: Nightly Test (MUSA)
+
+on:
+  schedule:
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+    inputs:
+      job_filter:
+        description: "Select which job to run (empty/all to run all jobs)"
+        required: false
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          - 'nightly-test-musa-general-kernel'
+          - 'nightly-test-musa-general-multimodal-layer'
+          - 'nightly-test-multimodal-server-1-gpu-musa'
+          - 'nightly-test-multimodal-server-2-gpu-musa'
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      job_filter:
+        description: 'Select which job to run (empty or "all" to run all jobs)'
+        required: false
+        type: string
+        default: 'all'
+
+concurrency:
+  group: nightly-test-musa-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+env:
+  SGLANG_IS_IN_CI: true
+
+jobs:
+  # ==================== General: kernel ====================
+  nightly-test-musa-general-kernel:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call'
+    runs-on: s5000-1-gpu-runner
+    timeout-minutes: 240
+    env:
+      TORCHADA_ENABLE_CPP_OPS: 1
+      HF_HUB_CACHE: /hf-cache/hub
+    steps:
+      - name: Gate by job_filter
+        id: gate
+        run: |
+          filter="${{ inputs.job_filter || 'all' }}"
+          if [[ -z "$filter" || "$filter" == "all" || "$filter" == "nightly-test-musa-general-kernel" ]]; then
+            echo "run_job=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_job=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout code
+        if: steps.gate.outputs.run_job == 'true'
+        uses: actions/checkout@v4
+        timeout-minutes: 10
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        if: steps.gate.outputs.run_job == 'true'
+        timeout-minutes: 10
+        run: |
+          bash scripts/ci/musa/musa_install_dependency.sh
+
+      - name: Run sgl-kernel unit tests (MUSA)
+        if: steps.gate.outputs.run_job == 'true'
+        timeout-minutes: 30
+        run: |
+          pytest sgl-kernel/tests/test_dsv3_router_gemm.py
+          pytest sgl-kernel/tests/test_per_token_quant_fp8.py
+          pytest sgl-kernel/tests/speculative/test_eagle_utils.py
+          pytest sgl-kernel/tests/speculative/test_ngram_utils.py
+          pytest sgl-kernel/tests/speculative/test_speculative_sampling.py
+          pytest sgl-kernel/tests/test_torch_defaults_reset.py
+
+  # ==================== General: multimodal layer ====================
+  nightly-test-musa-general-multimodal-layer:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call'
+    runs-on: s5000-1-gpu-runner
+    timeout-minutes: 240
+    env:
+      SGLANG_USE_MODELSCOPE: false
+      SGLANG_IS_IN_CI: true
+      TORCHADA_ENABLE_CPP_OPS: 1
+      HF_HOME: /hf-cache
+      HF_HUB_CACHE: /hf-cache/hub
+      HF_HUB_OFFLINE: 1
+    steps:
+      - name: Gate by job_filter
+        id: gate
+        run: |
+          filter="${{ inputs.job_filter || 'all' }}"
+          if [[ -z "$filter" || "$filter" == "all" || "$filter" == "nightly-test-musa-general-multimodal-layer" ]]; then
+            echo "run_job=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_job=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout code
+        timeout-minutes: 10
+        if: steps.gate.outputs.run_job == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        timeout-minutes: 10
+        if: steps.gate.outputs.run_job == 'true'
+        run: |
+          bash scripts/ci/musa/musa_install_dependency.sh
+
+      - name: Run multimodal MUSA layer unit tests
+        if: steps.gate.outputs.run_job == 'true'
+        timeout-minutes: 30
+        run: |
+          pytest python/sglang/multimodal_gen/test/layers/test_musa_rmsnorm.py
+          pytest python/sglang/multimodal_gen/test/layers/test_musa_silu_and_mul.py
+
+  # ==================== Multimodal: 1-GPU (split) ====================
+  nightly-test-multimodal-server-1-gpu-musa:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call'
+    runs-on: s5000-1-gpu-runner
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        part: [0, 1]
+    timeout-minutes: 240
+    env:
+      SGLANG_USE_MODELSCOPE: false
+      SGLANG_IS_IN_CI: true
+      TORCHADA_ENABLE_CPP_OPS: 1
+      HF_HOME: /hf-cache
+      HF_HUB_CACHE: /hf-cache/hub
+      HF_HUB_OFFLINE: 1
+    steps:
+      - name: Gate by job_filter
+        id: gate
+        run: |
+          filter="${{ inputs.job_filter || 'all' }}"
+          if [[ -z "$filter" || "$filter" == "all" || "$filter" == "nightly-test-multimodal-server-1-gpu-musa" ]]; then
+            echo "run_job=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_job=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout code
+        timeout-minutes: 10
+        if: steps.gate.outputs.run_job == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        timeout-minutes: 10
+        if: steps.gate.outputs.run_job == 'true'
+        run: |
+          bash scripts/ci/musa/musa_install_dependency.sh
+
+      - name: Run diffusion server tests (1-GPU)
+        if: steps.gate.outputs.run_job == 'true'
+        timeout-minutes: 60
+        env:
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
+        run: |
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite_musa.py \
+            --suite 1-gpu-musa-nightly \
+            --partition-id ${{ matrix.part }} \
+            --total-partitions 2 \
+            --continue-on-error
+
+  # ==================== Multimodal: 2-GPU ====================
+  nightly-test-multimodal-server-2-gpu-musa:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call'
+    runs-on: s5000-2-gpu-runner
+    timeout-minutes: 240
+    env:
+      SGLANG_USE_MODELSCOPE: false
+      SGLANG_IS_IN_CI: true
+      TORCHADA_ENABLE_CPP_OPS: 1
+      HF_HOME: /hf-cache
+      HF_HUB_CACHE: /hf-cache/hub
+      HF_HUB_OFFLINE: 1
+    steps:
+      - name: Gate by job_filter
+        id: gate
+        run: |
+          filter="${{ inputs.job_filter || 'all' }}"
+          if [[ -z "$filter" || "$filter" == "all" || "$filter" == "nightly-test-multimodal-server-2-gpu-musa" ]]; then
+            echo "run_job=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_job=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout code
+        timeout-minutes: 10
+        if: steps.gate.outputs.run_job == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        timeout-minutes: 10
+        if: steps.gate.outputs.run_job == 'true'
+        run: |
+          bash scripts/ci/musa/musa_install_dependency.sh
+
+      - name: Run diffusion server tests (2-GPU)
+        if: steps.gate.outputs.run_job == 'true'
+        timeout-minutes: 60
+        env:
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
+        run: |
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite_musa.py \
+            --suite 2-gpu-musa \
+            --continue-on-error
+
+  # ==================== finish ====================
+  nightly-test-musa-finish:
+    needs:
+      [
+        nightly-test-musa-general-kernel,
+        nightly-test-musa-general-multimodal-layer,
+        nightly-test-multimodal-server-1-gpu-musa,
+        nightly-test-multimodal-server-2-gpu-musa,
+      ]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          json_needs='${{ toJson(needs) }}'
+          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
+
+          for job in $job_names; do
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+            echo "$job: $result"
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "Nightly failed."
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully."

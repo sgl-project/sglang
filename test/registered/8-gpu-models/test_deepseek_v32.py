@@ -102,55 +102,55 @@ class TestDeepseekV32(unittest.TestCase):
         )
 
     @unittest.skipIf(is_blackwell_system(), "Requires H200 system")
-    def test_deepseek_v32_nsa_backends(self):
-        """Test NSA attention backend variants (H200 only).
+    def test_deepseek_v32_dsa_backends(self):
+        """Test DSA attention backend variants (H200 only).
 
-        Tests three NSA backend configurations:
+        Tests three DSA backend configurations:
         - flashmla: flashmla_sparse prefill + flashmla_kv decode
         - fa3: FA3 prefill + FA3 decode
         - fp8kvcache: default backends with FP8 KV cache
         """
-        NSA_FLASHMLA_ARGS = [
-            "--attention-backend=nsa",
-            "--nsa-prefill-backend=flashmla_sparse",
-            "--nsa-decode-backend=flashmla_kv",
+        DSA_FLASHMLA_ARGS = [
+            "--attention-backend=dsa",
+            "--dsa-prefill-backend=flashmla_sparse",
+            "--dsa-decode-backend=flashmla_kv",
         ]
 
-        NSA_FA3_ARGS = [
-            "--attention-backend=nsa",
-            "--nsa-prefill-backend=fa3",
-            "--nsa-decode-backend=fa3",
+        DSA_FA3_ARGS = [
+            "--attention-backend=dsa",
+            "--dsa-prefill-backend=fa3",
+            "--dsa-decode-backend=fa3",
         ]
 
-        NSA_FP8KV_ARGS = [
-            "--attention-backend=nsa",
+        DSA_FP8KV_ARGS = [
+            "--attention-backend=dsa",
             "--kv-cache-dtype=fp8_e4m3",
         ]
 
-        nsa_variants = [
+        dsa_variants = [
             # flashmla backend
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=BASE_ARGS + DP_ARGS + NSA_FLASHMLA_ARGS,
+                extra_args=BASE_ARGS + DP_ARGS + DSA_FLASHMLA_ARGS,
             ),
             # fa3 backend
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=BASE_ARGS + DP_ARGS + NSA_FA3_ARGS,
+                extra_args=BASE_ARGS + DP_ARGS + DSA_FA3_ARGS,
             ),
             # fp8 kv cache
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=BASE_ARGS + DP_ARGS + NSA_FP8KV_ARGS,
+                extra_args=BASE_ARGS + DP_ARGS + DSA_FP8KV_ARGS,
             ),
         ]
 
         run_combined_tests(
-            models=nsa_variants,
-            test_name="DeepSeek-V3.2 NSA Backends",
+            models=dsa_variants,
+            test_name="DeepSeek-V3.2 DSA Backends",
             accuracy_params=AccuracyTestParams(
                 dataset="gsm8k", baseline_accuracy=GSM8K_BASELINE
             ),
