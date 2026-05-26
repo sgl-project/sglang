@@ -13,7 +13,6 @@ class TestChunkedFeatureDPAttention(ChunkedTestBase):
         "--enable-dp-attention",
         "--dp",
         "2",
-        "--enable-mixed-chunk",
     ]
 
 
