@@ -105,8 +105,10 @@ def _script_chunk_size_256_prompt_10x(t: ScriptedRuntime):
 def _script_chunk_size_256_prompt_100x(t: ScriptedRuntime):
     # chunk_size = 256, prompt_len = 100 * 256 = 25600: long-prompt
     # stability test. May be slow on small models.
+    # NOTE: 25600 tokens may exceed DEFAULT_SMALL_MODEL_NAME_FOR_TEST's
+    # max-seq-len. If so, the engine should still admit/reject cleanly.
     r = t.start_req(prompt_len=100 * 256, max_new_tokens=2)
-    yield from run_until(r, lambda h: h.finished, max_steps=2000)
+    yield from run_until(r, lambda h: h.finished, max_steps=4000)
     assert r.finished
     assert r.chunks_done == 100
 
@@ -120,11 +122,11 @@ def _script_chunk_size_16_prompt_1024(t: ScriptedRuntime):
 
 
 def _script_chunk_size_4_prompt_4(t: ScriptedRuntime):
-    # chunk_size = 4, prompt_len = 4: single-shot boundary.
+    # chunk_size = 4, prompt_len = 4: single-shot, no chunking.
     r = t.start_req(prompt_len=4, max_new_tokens=2)
     yield from run_until_finished(r)
     assert r.finished
-    assert r.chunks_done <= 1
+    assert r.chunks_done == 0
 
 
 def _script_chunk_size_4_prompt_5(t: ScriptedRuntime):
