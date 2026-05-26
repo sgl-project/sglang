@@ -483,8 +483,16 @@ class EagleDraftWorker(BaseDraftWorker):
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if self.topk == 1:
+                # topk=1 → degenerate single-path tree; `topk_p` is unused
+                # downstream, so skip softmax and just argmax over logits.
+                topk_index = torch.argmax(
+                    logits_output.next_token_logits, dim=-1, keepdim=True
+                )
+                topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+            else:
+                probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             maybe_detect_oob(
                 topk_index,
                 0,
@@ -651,8 +659,14 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                 select_index
             ]
-        probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
-        ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+        if self.topk == 1:
+            ret_topk_index = torch.argmax(
+                draft_logits_output.next_token_logits, dim=-1, keepdim=True
+            )
+            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+        else:
+            probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
+            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
         ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values
@@ -1039,12 +1053,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 verify_input.retrieve_next_token.shape
             ).cpu()
 
-        # Run target verify batch in the main compute stream (GPU compute)
+        # Run target verify batch in the main compute stream (GPU compute).
+        # Only skip metadata init when cuda-graph already ran replay_prepare;
+        # the non-cuda-graph path needs forward_extend's init (post-pad).
         forward_batch_output = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
+            skip_attn_backend_init=can_run_cuda_graph,
         )
         logits_output = forward_batch_output.logits_output
 
