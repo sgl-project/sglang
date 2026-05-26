@@ -34,13 +34,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    DenoisingStage,
     InputValidationStage,
     TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
     SanaWMBeforeDenoisingStage,
     SanaWMDecodingStage,
+    SanaWMDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_refiner import (
     SanaWMLTX2RefinerStage,
@@ -107,7 +107,7 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
         self.add_stage(
-            DenoisingStage(
+            SanaWMDenoisingStage(
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
             ),

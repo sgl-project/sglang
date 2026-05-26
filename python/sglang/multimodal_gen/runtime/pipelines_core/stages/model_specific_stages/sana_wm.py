@@ -20,19 +20,25 @@ from typing import Any
 
 import numpy as np
 import os
+import time
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     get_or_create_request_scheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DenoisingStage,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 
@@ -208,6 +214,234 @@ class SanaWMDecodingStage(DecodingStage):
         frames = super().decode(latents, server_args, vae_dtype=vae_dtype)
         log_sana_wm_tensor_stats("decode.frames", frames)
         return frames
+
+
+def _first_tensor(value: Any) -> torch.Tensor | None:
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else None
+    return value if isinstance(value, torch.Tensor) else None
+
+
+def _to_device_dtype(
+    value: torch.Tensor | None,
+    *,
+    device: torch.device,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor | None:
+    if value is None:
+        return None
+    if dtype is None:
+        return value.to(device=device)
+    return value.to(device=device, dtype=dtype)
+
+
+def _cat_optional_tensors(
+    neg: torch.Tensor | None,
+    pos: torch.Tensor | None,
+) -> torch.Tensor | None:
+    if neg is None and pos is None:
+        return None
+    if neg is None:
+        return pos
+    if pos is None:
+        return neg
+    return torch.cat([neg, pos], dim=0)
+
+
+class SanaWMDenoisingStage(DenoisingStage):
+    """SANA-WM stage-1 sampler matching NVlabs ``flow_euler_ltx``.
+
+    The generic denoising stage uses one scalar timestep for every latent token
+    and updates the whole tensor. Official SANA-WM inference uses per-frame
+    timesteps: the first-frame condition stays at timestep 0 and is not updated,
+    while the remaining latent frames denoise normally.
+    """
+
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        if batch.latents is None:
+            raise ValueError("SANA-WM denoising requires initialized latents.")
+        if batch.latents.ndim != 5:
+            raise ValueError(
+                "SANA-WM denoising expects 5D latents shaped (B, C, T, H, W), "
+                f"got {tuple(batch.latents.shape)}."
+            )
+
+        device = get_local_torch_device()
+        target_dtype = PRECISION_TO_TYPE.get(
+            getattr(server_args.pipeline_config, "dit_precision", "bf16"),
+            torch.bfloat16,
+        )
+        scheduler = (
+            getattr(batch, "scheduler", None)
+            or get_or_create_request_scheduler(batch, self.scheduler)
+        )
+        timesteps = batch.timesteps
+        if timesteps is None:
+            raise ValueError("SANA-WM denoising requires prepared timesteps.")
+
+        latents = batch.latents.to(device=device, dtype=target_dtype)
+        init_latents = latents.clone()
+        condition_mask = torch.zeros_like(latents)
+        condition_mask[:, :, :1] = 1
+
+        pos_embeds = _to_device_dtype(
+            _first_tensor(server_args.pipeline_config.get_pos_prompt_embeds(batch)),
+            device=device,
+            dtype=target_dtype,
+        )
+        pos_mask = _to_device_dtype(
+            _first_tensor(batch.prompt_attention_mask), device=device
+        )
+        if pos_embeds is None:
+            raise ValueError("SANA-WM denoising requires positive prompt embeds.")
+
+        do_cfg = bool(batch.do_classifier_free_guidance)
+        neg_embeds = None
+        neg_mask = None
+        if do_cfg:
+            neg_embeds = _to_device_dtype(
+                _first_tensor(
+                    server_args.pipeline_config.get_neg_prompt_embeds(batch)
+                ),
+                device=device,
+                dtype=target_dtype,
+            )
+            neg_mask = _to_device_dtype(
+                _first_tensor(batch.negative_attention_mask), device=device
+            )
+            if neg_embeds is None:
+                raise ValueError("SANA-WM CFG requires negative prompt embeds.")
+
+        extra = batch.extra or {}
+        camera_conditions = _to_device_dtype(
+            extra.get("camera_conditions"), device=device, dtype=target_dtype
+        )
+        chunk_plucker = _to_device_dtype(
+            extra.get("chunk_plucker"), device=device, dtype=target_dtype
+        )
+
+        self.log_info(
+            "SANA-WM flow_euler_ltx denoising: latent=%s, steps=%d, cfg=%s, "
+            "guidance_scale=%.4f, first_frame_locked=yes",
+            tuple(latents.shape),
+            len(timesteps),
+            do_cfg,
+            float(getattr(batch, "guidance_scale", 1.0) or 1.0),
+        )
+        log_sana_wm_tensor_stats("denoise.input_latents", latents)
+
+        start_time = time.perf_counter()
+        with self.use_declared_component(
+            component_name="transformer", module=self.transformer
+        ) as transformer:
+            assert transformer is not None
+            self.transformer = transformer
+
+            for step_idx, t in enumerate(self.progress_bar(timesteps)):
+                latent_model_input = (
+                    torch.cat([latents, latents], dim=0) if do_cfg else latents
+                )
+                condition_mask_input = (
+                    torch.cat([condition_mask, condition_mask], dim=0)
+                    if do_cfg
+                    else condition_mask
+                )
+
+                timestep = t.expand(condition_mask_input.shape).float()
+                timestep = torch.minimum(
+                    timestep,
+                    (1.0 - condition_mask_input.float()) * 1000.0,
+                )
+                model_timestep = timestep[:, :1, :, 0, 0]
+
+                model_kwargs = {
+                    "encoder_hidden_states": (
+                        torch.cat([neg_embeds, pos_embeds], dim=0)
+                        if do_cfg
+                        else pos_embeds
+                    ),
+                    "encoder_attention_mask": (
+                        _cat_optional_tensors(neg_mask, pos_mask)
+                        if do_cfg
+                        else pos_mask
+                    ),
+                    "camera_conditions": (
+                        torch.cat([camera_conditions, camera_conditions], dim=0)
+                        if do_cfg and camera_conditions is not None
+                        else camera_conditions
+                    ),
+                    "chunk_plucker": (
+                        torch.cat([chunk_plucker, chunk_plucker], dim=0)
+                        if do_cfg and chunk_plucker is not None
+                        else chunk_plucker
+                    ),
+                }
+
+                with set_forward_context(
+                    current_timestep=step_idx,
+                    attn_metadata=None,
+                    forward_batch=batch,
+                ):
+                    noise_pred = transformer(
+                        hidden_states=latent_model_input.to(target_dtype),
+                        timestep=model_timestep,
+                        **model_kwargs,
+                    )
+
+                if do_cfg:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    guidance_scale = float(
+                        getattr(batch, "guidance_scale", 1.0) or 1.0
+                    )
+                    noise_pred = noise_pred_uncond + guidance_scale * (
+                        noise_pred_text - noise_pred_uncond
+                    )
+                    timestep = timestep.chunk(2)[0]
+
+                latents_dtype = latents.dtype
+                latents_shape = latents.shape
+                batch_size, channels, _, _, _ = latents_shape
+                scheduler_output = scheduler.step(
+                    -noise_pred.reshape(batch_size, channels, -1).transpose(1, 2),
+                    t,
+                    latents.reshape(batch_size, channels, -1).transpose(1, 2),
+                    per_token_timesteps=timestep.reshape(batch_size, channels, -1)[
+                        :, 0
+                    ],
+                    return_dict=False,
+                )[0]
+                denoised_latents = scheduler_output.transpose(1, 2).reshape(
+                    latents_shape
+                )
+
+                tokens_to_denoise = t.float() / 1000.0 - 1e-6 < (
+                    1.0 - condition_mask
+                )
+                latents = torch.where(tokens_to_denoise, denoised_latents, latents)
+                if latents.dtype != latents_dtype:
+                    latents = latents.to(latents_dtype)
+
+                if sana_wm_diagnostics_enabled() and (
+                    step_idx == 0 or step_idx == len(timesteps) - 1
+                ):
+                    log_sana_wm_tensor_stats(
+                        f"denoise.step_{step_idx}.noise_pred", noise_pred
+                    )
+                    log_sana_wm_tensor_stats(
+                        f"denoise.step_{step_idx}.latents", latents
+                    )
+
+        log_sana_wm_tensor_stats("denoise.output_latents", latents)
+        unchanged = (latents[:, :, :1] - init_latents[:, :, :1]).abs().max().item()
+        self.log_info(
+            "SANA-WM flow_euler_ltx denoising finished in %.4f seconds; "
+            "first_frame_max_delta=%.6g",
+            time.perf_counter() - start_time,
+            float(unchanged),
+        )
+        batch.latents = server_args.pipeline_config.post_denoising_loop(latents, batch)
+        return batch
 
 
 class SanaWMBeforeDenoisingStage(PipelineStage):

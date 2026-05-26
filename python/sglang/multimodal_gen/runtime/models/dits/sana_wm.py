@@ -557,9 +557,22 @@ class T2IFinalLayer(nn.Module):
         self.out_channels = out_channels
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        # t: (B, D) -> shift, scale from scale_shift_table
-        shift, scale = (self.scale_shift_table[None] + t[:, None]).chunk(2, dim=1)
-        x = self.norm_final(x) * (1 + scale) + shift
+        # t can be either (B, D) for scalar timesteps or (B, 1, T, D) for
+        # SANA-WM's first-frame-conditioned flow_euler_ltx sampler.
+        if t.dim() == 2:
+            shift, scale = (self.scale_shift_table[None] + t[:, None]).chunk(2, dim=1)
+            x = self.norm_final(x) * (1 + scale) + shift
+        else:
+            B, N, D = x.shape
+            t = t.reshape(B, -1, D)
+            num_frames = t.shape[1]
+            tokens_per_frame = N // num_frames
+            shift, scale = (
+                self.scale_shift_table[None, None, :, :] + t[:, :, None, :]
+            ).chunk(2, dim=2)
+            x = self.norm_final(x).reshape(B, num_frames, tokens_per_frame, D)
+            x = x * (1 + scale) + shift
+            x = x.reshape(B, N, D)
         return self.linear(x)
 
 
@@ -1285,6 +1298,15 @@ class SanaWMBlock(nn.Module):
     def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         return x * (1 + scale) + shift
 
+    @staticmethod
+    def _reshape_framewise_modulation(
+        x: torch.Tensor,
+        num_frames: int,
+    ) -> tuple[torch.Tensor, int]:
+        B, N, C = x.shape
+        tokens_per_frame = N // num_frames
+        return x.reshape(B, num_frames, tokens_per_frame, C), tokens_per_frame
+
     def forward(
         self,
         x: torch.Tensor,                          # (B, N, D)
@@ -1297,14 +1319,32 @@ class SanaWMBlock(nn.Module):
         mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
         B = x.shape[0]
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.scale_shift_table[None] + t.reshape(B, 6, -1)
-        ).chunk(6, dim=1)
+        if t.dim() == 2:
+            num_frames = None
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                self.scale_shift_table[None] + t.reshape(B, 6, -1)
+            ).chunk(6, dim=1)
+        else:
+            num_frames = t.reshape(B, -1, 6, t.shape[-1] // 6).shape[1]
+            t = t.reshape(B, num_frames, 6, -1)
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                self.scale_shift_table[None, None, :, :] + t
+            ).chunk(6, dim=2)
 
         # Self-attention with UCPE camera branch
-        x_in = self._modulate(self.norm1(x), shift_msa, scale_msa)
+        if num_frames is None:
+            x_in = self._modulate(self.norm1(x), shift_msa, scale_msa)
+        else:
+            x_norm, tokens_per_frame = self._reshape_framewise_modulation(
+                self.norm1(x), num_frames
+            )
+            x_in = self._modulate(x_norm, shift_msa, scale_msa).reshape_as(x)
         attn_out = self.attn(x_in, HW=HW, rotary_emb=rotary_emb, prope_fns=prope_fns)
-        x = x + gate_msa * attn_out
+        if num_frames is None:
+            x = x + gate_msa * attn_out
+        else:
+            attn_out = attn_out.reshape(B, num_frames, tokens_per_frame, -1)
+            x = x + (gate_msa * attn_out).reshape_as(x)
 
         # Plücker post-attn injection (zero-init linear)
         if self.plucker_proj is not None and plucker_emb is not None:
@@ -1314,8 +1354,18 @@ class SanaWMBlock(nn.Module):
         x = x + self.cross_attn(x, y, mask=mask)
 
         # FFN
-        x_in = self._modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = x + gate_mlp * self.mlp(x_in, HW=HW)
+        if num_frames is None:
+            x_in = self._modulate(self.norm2(x), shift_mlp, scale_mlp)
+            x = x + gate_mlp * self.mlp(x_in, HW=HW)
+        else:
+            x_norm, tokens_per_frame = self._reshape_framewise_modulation(
+                self.norm2(x), num_frames
+            )
+            x_in = self._modulate(x_norm, shift_mlp, scale_mlp).reshape_as(x)
+            mlp_out = self.mlp(x_in, HW=HW).reshape(
+                B, num_frames, tokens_per_frame, -1
+            )
+            x = x + (gate_mlp * mlp_out).reshape_as(x)
         return x
 
 
@@ -1488,8 +1538,19 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         x = self.x_embedder(hidden_states.to(dtype=self.x_embedder.proj.weight.dtype))
 
         # --- 2. Timestep AdaLN-single ---
-        t_emb = self.t_embedder(timestep)              # (B, D)
-        t6 = self.t_block(t_emb)                       # (B, 6D)
+        # SANA-WM's LTX sampler passes per-frame timesteps shaped (B, 1, T)
+        # so the clean first-frame condition can stay at timestep 0 while the
+        # remaining latent frames denoise. Keep the scalar path for generic
+        # scheduler compatibility.
+        if timestep.dim() == 1:
+            t_emb = self.t_embedder(timestep)          # (B, D)
+            t6 = self.t_block(t_emb)                   # (B, 6D)
+        else:
+            timestep_shape = tuple(timestep.shape)
+            t_flat = self.t_embedder(timestep.flatten())
+            t6_flat = self.t_block(t_flat)
+            t_emb = t_flat.unflatten(0, timestep_shape)
+            t6 = t6_flat.unflatten(0, timestep_shape)
 
         # --- 3. Caption projection + y_norm ---
         if isinstance(encoder_attention_mask, (list, tuple)):

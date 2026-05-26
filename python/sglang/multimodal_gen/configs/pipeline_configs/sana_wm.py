@@ -205,15 +205,25 @@ class SanaWMPipelineConfig(PipelineConfig):
         return out
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        """Build negative conditioning kwargs for CFG (no camera on the negative pass)."""
+        """Build negative conditioning kwargs for CFG.
+
+        Camera/plucker are structural video conditions, not text conditions.
+        NVlabs SANA-WM duplicates them for both CFG branches and only swaps
+        text embeddings/masks.
+        """
         out = {}
         m = batch.negative_attention_mask
         if isinstance(m, (list, tuple)):
             out["encoder_attention_mask"] = m[0] if m else None
         elif m is not None:
             out["encoder_attention_mask"] = m
-        # Intentionally omit camera_conditions / chunk_plucker -- the negative
-        # pass uses the text-unconditional baseline without camera control.
+        if hasattr(batch, "extra") and batch.extra:
+            cc = batch.extra.get("camera_conditions", None)
+            cp = batch.extra.get("chunk_plucker", None)
+            if cc is not None:
+                out["camera_conditions"] = cc
+            if cp is not None:
+                out["chunk_plucker"] = cp
         return out
 
     # --- Post-processing ---

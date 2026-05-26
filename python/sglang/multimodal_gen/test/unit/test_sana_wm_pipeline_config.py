@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
     SanaWMBeforeDenoisingStage,
+    SanaWMDenoisingStage,
     configure_sana_wm_ltx2_vae_for_long_video,
 )
 from sglang.multimodal_gen.runtime.utils.model_overlay import (
@@ -72,12 +73,14 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         deployment = self.config.get_model_deployment_config()
         self.assertTrue(deployment.auto_dit_layerwise_offload)
 
-    def test_prepare_neg_cond_kwargs_omits_camera(self) -> None:
+    def test_prepare_neg_cond_kwargs_keeps_camera_for_cfg(self) -> None:
+        camera_conditions = torch.zeros(1, 49, 20)
+        chunk_plucker = torch.zeros(1, 48, 7, 22, 40)
         batch = SimpleNamespace(
             negative_attention_mask=torch.ones(1, 16),
             extra={
-                "camera_conditions": torch.zeros(1, 49, 20),
-                "chunk_plucker": torch.zeros(1, 48, 7, 22, 40),
+                "camera_conditions": camera_conditions,
+                "chunk_plucker": chunk_plucker,
             },
         )
         kwargs = self.config.prepare_neg_cond_kwargs(
@@ -87,8 +90,8 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
             dtype=torch.bfloat16,
         )
         self.assertIn("encoder_attention_mask", kwargs)
-        self.assertNotIn("camera_conditions", kwargs)
-        self.assertNotIn("chunk_plucker", kwargs)
+        self.assertIs(kwargs["camera_conditions"], camera_conditions)
+        self.assertIs(kwargs["chunk_plucker"], chunk_plucker)
 
     def test_decode_scale_and_shift_uses_ltx2_latent_stats(self) -> None:
         vae = SimpleNamespace(
