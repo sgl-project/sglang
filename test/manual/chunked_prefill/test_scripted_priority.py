@@ -17,12 +17,15 @@ Also covers A.7 series from the expansion plan and fan-out variations
 multi-victim, retract during decode, retract-then-abort).
 """
 
+import time
 import unittest
 
+from sglang.srt.environ import envs
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
+    DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     run_until,
@@ -287,6 +290,98 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
         assert r.finished
         assert r.lock_refs == 0
         assert r.kv_pages == 0
+
+    def test_watchdog_skips_chunked_resume_invariant(self):
+        """Invariant W2: _abort_on_waiting_timeout must skip chunked-resume reqs even when their wait_queue_entry_time has aged past the timeout.
+
+        Direct access to ``_scheduler`` internals is intentional; this is an
+        invariant-tier test (see direct-internals-access plan).
+        """
+        self.runtime.run(self._script_watchdog_skips_chunked_resume_invariant)
+
+    # W2 — drive a chunked req mid-prefill, simulate the v2 "chunked-resume
+    # parked in waiting_queue" condition by manually inserting it into
+    # ``s.waiting_queue`` with a backdated entry_time, run the watchdog
+    # sweep deterministically by calling ``s._abort_on_waiting_timeout()``,
+    # and assert the chunked-resume survives. The watchdog being
+    # wall-clock driven makes the natural reproduction flaky in scripted
+    # runtime; invoking the sweep directly removes timing variance.
+    # See commit 359e5ed7bd ("Skip chunked-resume reqs in
+    # _abort_on_waiting_timeout") for the original bug.
+    @staticmethod
+    def _script_watchdog_skips_chunked_resume_invariant(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        # Drive until the scheduler is mid-chunk on this req — the
+        # chunked_req slot is occupied and inflight_middle_chunks > 0,
+        # which is the protected state.
+        yield from run_until(r, lambda h: h.is_chunking)
+        s = t._scheduler
+        req = t._find_req_by_rid(r.rid)
+        assert req is not None
+        assert s.chunked_req is req, (
+            f"setup expected s.chunked_req to point at r; got "
+            f"s.chunked_req={s.chunked_req!r}, r={req!r}"
+        )
+        assert req.inflight_middle_chunks > 0, (
+            f"setup expected inflight_middle_chunks > 0, got "
+            f"{req.inflight_middle_chunks}"
+        )
+
+        # Simulate the v2 layout: a chunked-resume req can sit in
+        # ``waiting_queue`` across iters with a stale entry_time. Force
+        # both conditions by backdating ``wait_queue_entry_time`` and
+        # inserting the req into ``waiting_queue`` so the watchdog has a
+        # candidate to abort. Note: the req remains the live chunked_req
+        # — the duplicate placement only persists for the synchronous
+        # sweep call below and is undone before we yield control back.
+        was_in_queue = req in s.waiting_queue
+        if not was_in_queue:
+            s.waiting_queue.append(req)
+        original_entry_time = req.time_stats.wait_queue_entry_time
+        # ``time.perf_counter()`` starts at process load, so by the time
+        # the engine is mid-chunk it is comfortably > 1.0s. An
+        # entry_time of 1.0 is unambiguously older than the deadline for
+        # any positive timeout.
+        req.time_stats.wait_queue_entry_time = 1.0
+        try:
+            with envs.SGLANG_REQ_WAITING_TIMEOUT.override(0.5):
+                # Confirm the deadline math actually selects r as a
+                # candidate — otherwise the assertion below would be
+                # vacuously satisfied.
+                deadline = time.perf_counter() - 0.5
+                assert (
+                    0 < req.time_stats.wait_queue_entry_time < deadline
+                ), "setup did not backdate entry_time past the watchdog deadline"
+                s._abort_on_waiting_timeout()
+
+            # Invariant: the watchdog must not have removed the
+            # chunked-resume req from waiting_queue. If it did, the
+            # gate is missing or broken and the resume would leak KV
+            # + req_to_token row on next iter.
+            assert req in s.waiting_queue, (
+                "watchdog incorrectly aborted a chunked-resume req: "
+                "r was removed from waiting_queue despite inflight_middle_chunks > 0"
+            )
+            # Also: chunked_req slot must still point at r — abort would
+            # have nulled / replaced it.
+            assert s.chunked_req is req, (
+                f"chunked_req slot must still hold r after watchdog "
+                f"skip, got s.chunked_req={s.chunked_req!r}"
+            )
+            assert req.finished_reason is None, (
+                f"chunked-resume req must not be marked finished by "
+                f"watchdog abort, got finished_reason={req.finished_reason!r}"
+            )
+        finally:
+            # Restore scheduler state so the rest of the script — and
+            # any later tests sharing this engine — see clean state.
+            if not was_in_queue and req in s.waiting_queue:
+                s.waiting_queue.remove(req)
+            req.time_stats.wait_queue_entry_time = original_entry_time
+
+        # Drive to completion so the engine returns to idle.
+        yield from run_until_finished(r, max_steps=DEFAULT_MAX_STEPS * 2)
+        assert r.finished
 
 
 class TestPriorityPriority(ScriptedRuntimeTestCase):
