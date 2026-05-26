@@ -225,6 +225,8 @@ class Step3p5MoEMLP(nn.Module):
             # router_logits: (batch * sequence_length, n_experts)
             router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
+        if hasattr(topk_output, "to_standard"):
+            topk_output = topk_output.to_standard(layer_id=self.layer_id)
         if self.routed_scaling_factor != 1.0:
             topk_output = StandardTopKOutput(
                 topk_weights=topk_output.topk_weights * self.routed_scaling_factor,
