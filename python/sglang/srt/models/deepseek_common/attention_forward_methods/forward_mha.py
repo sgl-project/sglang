@@ -5,11 +5,15 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
+from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
@@ -28,7 +32,11 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
 if _is_cuda:
-    from sgl_kernel import concat_mla_k, merge_state_v2
+    from sgl_kernel import merge_state_v2
+
+    from sglang.jit_kernel.concat_mla import concat_mla_k
+elif _is_musa:
+    from sgl_kernel import concat_mla_k
 
 if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
@@ -38,7 +46,7 @@ if _use_aiter_gfx95:
 
 
 def _resolve_attn_backend(forward_batch: ForwardBatch):
-    backend = forward_batch.attn_backend
+    backend = get_attn_backend()
     if isinstance(backend, TboAttnBackend):
         backend = backend.primary
     return backend
@@ -122,10 +130,10 @@ class DeepseekMHAForwardMixin:
                 )
             )
 
-            # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
+            # DSA Indexer: cache quantized keys, auto-skip topk for sequences <= dsa_index_topk
 
-            if self.use_nsa:
-                # NSA requires unquantized q_lora for the indexer. When q_b_proj is FP8
+            if self.use_dsa:
+                # DSA requires unquantized q_lora for the indexer. When q_b_proj is FP8
                 # on gfx95, we can still use fused RMSNorm+FP8 quant, but MUST request
                 # the unquantized output for q_lora; otherwise q_lora becomes the (fp8,scale)
                 # tuple.
@@ -220,6 +228,24 @@ class DeepseekMHAForwardMixin:
             kv_a = self.kv_a_layernorm(kv_a)
 
         k_pe = latent_cache[:, :, self.kv_lora_rank :]
+
+        # Backend prefill hook: the backend owns the BF16->FP8 transition
+        # (fused RoPE + quantize for Q/K, direct FP8 KV-cache write) and
+        # returns FP8 tensors ready for its kernel. Backends without the
+        # hook fall through to the BF16 path below.
+        backend = _resolve_attn_backend(forward_batch)
+        if hasattr(backend, "prepare_prefill_qkv"):
+            q_out, k_out, v_out = backend.prepare_prefill_qkv(
+                q=q,
+                q_pe=q_pe,
+                kv_a=kv_a,
+                k_pe=k_pe,
+                positions=positions,
+                layer=self,
+                forward_batch=forward_batch,
+            )
+            return q_out, k_out, v_out, forward_batch
+
         if self.rotary_emb is not None:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
@@ -230,15 +256,15 @@ class DeepseekMHAForwardMixin:
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
         ):
             if (
-                self.use_nsa
+                self.use_dsa
                 and self.kv_cache_dtype == "fp8_e4m3"
                 and (
-                    not get_global_server_args().nsa_decode_backend == "trtllm"
-                    or not get_global_server_args().nsa_prefill_backend == "trtllm"
+                    not get_global_server_args().dsa_decode_backend == "trtllm"
+                    or not get_global_server_args().dsa_prefill_backend == "trtllm"
                 )
             ):
-                # FP8 path: dequantize NSA-specific FP8 format to BF16
-                kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_nsa(forward_batch)
+                # FP8 path: dequantize DSA-specific FP8 format to BF16
+                kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_dsa(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
                 kv_a, k_pe = self._get_mla_kv_buffer(
@@ -316,8 +342,8 @@ class DeepseekMHAForwardMixin:
         # Only initialize the info once
         if has_extend_prefix and forward_batch.num_prefix_chunks is None:
             forward_batch.prepare_chunked_prefix_cache_info(q.device)
-            if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
-                forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
+            if hasattr(get_attn_backend(), "init_mha_chunk_metadata"):
+                get_attn_backend().init_mha_chunk_metadata(forward_batch)
 
         forward_batch.mha_return_lse = has_extend_prefix
         # Do mha for extended part without prefix
@@ -362,8 +388,8 @@ class DeepseekMHAForwardMixin:
         # Only initialize the info once
         if has_extend_prefix and forward_batch.num_prefix_chunks is None:
             forward_batch.num_prefix_chunks = 0
-            if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
-                forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
+            if hasattr(get_attn_backend(), "init_mha_chunk_metadata"):
+                get_attn_backend().init_mha_chunk_metadata(forward_batch)
         forward_batch.mha_return_lse = False
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
@@ -431,12 +457,12 @@ class DeepseekMHAForwardMixin:
     ):
         if _is_cuda or _use_aiter_gfx95:
             # Save latent cache
-            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+            get_token_to_kv_pool().set_mla_kv_buffer(
                 self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
             )
         elif _is_npu:
             # To reduce a time-costing split operation
-            forward_batch.token_to_kv_pool.set_kv_buffer(
+            get_token_to_kv_pool().set_kv_buffer(
                 self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
             )
         else:
@@ -444,7 +470,7 @@ class DeepseekMHAForwardMixin:
             latent_cache[:, :, self.kv_lora_rank :] = k_pe.clone()
 
             # Save latent cache
-            forward_batch.token_to_kv_pool.set_kv_buffer(
+            get_token_to_kv_pool().set_kv_buffer(
                 self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
             )
 
@@ -455,12 +481,12 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ):
         if _is_cuda or _use_aiter_gfx95:
-            kv_a, k_pe = forward_batch.token_to_kv_pool.get_mla_kv_buffer(
+            kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
             )
             kv_a = kv_a.squeeze(1)
         else:
-            latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(
+            latent_cache_buf = get_token_to_kv_pool().get_key_buffer(
                 self.attn_mha.layer_id
             )
             latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
@@ -471,16 +497,16 @@ class DeepseekMHAForwardMixin:
             kv_a = kv_a.squeeze(1).contiguous()
         return kv_a, k_pe
 
-    def _get_mla_kv_buffer_from_fp8_for_nsa(
+    def _get_mla_kv_buffer_from_fp8_for_dsa(
         self: DeepseekV2AttentionMLA,
         forward_batch: ForwardBatch,
     ):
         """
-        Dequantize FP8 KV cache to BF16 for MLA attention (NSA-specific format).
+        Dequantize FP8 KV cache to BF16 for MLA attention (DSA-specific format).
 
         Returns: (kv_a, k_pe) both in BF16
         """
-        backend = forward_batch.attn_backend
+        backend = get_attn_backend()
         if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
             backend = backend.primary
         kv_indices = backend.forward_metadata.page_table_1_flattened
@@ -488,9 +514,7 @@ class DeepseekMHAForwardMixin:
             kv_indices is not None
         ), "page_table_1_flattened should have been generated for FP8 MHA path"
 
-        kv_cache_fp8 = forward_batch.token_to_kv_pool.get_key_buffer(
-            self.attn_mha.layer_id
-        )
+        kv_cache_fp8 = get_token_to_kv_pool().get_key_buffer(self.attn_mha.layer_id)
 
         kv_latent_bf16 = dequantize_k_cache_paged(kv_cache_fp8, kv_indices)
 
@@ -526,7 +550,7 @@ class DeepseekMHAForwardMixin:
                 self.current_attention_backend == "fa3"
                 and self.kv_cache_dtype != "auto"
             ):
-                attn_dtype = forward_batch.token_to_kv_pool.dtype
+                attn_dtype = get_token_to_kv_pool().dtype
             else:
                 attn_dtype = k_nope.dtype
             k = k_nope.new_empty(*k_shape, dtype=attn_dtype)
