@@ -146,6 +146,27 @@ def make_dsv4_cases(backend: str) -> tuple[DSV4AttentionCase, ...]:
             page_size=DSV4_PAGE_SIZE,
             prefix_lens=(32, 96),
         ),
+        # Above-window extend: seq_len 160 > SWA_WINDOW=128. The SWA mask must
+        # drop the oldest 32 positions per query so the reference's trailing-
+        # window slice matches the backend's `get_swa_page_indices`. Exercises
+        # the path where some `pos_t - SWA_WINDOW + 1 > 0` invalid offsets are
+        # absent and the K cache slice covers >SWA_WINDOW total tokens.
+        DSV4AttentionCase(
+            name="dsv4_swa_extend_above_window",
+            prefix_lens=(128,),
+            extend_lens=(32,),
+            **common,
+        ),
+        # Above-window decode: 1-token DECODE on a prefix longer than the SWA
+        # window so the per-query SWA window strictly excludes the prefix head.
+        DSV4AttentionCase(
+            name="dsv4_swa_decode_above_window",
+            backend=backend,
+            forward_mode=ForwardMode.DECODE,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(160,),
+        ),
     )
 
 
@@ -635,13 +656,13 @@ def build_dsv4_attention_fixture(
     device: str = "cuda",
 ) -> DSV4AttentionFixture:
     max_seq = max(case.seq_lens)
-    # Each query must see only kv positions in its own SWA window. With page_size
-    # 256 and one prefix-free batch, this fits comfortably.
-    if max_seq > DSV4_SWA_WINDOW:
-        testcase.skipTest(
-            "DSV4 fixture currently restricts seq_len <= SWA_WINDOW; "
-            "longer sequences require the C4/C128 paths."
-        )
+    # SWA-only (compress_ratio=0) is the SGLang path that handles the
+    # last-`SWA_WINDOW`-tokens slice for *all* sequence lengths. seq_len >
+    # SWA_WINDOW just means the SWA mask truncates the oldest tokens; the
+    # backend's `get_swa_page_indices` and the fixture's reference both pick
+    # the same trailing window so this works without enabling C4/C128.
+    # The pool capacity (`swa_size`) and `max_context_len` are sized in
+    # `build_dsv4_attention_fixture` so the full KV fits.
     seed = 7100 + len(case.name)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
