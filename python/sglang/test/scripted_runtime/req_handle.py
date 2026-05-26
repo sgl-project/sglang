@@ -49,9 +49,10 @@ class ReqHandle:
 
         Consumed by: test_abort_during_chunked_prefill (abort),
                      test_engine_fully_idle_after_drain (invariants),
-                     test_chunked_prefill_finishes_with_correct_output_len (regression).
+                     test_chunked_prefill_finishes_with_correct_output_len (regression),
+                     test_swa_chunked_req_early_return_no_double_free (hybrid_swa).
         """
-        raise _wishlist("finished")
+        return self.runtime._lookup_finished(self.rid)
 
     @property
     def aborted(self) -> bool:
@@ -134,10 +135,14 @@ class ReqHandle:
     def is_chunking(self) -> bool:
         """True iff the req is currently in the middle of chunked prefill.
 
+        Reflects the scheduler's singular ``chunked_req`` slot — True iff
+        this rid is the current chunked_req.
+
         Consumed by: test_is_chunking_transitions (regression),
-                     test_chunked_req_slot_ownership (special_case).
+                     test_chunked_req_slot_ownership (special_case),
+                     test_swa_chunked_req_early_return_no_double_free (hybrid_swa).
         """
-        raise _wishlist("is_chunking")
+        return self.runtime._lookup_is_chunking(self.rid)
 
     @property
     def has_pending_chunk(self) -> bool:
@@ -173,9 +178,13 @@ class ReqHandle:
     def chunked_req_scheduled_last_iter(self) -> Optional[bool]:
         """Per-req snapshot of ``_chunked_req_scheduled_last_iter``.
 
-        Consumed by: test_chunked_req_scheduled_last_iter_flag (special_case).
+        Returns the scheduler flag if this req is the current chunked_req;
+        ``None`` otherwise (req is not in the chunked slot this iter).
+
+        Consumed by: test_chunked_req_scheduled_last_iter_flag (special_case),
+                     test_swa_chunked_req_early_return_no_double_free (hybrid_swa).
         """
-        raise _wishlist("chunked_req_scheduled_last_iter")
+        return self.runtime._lookup_chunked_req_scheduled_last_iter(self.rid)
 
     @property
     def extend_input_len(self) -> int:
@@ -481,13 +490,29 @@ class ReqHandle:
 
     @property
     def swa_stash_double_free_count(self) -> int:
-        """Count of double-free events on the SWA stash for this req.
+        """Count of stash-gate invariant violations for this req.
 
-        Invariant is "stays at 0".
+        Increments when ``stash_chunked_request`` is called on this req
+        with ``Scheduler._chunked_req_scheduled_last_iter == False`` —
+        the exact regression the flag was added to prevent. Invariant
+        is "stays at 0".
 
-        Consumed by: test_swa_no_stash_double_free (hybrid_swa).
+        Consumed by: test_swa_chunked_req_early_return_no_double_free (hybrid_swa).
         """
-        raise _wishlist("swa_stash_double_free_count")
+        return self.runtime._lookup_swa_stash_double_free_count(self.rid)
+
+    @property
+    def swa_chunked_early_return_count(self) -> int:
+        """Count of SWA early-returns from ``add_chunked_req`` for this req.
+
+        Incremented when hybrid-SWA budget pressure forces
+        ``schedule_policy.add_chunked_req`` to early-return without admitting
+        the chunked_req to ``can_run_list``. Used by regression tests to
+        verify the SWA early-return code path was actually exercised.
+
+        Consumed by: test_swa_chunked_req_early_return_no_double_free (hybrid_swa).
+        """
+        return self.runtime._lookup_swa_chunked_early_return_count(self.rid)
 
     @property
     def swa_budget_overflow_count(self) -> int:

@@ -2280,6 +2280,13 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
+        # Regression guard for the SWA chunked-req double-free bug
+        # (see ``_chunked_req_scheduled_last_iter`` init comment): stash
+        # on ``self.chunked_req`` must only run when the iter-gate flag
+        # is True. If a caller bypasses the gate, this counter on the
+        # req records the violation for ScriptedRuntime tests.
+        if req is self.chunked_req and not self._chunked_req_scheduled_last_iter:
+            req.swa_stash_double_free_count += 1
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -2540,10 +2547,20 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
+            chunked_req_before = self.chunked_req
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
             self._chunked_req_scheduled_last_iter = (
                 self.chunked_req in adder.can_run_list
             )
+            # SWA early-return detector: ``add_chunked_req`` returned the
+            # same req without admitting it (hybrid-SWA budget pressure;
+            # see schedule_policy.add_chunked_req). Surfaces to
+            # ScriptedRuntime tests via Req.swa_chunked_early_return_count.
+            if (
+                self.chunked_req is chunked_req_before
+                and not self._chunked_req_scheduled_last_iter
+            ):
+                chunked_req_before.swa_chunked_early_return_count += 1
         else:
             self._chunked_req_scheduled_last_iter = False
 

@@ -823,6 +823,14 @@ class Req(ReqDllmMixin):
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
 
+        # Regression instrumentation for the SWA chunked-req double-free
+        # bug guarded by Scheduler._chunked_req_scheduled_last_iter (see
+        # comment at its definition). Incremented per-iter by the scheduler;
+        # consumed by ScriptedRuntime tests. Negligible overhead vs. other
+        # per-req fields and bounded by active req lifetime.
+        self.swa_chunked_early_return_count: int = 0
+        self.swa_stash_double_free_count: int = 0
+
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
         # processed.

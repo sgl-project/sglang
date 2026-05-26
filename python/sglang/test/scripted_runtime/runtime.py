@@ -213,6 +213,79 @@ class ScriptedRuntime:
             return "running"
         return "unknown"
 
+    def _find_req_by_rid(self, rid: str) -> Optional[Any]:
+        """Locate the raw ``Req`` by rid across scheduler queues / batches.
+
+        Returns ``None`` if the rid is not currently held by the scheduler.
+        Used by ReqHandle properties that read per-req scheduler-side state.
+        """
+        s = self._scheduler
+        chunked = s.chunked_req
+        if chunked is not None and chunked.rid == rid:
+            return chunked
+        for r in s.waiting_queue:
+            if r.rid == rid:
+                return r
+        if s.running_batch is not None:
+            for r in s.running_batch.reqs:
+                if r.rid == rid:
+                    return r
+        last_batch = getattr(s, "last_batch", None)
+        if last_batch is not None:
+            for r in last_batch.reqs:
+                if r.rid == rid:
+                    return r
+        return None
+
+    def _lookup_finished(self, rid: str) -> bool:
+        """True iff the req has reached a finished state (or already gone).
+
+        Once a req is filtered out of all scheduler structures, the lookup
+        returns ``True`` — by that point the req can only have left because
+        it finished.
+        """
+        req = self._find_req_by_rid(rid)
+        if req is None:
+            # Req has left every scheduler structure → it finished (or was
+            # aborted, which is also a finish). True is the only sensible
+            # answer for a req that's no longer tracked.
+            return rid in self._req_handles
+        return req.finished()
+
+    def _lookup_is_chunking(self, rid: str) -> bool:
+        """True iff this rid is the scheduler's current chunked_req."""
+        s = self._scheduler
+        return s.chunked_req is not None and s.chunked_req.rid == rid
+
+    def _lookup_chunked_req_scheduled_last_iter(self, rid: str) -> Optional[bool]:
+        """Per-req snapshot of the scheduler's chunked-iter flag.
+
+        Returns the scheduler's ``_chunked_req_scheduled_last_iter`` if
+        this rid is the current ``chunked_req``; otherwise ``None``.
+        """
+        s = self._scheduler
+        if s.chunked_req is not None and s.chunked_req.rid == rid:
+            return s._chunked_req_scheduled_last_iter
+        return None
+
+    def _lookup_swa_chunked_early_return_count(self, rid: str) -> int:
+        """Per-req count of SWA early-returns from ``add_chunked_req``.
+
+        Reads ``Req.swa_chunked_early_return_count`` (always initialised).
+        Returns 0 if the req is no longer held by the scheduler.
+        """
+        req = self._find_req_by_rid(rid)
+        return req.swa_chunked_early_return_count if req is not None else 0
+
+    def _lookup_swa_stash_double_free_count(self, rid: str) -> int:
+        """Per-req count of stash-gate invariant violations.
+
+        Reads ``Req.swa_stash_double_free_count`` (always initialised).
+        Returns 0 if the req is no longer held by the scheduler.
+        """
+        req = self._find_req_by_rid(rid)
+        return req.swa_stash_double_free_count if req is not None else 0
+
     # ============================================================
     # Internal: invoked by SchedulerRequestReceiver at every iter.
     # ============================================================
@@ -755,10 +828,7 @@ class ScriptedRuntime:
 
         Consumed by: test_chunked_req_scheduled_last_iter_flag (special_case).
         """
-        raise NotImplementedError(
-            "scripted_runtime: last_chunked_req_scheduled_iter_flag is wishlist — see "
-            "2026-05-26-round-5-de-skip-and-api-wishlist.md"
-        )
+        return self._scheduler._chunked_req_scheduled_last_iter
 
     def last_chunked_exclude_set_source(self) -> Optional[str]:
         """Return where the chunked_req_to_exclude set came from on the last iter.
