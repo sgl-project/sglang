@@ -57,15 +57,7 @@ patches:
     edits:
       - match: |
           tail_tokens = next_token_ids.to(batch.input_ids.dtype)
-          next_prompt_token = batch.chunked_req_next_prompt_token
-          if next_prompt_token is not None:
-              for i, r in enumerate(batch.reqs):
-                  if r is batch.chunked_req:
-                      tail_tokens = tail_tokens.clone()
-                      tail_tokens[i] = next_prompt_token
-                      break
-          return tail_tokens
-        replacement: |
+        prepend: |
           return next_token_ids.to(batch.input_ids.dtype)
 """
 
