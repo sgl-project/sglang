@@ -678,13 +678,13 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         embedding_pool=None,
     ):
         super().__init__(
-            rid,
-            recv_req,
-            mm_processor,
-            encoder_urls,
-            host_name,
-            receive_count,
+            rid=rid,
+            recv_req=recv_req,
+            mm_processor=mm_processor,
+            encoder_urls=encoder_urls,
             model_type=model_type,
+            host_name=host_name,
+            receive_count=receive_count,
         )
         self.embeddings_engine = embeddings_engine
         self.dtype = dtype

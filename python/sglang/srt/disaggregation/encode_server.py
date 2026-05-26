@@ -1908,7 +1908,7 @@ class MMEncoder:
                     ),
                 )
 
-            final_slices = await self._encode_missing(
+            final_slices = self._encode_missing(
                 mm_feature,
                 mm_inputs,
                 list(range(total)),
