@@ -21,7 +21,7 @@ from sglang.srt.server_args import SAMPLING_BACKEND_CHOICES
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, suite="extra-a-1-gpu-large")
+register_cuda_ci(est_time=60, suite="extra-a-test-1-gpu-large")
 
 
 class TestInstallOracleSampler(CustomTestCase):

@@ -12,7 +12,7 @@ from sglang.srt.layers.sampler import _CUSTOM_SAMPLER_FACTORIES
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, suite="extra-a-1-gpu-large")
+register_cuda_ci(est_time=60, suite="extra-a-test-1-gpu-large")
 
 
 def _make_server_args(*, sampling_backend: str) -> SimpleNamespace:
