@@ -219,6 +219,9 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
     @staticmethod
     def _script_disagg_retract_resets_send_state_extra(t: ScriptedRuntime):
         # disagg path: retract must reset send-side state (414efd4a27).
+        # Even in non-disagg engine config, the D3 counter is defined
+        # and must stay 0 — retract still touches the same scheduler
+        # code path.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
         t.force_retract(r)
@@ -226,7 +229,10 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
         # NEW API NEEDED: r.disagg_send_state — current state of the
         # send-side machine (None when not disagg or after reset).
         assert r.disagg_send_state in (None, "idle")
+        # D3: no send-side leak observed even in this non-disagg config.
+        assert r.disagg_send_state_leak_after_retract_count == 0
         yield from run_until_finished(r)
+        assert r.finished
 
     def test_retract_chunked_resume_in_waiting(self):
         """Chunked-resume sitting in waiting → force retract releases row + KV and W2 watchdog gate holds."""
@@ -501,9 +507,15 @@ class TestPriorityDisagg(ScriptedRuntimeTestCase):
             None,
             "idle",
         ), f"disagg send state must reset on retract, got {r.disagg_send_state}"
+        # D3: source-side counter agrees with the field-level reset.
+        assert r.disagg_send_state_leak_after_retract_count == 0, (
+            f"D3 violation in disagg mode retract; got "
+            f"{r.disagg_send_state_leak_after_retract_count}"
+        )
 
         yield from run_until_finished(r)
         assert r.finished
+        assert r.disagg_send_state_leak_after_retract_count == 0
 
 
 if __name__ == "__main__":
