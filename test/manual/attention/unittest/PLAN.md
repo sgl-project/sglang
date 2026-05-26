@@ -914,6 +914,12 @@ Latest verification:
 - `python test/manual/attention/unittest/gdn/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_flashinfer.py -v`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
+  - Ran 132 tests in 38.626s (3 skipped) after adding DSA sparse CG decode,
+    Dual-chunk CG decode, FA3/FA4 EAGLE chain verify (eager + CG), FA3/FA4
+    EAGLE DRAFT_EXTEND V1 (eager + CG), FA3/FA4 production
+    EAGLEDraftCudaGraphRunner + EAGLEDraftExtendCudaGraphRunner +
+    EAGLEDraftExtendV2CudaGraphRunner coverage.
 - Previous broad sweep before the latest runner refactor:
   `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
 
