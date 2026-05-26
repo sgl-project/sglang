@@ -59,24 +59,21 @@ Implemented:
   orthogonal to runner/backend metadata compatibility.
 
 In progress:
-- Phase 2/3 representative coverage has been reviewed and is sufficient for the next
-  slice: dense `torch_native`/`triton`/`flashinfer`, SWA `triton`/`flashinfer`, MLA
-  `triton`, and GDN `triton` now cover the important runner/backend and input-layout
-  boundaries without expanding into every registered backend.
-- The next implementation slice is Phase 4 synthetic speculative metadata coverage
-  inside the affected attention-method folders, starting with dense
-  `triton`/`flashinfer`.
+- Phase 3 representative coverage needs one more pass before Phase 4: add CUDA
+  graph decode replay for SWA and GDN, and add representative PCG/BCG split-op
+  coverage for dense/SWA/GDN module paths.
 
 Next implementation steps:
-- Finish Phase 4 speculative metadata coverage for representative valid backends
-  before adding more Phase 2 backend files.
+- Finish the remaining Phase 3 graph coverage before implementing Phase 4.
+- Then finish Phase 4 speculative metadata coverage for representative valid
+  backends before adding more Phase 2 backend files.
 - After representative Phase 2/3/4 coverage is stable, expand Phase 2 to additional
   attention backends such as `flashmla`, `cutlass_mla`, `trtllm_mha`,
   `trtllm_mla`, `fa3`, `fa4`, `dual_chunk_flash_attn`, and `flex_attention`.
 - Keep `torch_native` SWA out of the matrix until the backend honors
   `RadixAttention.sliding_window_size`.
-- Defer Phase 2 expansion for additional backends and Phase 3 wrapper/BCG/PCG tests
-  until the representative Phase 4 tests are passing.
+- Defer Phase 2 expansion for additional backends until representative Phase 3 and
+  Phase 4 tests are passing.
 
 Latest verification:
 - `python -m py_compile test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/mla/test_triton.py`
@@ -434,8 +431,13 @@ Representative Phase 3 status:
   is the PyTorch baseline backend and does not exercise CUDA graph replay.
 - `triton` and `flashinfer` are covered in CUDA graph decode replay for MHA, GQA,
   and MQA, using distinct capture and replay batches.
-- BCG/PCG, `hybrid_attn`, and TBO coverage remains intentionally deferred until
-  Phase 4 synthetic spec metadata coverage is stable.
+- Still required before Phase 4: CUDA graph decode replay for SWA and GDN.
+- Still required before Phase 4: representative PCG and BCG coverage. At unit-test
+  scope this means exercising the PCG/BCG split-op path with active forward context
+  and comparing against eager/reference output; full server-level PCG/BCG capture can
+  remain in registered integration tests.
+- `hybrid_attn` and TBO composition should be added as focused Phase 3 cases after
+  the base backend graph paths are stable.
 
 ### Phase 4 matrix: speculative decoding attention
 
@@ -699,8 +701,9 @@ Initial implementation slice:
 - FlashInfer cases use `head_dim=64` to match FlashInfer kernel constraints.
 - `mla/test_triton.py` and `gdn/test_triton.py` cover the representative dense-style
   input edge cases for method-specific Triton paths.
-- Future representative-first slices should complete speculative modes for
-  `triton` and `flashinfer` before adding additional Phase 2 backend files.
+- Future representative-first slices should complete remaining Phase 3 graph paths
+  and then speculative modes for `triton` and `flashinfer` before adding additional
+  Phase 2 backend files.
 
 ---
 
@@ -715,12 +718,15 @@ For each supported runner/backend/family case:
 2. Capture/warm up the graph path:
    - CUDA graph: `init_cuda_graph_state`, capture metadata, warmup,
      `on_after_cuda_graph_warmup`, replay metadata.
-   - BCG/PCG: use the corresponding runner APIs and active forward context.
+   - BCG/PCG: exercise the split-op path with active piecewise/breakable forward
+     context at unit scope; full graph-capture runner coverage belongs in focused
+     registered integration tests.
 3. Replay the graph path.
 4. Assert graph replay output matches the eager output.
 
-This phase should include `hybrid_attn` and TBO composition in a focused way instead
-of as part of the full Cartesian product.
+This phase should include SWA and GDN CUDA graph coverage before Phase 4. It should
+also include `hybrid_attn` and TBO composition in a focused way instead of as part
+of the full Cartesian product.
 
 ---
 
