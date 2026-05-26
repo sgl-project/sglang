@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from typing import TYPE_CHECKING, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -118,6 +118,7 @@ class KVArgsRegisterInfo:
     decode_tp_size: int
     decode_tp_rank: int
     dst_kv_item_len: int
+    dst_kv_data_lens: List[int] = dataclasses.field(default_factory=list)
     dst_state_item_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: List[List[int]] = dataclasses.field(default_factory=list)
     # Keep last: optional, parsed from a variable-length tail of the ZMQ
@@ -135,6 +136,9 @@ class KVArgsRegisterInfo:
         dst_state_dim_per_tensor = (
             unpack_int_lists(msg[13], "I") if len(msg) > 13 and len(msg[13]) > 0 else []
         )
+        dst_kv_data_lens = (
+            unpack_int_lists(msg[16], "Q")[0] if len(msg) > 16 and msg[16] != b"" else []
+        )
 
         return cls(
             room=str(msg[0].decode("ascii")),
@@ -149,10 +153,42 @@ class KVArgsRegisterInfo:
             decode_tp_size=int(msg[9].decode("ascii")),
             decode_tp_rank=int(msg[10].decode("ascii")),
             dst_kv_item_len=int(msg[11].decode("ascii")),
+            dst_kv_data_lens=dst_kv_data_lens,
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
         )
+
+
+def repeat_indices_over_layers(
+    indices: npt.NDArray[np.int32],
+    layer_lengths: List[int],
+) -> npt.NDArray[np.int32]:
+    pages = np.asarray(indices, dtype=np.int32)
+    offsets = np.cumsum([0] + layer_lengths[:-1], dtype=np.int32)
+    return np.ascontiguousarray((offsets[:, None] + pages[None, :]).ravel())
+
+
+def expand_page_indices_for_slice(
+    page_indices: npt.NDArray[np.int32],
+    num_ptr_pairs: int,
+    num_slots: int,
+    page_size: int,
+    num_groups: int = 1,
+    head_group_idx: int = 0,
+) -> npt.NDArray[np.int32]:
+    pages = np.asarray(page_indices, dtype=np.int32)
+    token_offsets = np.arange(page_size, dtype=np.int32)
+    pair_stride = num_slots * page_size * num_groups
+    within_pair = (
+        pages[:, None] * (page_size * num_groups)
+        + token_offsets[None, :] * num_groups
+        + head_group_idx
+    ).ravel()
+    pair_offsets = np.arange(num_ptr_pairs, dtype=np.int64) * pair_stride
+    return np.ascontiguousarray(
+        (pair_offsets[:, None] + within_pair[None, :]).ravel(), dtype=np.int32
+    )
 
 
 @dataclasses.dataclass
@@ -249,8 +285,24 @@ class NixlKVManager(CommonKVManager):
 
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.kv_buffer_tensors = None
+        self.prep_handles: Dict[str, Any] = {}
+        self.prep_handle_slice_src: Optional[Tuple[Any, int, int, int]] = None
+        self.prep_handles_slice_dst: Dict[str, Tuple[Any, int]] = {}
+        self.peer_head_group: Dict[str, int] = {}
+        self._slots_per_kv_layer: List[int] = []
+        self._dst_slots_per_kv_layer: Dict[str, List[int]] = {}
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            missing_prepared_apis = [
+                name
+                for name in ("prep_xfer_dlist", "make_prepped_xfer")
+                if not hasattr(self.agent, name)
+            ]
+            if missing_prepared_apis:
+                raise RuntimeError(
+                    "NIXL two-step transfer API is required for KV payload "
+                    f"transfers; missing: {missing_prepared_apis}"
+                )
             transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
@@ -454,6 +506,412 @@ class NixlKVManager(CommonKVManager):
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
 
+    def _make_prepped_xfer(
+        self,
+        peer_name: str,
+        local_handle: Any,
+        local_indices: npt.NDArray[np.int32],
+        remote_handle: Any,
+        remote_indices: npt.NDArray[np.int32],
+        notif: str,
+    ):
+        local_indices = np.ascontiguousarray(local_indices, dtype=np.int32)
+        remote_indices = np.ascontiguousarray(remote_indices, dtype=np.int32)
+        if local_indices.size != remote_indices.size:
+            raise RuntimeError(
+                "Prepared NIXL transfer index mismatch: "
+                f"src={local_indices.size}, dst={remote_indices.size}, peer={peer_name}"
+            )
+
+        xfer_handle = self.agent.make_prepped_xfer(
+            "WRITE",
+            local_handle,
+            local_indices,
+            remote_handle,
+            remote_indices,
+            notif.encode("ascii"),
+        )
+        if not xfer_handle:
+            raise Exception("KVSender failed to create prepared transfer")
+        state = self.agent.transfer(xfer_handle)
+        if state == "ERR":
+            raise Exception("KVSender failed to post prepared transfer")
+        return xfer_handle
+
+    def _get_kv_layer_params(
+        self,
+        src_data_ptrs: list[int],
+        dst_data_ptrs: list[int],
+        item_lens: list[int],
+        src_data_lens: list[int],
+        dst_data_lens: list[int],
+    ):
+        src_data_ptrs = np.array(src_data_ptrs, dtype=np.uint64)
+        dst_data_ptrs = np.array(dst_data_ptrs, dtype=np.uint64)
+        item_lens = np.array(item_lens, dtype=np.uint64)
+        src_data_lens = np.array(src_data_lens, dtype=np.uint64)
+        dst_data_lens = np.array(dst_data_lens, dtype=np.uint64)
+
+        if self.is_mla_backend:
+            src_ptrs, dst_ptrs, layers_current_pp_stage = (
+                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+            )
+            src_lens, dst_lens, _ = self.get_mla_kv_ptrs_with_pp(
+                src_data_lens, dst_data_lens
+            )
+            return [
+                (
+                    int(src_ptrs[layer_id]),
+                    int(dst_ptrs[layer_id]),
+                    int(item_lens[layer_id]),
+                    int(src_lens[layer_id]),
+                    int(dst_lens[layer_id]),
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ]
+
+        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
+            self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+        )
+        src_k_lens, src_v_lens, dst_k_lens, dst_v_lens, _ = (
+            self.get_mha_kv_ptrs_with_pp(src_data_lens, dst_data_lens)
+        )
+        params = [
+            (
+                int(src_k_ptrs[layer_id]),
+                int(dst_k_ptrs[layer_id]),
+                int(item_lens[layer_id]),
+                int(src_k_lens[layer_id]),
+                int(dst_k_lens[layer_id]),
+            )
+            for layer_id in range(layers_current_pp_stage)
+        ]
+        v_item_offset = len(src_data_ptrs) // 2
+        params.extend(
+            (
+                int(src_v_ptrs[layer_id]),
+                int(dst_v_ptrs[layer_id]),
+                int(
+                    item_lens[
+                        v_item_offset + layer_id
+                        if v_item_offset + layer_id < len(item_lens)
+                        else layer_id
+                    ]
+                ),
+                int(src_v_lens[layer_id]),
+                int(dst_v_lens[layer_id]),
+            )
+            for layer_id in range(layers_current_pp_stage)
+        )
+        return params
+
+    def _make_prepared_page_descs(
+        self,
+        ptrs: List[int],
+        item_lens: List[int],
+        page_counts: npt.NDArray[np.int64],
+        gpu_id: int,
+    ):
+        total_descs = int(page_counts.sum())
+        if total_descs > np.iinfo(np.int32).max:
+            raise ValueError(
+                f"Prepared NIXL descriptor list is too large: {total_descs}"
+            )
+        descs = np.empty((total_descs, 3), dtype=np.uint64)
+        cursor = 0
+        for ptr, item_len, page_count in zip(ptrs, item_lens, page_counts):
+            page_count = int(page_count)
+            end = cursor + page_count
+            pages = np.arange(page_count, dtype=np.uint64)
+            descs[cursor:end, 0] = np.uint64(ptr) + pages * np.uint64(item_len)
+            descs[cursor:end, 1] = np.uint64(item_len)
+            descs[cursor:end, 2] = np.uint64(gpu_id)
+            cursor = end
+        return descs
+
+    def _init_prep_handle(self, peer_info: KVArgsRegisterInfo):
+        if "" in self.prep_handles and peer_info.agent_name in self.prep_handles:
+            return
+        if not peer_info.dst_kv_data_lens:
+            raise RuntimeError(
+                f"Decode peer {peer_info.agent_name} did not provide KV buffer sizes"
+            )
+
+        layer_params = self._get_kv_layer_params(
+            self.kv_args.kv_data_ptrs,
+            peer_info.dst_kv_ptrs,
+            self.kv_args.kv_item_lens,
+            self.kv_args.kv_data_lens,
+            peer_info.dst_kv_data_lens,
+        )
+        if not layer_params:
+            raise RuntimeError(
+                f"Cannot prepare NIXL KV transfer for peer {peer_info.agent_name}: "
+                "empty layer parameter list"
+            )
+
+        src_ptrs = [x[0] for x in layer_params]
+        dst_ptrs = [x[1] for x in layer_params]
+        item_lens = [x[2] for x in layer_params]
+        local_page_counts = np.array(
+            [x[3] // x[2] for x in layer_params], dtype=np.int64
+        )
+        remote_page_counts = np.array(
+            [x[4] // x[2] for x in layer_params], dtype=np.int64
+        )
+        if np.any(local_page_counts <= 0) or np.any(remote_page_counts <= 0):
+            raise RuntimeError(
+                f"Cannot prepare NIXL KV transfer for peer {peer_info.agent_name}: "
+                f"invalid page counts local={local_page_counts}, "
+                f"remote={remote_page_counts}"
+            )
+
+        local_slots = [int(x) for x in local_page_counts]
+        if "" not in self.prep_handles:
+            local_descs = self._make_prepared_page_descs(
+                src_ptrs, item_lens, local_page_counts, self.kv_args.gpu_id
+            )
+            self.prep_handles[""] = self.agent.prep_xfer_dlist(
+                "NIXL_INIT_AGENT", local_descs, "VRAM"
+            )
+            assert self.prep_handles[""] is not None, (
+                "prep_xfer_dlist returned None for source KV"
+            )
+            self._slots_per_kv_layer = local_slots
+        elif self._slots_per_kv_layer != local_slots:
+            raise RuntimeError(
+                "Prepared NIXL KV source dlist shape changed unexpectedly: "
+                f"existing={self._slots_per_kv_layer}, new={local_slots}"
+            )
+
+        remote_descs = self._make_prepared_page_descs(
+            dst_ptrs, item_lens, remote_page_counts, peer_info.gpu_id
+        )
+        self.prep_handles[peer_info.agent_name] = self.agent.prep_xfer_dlist(
+            peer_info.agent_name, remote_descs, "VRAM"
+        )
+        assert self.prep_handles[peer_info.agent_name] is not None, (
+            f"prep_xfer_dlist returned None for peer '{peer_info.agent_name}'"
+        )
+        self._dst_slots_per_kv_layer[peer_info.agent_name] = [
+            int(x) for x in remote_page_counts
+        ]
+
+        logger.info(
+            "Prepared reusable NIXL KV transfer for peer %s: layers=%d "
+            "local_descs=%d remote_descs=%d",
+            peer_info.agent_name,
+            len(item_lens),
+            int(local_page_counts.sum()),
+            int(remote_page_counts.sum()),
+        )
+
+    def _make_prepared_kv_indices(
+        self,
+        peer_name: str,
+        prefill_data_indices: npt.NDArray[np.int32],
+        dst_data_indices: npt.NDArray[np.int32],
+    ):
+        local_pages = np.asarray(prefill_data_indices, dtype=np.int64)
+        remote_pages = np.asarray(dst_data_indices, dtype=np.int64)
+        if local_pages.size != remote_pages.size:
+            raise RuntimeError(
+                f"Prepared NIXL KV index mismatch: src={local_pages.size}, "
+                f"dst={remote_pages.size}"
+            )
+        if local_pages.size == 0:
+            raise RuntimeError("Prepared NIXL KV transfer received no page indices")
+        if int(local_pages.min()) < 0 or int(remote_pages.min()) < 0:
+            raise RuntimeError("Prepared NIXL KV transfer received negative indices")
+
+        local_slots = self._slots_per_kv_layer
+        remote_slots = self._dst_slots_per_kv_layer[peer_name]
+        if int(local_pages.max()) >= min(local_slots):
+            raise RuntimeError(
+                f"Prepared NIXL KV source index {int(local_pages.max())} exceeds "
+                f"prepared slots {min(local_slots)}"
+            )
+        if int(remote_pages.max()) >= min(remote_slots):
+            raise RuntimeError(
+                f"Prepared NIXL KV destination index {int(remote_pages.max())} "
+                f"exceeds prepared slots {min(remote_slots)}"
+            )
+
+        return (
+            repeat_indices_over_layers(
+                local_pages.astype(np.int32, copy=False), local_slots
+            ),
+            repeat_indices_over_layers(
+                remote_pages.astype(np.int32, copy=False), remote_slots
+            ),
+        )
+
+    def _init_prep_handle_slice(
+        self, peer_name: str, peer_info: KVArgsRegisterInfo
+    ):
+        if (
+            self.prep_handle_slice_src is not None
+            and peer_name in self.prep_handles_slice_dst
+        ):
+            return
+        if not peer_info.dst_kv_data_lens:
+            raise RuntimeError(
+                f"Decode peer {peer_info.agent_name} did not provide KV buffer sizes"
+            )
+
+        prefill_tp_size = self.attn_tp_size
+        decode_tp_size = peer_info.decode_tp_size
+        decode_tp_rank = peer_info.decode_tp_rank
+        dst_kv_item_len = peer_info.dst_kv_item_len
+        page_size = self.kv_args.page_size
+        src_kv_item_len = self.kv_args.kv_item_lens[0]
+        local_num_slots = self.kv_args.kv_data_lens[0] // src_kv_item_len
+        remote_num_slots = peer_info.dst_kv_data_lens[0] // dst_kv_item_len
+        if local_num_slots <= 0 or remote_num_slots <= 0:
+            raise RuntimeError(
+                f"Cannot prepare NIXL slice transfer for peer {peer_info.agent_name}: "
+                f"invalid slots local={local_num_slots}, remote={remote_num_slots}"
+            )
+
+        total_kv_heads = getattr(self.kv_args, "total_kv_head_num", 0)
+        if total_kv_heads <= 0:
+            total_kv_heads = self.kv_args.kv_head_num * prefill_tp_size
+
+        src_heads_per_rank = max(1, total_kv_heads // prefill_tp_size)
+        dst_heads_per_rank = max(1, total_kv_heads // decode_tp_size)
+        bytes_per_head_slice = dst_kv_item_len // page_size // dst_heads_per_rank
+
+        if prefill_tp_size > decode_tp_size:
+            local_tp_rank_in_group = self.kv_args.engine_rank % prefill_tp_size
+            src_replication = max(1, prefill_tp_size // total_kv_heads)
+            num_groups = 1
+            num_heads_to_send = src_heads_per_rank
+            head_group_idx = 0
+            unique_head_idx = local_tp_rank_in_group // src_replication
+            dst_head_start = (unique_head_idx * src_heads_per_rank) % dst_heads_per_rank
+            dst_head_offset = dst_head_start * bytes_per_head_slice
+        else:
+            dst_tp_rank_in_group = decode_tp_rank % decode_tp_size
+            num_groups = decode_tp_size // prefill_tp_size
+            num_heads_to_send = dst_heads_per_rank
+            src_head_start = (
+                dst_tp_rank_in_group * dst_heads_per_rank
+            ) % src_heads_per_rank
+            head_group_idx = src_head_start // dst_heads_per_rank
+            dst_head_offset = 0
+
+        bytes_per_token_to_send = num_heads_to_send * bytes_per_head_slice
+        bytes_per_token_src = src_kv_item_len // page_size
+        bytes_per_token_dst = dst_kv_item_len // page_size
+
+        kv_data_ptrs = np.array(self.kv_args.kv_data_ptrs, dtype=np.uint64)
+        dst_kv_ptrs = np.array(peer_info.dst_kv_ptrs, dtype=np.uint64)
+        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
+            self.get_mha_kv_ptrs_with_pp(kv_data_ptrs, dst_kv_ptrs)
+        )
+        src_ptrs = np.asarray(
+            list(src_k_ptrs[:layers_current_pp_stage])
+            + list(src_v_ptrs[:layers_current_pp_stage]),
+            dtype=np.uint64,
+        )
+        dst_ptrs = np.asarray(
+            list(dst_k_ptrs[:layers_current_pp_stage])
+            + list(dst_v_ptrs[:layers_current_pp_stage]),
+            dtype=np.uint64,
+        )
+        num_ptr_pairs = len(src_ptrs)
+
+        if self.prep_handle_slice_src is None:
+            slots = np.arange(local_num_slots, dtype=np.uint64)
+            tokens = np.arange(page_size, dtype=np.uint64)
+            groups = np.arange(num_groups, dtype=np.uint64)
+            addrs = (
+                src_ptrs[:, None, None, None]
+                + slots[None, :, None, None] * np.uint64(src_kv_item_len)
+                + tokens[None, None, :, None] * np.uint64(bytes_per_token_src)
+                + groups[None, None, None, :] * np.uint64(bytes_per_token_to_send)
+            ).ravel()
+            src_reqs = np.column_stack(
+                (
+                    addrs,
+                    np.full_like(addrs, bytes_per_token_to_send, dtype=np.uint64),
+                    np.full_like(addrs, self.kv_args.gpu_id, dtype=np.uint64),
+                )
+            )
+            src_handle = self.agent.prep_xfer_dlist(
+                "NIXL_INIT_AGENT", src_reqs, "VRAM"
+            )
+            assert src_handle is not None, "prep_xfer_dlist returned None for slice src"
+            self.prep_handle_slice_src = (
+                src_handle,
+                num_groups,
+                num_ptr_pairs,
+                local_num_slots,
+            )
+
+        dst_slots = np.arange(remote_num_slots, dtype=np.uint64)
+        tokens = np.arange(page_size, dtype=np.uint64)
+        addrs = (
+            dst_ptrs[:, None, None]
+            + dst_slots[None, :, None] * np.uint64(dst_kv_item_len)
+            + tokens[None, None, :] * np.uint64(bytes_per_token_dst)
+            + np.uint64(dst_head_offset)
+        ).ravel()
+        dst_reqs = np.column_stack(
+            (
+                addrs,
+                np.full_like(addrs, bytes_per_token_to_send, dtype=np.uint64),
+                np.full_like(addrs, peer_info.gpu_id, dtype=np.uint64),
+            )
+        )
+        dst_handle = self.agent.prep_xfer_dlist(
+            peer_info.agent_name, dst_reqs, "VRAM"
+        )
+        assert dst_handle is not None, (
+            f"prep_xfer_dlist returned None for slice dst for peer "
+            f"'{peer_info.agent_name}'"
+        )
+        self.prep_handles_slice_dst[peer_name] = (dst_handle, remote_num_slots)
+        self.peer_head_group[peer_name] = head_group_idx
+
+        logger.info(
+            "Prepared reusable NIXL sliced KV transfer for peer %s: ptr_pairs=%d "
+            "local_slots=%d remote_slots=%d page_size=%d groups=%d",
+            peer_info.agent_name,
+            num_ptr_pairs,
+            local_num_slots,
+            remote_num_slots,
+            page_size,
+            num_groups,
+        )
+
+    def _prepare_payload_xfer(self, peer_info: KVArgsRegisterInfo):
+        if self.is_mla_backend or peer_info.decode_tp_size == self.attn_tp_size:
+            self._init_prep_handle(peer_info)
+        elif not (self.enable_staging and peer_info.staging is not None):
+            self._init_prep_handle_slice(peer_info.agent_name, peer_info)
+
+    def _send_prepared_kvcache(
+        self,
+        peer_name: str,
+        prefill_data_indices: npt.NDArray[np.int32],
+        dst_data_indices: npt.NDArray[np.int32],
+        notif: str,
+    ):
+        peer_info = self.decode_kv_args_table[peer_name]
+        self._init_prep_handle(peer_info)
+        local_indices, remote_indices = self._make_prepared_kv_indices(
+            peer_name, prefill_data_indices, dst_data_indices
+        )
+        return self._make_prepped_xfer(
+            peer_name,
+            self.prep_handles[""],
+            local_indices,
+            self.prep_handles[peer_name],
+            remote_indices,
+            notif,
+        )
+
     def transfer_worker(self, queue: FastQueue, staging_buffer=None):
         # Per-worker staging strategy: lazy-created on first chunk so we
         # see kv_buffer_tensors (set by ModelRunner after engine init).
@@ -463,6 +921,7 @@ class NixlKVManager(CommonKVManager):
         while True:
             kv_chunk: TransferKVChunk = queue.get()
             room = kv_chunk.room
+            handles: List[Any] = []
             try:
                 if self.check_status(room) == KVPoll.Failed:
                     continue
@@ -481,7 +940,6 @@ class NixlKVManager(CommonKVManager):
                 self.update_status(room, KVPoll.Transferring)
 
                 reqs_to_be_processed = list(self.transfer_infos[room].values())
-                handles: List = []
 
                 # Set when staging allocation/watermark is not yet ready and
                 # the chunk has been re-enqueued. We then break out of the
@@ -515,6 +973,11 @@ class NixlKVManager(CommonKVManager):
                             kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
                                 : len(chunked_dst_kv_indice)
                             ]
+
+                        notif = (
+                            f"{req.room}_kv_{kv_chunk.chunk_id}"
+                            f"_{int(kv_chunk.is_last_chunk)}_{self.kv_args.engine_rank}"
+                        )
 
                         # Decide which kv send path to use:
                         #   1. Staging (heterogeneous TP, both sides have
@@ -551,10 +1014,6 @@ class NixlKVManager(CommonKVManager):
                             # the slice path below.
 
                         if kv_xfer_handle is None:
-                            notif = (
-                                f"{req.room}_kv_{kv_chunk.chunk_id}"
-                                f"_{int(kv_chunk.is_last_chunk)}_{self.kv_args.engine_rank}"
-                            )
                             if self.is_mla_backend or (
                                 decode_tp_size == self.attn_tp_size
                             ):
@@ -707,6 +1166,8 @@ class NixlKVManager(CommonKVManager):
             return
         self.decode_kv_args_table[agent_name] = decode_kv_args
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self._prepare_payload_xfer(decode_kv_args)
 
     def _send_kvcache_generic(
         self,
@@ -721,6 +1182,14 @@ class NixlKVManager(CommonKVManager):
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
         Used by both send_kvcache and maybe_send_extra."""
+        if src_data_ptrs is self.kv_args.kv_data_ptrs:
+            return self._send_prepared_kvcache(
+                peer_name,
+                prefill_data_indices,
+                dst_data_indices,
+                notif,
+            )
+
         # Convert pointer lists to np.uint64 arrays up front.
         # torch.int exceeds np.int64 range on Intel XPU (addresses have bit 63 set, e.g.
         # 0xffff81ab54e01000). Casting here prevents overflow when these values
@@ -859,131 +1328,39 @@ class NixlKVManager(CommonKVManager):
         decode_tp_rank: int,
         dst_kv_item_len: int,
     ):
-        # Get configuration from kv_args
-        local_tp_rank_in_group = self.kv_args.engine_rank % prefill_tp_size
-        dst_tp_rank_in_group = decode_tp_rank % decode_tp_size
+        del dst_kv_ptrs, dst_gpu_id, prefill_tp_size, decode_tp_size
+        del decode_tp_rank, dst_kv_item_len
 
-        src_kv_item_len = self.kv_args.kv_item_lens[0]
-        page_size = self.kv_args.page_size
-
-        # Use total KV head count (not per-rank) for correct head distribution.
-        # Per-rank kv_head_num is max(1, total//tp) which loses info when total < tp.
-        total_kv_heads = getattr(self.kv_args, "total_kv_head_num", 0)
-        if total_kv_heads <= 0:
-            total_kv_heads = self.kv_args.kv_head_num * prefill_tp_size
-
-        src_heads_per_rank = max(1, total_kv_heads // prefill_tp_size)
-        dst_heads_per_rank = max(1, total_kv_heads // decode_tp_size)
-
-        bytes_per_head_slice_to_send = (
-            dst_kv_item_len // page_size // dst_heads_per_rank
+        peer_info = self.decode_kv_args_table[peer_name]
+        self._init_prep_handle_slice(peer_name, peer_info)
+        assert self.prep_handle_slice_src is not None
+        src_handle, num_groups, num_ptr_pairs, num_slots_src = (
+            self.prep_handle_slice_src
         )
-
-        # GQA replication: how many prefill ranks share the same KV head
-        src_replication = max(1, prefill_tp_size // total_kv_heads)
-
-        # Determine which heads to send
-        if prefill_tp_size > decode_tp_size:
-            # Multiple prefill ranks to one decode rank
-            src_head_start_offset = 0
-            num_heads_to_send = src_heads_per_rank
-            unique_head_idx = local_tp_rank_in_group // src_replication
-            dst_head_start_offset = (
-                unique_head_idx * src_heads_per_rank
-            ) % dst_heads_per_rank
-        else:
-            # Send KVCache from 1 prefill instance to multiple decode instances
-            src_head_start_offset = (
-                dst_tp_rank_in_group * dst_heads_per_rank
-            ) % src_heads_per_rank
-            num_heads_to_send = dst_heads_per_rank
-            dst_head_start_offset = 0
-
-        # torch.int exceeds np.int64 range on Intel XPU (addresses have bit 63 set, e.g.
-        # 0xffff81ab54e01000). Use np.uint64 to prevent overflow on XPU.
-        kv_data_ptrs = np.array(self.kv_args.kv_data_ptrs, dtype=np.uint64)
-        dst_kv_ptrs = np.array(dst_kv_ptrs, dtype=np.uint64)
-        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-            self.get_mha_kv_ptrs_with_pp(kv_data_ptrs, dst_kv_ptrs)
+        dst_handle, num_slots_dst = self.prep_handles_slice_dst[peer_name]
+        head_group_idx = self.peer_head_group[peer_name]
+        src_indices = expand_page_indices_for_slice(
+            prefill_kv_indices,
+            num_ptr_pairs,
+            num_slots_src,
+            self.kv_args.page_size,
+            num_groups,
+            head_group_idx,
         )
-        # Calculate precise byte offset and length for the sub-slice within the token
-        src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
-        dst_head_slice_offset = dst_head_start_offset * bytes_per_head_slice_to_send
-        heads_bytes_per_token_to_send = num_heads_to_send * bytes_per_head_slice_to_send
-
-        src_dst_ptr_pairs = [
-            (
-                src_k_ptrs[layer_id],
-                dst_k_ptrs[layer_id],
-            )
-            for layer_id in range(layers_current_pp_stage)
-        ] + [
-            (
-                src_v_ptrs[layer_id],
-                dst_v_ptrs[layer_id],
-            )
-            for layer_id in range(layers_current_pp_stage)
-        ]
-
-        prefill_indices = np.asarray(prefill_kv_indices, dtype=np.uint64)
-        dst_indices = np.asarray(dst_kv_indices, dtype=np.uint64)
-        bytes_per_token_prefill = src_kv_item_len // page_size
-        bytes_per_token_decode = dst_kv_item_len // page_size
-        token_offsets = np.arange(page_size, dtype=np.uint64)
-
-        src_addrs = []
-        dst_addrs = []
-
-        for src_ptr, dst_ptr in src_dst_ptr_pairs:
-            src_page_bases = src_ptr + prefill_indices * src_kv_item_len
-            dst_page_bases = dst_ptr + dst_indices * dst_kv_item_len
-
-            src_all = (
-                src_page_bases[:, None]
-                + token_offsets[None, :] * bytes_per_token_prefill
-                + src_head_slice_offset
-            ).ravel()
-            dst_all = (
-                dst_page_bases[:, None]
-                + token_offsets[None, :] * bytes_per_token_decode
-                + dst_head_slice_offset
-            ).ravel()
-
-            src_addrs.append(src_all)
-            dst_addrs.append(dst_all)
-
-        def make_req_array(addr_chunks, size, gpu):
-            if not addr_chunks:
-                return np.empty((0, 3), dtype=np.uint64)
-            flat_addrs = np.concatenate(addr_chunks).astype(np.uint64, copy=False)
-            return np.column_stack(
-                (
-                    flat_addrs,
-                    np.full_like(flat_addrs, size, dtype=np.uint64),
-                    np.full_like(flat_addrs, gpu, dtype=np.uint64),
-                )
-            )
-
-        src_reqs = make_req_array(
-            src_addrs, heads_bytes_per_token_to_send, self.kv_args.gpu_id
+        dst_indices = expand_page_indices_for_slice(
+            dst_kv_indices,
+            num_ptr_pairs,
+            num_slots_dst,
+            self.kv_args.page_size,
         )
-        dst_reqs = make_req_array(dst_addrs, heads_bytes_per_token_to_send, dst_gpu_id)
-
-        # Use NIXL agent for transfer
-        src_descs = self.agent.get_xfer_descs(src_reqs, "VRAM")
-        dst_descs = self.agent.get_xfer_descs(dst_reqs, "VRAM")
-
-        xfer_handle = self.agent.initialize_xfer(
-            "WRITE", src_descs, dst_descs, peer_name, notif.encode("ascii")
+        return self._make_prepped_xfer(
+            peer_name,
+            src_handle,
+            src_indices,
+            dst_handle,
+            dst_indices,
+            notif,
         )
-        if not xfer_handle:
-            raise Exception("Failed to create sliced KV transfer")
-
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("Failed to post sliced KV transfer")
-
-        return xfer_handle
 
     def send_kvcache_staged(
         self,
@@ -1886,6 +2263,9 @@ class NixlKVReceiver(CommonKVReceiver):
             packed_kv_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
             )
+            packed_kv_data_lens = pack_int_lists(
+                [self.kv_mgr.kv_args.kv_data_lens], "Q"
+            )
             packed_aux_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
             )
@@ -1931,6 +2311,7 @@ class NixlKVReceiver(CommonKVReceiver):
                         packed_state_dim_per_tensor,
                         packed_staging_base_ptr,
                         staging_total_size_str,
+                        packed_kv_data_lens,
                     ]
                 )
 
