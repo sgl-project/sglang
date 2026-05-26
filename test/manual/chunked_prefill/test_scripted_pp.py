@@ -49,7 +49,6 @@ class TestScriptedPP(CustomTestCase):
         # VERY_LONG_PROMPT_LEN / DEFAULT_CHUNK_SIZE chunks expected.
         assert r.chunks_done >= 2, f"expected >=2 chunks, got {r.chunks_done}"
 
-    @unittest.skip("requires real pp_size>1 topology — wire up when fixture lands")
     def test_pp_chunked_no_double_finalize(self):
         """PP=2 chunked req must finalize exactly once across microbatches."""
         execute_scripted_runtime(
@@ -74,7 +73,6 @@ class TestScriptedPP(CustomTestCase):
             f"got finish_event_count={r.finish_event_count}"
         )
 
-    @unittest.skip("requires real pp_size>1 topology — wire up when fixture lands")
     def test_pp_abort_during_inflight_chunk(self):
         """PP=2 abort on chunked req in both mb_other and waiting_queue dedups cleanly."""
         execute_scripted_runtime(
@@ -99,7 +97,6 @@ class TestScriptedPP(CustomTestCase):
         assert r.lock_refs == 0
         assert r.finish_event_count <= 1
 
-    @unittest.skip("requires real pp_size>1 topology — wire up when fixture lands")
     def test_pp_last_chunk_cross_mb_kv_correctness(self):
         """PP=2 last-chunk-in-flight across microbatches must not corrupt decode KV."""
         execute_scripted_runtime(
@@ -128,7 +125,6 @@ class TestScriptedPP(CustomTestCase):
             f"len(output_tokens)={len(r.output_tokens)}"
         )
 
-    @unittest.skip("requires real pp_size>1 topology — wire up when fixture lands")
     def test_pp_multi_microbatch_chunks_done_aggregation(self):
         """PP=2 single chunked req across 4+ chunks aggregates chunks_done correctly."""
         execute_scripted_runtime(
@@ -156,7 +152,6 @@ class TestScriptedPP(CustomTestCase):
         )
         assert r.finish_event_count == 1
 
-    @unittest.skip("requires real pp_size=4 topology — wire up when fixture lands")
     def test_pp_size_4_chunked_completes(self):
         """PP=4 long chunked req completes with no microbatch residue."""
         execute_scripted_runtime(
@@ -180,7 +175,6 @@ class TestScriptedPP(CustomTestCase):
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 
-    @unittest.skip("requires real pp_size>1 topology — wire up when fixture lands")
     def test_pp_two_chunked_one_per_mb_simultaneous(self):
         """PP=2 with one chunked req per microbatch — both complete; per-mb in-flight bounded."""
         execute_scripted_runtime(
@@ -211,7 +205,6 @@ class TestScriptedPP(CustomTestCase):
         yield from run_until_all_finished(handles=[r1, r2], max_steps=800)
         assert r1.finished and r2.finished
 
-    @unittest.skip("requires real pp_size>1 topology — wire up when fixture lands")
     def test_pp_retract_chunked_in_middle_mb(self):
         """PP=2 retract of chunked req mid-mb cleans cross-mb exclude set."""
         execute_scripted_runtime(
@@ -236,7 +229,6 @@ class TestScriptedPP(CustomTestCase):
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 
-    @unittest.skip("requires real pp_size>1 topology — wire up when fixture lands")
     def test_pp_chunked_req_to_exclude_pp_context(self):
         """PP last_batch.chunked_req stale pointer must be excluded from new batch."""
         execute_scripted_runtime(
@@ -263,9 +255,6 @@ class TestScriptedPP(CustomTestCase):
         yield from run_until_finished(r2, max_steps=400)
         assert r2.finished
 
-    @unittest.skip(
-        "requires real pp_size>1 + pdmux topology — wire up when fixture lands"
-    )
     def test_pp_split_prefill_chunked_no_merge_assert(self):
         """PP=2 + pdmux split-prefill + chunked must not trip merge_batch assert."""
         execute_scripted_runtime(
@@ -306,9 +295,6 @@ class TestScriptedPP(CustomTestCase):
                 f"{stats['merge_batch_assert_violations']}"
             )
 
-    @unittest.skip(
-        "requires real pp_size>1 + dynamic chunking telemetry — wire up when fixture lands"
-    )
     def test_pp_dynamic_chunking_predictor(self):
         """PP=2 + dynamic chunking — last_chunked_prefill_size set per iter by predictor."""
         execute_scripted_runtime(
