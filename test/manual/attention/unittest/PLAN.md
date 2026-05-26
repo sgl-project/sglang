@@ -358,6 +358,10 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Added FA3 and FA4 production EAGLE draft graph-runner coverage:
+  `run_dense_eagle_draft_cuda_graph_runner_case` (chain `topk=1`) and
+  `run_dense_eagle_draft_extend_v2_cuda_graph_runner_case` in both
+  `dense/test_fa3.py` and `dense/test_fa4.py`.
 - Added FA3 and FA4 EAGLE `DRAFT_EXTEND` (V1) eager + CUDA-graph
   replay coverage in `dense/test_fa3.py` and `dense/test_fa4.py`.
   Reuses the shared `run_dense_eagle_draft_extend_case` /
