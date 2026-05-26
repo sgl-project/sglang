@@ -171,6 +171,12 @@ Implemented:
   reference-output adapters live in the attention-method helper files rather than
   in the CUDA graph runner. GDN only supplies the recurrent-cache snapshot and
   restore hooks from the runner side.
+- Speculative runner helpers are split by speculative forward mode:
+  `common/target_verify.py` owns `TARGET_VERIFY` custom-mask/retrieve-index
+  metadata and verify graph replay, while `common/draft_extend.py` owns
+  `DRAFT_EXTEND`/`DRAFT_EXTEND_V2` accepted-token metadata and draft graph
+  replay. `common/spec_runner.py` remains only as a small compatibility re-export
+  shim; in-tree tests import the split modules directly.
 - RoPE is intentionally omitted from the current unit-level runner x attention
   tests. These tests feed post-RoPE-equivalent Q/K tensors because rotary math is
   orthogonal to runner/backend metadata compatibility.
@@ -181,8 +187,15 @@ In progress:
   `DRAFT_EXTEND_V2` has representative dense/MLA Triton CUDA graph replay cases;
   the next draft-runner slice should model multi-step draft backends and per-step
   buffer handoff more directly.
+- The production `EAGLEDraftCudaGraphRunner` class path is not covered yet. The
+  current Phase 4 graph-style tests validate attention-backend metadata capture
+  and replay around synthetic EAGLE draft inputs, but they do not instantiate the
+  decode draft runner used by `EAGLEWorker`/`EAGLEWorkerV2`.
 
 Next implementation steps:
+- Add a focused `EAGLEDraftCudaGraphRunner` fixture that captures with a fixed
+  forward batch and replays distinct draft metadata/input tensors, then compare
+  against the HF-style reference path used by the attention-method fixtures.
 - Finish Phase 4 `DRAFT_EXTEND_V2` / multi-layer draft-runner coverage for
   representative valid backends before broadening the speculative matrix.
 - Expand Phase 2 to additional attention methods/backends with method-specific
@@ -196,6 +209,14 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
+- Split speculative helpers into:
+  - `common/target_verify.py` for `TARGET_VERIFY` inputs and graph replay
+  - `common/draft_extend.py` for `DRAFT_EXTEND`/`DRAFT_EXTEND_V2` inputs and graph
+    replay
+  - `common/spec_runner.py` as a compatibility re-export shim only
+- `python -m py_compile test/manual/attention/unittest/common/target_verify.py test/manual/attention/unittest/common/draft_extend.py test/manual/attention/unittest/common/spec_runner.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/mla/test_triton.py test/manual/attention/unittest/mla/test_flashinfer.py test/manual/attention/unittest/mla/test_flashmla.py test/manual/attention/unittest/gdn/test_triton.py test/manual/attention/unittest/gdn/test_flashinfer.py`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+  - Ran 61 tests in 22.377s after splitting speculative helpers.
 - Added per-attention-method capability summaries:
   - `dense/README.md`, `swa/README.md`, `mla/README.md`, `gdn/README.md`
   - Placeholder method packages: `dual_chunk/`, `dsa/`, `dsv4/`

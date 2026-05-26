@@ -16,11 +16,11 @@ from common.gdn_attention import (
     make_gdn_cases,
     run_gdn_attention_case,
 )
-from common.spec_runner import (
+from common.split_op_runner import run_gdn_split_op_extend_case
+from common.target_verify import (
     run_gdn_eagle_verify_case,
     run_gdn_eagle_verify_cuda_graph_case,
 )
-from common.split_op_runner import run_gdn_split_op_extend_case
 
 
 @unittest.skipIf(

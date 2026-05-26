@@ -16,13 +16,15 @@ from common.dense_attention import (
     make_dense_cases,
     run_dense_attention_case,
 )
-from common.spec_runner import (
+from common.draft_extend import (
     run_dense_draft_extend_cuda_graph_case,
     run_dense_eagle_draft_extend_case,
+)
+from common.split_op_runner import run_dense_split_op_extend_case
+from common.target_verify import (
     run_dense_spec_verify_case,
     run_dense_spec_verify_cuda_graph_case,
 )
-from common.split_op_runner import run_dense_split_op_extend_case
 
 
 @unittest.skipIf(

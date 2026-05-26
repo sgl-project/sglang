@@ -15,12 +15,12 @@ from common.dense_attention import (
     make_dense_cases,
     run_dense_attention_case,
 )
-from common.spec_runner import (
-    run_dense_draft_extend_v2_cuda_graph_case,
+from common.draft_extend import run_dense_draft_extend_v2_cuda_graph_case
+from common.split_op_runner import run_dense_split_op_extend_case
+from common.target_verify import (
     run_dense_spec_verify_case,
     run_dense_spec_verify_cuda_graph_case,
 )
-from common.split_op_runner import run_dense_split_op_extend_case
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
