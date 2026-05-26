@@ -10,8 +10,8 @@ P2 (12)).
 
 import unittest
 
-from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
+from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
@@ -19,21 +19,19 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until_all_finished,
     run_until_finished,
 )
-from sglang.test.test_utils import CustomTestCase
 
 
-class TestScriptedDPAttention(CustomTestCase):
+class TestDPAttnBasic(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(
+        tp_size=2,
+        dp_size=2,
+        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        enable_dp_attention=True,
+    )
+
     def test_naive_dp_attention_chunked(self):
         """DP attention × chunked: naive ScriptedRuntime smoke."""
-        execute_scripted_runtime(
-            self._script_naive_dp_attention_chunked,
-            **base_engine_kwargs(
-                tp_size=2,
-                dp_size=2,
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-                enable_dp_attention=True,
-            ),
-        )
+        self.runtime.run(self._script_naive_dp_attention_chunked)
 
     @staticmethod
     def _script_naive_dp_attention_chunked(t: ScriptedRuntime):
@@ -44,15 +42,7 @@ class TestScriptedDPAttention(CustomTestCase):
 
     def test_dp_chunked_on_one_rank_other_idle(self):
         """DP rank 0 chunked, rank 1 fully idle — rank 1 must not block rank 0."""
-        execute_scripted_runtime(
-            self._script_dp_chunked_on_one_rank_other_idle,
-            **base_engine_kwargs(
-                tp_size=2,
-                dp_size=2,
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-                enable_dp_attention=True,
-            ),
-        )
+        self.runtime.run(self._script_dp_chunked_on_one_rank_other_idle)
 
     # DP rank imbalance — rank 0 has a long chunked req while
     # rank 1 stays idle; rank 1 must not block the chunked progress on
@@ -71,15 +61,7 @@ class TestScriptedDPAttention(CustomTestCase):
 
     def test_dp_two_chunked_one_per_rank(self):
         """DP one chunked req per rank with different chunk sizes — chunks_done tracked per rank."""
-        execute_scripted_runtime(
-            self._script_dp_two_chunked_one_per_rank,
-            **base_engine_kwargs(
-                tp_size=2,
-                dp_size=2,
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-                enable_dp_attention=True,
-            ),
-        )
+        self.runtime.run(self._script_dp_two_chunked_one_per_rank)
 
     # Per-rank chunked reqs with different sizes — each rank
     # tracks its own chunks_done; ranks must not cross-contaminate.
@@ -99,15 +81,7 @@ class TestScriptedDPAttention(CustomTestCase):
 
     def test_dp_chunked_completion_skew(self):
         """DP rank 0 finishes while rank 1 still chunking — broadcast stays consistent."""
-        execute_scripted_runtime(
-            self._script_dp_chunked_completion_skew,
-            **base_engine_kwargs(
-                tp_size=2,
-                dp_size=2,
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-                enable_dp_attention=True,
-            ),
-        )
+        self.runtime.run(self._script_dp_chunked_completion_skew)
 
     # DP completion skew — rank 0 finishes early; rank 1 keeps
     # chunking. The cross-rank broadcast must stay consistent and rank 0
