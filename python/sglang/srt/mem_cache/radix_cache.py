@@ -313,6 +313,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
         self.evictable_leaves = set()
+        self._chunked_inc_hit_count_skip_count: int = 0
         self.reset()
 
     @classmethod
@@ -696,6 +697,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         # inflation where a chunked request increments hit_count on nodes it created
         # in previous chunks.
         if chunked:
+            self._chunked_inc_hit_count_skip_count += 1
             return
         node.hit_count += 1
 
