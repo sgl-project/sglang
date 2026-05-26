@@ -4,28 +4,113 @@ on:
     tags:
       - 'v[0-9]+.*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version to publish (e.g. v0.5.11). Overrides setuptools-scm.'
+        required: true
+        type: string
 
 jobs:
-  publish:
+  build:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: ubuntu-latest
-    environment: "prod"
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: x64-docker-build-node
+          - arch: aarch64
+            runner: arm-docker-build-node
+    runs-on: ${{ matrix.runner }}
     steps:
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.10"
+      # Self-hosted build nodes retain the workspace across jobs. Prior builds
+      # leave root-owned artifacts behind that actions/checkout cannot remove,
+      # causing EACCES on rmdir. Wipe them via a throwaway root container.
+      - name: Clean workspace (remove root-owned files from prior runs)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
 
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0  # Required for setuptools-scm to determine version from tags
+          submodules: "recursive"
 
-      - name: Upload to pypi
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Needed by setuptools-rust to build the bundled native gRPC extension
+      # (rust/sglang-grpc) when `python -m build` builds the sglang wheel.
+      - name: Install protoc
+        run: sudo bash scripts/ci/utils/install_protoc.sh
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build wheel
+        env:
+          # When triggered manually, pin the wheel version to the supplied
+          # input (strip leading `v`) so setuptools-scm doesn't derive a
+          # `.devN+gHASH` version from the branch HEAD.
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
           cd python
           cp ../README.md ../LICENSE .
-          pip install build wheel setuptools setuptools-scm
-          python3 -m build
+          pip install build wheel setuptools setuptools-scm setuptools-rust
+          if [ -n "$RELEASE_VERSION" ]; then
+            export SETUPTOOLS_SCM_PRETEND_VERSION="${RELEASE_VERSION#v}"
+            echo "Pinning wheel version to $SETUPTOOLS_SCM_PRETEND_VERSION"
+          fi
+          python3 -m build --wheel
+
+      # PyPI rejects plain `linux_x86_64` / `linux_aarch64` platform tags;
+      # auditwheel rewrites the wheel's platform tag to a `manylinux_*` tag
+      # and bundles any external native deps. The runner's glibc determines
+      # the lowest acceptable manylinux policy.
+      - name: Repair wheel for manylinux
+        run: |
+          cd python
+          pip install auditwheel patchelf
+          mkdir -p dist-repaired
+          python3 -m auditwheel repair dist/*.whl -w dist-repaired/
+          rm dist/*.whl
+          mv dist-repaired/*.whl dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-py${{ matrix.python-version }}-${{ matrix.arch }}
+          path: python/dist/*.whl
+
+  publish:
+    needs: build
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    environment: "prod"
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+          pattern: wheel-*
+
+      - name: List wheels
+        run: ls -lh dist/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Upload to pypi
+        run: |
           pip install twine
-          python3 -m twine upload dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}
+          # --skip-existing makes partial reruns safe (e.g. one arch failed,
+          # rerun only the failed shard without re-uploading already-published wheels).
+          python3 -m twine upload --skip-existing dist/*.whl -u __token__ -p ${{ secrets.PYPI_TOKEN }}

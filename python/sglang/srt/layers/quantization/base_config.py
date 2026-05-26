@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/base_config.py
 from __future__ import annotations
 
@@ -10,6 +12,7 @@ from torch import nn
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+    from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.models.utils import WeightsMapper
 
@@ -105,6 +108,19 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
         raise NotImplementedError
+
+    def get_triton_quant_info(self, layer: torch.nn.Module) -> "TritonMoeQuantInfo":
+        """Return a ``TritonMoeQuantInfo`` describing the quantisation state
+        stored on *layer*.
+
+        The LoRA MoE runner calls this so that ``invoke_fused_moe_kernel``
+        receives the correct flags / scales / block-shape for the base
+        weights.  Each quantisation method must override this with the
+        same construction it already uses inside ``apply()``.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement get_triton_quant_info()"
+        )
 
 
 class QuantizationConfig(ABC):
