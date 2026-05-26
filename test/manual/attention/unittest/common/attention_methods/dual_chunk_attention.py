@@ -269,7 +269,11 @@ class DualChunkMockModelRunner(ModelRunner):
         device: str,
         max_context_len: int,
         head_dim: int,
+        disable_cuda_graph: bool = True,
+        disable_piecewise_cuda_graph: bool = True,
+        runner_batch_size: int | None = None,
     ):
+        pool_batch_size = runner_batch_size or case.batch_size
         self.device = device
         self.dtype = dtype
         self.kv_cache_dtype = dtype
@@ -282,8 +286,8 @@ class DualChunkMockModelRunner(ModelRunner):
         self.server_args = SimpleNamespace(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=True,
-            disable_piecewise_cuda_graph=True,
+            disable_cuda_graph=disable_cuda_graph,
+            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
             disable_radix_cache=False,
             dp_size=1,
             enable_dp_attention=False,
@@ -298,12 +302,12 @@ class DualChunkMockModelRunner(ModelRunner):
         )
         set_global_server_args_for_scheduler(self.server_args)
         self.req_to_token_pool = ReqToTokenPool(
-            size=case.batch_size,
+            size=pool_batch_size,
             max_context_len=max_context_len,
             device=device,
             enable_memory_saver=False,
         )
-        max_token_loc = case.page_size + case.batch_size * max_context_len
+        max_token_loc = case.page_size + pool_batch_size * max_context_len
         self.token_to_kv_pool = MHATokenToKVPool(
             size=max_token_loc + case.page_size,
             page_size=case.page_size,
@@ -544,6 +548,9 @@ def build_dual_chunk_attention_fixture(
     dtype: torch.dtype = DEFAULT_DTYPE,
     device: str = DEFAULT_DEVICE,
     dual_chunk_attention_config: dict | None = None,
+    disable_cuda_graph: bool = True,
+    disable_piecewise_cuda_graph: bool = True,
+    runner_batch_size: int | None = None,
 ) -> DualChunkAttentionFixture:
     max_context_len = max(max_context_len, max(case.seq_lens))
     if max_context_len % case.page_size:
@@ -570,6 +577,9 @@ def build_dual_chunk_attention_fixture(
         device=device,
         max_context_len=max_context_len,
         head_dim=head_dim,
+        disable_cuda_graph=disable_cuda_graph,
+        disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+        runner_batch_size=runner_batch_size,
     )
     try:
         backend = ATTENTION_BACKENDS[case.backend](runner)
@@ -815,3 +825,161 @@ def run_dual_chunk_sparse_threshold_gated_case(
     actual = run_dual_chunk_fixture_eager(fixture)
     expected = expected_dual_chunk_fixture_output(fixture)
     torch.testing.assert_close(actual, expected, atol=DENSE_ATOL, rtol=DENSE_RTOL)
+
+
+# ---------------------------------------------------------------------------
+# Runner-mode helpers (mirror dense conventions; dual-chunk wraps RadixAttention
+# so the K-write happens via `save_kv_cache=True` inside the backend forward).
+# ---------------------------------------------------------------------------
+
+
+def make_dual_chunk_case_with_prefix_lens(
+    case: DualChunkAttentionCase,
+    name: str,
+    prefix_lens: tuple[int, ...],
+) -> DualChunkAttentionCase:
+    if case.forward_mode.is_decode():
+        extend_lens: tuple[int, ...] = ()
+    else:
+        base = case.extend_lens or (1,)
+        if len(prefix_lens) <= len(base):
+            extend_lens = base[: len(prefix_lens)]
+        else:
+            extend_lens = base + (base[-1],) * (len(prefix_lens) - len(base))
+    return DualChunkAttentionCase(
+        name=name,
+        backend=case.backend,
+        forward_mode=case.forward_mode,
+        num_heads=case.num_heads,
+        num_kv_heads=case.num_kv_heads,
+        page_size=case.page_size,
+        prefix_lens=prefix_lens,
+        extend_lens=extend_lens,
+    )
+
+
+def dual_chunk_fixture_inputs(
+    fixture: DualChunkAttentionFixture,
+) -> dict:
+    return {
+        "prefix_hidden": fixture.prefix_hidden,
+        "input_hidden": fixture.input_hidden,
+    }
+
+
+def make_dual_chunk_random_inputs(
+    case: DualChunkAttentionCase,
+    fixture: DualChunkAttentionFixture,
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> dict:
+    hidden_size = fixture.actual_module.hidden_size
+    prefix_hidden = [
+        torch.randn(length, hidden_size, dtype=dtype, device=device)
+        for length in case.prefix_lens
+    ]
+    input_hidden = torch.randn(
+        case.num_input_tokens, hidden_size, dtype=dtype, device=device
+    )
+    return {"prefix_hidden": prefix_hidden, "input_hidden": input_hidden}
+
+
+def make_dual_chunk_replay_inputs(
+    case: DualChunkAttentionCase,
+    fixture: DualChunkAttentionFixture,
+    pad_prefix_lens: tuple[int, ...],
+    base_inputs: dict,
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> dict:
+    """Pad the base inputs with random prefix/input hidden for the trailing
+    padding requests so the replay batch matches the capture-batch shape."""
+    hidden_size = fixture.actual_module.hidden_size
+    pad_prefix_hidden = [
+        torch.randn(length, hidden_size, dtype=dtype, device=device)
+        for length in pad_prefix_lens
+    ]
+    extra_input_tokens = case.num_input_tokens - base_inputs["input_hidden"].shape[0]
+    if extra_input_tokens < 0:
+        raise ValueError("padded case must have at least as many input tokens as base.")
+    pad_input_hidden = torch.randn(
+        extra_input_tokens, hidden_size, dtype=dtype, device=device
+    )
+    return {
+        "prefix_hidden": base_inputs["prefix_hidden"] + pad_prefix_hidden,
+        "input_hidden": torch.cat(
+            [base_inputs["input_hidden"], pad_input_hidden], dim=0
+        ),
+    }
+
+
+def prepare_dual_chunk_runner_inputs(
+    fixture: DualChunkAttentionFixture,
+    case: DualChunkAttentionCase,
+    batch: ForwardBatch,
+    inputs: dict,
+    *,
+    max_context_len: int,
+) -> None:
+    """Rebind inputs on the fixture, set `batch.orig_seq_lens` (dual-chunk
+    reads it during forward), and re-populate prefix K cache for the
+    (possibly re-shaped) case."""
+    fixture.case = case
+    fixture.forward_batch = batch
+    fixture.prefix_hidden = inputs["prefix_hidden"]
+    fixture.input_hidden = inputs["input_hidden"]
+    _set_orig_seq_lens(batch, case)
+    _populate_prefix_kv(
+        fixture.actual_module,
+        case,
+        fixture.runner,
+        fixture.prefix_hidden,
+        max_context_len=max_context_len,
+    )
+
+
+def run_dual_chunk_forward(
+    fixture: DualChunkAttentionFixture,
+    batch: ForwardBatch,
+    inputs: dict,
+) -> torch.Tensor:
+    return fixture.actual_module(inputs["input_hidden"], batch)
+
+
+def expected_dual_chunk_output_from_inputs(
+    fixture: DualChunkAttentionFixture,
+    case: DualChunkAttentionCase,
+    inputs: dict,
+    state,
+) -> torch.Tensor:
+    del state
+    return _dual_chunk_attention_reference(
+        fixture.reference_module,
+        case,
+        inputs["prefix_hidden"],
+        inputs["input_hidden"],
+    )
+
+
+def dual_chunk_attention_layers(fixture: DualChunkAttentionFixture) -> list:
+    return [fixture.actual_module.attn]
+
+
+def _clone_dual_chunk_cache(fixture: DualChunkAttentionFixture):
+    """Snapshot the layer's K cache buffer. Dual-chunk writes K cache via
+    `set_kv_buffer` at decode time, so the capture forward's K write
+    persists into replay; the snapshot lets us roll it back."""
+    layer_id = fixture.actual_module.attn.layer_id
+    kv_buf = fixture.runner.token_to_kv_pool.get_key_buffer(layer_id)
+    v_buf = fixture.runner.token_to_kv_pool.get_value_buffer(layer_id)
+    return (kv_buf.clone(), v_buf.clone())
+
+
+def _restore_dual_chunk_cache(
+    fixture: DualChunkAttentionFixture, state
+) -> None:
+    layer_id = fixture.actual_module.attn.layer_id
+    fixture.runner.token_to_kv_pool.get_key_buffer(layer_id).copy_(state[0])
+    fixture.runner.token_to_kv_pool.get_value_buffer(layer_id).copy_(state[1])
