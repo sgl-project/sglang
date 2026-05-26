@@ -37,6 +37,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_xpu,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ global _use_multi_stream
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
@@ -63,6 +65,10 @@ if _is_cuda:
         import deep_gemm
     except ImportError as e:
         deep_gemm = e
+
+if _is_xpu:
+    from sgl_kernel import fp8_mqa_logits as sgl_fp8_mqa_logits
+    from sgl_kernel import fp8_paged_mqa_logits as sgl_fp8_paged_mqa_logits
 
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
@@ -248,6 +254,10 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     # from sgl_kernel import hadamard_transform
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
+    elif _is_xpu:
+        from sglang.srt.hardware_backend.xpu.kernels.dsa.hadamard_transform import (
+            hadamard_transform,
+        )
     else:
         from sglang.jit_kernel.hadamard import hadamard_transform
 
@@ -546,6 +556,11 @@ class Indexer(MultiPlatformOp):
                 assert (
                     page_size == 1
                 ), f"HIP legacy DSA path requires page_size == 1, got {page_size}"
+        elif _is_xpu:
+            assert page_size in (
+                64,
+                128,
+            ), f"XPU DSA only supports page_size 64 or 128, got {page_size}"
         else:
             assert page_size == 64, "only support page size 64"
         # NOTE(dark): this support extend/decode/decode+graph
@@ -618,6 +633,17 @@ class Indexer(MultiPlatformOp):
                 max_seq_len,
                 Preshuffle=_use_aiter_preshuffle,
                 KVBlockSize=block_kv,
+            )
+        elif _is_xpu:
+            logits = sgl_fp8_paged_mqa_logits(
+                q_fp8[:q_offset],
+                kv_cache_fp8,
+                weights[:q_offset],
+                seqlens_32_2d,
+                block_tables,
+                None,
+                max_seq_len,
+                clean_logits=False,
             )
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
@@ -795,6 +821,15 @@ class Indexer(MultiPlatformOp):
                     logits = fp8_mqa_logits(
                         q_fp8[:q_offset], kv, scale, weights[:q_offset], ks, ke
                     )
+                elif _is_xpu:
+                    logits = sgl_fp8_mqa_logits(
+                        q_fp8[:q_offset],
+                        kv_fp8,
+                        weights[:q_offset],
+                        ks,
+                        ke,
+                        clean_logits=False,
+                    )
                 else:
                     logits = deep_gemm.fp8_mqa_logits(
                         q_fp8[:q_offset],
@@ -844,6 +879,15 @@ class Indexer(MultiPlatformOp):
                         weights[start:end],
                         ks[start:end],
                         ke[start:end],
+                    )
+                elif _is_xpu:
+                    logits_chunk = sgl_fp8_mqa_logits(
+                        q_fp8[start:end],
+                        kv_fp8,
+                        weights[start:end],
+                        ks[start:end],
+                        ke[start:end],
+                        clean_logits=False,
                     )
                 else:
                     logits_chunk = deep_gemm.fp8_mqa_logits(
@@ -1267,6 +1311,10 @@ class Indexer(MultiPlatformOp):
     ) -> Optional[torch.Tensor]:
         if _is_hip:
             from sglang.srt.layers.attention.dsa.tilelang_kernel import act_quant
+        elif _is_xpu:
+            from sglang.srt.hardware_backend.xpu.kernels.dsa.act_quant import (
+                act_quant,
+            )
         elif not _is_npu:
             from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
 
@@ -1421,7 +1469,7 @@ class Indexer(MultiPlatformOp):
             else:
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
 
-        if _is_cuda or _is_hip:
+        if _is_cuda or _is_hip or _is_xpu:
             # In piecewise CUDA graph, any access to seq_lens_cpu creates a Dynamo shape guard.
             # Piecewise CUDA graph never has empty batches.
             if not is_in_piecewise_cuda_graph():
