@@ -1,17 +1,4 @@
-"""Smoke test for ScriptedRuntime.
-
-Verifies the basic generator-driven mechanism end-to-end:
-1. An Engine launches with a scripted_runtime config.
-2. The scheduler subprocess constructs a ScriptedRuntime, runs the
-   provided script generator.
-3. The script can submit a request via ``start_req``, advance the
-   scheduler with ``yield``, and read back status via ReqHandle.
-4. When the generator returns, all ranks exit cleanly and the test
-   process unblocks without an exception.
-
-The script function is intentionally underscore-prefixed so unittest
-discovery does not mistake it for a test method.
-"""
+"""Minimal end-to-end smoke test for ScriptedRuntime."""
 
 import unittest
 
@@ -21,13 +8,9 @@ from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTest
 
 def _smoke_script(t: ScriptedRuntime):
     r1 = t.start_req(prompt_len=10, max_new_tokens=4)
-    yield  # let the scheduler pick up the injected request
-    yield  # one more step so it has a chance to enter running
-    assert r1.status in (
-        "waiting",
-        "running",
-        "unknown",
-    ), f"unexpected status: {r1.status!r}"
+    yield
+    yield
+    assert r1.status in ("waiting", "running", "unknown")
 
 
 class TestScriptedRuntimeSmoke(CustomTestCase):
