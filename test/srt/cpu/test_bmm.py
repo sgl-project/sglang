@@ -49,12 +49,16 @@ class TestBmm(CustomTestCase):
         mat2_t = mat2.transpose_(1, 2)
         mat3.zero_()
         torch.ops.sgl_kernel.bmm_cpu(mat3, mat1, mat2, False, None)
+        self.assertEqual(mat3.shape, (B, M, N))
+        self.assertEqual(mat3.dtype, dtype)
         atol = rtol = precision[ref.dtype]
         torch.testing.assert_close(ref, mat3, atol=atol, rtol=rtol)
 
         packed_B = torch.ops.sgl_kernel.convert_weight_packed(mat2_t)
         mat3.zero_()
         torch.ops.sgl_kernel.bmm_cpu(mat3, mat1, packed_B, True, None)
+        self.assertEqual(mat3.shape, (B, M, N))
+        self.assertEqual(mat3.dtype, dtype)
         torch.testing.assert_close(ref, mat3, atol=atol, rtol=rtol)
 
     def _fp8_bmm(self, B, M, N, K, chunk, dtype=torch.bfloat16):
@@ -65,11 +69,15 @@ class TestBmm(CustomTestCase):
         mat3.zero_()
         atol = rtol = precision[ref.dtype]
         torch.ops.sgl_kernel.bmm_cpu(mat3, mat1, mat2_q_t, False, mat2_s)
+        self.assertEqual(mat3.shape, (B, M, N))
+        self.assertEqual(mat3.dtype, dtype)
         torch.testing.assert_close(ref, mat3, atol=atol, rtol=rtol)
 
         packed_B_q = torch.ops.sgl_kernel.convert_weight_packed(mat2_q_t)
         mat3.zero_()
         torch.ops.sgl_kernel.bmm_cpu(mat3, mat1, packed_B_q, True, mat2_s)
+        self.assertEqual(mat3.shape, (B, M, N))
+        self.assertEqual(mat3.dtype, dtype)
         torch.testing.assert_close(ref, mat3, atol=atol, rtol=rtol)
 
     def test_bmm(self):

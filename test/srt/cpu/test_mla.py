@@ -118,6 +118,9 @@ class TestMLA(CustomTestCase):
             False,
             None,
         )
+        self.assertEqual(o.shape, (B, H_Q, D_V))
+        self.assertEqual(o.dtype, dtype)
+        self.assertEqual(attn_logits.dtype, torch.float32)
 
         self._run_sdpa_forward_decode(
             q,
@@ -144,6 +147,7 @@ class TestMLA(CustomTestCase):
 
     def test_grouped_decode_attention(self):
         configs = [
+            (1, 1, 1, 16, 16, 1),
             (1, 22, 1, 576, 512, 8 * 111),
             (4, 22, 1, 576, 512, 8 * 128),
             (40, 22, 1, 576, 512, 8 * 133),
