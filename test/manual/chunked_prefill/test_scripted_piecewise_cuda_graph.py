@@ -17,8 +17,8 @@ capture machinery is actually exercised.
 
 import unittest
 
-from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
+from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
@@ -26,22 +26,20 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until,
     run_until_finished,
 )
-from sglang.test.test_utils import CustomTestCase
 
 
-class TestScriptedPiecewiseCG(CustomTestCase):
+class TestPiecewiseBasic(ScriptedRuntimeTestCase):
+    # Deliberately do not pass disable_cuda_graph=True so piecewise
+    # capture runs; ``base_engine_kwargs`` defaults it off for
+    # compatibility with all the other tests, so override here.
+    ENGINE_KWARGS = base_engine_kwargs(
+        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        disable_cuda_graph=False,
+    )
+
     def test_naive_piecewise_cg_chunked(self):
         """Piecewise CUDA graph capture runs alongside chunked prefill."""
-        # Note: deliberately *do not* pass disable_cuda_graph=True so
-        # piecewise capture runs; ``base_engine_kwargs`` defaults it off
-        # for compatibility with all the other tests, so override here.
-        execute_scripted_runtime(
-            self._script_naive_piecewise_cg_chunked,
-            **base_engine_kwargs(
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-                disable_cuda_graph=False,
-            ),
-        )
+        self.runtime.run(self._script_naive_piecewise_cg_chunked)
 
     @staticmethod
     def _script_naive_piecewise_cg_chunked(t: ScriptedRuntime):
@@ -50,44 +48,11 @@ class TestScriptedPiecewiseCG(CustomTestCase):
         assert r.finished
         assert r.chunks_done >= 2
 
-    def test_piecewise_cg_chunk_size_misses_bucket(self):
-        """Chunk size that hits no captured graph bucket still completes via fallback or next-larger bucket."""
-        # Pick a chunk size that is unlikely to be a captured bucket
-        # boundary (most captures use powers-of-two / multiples of 64).
-        odd_chunk_size: int = 257
-        execute_scripted_runtime(
-            self._script_piecewise_cg_chunk_size_misses_bucket,
-            **base_engine_kwargs(
-                chunked_prefill_size=odd_chunk_size,
-                disable_cuda_graph=False,
-            ),
-        )
-
-    # chunk_size deliberately falls between captured
-    # graph buckets — the piecewise dispatcher must fall back to
-    # eager or to the next-larger bucket. Either path is fine; the
-    # request must still complete cleanly with no graph-capture crash.
-    @staticmethod
-    def _script_piecewise_cg_chunk_size_misses_bucket(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
-        yield from run_until_finished(r, max_steps=800)
-        assert r.finished
-        # Prompt > 8x chunk_size still produces many chunks even with
-        # a bucket-missing size; we just need >=2 to confirm the path.
-        assert r.chunks_done >= 2
-
     def test_piecewise_cg_tail_chunk_tiny(self):
         """Tail chunk of exactly 1 token still runs under piecewise CUDA graph."""
         # prompt_len = N*chunk_size + 1 produces a final tail chunk of
         # exactly 1 token after N full chunks.
-        prompt_len: int = 4 * DEFAULT_CHUNK_SIZE + 1
-        execute_scripted_runtime(
-            self._script_piecewise_cg_tail_chunk_tiny,
-            **base_engine_kwargs(
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-                disable_cuda_graph=False,
-            ),
-        )
+        self.runtime.run(self._script_piecewise_cg_tail_chunk_tiny)
 
     # Tiny tail chunk = 1 token. Piecewise capture
     # typically does not have a bucket for extend_len=1; the
@@ -104,16 +69,43 @@ class TestScriptedPiecewiseCG(CustomTestCase):
         # is the path under test.
         assert r.chunks_done >= 4
 
+
+class TestPiecewiseMissesBucket(ScriptedRuntimeTestCase):
+    # Pick a chunk size that is unlikely to be a captured bucket
+    # boundary (most captures use powers-of-two / multiples of 64).
+    ENGINE_KWARGS = base_engine_kwargs(
+        chunked_prefill_size=257,
+        disable_cuda_graph=False,
+    )
+
+    def test_piecewise_cg_chunk_size_misses_bucket(self):
+        """Chunk size that hits no captured graph bucket still completes via fallback or next-larger bucket."""
+        self.runtime.run(self._script_piecewise_cg_chunk_size_misses_bucket)
+
+    # chunk_size deliberately falls between captured
+    # graph buckets — the piecewise dispatcher must fall back to
+    # eager or to the next-larger bucket. Either path is fine; the
+    # request must still complete cleanly with no graph-capture crash.
+    @staticmethod
+    def _script_piecewise_cg_chunk_size_misses_bucket(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
+        yield from run_until_finished(r, max_steps=800)
+        assert r.finished
+        # Prompt > 8x chunk_size still produces many chunks even with
+        # a bucket-missing size; we just need >=2 to confirm the path.
+        assert r.chunks_done >= 2
+
+
+class TestPiecewiseDynamicChunking(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(
+        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        disable_cuda_graph=False,
+        enable_dynamic_chunking=True,
+    )
+
     def test_piecewise_cg_retract_resume_different_bucket(self):
         """Retract then resume lands the resumed chunk in a different graph bucket."""
-        execute_scripted_runtime(
-            self._script_piecewise_cg_retract_resume_different_bucket,
-            **base_engine_kwargs(
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-                disable_cuda_graph=False,
-                enable_dynamic_chunking=True,
-            ),
-        )
+        self.runtime.run(self._script_piecewise_cg_retract_resume_different_bucket)
 
     # Force a retract mid-chunk; on resume the dynamic
     # chunker may pick a different size (different bucket). Piecewise
@@ -132,14 +124,7 @@ class TestScriptedPiecewiseCG(CustomTestCase):
 
     def test_piecewise_cg_dynamic_chunking_bucket_walk(self):
         """Dynamic chunking iterates several distinct chunk sizes — each hits or falls back cleanly."""
-        execute_scripted_runtime(
-            self._script_piecewise_cg_dynamic_chunking_bucket_walk,
-            **base_engine_kwargs(
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-                disable_cuda_graph=False,
-                enable_dynamic_chunking=True,
-            ),
-        )
+        self.runtime.run(self._script_piecewise_cg_dynamic_chunking_bucket_walk)
 
     # Dynamic chunking predictor emits a sequence of chunk
     # sizes as the batch shape evolves. Each chunk size dispatches to
