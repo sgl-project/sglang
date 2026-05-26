@@ -79,7 +79,7 @@ def _script_add_chunked_req_path(t: ScriptedRuntime):
 # early-return (scheduler.py:2544-2548). The flag flips between True
 # and False as ``add_chunked_req`` succeeds vs early-returns.
 #
-# Requires hybrid SWA model — see test_feature_hybrid_swa.py.
+# Requires hybrid SWA model — see test_scripted_hybrid_swa.py.
 def _script_chunked_scheduled_last_iter_flag(t: ScriptedRuntime):
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     yield from run_until_finished(r)

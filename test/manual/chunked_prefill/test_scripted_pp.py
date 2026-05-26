@@ -6,7 +6,7 @@ chunked req crosses microbatch boundaries.
 
 Asserts the request reaches ``finished`` and went through ≥ 2 chunks.
 Does not attempt to reproduce the 309b6dc last-chunk-in-flight race —
-that lives in ``test_regression_309b6dc.py``.
+that lives in ``test_scripted_regression_309b6dc.py``.
 
 Requires 4 GPUs. ScriptedRuntime must support ``pp_size > 1`` / ``tp_size > 1``
 (see wishlist §4 P2 (12)).

@@ -7,7 +7,7 @@ deadlock that previously kept it stuck in waiting_queue.
 
 This is a *smoke* — it doesn't deliberately trigger the drainer. The
 deliberate drainer-deadlock regression lives in
-``test_regression_309b6dc.py``.
+``test_scripted_regression_309b6dc.py``.
 """
 
 import unittest

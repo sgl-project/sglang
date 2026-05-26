@@ -1,7 +1,7 @@
 """Commit-history regression — extra coverage.
 
 Covers category C from the expansion plan: commits from the 309b6dc
-window that were NOT picked up by the round-1 ``test_regression_309b6dc.py``
+window that were NOT picked up by the round-1 ``test_scripted_regression_309b6dc.py``
 (~15 new regressions). Each test mirrors one commit's bug shape.
 
 These tests reference upstream commit SHAs in the docstrings — when

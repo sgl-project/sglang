@@ -3,7 +3,7 @@
 HiSparse staging DMA can race with chunked admission (audit doc
 § "HiSparse"). A naive smoke just verifies "engine starts with both
 flags enabled + chunked path completes". Deeper time-sensitive cases
-live in ``test_special_case_coverage.py``.
+live in ``test_scripted_special_case_coverage.py``.
 
 Uses the same GLM-5-FP8 model and 8×H200 layout as
 ``test_dsa_models_hisparse.py``.

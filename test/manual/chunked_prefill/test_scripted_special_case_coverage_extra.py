@@ -2,7 +2,7 @@
 
 Covers category D from the expansion plan: scheduler.py /
 disaggregation / dllm chunked-related branches that round-1's
-``test_special_case_coverage.py`` did not address. Each test drives
+``test_scripted_special_case_coverage.py`` did not address. Each test drives
 the scheduler through a specific branch.
 """
 
