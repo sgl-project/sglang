@@ -183,7 +183,14 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
-DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori", "tcp"]
+DISAGG_TRANSFER_BACKEND_CHOICES = [
+    "mooncake",
+    "nixl",
+    "ascend",
+    "fake",
+    "mori",
+    "mooncake_tcp",
+]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
@@ -3836,8 +3843,19 @@ class ServerArgs:
                 "requires at least one encoder urls to be set via --encoder-urls"
             )
 
+        # "mooncake_tcp" is mooncake with the TCP transport forced: set
+        # MC_FORCE_TCP so mooncake installs TcpTransport instead of RDMA,
+        # rewrite the backend to mooncake, and skip RDMA HCA selection.
+        if self.disaggregation_transfer_backend == "mooncake_tcp":
+            os.environ.setdefault("MC_FORCE_TCP", "1")
+            self.disaggregation_transfer_backend = "mooncake"
+            self.disaggregation_ib_device = None
+            logger.info(
+                "disaggregation transfer backend 'mooncake_tcp' -> mooncake "
+                "with MC_FORCE_TCP=1 (TCP transport, no RDMA)"
+            )
         # Validate IB devices when mooncake backend is used
-        if (
+        elif (
             self.disaggregation_transfer_backend == "mooncake"
             and self.disaggregation_mode in ("prefill", "decode")
         ) or self.encoder_transfer_backend == "mooncake":
