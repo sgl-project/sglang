@@ -634,6 +634,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     enable_memory_saver=enable_memory_saver,
                     ratio=ratio,
                     online=(ratio == 128 and ONLINE_C128),
+                    page_size=self.swa_page_size,
                 )
 
             if ratio == 4:
@@ -646,6 +647,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     dtype=self.state_dtype,
                     enable_memory_saver=enable_memory_saver,
                     ratio=ratio,
+                    page_size=self.swa_page_size,
                 )
 
             self.compress_state_pools.append(compress_state_pool)
@@ -702,6 +704,18 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             indexer_compress_state_pool is not None
         ), "Only c4 layers have indexer states."
         return indexer_compress_state_pool
+
+    def get_attention_compress_state_cache(self, layer_id: int) -> torch.Tensor:
+        """fp32 ``[block_num, page_size, 2*coff*D]`` view of this layer's
+        kv+score buffer. Caller is the fused compressor op
+        (``torch.ops.custom.compressor``)'s ``state_cache`` argument.
+        """
+        return self.get_attention_compress_states(layer_id).state_cache_3d
+
+    def get_indexer_compress_state_cache(self, layer_id: int) -> torch.Tensor:
+        """Same as :meth:`get_attention_compress_state_cache` for indexer
+        (c4 layers only)."""
+        return self.get_indexer_compress_states(layer_id).state_cache_3d
 
     def get_swa_key_buffer(self, layer_id: int) -> torch.Tensor:
         return self.swa_kv_pool.get_key_buffer(layer_id)

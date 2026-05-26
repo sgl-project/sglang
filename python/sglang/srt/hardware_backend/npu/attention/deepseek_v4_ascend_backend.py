@@ -276,12 +276,6 @@ class DeepseekV4AscendAttnBackend(
             bs, dtype=torch.int32, device=device,
         )
 
-        # actual_seq_lengths_q_cmp: same shape as _pa (bs+1). Replay mirrors
-        # _pa into this (some compress-attn metadata kernels read it separately).
-        metadata.actual_seq_lengths_q_cmp = torch.zeros(
-            bs + 1, dtype=torch.int32, device=device,
-        )
-
         # Bind preallocated V4 page tables to metadata, sliced to [:bs, :].
         metadata.swa_page_table = self.graph_metadata["swa_page_table"][:bs, :]
         metadata.c4_page_table = self.graph_metadata["c4_page_table"][:bs, :]
@@ -298,6 +292,23 @@ class DeepseekV4AscendAttnBackend(
         metadata.c128_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
         metadata.c4_state_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
         metadata.c128_state_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
+
+        # Fused-compressor metadata buffers. Decode-mode size for
+        # positions_cmp_padding is min(n_tok, n_tok//ratio + bs) which
+        # equals bs for decode (tokens_per_bs=1). For target_verify /
+        # draft modes, n_tok = bs * n_draft and the upper bound is
+        # bs * (n_draft // ratio + 1) ≤ n_tok; size n_tok covers both
+        # cases. int64 dtype matches what _compute_compress_locs emits.
+        c4_pad   = min(n_tok, n_tok // 4   + bs)
+        c128_pad = min(n_tok, n_tok // 128 + bs)
+        metadata.positions_cmp_padding_c4 = torch.zeros(
+            c4_pad, dtype=torch.int64, device=device
+        )
+        metadata.positions_cmp_padding_c128 = torch.zeros(
+            c128_pad, dtype=torch.int64, device=device
+        )
+        metadata.start_pos = torch.zeros(bs, dtype=torch.int32, device=device)
+        metadata.seqused = torch.zeros(bs, dtype=torch.int32, device=device)
 
         # kernel_metadata dict points at preallocated 1024-int32 buffers.
         metadata.kernel_metadata = {
@@ -380,9 +391,6 @@ class DeepseekV4AscendAttnBackend(
             seq_lens[:bs].to(torch.int32).clamp(min=1)
         )
 
-        # actual_seq_lengths_q_cmp mirrors actual_seq_lengths_q_pa (captured already).
-        fm.actual_seq_lengths_q_cmp.copy_(fm.actual_seq_lengths_q_pa)
-
         # Phase 3: compress locs via shared helper (Task 2 _compute_compress_locs).
         pool = forward_batch.token_to_kv_pool
         req_to_token = forward_batch.req_to_token_pool.req_to_token
@@ -424,6 +432,18 @@ class DeepseekV4AscendAttnBackend(
                 _copy_2d(getattr(fm, key), result[key])
         for key in ("c4_loc", "c128_loc", "c4_state_loc", "c128_state_loc"):
             if key in result:
+                _copy_1d(getattr(fm, key), result[key])
+
+        # Fused-compressor metadata (decode-path only; capture skips other modes).
+        # positions_cmp_padding tail stays 0 — which is a benign position used as
+        # padding and masked away by seqused at op time.
+        for key in (
+            "positions_cmp_padding_c4",
+            "positions_cmp_padding_c128",
+            "start_pos",
+            "seqused",
+        ):
+            if key in result and hasattr(fm, key) and getattr(fm, key) is not None:
                 _copy_1d(getattr(fm, key), result[key])
 
         # swa_loc — eager path uses pool.translate_loc_from_full_to_swa(out_cache_loc).
@@ -726,13 +746,14 @@ class DeepseekV4AscendAttnBackend(
         returns a dict that graph replay can copy into preallocated buffers.
         """
         fm = self.forward_metadata
+        is_decode = forward_batch.forward_mode.is_decode()
         result = self._compute_compress_locs(
             pool=forward_batch.token_to_kv_pool,
             req_to_token=forward_batch.req_to_token_pool.req_to_token,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             out_cache_loc=forward_batch.out_cache_loc,
-            is_decode=forward_batch.forward_mode.is_decode(),
+            is_decode=is_decode,
             bs=forward_batch.batch_size,
             device=forward_batch.seq_lens.device,
             req_to_token_pool=forward_batch.req_to_token_pool,
@@ -743,13 +764,81 @@ class DeepseekV4AscendAttnBackend(
         # Non-decode path leaves c{ratio}_state_loc / c{ratio}_loc absent from
         # result; the eager contract was that those fm fields are None in
         # non-decode mode. Replay (Task 5) checks key presence instead.
-        if not forward_batch.forward_mode.is_decode():
+        if not is_decode:
             for ratio in self._dsv4_compress_ratios:
                 if ratio in (4, 128):
                     if f"c{ratio}_state_loc" not in result:
                         setattr(fm, f"c{ratio}_state_loc", None)
                     if f"c{ratio}_loc" not in result:
                         setattr(fm, f"c{ratio}_loc", None)
+
+        # Fused-compressor metadata. Decode case lives in
+        # _compute_compress_locs (graph-replay-compatible); prefill needs
+        # per-request slicing of forward_batch.positions via cu_seqlens.
+        # Prefill is not graph-captured today so we keep it here in the
+        # eager-only shim. See cheat sheet B.2.
+        #
+        # Gated on the fused-op env flag — the per-req loop below does a
+        # cpu().tolist() host sync we don't want to pay when fused is off.
+        # When fused is off, the per-request Python forward_npu path
+        # consumes its own per-req metadata inline, so positions_cmp_padding
+        # / start_pos / seqused are not needed on fm.
+        if (
+            envs.SGLANG_DSV4_NPU_FUSED_COMPRESSOR.get()
+            and forward_batch.forward_mode.is_prefill()
+            and not forward_batch.forward_mode.is_target_verify()
+            and self._dsv4_compress_ratios
+        ):
+            self._build_npu_compress_metadata_prefill(forward_batch)
+
+    def _build_npu_compress_metadata_prefill(
+        self, forward_batch: "ForwardBatch"
+    ) -> None:
+        fm = self.forward_metadata
+        device = forward_batch.seq_lens.device
+        positions = forward_batch.positions
+        t = positions.shape[0]
+        bs = forward_batch.batch_size
+        # cu_seqlens (prefix-sum query lengths with leading 0, shape [bs+1]
+        # int32). Set by init_forward_metadata in every mode.
+        cu = fm.actual_seq_lengths_q_pa
+
+        # Per-request positions: build positions_cmp_padding for each ratio
+        # by slicing `positions[start:end][:cutoff:ratio]` per request and
+        # concatenating. cu_seqlens reads sync to host; this is fine in
+        # eager prefill (graph capture skips this branch).
+        cu_cpu = cu.cpu().tolist()
+        ratio_lists: dict = {r: [] for r in self._dsv4_compress_ratios if r in (4, 128)}
+        for idx in range(bs):
+            start = int(cu_cpu[idx])
+            end = int(cu_cpu[idx + 1])
+            if end == start:
+                continue
+            seq = end - start
+            req_positions = positions[start:end]
+            for ratio in ratio_lists:
+                cutoff = seq - (seq % ratio)
+                if cutoff > 0:
+                    ratio_lists[ratio].append(req_positions[:cutoff:ratio])
+
+        for ratio in (4, 128):
+            if ratio not in ratio_lists:
+                continue
+            padding_size = min(t, t // ratio + bs)
+            padding = torch.zeros(padding_size, dtype=torch.int64, device=device)
+            if ratio_lists[ratio]:
+                cat = torch.cat(ratio_lists[ratio], dim=0).to(torch.int64)
+                assert cat.numel() <= padding.numel(), (
+                    f"positions_cmp_padding_c{ratio} overflow: "
+                    f"{cat.numel()} > {padding.numel()}"
+                )
+                padding[: cat.shape[0]].copy_(cat)
+            setattr(fm, f"positions_cmp_padding_c{ratio}", padding)
+
+        # Prefill: start_pos = 0 per req (no chunk prefill support yet),
+        # seqused = None (op falls back to cu_seqlens diff).
+        fm.start_pos = torch.zeros(bs, dtype=torch.int32, device=device)
+        fm.seqused = None
 
     def _compute_compress_locs(
         self,
@@ -877,6 +966,38 @@ class DeepseekV4AscendAttnBackend(
                 slots[:, :: self.page_size] // self.page_size
             ).to(torch.int32)
             result[f"c{ratio}_page_table"] = c_page_table
+
+        # Fused-compressor metadata. The torch.ops.custom.compressor op
+        # consumes positions_cmp_padding_c{4,128} (the absolute positions
+        # of the tokens being compressed this step), start_pos (where in
+        # the sequence each request is writing), and seqused (per-req
+        # valid token count this step). Decode path only — prefill is
+        # computed in _build_npu_compress_metadata's prefill branch since
+        # the per-request slicing pattern needs cu_seqlens host reads.
+        # See cheat sheet section B.1 (decode) for the reference impl.
+        if is_decode:
+            valid = seq_lens > 0
+            positions_last = torch.clamp(seq_lens - 1, min=0)
+            for ratio in self._dsv4_compress_ratios:
+                if ratio not in (4, 128):
+                    continue
+                # padding size = min(bs, bs // ratio + bs) which is just bs
+                # for any reasonable bs / ratio combo in decode mode (1
+                # query token per req, so t=bs).
+                padding_size = min(bs, bs // ratio + bs)
+                padding = torch.zeros(
+                    padding_size, dtype=torch.int64, device=device
+                )
+                should_compress = ((seq_lens % ratio) == 0) & valid
+                pos_cmp = positions_last[should_compress].to(torch.int64) + (
+                    1 - ratio
+                )
+                if pos_cmp.numel() > 0:
+                    padding[: pos_cmp.shape[0]].copy_(pos_cmp)
+                result[f"positions_cmp_padding_c{ratio}"] = padding
+
+            result["start_pos"] = positions_last.to(torch.int32)
+            result["seqused"] = valid.to(torch.int32)
 
         return result
 

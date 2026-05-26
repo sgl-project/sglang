@@ -125,6 +125,35 @@ def _get_contig_freqs_real_imag(freqs_cis: torch.Tensor) -> tuple[torch.Tensor, 
     return cached
 
 
+def get_fused_compressor_rope_cos_sin(
+    freqs_cis: torch.Tensor,
+    positions_cmp: torch.Tensor,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build (cos, sin) tensors shaped ``[T, rope_head_dim]`` for the fused
+    compressor op (``torch.ops.custom.compressor``).
+
+    The op consumes ``rope_cos`` / ``rope_sin`` of shape
+    ``[min(T, T//cmp_ratio + B), rope_head_dim]`` in bf16/fp16. We index
+    the cached contig real/imag halves of the complex ``freqs_cis`` and
+    interleave-double the last dim to match the kernel's expected layout
+    (matches dsv4_release ``ComplexExpRotaryEmbedding.cos_cache``, which
+    is built as ``complex_cache.real.repeat_interleave(2, dim=-1)``).
+
+    Safe to call from inside a captured aclgraph: both ``index_select`` and
+    ``repeat_interleave`` over a graph-input ``positions_cmp`` of fixed
+    capture-time shape produce static-shape outputs. Identical to what the
+    existing inplace_partial_rotary_mul fallback does at
+    :func:`_v4_rope_inplace_npu`, just without the inverse / 4D-view step.
+    """
+    real_contig, imag_contig = _get_contig_freqs_real_imag(freqs_cis)
+    cos_half = real_contig.index_select(0, positions_cmp)
+    sin_half = imag_contig.index_select(0, positions_cmp)
+    cos = cos_half.repeat_interleave(2, dim=-1).to(dtype)
+    sin = sin_half.repeat_interleave(2, dim=-1).to(dtype)
+    return cos, sin
+
+
 def _v4_rope_inplace_npu(
     q_rope: torch.Tensor,
     kv_rope: Optional[torch.Tensor],

@@ -369,6 +369,12 @@ class Compressor(nn.Module):
             # (init runs on CPU before weights move to NPU); cache key
             # includes device so it's safe.
             self._npu_hadamard_built = False
+            # Lazy caches for the fused-compressor op (built on first call,
+            # after weight loading + device move). See _ensure_fused_caches.
+            self._fused_caches_built = False
+            self._fused_wkv_w: Optional[torch.Tensor] = None
+            self._fused_wgate_w: Optional[torch.Tensor] = None
+            self._fused_norm_weight_bf16: Optional[torch.Tensor] = None
 
     def apply_ape_hotfix(self):
         assert not self.ape_converted
@@ -406,6 +412,9 @@ class Compressor(nn.Module):
             # NPU path: run the full compress flow inline. Writes go straight
             # to the kv pool via set_compress_*_buffer, so there's nothing
             # for forward_core_compressor to write afterwards.
+            if envs.SGLANG_DSV4_NPU_FUSED_COMPRESSOR.get():
+                self._forward_npu_fused(x, forward_batch.positions, forward_batch)
+                return None
             return self.forward_npu(x, forward_batch.positions, forward_batch)
 
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
@@ -451,6 +460,131 @@ class Compressor(nn.Module):
             self.register_buffer("hadamard_matrix", H, persistent=False)
             self._npu_hadamard_built = True
         return H
+
+    def _ensure_fused_caches(self) -> None:
+        """Build the per-instance views the fused compressor op needs.
+
+        Lazy because at __init__ time wkv_gate.weight is uninitialized and
+        norm.weight hasn't been loaded yet; first forward fires after
+        weight loading + device move, when these slices are stable.
+
+        * ``_fused_wkv_w`` / ``_fused_wgate_w``: views into
+          ``wkv_gate.weight`` (which stores ``[kv;gate]`` concatenated
+          along output dim, kv first per ``ReplicatedLinear`` convention).
+          The op signature wants them separately; views avoid the copy
+          cost on every forward.
+        * ``_fused_norm_weight_bf16``: bf16 copy of the fp32 RMSNorm
+          weight. The op signature requires bf16/fp16; the cast result is
+          a constant since the underlying weight is frozen post-load.
+        """
+        if self._fused_caches_built:
+            return
+        coff = 1 + int(self.overlap)
+        split = coff * self.head_dim
+        # wkv_gate.weight shape: [2*coff*head_dim, hidden_size]. Split row-wise.
+        w = self.wkv_gate.weight
+        assert w.shape[0] == 2 * split, (
+            f"wkv_gate.weight rows={w.shape[0]} != 2*coff*head_dim={2*split}"
+        )
+        self._fused_wkv_w = w[:split]
+        self._fused_wgate_w = w[split:]
+        self._fused_norm_weight_bf16 = self.norm.weight.to(torch.bfloat16)
+        self._fused_caches_built = True
+
+    def _forward_npu_fused(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Fused-op NPU compressor path — single ``torch.ops.custom.compressor``
+        call replaces the per-request Python loop in :meth:`forward_npu`.
+
+        The op:
+          1. Computes ``kv_state = x @ wkv``, ``score_state = x @ wgate``.
+          2. Writes (kv_state, score_state) into ``state_cache`` at offsets
+             derived from ``start_pos`` + ``cu_seqlens``.
+          3. Per-ratio: adds ``ape``, softmax over the ratio dim, sum-reduces,
+             applies RMSNorm + interleave-mode rope (rotary_mode=2), returns
+             ``cmp_kv`` of shape ``[min(T, T//ratio + B), head_dim]``.
+
+        State_cache writes happen inside the op, so we do NOT also call
+        ``set_compress_state_buffer`` afterwards — only the compressed-kv
+        epilog (:meth:`_compressor_epilog_npu`) runs on the returned tensor.
+
+        Requires ``state_dtype=fp32`` (already the case for DSV4), the new
+        backend metadata fields from :meth:`_compute_compress_locs` and
+        :meth:`_build_npu_compress_metadata_prefill`, and a wheel where
+        ``torch.ops.custom.compressor`` is registered.
+        """
+        from sglang.srt.models.deepseek_v4 import get_fused_compressor_rope_cos_sin
+
+        ratio = self.ratio
+        coff = 1 + int(self.overlap)
+        device = x.device
+        self._ensure_npu_hadamard(device)
+        self._ensure_fused_caches()
+
+        fm = forward_batch.attn_backend.forward_metadata
+        positions_cmp = getattr(fm, f"positions_cmp_padding_c{ratio}", None)
+        page_table = getattr(fm, f"c{ratio}_state_page_table", None)
+        start_pos = getattr(fm, "start_pos", None)
+        seqused = getattr(fm, "seqused", None)
+        # cu_seqlens: prefix-sum query lengths with leading 0, [bs+1] int32.
+        cu_seqlens = getattr(fm, "actual_seq_lengths_q_pa", None)
+        assert positions_cmp is not None and page_table is not None, (
+            "fused compressor needs backend metadata "
+            "(positions_cmp_padding / c*_state_page_table) — make sure "
+            "_build_npu_compress_metadata ran before this forward."
+        )
+        assert start_pos is not None, "fused compressor needs start_pos"
+        assert cu_seqlens is not None, "fused compressor needs cu_seqlens"
+
+        # state_cache: fp32 [block_num, page_size, 2*coff*D].
+        pool = forward_batch.token_to_kv_pool
+        if TYPE_CHECKING:
+            assert isinstance(pool, DeepSeekV4TokenToKVPool)
+        if self.is_in_indexer:
+            state_cache = pool.get_indexer_compress_state_cache(self.layer_id)
+        else:
+            state_cache = pool.get_attention_compress_state_cache(self.layer_id)
+
+        cos, sin = get_fused_compressor_rope_cos_sin(
+            self.freqs_cis, positions_cmp, dtype=torch.bfloat16
+        )
+
+        cmp_kv = torch.ops.custom.compressor(
+            x,
+            self._fused_wkv_w,
+            self._fused_wgate_w,
+            state_cache,
+            self.ape,
+            self._fused_norm_weight_bf16,
+            rope_sin=sin,
+            rope_cos=cos,
+            rope_head_dim=self.rope_head_dim,
+            cmp_ratio=ratio,
+            state_block_table=page_table,
+            cu_seqlens=cu_seqlens,
+            seqused=seqused,
+            start_pos=start_pos,
+            coff=coff,
+            norm_eps=self.norm.variance_epsilon,
+            rotary_mode=2,
+            cache_mode=1,
+        )
+
+        # cmp_kv shape: [min(T, T//ratio + B), head_dim]. For prefill the loc
+        # tensor may be shorter than the padded output (trailing slots are
+        # never compressed-to); trim to len(loc) before hadamard + epilog.
+        loc = getattr(fm, f"c{ratio}_loc", None)
+        if loc is not None and loc.numel() < cmp_kv.shape[0]:
+            cmp_kv = cmp_kv[: loc.numel()]
+
+        if forward_batch.attn_backend.graph_mode or cmp_kv.shape[0] > 0:
+            if self.rotate:
+                cmp_kv = _apply_hadamard(cmp_kv, self.hadamard_matrix)
+            self._compressor_epilog_npu(cmp_kv, forward_batch)
 
     def forward_npu(
         self,
