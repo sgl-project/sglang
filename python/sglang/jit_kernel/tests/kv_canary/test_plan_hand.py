@@ -1292,9 +1292,7 @@ class TestExpectedTokenPoolValidLens:
             prefix_lens=_tensor([3, 3]),
             valid_lens=_tensor([2, 4]),
         )
-        assert torch.equal(
-            got, self._expected([1000, 1001, -1, 2000, 2001, 2002])
-        )
+        assert torch.equal(got, self._expected([1000, 1001, -1, 2000, 2001, 2002]))
 
     def test_valid_lens_zero_emits_all_sentinel_for_that_req(self) -> None:
         """valid_lens[r] == 0 disables every gather for req r regardless of pool content."""
@@ -1350,7 +1348,9 @@ class TestExpectedTokenPoolValidLens:
     def test_pool_set_but_valid_lens_missing_raises(self) -> None:
         """One-way contract: passing the pool without per-req valid_lens is rejected at the Python wrapper."""
         triton_v, triton_w = _plan_pair(verify_capacity=64, write_req_capacity=4)[0]
-        with pytest.raises(ValueError, match="req_to_verify_expected_tokens_valid_lens"):
+        with pytest.raises(
+            ValueError, match="req_to_verify_expected_tokens_valid_lens"
+        ):
             launch_canary_plan_kernels(
                 verify_plan_out=triton_v,
                 write_plan_out=triton_w,
