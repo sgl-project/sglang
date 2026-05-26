@@ -177,7 +177,10 @@ class TinyDSV4ModelConfig:
         *,
         num_heads: int,
         context_len: int,
+        compression_ratios: list[int] = None,
     ):
+        if compression_ratios is None:
+            compression_ratios = [0]
         self.context_len = context_len
         self.hidden_size = DSV4_HEAD_DIM
         self.num_attention_heads = num_heads
@@ -205,8 +208,8 @@ class TinyDSV4ModelConfig:
             kv_lora_rank=DSV4_KV_LORA_RANK,
             v_head_dim=DSV4_V_HEAD_DIM,
             index_topk=DSV4_INDEX_TOPK,
-            num_hidden_layers=1,
-            compress_ratios=[0],
+            num_hidden_layers=len(compression_ratios),
+            compress_ratios=list(compression_ratios),
         )
         self.hf_text_config = self.hf_config
 
@@ -230,7 +233,10 @@ class MockDSV4ModelRunner:
         disable_cuda_graph: bool = True,
         disable_piecewise_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
+        compression_ratios: list[int] = None,
     ):
+        if compression_ratios is None:
+            compression_ratios = [0]
         pool_batch_size = runner_batch_size or case.batch_size
         self.device = device
         self.dtype = dtype
@@ -273,15 +279,16 @@ class MockDSV4ModelRunner:
             device=device,
             enable_memory_saver=False,
         )
-        # DeepSeekV4TokenToKVPool requires page_size % swa_page_size == 0 and
-        # the SWA window currently equals SWA_WINDOW (=128) in the backend.
-        # `compression_ratios=[0]` disables C4/C128 sub-pools (their layer_num=0).
-        # DSV4 KV pool stores FP8 nope; pass fp8 dtype so store_dtype=uint8 (the
-        # backing tensor is always raw bytes regardless of the nominal dtype).
+        # `compression_ratios=[0]` (default) disables C4/C128 sub-pools (their
+        # layer_num=0). Tests for C4 / C128 dispatch pass e.g. `[4]` or
+        # `[128]` to allocate the corresponding sub-pool. DSV4 KV pool stores
+        # FP8 nope; pass fp8 dtype so store_dtype=uint8 (the backing tensor is
+        # always raw bytes regardless of the nominal dtype).
+        layer_num = len(compression_ratios)
         self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
             max_num_reqs=pool_batch_size,
             swa_size=swa_size,
-            c4_size=case.page_size,  # minimum: one page worth; unused for layer_num=0
+            c4_size=case.page_size,
             c128_size=case.page_size,
             c4_state_pool_size=pool_batch_size,
             c128_state_pool_size=pool_batch_size,
@@ -292,10 +299,10 @@ class MockDSV4ModelRunner:
             qk_nope_head_dim=DSV4_QK_NOPE_HEAD_DIM,
             qk_rope_head_dim=DSV4_QK_ROPE_HEAD_DIM,
             indexer_head_dim=128,
-            layer_num=1,
+            layer_num=layer_num,
             device=device,
             enable_memory_saver=False,
-            compression_ratios=[0],
+            compression_ratios=list(compression_ratios),
         )
         # Register identity full->swa mapping over swa_size full locs.
         identity = torch.arange(swa_size, dtype=torch.int64, device=device)
@@ -577,6 +584,7 @@ def build_dsv4_attention_fixture(
     disable_cuda_graph: bool = True,
     disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
+    compression_ratios: list[int] = None,
 ) -> DSV4AttentionFixture:
     max_seq = max(case.seq_lens)
     # SWA-only (compress_ratio=0) is the SGLang path that handles the
@@ -593,6 +601,7 @@ def build_dsv4_attention_fixture(
     model_config = TinyDSV4ModelConfig(
         num_heads=case.num_heads,
         context_len=max_context_len,
+        compression_ratios=compression_ratios,
     )
     runner = MockDSV4ModelRunner(
         case=case,
@@ -604,6 +613,7 @@ def build_dsv4_attention_fixture(
         disable_cuda_graph=disable_cuda_graph,
         disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
         runner_batch_size=runner_batch_size,
+        compression_ratios=compression_ratios,
     )
     try:
         backend = ATTENTION_BACKENDS[case.backend](runner)
@@ -994,3 +1004,82 @@ def expected_dsv4_output_from_inputs(
     return _pure_torch_dsv4_swa_reference(
         fixture, q_input, full_kv_locs_per_req, case=case
     ).float()
+
+
+def _populate_extra_kv_cache(
+    fixture: DSV4AttentionFixture,
+    *,
+    layer_id: int = 0,
+    num_entries: int = 32,
+) -> None:
+    """Write `num_entries` packed FP8-nope/BF16-rope K vectors into the C4 or
+    C128 extra cache via the production `set_extra_key_buffer` path. The
+    backend's `forward(compress_ratio=4 or 128)` path reads from this buffer."""
+    pool = fixture.runner.token_to_kv_pool
+    device = fixture.runner.device
+    rand_k = torch.randn(num_entries, DSV4_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    pack = quant_to_nope_fp8_rope_bf16_pack_triton(rand_k)
+    loc = torch.arange(num_entries, dtype=torch.int64, device=device)
+    pool.set_extra_key_buffer(layer_id=layer_id, loc=loc, cache_nope_fp8_rope_bf16_pack=pack)
+
+
+def run_dsv4_compress_smoke_case(
+    testcase,
+    case: DSV4AttentionCase,
+    *,
+    extra_entries: int = 32,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+) -> None:
+    """Smoke test for the C4 (compress_ratio=4) or C128 (compress_ratio=128)
+    dispatch through `DeepseekV4AttnBackend.forward`.
+
+    Pre-writes random packed K into both the SWA cache and the C4/C128 extra
+    cache via the production pack+set paths, lets `init_forward_metadata`
+    populate the compression metadata, then dispatches `forward(compress_ratio=
+    case.compress_ratio)`. Asserts the output has the right shape and is
+    finite; does not verify Compressor math (no independent compressor
+    reference yet — that is a deferred follow-up).
+    """
+    assert case.compress_ratio in (4, 128), (
+        f"smoke runner requires compress_ratio in (4, 128); got {case.compress_ratio}"
+    )
+    fixture = build_dsv4_attention_fixture(
+        testcase,
+        case,
+        dtype=dtype,
+        device=device,
+        compression_ratios=[case.compress_ratio],
+    )
+    runner = fixture.runner
+    max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
+
+    _populate_swa_kv_cache(fixture, max_context_len=max_context_len, device=device)
+    _populate_extra_kv_cache(fixture, layer_id=0, num_entries=extra_entries)
+
+    q_input, _ = fixture.actual_module.project(fixture.input_hidden)
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+        fixture.backend.init_forward_metadata(fixture.forward_batch)
+        out = fixture.backend.forward(
+            q=q_input,
+            k=q_input,
+            v=q_input,
+            layer=fixture.actual_module.attn,
+            forward_batch=fixture.forward_batch,
+            compress_ratio=case.compress_ratio,
+            save_kv_cache=False,
+            attn_sink=fixture.actual_module.attn_sink,
+        )
+
+    expected_shape = (case.num_input_tokens, case.num_heads, DSV4_V_HEAD_DIM)
+    testcase.assertEqual(
+        tuple(out.shape),
+        expected_shape,
+        f"compress_ratio={case.compress_ratio} forward must return shape "
+        f"[num_input_tokens, num_heads, v_head_dim]",
+    )
+    testcase.assertTrue(
+        torch.isfinite(out).all().item(),
+        f"compress_ratio={case.compress_ratio} forward must return finite values "
+        f"(no NaN/Inf); mean abs = {out.abs().mean().item()}",
+    )

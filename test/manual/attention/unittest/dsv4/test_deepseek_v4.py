@@ -1,9 +1,15 @@
-"""DSV4 attention correctness — SWA-only (compress_ratio=0) slice.
+"""DSV4 attention correctness — SWA + C4/C128 dispatch coverage.
 
 Covers eager EXTEND/DECODE plus CUDA-graph-style capture/replay for the
-DECODE path of `DeepseekV4AttnBackend` through flash_mla with the production
-packed FP8-nope/BF16-rope SWA cache. C4 (4x) and C128 (128x) compressor +
-indexer paths and speculative modes are explicit follow-ups.
+SWA-only (compress_ratio=0) path of `DeepseekV4AttnBackend` through flash_mla
+with the production packed FP8-nope/BF16-rope SWA cache, plus
+metadata-level smoke tests for the C4 (compress_ratio=4) and C128
+(compress_ratio=128) paths. The C4/C128 smoke tests bypass the production
+`Compressor`/`C4Indexer` modules — they pre-populate the extra K cache via
+the production pack+set path and verify only that the dispatch path
+(metadata population, flash_mla integration with `extra_k_cache`) produces
+shape-correct finite output. Compressor math correctness is a deferred
+follow-up.
 """
 
 import importlib.util
@@ -25,6 +31,7 @@ from common.attention_methods.dsv4_attention import (  # noqa: E402
     DSV4AttentionCase,
     make_dsv4_cases,
     run_dsv4_attention_case,
+    run_dsv4_compress_smoke_case,
 )
 from common.runner_modes.cuda_graph_decode_runner import (  # noqa: E402
     run_dsv4_cuda_graph_decode_case,
@@ -53,6 +60,50 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
             prefix_lens=(32, 96),
         ),
     )
+    # C4 (compress_ratio=4) and C128 (compress_ratio=128) dispatch smoke cases.
+    # They populate the extra K cache directly via `set_extra_key_buffer` and
+    # verify the `forward(compress_ratio=...)` dispatch produces finite output;
+    # the production `Compressor`/`C4Indexer` math path is not exercised here.
+    COMPRESS_SMOKE_CASES = (
+        DSV4AttentionCase(
+            name="dsv4_c4_extend_smoke",
+            backend="dsv4",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(64,),
+            extend_lens=(16,),
+            compress_ratio=4,
+        ),
+        DSV4AttentionCase(
+            name="dsv4_c4_decode_smoke",
+            backend="dsv4",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(64,),
+            compress_ratio=4,
+        ),
+        DSV4AttentionCase(
+            name="dsv4_c128_extend_smoke",
+            backend="dsv4",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(128,),
+            extend_lens=(16,),
+            compress_ratio=128,
+        ),
+        DSV4AttentionCase(
+            name="dsv4_c128_decode_smoke",
+            backend="dsv4",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(128,),
+            compress_ratio=128,
+        ),
+    )
 
     def test_swa_only_cases(self):
         for case in self.CASES:
@@ -63,6 +114,15 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
         for case in self.CUDA_GRAPH_DECODE_CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_dsv4_cuda_graph_decode_case(self, case)
+
+    def test_compress_dispatch_smoke_cases(self):
+        for case in self.COMPRESS_SMOKE_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                compress_ratio=case.compress_ratio,
+            ):
+                run_dsv4_compress_smoke_case(self, case)
 
 
 if __name__ == "__main__":
