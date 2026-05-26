@@ -235,7 +235,9 @@ def _script_radix_calc_priority_skip_chunked_resume(t: ScriptedRuntime):
         if path == "priority_skip_chunked_resume":
             saw_skip = True
         yield
-    assert saw_skip, "expected priority-skip-chunked-resume branch to fire at least once"
+    assert (
+        saw_skip
+    ), "expected priority-skip-chunked-resume branch to fire at least once"
 
 
 class TestScriptedRadix(CustomTestCase):

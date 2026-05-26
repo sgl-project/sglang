@@ -133,7 +133,9 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
     def test_primary_depth_takes_multiple_values(self):
         """Primary depth k varies across queries (uniform sampling actually fires)."""
         e = self._make_eval()
-        ks = {self._decompose(e, e._build_prefix(i))[0] for i in range(self.NUM_EXAMPLES)}
+        ks = {
+            self._decompose(e, e._build_prefix(i))[0] for i in range(self.NUM_EXAMPLES)
+        }
         self.assertGreater(len(ks), 2, f"k values seen: {ks}")
 
     def test_secondary_size_takes_multiple_values(self):

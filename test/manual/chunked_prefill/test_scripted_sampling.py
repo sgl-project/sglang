@@ -41,9 +41,7 @@ def _script_max_new_tokens_zero_rejected(t: ScriptedRuntime):
         if r.finished:
             return
         yield
-    raise AssertionError(
-        "max_new_tokens=0 should fast-fail with an error_message"
-    )
+    raise AssertionError("max_new_tokens=0 should fast-fail with an error_message")
 
 
 def _script_max_new_tokens_one_long_chunked(t: ScriptedRuntime):

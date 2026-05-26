@@ -53,9 +53,7 @@ class MixedPrefixGSM8KEval(GSM8KEval):
         rng = random.Random(self._seed + idx)
         num_primary = rng.randint(0, self._num_shots)
         secondary_size = rng.randint(0, self._secondary_pool_size)
-        secondary_indices = rng.sample(
-            range(len(self._secondary_pool)), secondary_size
-        )
+        secondary_indices = rng.sample(range(len(self._secondary_pool)), secondary_size)
         primary = self._primary_shots[:num_primary]
         secondary = [self._secondary_pool[i] for i in secondary_indices]
         combined = primary + secondary
