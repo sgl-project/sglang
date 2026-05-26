@@ -30,7 +30,17 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
     HEAD_DIM = 64
     HIDDEN_SIZE = 256
 
+    # NOTE: `make_swa_prefix_input_config_cases` is *not* added here. A clone
+    # of triton's with-prefix SWA EXTEND fails on flashinfer with ~0.22 max
+    # diff. FlashInfer's prefill kernel routes prefix differently than triton
+    # for SWA. See dsv4/README discussion about flashinfer SWA prefix
+    # handling — the production code paths are not symmetric across backends.
     CASES = make_swa_no_prefix_input_config_cases("flashinfer")
+    # NOTE: a `runner_cuda_graph_swa_decode_above_window` clone of the triton
+    # SWA test (`prefix_lens=(7, 8, 9)`, `sliding_window_size=4`) fails on
+    # flashinfer with large diffs. FlashInfer's SWA replay metadata builder
+    # does not apply the same `min(seq_lens, window)` clipping as triton.
+    # Investigate before adding above-window decode to flashinfer SWA.
     CUDA_GRAPH_CASES = (
         DenseAttentionCase(
             name="runner_cuda_graph_swa_decode_within_window",
@@ -43,6 +53,12 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
             sliding_window_size=4,
         ),
     )
+    # NOTE: a `runner_split_op_swa_extend_prefix_within_window` clone of the
+    # triton SWA test fails on flashinfer (~0.21 max diff). FlashInfer's
+    # prefill-split path does not handle SWA prefix the same way as triton;
+    # the projected EXTEND covers the prefix path through the unsplit kernel
+    # which does match the reference. Investigate before adding split_op
+    # prefix to flashinfer SWA.
     SPLIT_OP_CASES = (
         (
             DenseAttentionCase(
