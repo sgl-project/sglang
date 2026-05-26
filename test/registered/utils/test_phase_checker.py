@@ -165,9 +165,19 @@ class TestUpdateAssertEnabled(CustomTestCase):
             text=True,
             timeout=180,
         )
-        self.assertEqual(
+        # Accept both exit-0 (RuntimeError caught) and SIGABRT (-6, the kernel's
+        # device_assert killed the process directly before sync could raise).
+        # Either way, the kernel-side check fired — which is what we're verifying.
+        # The presence of the SimplePhaseChecker FAIL line in stdout confirms it.
+        self.assertIn(
+            "SimplePhaseChecker FAIL",
+            result.stdout,
+            f"stdout: {result.stdout}\nstderr: {result.stderr}",
+        )
+        self.assertIn(
             result.returncode,
-            0,
+            (0, -6),
+            f"unexpected returncode {result.returncode}; "
             f"stdout: {result.stdout}\nstderr: {result.stderr}",
         )
 

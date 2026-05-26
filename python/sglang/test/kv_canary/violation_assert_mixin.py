@@ -39,12 +39,14 @@ class CanaryViolationAssertMixin:
         target_group: TargetGroupKind,
         side: _Side = None,
         flush_wait_seconds: float = 2.0,
+        max_retries: int = 4,
     ) -> None:
         self.assert_violation_logged_any(
             launch_tag_patterns=(f"SWEEP_*_{target_group.name}",),
             fail_reason=fail_reason,
             side=side,
             flush_wait_seconds=flush_wait_seconds,
+            max_retries=max_retries,
         )
 
     def assert_any_launch_tag_violation_reported(
