@@ -57,7 +57,7 @@ def _grpc_max_message_bytes() -> int:
 
 def _with_grpc_message_size_options(options, max_message_bytes: int):
     keys = {"grpc.max_send_message_length", "grpc.max_receive_message_length"}
-    merged = [(k, v) for k, v in (options or []) if k not in keys]
+    merged = [(k, v) for k, v in options if k not in keys]
     merged.extend(
         [
             ("grpc.max_send_message_length", max_message_bytes),
@@ -77,17 +77,20 @@ def _patch_grpc_message_size_options() -> None:
 
     def aio_server_with_message_size(*args, **kwargs):
         if "options" in kwargs:
+            kwargs["options"] = [] if kwargs["options"] is None else kwargs["options"]
             kwargs["options"] = _with_grpc_message_size_options(
                 kwargs["options"], max_message_bytes
             )
         elif len(args) >= 3:
             args = list(args)
+            args[2] = [] if args[2] is None else args[2]
             args[2] = _with_grpc_message_size_options(args[2], max_message_bytes)
         else:
-            kwargs["options"] = _with_grpc_message_size_options(None, max_message_bytes)
+            kwargs["options"] = _with_grpc_message_size_options([], max_message_bytes)
         return original_aio_server(*args, **kwargs)
 
     def insecure_channel_with_message_size(target, options=None, *args, **kwargs):
+        options = [] if options is None else options
         options = _with_grpc_message_size_options(options, max_message_bytes)
         return original_insecure_channel(target, options, *args, **kwargs)
 
