@@ -371,6 +371,152 @@ class TestScriptedRadix(CustomTestCase):
             saw_skip
         ), "expected priority-skip-chunked-resume branch to fire at least once"
 
+    @unittest.skip("needs ScriptedRuntime radix hit_count query — wire up when t.engine_stats() exposes radix hit_count")
+    def test_radix_chunked_stash_no_hit_count_inflation(self):
+        """Chunked re-insert does not inflate radix hit_count via the self-referencing stash path."""
+        execute_scripted_runtime(
+            self._script_radix_chunked_stash_no_hit_count_inflation,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [c-C2] _inc_hit_count(chunked=True) is the gate that prevents a
+    # chunked-resume's own re-insert from inflating the prefix's hit
+    # count. Pre-fix, the prefix's hit_count could climb one per chunk
+    # — making this prefix look hotter than it really was. With a
+    # single chunked req touching the prefix, observed hit_count must
+    # stay == 1 from first commit to finish.
+    @staticmethod
+    def _script_radix_chunked_stash_no_hit_count_inflation(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+        # After first commit, hit_count for the chunked req's own
+        # prefix should be exactly 1 (the req's own lock_ref).
+        stats = t.engine_stats()
+        hit_count_first = stats["radix_hit_count_for_inflight_chunked"]
+        assert hit_count_first == 1, (
+            f"radix hit_count should be 1 at first commit, got {hit_count_first}"
+        )
+        # Drive through several more chunks; hit_count must not climb.
+        for _ in range(20):
+            if r.finished:
+                break
+            stats = t.engine_stats()
+            cur = stats["radix_hit_count_for_inflight_chunked"]
+            assert cur == 1, (
+                f"radix hit_count inflated by chunked re-insert: {cur} > 1"
+            )
+            yield
+        yield from run_until_finished(r)
+        assert r.finished
+
+    def test_radix_hit_changes_between_chunks(self):
+        """Second req with identical prompt admits with a prefix reflecting r1's already-committed chunks."""
+        execute_scripted_runtime(
+            self._script_radix_hit_changes_between_chunks,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-Radix4] r1 chunks a long prompt; r2 with the same prompt is
+    # submitted while r1 is mid-prefill. r2's admission prefix length
+    # must reflect r1's already-committed chunks (i.e. r2 starts
+    # further along than if r1 had not run). r2 should therefore
+    # chunk fewer times than r1.
+    @staticmethod
+    def _script_radix_hit_changes_between_chunks(t: ScriptedRuntime):
+        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        # Wait until r1 has committed at least one chunk's worth of
+        # prefix into the radix tree.
+        yield from run_until(r1, lambda h: h.is_chunking and h.chunks_done >= 1)
+        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until_finished(r1, max_steps=800)
+        yield from run_until_finished(r2, max_steps=800)
+        assert r1.finished and r2.finished
+        # r2 must benefit from r1's committed prefix — fewer chunks.
+        assert r2.chunks_done < r1.chunks_done, (
+            f"r2 should hit r1's committed prefix; r2.chunks_done="
+            f"{r2.chunks_done} not < r1.chunks_done={r1.chunks_done}"
+        )
+
+    def test_radix_evict_during_inflight_chunk(self):
+        """External evict_radix during an in-flight chunked req does not use-after-free its prefix."""
+        execute_scripted_runtime(
+            self._script_radix_evict_during_inflight_chunk,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-Radix6] r1 chunks a long prompt; midway through, we call
+    # evict_radix on the in-flight prefix. The req's own lock_ref
+    # must prevent the evict from freeing pages it still references;
+    # the req must complete cleanly with no use-after-free.
+    @staticmethod
+    def _script_radix_evict_during_inflight_chunk(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+        # Evict the entire tree while r is still chunking — r's own
+        # lock_ref on its in-flight prefix must keep its pages alive.
+        t.evict_radix(prefix_tokens=None)
+        yield
+        yield from run_until_finished(r, max_steps=800)
+        assert r.finished
+        assert r.kv_pages == 0
+        assert r.lock_refs == 0
+
+    def test_radix_full_hit_no_chunked_path(self):
+        """Warmed prefix exactly equal to the resubmitted prompt produces zero chunks."""
+        execute_scripted_runtime(
+            self._script_radix_full_hit_no_chunked_path,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-Radix7] Warm a long prefix, then re-submit the *exact same*
+    # prompt. The cached prefix covers the entire input, so the new
+    # req should bypass the chunked path entirely and go straight to
+    # decode — chunks_done must be 0.
+    @staticmethod
+    def _script_radix_full_hit_no_chunked_path(t: ScriptedRuntime):
+        prompt_len: int = 16 * DEFAULT_CHUNK_SIZE
+        r_warm = t.start_req(prompt_len=prompt_len, max_new_tokens=1)
+        yield from run_until_finished(r_warm, max_steps=1200)
+        assert r_warm.finished
+
+        r = t.start_req(prompt_len=prompt_len, max_new_tokens=2)
+        yield from run_until_finished(r, max_steps=400)
+        assert r.finished
+        assert r.chunks_done == 0, (
+            f"full prefix hit must skip chunked path; got chunks_done={r.chunks_done}"
+        )
+
+    def test_radix_evict_race_concurrent_chunked_admit(self):
+        """Radix evict racing a chunked admission acquires lock_ref before any page release."""
+        execute_scripted_runtime(
+            self._script_radix_evict_race_concurrent_chunked_admit,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-Radix-extra] Warm a prefix, then in the same scheduler step
+    # both evict it and submit a new req that shares it. The admission
+    # path must take its lock_ref before the evict can release pages,
+    # otherwise the new req sees a stale pointer / use-after-free.
+    @staticmethod
+    def _script_radix_evict_race_concurrent_chunked_admit(t: ScriptedRuntime):
+        warm_len: int = 4 * DEFAULT_CHUNK_SIZE
+        r_warm = t.start_req(prompt_len=warm_len, max_new_tokens=1)
+        yield from run_until_finished(r_warm, max_steps=400)
+        assert r_warm.finished
+
+        # Same yield: kick off evict AND submit a sharing req. The
+        # scheduler must serialize the lock_ref grab before the evict
+        # can free pages — no use-after-free on the chunked admission.
+        t.evict_radix(prefix_tokens=None)
+        r = t.start_req(
+            prompt_len=warm_len + DEFAULT_CHUNK_SIZE * 2,
+            max_new_tokens=2,
+        )
+        yield from run_until_finished(r, max_steps=800)
+        assert r.finished
+        assert r.kv_pages == 0
+        assert r.lock_refs == 0
+
 
 if __name__ == "__main__":
     unittest.main()
