@@ -39,7 +39,11 @@ def launch_canary_plan_kernels(
       (SWA-translated via full_to_swa_index_mapping if non-None); prev_slot_idx =
       req_to_token[req_pool_indices[r], pos-1] for pos > 0, else -1. (SWA windows do NOT reset the chain —
       the writer chains across the entire prefix; sweep verify within an SWA window dereferences the real
-      predecessor for chain-link reconstruction.)
+      predecessor for chain-link reconstruction.) Expected-token gather: when
+      ``req_to_verify_expected_tokens`` is supplied, ``expected_input_id =
+      req_to_verify_expected_tokens[rp, pos + kv_token_id_vs_position_offset]`` when ``0 <= pos +
+      kv_token_id_vs_position_offset < req_to_verify_expected_tokens_valid_lens[r]``, else the ``-1``
+      sentinel (which the verify kernel treats as "skip token-id check").
     - **Write metadata** (when extend_seq_lens[r] > 0): contribute extend_seq_lens[r] to the per-req
       write count (for write_offsets cumsum). Per-req chain seed = req_to_token[req_pool_indices[r],
       prefix_lens[r]-1] (SWA-translated), or -1 if prefix_lens[r] == 0. Per-token write data
@@ -59,6 +63,18 @@ def launch_canary_plan_kernels(
             swa_window_size > 0. Used to translate verify slot indices and chain-seed slot indices at plan time.
             Loaded element-typed via Triton ``tl.load``; intermediate translated slot values are int64 inside the
             kernel and stored in the int64 plan schema.
+        verify_capacity: Length of verify_plan_out.verify_*; on overflow the offsets kernel clears
+            verify_enable and plan_entries skips the scatter.
+        req_to_verify_expected_tokens: Optional source-of-truth token pool, shape [max_reqs, max_context_len],
+            int32. When supplied, the plan kernel gathers expected_input_id for each verify entry from
+            ``[rp, pos + kv_token_id_vs_position_offset]``; when None, every entry gets the ``-1`` sentinel.
+        req_to_verify_expected_tokens_valid_lens: Per-req snapshot length on ``req_to_verify_expected_tokens``,
+            shape [bs], int64. Required iff ``req_to_verify_expected_tokens`` is set. Reads past
+            ``valid_lens[r]`` skip the gather (emit ``-1``) — this is what makes the plan kernel correct in the
+            presence of EAGLE draft / verify positions written past the committed history, and across pool
+            rows recycled from a longer previous owner whose stale tail still lives at high indices.
+        kv_token_id_vs_position_offset: Per-buffer-group logical-position offset applied to ``pos`` before
+            indexing ``req_to_verify_expected_tokens``. 0 for target pools; +1 for EAGLE draft.
 
     Implementation:
         - Two sub-kernels launched in sequence:
