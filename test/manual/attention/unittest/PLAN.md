@@ -58,6 +58,10 @@ Implemented:
   `flashinfer` covers EAGLE tree, Frozen-KV MTP chain, and DFlash chain; SWA
   `triton` covers EAGLE tree with sliding-window metadata; MLA `triton` covers
   EAGLE tree with the absorb-MLA cached-KV path.
+- Phase 4 draft-extend CUDA-graph-style replay now covers dense `flashinfer` for
+  EAGLE and Frozen-KV MTP `DRAFT_EXTEND` with ragged accepted-token counts. The
+  capture batch uses a fixed max accepted-token count per request, while replay
+  uses distinct ragged request metadata/input tensors.
 - The synthetic EAGLE verify helper uses realistic target-verify semantics:
   `ForwardBatch.seq_lens` represents prefix KV lengths, while `spec_info`
   supplies the draft tokens, positions, retrieve indices, and custom tree mask.
@@ -116,14 +120,13 @@ Implemented:
   orthogonal to runner/backend metadata compatibility.
 
 In progress:
-- Phase 4 draft-runner coverage remains open for `DRAFT_EXTEND` /
-  `DRAFT_EXTEND_V2` CUDA graph runners. Target-verify replay now has a
-  fixed-capture-batch unit helper; the next draft-runner slice should mirror the
-  production draft-runner buffer lifecycle before enabling new green tests.
+- Phase 4 `DRAFT_EXTEND_V2` CUDA graph coverage remains open. `DRAFT_EXTEND`
+  replay now has a fixed-capture-batch unit helper for FlashInfer; the next
+  draft-runner slice should model EAGLE v2 / multi-layer draft-runner buffers.
 
 Next implementation steps:
-- Finish Phase 4 draft-runner coverage for representative valid backends before
-  broadening the speculative matrix.
+- Finish Phase 4 `DRAFT_EXTEND_V2` / multi-layer draft-runner coverage for
+  representative valid backends before broadening the speculative matrix.
 - Expand Phase 2 to additional attention methods/backends with method-specific
   fixtures rather than forcing them through the dense harness. Priority candidates:
   supported-shape MLA kernels (`flashinfer` MLA, `flashmla`, `cutlass_mla`,
@@ -135,6 +138,10 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+  - Ran 36 tests in 21.417s after adding FlashInfer draft-extend CUDA-graph-style replay.
+- `python -m py_compile test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/common/spec_runner.py test/manual/attention/unittest/dense/test_flashinfer.py`
+- `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
   - Ran 35 tests in 21.392s after adding Phase 4 target-verify CUDA-graph-style replay.
 - `python -m py_compile test/manual/attention/unittest/common/spec_runner.py test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/mla/test_triton.py`
@@ -585,13 +592,14 @@ Current Layer A status:
   EAGLE tree, DFlash chain, and NGRAM chain; FlashInfer covers EAGLE tree,
   Frozen-KV MTP chain, and DFlash chain.
 - Dense `flashinfer`: EAGLE and Frozen-KV MTP `DRAFT_EXTEND` ragged accepted-token
-  coverage.
+  coverage, including CUDA-graph-style replay with a fixed max accepted-token
+  capture batch and ragged replay metadata.
 - SWA `triton`: EAGLE `TARGET_VERIFY` chain/tree custom-mask coverage with sliding
   window enabled, including CUDA-graph-style target-verify replay for a tree mask.
 - MLA `triton`: `TARGET_VERIFY` chain custom-mask coverage plus
   CUDA-graph-style target-verify replay for a tree mask.
 - Deferred: Triton `DRAFT_EXTEND` until the fixture/reference semantics are
-  clarified; production draft-runner (`DRAFT_EXTEND` / `DRAFT_EXTEND_V2`) graph
+  clarified; production `DRAFT_EXTEND_V2` / multi-layer draft-runner graph
   coverage until the draft-runner buffer lifecycle is represented faithfully;
   FlashInfer SWA target verify until prefix-lens metadata is available in its
   sliding-window updater; GDN speculative verify until recurrent speculative-state

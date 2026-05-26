@@ -283,7 +283,7 @@ class MockModelRunner(ModelRunner):
         self.dp_size = 1
         self.pp_size = 1
         speculative_num_draft_tokens = (
-            case.input_lens[0]
+            max(case.input_lens)
             if case.forward_mode.is_target_verify()
             or case.forward_mode.is_draft_extend()
             else 0
