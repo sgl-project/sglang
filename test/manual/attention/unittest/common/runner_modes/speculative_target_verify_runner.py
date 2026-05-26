@@ -720,3 +720,104 @@ def run_mla_eagle_verify_cuda_graph_case(
         atol=MLA_ATOL,
         rtol=MLA_RTOL,
     )
+
+
+def run_dsv4_eagle_verify_cuda_graph_case(
+    testcase,
+    case,
+    *,
+    topk: int = 1,
+    swa_size: int = 1024,
+    max_context_len: int = 256,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+    cuda_graph_capture_batch_size: int = 2,
+):
+    """DSV4 EAGLE target_verify CUDA-graph capture/replay. Chain only —
+    `DeepseekV4AttnBackend.__init__` asserts `self.topk in [0, 1]` at
+    `deepseek_v4_backend.py:369` so tree verify is production-unsupported.
+
+    Unlike the dense/MLA/GDN variants, the DSV4 reference reads the per-q
+    `swa_page_indices` / `c4_sparse_page_indices` / `c128_page_indices`
+    populated by `init_forward_metadata_target_verify` rather than applying
+    a synthetic tree mask, and seeds `c4_sparse_page_indices` after the
+    upgrade (since the C4 indexer is not running in this fixture).
+    """
+    assert topk == 1, (
+        "DSV4 target_verify is chain-only — `deepseek_v4_backend.py:369` "
+        "asserts `self.topk in [0, 1]`."
+    )
+    # Local import to avoid a circular import (dsv4_attention imports
+    # _make_eagle_verify_input + _prepare_target_verify_batch from this
+    # module; we now import dsv4 helpers back).
+    from ..attention_methods.dsv4_attention import (
+        DSV4_GRAPH_ATOL,
+        DSV4_GRAPH_RTOL,
+        DSV4AttentionCase,
+        build_dsv4_attention_fixture,
+        dsv4_fixture_inputs,
+        expected_dsv4_output_from_inputs,
+        make_dsv4_case_with_prefix_lens,
+        make_dsv4_padded_replay_inputs,
+        make_dsv4_random_inputs,
+        prepare_dsv4_runner_inputs,
+        run_dsv4_forward,
+    )
+    from ..attention_methods.dsv4_attention import (
+        _make_forward_batch as _make_dsv4_forward_batch,
+    )
+
+    num_draft_tokens = case.extend_lens[0] if case.extend_lens else 0
+    assert num_draft_tokens > 0, (
+        "DSV4 verify cases must set `extend_lens=(num_draft, ...)`."
+    )
+
+    def _prepare_dsv4_verify_batch(spec_case, batch):
+        _prepare_target_verify_batch(batch, spec_case, device)
+        batch.spec_info = _make_eagle_verify_input(
+            spec_case, batch, topk=topk, device=device
+        )
+
+    def _make_capture_case(base, name, capture_prefix_len: int, bs: int):
+        # Capture uses uniform prefixes per request; each request still
+        # contributes `num_draft_tokens` queries.
+        return make_dsv4_case_with_prefix_lens(
+            base, name, (capture_prefix_len,) * bs
+        )
+
+    def _make_replay_case(base, name, pad_prefix_lens):
+        return make_dsv4_case_with_prefix_lens(
+            base, name, base.prefix_lens + pad_prefix_lens
+        )
+
+    adapter = SpeculativeCudaGraphAdapter(
+        build_fixture=build_dsv4_attention_fixture,
+        make_capture_case=_make_capture_case,
+        make_replay_case=_make_replay_case,
+        make_forward_batch=_make_dsv4_forward_batch,
+        fixture_inputs=dsv4_fixture_inputs,
+        make_capture_inputs=make_dsv4_random_inputs,
+        make_replay_inputs=make_dsv4_padded_replay_inputs,
+        prepare_batch=_prepare_dsv4_verify_batch,
+        prepare_inputs=prepare_dsv4_runner_inputs,
+        run_forward=run_dsv4_forward,
+        expected_output=expected_dsv4_output_from_inputs,
+        max_num_tokens=lambda _case, bs: bs * num_draft_tokens,
+        atol=DSV4_GRAPH_ATOL,
+        rtol=DSV4_GRAPH_RTOL,
+    )
+    run_speculative_cuda_graph_case(
+        testcase,
+        case,
+        adapter=adapter,
+        build_kwargs=dict(
+            swa_size=swa_size,
+            max_context_len=max_context_len,
+            dtype=dtype,
+            device=device,
+        ),
+        capture_batch_size=cuda_graph_capture_batch_size,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+    )

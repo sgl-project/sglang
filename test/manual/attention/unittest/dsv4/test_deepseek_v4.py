@@ -38,6 +38,9 @@ from common.attention_methods.dsv4_attention import (  # noqa: E402
 from common.runner_modes.cuda_graph_decode_runner import (  # noqa: E402
     run_dsv4_cuda_graph_decode_case,
 )
+from common.runner_modes.speculative_target_verify_runner import (  # noqa: E402
+    run_dsv4_eagle_verify_cuda_graph_case,
+)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -188,6 +191,48 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
                 compress_ratio=case.compress_ratio,
             ):
                 run_dsv4_target_verify_attention_case(self, case, topk=1)
+
+    # CUDA-graph capture/replay for EAGLE target_verify across SWA + C4 + C128.
+    EAGLE_VERIFY_CUDA_GRAPH_CASES = (
+        DSV4AttentionCase(
+            name="runner_cuda_graph_dsv4_swa_eagle_verify_chain",
+            backend="dsv4",
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(64, 96),
+            extend_lens=(3, 3),
+        ),
+        DSV4AttentionCase(
+            name="runner_cuda_graph_dsv4_c4_eagle_verify_chain",
+            backend="dsv4",
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(64, 96),
+            extend_lens=(3, 3),
+            compress_ratio=4,
+        ),
+        DSV4AttentionCase(
+            name="runner_cuda_graph_dsv4_c128_eagle_verify_chain",
+            backend="dsv4",
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(128, 160),
+            extend_lens=(3, 3),
+            compress_ratio=128,
+        ),
+    )
+
+    def test_runner_mode_eagle_verify_cuda_graph_cases(self):
+        for case in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                compress_ratio=case.compress_ratio,
+            ):
+                run_dsv4_eagle_verify_cuda_graph_case(self, case, topk=1)
 
     # EAGLE DRAFT_EXTEND is SWA-only for DSV4 (see runner docstring).
     DRAFT_EXTEND_CASES = (

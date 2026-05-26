@@ -87,6 +87,20 @@ def run_speculative_cuda_graph_case(
             )
         graph_batch = graph_fixture.forward_batch
         adapter.prepare_batch(case, graph_batch)
+        # Run prepare_inputs in the eager leg too so backends whose reference
+        # depends on cache state / per-fixture stashes (e.g. DSV4 reads BF16
+        # K from `fixture._swa_bf16_k_per_req`, populated by
+        # `prepare_dsv4_runner_inputs`) work the same way as the
+        # capture/replay legs. Backends whose reference is self-contained
+        # (dense / MLA — they re-project from `inputs`) are unaffected;
+        # `prepare_inputs` just re-writes the SWA cache.
+        adapter.prepare_inputs(
+            graph_fixture,
+            case,
+            graph_batch,
+            graph_inputs,
+            max_context_len=max_context_len,
+        )
         graph_expected = adapter.expected_output(
             graph_fixture,
             case,
