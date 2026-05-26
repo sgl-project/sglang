@@ -453,16 +453,15 @@ class TinyDeepseekMLAAttention(nn.Module):
     def forward(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         q_nope_out, k_nope, q_rope, k_rope = self.forward_absorb_prepare(hidden_states)
         self.write_kv_cache(forward_batch.out_cache_loc, k_nope, k_rope)
-        attn_kwargs = {}
+        q = q_nope_out
         if self.qk_rope_head_dim:
-            attn_kwargs["q_rope"] = q_rope.flatten(1, 2)
+            q = torch.cat([q_nope_out, q_rope], dim=-1)
         attn_output = self.attn_mqa(
-            q_nope_out.flatten(1, 2),
+            q.flatten(1, 2),
             None,
             None,
             forward_batch,
             save_kv_cache=False,
-            **attn_kwargs,
         )
         attn_output = attn_output.view(-1, self.num_heads, self.kv_lora_rank)
         attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc).transpose(
