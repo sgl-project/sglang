@@ -982,9 +982,7 @@ def _get_http_session() -> requests.Session:
                     raise_on_status=False,
                 )
                 adapter = HTTPAdapter(
-                    pool_connections=int(
-                        os.getenv("SGLANG_HTTP_POOL_CONNS", "64")
-                    ),
+                    pool_connections=int(os.getenv("SGLANG_HTTP_POOL_CONNS", "64")),
                     pool_maxsize=int(os.getenv("SGLANG_HTTP_POOL_MAXSIZE", "128")),
                     max_retries=retry,
                 )
