@@ -38,8 +38,6 @@ def invoke_plan(
     group: CanaryBufferGroup,
     req_to_token: torch.Tensor,
     swa_window_size: int,
-    expected_token_pool: torch.Tensor | None,
-    expected_token_valid_lens: torch.Tensor | None,
 ) -> None:
     window = swa_window_size if group.kind is PoolKind.SWA else 0
     launch_canary_plan_kernels(
@@ -51,9 +49,6 @@ def invoke_plan(
         req_to_token=req_to_token,
         swa_window_size=window,
         full_to_swa_index_mapping=group.swa_index_lut,
-        expected_token_pool=expected_token_pool,
-        expected_token_valid_lens=expected_token_valid_lens,
-        slot_token_offset=group.slot_token_offset,
         verify_capacity=int(verify_plan.verify_slot_indices.shape[0]),
     )
 

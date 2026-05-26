@@ -34,7 +34,6 @@ enum class FailReason : int64_t {
   kRealKvHash = 1LL << 2,
   kWriteTokenMismatch = 1LL << 3,
   kWritePositionMismatch = 1LL << 4,
-  kVerifyTokenMismatch = 1LL << 5,
 };
 
 constexpr FailReason operator|(FailReason a, FailReason b) {

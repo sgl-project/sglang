@@ -17,7 +17,6 @@ def attach_swa(
     pool: object,
     device: torch.device,
     read_bytes: int,
-    slot_token_offset: int = 0,
 ) -> tuple[CanaryBufferGroup, ...]:
     full_group = _build_subpool_group(
         sub_pool=pool.full_kv_pool,
@@ -25,7 +24,6 @@ def attach_swa(
         device=device,
         read_bytes=read_bytes,
         swa_lut=None,
-        slot_token_offset=slot_token_offset,
     )
     swa_group = _build_subpool_group(
         sub_pool=pool.swa_kv_pool,
@@ -33,7 +31,6 @@ def attach_swa(
         device=device,
         read_bytes=read_bytes,
         swa_lut=pool.full_to_swa_index_mapping,
-        slot_token_offset=slot_token_offset,
     )
 
     patch_buf_info_method(
@@ -60,7 +57,6 @@ def _build_subpool_group(
     device: torch.device,
     read_bytes: int,
     swa_lut: Optional[torch.Tensor],
-    slot_token_offset: int,
 ) -> CanaryBufferGroup:
     num_slots = int(sub_pool.k_buffer[0].shape[0])
     k_head = alloc_canary_buf(num_slots=num_slots, device=device)
@@ -80,5 +76,4 @@ def _build_subpool_group(
             layer_buffer=sub_pool.v_buffer[0], read_bytes=read_bytes
         ),
         swa_index_lut=swa_lut,
-        slot_token_offset=slot_token_offset,
     )

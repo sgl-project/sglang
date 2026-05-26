@@ -102,9 +102,6 @@ def _run_label(
         req_to_token=req_to_token,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
-        expected_token_pool=None,
-        expected_token_valid_lens=None,
-        slot_token_offset=0,
         verify_capacity=verify_capacity,
     )
     torch.cuda.synchronize()
@@ -821,9 +818,6 @@ class TestMisc:
                 req_to_token=rtt,
                 swa_window_size=0,
                 full_to_swa_index_mapping=None,
-                expected_token_pool=None,
-                expected_token_valid_lens=None,
-                slot_token_offset=0,
                 verify_capacity=verify_capacity,
             )
             torch.cuda.synchronize()
@@ -836,9 +830,6 @@ class TestMisc:
                 req_to_token=rtt,
                 swa_window_size=0,
                 full_to_swa_index_mapping=None,
-                expected_token_pool=None,
-                expected_token_valid_lens=None,
-                slot_token_offset=0,
                 verify_capacity=verify_capacity,
             )
             torch.cuda.synchronize()
@@ -1054,109 +1045,3 @@ class TestBoundarySweep:
             req_to_token=req_to_token,
             extras=empty_extras(),
         )
-
-
-class TestExpectedTokenPool:
-    def _make_pool(
-        self,
-        *,
-        max_reqs: int,
-        max_seq_len: int,
-        filled: dict[int, list[int]],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        pool = torch.zeros(max_reqs, max_seq_len, dtype=torch.int32, device=_DEVICE)
-        valid_lens = torch.zeros(max_reqs, dtype=torch.int32, device=_DEVICE)
-        for rpi, tokens in filled.items():
-            seq_len = len(tokens)
-            if seq_len > 0:
-                pool[rpi, :seq_len] = torch.tensor(
-                    tokens, dtype=torch.int32, device=_DEVICE
-                )
-            valid_lens[rpi] = seq_len
-        return pool, valid_lens
-
-    def test_offset_zero_full_pool_byte_equal(self) -> None:
-        """slot_token_offset=0 + fully-populated pool → every verify entry gets pool[rpi, pos]."""
-        max_reqs, max_seq_len = 4, 32
-        req_to_token = make_req_to_token(
-            kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE
-        )
-        prefix_len = 5
-        pool, valid_lens = self._make_pool(
-            max_reqs=max_reqs,
-            max_seq_len=max_seq_len,
-            filled={2: [100, 101, 102, 103, 104]},
-        )
-        plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
-        run_plan_diff(
-            plan_pair=plans,
-            req_pool_indices=_tensor([2]),
-            prefix_lens=_tensor([prefix_len]),
-            extend_seq_lens=_tensor([1]),
-            req_to_token=req_to_token,
-            extras=empty_extras(),
-            expected_token_pool=pool,
-            expected_token_valid_lens=valid_lens,
-            slot_token_offset=0,
-        )
-
-        triton_v, _ = plans[0]
-        expected = torch.tensor(
-            [100, 101, 102, 103, 104], dtype=torch.int64, device=_DEVICE
-        )
-        assert torch.equal(triton_v.verify_expected_tokens[:prefix_len], expected)
-
-    def test_offset_one_eagle_draft_layout(self) -> None:
-        """slot_token_offset=1 → entry at pos p gathers pool[rpi, p+1]; tail beyond valid_len becomes -1."""
-        max_reqs, max_seq_len = 4, 32
-        req_to_token = make_req_to_token(
-            kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE
-        )
-        # valid_len=4 → positions {0,1,2,3} map to tokens at indices {1,2,3,?}. Index 4 falls past
-        # valid_len, so the last entry must hold the -1 "skip" sentinel.
-        pool, valid_lens = self._make_pool(
-            max_reqs=max_reqs,
-            max_seq_len=max_seq_len,
-            filled={2: [10, 11, 12, 13]},
-        )
-        prefix_len = 4
-        plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
-        run_plan_diff(
-            plan_pair=plans,
-            req_pool_indices=_tensor([2]),
-            prefix_lens=_tensor([prefix_len]),
-            extend_seq_lens=_tensor([1]),
-            req_to_token=req_to_token,
-            extras=empty_extras(),
-            expected_token_pool=pool,
-            expected_token_valid_lens=valid_lens,
-            slot_token_offset=1,
-        )
-
-        triton_v, _ = plans[0]
-        expected = torch.tensor([11, 12, 13, -1], dtype=torch.int64, device=_DEVICE)
-        assert torch.equal(triton_v.verify_expected_tokens[:prefix_len], expected)
-
-    def test_missing_pool_defaults_to_minus_one_sentinel(self) -> None:
-        """pool=None + valid_lens=None → every active verify entry receives the -1 sentinel."""
-        max_reqs, max_seq_len = 4, 32
-        req_to_token = make_req_to_token(
-            kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE
-        )
-        prefix_len = 3
-        plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
-        run_plan_diff(
-            plan_pair=plans,
-            req_pool_indices=_tensor([2]),
-            prefix_lens=_tensor([prefix_len]),
-            extend_seq_lens=_tensor([1]),
-            req_to_token=req_to_token,
-            extras=empty_extras(),
-            expected_token_pool=None,
-            expected_token_valid_lens=None,
-            slot_token_offset=0,
-        )
-
-        triton_v, _ = plans[0]
-        expected = torch.full((prefix_len,), -1, dtype=torch.int64, device=_DEVICE)
-        assert torch.equal(triton_v.verify_expected_tokens[:prefix_len], expected)

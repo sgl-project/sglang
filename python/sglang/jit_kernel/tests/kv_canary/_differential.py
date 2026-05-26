@@ -47,9 +47,6 @@ def _run_both_plan(
     extras: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     swa_window_size: int,
     full_to_swa_index_mapping: Optional[torch.Tensor],
-    expected_token_pool: Optional[torch.Tensor] = None,
-    expected_token_valid_lens: Optional[torch.Tensor] = None,
-    slot_token_offset: int = 0,
     assert_equal: bool = True,
     active_verify_entries: Optional[int] = None,
     active_write_reqs: Optional[int] = None,
@@ -65,9 +62,6 @@ def _run_both_plan(
         req_to_token=req_to_token,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
-        expected_token_pool=expected_token_pool,
-        expected_token_valid_lens=expected_token_valid_lens,
-        slot_token_offset=slot_token_offset,
         verify_capacity=verify_capacity,
     )
     launch_canary_plan_kernels_torch_reference(
@@ -79,9 +73,6 @@ def _run_both_plan(
         req_to_token=req_to_token,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
-        expected_token_pool=expected_token_pool,
-        expected_token_valid_lens=expected_token_valid_lens,
-        slot_token_offset=slot_token_offset,
         verify_capacity=int(ref_verify.verify_slot_indices.shape[0]),
     )
     torch.cuda.synchronize()
@@ -141,10 +132,6 @@ def _assert_plans_byte_equal(
         assert torch.equal(
             triton_verify.verify_prev_slot_indices[:n_verify],
             ref_verify.verify_prev_slot_indices[:n_verify],
-        )
-        assert torch.equal(
-            triton_verify.verify_expected_tokens[:n_verify],
-            ref_verify.verify_expected_tokens[:n_verify],
         )
 
     n_write = (
@@ -496,9 +483,6 @@ def run_plan_diff(
     extras: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     swa_window_size: int = 0,
     full_to_swa_index_mapping: Optional[torch.Tensor] = None,
-    expected_token_pool: Optional[torch.Tensor] = None,
-    expected_token_valid_lens: Optional[torch.Tensor] = None,
-    slot_token_offset: int = 0,
     assert_equal: bool = True,
     active_verify_entries: Optional[int] = None,
     active_write_reqs: Optional[int] = None,
@@ -519,9 +503,6 @@ def run_plan_diff(
         extras=extras,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
-        expected_token_pool=expected_token_pool,
-        expected_token_valid_lens=expected_token_valid_lens,
-        slot_token_offset=slot_token_offset,
         assert_equal=assert_equal,
         active_verify_entries=active_verify_entries,
         active_write_reqs=active_write_reqs,

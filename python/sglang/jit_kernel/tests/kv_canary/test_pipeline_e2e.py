@@ -89,9 +89,6 @@ def _run_pipeline(
         req_to_token=req_to_token,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
-        expected_token_pool=None,
-        expected_token_valid_lens=None,
-        slot_token_offset=0,
         verify_capacity=verify_capacity,
     )
 

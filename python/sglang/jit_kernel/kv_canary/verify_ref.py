@@ -53,16 +53,12 @@ def launch_canary_verify_kernel_torch_reference(
     prev_slot_indices_host = plan.verify_prev_slot_indices[:active].to(
         device=work_device, dtype=torch.int64
     )
-    expected_tokens_host = plan.verify_expected_tokens[:active].to(
-        device=work_device, dtype=torch.int64
-    )
 
     slot_run_counter.add_(active)
 
     kept_slots: list[int] = []
     kept_expected_positions: list[int] = []
     kept_prev_slots: list[int] = []
-    kept_expected_tokens: list[int] = []
     for k in range(active):
         s = int(slot_indices_host[k].item())
         # Skip SGLang's padded-token dummy KV slot so unfilled req_to_token entries (zero-initialized) do not
@@ -71,14 +67,12 @@ def launch_canary_verify_kernel_torch_reference(
             kept_slots.append(s)
             kept_expected_positions.append(int(expected_positions_host[k].item()))
             kept_prev_slots.append(int(prev_slot_indices_host[k].item()))
-            kept_expected_tokens.append(int(expected_tokens_host[k].item()))
     active = len(kept_slots)
     if active <= 0:
         return
     slot_indices_list: list[int] = kept_slots
     expected_positions_list: list[int] = kept_expected_positions
     prev_slot_indices_list: list[int] = kept_prev_slots
-    expected_tokens_list: list[int] = kept_expected_tokens
 
     buf_i64 = canary_buf.detach().to(device=work_device).contiguous().view(torch.int64)
     slot_stride_i64 = int(buf_i64.shape[1])
@@ -93,8 +87,6 @@ def launch_canary_verify_kernel_torch_reference(
         slot_idx = slot_indices_list[k]
         expected_position = expected_positions_list[k]
         prev_slot = prev_slot_indices_list[k]
-        expected_token = expected_tokens_list[k]
-        check_token = expected_token != -1
 
         stored_token = int(buf_i64[slot_idx, consts.CANARY_FIELD_TOKEN].item())
         stored_position = int(buf_i64[slot_idx, consts.CANARY_FIELD_POSITION].item())
@@ -120,8 +112,6 @@ def launch_canary_verify_kernel_torch_reference(
             fail_reason |= consts.FailReason.POSITION
         if stored_real_kv_hash != expected_real_kv_hash:
             fail_reason |= consts.FailReason.REAL_KV_HASH
-        if check_token and stored_token != expected_token:
-            fail_reason |= consts.FailReason.VERIFY_TOKEN_MISMATCH
 
         if fail_reason != consts.FailReason(0):
             row = [0] * consts.VIOLATION_FIELDS
@@ -129,9 +119,7 @@ def launch_canary_verify_kernel_torch_reference(
             row[consts.VIOLATION_FIELD_SLOT_IDX] = slot_idx
             row[consts.VIOLATION_FIELD_POSITION] = stored_position
             row[consts.VIOLATION_FIELD_STORED_TOKEN] = stored_token
-            row[consts.VIOLATION_FIELD_EXPECTED_TOKEN] = (
-                expected_token if check_token else 0
-            )
+            row[consts.VIOLATION_FIELD_EXPECTED_TOKEN] = 0
             row[consts.VIOLATION_FIELD_STORED_CHAIN_HASH] = stored_chain_hash
             row[consts.VIOLATION_FIELD_EXPECTED_AUX] = expected_chain_hash
             row[consts.VIOLATION_FIELD_FAIL_REASON_BITS] = int(fail_reason)

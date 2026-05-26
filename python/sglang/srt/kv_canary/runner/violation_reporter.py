@@ -16,7 +16,6 @@ _REASON_LABELS: dict[FailReason, str] = {
     FailReason.REAL_KV_HASH: "real_kv_hash",
     FailReason.WRITE_TOKEN_MISMATCH: "write_token",
     FailReason.WRITE_POSITION_MISMATCH: "write_position",
-    FailReason.VERIFY_TOKEN_MISMATCH: "verify_token",
 }
 
 

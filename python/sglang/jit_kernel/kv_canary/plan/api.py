@@ -25,9 +25,6 @@ def launch_canary_plan_kernels(
     req_to_token: torch.Tensor,
     swa_window_size: int,
     full_to_swa_index_mapping: Optional[torch.Tensor],
-    expected_token_pool: Optional[torch.Tensor],
-    expected_token_valid_lens: Optional[torch.Tensor],
-    slot_token_offset: int,
     verify_capacity: int,
 ) -> None:
     """Fill verify_plan_out + write_plan_out from normalized canary plan inputs.
@@ -39,10 +36,7 @@ def launch_canary_plan_kernels(
       (SWA-translated via full_to_swa_index_mapping if non-None); prev_slot_idx =
       req_to_token[req_pool_indices[r], pos-1] for pos > 0, else -1. (SWA windows do NOT reset the chain —
       the writer chains across the entire prefix; sweep verify within an SWA window dereferences the real
-      predecessor for chain-link reconstruction.) When ``expected_token_pool`` is provided, each entry
-      also gathers ``expected_token_pool[req_pool_indices[r], pos + slot_token_offset]`` into
-      ``verify_plan_out.verify_expected_tokens``; out-of-range or absent-pool entries get the ``-1``
-      sentinel that tells the verify kernel to skip the SOT token check.
+      predecessor for chain-link reconstruction.)
     - **Write metadata** (when extend_seq_lens[r] > 0): contribute extend_seq_lens[r] to the per-req
       write count (for write_offsets cumsum). Per-req chain seed = req_to_token[req_pool_indices[r],
       prefix_lens[r]-1] (SWA-translated), or -1 if prefix_lens[r] == 0. Per-token write data
@@ -62,15 +56,6 @@ def launch_canary_plan_kernels(
             swa_window_size > 0. Used to translate verify slot indices and chain-seed slot indices at plan time.
             Loaded element-typed via Triton ``tl.load``; intermediate translated slot values are int64 inside the
             kernel and stored in the int64 plan schema.
-        expected_token_pool: Source-of-truth token id pool, shape [req_pool_alloc_size, max_context_len],
-            int32, or ``None``. When set, the entries kernel gathers
-            ``expected_token_pool[req_pool_indices[r], pos + slot_token_offset]`` into
-            ``verify_plan_out.verify_expected_tokens``. Must be paired with ``expected_token_valid_lens``.
-        expected_token_valid_lens: Per-row valid length, shape [req_pool_alloc_size], int32, or ``None``.
-            Same pairing rules as ``expected_token_pool``. The kernel emits the ``-1`` sentinel for any
-            entry whose ``pos + slot_token_offset`` falls outside ``[0, valid_lens[req_pool_indices[r]])``.
-        slot_token_offset: Logical-position offset (0 target / 1 EAGLE draft) added to ``pos`` before
-            indexing ``expected_token_pool``.
 
     Implementation:
         - Two sub-kernels launched in sequence:
@@ -150,12 +135,8 @@ def launch_canary_plan_kernels(
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_offsets_scratch=verify_offsets_scratch,
         verify_enable=verify_plan_out.enable,
-        expected_token_pool=expected_token_pool,
-        expected_token_valid_lens=expected_token_valid_lens,
         out_verify_slot_indices=verify_plan_out.verify_slot_indices,
         out_verify_positions=verify_plan_out.verify_positions,
         out_verify_prev_slot_indices=verify_plan_out.verify_prev_slot_indices,
-        out_verify_expected_tokens=verify_plan_out.verify_expected_tokens,
         swa_window_size=int(swa_window_size),
-        slot_token_offset=int(slot_token_offset),
     )

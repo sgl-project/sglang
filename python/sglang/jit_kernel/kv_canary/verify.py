@@ -177,12 +177,6 @@ class VerifyPlan:
             head (anchor on CANARY_CHAIN_ANCHOR). Explicit (not derived from verify_slot_indices[i-1])
             because chain heads, SWA window starts, cross-req boundaries, and radix-orphan extras break the
             "predecessor == previous array entry" assumption.
-        verify_expected_tokens: Source-of-truth token id per verify entry, shape [verify_capacity], int64.
-            Plan side gathers ``pool[req_idx, position + group.slot_token_offset]``; entries whose mapped
-            position falls outside the valid sequence (speculative draft decode slots, draft rotation
-            bonus tail) emit a ``-1`` sentinel which the verify kernel treats as "skip token check". Verify
-            kernel compares this against the stored token field and records a
-            :class:`FailReason.VERIFY_TOKEN_MISMATCH` violation on mismatch.
         verify_num_valid: Active entry count, shape [1], int32. Clamped by the plan kernel to
             min(total_requested, verify_capacity) so the verify kernel grid never reads past the buffer.
         enable: Run-this-step flag, shape [1], int32. 1 = verify kernel runs as usual; 0 = the plan kernel
@@ -193,7 +187,6 @@ class VerifyPlan:
     verify_slot_indices: torch.Tensor
     verify_positions: torch.Tensor
     verify_prev_slot_indices: torch.Tensor
-    verify_expected_tokens: torch.Tensor
     verify_num_valid: torch.Tensor
     enable: torch.Tensor
 
@@ -213,11 +206,6 @@ class VerifyPlan:
             verify_prev_slot_indices=torch.empty(
                 verify_capacity, dtype=torch.int64, device=device
             ),
-            # Default to the "skip token check" sentinel (-1) so test helpers and pre-plan-kernel
-            # observers never see a stale non-sentinel value as an apparent SOT token.
-            verify_expected_tokens=torch.full(
-                (verify_capacity,), -1, dtype=torch.int64, device=device
-            ),
             verify_num_valid=torch.empty(1, dtype=torch.int32, device=device),
             # enable defaults to 1 ("run verify") so test helpers that build a VerifyPlan
             # directly (no plan kernel) don't have to remember to set it. Plan kernel always
@@ -231,7 +219,6 @@ class VerifyPlan:
         self.verify_slot_indices.zero_()
         self.verify_positions.zero_()
         self.verify_prev_slot_indices.zero_()
-        self.verify_expected_tokens.zero_()
         self.verify_num_valid.zero_()
         self.enable.zero_()
         return self
@@ -282,10 +269,8 @@ def launch_canary_verify_kernel(
               prev_slot_idx == -1 anchors at splitmix64(CANARY_CHAIN_ANCHOR).
           (c) For each src in real_kv_sources: read src.read_bytes leading bytes from src.tensor[...] (per the
               RealKvSource access invariant) and splitmix64-fold into running_real_kv_hash.
-        - Compare expected vs stored (chain hash, position, real_kv_hash, and source-of-truth token when
-          ``plan.verify_expected_tokens[entry_idx] != -1``) and accumulate fail_reason bits; if non-zero →
-          record_violation(). The ``-1`` sentinel skips the SOT-token check for entries the plan side
-          marked as out-of-scope (speculative draft decode slots, EAGLE rotation bonus tail).
+        - Compare expected vs stored (chain hash, position, real_kv_hash) and accumulate fail_reason bits; if
+          non-zero → record_violation().
         - record_violation(): idx = atomicAdd(violation_write_index, 1); if idx < ring_capacity, atomic-write
           the 8 int64 fields to violation_ring[idx] (kernel_kind, slot_idx, position, stored vs expected
           fields, fail_reason).
@@ -316,7 +301,6 @@ def launch_canary_verify_kernel(
     _assert_contiguous(plan.verify_slot_indices, "plan.verify_slot_indices")
     _assert_contiguous(plan.verify_positions, "plan.verify_positions")
     _assert_contiguous(plan.verify_prev_slot_indices, "plan.verify_prev_slot_indices")
-    _assert_contiguous(plan.verify_expected_tokens, "plan.verify_expected_tokens")
     _assert_contiguous(plan.verify_num_valid, "plan.verify_num_valid")
     _assert_contiguous(plan.enable, "plan.enable")
     _assert_contiguous(context.violation_ring, "violation_ring")
@@ -334,7 +318,6 @@ def launch_canary_verify_kernel(
         plan.verify_slot_indices,
         plan.verify_positions,
         plan.verify_prev_slot_indices,
-        plan.verify_expected_tokens,
         plan.verify_num_valid,
         plan.enable,
         int(context.kernel_kind),
