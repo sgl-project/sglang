@@ -220,6 +220,7 @@ def _make_plan_callable(inputs: dict):
             full_to_swa_index_mapping=inputs["full_to_swa_index_mapping"],
             verify_capacity=inputs["verify_capacity"],
             req_to_verify_expected_tokens=None,
+            req_to_verify_expected_tokens_valid_lens=None,
             kv_token_id_vs_position_offset=0,
         )
 

@@ -71,12 +71,26 @@ def _run_pipeline(
     verify_capacity: int,
     write_req_capacity: int,
     req_to_verify_expected_tokens: Optional[torch.Tensor] = None,
+    req_to_verify_expected_tokens_valid_lens: Optional[torch.Tensor] = None,
     kv_token_id_vs_position_offset: int = 0,
     check_verify_expected_token: bool = True,
 ) -> tuple[VerifyPlan, WritePlan]:
     _ = extras
     plan_v = VerifyPlan.allocate(verify_capacity=verify_capacity, device=_DEVICE)
     plan_w = WritePlan.allocate(write_req_capacity=write_req_capacity, device=_DEVICE)
+
+    # Existing pipeline tests that supply a pool but no per-req lens want "bound by full
+    # row width" semantics. Synthesise that bound here so callers don't have to.
+    if (
+        req_to_verify_expected_tokens is not None
+        and req_to_verify_expected_tokens_valid_lens is None
+    ):
+        req_to_verify_expected_tokens_valid_lens = torch.full(
+            (int(req_pool_indices.shape[0]),),
+            int(req_to_verify_expected_tokens.shape[1]),
+            dtype=torch.int64,
+            device=req_pool_indices.device,
+        )
 
     plan_fn = (
         launch_canary_plan_kernels
@@ -94,6 +108,7 @@ def _run_pipeline(
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=verify_capacity,
         req_to_verify_expected_tokens=req_to_verify_expected_tokens,
+        req_to_verify_expected_tokens_valid_lens=req_to_verify_expected_tokens_valid_lens,
         kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
     )
 
@@ -715,6 +730,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
         full_to_swa_index_mapping=None,
         verify_capacity=int(plan_v_real.verify_slot_indices.shape[0]),
         req_to_verify_expected_tokens=None,
+        req_to_verify_expected_tokens_valid_lens=None,
         kv_token_id_vs_position_offset=0,
     )
     launch_canary_plan_kernels_torch_reference(
@@ -728,6 +744,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
         full_to_swa_index_mapping=None,
         verify_capacity=int(plan_v_ref.verify_slot_indices.shape[0]),
         req_to_verify_expected_tokens=None,
+        req_to_verify_expected_tokens_valid_lens=None,
         kv_token_id_vs_position_offset=0,
     )
 
@@ -836,9 +853,7 @@ def test_pipeline_token_mismatch_detected_via_pool() -> None:
     out_cache_loc = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
 
     expected_tokens = [1000 + pos for pos in range(prefix_len)]
-    pool = torch.full(
-        (max_reqs, max_seq_len), -999, dtype=torch.int32, device=_DEVICE
-    )
+    pool = torch.full((max_reqs, max_seq_len), -999, dtype=torch.int32, device=_DEVICE)
     for pos, token in enumerate(expected_tokens):
         pool[1, pos] = token
 
@@ -881,17 +896,15 @@ def test_pipeline_token_mismatch_detected_via_pool() -> None:
         fail_bits = int(
             log_real.ring[row_idx, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
         )
-        assert (
-            fail_bits & int(consts.FailReason.VERIFY_TOKEN_MISMATCH)
+        assert fail_bits & int(
+            consts.FailReason.VERIFY_TOKEN_MISMATCH
         ), f"row {row_idx}: VERIFY_TOKEN_MISMATCH bit missing in {fail_bits:#b}"
         stored = int(log_real.ring[row_idx, consts.VIOLATION_FIELD_STORED_TOKEN].item())
         expected = int(
             log_real.ring[row_idx, consts.VIOLATION_FIELD_EXPECTED_TOKEN].item()
         )
         observed_pairs.add((stored, expected))
-    expected_pairs = {
-        (stored_tokens[i], expected_tokens[i]) for i in range(prefix_len)
-    }
+    expected_pairs = {(stored_tokens[i], expected_tokens[i]) for i in range(prefix_len)}
     assert observed_pairs == expected_pairs
 
 
@@ -912,9 +925,7 @@ def test_pipeline_eagle_offset_plus_1_byte_equal() -> None:
     out_cache_loc = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
 
     stored_tokens = [2000 + pos for pos in range(prefix_len)]
-    pool = torch.full(
-        (max_reqs, max_seq_len), -999, dtype=torch.int32, device=_DEVICE
-    )
+    pool = torch.full((max_reqs, max_seq_len), -999, dtype=torch.int32, device=_DEVICE)
     for pos in range(prefix_len):
         # offset=+1 means kernel gathers from pool[rp, pos + 1], so place stored_tokens[pos] there.
         pool[1, pos + 1] = stored_tokens[pos]

@@ -21,6 +21,9 @@ def _make_static_plan_input(*, bs_capacity: int, device) -> PlanInput:
         req_pool_indices=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
         prefix_lens=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
         extend_seq_lens=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
+        req_to_verify_expected_tokens_valid_lens=torch.zeros(
+            bs_capacity, dtype=torch.int64, device=device
+        ),
     )
 
 
@@ -104,6 +107,24 @@ class TestSelfUnitPlanInput(CustomTestCase):
         plan.fill_from_forward_batch(forward_batch=fb)
         self.assertEqual(plan.prefix_lens[:3].tolist(), [3, 6, 0])
         self.assertEqual(plan.extend_seq_lens[:3].tolist(), [1, 1, 1])
+
+    def test_plan_input_mirrors_req_all_ids_lens(self):
+        """req_to_verify_expected_tokens_valid_lens copies forward_batch.req_all_ids_lens for active rows."""
+        fb = make_forward_batch(
+            self.device,
+            req_pool_indices=torch.tensor(
+                [1, 2], dtype=torch.int64, device=self.device
+            ),
+            seq_lens=torch.tensor([10, 12], dtype=torch.int32, device=self.device),
+            is_extend=False,
+        )
+        fb.req_all_ids_lens = torch.tensor([7, 9], dtype=torch.int64, pin_memory=True)
+        plan = _make_static_plan_input(bs_capacity=4, device=self.device)
+        plan.fill_from_forward_batch(forward_batch=fb)
+        torch.cuda.synchronize()
+        self.assertEqual(plan.req_to_verify_expected_tokens_valid_lens[:2].tolist(), [7, 9])
+        # Padding tail stays at zero so the plan kernel reads "no in-range positions" for it.
+        self.assertEqual(plan.req_to_verify_expected_tokens_valid_lens[2:].tolist(), [0, 0])
 
     def test_plan_input_padding_dummy_sentinel(self):
         """Verify padding sentinel rows remain valid plan input entries."""

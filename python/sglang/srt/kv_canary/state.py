@@ -124,7 +124,7 @@ class CanaryDeviceState:
                     "kv-canary: CanaryDeviceState.allocate requires req_to_token_alloc_size "
                     "and max_context_len when CanaryConfig.enable_verify_token_assert is on"
                 )
-            req_to_verify_expected_tokens = torch.zeros(
+            req_to_verify_expected_tokens = torch.empty(
                 (req_to_token_alloc_size, max_context_len),
                 dtype=torch.int32,
                 device=device,
