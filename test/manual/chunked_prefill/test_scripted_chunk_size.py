@@ -527,6 +527,82 @@ class TestScriptedChunkSize(CustomTestCase):
         assert r.finished
         assert r.chunks_done == 32
 
+    def test_chunk_size_equals_page_size(self):
+        """chunk_size == page_size: each chunk allocates one page; final kv_pages reflects chunks_done."""
+        execute_scripted_runtime(
+            self._script_chunk_size_equals_page_size,
+            **base_engine_kwargs(chunked_prefill_size=16, page_size=16),
+        )
+
+    # [a-Boundary6] chunk_size == page_size — every chunk is exactly one
+    # page; the chunked path must not double-allocate or leak.
+    @staticmethod
+    def _script_chunk_size_equals_page_size(t: ScriptedRuntime):
+        # prompt_len = 8 * page_size → 8 chunks expected.
+        r = t.start_req(prompt_len=8 * 16, max_new_tokens=2)
+        yield from run_until_finished(r, max_steps=400)
+        assert r.finished
+        assert r.chunks_done == 8
+        # After finish, KV must be fully released.
+        assert r.kv_pages == 0
+
+    def test_chunk_size_misaligned_page_size_plus_minus_1(self):
+        """chunk_size = page_size ± 1: chunked completes and page accounting stays consistent."""
+        execute_scripted_runtime(
+            self._script_chunk_size_misaligned_page_size_plus_minus_1,
+            **base_engine_kwargs(chunked_prefill_size=15, page_size=16),
+        )
+
+    # [a-Boundary7] chunk_size = page_size - 1 — misaligned boundaries
+    # exercise the partial-page tail; finishing without leaks is the
+    # property under test.
+    @staticmethod
+    def _script_chunk_size_misaligned_page_size_plus_minus_1(t: ScriptedRuntime):
+        # chunk_size = page_size - 1 = 15; prompt = 60 → 4 chunks
+        # (15 + 15 + 15 + 15) but each chunk straddles page boundaries.
+        r = t.start_req(prompt_len=60, max_new_tokens=2)
+        yield from run_until_finished(r, max_steps=400)
+        assert r.finished
+        assert r.chunks_done == 4
+        assert r.kv_pages == 0
+
+    def test_prompt_n_chunks_plus_minus_1(self):
+        """Sweep prompt_len = N*chunk_size ± 1 for N in {1..5}; chunks_done matches ceil-div."""
+        execute_scripted_runtime(
+            self._script_prompt_n_chunks_plus_minus_1,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-Boundary3 / Prompt2] N*chunk_size ± 1 sweep — verifies that the
+    # ceil-div arithmetic in the chunked admission path is correct at
+    # every chunk multiple, both just below and just above.
+    @staticmethod
+    def _script_prompt_n_chunks_plus_minus_1(t: ScriptedRuntime):
+        # N = 1..5 — for each N, submit two reqs: one at N*chunk_size - 1
+        # and one at N*chunk_size + 1, and check chunks_done = ceil-div.
+        for n in range(1, 6):
+            # N*chunk_size - 1.
+            prompt_minus = n * DEFAULT_CHUNK_SIZE - 1
+            r_minus = t.start_req(prompt_len=prompt_minus, max_new_tokens=1)
+            yield from run_until_finished(r_minus, max_steps=800)
+            assert r_minus.finished
+            expected_minus = _expected_chunks(prompt_minus, DEFAULT_CHUNK_SIZE)
+            assert r_minus.chunks_done == expected_minus, (
+                f"N={n} prompt_len={prompt_minus}: "
+                f"expected chunks_done={expected_minus}, got {r_minus.chunks_done}"
+            )
+
+            # N*chunk_size + 1.
+            prompt_plus = n * DEFAULT_CHUNK_SIZE + 1
+            r_plus = t.start_req(prompt_len=prompt_plus, max_new_tokens=1)
+            yield from run_until_finished(r_plus, max_steps=800)
+            assert r_plus.finished
+            expected_plus = _expected_chunks(prompt_plus, DEFAULT_CHUNK_SIZE)
+            assert r_plus.chunks_done == expected_plus, (
+                f"N={n} prompt_len={prompt_plus}: "
+                f"expected chunks_done={expected_plus}, got {r_plus.chunks_done}"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
