@@ -19,29 +19,14 @@ from common.attention_methods.mamba2_attention import (
     DEFAULT_STATE_SIZE,
     Mamba2AttentionCase,
     build_mamba2_attention_fixture,
+    make_mamba2_cases,
     run_mamba2_attention_case,
 )
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
 class TestTritonMamba2BackendCorrectness(CustomTestCase):
-    CASES = (
-        Mamba2AttentionCase(
-            name="mamba2_extend_zero_prefix_exact_page",
-            backend="triton",
-            forward_mode=ForwardMode.EXTEND,
-            num_heads=DEFAULT_NUM_HEADS,
-            head_dim=DEFAULT_HEAD_DIM,
-            state_size=DEFAULT_STATE_SIZE,
-            n_groups=DEFAULT_N_GROUPS,
-            conv_kernel=DEFAULT_CONV_KERNEL,
-            mamba_chunk_size=DEFAULT_MAMBA_CHUNK_SIZE,
-            hidden_size=DEFAULT_HIDDEN_SIZE,
-            page_size=16,
-            prefix_lens=(0,),
-            extend_lens=(16,),
-        ),
-    )
+    CASES = make_mamba2_cases("triton")
     # `seq_lens_cpu=[5, 1, 1]` mixes a live row with two cuda-graph
     # fill-value rows so the replay padding count is non-trivial.
     REPLAY_METADATA_CASE = Mamba2AttentionCase(

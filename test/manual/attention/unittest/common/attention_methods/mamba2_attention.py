@@ -124,11 +124,63 @@ def make_mamba2_cases(backend: str) -> tuple[Mamba2AttentionCase, ...]:
         mamba_chunk_size=DEFAULT_MAMBA_CHUNK_SIZE,
         hidden_size=DEFAULT_HIDDEN_SIZE,
     )
+    # DECODE is intentionally not enabled here: `MambaMixer2.forward_decode`
+    # requires `initialize_mamba_selective_state_update_backend()` which is
+    # only wired by the production model runner. EXTEND covers the chunked-
+    # scan kernel path that's reachable in the fixture.
     return (
         Mamba2AttentionCase(
             name="mamba2_extend_zero_prefix_exact_page",
             forward_mode=ForwardMode.EXTEND,
             page_size=16,
+            prefix_lens=(0,),
+            extend_lens=(16,),
+            **common,
+        ),
+        Mamba2AttentionCase(
+            name="mamba2_extend_zero_prefix_below_page",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(0,),
+            extend_lens=(8,),
+            **common,
+        ),
+        Mamba2AttentionCase(
+            name="mamba2_extend_zero_prefix_above_page",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(0,),
+            extend_lens=(32,),
+            **common,
+        ),
+        Mamba2AttentionCase(
+            name="mamba2_extend_with_prefix",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(16,),
+            extend_lens=(16,),
+            **common,
+        ),
+        Mamba2AttentionCase(
+            name="mamba2_extend_multi_request_zero_prefix",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(0, 0),
+            extend_lens=(16, 16),
+            **common,
+        ),
+        Mamba2AttentionCase(
+            name="mamba2_extend_multi_request_ragged",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(0, 16),
+            extend_lens=(16, 16),
+            **common,
+        ),
+        Mamba2AttentionCase(
+            name="mamba2_extend_page_size_1",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=1,
             prefix_lens=(0,),
             extend_lens=(16,),
             **common,
