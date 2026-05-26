@@ -28,8 +28,31 @@ DEFAULT_DEVICE = "cuda"
 DENSE_ATOL = 3e-2
 DENSE_RTOL = 3e-2
 
-# Backends whose decode metadata applies `min(seq_lens, sliding_window_size)`.
-_SWA_AWARE_DECODE_BACKENDS = frozenset({"triton", "flashinfer"})
+# SWA decode rule classification — production metadata builders differ:
+#   - `min_seq_len_window` rule: `window_kv_lens = min(seq_lens, window)` (the
+#     extra current-token slot is NOT included).
+#   - `extend_window` rule: keys at `[query_pos - window, query_pos]` are
+#     allowed by the extend kernel mask (the current token IS included).
+# Each known backend must be classified into exactly one set; an unclassified
+# backend trips `_swa_decode_uses_min_seq_len_rule` so a future SWA backend
+# can't silently inherit the wrong rule via a fallback.
+_SWA_DECODE_MIN_SEQ_LEN_WINDOW: frozenset[str] = frozenset({"triton", "flashinfer"})
+_SWA_DECODE_EXTEND_WINDOW: frozenset[str] = frozenset(
+    {"torch_native", "fa3", "fa4", "flex_attention", "trtllm_mha"}
+)
+
+
+def _swa_decode_uses_min_seq_len_rule(case: "DenseAttentionCase") -> bool:
+    if case.backend in _SWA_DECODE_MIN_SEQ_LEN_WINDOW:
+        return True
+    if case.backend in _SWA_DECODE_EXTEND_WINDOW:
+        return False
+    raise ValueError(
+        f"Unknown SWA decode rule for backend {case.backend!r}. Add it to "
+        f"either `_SWA_DECODE_MIN_SEQ_LEN_WINDOW` or `_SWA_DECODE_EXTEND_WINDOW` "
+        f"in common/attention_methods/dense_attention.py, depending on what its "
+        f"`init_forward_metadata_decode` metadata builder produces."
+    )
 
 
 @dataclass(frozen=True)
@@ -632,10 +655,9 @@ def _dense_attention_reference(
                 # Two SWA mask rules in production:
                 #   - extend kernel: `kv_id >= q_id - window` (window + 1 keys).
                 #   - SWA-aware decode metadata: `min(seq_lens, window)` keys.
-                # `torch_native` decodes without SWA, so it stays on the looser extend rule.
                 if (
                     case.forward_mode.is_decode()
-                    and case.backend in _SWA_AWARE_DECODE_BACKENDS
+                    and _swa_decode_uses_min_seq_len_rule(case)
                 ):
                     key_start = max(0, query_pos + 1 - case.sliding_window_size)
                 else:
