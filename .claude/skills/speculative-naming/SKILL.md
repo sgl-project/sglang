@@ -1,6 +1,11 @@
+---
+name: speculative-naming
+description: Naming conventions for SGLang speculative decoding identifiers. Use when adding, renaming, or reviewing identifiers in speculative decoding code — anything under `python/sglang/srt/speculative/`, related attention backends, scheduler accumulators, IPC fields, observability metrics, or CLI flags.
+---
+
 # Speculative Decoding — Naming Conventions
 
-Apply this rule when adding, renaming, or reviewing identifiers in speculative decoding code (anything under `python/sglang/srt/speculative/`, related attention backends, scheduler accumulators, IPC fields, observability metrics, or CLI flags).
+Apply this skill when adding, renaming, or reviewing identifiers in speculative decoding code (anything under `python/sglang/srt/speculative/`, related attention backends, scheduler accumulators, IPC fields, observability metrics, or CLI flags).
 
 ## Rule 1 — Verb form, drop `-ed`
 
