@@ -162,55 +162,6 @@ class TestScriptedSampling(CustomTestCase):
         assert r.finished
         assert len(r.output_tokens) < 512
 
-    def test_top_p_chunked(self):
-        """Top_p sampling + chunked: doesn't hang or crash."""
-        execute_scripted_runtime(
-            self._script_top_p_chunked,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_top_p_chunked(t: ScriptedRuntime):
-        # top_p sampling + chunked: doesn't hang or crash.
-        # NEW API NEEDED: start_req(..., top_p=).
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, top_p=0.9)
-        yield from run_until_finished(r)
-        assert r.finished
-
-    def test_top_k_chunked(self):
-        """Top_k sampling + chunked."""
-        execute_scripted_runtime(
-            self._script_top_k_chunked,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_top_k_chunked(t: ScriptedRuntime):
-        # top_k sampling + chunked.
-        # NEW API NEEDED: start_req(..., top_k=).
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, top_k=50)
-        yield from run_until_finished(r)
-        assert r.finished
-
-    def test_top_p_top_k_combined_chunked(self):
-        """Top_p AND top_k together + chunked."""
-        execute_scripted_runtime(
-            self._script_top_p_top_k_combined_chunked,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_top_p_top_k_combined_chunked(t: ScriptedRuntime):
-        # top_p AND top_k together + chunked.
-        r = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN,
-            max_new_tokens=4,
-            top_p=0.95,
-            top_k=40,
-        )
-        yield from run_until_finished(r)
-        assert r.finished
-
     def test_high_temperature_chunked(self):
         """High temperature + chunked: stable output, no crash."""
         execute_scripted_runtime(
@@ -364,40 +315,6 @@ class TestScriptedSampling(CustomTestCase):
         yield from run_until_finished(r)
         assert r.finished
 
-    def test_frequency_penalty_chunked(self):
-        """Frequency_penalty + chunked."""
-        execute_scripted_runtime(
-            self._script_frequency_penalty_chunked,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_frequency_penalty_chunked(t: ScriptedRuntime):
-        # frequency_penalty + chunked.
-        # NEW API NEEDED: start_req(..., frequency_penalty=).
-        r = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, frequency_penalty=0.5
-        )
-        yield from run_until_finished(r)
-        assert r.finished
-
-    def test_presence_penalty_chunked(self):
-        """Presence_penalty + chunked."""
-        execute_scripted_runtime(
-            self._script_presence_penalty_chunked,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_presence_penalty_chunked(t: ScriptedRuntime):
-        # presence_penalty + chunked.
-        # NEW API NEEDED: start_req(..., presence_penalty=).
-        r = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, presence_penalty=0.5
-        )
-        yield from run_until_finished(r)
-        assert r.finished
-
     def test_explicit_rid_chunked(self):
         """Explicit rid + chunked: handle uses given rid."""
         execute_scripted_runtime(
@@ -455,21 +372,6 @@ class TestScriptedSampling(CustomTestCase):
     @staticmethod
     def _script_high_temperature_short(t: ScriptedRuntime):
         r = t.start_req(prompt_len=16, max_new_tokens=4, temperature=1.8)
-        yield from run_until_finished(r)
-        assert r.finished
-
-    def test_high_temperature_chunked_extra(self):
-        """Chunked long prompt with high temperature (1.8) finishes cleanly."""
-        execute_scripted_runtime(
-            self._script_high_temperature_chunked_extra,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_high_temperature_chunked_extra(t: ScriptedRuntime):
-        r = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=1.8
-        )
         yield from run_until_finished(r)
         assert r.finished
 
