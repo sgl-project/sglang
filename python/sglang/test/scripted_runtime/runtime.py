@@ -21,13 +21,19 @@ from typing import (
     Dict,
     Generator,
     List,
+    Literal,
     Optional,
     Set,
     Tuple,
     Union,
 )
 
-from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    ContinueGenerationReqInput,
+    PauseGenerationReqInput,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils.common import broadcast_pyobj
 from sglang.test.scripted_runtime.req_handle import ReqHandle, ReqStatus
@@ -198,6 +204,49 @@ class ScriptedRuntime:
         handle = ReqHandle(rid=rid, runtime=self)
         self._req_handles[rid] = handle
         return handle
+
+    def pause_generation(self, *, mode: Literal["retract", "in_place"]) -> None:
+        """Scripted-only entry point: bypasses HTTP server / tokenizer manager.
+
+        Drives ``scheduler.pause_generation`` directly with the given mode.
+        ``mode="abort"`` is intentionally not supported here: the scheduler
+        has no abort branch inside ``pause_generation``; use
+        :meth:`abort_all` instead.
+        """
+        assert self._is_driver, "pause_generation is only callable from the driver rank"
+        self._scheduler.pause_generation(PauseGenerationReqInput(mode=mode))
+
+    def continue_generation(self, *, torch_empty_cache: bool = False) -> None:
+        """Scripted-only entry point: bypasses HTTP server / tokenizer manager.
+
+        Resume after :meth:`pause_generation`. Defaults to skipping the
+        empty_cache call to keep scripted runs deterministic.
+        """
+        assert (
+            self._is_driver
+        ), "continue_generation is only callable from the driver rank"
+        self._scheduler.continue_generation(
+            ContinueGenerationReqInput(torch_empty_cache=torch_empty_cache)
+        )
+
+    def abort_all(self) -> None:
+        """Scripted-only entry point: bypasses HTTP server / tokenizer manager.
+
+        Drives ``scheduler.abort_request(AbortReq(abort_all=True))`` —
+        the real abort code path. ``pause_generation(mode="abort")`` does
+        not abort in the scheduler today; this is the only way to reach
+        the abort branch from a script.
+        """
+        assert self._is_driver, "abort_all is only callable from the driver rank"
+        self._scheduler.abort_request(AbortReq(abort_all=True))
+
+    def radix_chunked_hit_count_skip_count(self) -> int:
+        """Counter: number of times ``_inc_hit_count`` short-circuited because
+        the insert was chunked. Reads the tree_cache field added in
+        :class:`RadixCache`. Used to verify the chunked self-referencing
+        inflation guard was exercised.
+        """
+        return self._scheduler.tree_cache._chunked_inc_hit_count_skip_count
 
     # ============================================================
     # Lookups used by ReqHandle (driver-rank-local view).
