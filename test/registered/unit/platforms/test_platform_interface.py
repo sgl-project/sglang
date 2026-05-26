@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.platforms import _load_platform_class, _resolve_platform
+from sglang.srt.platforms.cpu import CpuDeviceMixin, CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaDeviceMixin, CudaSRTPlatform
 from sglang.srt.platforms.device_mixin import (
     CpuArchEnum,
@@ -331,6 +332,94 @@ class TestCudaDeviceMixin(CustomTestCase):
         self.assertTrue(base.support_piecewise_cuda_graph())
 
 
+class TestCpuDeviceMixin(CustomTestCase):
+    """Tests for CPU device operation defaults (covers both x86 and ARM)."""
+
+    def test_cpu_platform_identity(self):
+        base = CpuSRTPlatform()
+        self.assertTrue(base.is_cpu())
+        self.assertFalse(base.is_cuda())
+        self.assertFalse(base.is_cuda_alike())
+        self.assertIsInstance(base, CpuDeviceMixin)
+
+    def test_default_get_device_returns_cpu_device(self):
+        base = CpuSRTPlatform()
+        # ``local_rank`` is ignored — CPU has no per-rank device.
+        self.assertEqual(base.get_device(0), torch.device("cpu"))
+        self.assertEqual(base.get_device(7), torch.device("cpu"))
+
+    @patch("sglang.srt.platforms.cpu.psutil.virtual_memory")
+    def test_default_get_device_total_memory_uses_psutil(self, mock_vm):
+        mock_vm.return_value.total = 12345
+        base = CpuSRTPlatform()
+        self.assertEqual(base.get_device_total_memory(), 12345)
+
+    @patch("sglang.srt.platforms.cpu.psutil.virtual_memory")
+    def test_default_get_available_memory_uses_psutil(self, mock_vm):
+        mock_vm.return_value.available = 100
+        mock_vm.return_value.total = 200
+        base = CpuSRTPlatform()
+        self.assertEqual(base.get_available_memory(), (100, 200))
+
+    @patch("sglang.srt.platforms.cpu.psutil.Process")
+    def test_default_get_current_memory_usage_uses_process_rss(self, mock_proc):
+        mock_proc.return_value.memory_info.return_value.rss = 4567
+        base = CpuSRTPlatform()
+        self.assertEqual(base.get_current_memory_usage(), 4567.0)
+
+    def test_default_set_device_is_noop(self):
+        base = CpuSRTPlatform()
+        # Should not raise and should not flip torch default device.
+        before = torch.empty(0).device
+        base.set_device(torch.device("cpu"))
+        after = torch.empty(0).device
+        self.assertEqual(before, after)
+
+    @patch("sglang.srt.platforms.cpu.gc.collect")
+    def test_default_empty_cache_calls_gc_collect(self, mock_collect):
+        base = CpuSRTPlatform()
+        base.empty_cache()
+        mock_collect.assert_called_once_with()
+
+    def test_default_synchronize_is_noop(self):
+        base = CpuSRTPlatform()
+        # Inherited base ``pass`` — must not raise.
+        base.synchronize()
+
+    def test_default_distributed_backend_is_gloo(self):
+        base = CpuSRTPlatform()
+        self.assertEqual(base.get_torch_distributed_backend_str(), "gloo")
+
+    @patch("platform.machine", return_value="aarch64")
+    def test_get_device_name_arm_branch(self, _mock_machine):
+        base = CpuSRTPlatform()
+        name = base.get_device_name()
+        self.assertIn("aarch64", name)
+
+    @patch("platform.machine", return_value="x86_64")
+    def test_get_device_name_x86_branch(self, _mock_machine):
+        base = CpuSRTPlatform()
+        name = base.get_device_name()
+        self.assertIn("x86_64", name)
+
+    @patch("sglang.srt.platforms.cpu._platform.machine", return_value="aarch64")
+    def test_get_device_uuid_returns_machine(self, _mock_machine):
+        base = CpuSRTPlatform()
+        self.assertEqual(base.get_device_uuid(), "aarch64")
+
+    def test_get_device_capability_returns_none(self):
+        base = CpuSRTPlatform()
+        self.assertIsNone(base.get_device_capability())
+
+    def test_cpu_srt_platform_capabilities(self):
+        base = CpuSRTPlatform()
+        self.assertFalse(base.supports_fp8())
+        self.assertFalse(base.support_cuda_graph())
+        self.assertFalse(base.support_piecewise_cuda_graph())
+        # Override of the SRTPlatform default (True) — no GPU to pin to.
+        self.assertFalse(base.is_pin_memory_available())
+
+
 class TestSRTPlatformOverrides(CustomTestCase):
     """Tests for SRTPlatform method overrides via plugins."""
 
@@ -495,6 +584,51 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
 
         self.assertIsInstance(result, SRTPlatform)
         self.assertNotIsInstance(result, CudaSRTPlatform)
+
+    @patch("sglang.srt.platforms.load_plugins_by_group")
+    @patch("sglang.srt.platforms._is_cuda_available")
+    @patch("sglang.srt.platforms._is_cpu_available")
+    @patch("sglang.srt.platforms.envs")
+    def test_no_plugin_cpu_engine_enabled_activates_cpu_fallback(
+        self, mock_envs, mock_is_cpu, mock_is_cuda, mock_load
+    ):
+        """SGLANG_USE_CPU_ENGINE=1 + no plugins → CpuSRTPlatform."""
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_is_cpu.return_value = True
+        mock_is_cuda.return_value = False
+        mock_load.return_value = {}
+        result = _resolve_platform()
+        self.assertIsInstance(result, CpuSRTPlatform)
+
+    @patch("sglang.srt.platforms.load_plugins_by_group")
+    @patch("sglang.srt.platforms._is_cuda_available")
+    @patch("sglang.srt.platforms._is_cpu_available")
+    @patch("sglang.srt.platforms.envs")
+    def test_cpu_engine_wins_over_cuda(
+        self, mock_envs, mock_is_cpu, mock_is_cuda, mock_load
+    ):
+        """When both CPU engine and CUDA are available, explicit opt-in wins."""
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_is_cpu.return_value = True
+        mock_is_cuda.return_value = True
+        mock_load.return_value = {}
+        result = _resolve_platform()
+        self.assertIsInstance(result, CpuSRTPlatform)
+
+    @patch("sglang.srt.platforms.load_plugins_by_group")
+    @patch("sglang.srt.platforms._is_cuda_available")
+    @patch("sglang.srt.platforms._is_cpu_available")
+    @patch("sglang.srt.platforms.envs")
+    def test_no_plugin_cpu_engine_disabled_prefers_cuda(
+        self, mock_envs, mock_is_cpu, mock_is_cuda, mock_load
+    ):
+        """Regression: CPU opt-out leaves the existing CUDA fallback path intact."""
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_is_cpu.return_value = False
+        mock_is_cuda.return_value = True
+        mock_load.return_value = {}
+        result = _resolve_platform()
+        self.assertIsInstance(result, CudaSRTPlatform)
 
     @patch("sglang.srt.platforms.load_plugins_by_group")
     @patch("sglang.srt.platforms.envs")
