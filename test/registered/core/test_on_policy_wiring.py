@@ -20,6 +20,7 @@ from sglang.srt.true_on_policy import (
     should_disable_fused_qk_norm_mrope,
     should_disable_mlp_allreduce_fusion_for_on_policy,
     should_disable_reduce_scatter_for_on_policy,
+    should_use_deterministic_moe_combine,
     should_use_tp_invariant_row_linear,
     should_use_tp_invariant_tree_all_reduce,
 )
@@ -110,9 +111,7 @@ def _run_server_args_script(argv: list[str]) -> dict[str, object]:
             json.dumps(
                 {
                     "enable_deterministic_inference": server_args.enable_deterministic_inference,
-                    "enable_prefill_only_deterministic_inference": server_args.enable_prefill_only_deterministic_inference,
                     "enable_flashinfer_allreduce_fusion": server_args.enable_flashinfer_allreduce_fusion,
-                    "rl_on_policy_target": server_args.rl_on_policy_target,
                     "true_on_policy_contract": server_args.true_on_policy_contract,
                     "sampling_backend": server_args.sampling_backend,
                 }
@@ -138,51 +137,6 @@ def _run_server_args_script(argv: list[str]) -> dict[str, object]:
 
 
 class TestOnPolicyServerArgs(unittest.TestCase):
-    def test_cli_parses_prefill_only_deterministic_flag(self):
-        result = _run_server_args_script(
-            [
-                "--model-path",
-                "dummy",
-                "--attention-backend",
-                "triton",
-                "--enable-prefill-only-deterministic-inference",
-            ]
-        )
-
-        self.assertTrue(result["enable_prefill_only_deterministic_inference"])
-        self.assertTrue(result["enable_deterministic_inference"])
-        self.assertIsNone(result["rl_on_policy_target"])
-        self.assertEqual(result["sampling_backend"], "pytorch")
-
-    def test_cli_accepts_fsdp_and_fsdp_tp_targets(self):
-        fsdp_tp_result = _run_server_args_script(
-            [
-                "--model-path",
-                "dummy",
-                "--attention-backend",
-                "triton",
-                "--rl-on-policy-target",
-                "fsdp_tp",
-            ]
-        )
-        self.assertEqual(fsdp_tp_result["rl_on_policy_target"], "fsdp_tp")
-        self.assertIsNone(fsdp_tp_result["true_on_policy_contract"])
-        self.assertTrue(fsdp_tp_result["enable_deterministic_inference"])
-
-        fsdp_result = _run_server_args_script(
-            [
-                "--model-path",
-                "dummy",
-                "--attention-backend",
-                "triton",
-                "--rl-on-policy-target",
-                "fsdp",
-            ]
-        )
-        self.assertEqual(fsdp_result["rl_on_policy_target"], "fsdp")
-        self.assertIsNone(fsdp_result["true_on_policy_contract"])
-        self.assertTrue(fsdp_result["enable_deterministic_inference"])
-
     def test_cli_accepts_explicit_true_on_policy_contract(self):
         result = _run_server_args_script(
             [
@@ -195,7 +149,6 @@ class TestOnPolicyServerArgs(unittest.TestCase):
             ]
         )
 
-        self.assertIsNone(result["rl_on_policy_target"])
         self.assertEqual(
             result["true_on_policy_contract"], QWEN3_DENSE_TRUE_ON_POLICY_V1
         )
@@ -217,19 +170,56 @@ class TestOnPolicyServerArgs(unittest.TestCase):
         )
         self.assertFalse(result["enable_flashinfer_allreduce_fusion"])
 
-    def test_legacy_target_keeps_flashinfer_allreduce_fusion_available(self):
-        result = _run_server_args_script(
-            [
-                "--model-path",
-                "dummy",
-                "--attention-backend",
-                "triton",
-                "--rl-on-policy-target",
-                "fsdp_tp",
-                "--enable-flashinfer-allreduce-fusion",
-            ]
+
+class TestDefaultPathUnchanged(unittest.TestCase):
+    """Default serving must not enter true-on-policy policy paths."""
+
+    def setUp(self):
+        self.default_args = SimpleNamespace(
+            true_on_policy_contract=None,
+            tp_size=1,
         )
-        self.assertTrue(result["enable_flashinfer_allreduce_fusion"])
+
+    def test_default_args_no_on_policy(self):
+        self.assertFalse(is_true_on_policy_enabled(self.default_args))
+        self.assertFalse(is_tp_invariant_target(self.default_args))
+
+    def test_default_args_row_linear_uses_quant_method(self):
+        self.assertFalse(
+            should_use_tp_invariant_row_linear(
+                256,
+                server_args=self.default_args,
+                row_linear_enable_inv=True,
+            )
+        )
+
+    def test_default_args_tree_allreduce_not_selected(self):
+        self.assertFalse(
+            should_use_tp_invariant_tree_all_reduce(
+                server_args=self.default_args,
+                accl_binary_tree_enabled=False,
+            )
+        )
+
+    def test_default_args_moe_combine_uses_standard_allreduce(self):
+        self.assertFalse(should_use_deterministic_moe_combine(self.default_args))
+
+    def test_default_args_reduce_scatter_available(self):
+        self.assertFalse(should_disable_reduce_scatter_for_on_policy(self.default_args))
+
+    def test_default_args_mlp_fusion_available(self):
+        self.assertFalse(
+            should_disable_mlp_allreduce_fusion_for_on_policy(self.default_args)
+        )
+
+    def test_default_args_flashinfer_fusion_available(self):
+        self.assertFalse(should_disable_flashinfer_allreduce_fusion(self.default_args))
+
+    def test_default_server_args_cli_no_on_policy_flags(self):
+        result = _run_server_args_script(
+            ["--model-path", "dummy", "--attention-backend", "triton"]
+        )
+        self.assertFalse(result["enable_deterministic_inference"])
 
 
 def _mock_args(**kwargs):
@@ -247,56 +237,6 @@ def _contract_args(*, tp_size: int = 1):
         true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
         tp_size=tp_size,
     )
-
-
-class TestDefaultPathUnchanged(unittest.TestCase):
-    """Default serving must not enter true-on-policy policy paths."""
-
-    def setUp(self):
-        self.default_args = _mock_args()
-
-    def test_default_args_no_on_policy(self):
-        with patch(_PATCH_TARGET, return_value=self.default_args):
-            self.assertIsNone(get_rl_on_policy_target())
-            self.assertFalse(is_true_on_policy_enabled())
-            self.assertFalse(is_tp_invariant_target())
-
-    def test_default_args_row_linear_uses_quant_method(self):
-        with patch(_PATCH_TARGET, return_value=self.default_args):
-            self.assertFalse(
-                should_use_tp_invariant_row_linear(
-                    256,
-                    row_linear_enable_inv=True,
-                )
-            )
-
-    def test_default_args_tree_allreduce_not_selected(self):
-        with patch(_PATCH_TARGET, return_value=self.default_args):
-            self.assertFalse(
-                should_use_tp_invariant_tree_all_reduce(
-                    accl_binary_tree_enabled=False,
-                )
-            )
-
-    def test_default_args_reduce_scatter_available(self):
-        with patch(_PATCH_TARGET, return_value=self.default_args):
-            self.assertFalse(should_disable_reduce_scatter_for_on_policy())
-
-    def test_default_args_mlp_fusion_available(self):
-        with patch(_PATCH_TARGET, return_value=self.default_args):
-            self.assertFalse(should_disable_mlp_allreduce_fusion_for_on_policy())
-
-    def test_default_args_flashinfer_fusion_available(self):
-        with patch(_PATCH_TARGET, return_value=self.default_args):
-            self.assertFalse(should_disable_flashinfer_allreduce_fusion())
-
-    def test_default_server_args_cli_no_on_policy_flags(self):
-        result = _run_server_args_script(
-            ["--model-path", "dummy", "--attention-backend", "triton"]
-        )
-        self.assertIsNone(result["rl_on_policy_target"])
-        self.assertFalse(result["enable_deterministic_inference"])
-        self.assertFalse(result["enable_prefill_only_deterministic_inference"])
 
 
 class TestOnPolicyHelpers(unittest.TestCase):
