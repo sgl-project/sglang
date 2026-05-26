@@ -173,7 +173,7 @@ class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTest
             ),
         },
         {
-            "name": "deep_gemm_mxfp8",
+            "name": "deep_gemm_deepep_mxfp8",
             "other_args": (
                 "--base-gpu-id",
                 "0",
@@ -183,6 +183,8 @@ class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTest
                 "deep_gemm",
                 "--moe-runner-backend",
                 "deep_gemm",
+                "--moe-a2a-backend",
+                "deepep",
             ),
         },
     )

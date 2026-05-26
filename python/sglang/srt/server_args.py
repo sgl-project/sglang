@@ -3189,6 +3189,16 @@ class ServerArgs:
                         "captures large per-expert scratch buffers."
                     )
                 self.disable_piecewise_cuda_graph = True
+            if (
+                self.moe_runner_backend == "deep_gemm"
+                and self.moe_a2a_backend == "deepep"
+                and self.deepep_mode == "auto"
+            ):
+                logger.warning(
+                    "DeepGEMM MXFP8 MoE uses DeepEP normal mode because "
+                    "DeepEP low-latency dispatch is not supported for MXFP8 scales."
+                )
+                self.deepep_mode = "normal"
 
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [

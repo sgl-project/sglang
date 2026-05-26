@@ -108,7 +108,10 @@ def grouped_gemm_nt_bf16_masked(
     with compile_utils.deep_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
     ):
-        return deep_gemm.m_grouped_bf16_gemm_nt_masked(
+        fn = getattr(deep_gemm, "m_grouped_bf16_gemm_nt_masked", None)
+        if fn is None:
+            fn = getattr(deep_gemm, "bf16_m_grouped_gemm_nt_masked")
+        return fn(
             a,
             b,
             d,
@@ -166,6 +169,10 @@ def grouped_gemm_nt_bf16_contig(
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, m_indices)
+
+
+def has_grouped_gemm_nt_bf16_contig() -> bool:
+    return hasattr(deep_gemm, "m_grouped_bf16_gemm_nt_contiguous")
 
 
 def gemm_nt_f8f8bf16(
