@@ -66,6 +66,7 @@ MODEL_CONFIG = {
         "--max-running-requests",
         "24",
         "--disable-radix-cache",
+        "--disable-cuda-graph",
         "--chunked-prefill-size",
         "16384",
         "--max-prefill-tokens",
