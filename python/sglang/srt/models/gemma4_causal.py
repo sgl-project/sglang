@@ -33,6 +33,7 @@ from sglang.srt.layers.gemma4_fused_ops import (
     gemma_dual_rmsnorm_residual_scalar,
     gemma_qkv_rmsnorm,
     gemma_rmsnorm_residual_scalar,
+    gemma_routing_post_topk,
 )
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
@@ -143,7 +144,8 @@ class Gemma4Router(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        # RMSNorm without learned weight — pure normalization only
+        # RMSNorm without learned weight — scale is folded into norm weight
+        # after loading so forward is a single fused norm kernel.
         self.norm = Gemma4RMSNorm(
             self.hidden_size, eps=config.rms_norm_eps, with_scale=False
         )
@@ -163,18 +165,19 @@ class Gemma4Router(nn.Module):
             quant_config=None,
             prefix=add_prefix("proj", prefix),
         )
-        self._fused_scale: Optional[torch.Tensor] = None
+        self._scale_fused = False
 
     def fuse_scale(self):
-        """Pre-compute scale * root_size. Call after weights are loaded."""
-        self._fused_scale = (self.scale * self.root_size).to(self.scale.dtype)
+        """Fold scale * root_size into norm.weight so forward needs no extra mul."""
+        fused = (self.scale * self.root_size).to(self.norm.weight.dtype)
+        self.norm.weight.data.copy_(fused)
+        self._scale_fused = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Returns raw router logits [T, E]."""
-        x = self.norm(x)
-        if self._fused_scale is None:
+        if not self._scale_fused:
             self.fuse_scale()
-        x = x * self._fused_scale.to(x.dtype)
+        x = self.norm(x)
         router_logits, _ = self.proj(x)
         return router_logits
 
@@ -220,13 +223,15 @@ class Gemma4MoE(nn.Module):
             # softmax(all)[topk] / sum(softmax(all)[topk]) = softmax(topk_logits),
             # so we softmax only the top-k logits (fewer kernel launches).
             topk_logits, topk_ids = torch.topk(gating_output, k=topk, dim=-1)
-            topk_weights = torch.nn.functional.softmax(topk_logits, dim=-1)
 
-            # Fold per_expert_scale into routing weights
+            # Fused: softmax + per_expert_scale gather + mul + casts in one kernel
+            if topk_logits.is_cuda or topk_logits.is_xpu:
+                return gemma_routing_post_topk(topk_logits, topk_ids, per_expert_scale)
+
+            topk_weights = torch.nn.functional.softmax(topk_logits, dim=-1)
             topk_weights = topk_weights * per_expert_scale[topk_ids].to(
                 topk_weights.dtype
             )
-
             return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
         self.topk = TopK(
@@ -657,7 +662,7 @@ class Gemma4DecoderLayer(nn.Module):
             # Fused: (rmsnorm(rmsnorm(h1,w1) + rmsnorm(h2,w2), w3) + residual) * scalar
             if (
                 not self.has_ple
-                and hidden_states_1.is_cuda
+                and (hidden_states_1.is_cuda or hidden_states_1.is_xpu)
                 and hidden_states_1.dim() == 2
             ):
                 norm1 = self.post_feedforward_layernorm_1
@@ -689,7 +694,11 @@ class Gemma4DecoderLayer(nn.Module):
             )
             hidden_states = self.mlp(hidden_states)
 
-        if not self.has_ple and hidden_states.is_cuda and hidden_states.dim() == 2:
+        if (
+            not self.has_ple
+            and (hidden_states.is_cuda or hidden_states.is_xpu)
+            and hidden_states.dim() == 2
+        ):
             # Fused: (post_ff_norm(h) + residual) * layer_scalar in one kernel
             norm = self.post_feedforward_layernorm
             hidden_states = gemma_rmsnorm_residual_scalar(
