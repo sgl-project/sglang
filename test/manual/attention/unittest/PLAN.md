@@ -353,6 +353,17 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Enabled Mamba2 DECODE in the fixture by installing the global
+  selective-state-update backend via
+  `initialize_mamba_selective_state_update_backend(server_args)` in
+  `MockMamba2ModelRunner.__init__` (mirroring scheduler startup). Added
+  two DECODE cases to `make_mamba2_cases`: page-boundary and bsz=1
+  nonzero-prefix. Then wired Mamba2 CUDA-graph decode runner adapter
+  (`run_mamba2_cuda_graph_decode_case`) with both-state (SSM + conv)
+  snapshot/restore via `_clone_mamba2_cache` / `_restore_mamba2_cache`.
+  Loose `MAMBA2_GRAPH_ATOL=1e-1` absorbs chunked-scan kernel CG-replay
+  drift; eager `MAMBA2_ATOL=5e-2` kept for non-graph cases. The M21
+  metadata-only padding test still covers its mutation surface.
 - Added Mamba2 `HybridLinearAttnBackend` dispatch fan-out tests
   (`test_hybrid_dispatch_*` in `mamba/test_mamba2.py`) mirroring GDN's 3
   MagicMock-based spy tests. Covers M19/M20 dispatch-layer slice
