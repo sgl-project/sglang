@@ -167,6 +167,7 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
                 num_shots=self.NUM_SHOTS,
                 secondary_pool_size=self.SECONDARY_POOL_SIZE,
                 data_path=tiny,
+                seed=42,
             )
 
 

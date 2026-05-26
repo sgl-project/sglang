@@ -1,16 +1,3 @@
-"""GSM8K with a per-question variable-length primary + random secondary prefix.
-
-Each query's prefix =
-    primary_shots[:k]
-  + random_subset(secondary_pool)
-
-where k ~ Uniform{0..num_shots} and the secondary subset is itself a random
-sample of random size in {0..secondary_pool_size}. The primary portion is
-order-stable across queries, so two queries picking k1 <= k2 primary shots
-share the first k1 examples as a radix-cacheable prefix. The secondary tail
-makes each full prefix unique.
-"""
-
 import random
 from typing import Optional
 
@@ -18,14 +5,27 @@ from sglang.test.simple_eval_gsm8k import GSM8KEval, get_one_example
 
 
 class MixedPrefixGSM8KEval(GSM8KEval):
+    """GSM8K with a per-question variable-length primary + random secondary prefix.
+
+    Each query's prefix =
+        primary_shots[:k]
+      + random_subset(secondary_pool)
+
+    where k ~ Uniform{0..num_shots} and the secondary subset is itself a
+    random sample of random size in {0..secondary_pool_size}. The primary
+    portion is order-stable across queries, so two queries picking k1 <= k2
+    primary shots share the first k1 examples as a radix-cacheable prefix.
+    The secondary tail makes each full prefix unique.
+    """
+
     def __init__(
         self,
-        num_examples: Optional[int] = 100,
-        num_threads: int = 128,
-        num_shots: int = 10,
-        secondary_pool_size: int = 15,
-        data_path: Optional[str] = None,
-        seed: int = 42,
+        num_examples: Optional[int],
+        num_threads: int,
+        num_shots: int,
+        secondary_pool_size: int,
+        data_path: Optional[str],
+        seed: int,
     ):
         self._secondary_pool_size = secondary_pool_size
         self._seed = seed
