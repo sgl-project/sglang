@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
@@ -81,12 +82,21 @@ class CanaryDeviceState:
         enable_chain_position_assert: int32 [1] device flag gating the write kernel's chain-step
             write_position assert. allocate() defaults to 1; CanaryManager zeros it during
             __init__ for the warmup window and mark_init_finished() flips it back to 1.
+        req_to_expected_token_ids: Optional int32 device tensor shape
+            ``[req_to_token_alloc_size, max_context_len]``. Mirrors ReqToTokenPool layout;
+            ``pool[req_idx, p]`` = source-of-truth token at logical position ``p`` for the
+            req in slot ``req_idx``. Allocated only when
+            ``CanaryConfig.enable_req_token_ids_check`` is True. The plan-side entries
+            kernel gathers from this pool (via ``expected_token_ids_offset`` per buffer
+            group) into ``VerifyPlan.verify_expected_input_ids``; the verify kernel then
+            compares against each canary slot's stored token.
     """
 
     violation_log: ViolationLog
     kernel_run_counters: torch.Tensor
     slot_run_counters: torch.Tensor
     enable_chain_position_assert: torch.Tensor
+    req_to_expected_token_ids: Optional[torch.Tensor]
 
     @classmethod
     def allocate(
@@ -95,6 +105,8 @@ class CanaryDeviceState:
         config: CanaryConfig,
         device: torch.device,
         num_tags: int,
+        req_to_token_alloc_size: Optional[int] = None,
+        max_context_len: Optional[int] = None,
     ) -> "CanaryDeviceState":
         if num_tags <= 0:
             raise ValueError(
@@ -106,9 +118,23 @@ class CanaryDeviceState:
         kernel_run_counters = torch.zeros(num_tags, dtype=torch.int64, device=device)
         slot_run_counters = torch.zeros(num_tags, dtype=torch.int64, device=device)
         enable_chain_position_assert = torch.ones(1, dtype=torch.int32, device=device)
+        if config.enable_req_token_ids_check:
+            if req_to_token_alloc_size is None or max_context_len is None:
+                raise ValueError(
+                    "kv-canary: CanaryDeviceState.allocate requires req_to_token_alloc_size "
+                    "and max_context_len when CanaryConfig.enable_req_token_ids_check is on"
+                )
+            req_to_expected_token_ids = torch.zeros(
+                (req_to_token_alloc_size, max_context_len),
+                dtype=torch.int32,
+                device=device,
+            )
+        else:
+            req_to_expected_token_ids = None
         return cls(
             violation_log=violation_log,
             kernel_run_counters=kernel_run_counters,
             slot_run_counters=slot_run_counters,
             enable_chain_position_assert=enable_chain_position_assert,
+            req_to_expected_token_ids=req_to_expected_token_ids,
         )
