@@ -29,7 +29,7 @@ from typing_extensions import Annotated
 DEFAULT_INPUT_SAMPLE_RATE = 24000
 
 # Wire rates we accept on `audio.input.format.rate` and resample to
-# `adapter.model_sample_rate` via librosa. 24000 matches the SDK pin;
+# `adapter.model_sample_rate` server-side. 24000 matches the SDK pin;
 # 16000 and 48000 widen it to cover common ASR-client and consumer-audio
 # rates. Add a value here only after verifying transcription quality.
 SUPPORTED_INPUT_SAMPLE_RATES = (16000, 24000, 48000)

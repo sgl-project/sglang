@@ -16,7 +16,6 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-import librosa
 import numpy as np
 import pybase64
 import soundfile as sf
@@ -87,9 +86,16 @@ _SAMPLE_WIDTH = 2
 def _resample_to_target_rate(pcm: bytes, src_rate: int, target_rate: int) -> bytes:
     if src_rate == target_rate or not pcm:
         return pcm
+    import torch
+    import torchaudio
+
     samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-    samples = librosa.resample(samples, orig_sr=src_rate, target_sr=target_rate)
-    # Re-encode by 2^15 - 1 so a clipped 1.0 stays in int16 range.
+    audio = torch.from_numpy(samples).unsqueeze(0)
+    audio = torchaudio.functional.resample(
+        audio, orig_freq=src_rate, new_freq=target_rate
+    )
+    samples = audio.squeeze(0).numpy()
+    # Clip to int16 range via 2^15 - 1 so a clipped 1.0 stays representable.
     return (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
 
 
