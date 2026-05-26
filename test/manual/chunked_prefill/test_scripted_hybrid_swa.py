@@ -49,7 +49,6 @@ class TestScriptedHybridSWA(CustomTestCase):
         assert r.finished
         assert r.chunks_done >= 2
 
-    @unittest.skip("requires real hybrid-SWA topology — wire up when fixture lands")
     def test_swa_prompt_equals_window(self):
         """SWA chunked admission with prompt_len == sliding_window aligns to the boundary."""
         execute_scripted_runtime(
@@ -75,7 +74,6 @@ class TestScriptedHybridSWA(CustomTestCase):
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 
-    @unittest.skip("requires real hybrid-SWA topology — wire up when fixture lands")
     def test_swa_prompt_2x_window_half_chunks(self):
         """SWA prompt = 2*window, chunk_size = window/2 — each chunk crosses the boundary."""
         execute_scripted_runtime(
@@ -101,7 +99,6 @@ class TestScriptedHybridSWA(CustomTestCase):
         ), f"expected >=4 chunks for 2*window / (window/2), got {r.chunks_done}"
         assert len(r.output_tokens) == 4
 
-    @unittest.skip("requires real hybrid-SWA topology — wire up when fixture lands")
     def test_swa_chunked_req_early_return_no_double_free(self):
         """SWA add_chunked_req early-return must flip _chunked_req_scheduled_last_iter cleanly."""
         execute_scripted_runtime(
@@ -138,7 +135,6 @@ class TestScriptedHybridSWA(CustomTestCase):
             r.swa_stash_double_free_count == 0
         ), f"SWA stash double-free observed {r.swa_stash_double_free_count} times"
 
-    @unittest.skip("requires real hybrid-SWA topology — wire up when fixture lands")
     def test_swa_budget_for_chunked_req_math(self):
         """SWA _swa_budget_for_req math must not overflow across chunk_size / window combos."""
         execute_scripted_runtime(
@@ -162,7 +158,6 @@ class TestScriptedHybridSWA(CustomTestCase):
             r.swa_budget_overflow_count == 0
         ), f"SWA budget overflowed {r.swa_budget_overflow_count} times"
 
-    @unittest.skip("requires real hybrid-SWA topology — wire up when fixture lands")
     def test_swa_chunk_cache_evict_skips_first_two_extends(self):
         """SWA + overlap + chunked: the first two extend_batch_idx values must skip eviction."""
         execute_scripted_runtime(
@@ -188,7 +183,6 @@ class TestScriptedHybridSWA(CustomTestCase):
             f"{r.swa_chunk_cache_first_two_evict_skips}"
         )
 
-    @unittest.skip("requires real hybrid-SWA topology — wire up when fixture lands")
     def test_swa_chunk_size_exceeds_window(self):
         """SWA chunk_size > sliding_window: engine must accept or reject cleanly and consistently."""
         execute_scripted_runtime(
@@ -213,7 +207,6 @@ class TestScriptedHybridSWA(CustomTestCase):
         # still be valid.
         assert len(r.output_tokens) == 2
 
-    @unittest.skip("requires real hybrid-SWA topology — wire up when fixture lands")
     def test_swa_radix_partial_hit_straddles_window(self):
         """SWA + radix + chunked: prefix hit, window, and chunked admission stay consistent."""
         execute_scripted_runtime(
@@ -246,7 +239,6 @@ class TestScriptedHybridSWA(CustomTestCase):
             r2.cached_tokens > 0
         ), f"r2 must hit the radix prefix, got cached_tokens={r2.cached_tokens}"
 
-    @unittest.skip("requires real hybrid-SWA topology — wire up when fixture lands")
     def test_swa_chunked_resume_kv_committed_bound(self):
         """SWA early-return between chunks: prefix_indices must be bounded by kv_committed_len."""
         execute_scripted_runtime(
