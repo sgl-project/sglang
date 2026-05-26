@@ -7,12 +7,13 @@ from typing import ClassVar, List, Optional
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
+
+DEFAULT_MODEL: str = "Qwen/Qwen3-0.6B"
 
 DEFAULT_CHUNKED_PREFILL_SIZE: int = 256
 DEFAULT_NUM_EXAMPLES: int = 100
@@ -27,7 +28,7 @@ KV_CANARY_ARGS: List[str] = ["--enable-kv-canary"]
 
 
 class ChunkedRefactorTestBase(CustomTestCase):
-    model: ClassVar[str] = DEFAULT_MODEL_NAME_FOR_TEST
+    model: ClassVar[str] = DEFAULT_MODEL
     feature_args: ClassVar[List[str]] = []
 
     chunked_prefill_size: ClassVar[int] = DEFAULT_CHUNKED_PREFILL_SIZE
