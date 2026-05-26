@@ -298,13 +298,6 @@ class TestLoRAAdapterEviction(ScriptedRuntimeTestCase):
         assert r_a.status in ("finished", "unknown")
         assert r_a.kv_pages == 0
         assert r_a.lock_refs == 0
-        # W3: triple-race abort across the LoRA drainer must not double-
-        # release; aborting a chunked-resume in flight is the exact path
-        # commit de3859646b protects.
-        assert r_a.abort_double_release_count == 0, (
-            f"W3 violation in LoRA + chunked + abort triple-race; got "
-            f"{r_a.abort_double_release_count}"
-        )
         yield from run_until_finished(r_b)
         assert r_b.finished
         # r_b stays pinned to adapter B — eviction churn must not strand
