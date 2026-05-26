@@ -135,9 +135,20 @@ Implemented:
   Chain verify (`topk=1`) passes, but the tree custom-mask path currently
   mismatches the HF-style PyTorch reference on realistic MLA shapes.
 - FlashMLA MLA `DRAFT_EXTEND` CUDA-graph replay is intentionally not enabled yet.
-  The eager path passes, but capture currently raises
-  `AttributeError: 'FlashMLABackend' object has no attribute 'cuda_graph_qo_indptr'`
-  from the inherited FlashInfer MLA capture metadata path.
+  The eager path passes, but capture falls through to
+  `FlashInferMLAAttnBackend.init_forward_metadata_capture_cuda_graph` (since
+  `FlashMLABackend` only overrides decode and target-verify), which reads
+  `self.cuda_graph_qo_indptr`, `self.cuda_graph_kv_indptr`, `self.cuda_graph_kv_lens`,
+  and a 1D `self.cuda_graph_kv_indices` (parent layout
+  `[max_bs * max_context_len]`). `FlashMLABackend.init_cuda_graph_state` skips
+  those entirely and instead allocates `cuda_graph_kv_indices` with a
+  FlashMLA-specific 2D layout `[max_bs, (max_context + PAGE_SIZE) // PAGE_SIZE]`
+  for decode. The fix requires either: (a) overriding capture/replay for
+  `DRAFT_EXTEND` in `FlashMLABackend` to use the 2D layout if
+  `BatchMLAPagedAttentionWrapper` supports it, or (b) allocating both
+  parent-style 1D and FlashMLA-style 2D buffers and routing `DRAFT_EXTEND` to
+  the parent's path. Either is a real backend change and is deferred as a
+  focused FlashMLA follow-up.
 - Cutlass MLA, TRT-LLM MLA, and Tokenspeed MLA now each have a
   capability-gated test file under `mla/` (`test_cutlass_mla.py`,
   `test_trtllm_mla.py`, `test_tokenspeed_mla.py`). Each gate is one
