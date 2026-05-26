@@ -2,7 +2,7 @@
 
 ## Current progress
 
-Last updated: 2026-05-29
+Last updated: 2026-05-26
 
 Implemented:
 - Shared dense MHA/GQA correctness helpers exist in
@@ -358,6 +358,44 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Added FA3 and FA4 EAGLE `TARGET_VERIFY` chain (topk=1) eager +
+  CUDA-graph replay coverage in `dense/test_fa3.py` and
+  `dense/test_fa4.py`. Reuses the shared
+  `run_dense_spec_verify_case` / `run_dense_spec_verify_cuda_graph_case`
+  helpers. FA3/FA4 tree (topk=2) stays deferred per the documented
+  ~0.16 bf16 kernel drift (not a CG mechanic).
+- Added dual-chunk (`dual_chunk_flash_attn`) CUDA-graph decode replay
+  coverage. Wired the runner adapter
+  `run_dual_chunk_cuda_graph_decode_case` to the shared
+  `CudaGraphDecodeAdapter` lifecycle and added 10 method-specific
+  callbacks under `common/attention_methods/dual_chunk_attention.py`
+  (`make_dual_chunk_case_with_prefix_lens`,
+  `dual_chunk_fixture_inputs`, `make_dual_chunk_random_inputs`,
+  `make_dual_chunk_replay_inputs`,
+  `prepare_dual_chunk_runner_inputs`, `run_dual_chunk_forward`,
+  `expected_dual_chunk_output_from_inputs`,
+  `dual_chunk_attention_layers`, `_clone_dual_chunk_cache`,
+  `_restore_dual_chunk_cache`).
+  `DualChunkMockModelRunner` and `build_dual_chunk_attention_fixture`
+  now accept the standard `disable_cuda_graph` /
+  `disable_piecewise_cuda_graph` / `runner_batch_size` kwargs.
+  `_clone_dual_chunk_cache` snapshots both K and V buffers because
+  dual-chunk's `forward_decode` writes K and V into the cache via
+  `set_kv_buffer`.
+- Added DSA sparse `flashmla_kv` CUDA-graph decode replay coverage in
+  `dsa/test_dsa.py`. Unlike the MHA_ONE_SHOT dense fallback (where
+  inline prefix+extend K is sliced away by
+  `unified_attention_with_output`), sparse decode reads cached MLA
+  latent KV via `_populate_dsa_sparse_prefix_kv`, so the CG runner
+  contract holds. Added 10 sparse adapter helpers
+  (`make_dsa_sparse_case_with_prefix_lens`,
+  `dsa_sparse_fixture_inputs`, `make_dsa_sparse_random_inputs`,
+  `make_dsa_sparse_replay_inputs`,
+  `prepare_dsa_sparse_runner_inputs`, `run_dsa_sparse_forward`,
+  `expected_dsa_sparse_output_from_inputs`, `_clone_dsa_sparse_cache`,
+  `_restore_dsa_sparse_cache`) and the testcase
+  `runner_cuda_graph_dsa_sparse_decode_flashmla_kv`
+  (`prefix_lens=(127, 128)`).
 - Investigated DSA runner-mode coverage and landed the fixture plumbing
   + documented the structural block. `DSAMockModelRunner` and
   `build_dsa_attention_fixture` now accept the standard
@@ -375,9 +413,7 @@ Latest verification:
   prefix+extend K inline (length `sum(seq_lens)`) so the slicer
   drops the prefix and the piecewise actual diverges from eager by
   ~50% mismatch. Documented in `dsa/README.md` with two unblocking
-  paths. The natural next target is sparse CG decode via the
-  `flashmla_kv` decode cases (uses cached K so the slicer is a
-  no-op).
+  paths.
 - Fixed FA `DRAFT_EXTEND_V2` cache-extent bug in
   `flashattention_backend.py` (commit `7e8475592`). Both eager
   `init_forward_metadata` (~L503) and replay
