@@ -523,5 +523,57 @@ class TestScriptedRadix(CustomTestCase):
         assert r.lock_refs == 0
 
 
+    def test_chunked_req_re_chunked_after_resume_same_prefix(self):
+        """Chunked req retracted mid-stream and resumed: chunks_done across the full lifetime matches the expected total chunk count."""
+        execute_scripted_runtime(
+            self._script_chunked_req_re_chunked_after_resume_same_prefix,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-NEW] retract-resume re-chunking accounting. R1 is mid-stream
+    # when we force_retract it; on resume it must re-chunk the
+    # remaining prompt — chunks_done across the full lifetime should
+    # equal the expected total chunk count for the original prompt
+    # (not 0, not doubled). The radix layer's lock_ref on the
+    # already-committed prefix means resume can re-use prior chunks'
+    # KV, so chunks_done counts only the chunks the scheduler actually
+    # admitted for this req.
+    @staticmethod
+    def _script_chunked_req_re_chunked_after_resume_same_prefix(t: ScriptedRuntime):
+        # 4 * DEFAULT_CHUNK_SIZE makes the expected chunk count exact
+        # and small enough to bound assertions tightly.
+        prompt_len: int = 4 * DEFAULT_CHUNK_SIZE
+        r = t.start_req(prompt_len=prompt_len, max_new_tokens=2)
+        # Mid-stream: at least one chunk committed, still chunking.
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+
+        t.force_retract(r)
+        yield
+        assert r.kv_pages == 0, (
+            f"retract must release KV; got {r.kv_pages}"
+        )
+
+        # Resume: the scheduler re-admits the req and finishes it.
+        yield from run_until_finished(r, max_steps=800)
+        assert r.finished
+        # Total chunks_done for prompt_len = 4 * CHUNK_SIZE must be at
+        # least 4 — the lifetime aggregate count across pre-retract
+        # chunks + post-resume chunks. Upper bound: doubling would
+        # indicate the resume re-chunked the entire prompt instead of
+        # picking up where retract left off (we tolerate a small
+        # overshoot but reject 2x).
+        expected_total: int = prompt_len // DEFAULT_CHUNK_SIZE
+        assert r.chunks_done >= expected_total, (
+            f"lifetime chunks_done after retract+resume must cover the "
+            f"whole prompt; expected >= {expected_total}, got "
+            f"{r.chunks_done}"
+        )
+        assert r.chunks_done < 2 * expected_total, (
+            f"lifetime chunks_done after retract+resume should not double "
+            f"the prompt's chunk count; expected < {2 * expected_total}, "
+            f"got {r.chunks_done}"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
