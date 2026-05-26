@@ -157,12 +157,6 @@ class CanaryE2EBase(CapturedServerE2EBase):
             workload must drive SWA pool pressure for this to fire — required because the
             "pool reuse" path is the one production hits under sustained long-context
             traffic, and we must keep it covered.
-            NOTE: when the SWA allocator triggers slot remap, the FULL-kernel canary
-            currently fires a separate position FP — see the deep-bug note at
-            ``agent-context/.../2026-05-25-canary-swa-pool-remap-position-fp.md``.
-            Until that bug is fixed, exercising this assertion meaningfully requires
-            either fixing the FP or scoping the perturbation tests' workload so the FP
-            and the perturb's expected signal are distinguishable.
           - ``verify_swa < verify_full``: SWA verify kernel processed fewer tokens than
             FULL — proves both kernel groups ran and the window short-circuited SWA.
         """
