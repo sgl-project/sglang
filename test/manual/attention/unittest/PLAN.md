@@ -238,7 +238,7 @@ Implemented:
   tests. These tests feed post-RoPE-equivalent Q/K tensors because rotary math is
   orthogonal to runner/backend metadata compatibility.
 
-In progress:
+Current status:
 - Locally runnable Phase 4 production draft-runner coverage is complete for the
   representative valid backends listed above. Remaining Phase 4 work is limited
   to backend-specific blockers and hardware-gated paths documented in the
@@ -249,14 +249,14 @@ In progress:
   hardware-gated, or sparse pruning layouts beyond the local DSA/dual-chunk
   slices.
 
-Next implementation steps:
+Deferred follow-ups:
 - Expand Phase 2 to additional attention methods/backends with method-specific
   fixtures rather than forcing them through the dense harness. Priority candidates:
   hardware-gated MLA kernels (`cutlass_mla`, `trtllm_mla`/`tokenspeed_mla` where
   hardware and KV dtype support them), dual-chunk sparse pruning layouts,
   additional DSA index layouts, and DSV4-style methods.
-- Defer Phase 2 expansion for additional backends until representative Phase 3 and
-  Phase 4 tests are passing.
+- Keep additional backend expansion deferred until representative Phase 3 and
+  Phase 4 tests are passing for the local matrix.
 
 Latest verification:
 - Added dual-chunk sparse all-column Phase 2 coverage using the local
