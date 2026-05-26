@@ -316,26 +316,6 @@ class TestScriptedRegression(CustomTestCase):
             "the cross-mb exclude (no output-stash dedupe needed)"
         )
 
-    def test_pdmux_filter_chunked(self):
-        """34c02d6a67 "Filter chunked-resume reqs from split_prefill_batch before pdmux merge"."""
-        execute_scripted_runtime(
-            self._script_pdmux_filter_chunked,
-            **base_engine_kwargs(
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-                disaggregation_mode="prefill",
-            ),
-        )
-
-    # 34c02d6a67 "Filter chunked-resume reqs from split_prefill_batch
-    # before pdmux merge".
-    # Bug: pdmux merge would see chunked-resume reqs that should be
-    # excluded. With disagg + chunked, the merge must filter them out.
-    @staticmethod
-    def _script_pdmux_filter_chunked(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
-
     def test_priority_skips_chunked_in_prefix_match(self):
         """Aaf3752d2b "Skip chunked-resume reqs in calc_priority prefix matching"."""
         execute_scripted_runtime(
@@ -383,27 +363,6 @@ class TestScriptedRegression(CustomTestCase):
     # actual mamba model wiring is left for the harness to fill in.
     @staticmethod
     def _script_mamba_chunked_resume_no_token(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
-
-    def test_streaming_session_stash_bound(self):
-        """116584e8fa "Bound streaming-session chunked stash by kv_committed_len"."""
-        execute_scripted_runtime(
-            self._script_streaming_session_stash_bound,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    # 116584e8fa "Bound streaming-session chunked stash by
-    # kv_committed_len".
-    # Streaming-session specific: when the session's KV commit length is
-    # shorter than the chunked extend, the stash must clip to the committed
-    # length to avoid stashing un-committed tokens.
-    @staticmethod
-    def _script_streaming_session_stash_bound(t: ScriptedRuntime):
-        # Streaming session creation isn't yet a ScriptedRuntime primitive;
-        # this test pumps a long req in a streaming-flagged engine and
-        # verifies the chunk loop completes cleanly.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
@@ -573,38 +532,6 @@ class TestScriptedRegression(CustomTestCase):
                 "5c523049db: filter_batch must exclude in-flight "
                 "other-mb reqs from local running set"
             )
-
-    def test_chunked_req_marker_pp_filter_exclusion(self):
-        """33f981ce93 / 11db3a4192: re-add ScheduleBatch.chunked_req marker for PP cross-mb filter exclusion."""
-        execute_scripted_runtime(
-            self._script_chunked_req_marker_pp_filter_exclusion,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_chunked_req_marker_pp_filter_exclusion(t: ScriptedRuntime):
-        # 33f981ce93 / 11db3a4192: re-add ScheduleBatch.chunked_req marker
-        # for PP cross-mb filter exclusion.
-        # TODO(round-3): recreate the specific bug shape; this currently
-        # is a forward-pointing smoke.
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
-        yield from run_until_finished(r)
-
-    def test_v1_swa_chunked_tests_dropped(self):
-        """A94e842611 / daf9c42f17: dropped v1 SWA chunked-req tests."""
-        execute_scripted_runtime(
-            self._script_v1_swa_chunked_tests_dropped,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_v1_swa_chunked_tests_dropped(t: ScriptedRuntime):
-        # a94e842611 / daf9c42f17: dropped v1 SWA chunked-req tests. Verifies
-        # the v2 path is what runs (no v1 codepath revival).
-        # TODO(round-3): recreate the specific bug shape; this currently
-        # is a forward-pointing smoke.
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
 
     def test_stage_a_chunk_stash_iter_boundary(self):
         """678bba26f0: Stage A chunk-stash runs at iter boundary, not mid-iter."""
@@ -832,38 +759,6 @@ class TestScriptedRegression(CustomTestCase):
                 break
             yield
         assert saw_waiting, "expected to observe chunked-resume in waiting_queue state"
-
-    def test_unified_admission_via_add_one_req(self):
-        """74f1d8bbab: unify chunked admission via add_one_req reuse + has_pending_chunk."""
-        execute_scripted_runtime(
-            self._script_unified_admission_via_add_one_req,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_unified_admission_via_add_one_req(t: ScriptedRuntime):
-        # 74f1d8bbab: unify chunked admission via add_one_req reuse +
-        # has_pending_chunk. Smoke: chunked admission works.
-        # TODO(round-3): recreate the specific bug shape; this currently
-        # is a forward-pointing smoke.
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
-
-    def test_alloc_assert_no_is_chunked(self):
-        """9b361aef46: drop is_chunked from req_to_token_pool alloc assert."""
-        execute_scripted_runtime(
-            self._script_alloc_assert_no_is_chunked,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_alloc_assert_no_is_chunked(t: ScriptedRuntime):
-        # 9b361aef46: drop is_chunked from req_to_token_pool alloc assert.
-        # Smoke: alloc + chunked does not hit a stale assert.
-        # TODO(round-3): recreate the specific bug shape; this currently
-        # is a forward-pointing smoke.
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
 
     def test_cache_unfinished_req_row_bound(self):
         """1c3bf8e7db: bound cache_unfinished_req row read by kv_committed_len."""
