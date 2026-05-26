@@ -141,69 +141,6 @@ class SingleForwardManager:
                 f"CanaryLaunchCapacities.from_args"
             )
 
-        self._populate_expected_token_pool(
-            forward_batch=maybe_inaccurate_forward_batch
-        )
-
-    def _populate_expected_token_pool(
-        self, *, forward_batch: "ForwardBatch"
-    ) -> None:
-        """Refill the device-side source-of-truth pool and valid_lens before
-        the cuda graph captures the gather kernel. No-op when the flag is off
-        or the batch carries no req-truth snapshot (capture-time synthetic
-        batches and pre-snapshot warmup); the gather kernel then falls back to
-        ``input_ids`` for every token via valid_lens==0."""
-        if not self._config.enable_req_token_ids_check:
-            return
-        req_truth_seqs = forward_batch.req_truth_seqs
-        if req_truth_seqs is None:
-            return
-
-        pool = self._device_state.req_to_expected_token_ids_pool
-        valid_lens = self._device_state.req_to_expected_token_ids_valid_lens
-        if pool is None or valid_lens is None:
-            raise RuntimeError(
-                "kv-canary: enable_req_token_ids_check is on but device pool / "
-                "valid_lens were not allocated; check CanaryDeviceState.allocate"
-            )
-
-        req_pool_indices_host = forward_batch.req_pool_indices.tolist()
-        if len(req_pool_indices_host) != len(req_truth_seqs):
-            raise RuntimeError(
-                "kv-canary: forward_batch.req_pool_indices length "
-                f"{len(req_pool_indices_host)} does not match req_truth_seqs length "
-                f"{len(req_truth_seqs)}"
-            )
-
-        max_context_len = int(pool.shape[1])
-        valid_lens_host = torch.zeros(
-            len(req_pool_indices_host), dtype=torch.int32, pin_memory=True
-        )
-        for row, (req_pool_idx, seq) in enumerate(
-            zip(req_pool_indices_host, req_truth_seqs)
-        ):
-            seq_len = len(seq)
-            if seq_len > max_context_len:
-                raise RuntimeError(
-                    f"kv-canary: req sequence length {seq_len} exceeds canary pool "
-                    f"max_context_len {max_context_len}; raise --context-length or "
-                    f"audit ReqToTokenPool sizing"
-                )
-            valid_lens_host[row] = seq_len
-            if seq_len == 0:
-                continue
-            seq_tensor = torch.tensor(seq, dtype=torch.int32, pin_memory=True)
-            pool[req_pool_idx, :seq_len].copy_(seq_tensor, non_blocking=True)
-
-        req_indices_device = torch.tensor(
-            req_pool_indices_host, dtype=torch.int64, pin_memory=True
-        ).to(valid_lens.device, non_blocking=True)
-        valid_lens_device_slice = valid_lens_host.to(valid_lens.device, non_blocking=True)
-        # Scatter per-req valid lens into the global slot-indexed tensor. Slots
-        # not touched this forward keep their previous value (kernel only reads
-        # slots referenced by req_pool_indices, so stale rows are inert).
-        valid_lens.index_copy_(0, req_indices_device, valid_lens_device_slice)
-
     def pre_ops_maybe_inside_graph(
         self, forward_batch: "ForwardBatch"
     ) -> "_PreOpsMaybeInsideGraphOutput":
@@ -232,15 +169,14 @@ class SingleForwardManager:
             bs_capacity=self._write_req_capacity, device=self._device
         )
 
-        plan_input.fill_from_forward_batch(forward_batch=forward_batch)
-
         input_check_mode = self._should_enable_input_check_for_launch(forward_batch)
         if input_check_mode:
             self._fill_expected_inputs(
                 forward_batch=forward_batch,
-                plan_input=plan_input,
                 out_expected_inputs=expected_inputs,
             )
+
+        plan_input.fill_from_forward_batch(forward_batch=forward_batch)
 
         violation_log = self._device_state.violation_log
         num_tokens = int(forward_batch.positions.shape[0])
@@ -353,23 +289,14 @@ class SingleForwardManager:
         self,
         *,
         forward_batch: "ForwardBatch",
-        plan_input: PlanInput,
         out_expected_inputs: ExpectedInputs,
     ) -> None:
         if self._config.enable_req_token_ids_check:
-            pool = self._device_state.req_to_expected_token_ids_pool
-            valid_lens = self._device_state.req_to_expected_token_ids_valid_lens
-            if pool is None or valid_lens is None:
-                raise RuntimeError(
-                    "kv-canary: enable_req_token_ids_check is on but device pool / "
-                    "valid_lens were not allocated; check CanaryDeviceState.allocate"
-                )
             fill_expected_inputs_from_reqs(
                 forward_batch=forward_batch,
                 out_expected_inputs=out_expected_inputs,
-                plan_input=plan_input,
-                pool=pool,
-                valid_lens=valid_lens,
+                pool=self._device_state.req_to_expected_token_ids_pool,
+                valid_lens=self._device_state.req_to_expected_token_ids_valid_lens,
             )
             return
 
