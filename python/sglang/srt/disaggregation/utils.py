@@ -24,6 +24,7 @@ if TYPE_CHECKING:
         CommonKVSender,
     )
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.server_args import ServerArgs
 
 #########################
 # Constants & Enums
@@ -53,7 +54,7 @@ class DisaggregationMode(Enum):
 FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
 
 
-def _is_fake_transfer_check(req, server_args) -> bool:
+def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
     return req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
         req.bootstrap_host is None
         and server_args.disaggregation_transfer_backend == "fake"
@@ -69,7 +70,7 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args) -> N
     for i, poll_val in enumerate(polls):
         if poll_val == int(KVPoll.Success):
             decode_req = decode_reqs[i]
-            if _is_fake_transfer_check(decode_req.req, server_args):
+            if _is_fake_transfer(decode_req.req, server_args):
                 continue
             actual_room = metadata_buffers.bootstrap_room[
                 decode_req.metadata_buffer_index, 0

@@ -37,12 +37,12 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.utils import (
-    FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
     KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    _is_fake_transfer,
     get_kv_class,
     is_mla_backend,
     poll_and_all_reduce,
@@ -82,16 +82,8 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.server_args import ServerArgs
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
-
-
-def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
-    return req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
-        req.bootstrap_host is None
-        and server_args.disaggregation_transfer_backend == "fake"
-    )
 
 
 def _bootstrap_addr(req: Req) -> str:
@@ -1414,7 +1406,8 @@ class DecodeTransferQueue:
             )
             prepare_abort(
                 decode_req.req,
-                "Metadata corruption detected - bootstrap_room mismatch",
+                "Metadata unexpectedly not ready after readiness gate "
+                "(bootstrap_room=0)",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             decode_req.kv_receiver.clear()
