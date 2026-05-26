@@ -38,7 +38,7 @@ def invoke_plan(
     group: CanaryBufferGroup,
     req_to_token: torch.Tensor,
     swa_window_size: int,
-    req_to_expected_token_ids: Optional[torch.Tensor] = None,
+    req_to_expected_token_ids: Optional[torch.Tensor],
 ) -> None:
     window = swa_window_size if group.kind is PoolKind.SWA else 0
     launch_canary_plan_kernels(

@@ -42,7 +42,7 @@ class TestTokenOracleManager(CustomTestCase):
 
         manager.fill_expected_inputs(
             forward_batch=forward_batch,
-            out_expected_inputs=expected_inputs,
+            expected_inputs_out=expected_inputs,
         )
 
         self.assertTrue(

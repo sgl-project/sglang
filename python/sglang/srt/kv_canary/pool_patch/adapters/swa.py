@@ -17,7 +17,7 @@ def attach_swa(
     pool: object,
     device: torch.device,
     read_bytes: int,
-    expected_token_ids_offset: int = 0,
+    expected_token_ids_offset: int,
 ) -> tuple[CanaryBufferGroup, ...]:
     full_group = _build_subpool_group(
         sub_pool=pool.full_kv_pool,

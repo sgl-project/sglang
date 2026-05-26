@@ -20,8 +20,8 @@ def launch_canary_plan_kernels_torch_reference(
     swa_window_size: int,
     full_to_swa_index_mapping: Optional[torch.Tensor],
     verify_capacity: int,
-    req_to_expected_token_ids: Optional[torch.Tensor] = None,
-    expected_token_ids_offset: int = 0,
+    req_to_expected_token_ids: Optional[torch.Tensor],
+    expected_token_ids_offset: int,
 ) -> None:
     """Python reference for :func:`launch_canary_plan_kernels`. Same signature & byte-equal semantics."""
     bs = int(req_pool_indices.shape[0])
@@ -201,14 +201,14 @@ def _materialize_verify_entries(
             verify_plan_out.verify_slot_indices.device
         )
     )
-    verify_plan_out.verify_expected_positions[:total_verify].copy_(
-        positions_t.to(verify_plan_out.verify_expected_positions.dtype).to(
-            verify_plan_out.verify_expected_positions.device
-        )
-    )
     verify_plan_out.verify_expected_input_ids[:total_verify].copy_(
         expected_input_ids_t.to(verify_plan_out.verify_expected_input_ids.dtype).to(
             verify_plan_out.verify_expected_input_ids.device
+        )
+    )
+    verify_plan_out.verify_expected_positions[:total_verify].copy_(
+        positions_t.to(verify_plan_out.verify_expected_positions.dtype).to(
+            verify_plan_out.verify_expected_positions.device
         )
     )
     verify_plan_out.verify_prev_slot_indices[:total_verify].copy_(

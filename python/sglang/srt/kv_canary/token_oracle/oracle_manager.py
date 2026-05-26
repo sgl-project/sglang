@@ -19,7 +19,7 @@ class TokenOracleManager:
         self,
         *,
         forward_batch: "ForwardBatch",
-        out_expected_inputs: ExpectedInputs,
+        expected_inputs_out: ExpectedInputs,
     ) -> None:
         positions = forward_batch.positions
         input_ids = forward_batch.input_ids
@@ -43,8 +43,8 @@ class TokenOracleManager:
                 generalized_req_ids=generalized_req_ids,
                 positions=positions.to(torch.int64),
             )
-        out_expected_inputs.tokens[:num_tokens].copy_(expected_tokens.to(torch.int64))
-        out_expected_inputs.positions[:num_tokens].copy_(positions.to(torch.int64))
+        expected_inputs_out.tokens[:num_tokens].copy_(expected_tokens.to(torch.int64))
+        expected_inputs_out.positions[:num_tokens].copy_(positions.to(torch.int64))
 
     def sample_next_tokens(
         self, *, generalized_req_ids: torch.Tensor, logits_positions: torch.Tensor

@@ -60,7 +60,7 @@ class CanaryBufferGroup:
     real_kv_sources_k: tuple[RealKvSource, ...]
     real_kv_sources_v: tuple[RealKvSource, ...]
     swa_index_lut: Optional[torch.Tensor]
-    expected_token_ids_offset: int = 0
+    expected_token_ids_offset: int
 
     @property
     def has_v_half(self) -> bool:

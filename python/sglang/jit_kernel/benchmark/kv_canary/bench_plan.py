@@ -219,6 +219,8 @@ def _make_plan_callable(inputs: dict):
             swa_window_size=inputs["swa_window_size"],
             full_to_swa_index_mapping=inputs["full_to_swa_index_mapping"],
             verify_capacity=inputs["verify_capacity"],
+            req_to_expected_token_ids=None,
+            expected_token_ids_offset=0,
         )
 
     return fn

@@ -63,6 +63,8 @@ def _run_both_plan(
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=verify_capacity,
+        req_to_expected_token_ids=None,
+        expected_token_ids_offset=0,
     )
     launch_canary_plan_kernels_torch_reference(
         verify_plan_out=ref_verify,
@@ -74,6 +76,8 @@ def _run_both_plan(
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=int(ref_verify.verify_slot_indices.shape[0]),
+        req_to_expected_token_ids=None,
+        expected_token_ids_offset=0,
     )
     torch.cuda.synchronize()
 
@@ -126,12 +130,12 @@ def _assert_plans_byte_equal(
             ref_verify.verify_slot_indices[:n_verify],
         )
         assert torch.equal(
-            triton_verify.verify_expected_positions[:n_verify],
-            ref_verify.verify_expected_positions[:n_verify],
-        )
-        assert torch.equal(
             triton_verify.verify_expected_input_ids[:n_verify],
             ref_verify.verify_expected_input_ids[:n_verify],
+        )
+        assert torch.equal(
+            triton_verify.verify_expected_positions[:n_verify],
+            ref_verify.verify_expected_positions[:n_verify],
         )
         assert torch.equal(
             triton_verify.verify_prev_slot_indices[:n_verify],

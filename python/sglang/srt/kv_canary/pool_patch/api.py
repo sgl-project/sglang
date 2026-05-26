@@ -37,7 +37,7 @@ def attach_canary_buffers(
     pool: KVCache,
     config: CanaryConfig,
     device: torch.device,
-    expected_token_ids_offset: int = 0,
+    expected_token_ids_offset: int,
 ) -> tuple[CanaryBufferGroup, ...]:
     """Install canary buffers on a KV pool and return the resulting CanaryBufferGroup tuple.
 

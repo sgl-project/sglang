@@ -172,13 +172,13 @@ class VerifyPlan:
     Fields:
         verify_slot_indices: Canary slot index per entry, shape [verify_capacity], int64. Already SWA-translated
             for the SWA group.
-        verify_expected_positions: Expected sequence position per entry, shape [verify_capacity], int64.
         verify_expected_input_ids: Source-of-truth token id per entry, shape [verify_capacity], int64.
             The plan-side entries kernel gathers from
             ``CanaryDeviceState.req_to_expected_token_ids[rp, position + expected_token_ids_offset]``;
             entries that fall outside the pool's row (e.g. EAGLE draft's last slot rotating in a bonus
             token, or padding beyond the per-req length) get the ``-1`` sentinel. The verify kernel
             compares against the stored canary token and skips when this is ``-1``.
+        verify_expected_positions: Expected sequence position per entry, shape [verify_capacity], int64.
         verify_prev_slot_indices: Chain predecessor slot per entry, shape [verify_capacity], int64. -1 = chain
             head (anchor on CANARY_CHAIN_ANCHOR). Explicit (not derived from verify_slot_indices[i-1])
             because chain heads, SWA window starts, cross-req boundaries, and radix-orphan extras break the
@@ -191,8 +191,8 @@ class VerifyPlan:
     """
 
     verify_slot_indices: torch.Tensor
-    verify_expected_positions: torch.Tensor
     verify_expected_input_ids: torch.Tensor
+    verify_expected_positions: torch.Tensor
     verify_prev_slot_indices: torch.Tensor
     verify_num_valid: torch.Tensor
     enable: torch.Tensor
@@ -207,14 +207,14 @@ class VerifyPlan:
             verify_slot_indices=torch.empty(
                 verify_capacity, dtype=torch.int64, device=device
             ),
-            verify_expected_positions=torch.empty(
-                verify_capacity, dtype=torch.int64, device=device
-            ),
             # verify_expected_input_ids defaults to -1 so test helpers and pre-plan
             # observers see the "skip token check" sentinel; the plan kernel rewrites
             # every active entry per step.
             verify_expected_input_ids=torch.full(
                 (verify_capacity,), -1, dtype=torch.int64, device=device
+            ),
+            verify_expected_positions=torch.empty(
+                verify_capacity, dtype=torch.int64, device=device
             ),
             verify_prev_slot_indices=torch.empty(
                 verify_capacity, dtype=torch.int64, device=device
@@ -230,10 +230,10 @@ class VerifyPlan:
         """WARN: ONLY use it when testing plan kernel. Do not use it when testing verify or
         write kernel to avoid hiding bugs."""
         self.verify_slot_indices.zero_()
-        self.verify_expected_positions.zero_()
         # Test helpers expect the "skip token check" sentinel after zero-out, matching
         # the verify-kernel contract.
         self.verify_expected_input_ids.fill_(-1)
+        self.verify_expected_positions.zero_()
         self.verify_prev_slot_indices.zero_()
         self.verify_num_valid.zero_()
         self.enable.zero_()
@@ -315,8 +315,8 @@ def launch_canary_verify_kernel(
 
     _assert_contiguous(canary_buf, "canary_buf")
     _assert_contiguous(plan.verify_slot_indices, "plan.verify_slot_indices")
-    _assert_contiguous(plan.verify_expected_positions, "plan.verify_expected_positions")
     _assert_contiguous(plan.verify_expected_input_ids, "plan.verify_expected_input_ids")
+    _assert_contiguous(plan.verify_expected_positions, "plan.verify_expected_positions")
     _assert_contiguous(plan.verify_prev_slot_indices, "plan.verify_prev_slot_indices")
     _assert_contiguous(plan.verify_num_valid, "plan.verify_num_valid")
     _assert_contiguous(plan.enable, "plan.enable")
@@ -333,8 +333,8 @@ def launch_canary_verify_kernel(
     module.canary_verify_step_cuda(
         canary_buf,
         plan.verify_slot_indices,
-        plan.verify_expected_positions,
         plan.verify_expected_input_ids,
+        plan.verify_expected_positions,
         plan.verify_prev_slot_indices,
         plan.verify_num_valid,
         plan.enable,
