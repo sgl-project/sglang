@@ -1,4 +1,4 @@
-"""Edge cases — sampling parameter × chunked interactions.
+"""Sampling parameter scripted tests for chunked prefill.
 
 Covers the A.2 series from the expansion plan plus parametrised
 combinations of greedy / stochastic / EOS-handling / stop-str /
@@ -8,6 +8,10 @@ Many cases here invoke ``start_req`` with sampling kwargs that the
 v0 ``ScriptedRuntime`` API does not yet accept (temperature, top_p,
 top_k, ignore_eos, stop, return_logprob, rid). Those are listed in
 expansion plan §6 as P0/P1 wishlist items.
+
+Also covers B.4 series from the expansion plan plus parametric fan-out
+across (default / greedy / high temperature / top-k / top-p) ×
+(short / chunked prompt).
 """
 
 import unittest
@@ -248,7 +252,77 @@ def _script_explicit_rid_chunked(t: ScriptedRuntime):
     assert r.finished
 
 
-class TestEdgeSamplingParams(CustomTestCase):
+def _script_default_sampling_chunked(t: ScriptedRuntime):
+    # All defaults + chunked: just complete cleanly.
+    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
+    yield from run_until_finished(r)
+    assert r.finished
+
+
+def _script_greedy_chunked(t: ScriptedRuntime):
+    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0)
+    yield from run_until_finished(r)
+    assert r.finished
+
+
+def _script_high_temperature_short(t: ScriptedRuntime):
+    r = t.start_req(prompt_len=16, max_new_tokens=4, temperature=1.8)
+    yield from run_until_finished(r)
+    assert r.finished
+
+
+def _script_high_temperature_chunked_extra(t: ScriptedRuntime):
+    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=1.8)
+    yield from run_until_finished(r)
+    assert r.finished
+
+
+def _script_low_temperature_short(t: ScriptedRuntime):
+    r = t.start_req(prompt_len=16, max_new_tokens=4, temperature=0.1)
+    yield from run_until_finished(r)
+    assert r.finished
+
+
+def _script_default_top_p(t: ScriptedRuntime):
+    r = t.start_req(prompt_len=16, max_new_tokens=4, top_p=0.95)
+    yield from run_until_finished(r)
+    assert r.finished
+
+
+def _script_default_top_k(t: ScriptedRuntime):
+    r = t.start_req(prompt_len=16, max_new_tokens=4, top_k=50)
+    yield from run_until_finished(r)
+    assert r.finished
+
+
+def _script_combined_sampling_chunked(t: ScriptedRuntime):
+    # All sampling knobs on at once.
+    r = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN,
+        max_new_tokens=4,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=40,
+    )
+    yield from run_until_finished(r)
+    assert r.finished
+
+
+def _script_default_sampling_short(t: ScriptedRuntime):
+    r = t.start_req(prompt_len=8, max_new_tokens=2)
+    yield from run_until_finished(r)
+    assert r.finished
+
+
+def _script_sampling_diversity_two_reqs(t: ScriptedRuntime):
+    # Two reqs with same prompt and non-greedy temp: outputs may differ.
+    r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=1.0)
+    yield from run_until_finished(r1)
+    r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=1.0)
+    yield from run_until_finished(r2)
+
+
+class TestScriptedSampling(CustomTestCase):
     def test_max_new_tokens_zero_rejected(self):
         execute_scripted_runtime(
             _script_max_new_tokens_zero_rejected,
@@ -372,6 +446,66 @@ class TestEdgeSamplingParams(CustomTestCase):
     def test_explicit_rid_chunked(self):
         execute_scripted_runtime(
             _script_explicit_rid_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_default_sampling_chunked(self):
+        execute_scripted_runtime(
+            _script_default_sampling_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_greedy_chunked(self):
+        execute_scripted_runtime(
+            _script_greedy_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_high_temperature_short(self):
+        execute_scripted_runtime(
+            _script_high_temperature_short,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_high_temperature_chunked_extra(self):
+        execute_scripted_runtime(
+            _script_high_temperature_chunked_extra,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_low_temperature_short(self):
+        execute_scripted_runtime(
+            _script_low_temperature_short,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_default_top_p(self):
+        execute_scripted_runtime(
+            _script_default_top_p,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_default_top_k(self):
+        execute_scripted_runtime(
+            _script_default_top_k,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_combined_sampling_chunked(self):
+        execute_scripted_runtime(
+            _script_combined_sampling_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_default_sampling_short(self):
+        execute_scripted_runtime(
+            _script_default_sampling_short,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_sampling_diversity_two_reqs(self):
+        execute_scripted_runtime(
+            _script_sampling_diversity_two_reqs,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
