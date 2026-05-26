@@ -17,6 +17,9 @@ from common.attention_methods.dense_attention import (
 from common.runner_modes.cuda_graph_decode_runner import (
     run_dense_cuda_graph_decode_case,
 )
+from common.runner_modes.speculative_draft_extend_runner import (
+    run_dense_draft_extend_v2_cuda_graph_case,
+)
 from common.runner_modes.split_op_runner import run_dense_split_op_extend_case
 
 
@@ -36,6 +39,18 @@ class TestFA4DenseAttentionBackendCorrectness(CustomTestCase):
             num_kv_heads=4,
             page_size=16,
             prefix_lens=(14, 15, 16),
+        ),
+    )
+    DRAFT_EXTEND_V2_CUDA_GRAPH_CASES = (
+        DenseAttentionCase(
+            name="runner_cuda_graph_fa4_eagle_draft_extend_v2_fixed_tokens",
+            backend="fa4",
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(4, 7),
+            extend_lens=(3, 3),
         ),
     )
     SPLIT_OP_CASES = (
@@ -104,6 +119,16 @@ class TestFA4DenseAttentionBackendCorrectness(CustomTestCase):
                         head_dim=self.HEAD_DIM,
                         hidden_size=self.HIDDEN_SIZE,
                     )
+
+    def test_runner_mode_eagle_draft_extend_v2_cuda_graph_cases(self):
+        for case in self.DRAFT_EXTEND_V2_CUDA_GRAPH_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_dense_draft_extend_v2_cuda_graph_case(
+                    self,
+                    case,
+                    head_dim=self.HEAD_DIM,
+                    hidden_size=self.HIDDEN_SIZE,
+                )
 
 
 if __name__ == "__main__":
