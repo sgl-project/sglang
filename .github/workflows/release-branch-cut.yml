@@ -26,6 +26,7 @@ jobs:
     environment: 'prod'
     outputs:
       branch_name: ${{ steps.set_output.outputs.branch_name }}
+      branch_exists: ${{ steps.check_exists.outputs.branch_exists }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -77,18 +78,20 @@ jobs:
           echo "Validated commit SHA: $COMMIT_SHA"
 
       - name: Check if branch already exists
+        id: check_exists
         run: |
           BRANCH_NAME="${{ github.event.inputs.branch_name }}"
 
           if git ls-remote --heads origin "$BRANCH_NAME" | grep -q "$BRANCH_NAME"; then
-            echo "::error::Branch '$BRANCH_NAME' already exists"
-            exit 1
+            echo "Branch '$BRANCH_NAME' already exists, skipping creation and proceeding to downstream tests"
+            echo "branch_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Branch '$BRANCH_NAME' does not exist, proceeding with creation"
+            echo "branch_exists=false" >> $GITHUB_OUTPUT
           fi
 
-          echo "Branch '$BRANCH_NAME' does not exist, proceeding with creation"
-
       - name: Create release branch
-        id: set_output
+        if: steps.check_exists.outputs.branch_exists != 'true'
         run: |
           COMMIT_SHA="${{ steps.validate.outputs.COMMIT_SHA }}"
           BRANCH_NAME="${{ github.event.inputs.branch_name }}"
@@ -99,10 +102,10 @@ jobs:
           # Create branch from the specified commit
           git checkout -b "$BRANCH_NAME" "$COMMIT_SHA"
 
-          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
           echo "Successfully created branch '$BRANCH_NAME' from commit '$COMMIT_SHA'"
 
       - name: Update version references in documentation
+        if: steps.check_exists.outputs.branch_exists != 'true'
         run: |
           BRANCH_NAME="${{ github.event.inputs.branch_name }}"
           # Extract version from branch name (e.g., release/v0.5.8 -> v0.5.8)
@@ -122,15 +125,29 @@ jobs:
           fi
 
       - name: Push release branch
+        if: steps.check_exists.outputs.branch_exists != 'true'
         run: |
-          BRANCH_NAME="${{ steps.set_output.outputs.branch_name }}"
+          BRANCH_NAME="${{ github.event.inputs.branch_name }}"
           git push origin "$BRANCH_NAME"
           echo "Successfully pushed branch '$BRANCH_NAME'"
+
+      - name: Emit branch_name output
+        id: set_output
+        run: |
+          BRANCH_NAME="${{ github.event.inputs.branch_name }}"
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
 
       - name: Summary
         run: |
           COMMIT_SHA="${{ steps.validate.outputs.COMMIT_SHA }}"
           BRANCH_NAME="${{ github.event.inputs.branch_name }}"
+          BRANCH_EXISTS="${{ steps.check_exists.outputs.branch_exists }}"
+
+          if [ "$BRANCH_EXISTS" = "true" ]; then
+            STATUS="Branch already existed — creation skipped, downstream tests will run"
+          else
+            STATUS="Newly created"
+          fi
 
           echo "## Release Branch Cut Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -138,6 +155,7 @@ jobs:
           echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Branch | \`$BRANCH_NAME\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit | \`$COMMIT_SHA\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | $STATUS |" >> $GITHUB_STEP_SUMMARY
           echo "| Triggered by | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
