@@ -45,7 +45,9 @@ class TestScriptedPriority(CustomTestCase):
 
     @staticmethod
     def _script_naive_priority_chunked(t: ScriptedRuntime):
-        low = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, priority="low")
+        low = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, priority="low"
+        )
         yield  # let scheduler pull `low` and begin its chunk loop
 
         high = t.start_req(prompt_len=8, max_new_tokens=2, priority="high")
@@ -101,7 +103,9 @@ class TestScriptedPriority(CustomTestCase):
     # its slot.
     @staticmethod
     def _script_priority_preempt_chunked(t: ScriptedRuntime):
-        low = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="low")
+        low = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="low"
+        )
         yield from run_until(low, lambda h: h.is_chunking and h.chunks_done >= 1)
         assert low.kv_pages > 0
 
@@ -304,7 +308,8 @@ class TestScriptedPriority(CustomTestCase):
     def _script_preempt_five_victims(t: ScriptedRuntime):
         # 5 chunked reqs preempted simultaneously.
         victims = [
-            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2) for _ in range(5)
+            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+            for _ in range(5)
         ]
         yield from run_until(victims[0], lambda h: h.is_chunking)
 
@@ -456,7 +461,6 @@ class TestScriptedPriority(CustomTestCase):
         yield from run_until_finished(r)
         assert r.finished
 
-
     def test_priority_preempt_with_chunked_admission_same_yield(self):
         """Same yield: high-priority R1 + new long chunked R2 land while low-priority R3 runs; R3 preempted, R2 chunks_done starts; both finish."""
         execute_scripted_runtime(
@@ -497,9 +501,9 @@ class TestScriptedPriority(CustomTestCase):
         yield
 
         # R3 retracted: kv_pages released.
-        assert r3.kv_pages == 0, (
-            f"preempted low-priority r3 must release KV; got {r3.kv_pages}"
-        )
+        assert (
+            r3.kv_pages == 0
+        ), f"preempted low-priority r3 must release KV; got {r3.kv_pages}"
 
         # R2 must enter chunked admission.
         yield from run_until(r2, lambda h: h.is_chunking)
