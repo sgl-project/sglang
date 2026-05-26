@@ -358,6 +358,12 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Added FA3 and FA4 EAGLE `DRAFT_EXTEND` (V1) eager + CUDA-graph
+  replay coverage in `dense/test_fa3.py` and `dense/test_fa4.py`.
+  Reuses the shared `run_dense_eagle_draft_extend_case` /
+  `run_dense_draft_extend_cuda_graph_case` helpers. FA's V2 fix in
+  `flashattention_backend.py:506,2288` (commit `7e8475592`) was for
+  V2 only; V1 was already correct and just needed test wiring.
 - Added FA3 and FA4 EAGLE `TARGET_VERIFY` chain (topk=1) eager +
   CUDA-graph replay coverage in `dense/test_fa3.py` and
   `dense/test_fa4.py`. Reuses the shared

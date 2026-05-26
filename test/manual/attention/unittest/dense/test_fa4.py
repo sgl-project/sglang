@@ -18,7 +18,9 @@ from common.runner_modes.cuda_graph_decode_runner import (
     run_dense_cuda_graph_decode_case,
 )
 from common.runner_modes.speculative_draft_extend_runner import (
+    run_dense_draft_extend_cuda_graph_case,
     run_dense_draft_extend_v2_cuda_graph_case,
+    run_dense_eagle_draft_extend_case,
 )
 from common.runner_modes.speculative_target_verify_runner import (
     run_dense_spec_verify_case,
@@ -43,6 +45,30 @@ class TestFA4DenseAttentionBackendCorrectness(CustomTestCase):
             num_kv_heads=4,
             page_size=16,
             prefix_lens=(14, 15, 16),
+        ),
+    )
+    DRAFT_EXTEND_CASES = (
+        DenseAttentionCase(
+            name="runner_fa4_eagle_draft_extend",
+            backend="fa4",
+            forward_mode=ForwardMode.DRAFT_EXTEND,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(4, 7),
+            extend_lens=(3, 3),
+        ),
+    )
+    DRAFT_EXTEND_CUDA_GRAPH_CASES = (
+        DenseAttentionCase(
+            name="runner_cuda_graph_fa4_eagle_draft_extend",
+            backend="fa4",
+            forward_mode=ForwardMode.DRAFT_EXTEND,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(4, 7),
+            extend_lens=(3, 3),
         ),
     )
     DRAFT_EXTEND_V2_CUDA_GRAPH_CASES = (
@@ -155,6 +181,26 @@ class TestFA4DenseAttentionBackendCorrectness(CustomTestCase):
         for case in self.DRAFT_EXTEND_V2_CUDA_GRAPH_CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_dense_draft_extend_v2_cuda_graph_case(
+                    self,
+                    case,
+                    head_dim=self.HEAD_DIM,
+                    hidden_size=self.HIDDEN_SIZE,
+                )
+
+    def test_runner_mode_eagle_draft_extend_cases(self):
+        for case in self.DRAFT_EXTEND_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_dense_eagle_draft_extend_case(
+                    self,
+                    case,
+                    head_dim=self.HEAD_DIM,
+                    hidden_size=self.HIDDEN_SIZE,
+                )
+
+    def test_runner_mode_draft_extend_cuda_graph_cases(self):
+        for case in self.DRAFT_EXTEND_CUDA_GRAPH_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_dense_draft_extend_cuda_graph_case(
                     self,
                     case,
                     head_dim=self.HEAD_DIM,
