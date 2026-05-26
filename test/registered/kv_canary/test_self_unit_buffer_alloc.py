@@ -25,6 +25,7 @@ def _config(mode: RealKvHashMode) -> CanaryConfig:
         sweep_interval=0,
         real_kv_hash_mode=mode,
         input_check_mode=False,
+        enable_req_token_ids_check=False,
         stats_print_every_n_steps=100,
     )
 
