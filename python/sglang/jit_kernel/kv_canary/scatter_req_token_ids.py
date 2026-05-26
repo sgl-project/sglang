@@ -5,7 +5,11 @@ import triton
 import triton.language as tl
 
 _SCATTER_TOKEN_BLOCK: int = 256
-_SCATTER_BATCH_BLOCK: int = 4096
+# Upper bound on bs+1 the kernel can scan per program. Owner-req lookup uses an
+# outer-product tile of shape ``[TOKEN_BLOCK, BATCH_BLOCK]``; keep this small so
+# the tile stays in registers (256 x 512 = 128 KiB i1, well below the SM trap-
+# inducing budget that bites at the 1M cell mark).
+_SCATTER_BATCH_BLOCK: int = 512
 
 
 @triton.jit
