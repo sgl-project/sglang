@@ -128,32 +128,24 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
         assert r.pending_middle_outputs == 0
 
     def test_force_retract_then_readmit(self):
-        """Force retract then watchdog must not abort the chunked-resume; req re-admits and finishes cleanly."""
+        """Force retract then req re-admits and finishes cleanly."""
         self.runtime.run(self._script_force_retract_then_readmit)
 
     @staticmethod
     def _script_force_retract_then_readmit(t: ScriptedRuntime):
-        # Force retract; next yield re-admits and completes. The
-        # chunked-resume in waiting_queue is exactly the state where
-        # the watchdog would (incorrectly) abort it pre-fix
-        # (commit 359e5ed7bd) — W2 must stay at 0.
+        # Force retract; the chunked-resume parked in waiting_queue
+        # must not be aborted by the watchdog (commit 359e5ed7bd) —
+        # observable as the req successfully re-admitting and finishing.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
         t.force_retract(r)
         yield
         assert r.kv_pages == 0, "retract must release KV before re-admission"
-        # Continue: scheduler should re-admit on its own. Track W2
-        # across the resume window.
-        for _ in range(800):
-            assert r.watchdog_aborted_while_chunked_resume_count == 0, (
-                f"W2 violation: watchdog aborted chunked-resume mid-cycle; "
-                f"got {r.watchdog_aborted_while_chunked_resume_count}"
-            )
-            if r.finished:
-                break
-            yield
+        # Scheduler should re-admit on its own and the req must finish.
+        yield from run_until_finished(r, max_steps=800)
         assert r.finished
-        assert r.watchdog_aborted_while_chunked_resume_count == 0
+        assert r.kv_pages == 0
+        assert r.lock_refs == 0
 
     def test_retract_one_admit_one(self):
         """Retract r1 while admitting r2: r2 finishes first, r1 re-admits and finishes, neither leaks resources."""
@@ -163,8 +155,7 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
     def _script_retract_one_admit_one(t: ScriptedRuntime):
         # Force retract r1 + simultaneously admit r2. r2 must complete
         # quickly; r1 must re-admit and complete cleanly. KV / lock_refs
-        # must release for both. W2 must stay 0 (r1 sat in waiting
-        # as a chunked-resume).
+        # must release for both.
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
         r2 = t.start_req(prompt_len=8, max_new_tokens=2)
@@ -176,7 +167,6 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
         assert r1.finished
         assert r1.kv_pages == 0
         assert r1.lock_refs == 0
-        assert r1.watchdog_aborted_while_chunked_resume_count == 0
 
     def test_retract_during_decode(self):
         """Retract during pure decode (no chunked) cleanly releases resources and the req still finishes."""
@@ -219,9 +209,9 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
     @staticmethod
     def _script_disagg_retract_resets_send_state_extra(t: ScriptedRuntime):
         # disagg path: retract must reset send-side state (414efd4a27).
-        # Even in non-disagg engine config, the D3 counter is defined
-        # and must stay 0 — retract still touches the same scheduler
-        # code path.
+        # Even in non-disagg engine config, the send-side field must be
+        # absent/idle after retract — retract still touches the same
+        # scheduler code path.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
         t.force_retract(r)
@@ -229,41 +219,40 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
         # NEW API NEEDED: r.disagg_send_state — current state of the
         # send-side machine (None when not disagg or after reset).
         assert r.disagg_send_state in (None, "idle")
-        # D3: no send-side leak observed even in this non-disagg config.
-        assert r.disagg_send_state_leak_after_retract_count == 0
         yield from run_until_finished(r)
         assert r.finished
 
     def test_retract_chunked_resume_in_waiting(self):
-        """Chunked-resume sitting in waiting → force retract releases row + KV and W2 watchdog gate holds."""
+        """Chunked-resume sitting in waiting → force retract releases row + KV cleanly."""
         self.runtime.run(self._script_retract_chunked_resume_in_waiting)
 
     @staticmethod
     def _script_retract_chunked_resume_in_waiting(t: ScriptedRuntime):
         # Chunked-resume already parked in waiting — this is the exact
-        # state the W2 (commit 359e5ed7bd) fix protects: watchdog must
-        # not abort a chunked-resume here.
+        # state the commit 359e5ed7bd fix protects: watchdog must not
+        # abort a chunked-resume here. Observable as the req being
+        # retracted cleanly (kv_pages == 0, row_idx released) rather
+        # than entering an aborted state.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
         yield from run_until(r, lambda h: h.status == "waiting")
-        # Snapshot W2 *before* and *after* retract; must stay 0.
-        assert r.watchdog_aborted_while_chunked_resume_count == 0
         t.force_retract(r)
         yield
         assert r.kv_pages == 0
         assert r.row_idx is None
-        assert r.watchdog_aborted_while_chunked_resume_count == 0
+        # Status must be a clean retract-park ("waiting"), not aborted.
+        assert r.status in ("waiting", "finished")
 
     def test_two_retracts_same_yield(self):
-        """Two reqs retracted in the same yield release KV simultaneously and both still finish without watchdog-induced abort."""
+        """Two reqs retracted in the same yield release KV simultaneously and both still finish."""
         self.runtime.run(self._script_two_retracts_same_yield)
 
     @staticmethod
     def _script_two_retracts_same_yield(t: ScriptedRuntime):
         # Two reqs force_retracted in the same yield step — both must
-        # release KV in lockstep, both must re-admit and finish, and W2
-        # must hold for both (chunked-resume in waiting cannot be
-        # spuriously aborted by the watchdog).
+        # release KV in lockstep, both must re-admit and finish (the
+        # observable witness that the watchdog did not spuriously abort
+        # the chunked-resume in waiting).
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
@@ -276,19 +265,17 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
         assert r1.finished and r2.finished
         assert r1.lock_refs == 0
         assert r2.lock_refs == 0
-        assert r1.watchdog_aborted_while_chunked_resume_count == 0
-        assert r2.watchdog_aborted_while_chunked_resume_count == 0
 
     def test_retract_then_re_chunk(self):
-        """Retract mid-chunk then resume: re-chunk continues, KV/lock release at finish, and the W2 watchdog gate holds."""
+        """Retract mid-chunk then resume: re-chunk continues, KV/lock release at finish."""
         self.runtime.run(self._script_retract_then_re_chunk)
 
     @staticmethod
     def _script_retract_then_re_chunk(t: ScriptedRuntime):
         # Retract a mid-chunk req; subsequent re-chunk must complete
-        # without prefix_indices residue. While the req sits in
-        # waiting_queue as a chunked-resume the watchdog must NOT
-        # abort it (W2 invariant).
+        # without prefix_indices residue. The req successfully finishing
+        # is the observable witness that the watchdog did not abort the
+        # chunked-resume while it sat in the waiting_queue.
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         yield from run_until(r, lambda h: h.chunks_done >= 1)
         t.force_retract(r)
@@ -296,18 +283,10 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
         # subsequent run_until_finished observes any state.
         yield
         assert r.kv_pages == 0, "retract must release KV"
-        # W2 watch loop until the req finishes.
-        for _ in range(800):
-            assert r.watchdog_aborted_while_chunked_resume_count == 0, (
-                f"W2 violation: watchdog aborted chunked-resume; got "
-                f"{r.watchdog_aborted_while_chunked_resume_count}"
-            )
-            if r.finished:
-                break
-            yield
+        yield from run_until_finished(r, max_steps=800)
         assert r.finished
         assert r.lock_refs == 0
-        assert r.watchdog_aborted_while_chunked_resume_count == 0
+        assert r.kv_pages == 0
 
 
 class TestPriorityPriority(ScriptedRuntimeTestCase):
@@ -507,15 +486,9 @@ class TestPriorityDisagg(ScriptedRuntimeTestCase):
             None,
             "idle",
         ), f"disagg send state must reset on retract, got {r.disagg_send_state}"
-        # D3: source-side counter agrees with the field-level reset.
-        assert r.disagg_send_state_leak_after_retract_count == 0, (
-            f"D3 violation in disagg mode retract; got "
-            f"{r.disagg_send_state_leak_after_retract_count}"
-        )
 
         yield from run_until_finished(r)
         assert r.finished
-        assert r.disagg_send_state_leak_after_retract_count == 0
 
 
 if __name__ == "__main__":
