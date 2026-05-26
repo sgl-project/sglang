@@ -123,6 +123,11 @@ _HDR_SIZE = struct.calcsize(_HDR_FMT)
 _BUF_FMT = "<BBIII"  # kind, comp_idx, layer, num_indices, item_len
 _BUF_SIZE = struct.calcsize(_BUF_FMT)
 
+# Hard cap on a single TCP frame to bound decode-side allocation. A normal
+# chunk frame's worst case is num_layers * num_pages * item_len + headers;
+# even DSv4 671B-class workloads stay well under 2 GB per chunk.
+_MAX_FRAME_BYTES = 2 << 30  # 2 GB
+
 
 def _recv_exact(sock: socket.socket, nbytes: int) -> bytes:
     chunks = []
@@ -246,6 +251,11 @@ class TcpKVManager(CommonKVManager):
         # are read directly from self.kv_args at transfer time.
         self.data_host = self.local_ip
 
+        # Per-thread cuda streams so workers don't serialise on a shared stream.
+        # Streams are created lazily inside each worker thread, after the
+        # thread has called torch.cuda.set_device.
+        self._tls = threading.local()
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.transfer_infos: Dict[int, Dict[str, TcpTransferInfo]] = {}
             self.decode_kv_args_table: Dict[str, TcpKVArgsRegisterInfo] = {}
@@ -253,8 +263,6 @@ class TcpKVManager(CommonKVManager):
             self._client_socks: Dict[str, socket.socket] = {}
             self._client_locks: Dict[str, threading.Lock] = {}
             self._client_pool_lock = threading.Lock()
-            # Stream + pinned host bounce buffer used by D2H staging.
-            self._d2h_stream = torch.cuda.Stream()
             # Worker pool — single queue is sufficient for spike; mooncake
             # uses N for shardable contention reduction. We can scale later.
             queue_count = max(1, envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get())
@@ -271,11 +279,18 @@ class TcpKVManager(CommonKVManager):
             self.start_prefill_thread()
         else:  # DECODE
             self.session_id = ""  # set after data port is bound
-            self._h2d_stream = torch.cuda.Stream()
             self._start_decode_data_server()
             # session_id format mirrors mooncake's "ip:rpc_port" convention.
             self.session_id = f"{self.local_ip}:{self.data_port}"
             self.start_decode_thread()
+
+    def _thread_stream(self, name: str) -> torch.cuda.Stream:
+        """Lazily create a per-thread cuda Stream so issuers don't serialise."""
+        stream = getattr(self._tls, name, None)
+        if stream is None:
+            stream = torch.cuda.Stream()
+            setattr(self._tls, name, stream)
+        return stream
 
     # -- prefill bookkeeping ---------------------------------------------------
 
@@ -326,10 +341,21 @@ class TcpKVManager(CommonKVManager):
         state_indices: Optional[List] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
-        if (
-            bootstrap_room not in self.request_status
-            or self.check_status(bootstrap_room) == KVPoll.Failed
-        ):
+        if bootstrap_room not in self.request_status:
+            return
+        status = self.check_status(bootstrap_room)
+        if status == KVPoll.Failed:
+            return
+        if status != KVPoll.WaitingForInput:
+            # Sender called send() before the receiver pushed metadata, or the
+            # room was concluded already. Drop chunk and log — silently
+            # enqueuing here would lose data because the worker can't dispatch
+            # without a registered transfer_info.
+            logger.warning(
+                "tcp backend: chunk for room=%s dropped, status=%s (expected WaitingForInput)",
+                bootstrap_room,
+                status,
+            )
             return
         if bootstrap_room not in self.transfer_infos:
             # Dummy rank for this room.
@@ -473,7 +499,7 @@ class TcpKVManager(CommonKVManager):
                 )
 
         # All D2H copies are now enqueued; wait for them before serialising.
-        self._d2h_stream.synchronize()
+        self._thread_stream("d2h").synchronize()
 
         # Convert host tensors to bytes only after sync — host_bufs stay alive
         # via the `staged` list reference throughout.
@@ -506,7 +532,7 @@ class TcpKVManager(CommonKVManager):
         nbytes = n * item_len
         host_buf = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
         host_ptr = host_buf.data_ptr()
-        stream_ptr = self._d2h_stream.cuda_stream
+        stream_ptr = self._thread_stream("d2h").cuda_stream
         for i, idx in enumerate(indices.tolist()):
             ret = _cuda_memcpy_async(
                 host_ptr + i * item_len,
@@ -664,10 +690,20 @@ class TcpKVManager(CommonKVManager):
             while True:
                 hdr = _recv_exact(conn, 4)
                 body_len = struct.unpack("<I", hdr)[0]
+                if body_len > _MAX_FRAME_BYTES:
+                    raise ConnectionError(
+                        f"frame size {body_len} exceeds {_MAX_FRAME_BYTES}"
+                    )
                 body = _recv_exact(conn, body_len)
                 self._apply_frame(body)
         except (ConnectionError, OSError) as e:
-            logger.debug("Decode recv loop %s closed: %s", addr, e)
+            logger.debug("decode recv loop %s closed: %s", addr, e)
+        except Exception as e:
+            # Apply errors (cuda copy failure, malformed frame, etc.) must NOT
+            # silently kill this loop while leaving the prefill side believing
+            # the transfer succeeded. We log and bail; the prefill side will
+            # eventually see BrokenPipe on its next chunk and fail the room.
+            logger.error("decode recv loop %s aborted: %r", addr, e, exc_info=True)
         finally:
             try:
                 conn.close()
@@ -677,43 +713,58 @@ class TcpKVManager(CommonKVManager):
     def _apply_frame(self, body: bytes) -> None:
         room, prefill_rank, is_last, num_buffers = struct.unpack_from(_HDR_FMT, body, 0)
         off = _HDR_SIZE
-        stream_ptr = self._h2d_stream.cuda_stream
+        stream = self._thread_stream("h2d")
+        stream_ptr = stream.cuda_stream
         # Keep all pinned host buffers alive until the stream is synchronised.
         # PyTorch's caching allocator will reclaim a pinned tensor as soon as
         # its refcount hits zero — without these references the cudaMemcpyAsync
         # H2D copies would read freed memory once a later iteration reallocates.
+        # The try/finally guarantees we sync the stream even on apply error,
+        # so `live_host_bufs` stays alive until cuda has finished reading it.
         live_host_bufs: List[torch.Tensor] = []
-        for _ in range(num_buffers):
-            kind, comp_idx, layer, n_idx, item_len = struct.unpack_from(
-                _BUF_FMT, body, off
-            )
-            off += _BUF_SIZE
-            dst_indices = np.frombuffer(body, dtype=np.int32, count=n_idx, offset=off)
-            off += n_idx * 4
-            payload_len = n_idx * item_len
-            payload_view = memoryview(body)[off : off + payload_len]
-            off += payload_len
-
-            dst_base_ptr = self._dst_base_ptr(kind, comp_idx, layer)
-            if dst_base_ptr == 0:
-                continue
-            host_buf = torch.empty(payload_len, dtype=torch.uint8, pin_memory=True)
-            host_arr = host_buf.numpy()
-            host_arr[:] = np.frombuffer(payload_view, dtype=np.uint8)
-            live_host_bufs.append(host_buf)
-            host_ptr = host_buf.data_ptr()
-            for i, idx in enumerate(dst_indices.tolist()):
-                ret = _cuda_memcpy_async(
-                    dst_base_ptr + idx * item_len,
-                    host_ptr + i * item_len,
-                    item_len,
-                    _CUDA_MEMCPY_HOST_TO_DEVICE,
-                    stream_ptr,
+        try:
+            for _ in range(num_buffers):
+                kind, comp_idx, layer, n_idx, item_len = struct.unpack_from(
+                    _BUF_FMT, body, off
                 )
-                if ret != 0:
-                    raise RuntimeError(f"cudaMemcpyAsync H2D failed: {ret}")
-        self._h2d_stream.synchronize()
-        # `live_host_bufs` goes out of scope here; safe to free now.
+                off += _BUF_SIZE
+                dst_indices = np.frombuffer(
+                    body, dtype=np.int32, count=n_idx, offset=off
+                )
+                off += n_idx * 4
+                payload_len = n_idx * item_len
+                payload_view = memoryview(body)[off : off + payload_len]
+                off += payload_len
+
+                dst_base_ptr = self._dst_base_ptr(kind, comp_idx, layer)
+                if dst_base_ptr == 0:
+                    logger.warning(
+                        "tcp backend: dropped buffer (kind=%s comp_idx=%s layer=%s) "
+                        "— no destination pointer on this rank",
+                        kind,
+                        comp_idx,
+                        layer,
+                    )
+                    continue
+                host_buf = torch.empty(payload_len, dtype=torch.uint8, pin_memory=True)
+                host_arr = host_buf.numpy()
+                host_arr[:] = np.frombuffer(payload_view, dtype=np.uint8)
+                live_host_bufs.append(host_buf)
+                host_ptr = host_buf.data_ptr()
+                for i, idx in enumerate(dst_indices.tolist()):
+                    ret = _cuda_memcpy_async(
+                        dst_base_ptr + idx * item_len,
+                        host_ptr + i * item_len,
+                        item_len,
+                        _CUDA_MEMCPY_HOST_TO_DEVICE,
+                        stream_ptr,
+                    )
+                    if ret != 0:
+                        raise RuntimeError(f"cudaMemcpyAsync H2D failed: {ret}")
+        finally:
+            # Always sync before live_host_bufs goes out of scope, otherwise
+            # pinned tensors are freed while cudaMemcpyAsync is still reading.
+            stream.synchronize()
 
     def _dst_base_ptr(self, kind: int, comp_idx: int, layer: int) -> int:
         if kind == _KIND_MAIN:
@@ -741,7 +792,13 @@ class TcpKVManager(CommonKVManager):
                     continue
                 if status == KVPoll.Success:
                     self.prefill_response_tracker[room].add(prefill_rank)
-                    expected = self.required_prefill_response_num_table.get(room, 1)
+                    expected = self.required_prefill_response_num_table.get(room)
+                    if expected is None:
+                        # Receiver hasn't finished init() yet — defer Success.
+                        # When init() lands, future Success pushes from other
+                        # ranks will close this out; if no more come, the
+                        # waiting-timeout path will fail the room.
+                        continue
                     if len(self.prefill_response_tracker[room]) == expected:
                         self.update_status(room, KVPoll.Success)
                 elif status == KVPoll.Failed:
