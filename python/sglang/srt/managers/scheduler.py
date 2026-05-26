@@ -1062,6 +1062,21 @@ class Scheduler(
         # init_next_round_input, so running stash would double-free and
         # corrupt prefix_indices.
         self._chunked_req_scheduled_last_iter = False
+
+        # Regression instrumentation for invariant S2: self.chunked_req
+        # must NOT also appear in self.running_batch.reqs (chunked-prefill
+        # is exclusive of running). Incremented at the top of
+        # get_next_batch_to_run when the violation is observed.
+        self._chunked_req_in_batch_violation_count: int = 0
+
+        # Regression instrumentation for invariant S3: in pipeline
+        # parallelism, last_batch.chunked_req must be added to
+        # chunked_req_to_exclude before merging into running_batch.
+        # Incremented when post-merge running_batch.reqs still contains
+        # last_batch.chunked_req (see get_next_batch_to_run PP merge
+        # branch).
+        self._stale_chunked_req_merged_count: int = 0
+
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
@@ -2326,6 +2341,16 @@ class Scheduler(
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        # Invariant S2: chunked_req and running_batch.reqs are mutually
+        # exclusive — the chunked req is held aside and merged back only
+        # after its final chunk. If both contain the same req, double
+        # accounting / double release follows.
+        if (
+            self.chunked_req is not None
+            and self.chunked_req in self.running_batch.reqs
+        ):
+            self._chunked_req_in_batch_violation_count += 1
+
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
         self._abort_on_waiting_timeout()
