@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
     SanaWMBeforeDenoisingStage,
+    configure_sana_wm_ltx2_vae_for_long_video,
 )
 from sglang.multimodal_gen.runtime.utils.model_overlay import (
     resolve_model_overlay_target,
@@ -104,6 +105,81 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         )
         self.assertTrue(
             torch.equal(shift, torch.tensor([1.0, 2.0]).view(1, 2, 1, 1, 1))
+        )
+
+    def test_sana_wm_ltx2_vae_tiling_defaults_match_upstream(self) -> None:
+        self.assertTrue(self.config.vae_tiling)
+        self.assertTrue(self.config.vae_framewise_encoding)
+        self.assertTrue(self.config.vae_framewise_decoding)
+        self.assertEqual(self.config.vae_tile_sample_min_num_frames, 96)
+        self.assertEqual(self.config.vae_tile_sample_stride_num_frames, 64)
+        self.assertEqual(self.config.vae_config.tile_sample_min_num_frames, 96)
+        self.assertEqual(self.config.vae_config.tile_sample_stride_num_frames, 64)
+        self.assertEqual(self.config.vae_config.blend_num_frames, 32)
+
+    def test_configure_sana_wm_ltx2_vae_enables_framewise_decode(self) -> None:
+        class FakeLTX2VAE:
+            def __init__(self):
+                self.use_tiling = False
+                self.use_framewise_encoding = False
+                self.use_framewise_decoding = False
+                self.tile_sample_min_num_frames = 16
+                self.tile_sample_stride_num_frames = 8
+                self.enable_tiling_kwargs = None
+
+            def enable_tiling(self, **kwargs):
+                self.use_tiling = True
+                self.enable_tiling_kwargs = kwargs
+                self.tile_sample_min_num_frames = kwargs[
+                    "tile_sample_min_num_frames"
+                ]
+                self.tile_sample_stride_num_frames = kwargs[
+                    "tile_sample_stride_num_frames"
+                ]
+
+        vae = FakeLTX2VAE()
+        configure_sana_wm_ltx2_vae_for_long_video(vae, self.config)
+
+        self.assertTrue(vae.use_tiling)
+        self.assertTrue(vae.use_framewise_encoding)
+        self.assertTrue(vae.use_framewise_decoding)
+        self.assertEqual(vae.tile_sample_min_num_frames, 96)
+        self.assertEqual(vae.tile_sample_stride_num_frames, 64)
+        self.assertEqual(
+            vae.enable_tiling_kwargs,
+            {
+                "tile_sample_min_num_frames": 96,
+                "tile_sample_stride_num_frames": 64,
+            },
+        )
+
+    def test_configure_sana_wm_ltx2_vae_honors_nested_vae_config(self) -> None:
+        vae = SimpleNamespace(
+            use_tiling=False,
+            use_framewise_encoding=False,
+            use_framewise_decoding=False,
+            tile_sample_min_num_frames=16,
+            tile_sample_stride_num_frames=8,
+        )
+
+        def enable_tiling(**kwargs):
+            vae.use_tiling = True
+            vae.enable_tiling_kwargs = kwargs
+
+        vae.enable_tiling = enable_tiling
+        self.config.vae_config.tile_sample_min_num_frames = 128
+        self.config.vae_config.tile_sample_stride_num_frames = 80
+
+        configure_sana_wm_ltx2_vae_for_long_video(vae, self.config)
+
+        self.assertEqual(vae.tile_sample_min_num_frames, 128)
+        self.assertEqual(vae.tile_sample_stride_num_frames, 80)
+        self.assertEqual(
+            vae.enable_tiling_kwargs,
+            {
+                "tile_sample_min_num_frames": 128,
+                "tile_sample_stride_num_frames": 80,
+            },
         )
 
 

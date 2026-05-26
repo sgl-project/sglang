@@ -75,13 +75,31 @@ class SanaWMPipelineConfig(PipelineConfig):
     # --- VAE: LTX-2 (128ch, 8× temporal, 32× spatial) ---
     vae_config: VAEConfig = field(default_factory=LTXVideoVAEConfig)
     vae_precision: str = "bf16"
-    vae_tiling: bool = False   # LTX-2 VAE does not use tiling by default
+    # Match NVlabs SANA-WM inference: long videos must use LTX-2 spatial
+    # tiling plus framewise temporal decode to avoid oversized Conv3d pads.
+    vae_tiling: bool = True
     vae_sp: bool = False        # no VAE SP for now
+    vae_framewise_encoding: bool = True
+    vae_framewise_decoding: bool = True
+    vae_tile_sample_min_num_frames: int = 96
+    vae_tile_sample_stride_num_frames: int = 64
 
     # Load both encoder and decoder (need encoder for first-frame conditioning)
     def __post_init__(self):
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
+        self.vae_config.use_tiling = self.vae_tiling
+        self.vae_config.use_temporal_tiling = self.vae_framewise_decoding
+        self.vae_config.tile_sample_min_num_frames = (
+            self.vae_tile_sample_min_num_frames
+        )
+        self.vae_config.tile_sample_stride_num_frames = (
+            self.vae_tile_sample_stride_num_frames
+        )
+        self.vae_config.blend_num_frames = (
+            self.vae_tile_sample_min_num_frames
+            - self.vae_tile_sample_stride_num_frames
+        )
 
     # --- Text encoder: Gemma-2-2b-it (single encoder, same as SANA T2I) ---
     text_encoder_configs: tuple[EncoderConfig, ...] = field(

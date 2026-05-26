@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
     SanaWMBeforeDenoisingStage,
+    SanaWMDecodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_refiner import (
     SanaWMLTX2RefinerStage,
@@ -119,7 +120,14 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
         self._add_decoding_stage()
 
     def _add_decoding_stage(self) -> None:
-        self.add_standard_decoding_stage()
+        self.add_stage(
+            SanaWMDecodingStage(
+                vae=self.get_module("vae"),
+                pipeline=self,
+                component_name="vae",
+            ),
+            "decoding_stage",
+        )
 
     def _maybe_add_refiner_stage(self, server_args: ServerArgs) -> None:
         """Hook for subclasses; single-stage pipeline is a no-op."""

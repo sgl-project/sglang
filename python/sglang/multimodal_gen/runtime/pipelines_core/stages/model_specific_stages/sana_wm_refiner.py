@@ -40,8 +40,8 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_refiner_transformer impor
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
-from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
+    SanaWMDecodingStage,
     log_sana_wm_tensor_stats,
     sana_wm_diagnostics_enabled,
 )
@@ -401,7 +401,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         return batch
 
 
-class SanaWMRefinerDecodingStage(DecodingStage):
+class SanaWMRefinerDecodingStage(SanaWMDecodingStage):
     """Decode refined latents and drop the clean sink anchor frame."""
 
     @torch.no_grad()

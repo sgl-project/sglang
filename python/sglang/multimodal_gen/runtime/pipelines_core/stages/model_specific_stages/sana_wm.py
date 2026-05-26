@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils impo
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -39,6 +40,24 @@ _SANA_WM_DIAGNOSTICS_ENVS = (
     "SGLANG_SANA_WM_DIAGNOSTICS",
     "SGLANG_SANA_WM_LOG_TENSOR_STATS",
 )
+
+_SANA_WM_DEFAULT_VAE_TILE_MIN_FRAMES = 96
+_SANA_WM_DEFAULT_VAE_TILE_STRIDE_FRAMES = 64
+
+
+def _resolve_sana_wm_vae_frame_tile_value(
+    pipeline_config: SanaWMPipelineConfig,
+    direct_attr: str,
+    vae_config_attr: str,
+    default: int,
+) -> int:
+    direct_value = getattr(pipeline_config, direct_attr, default)
+    if direct_value != default:
+        return int(direct_value)
+
+    vae_config = getattr(pipeline_config, "vae_config", None)
+    nested_value = getattr(vae_config, vae_config_attr, None)
+    return int(nested_value or default)
 
 
 def sana_wm_diagnostics_enabled() -> bool:
@@ -107,6 +126,90 @@ def log_sana_wm_tensor_stats(label: str, tensor: torch.Tensor | None) -> None:
         )
 
 
+def configure_sana_wm_ltx2_vae_for_long_video(
+    vae: Any,
+    pipeline_config: SanaWMPipelineConfig,
+    *,
+    log_info: Any | None = None,
+) -> None:
+    """Apply SANA-WM's upstream LTX-2 VAE tiling knobs.
+
+    The LTX-2 VAE implements temporal tiled decode, but unlike the generic
+    VAE base it does not enable it from ``enable_tiling()`` alone. Without this
+    321-frame 720p decode can enter one large Conv3d path and hit PyTorch's
+    32-bit index math limit.
+    """
+
+    min_frames = _resolve_sana_wm_vae_frame_tile_value(
+        pipeline_config,
+        "vae_tile_sample_min_num_frames",
+        "tile_sample_min_num_frames",
+        _SANA_WM_DEFAULT_VAE_TILE_MIN_FRAMES,
+    )
+    stride_frames = _resolve_sana_wm_vae_frame_tile_value(
+        pipeline_config,
+        "vae_tile_sample_stride_num_frames",
+        "tile_sample_stride_num_frames",
+        _SANA_WM_DEFAULT_VAE_TILE_STRIDE_FRAMES,
+    )
+
+    use_tiling = bool(getattr(pipeline_config, "vae_tiling", True))
+    if use_tiling and hasattr(vae, "enable_tiling"):
+        try:
+            vae.enable_tiling(
+                tile_sample_min_num_frames=min_frames,
+                tile_sample_stride_num_frames=stride_frames,
+            )
+        except TypeError:
+            vae.enable_tiling()
+
+    if hasattr(vae, "use_framewise_encoding"):
+        vae.use_framewise_encoding = bool(
+            getattr(pipeline_config, "vae_framewise_encoding", True)
+        )
+    if hasattr(vae, "use_framewise_decoding"):
+        vae.use_framewise_decoding = bool(
+            getattr(pipeline_config, "vae_framewise_decoding", True)
+        )
+
+    if hasattr(vae, "tile_sample_min_num_frames"):
+        vae.tile_sample_min_num_frames = min_frames
+    if hasattr(vae, "tile_sample_stride_num_frames"):
+        vae.tile_sample_stride_num_frames = stride_frames
+
+    if log_info is not None:
+        log_info(
+            "SANA-WM VAE tiling configured: spatial=%s, framewise_encode=%s, "
+            "framewise_decode=%s, tile_frames_min=%d, tile_frames_stride=%d",
+            getattr(vae, "use_tiling", use_tiling),
+            getattr(vae, "use_framewise_encoding", None),
+            getattr(vae, "use_framewise_decoding", None),
+            getattr(vae, "tile_sample_min_num_frames", min_frames),
+            getattr(vae, "tile_sample_stride_num_frames", stride_frames),
+        )
+
+
+class SanaWMDecodingStage(DecodingStage):
+    """Decode SANA-WM LTX-2 latents with upstream long-video VAE settings."""
+
+    @torch.no_grad()
+    def decode(
+        self,
+        latents: torch.Tensor,
+        server_args: ServerArgs,
+        *,
+        vae_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        configure_sana_wm_ltx2_vae_for_long_video(
+            self.vae,
+            server_args.pipeline_config,
+            log_info=self.log_info,
+        )
+        frames = super().decode(latents, server_args, vae_dtype=vae_dtype)
+        log_sana_wm_tensor_stats("decode.frames", frames)
+        return frames
+
+
 class SanaWMBeforeDenoisingStage(PipelineStage):
     """
     Monolithic pre-processing stage for SANA-WM TI2V inference.
@@ -140,6 +243,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
     ) -> torch.Tensor:
         """Encode a single image frame through the VAE encoder."""
         vae = self.vae
+        configure_sana_wm_ltx2_vae_for_long_video(vae, self.pipeline_config)
         vae_dtype_map = {
             "bf16": torch.bfloat16,
             "fp16": torch.float16,
