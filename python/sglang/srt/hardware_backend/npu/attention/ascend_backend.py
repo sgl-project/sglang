@@ -1307,8 +1307,13 @@ class AscendAttnBackend(AttentionBackend):
                 v_view = v_cache.view(
                     -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
                 )
-                q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 num_token_padding = q.shape[0]
+                if num_token_padding > forward_batch.num_token_non_padded_cpu:
+                    q, k, v = [
+                        data[: forward_batch.num_token_non_padded_cpu]
+                        for data in [q, k, v]
+                    ]
+                q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
                 if self._can_use_tnd(layer):
                     # Batched TND v2 (head_dim in {64,128,192})
