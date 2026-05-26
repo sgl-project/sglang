@@ -151,7 +151,7 @@ def _script_no_idle_during_chunked(t: ScriptedRuntime):
     yield from run_until(r, lambda h: h.is_chunking)
 
     # If the scheduler had idled, the chunked req would not progress.
-    assert not t.scheduler_idle
+    assert not t.is_idle
     yield from run_until_finished(r)
 
 

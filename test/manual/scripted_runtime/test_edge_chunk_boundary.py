@@ -71,10 +71,17 @@ def _script_tiny_prompt(t: ScriptedRuntime):
 # tail. Verifies the chunked-resume path is not taken when the radix
 # match already covers everything but a sliver.
 def _script_radix_hit_minus_one(t: ScriptedRuntime):
-    # Warm radix with chunk_size-1 tokens.
+    # Warm radix with chunk_size-1 tokens. start_req builds input_ids
+    # = [1] * prompt_len, so r_warm and r below share the exact same
+    # prefix bytes — the radix cache will key off them.
     r_warm = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE - 1, max_new_tokens=1)
     yield from run_until_finished(r_warm)
     assert r_warm.finished
+
+    # Give the cache one extra iteration to commit r_warm's KV into the
+    # radix tree before the follow-up submission. Without this yield
+    # the prefix may not yet be visible to r.
+    yield
 
     # Same prefix + 1 extra token = total chunk_size. Even though the
     # *total* prompt equals chunk_size, only 1 token is fresh.
@@ -119,9 +126,15 @@ class TestEdgeChunkBoundary(CustomTestCase):
         )
 
     def test_radix_hit_minus_one(self):
+        # Radix cache is on by default; pass explicitly to make the
+        # dependency obvious — if someone flips the default later, the
+        # test still pins what it needs.
         execute_scripted_runtime(
             _script_radix_hit_minus_one,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+            **base_engine_kwargs(
+                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+                disable_radix_cache=False,
+            ),
         )
 
 

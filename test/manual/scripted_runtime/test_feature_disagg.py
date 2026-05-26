@@ -41,8 +41,6 @@ class TestFeatureDisaggChunked(CustomTestCase):
             _script_naive_disagg_chunked,
             **base_engine_kwargs(
                 model_path=DEFAULT_MODEL_NAME_FOR_TEST,
-                tp_size=2,
-                pp_size=2,
                 chunked_prefill_size=DEFAULT_CHUNK_SIZE,
                 disaggregation_mode="prefill",
             ),
