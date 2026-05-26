@@ -165,12 +165,10 @@ class BreakableCudaGraphRunner:
         self.raw_num_tokens = 0
 
     def _has_inactive_dp_rank(self, forward_batch: "ForwardBatch") -> bool:
-        global_num_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
+        global_num_tokens = forward_batch.global_num_tokens_cpu
         if global_num_tokens is None:
             return False
 
-        if hasattr(global_num_tokens, "tolist"):
-            global_num_tokens = global_num_tokens.tolist()
         # DSV4 DP attention / DeepEP collectives need every DP rank to enter
         # the same replay path. Sparse-DP batches fall back to eager to avoid
         # hanging ranks that have zero local tokens.
@@ -387,10 +385,9 @@ class BreakableCudaGraphRunner:
             return False
         if self._has_inactive_dp_rank(forward_batch):
             return False
-        if getattr(
-            forward_batch, "global_num_tokens_cpu", None
-        ) is not None and not getattr(
-            forward_batch, "can_run_dp_breakable_cuda_graph", False
+        if (
+            forward_batch.global_num_tokens_cpu is not None
+            and not forward_batch.can_run_dp_breakable_cuda_graph
         ):
             return False
         num_tokens = len(forward_batch.input_ids)

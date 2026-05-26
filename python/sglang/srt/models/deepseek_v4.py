@@ -175,14 +175,7 @@ def deepseek_v4_attention_with_output(
     key_value = key_value[:real_num_tokens]
 
     original_out_cache_loc = forward_batch.out_cache_loc
-    original_out_cache_loc_swa = forward_batch.out_cache_loc_swa
-    token_to_kv_pool = forward_batch.token_to_kv_pool
-    original_swa_loc = getattr(token_to_kv_pool, "swa_loc", None)
     forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
-    if original_out_cache_loc_swa is not None:
-        forward_batch.out_cache_loc_swa = original_out_cache_loc_swa[:real_num_tokens]
-        if hasattr(token_to_kv_pool, "set_swa_loc"):
-            token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
     try:
         ret = forward_batch.attn_backend.forward(
@@ -197,11 +190,6 @@ def deepseek_v4_attention_with_output(
         )
     finally:
         forward_batch.out_cache_loc = original_out_cache_loc
-        forward_batch.out_cache_loc_swa = original_out_cache_loc_swa
-        if original_out_cache_loc_swa is not None and hasattr(
-            token_to_kv_pool, "set_swa_loc"
-        ):
-            token_to_kv_pool.set_swa_loc(original_swa_loc)
 
     assert (
         output[:real_num_tokens].numel() == ret.numel()
