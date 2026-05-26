@@ -4,19 +4,23 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
 @cache_once
-def _jit_plan_entries_module() -> "Module":
+def _jit_plan_entries_module(
+    has_swa_lut: bool, has_expected_token_pool: bool
+) -> "Module":
+    args = make_cpp_args(has_swa_lut, has_expected_token_pool)
     return load_jit(
         "kv_canary_plan_entries",
+        *args,
         cuda_files=["kv_canary/canary_plan_entries.cuh"],
         cuda_wrappers=[
-            ("plan_entries", "PlanEntriesKernel::run"),
+            ("plan_entries", f"PlanEntriesKernel<{args}>::run"),
         ],
     )
 
@@ -37,7 +41,9 @@ def launch_plan_entries_kernel(
     expected_token_ids_offset: int,
     swa_window_size: int,
 ) -> None:
-    module = _jit_plan_entries_module()
+    has_swa_lut = full_to_swa_index_mapping is not None
+    has_expected_token_pool = req_to_expected_token_ids is not None
+    module = _jit_plan_entries_module(has_swa_lut, has_expected_token_pool)
     module.plan_entries(
         req_pool_indices,
         prefix_lens,

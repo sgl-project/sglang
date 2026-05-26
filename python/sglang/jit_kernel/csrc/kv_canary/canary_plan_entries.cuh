@@ -22,9 +22,6 @@ struct PlanEntriesParams {
   const int64_t* __restrict__ full_to_swa_lut;         // [lut_len] int64, may be nullptr when !HAS_SWA_LUT
   const int64_t* __restrict__ verify_offsets_scratch;  // [bs_padded + 1] int64 (cumulative prefix sum)
   const int32_t* __restrict__ verify_enable;           // [1] int32 — 0 ⇒ skip scatter entirely
-  // ``req_to_expected_token_ids`` is the static source-of-truth pool managed by
-  // CanaryDeviceState; nullptr / HAS_EXPECTED_TOKEN_POOL=false disables the gather and writes
-  // the ``-1`` sentinel into every active entry.
   const int32_t* __restrict__ req_to_expected_token_ids;  // [max_reqs, max_context_len] int32, may be nullptr
   // Outputs.
   int64_t* __restrict__ out_verify_slot_indices;        // [verify_capacity] int64
@@ -142,10 +139,6 @@ __global__ void plan_entries_persistent_kernel(
       out_prev_slot = -1;
     }
 
-    // Gather the source-of-truth token from req_to_expected_token_ids when available.
-    // Out-of-range positions (e.g. EAGLE draft's slot-N-1 rotating in a bonus token, or padding
-    // past the per-req length where the pool row is zero) write the ``-1`` sentinel so the
-    // verify kernel skips the token-mismatch check.
     int64_t out_expected_input_id = -1;
     if constexpr (HAS_EXPECTED_TOKEN_POOL) {
       const int64_t sot_pos = out_position + static_cast<int64_t>(params.expected_token_ids_offset);
@@ -163,6 +156,7 @@ __global__ void plan_entries_persistent_kernel(
   }
 }
 
+template <bool HAS_SWA_LUT, bool HAS_EXPECTED_TOKEN_POOL>
 struct PlanEntriesKernel {
   static constexpr int kBlockSize = 128;
   static constexpr int kBlocksPerSm = 8;
@@ -223,15 +217,19 @@ struct PlanEntriesKernel {
         .with_dtype<int32_t>()
         .with_device<kDLCUDA>(device_)
         .verify(req_to_token);
-    const bool has_swa_lut = full_to_swa_index_mapping.has_value();
-    if (has_swa_lut) {
+    RuntimeCheck(
+        full_to_swa_index_mapping.has_value() == HAS_SWA_LUT,
+        "full_to_swa_index_mapping presence does not match HAS_SWA_LUT specialization");
+    RuntimeCheck(
+        req_to_expected_token_ids.has_value() == HAS_EXPECTED_TOKEN_POOL,
+        "req_to_expected_token_ids presence does not match HAS_EXPECTED_TOKEN_POOL specialization");
+    if constexpr (HAS_SWA_LUT) {
       TensorMatcher({Nlut})  //
           .with_dtype<int64_t>()
           .with_device<kDLCUDA>(device_)
           .verify(full_to_swa_index_mapping.value());
     }
-    const bool has_expected_token_pool = req_to_expected_token_ids.has_value();
-    if (has_expected_token_pool) {
+    if constexpr (HAS_EXPECTED_TOKEN_POOL) {
       TensorMatcher({Npool_rows, Npool_cols})  //
           .with_dtype<int32_t>()
           .with_device<kDLCUDA>(device_)
@@ -244,15 +242,21 @@ struct PlanEntriesKernel {
       return;
     }
 
-    const int64_t* lut_ptr =
-        has_swa_lut ? static_cast<const int64_t*>(full_to_swa_index_mapping.value().data_ptr()) : nullptr;
-    const int64_t lut_len = has_swa_lut ? static_cast<int64_t>(Nlut.unwrap()) : 0;
+    const int64_t* lut_ptr = nullptr;
+    int64_t lut_len = 0;
+    if constexpr (HAS_SWA_LUT) {
+      lut_ptr = static_cast<const int64_t*>(full_to_swa_index_mapping.value().data_ptr());
+      lut_len = static_cast<int64_t>(Nlut.unwrap());
+    }
 
-    const int32_t* expected_token_ids_ptr =
-        has_expected_token_pool ? static_cast<const int32_t*>(req_to_expected_token_ids.value().data_ptr()) : nullptr;
-    const int64_t expected_token_ids_stride0 = has_expected_token_pool ? static_cast<int64_t>(Npool_cols.unwrap()) : 0;
-    const int64_t expected_token_ids_max_context_len =
-        has_expected_token_pool ? static_cast<int64_t>(Npool_cols.unwrap()) : 0;
+    const int32_t* expected_token_ids_ptr = nullptr;
+    int64_t expected_token_ids_stride0 = 0;
+    int64_t expected_token_ids_max_context_len = 0;
+    if constexpr (HAS_EXPECTED_TOKEN_POOL) {
+      expected_token_ids_ptr = static_cast<const int32_t*>(req_to_expected_token_ids.value().data_ptr());
+      expected_token_ids_stride0 = static_cast<int64_t>(Npool_cols.unwrap());
+      expected_token_ids_max_context_len = static_cast<int64_t>(Npool_cols.unwrap());
+    }
 
     const PlanEntriesParams params = PlanEntriesParams{
         .req_pool_indices = static_cast<const int64_t*>(req_pool_indices.data_ptr()),
@@ -282,19 +286,8 @@ struct PlanEntriesKernel {
     const dim3 grid(num_blocks);
     const dim3 block(kBlockSize);
 
-    if (has_swa_lut) {
-      if (has_expected_token_pool) {
-        LaunchKernel(grid, block, device)(plan_entries_persistent_kernel<true, true>, params, lut_len);
-      } else {
-        LaunchKernel(grid, block, device)(plan_entries_persistent_kernel<true, false>, params, lut_len);
-      }
-    } else {
-      if (has_expected_token_pool) {
-        LaunchKernel(grid, block, device)(plan_entries_persistent_kernel<false, true>, params, lut_len);
-      } else {
-        LaunchKernel(grid, block, device)(plan_entries_persistent_kernel<false, false>, params, lut_len);
-      }
-    }
+    LaunchKernel(grid, block, device)(
+        plan_entries_persistent_kernel<HAS_SWA_LUT, HAS_EXPECTED_TOKEN_POOL>, params, lut_len);
   }
 };
 
