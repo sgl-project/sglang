@@ -417,6 +417,75 @@ def _write_swa_cache(
     )
 
 
+def _unpack_packed_kv_at_locs(
+    buf: torch.Tensor,
+    page_size: int,
+    locs: torch.Tensor,
+) -> torch.Tensor:
+    """Unpack the production packed FP8-nope + BF16-rope + UE8M0-scale layout
+    from a single sub-pool's kv_buffer at the given flat locs.
+
+    `buf` is `[num_pages, bytes_per_page]` (the padded page bytes layout used
+    by `DeepSeekV4SingleKVPool.create_buffer`). `locs[i] = page_idx * page_size
+    + tok_in_page` selects one slot per request token. Returns
+    `[num_locs, DSV4_HEAD_DIM]` bfloat16.
+
+    Both the SWA pool and the C4 / C128 extra pools use the same layout,
+    differing only in `page_size` and the resulting `bytes_per_page`.
+    """
+    num_pages, bytes_per_page = buf.shape
+
+    nope_dim = DSV4_QK_NOPE_HEAD_DIM
+    rope_dim = DSV4_QK_ROPE_HEAD_DIM
+    nope_rope_bytes = nope_dim + rope_dim * 2  # 448 + 128 = 576
+    s_offset_nbytes_in_page = page_size * nope_rope_bytes
+    scale_dim = nope_dim // 64  # 7 tiles of 64 elems
+    padded_scale = scale_dim + 1  # 8 bytes/token incl. pad
+
+    fp8_dtype = torch.float8_e4m3fn
+    buf_fp8 = buf.view(fp8_dtype)
+    buf_bf16 = buf.view(torch.bfloat16)
+    buf_u8 = buf.view(torch.uint8)
+
+    locs64 = locs.to(torch.int64)
+    num_locs = locs64.shape[0]
+    device = buf.device
+
+    page_idx = locs64 // page_size
+    tok_in_page = locs64 % page_size
+
+    nope_byte_base = page_idx * bytes_per_page + tok_in_page * nope_rope_bytes
+    nope_byte_offsets = nope_byte_base.unsqueeze(1) + torch.arange(
+        nope_dim, device=device, dtype=torch.int64
+    ).unsqueeze(0)
+    nope_fp8 = buf_fp8.flatten()[nope_byte_offsets.flatten()].view(num_locs, nope_dim)
+
+    rope_bf16_base = (
+        page_idx * (bytes_per_page // 2)
+        + tok_in_page * (nope_rope_bytes // 2)
+        + (nope_dim // 2)
+    )
+    rope_bf16_offsets = rope_bf16_base.unsqueeze(1) + torch.arange(
+        rope_dim, device=device, dtype=torch.int64
+    ).unsqueeze(0)
+    rope_bf16 = buf_bf16.flatten()[rope_bf16_offsets.flatten()].view(num_locs, rope_dim)
+
+    scale_byte_base = (
+        page_idx * bytes_per_page + s_offset_nbytes_in_page + tok_in_page * padded_scale
+    )
+    scale_byte_offsets = scale_byte_base.unsqueeze(1) + torch.arange(
+        scale_dim, device=device, dtype=torch.int64
+    ).unsqueeze(0)
+    scale_u8 = buf_u8.flatten()[scale_byte_offsets.flatten()].view(num_locs, scale_dim)
+    scale = torch.pow(2.0, (scale_u8.to(torch.float32) - 127.0))
+
+    nope_f32 = nope_fp8.float().view(num_locs, scale_dim, 64)
+    nope_dequant = nope_f32 * scale.unsqueeze(-1)
+    nope_dequant = nope_dequant.view(num_locs, nope_dim).to(torch.bfloat16)
+
+    return torch.cat([nope_dequant, rope_bf16], dim=-1)
+
+
 def _unpack_swa_cache(
     runner: MockDSV4ModelRunner,
     layer_id: int,
@@ -431,68 +500,30 @@ def _unpack_swa_cache(
     pool = runner.token_to_kv_pool
     swa_locs = pool.translate_loc_from_full_to_swa(full_locs).to(torch.int64)
     swa_kv_pool = pool.swa_kv_pool
-    page_size = swa_kv_pool.page_size  # 128
-    buf = swa_kv_pool.kv_buffer[layer_id]  # [num_pages, bytes_per_page]
-    num_pages, bytes_per_page = buf.shape
-
-    nope_dim = DSV4_QK_NOPE_HEAD_DIM
-    rope_dim = DSV4_QK_ROPE_HEAD_DIM
-    nope_rope_bytes = nope_dim + rope_dim * 2  # 448 + 128 = 576
-    s_offset_nbytes_in_page = page_size * nope_rope_bytes  # 128 * 576
-    scale_dim = nope_dim // 64  # 7 tiles of 64 elems
-    padded_scale = scale_dim + 1  # 8 bytes/token incl. pad
-
-    fp8_dtype = torch.float8_e4m3fn
-    buf_fp8 = buf.view(fp8_dtype)
-    buf_bf16 = buf.view(torch.bfloat16)
-    buf_u8 = buf.view(torch.uint8)
-
-    num_tokens = full_locs.shape[0]
-    device = buf.device
-
-    page_idx = swa_locs // page_size
-    tok_in_page = swa_locs % page_size
-
-    # nope: [num_tokens, nope_dim] FP8
-    nope_byte_base = page_idx * bytes_per_page + tok_in_page * nope_rope_bytes
-    nope_byte_offsets = nope_byte_base.unsqueeze(1) + torch.arange(
-        nope_dim, device=device, dtype=torch.int64
-    ).unsqueeze(0)
-    nope_fp8 = buf_fp8.flatten()[nope_byte_offsets.flatten()].view(num_tokens, nope_dim)
-
-    # rope: [num_tokens, rope_dim] BF16 (BF16 strides are 2-byte; view is via bf16)
-    rope_bf16_base = (
-        page_idx * (bytes_per_page // 2)
-        + tok_in_page * (nope_rope_bytes // 2)
-        + (nope_dim // 2)
-    )
-    rope_bf16_offsets = rope_bf16_base.unsqueeze(1) + torch.arange(
-        rope_dim, device=device, dtype=torch.int64
-    ).unsqueeze(0)
-    rope_bf16 = buf_bf16.flatten()[rope_bf16_offsets.flatten()].view(
-        num_tokens, rope_dim
+    return _unpack_packed_kv_at_locs(
+        swa_kv_pool.kv_buffer[layer_id], swa_kv_pool.page_size, swa_locs
     )
 
-    # scales: ue8m0 stored as uint8 = exponent + 127; dequant factor = 2^(byte-127).
-    scale_byte_base = (
-        page_idx * bytes_per_page + s_offset_nbytes_in_page + tok_in_page * padded_scale
-    )
-    scale_byte_offsets = scale_byte_base.unsqueeze(1) + torch.arange(
-        scale_dim, device=device, dtype=torch.int64
-    ).unsqueeze(0)
-    scale_u8 = buf_u8.flatten()[scale_byte_offsets.flatten()].view(
-        num_tokens, scale_dim
-    )
-    scale = torch.pow(
-        2.0, (scale_u8.to(torch.float32) - 127.0)
-    )  # [num_tokens, scale_dim]
 
-    # nope_fp8 -> float32 -> per-tile scale broadcast.
-    nope_f32 = nope_fp8.float().view(num_tokens, scale_dim, 64)
-    nope_dequant = nope_f32 * scale.unsqueeze(-1)
-    nope_dequant = nope_dequant.view(num_tokens, nope_dim).to(torch.bfloat16)
-
-    return torch.cat([nope_dequant, rope_bf16], dim=-1)
+def _unpack_extra_cache(
+    runner: MockDSV4ModelRunner,
+    layer_id: int,
+    extra_locs: torch.Tensor,
+) -> torch.Tensor:
+    """Unpack K from the layer's extra (C4 or C128) sub-pool at `extra_locs`.
+    `extra_locs[i] = page_idx * extra_page_size + tok_in_page`, matching the
+    flat-index encoding flash_mla expects for `extra_indices_in_kvcache`.
+    """
+    pool = runner.token_to_kv_pool
+    _, compress_layer_id, compress_kv_pool = pool.layer_mapping[layer_id]
+    assert compress_kv_pool is not None, (
+        f"layer {layer_id} has no extra (C4/C128) sub-pool"
+    )
+    return _unpack_packed_kv_at_locs(
+        compress_kv_pool.kv_buffer[compress_layer_id],
+        compress_kv_pool.page_size,
+        extra_locs,
+    )
 
 
 @dataclass
@@ -1011,19 +1042,142 @@ def _populate_extra_kv_cache(
     *,
     layer_id: int = 0,
     num_entries: int = 32,
-) -> None:
+) -> int:
     """Write `num_entries` packed FP8-nope/BF16-rope K vectors into the C4 or
-    C128 extra cache via the production `set_extra_key_buffer` path. The
-    backend's `forward(compress_ratio=4 or 128)` path reads from this buffer."""
+    C128 extra cache via the production `set_extra_key_buffer` path. Returns
+    `num_entries` so callers can use the same count when manually populating
+    `c4_sparse_page_indices` to point at the entries we just wrote.
+    """
     pool = fixture.runner.token_to_kv_pool
     device = fixture.runner.device
     rand_k = torch.randn(num_entries, DSV4_HEAD_DIM, dtype=torch.bfloat16, device=device)
     pack = quant_to_nope_fp8_rope_bf16_pack_triton(rand_k)
     loc = torch.arange(num_entries, dtype=torch.int64, device=device)
     pool.set_extra_key_buffer(layer_id=layer_id, loc=loc, cache_nope_fp8_rope_bf16_pack=pack)
+    return num_entries
 
 
-def run_dsv4_compress_smoke_case(
+def _extra_metadata_indices(
+    core_metadata, compress_ratio: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return `(extra_indices, extra_topk_lengths)` for C4 / C128 paths from
+    the upgraded `DSV4AttnMetadata`. Mirrors the dispatch in
+    `DeepseekV4AttnBackend.forward(compress_ratio=...)`.
+    """
+    if compress_ratio == 4:
+        return core_metadata.c4_sparse_page_indices, core_metadata.c4_sparse_topk_lengths
+    if compress_ratio == 128:
+        return core_metadata.c128_page_indices, core_metadata.c128_topk_lengths_clamp1
+    raise ValueError(f"unsupported compress_ratio={compress_ratio}")
+
+
+def _pure_torch_dsv4_combined_reference(
+    fixture: DSV4AttentionFixture,
+    q: torch.Tensor,
+    *,
+    layer_id: int = 0,
+) -> torch.Tensor:
+    """Pure-PyTorch reference that mirrors what `flash_mla.flash_mla_with_kvcache`
+    does on the SWA + extra (C4/C128) caches. Reads the upgraded
+    `DSV4AttnMetadata` to discover which cache slots each q token attends to,
+    unpacks K from those slots through `_unpack_packed_kv_at_locs`, then runs
+    softmax(q @ k.T) * scaling with the attention-sink virtual-key correction.
+
+    Requires `backend.forward_metadata` to already be a `DSV4Metadata` (call
+    `backend._maybe_upgrade_forward_metadata()` or `backend.forward()` first).
+    """
+    case = fixture.case
+    md = fixture.backend.forward_metadata.core_metadata
+    pool = fixture.runner.token_to_kv_pool
+    swa_kv_pool = pool.swa_kv_pool
+    swa_buf = swa_kv_pool.kv_buffer[layer_id]
+    swa_page_size = swa_kv_pool.page_size
+
+    swa_indices = md.swa_page_indices  # [num_q, padded_window]
+    swa_topk_lengths = md.swa_topk_lengths  # [num_q]
+
+    if case.compress_ratio in (4, 128):
+        extra_indices, extra_topk_lengths = _extra_metadata_indices(
+            md, case.compress_ratio
+        )
+    else:
+        extra_indices, extra_topk_lengths = None, None
+
+    scaling = DSV4_HEAD_DIM**-0.5
+    attn_sink = fixture.actual_module.attn_sink.detach()
+    outputs = []
+
+    num_q = q.shape[0]
+    for q_idx in range(num_q):
+        swa_len = int(swa_topk_lengths[q_idx].item())
+        swa_locs_q = swa_indices[q_idx, :swa_len]
+        swa_locs_q = swa_locs_q[swa_locs_q >= 0]
+        if swa_locs_q.numel() > 0:
+            swa_k = _unpack_packed_kv_at_locs(
+                swa_buf, swa_page_size, swa_locs_q
+            ).float()
+        else:
+            swa_k = torch.zeros((0, DSV4_HEAD_DIM), dtype=torch.float32, device=q.device)
+
+        if extra_indices is not None:
+            extra_len = int(extra_topk_lengths[q_idx].item())
+            extra_locs_q = extra_indices[q_idx, :extra_len]
+            extra_locs_q = extra_locs_q[extra_locs_q >= 0]
+            if extra_locs_q.numel() > 0:
+                extra_k = _unpack_extra_cache(
+                    fixture.runner, layer_id, extra_locs_q
+                ).float()
+                keys = torch.cat([swa_k, extra_k], dim=0)
+            else:
+                keys = swa_k
+        else:
+            keys = swa_k
+
+        query = q[q_idx].float()
+        scores = torch.einsum("hd,kd->hk", query, keys) * scaling
+        sink_scores = attn_sink.view(-1, 1).to(scores.dtype)
+        scores_with_sink = torch.cat([scores, sink_scores], dim=-1)
+        probs_with_sink = torch.softmax(scores_with_sink, dim=-1)
+        probs = probs_with_sink[:, :-1]
+        out = torch.einsum("hk,kd->hd", probs, keys)
+        outputs.append(out)
+
+    return torch.stack(outputs, dim=0).to(q.dtype)
+
+
+def _seed_c4_sparse_indices(
+    fixture: DSV4AttentionFixture,
+    *,
+    num_entries: int,
+) -> None:
+    """For compress_ratio=4 the production `init_flashmla_related` initializes
+    `c4_sparse_page_indices` to all `-1` (the C4Indexer fills it in later).
+    Since the smoke fixture does not run the indexer, the C4 path attends to
+    zero extra entries unless we seed the indices ourselves. Seed each query
+    row to point to `[0, 1, ..., num_entries - 1]` so the backend reads the
+    same `num_entries` C4 K's that the reference also reads, exercising the
+    `extra_k_cache` + `extra_indices_in_kvcache` flash_mla integration with
+    non-trivial extra contribution.
+    """
+    md = fixture.backend.forward_metadata.core_metadata
+    sparse_indices = md.c4_sparse_page_indices
+    num_q, sparse_topk = sparse_indices.shape
+    seed = torch.full(
+        (num_q, sparse_topk),
+        -1,
+        dtype=sparse_indices.dtype,
+        device=sparse_indices.device,
+    )
+    seed[:, :num_entries] = torch.arange(
+        num_entries, dtype=sparse_indices.dtype, device=sparse_indices.device
+    )
+    md.c4_sparse_page_indices = seed
+    md.c4_sparse_topk_lengths = torch.full(
+        (num_q,), num_entries, dtype=md.c4_sparse_topk_lengths.dtype, device=md.c4_sparse_topk_lengths.device
+    )
+
+
+def run_dsv4_compress_attention_case(
     testcase,
     case: DSV4AttentionCase,
     *,
@@ -1031,15 +1185,18 @@ def run_dsv4_compress_smoke_case(
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ) -> None:
-    """Smoke test for the C4 (compress_ratio=4) or C128 (compress_ratio=128)
-    dispatch through `DeepseekV4AttnBackend.forward`.
+    """Math-faithful test for the SWA + C4 (compress_ratio=4) / SWA + C128
+    (compress_ratio=128) path through `DeepseekV4AttnBackend.forward`.
 
-    Pre-writes random packed K into both the SWA cache and the C4/C128 extra
-    cache via the production pack+set paths, lets `init_forward_metadata`
-    populate the compression metadata, then dispatches `forward(compress_ratio=
-    case.compress_ratio)`. Asserts the output has the right shape and is
-    finite; does not verify Compressor math (no independent compressor
-    reference yet — that is a deferred follow-up).
+    Pre-writes random packed K into both the SWA cache and the extra
+    (C4/C128) cache via the production pack+set paths, lets
+    `init_forward_metadata` populate the compression metadata, manually seeds
+    `c4_sparse_page_indices` for the C4 case (so the flash_mla `extra_k_cache`
+    path actually attends to entries we wrote rather than the all-`-1` initial
+    value that the un-run indexer would leave), then dispatches `forward(
+    compress_ratio=case.compress_ratio)` and compares against an independent
+    pure-PyTorch SWA + extra reference that reads the SAME cache bytes and
+    metadata indices.
     """
     assert case.compress_ratio in (4, 128), (
         f"smoke runner requires compress_ratio in (4, 128); got {case.compress_ratio}"
@@ -1060,7 +1217,12 @@ def run_dsv4_compress_smoke_case(
     q_input, _ = fixture.actual_module.project(fixture.input_hidden)
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
         fixture.backend.init_forward_metadata(fixture.forward_batch)
-        out = fixture.backend.forward(
+        # Trigger lazy upgrade so we can patch the metadata that the smoke
+        # case relies on (specifically c4_sparse_page_indices).
+        fixture.backend._maybe_upgrade_forward_metadata()
+        if case.compress_ratio == 4:
+            _seed_c4_sparse_indices(fixture, num_entries=extra_entries)
+        actual = fixture.backend.forward(
             q=q_input,
             k=q_input,
             v=q_input,
@@ -1070,191 +1232,8 @@ def run_dsv4_compress_smoke_case(
             save_kv_cache=False,
             attn_sink=fixture.actual_module.attn_sink,
         )
+        expected = _pure_torch_dsv4_combined_reference(fixture, q_input)
 
-    expected_shape = (case.num_input_tokens, case.num_heads, DSV4_V_HEAD_DIM)
-    testcase.assertEqual(
-        tuple(out.shape),
-        expected_shape,
-        f"compress_ratio={case.compress_ratio} forward must return shape "
-        f"[num_input_tokens, num_heads, v_head_dim]",
+    torch.testing.assert_close(
+        actual.float(), expected.float(), atol=DSV4_ATOL, rtol=DSV4_RTOL
     )
-    testcase.assertTrue(
-        torch.isfinite(out).all().item(),
-        f"compress_ratio={case.compress_ratio} forward must return finite values "
-        f"(no NaN/Inf); mean abs = {out.abs().mean().item()}",
-    )
-
-
-def run_dsv4_compress_cuda_graph_decode_smoke_case(
-    testcase,
-    case: DSV4AttentionCase,
-    *,
-    capture_batch_size: int = 2,
-    extra_entries: int = 32,
-    dtype: torch.dtype = torch.bfloat16,
-    device: str = "cuda",
-) -> None:
-    """CUDA-graph capture/replay smoke for compress_ratio in {4, 128}.
-
-    Exercises the `init_forward_metadata_capture_cuda_graph` ->
-    `init_forward_metadata_replay_cuda_graph` -> `forward(compress_ratio=N)`
-    flow with C4 / C128 sub-pool allocated. Asserts capture and replay each
-    produce finite, shape-correct output; does not check math correctness
-    against an independent Compressor reference (deferred follow-up).
-    """
-    assert case.compress_ratio in (4, 128), (
-        f"smoke graph runner requires compress_ratio in (4, 128); "
-        f"got {case.compress_ratio}"
-    )
-    assert case.forward_mode.is_decode(), (
-        "compress cuda-graph smoke only covers DECODE for now"
-    )
-    if case.batch_size > capture_batch_size:
-        raise ValueError(
-            "capture_batch_size must be at least the case batch size; "
-            f"got case.batch_size={case.batch_size}, "
-            f"capture_batch_size={capture_batch_size}"
-        )
-
-    fixture = build_dsv4_attention_fixture(
-        testcase,
-        case,
-        dtype=dtype,
-        device=device,
-        compression_ratios=[case.compress_ratio],
-        disable_cuda_graph=False,
-        runner_batch_size=capture_batch_size,
-    )
-    runner = fixture.runner
-    backend = fixture.backend
-    max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
-
-    capture_prefix_len = max(0, backend.get_cuda_graph_seq_len_fill_value() - 1)
-    pad_prefix_lens = (capture_prefix_len,) * (capture_batch_size - case.batch_size)
-    padded_case = make_dsv4_case_with_prefix_lens(
-        case,
-        f"{case.name}_padded",
-        case.prefix_lens + pad_prefix_lens,
-    )
-
-    # Build padded prefix/input hidden so the SWA cache covers every padded
-    # request, then write packed K into both SWA and the extra (C4/C128) cache.
-    padded_prefix_hidden = list(fixture.prefix_hidden) + [
-        torch.randn(length, DSV4_HEAD_DIM, dtype=dtype, device=device)
-        for length in pad_prefix_lens
-    ]
-    pad_token_count = padded_case.num_input_tokens - fixture.input_hidden.shape[0]
-    padded_input_hidden = (
-        fixture.input_hidden
-        if pad_token_count == 0
-        else torch.cat(
-            [
-                fixture.input_hidden,
-                torch.randn(
-                    pad_token_count, DSV4_HEAD_DIM, dtype=dtype, device=device
-                ),
-            ],
-            dim=0,
-        )
-    )
-
-    # Build the padded forward batch + populate per-padded-request KV.
-    padded_batch = _make_forward_batch(
-        padded_case, runner, max_context_len=max_context_len, device=device
-    )
-    prepare_dsv4_runner_inputs(
-        fixture,
-        padded_case,
-        padded_batch,
-        {"prefix_hidden": padded_prefix_hidden, "input_hidden": padded_input_hidden},
-        max_context_len=max_context_len,
-    )
-    _populate_extra_kv_cache(fixture, layer_id=0, num_entries=extra_entries)
-
-    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
-        backend.init_cuda_graph_state(
-            max_bs=capture_batch_size,
-            max_num_tokens=capture_batch_size,
-        )
-        # Capture with a synthetic batch at the capture shape.
-        capture_seq_lens = torch.full(
-            (capture_batch_size,),
-            capture_prefix_len + 1,
-            dtype=torch.int32,
-            device=device,
-        )
-        capture_req_pool = torch.arange(
-            capture_batch_size, dtype=torch.int32, device=device
-        )
-        backend.init_forward_metadata_capture_cuda_graph(
-            bs=capture_batch_size,
-            num_tokens=capture_batch_size,
-            req_pool_indices=capture_req_pool,
-            seq_lens=capture_seq_lens,
-            encoder_lens=None,
-            forward_mode=ForwardMode.DECODE,
-            spec_info=None,
-        )
-        capture_q = torch.randn(
-            capture_batch_size,
-            case.num_heads,
-            DSV4_HEAD_DIM,
-            dtype=dtype,
-            device=device,
-        )
-        capture_out = backend.forward(
-            q=capture_q,
-            k=capture_q,
-            v=capture_q,
-            layer=fixture.actual_module.attn,
-            forward_batch=padded_batch,
-            compress_ratio=case.compress_ratio,
-            save_kv_cache=False,
-            attn_sink=fixture.actual_module.attn_sink,
-        )
-        backend.on_after_cuda_graph_warmup()
-
-        # Replay with the case's actual metadata (one decode token per padded request).
-        backend._replay_forward_batch = padded_batch
-        try:
-            backend.init_forward_metadata_replay_cuda_graph(
-                bs=capture_batch_size,
-                req_pool_indices=padded_batch.req_pool_indices,
-                seq_lens=padded_batch.seq_lens,
-                seq_lens_sum=padded_batch.seq_lens_sum,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=None,
-                seq_lens_cpu=padded_batch.seq_lens_cpu,
-            )
-        finally:
-            backend._replay_forward_batch = None
-        replay_q, _ = fixture.actual_module.project(padded_input_hidden)
-        replay_out = backend.forward(
-            q=replay_q,
-            k=replay_q,
-            v=replay_q,
-            layer=fixture.actual_module.attn,
-            forward_batch=padded_batch,
-            compress_ratio=case.compress_ratio,
-            save_kv_cache=False,
-            attn_sink=fixture.actual_module.attn_sink,
-        )
-
-    expected_shape = (
-        capture_batch_size,
-        case.num_heads,
-        DSV4_V_HEAD_DIM,
-    )
-    for label, out in (("capture", capture_out), ("replay", replay_out)):
-        testcase.assertEqual(
-            tuple(out.shape),
-            expected_shape,
-            f"compress_ratio={case.compress_ratio} {label} forward must return "
-            f"shape [capture_batch_size, num_heads, v_head_dim]",
-        )
-        testcase.assertTrue(
-            torch.isfinite(out).all().item(),
-            f"compress_ratio={case.compress_ratio} {label} forward must return "
-            f"finite values; mean abs = {out.abs().mean().item()}",
-        )

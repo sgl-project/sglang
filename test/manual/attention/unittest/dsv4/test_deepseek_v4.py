@@ -1,15 +1,15 @@
-"""DSV4 attention correctness — SWA + C4/C128 dispatch coverage.
+"""DSV4 attention correctness — SWA + C4/C128 coverage.
 
 Covers eager EXTEND/DECODE plus CUDA-graph-style capture/replay for the
 SWA-only (compress_ratio=0) path of `DeepseekV4AttnBackend` through flash_mla
-with the production packed FP8-nope/BF16-rope SWA cache, plus
-metadata-level smoke tests for the C4 (compress_ratio=4) and C128
-(compress_ratio=128) paths. The C4/C128 smoke tests bypass the production
-`Compressor`/`C4Indexer` modules — they pre-populate the extra K cache via
-the production pack+set path and verify only that the dispatch path
-(metadata population, flash_mla integration with `extra_k_cache`) produces
-shape-correct finite output. Compressor math correctness is a deferred
-follow-up.
+with the production packed FP8-nope/BF16-rope SWA cache, plus math-faithful
+EAGER coverage for the C4 (compress_ratio=4) and C128 (compress_ratio=128)
+paths. The C4/C128 cases bypass the production `Compressor`/`C4Indexer`
+modules (writing the extra K cache directly via the pack+set path and
+seeding `c4_sparse_page_indices` for the un-run indexer) but compare the
+flash_mla `extra_k_cache` integration against an independent PyTorch SWA +
+extra-K softmax reference. Compressor math correctness (i.e. verifying the
+gate+norm+rotate compression itself) is a deferred follow-up.
 """
 
 import importlib.util
@@ -31,8 +31,7 @@ from common.attention_methods.dsv4_attention import (  # noqa: E402
     DSV4AttentionCase,
     make_dsv4_cases,
     run_dsv4_attention_case,
-    run_dsv4_compress_cuda_graph_decode_smoke_case,
-    run_dsv4_compress_smoke_case,
+    run_dsv4_compress_attention_case,
 )
 from common.runner_modes.cuda_graph_decode_runner import (  # noqa: E402
     run_dsv4_cuda_graph_decode_case,
@@ -61,13 +60,14 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
             prefix_lens=(32, 96),
         ),
     )
-    # C4 (compress_ratio=4) and C128 (compress_ratio=128) dispatch smoke cases.
-    # They populate the extra K cache directly via `set_extra_key_buffer` and
-    # verify the `forward(compress_ratio=...)` dispatch produces finite output;
-    # the production `Compressor`/`C4Indexer` math path is not exercised here.
-    COMPRESS_SMOKE_CASES = (
+    # SWA + C4 / SWA + C128 cases. Each pre-populates the extra K cache directly
+    # via `set_extra_key_buffer`, lets `init_forward_metadata` populate the
+    # compression metadata (and seeds `c4_sparse_page_indices` manually for C4
+    # since the un-run indexer leaves it at -1), then compares the flash_mla
+    # output to an independent PyTorch SWA + extra-K softmax reference.
+    COMPRESS_CASES = (
         DSV4AttentionCase(
-            name="dsv4_c4_extend_smoke",
+            name="dsv4_c4_extend",
             backend="dsv4",
             forward_mode=ForwardMode.EXTEND,
             num_heads=64,
@@ -77,7 +77,7 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
             compress_ratio=4,
         ),
         DSV4AttentionCase(
-            name="dsv4_c4_decode_smoke",
+            name="dsv4_c4_decode",
             backend="dsv4",
             forward_mode=ForwardMode.DECODE,
             num_heads=64,
@@ -86,7 +86,7 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
             compress_ratio=4,
         ),
         DSV4AttentionCase(
-            name="dsv4_c128_extend_smoke",
+            name="dsv4_c128_extend",
             backend="dsv4",
             forward_mode=ForwardMode.EXTEND,
             num_heads=64,
@@ -96,7 +96,7 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
             compress_ratio=128,
         ),
         DSV4AttentionCase(
-            name="dsv4_c128_decode_smoke",
+            name="dsv4_c128_decode",
             backend="dsv4",
             forward_mode=ForwardMode.DECODE,
             num_heads=64,
@@ -116,44 +116,14 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_dsv4_cuda_graph_decode_case(self, case)
 
-    def test_compress_dispatch_smoke_cases(self):
-        for case in self.COMPRESS_SMOKE_CASES:
+    def test_compress_attention_cases(self):
+        for case in self.COMPRESS_CASES:
             with self.subTest(
                 case=case.name,
                 backend=case.backend,
                 compress_ratio=case.compress_ratio,
             ):
-                run_dsv4_compress_smoke_case(self, case)
-
-    COMPRESS_CUDA_GRAPH_DECODE_CASES = (
-        DSV4AttentionCase(
-            name="runner_cuda_graph_dsv4_c4_decode_smoke",
-            backend="dsv4",
-            forward_mode=ForwardMode.DECODE,
-            num_heads=64,
-            page_size=DSV4_PAGE_SIZE,
-            prefix_lens=(64,),
-            compress_ratio=4,
-        ),
-        DSV4AttentionCase(
-            name="runner_cuda_graph_dsv4_c128_decode_smoke",
-            backend="dsv4",
-            forward_mode=ForwardMode.DECODE,
-            num_heads=64,
-            page_size=DSV4_PAGE_SIZE,
-            prefix_lens=(64,),
-            compress_ratio=128,
-        ),
-    )
-
-    def test_compress_cuda_graph_decode_smoke_cases(self):
-        for case in self.COMPRESS_CUDA_GRAPH_DECODE_CASES:
-            with self.subTest(
-                case=case.name,
-                backend=case.backend,
-                compress_ratio=case.compress_ratio,
-            ):
-                run_dsv4_compress_cuda_graph_decode_smoke_case(self, case)
+                run_dsv4_compress_attention_case(self, case)
 
 
 if __name__ == "__main__":
