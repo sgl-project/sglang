@@ -49,7 +49,10 @@ def launch_plan_entries_kernel(
             "kv-canary: launch_plan_entries_kernel requires "
             "expected_token_pool_valid_lens when req_to_verify_expected_tokens is set"
         )
-    if not has_verify_expected_token_pool and expected_token_pool_valid_lens is not None:
+    if (
+        not has_verify_expected_token_pool
+        and expected_token_pool_valid_lens is not None
+    ):
         raise ValueError(
             "kv-canary: launch_plan_entries_kernel cannot accept "
             "expected_token_pool_valid_lens without req_to_verify_expected_tokens"

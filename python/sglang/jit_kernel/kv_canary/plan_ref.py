@@ -60,8 +60,10 @@ def launch_canary_plan_kernels_torch_reference(
                 "kv-canary: launch_canary_plan_kernels_torch_reference requires "
                 "expected_token_pool_valid_lens when req_to_verify_expected_tokens is set"
             )
-        expected_token_pool_valid_lens_host = expected_token_pool_valid_lens.detach().to(
-            device=work_device, dtype=torch.int64
+        expected_token_pool_valid_lens_host = (
+            expected_token_pool_valid_lens.detach().to(
+                device=work_device, dtype=torch.int64
+            )
         )
 
     total_verify = _materialize_verify_entries(

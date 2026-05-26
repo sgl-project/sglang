@@ -16,15 +16,15 @@ namespace {
 
 struct PlanEntriesParams {
   // Inputs.
-  const int64_t* __restrict__ req_pool_indices;               // [bs_padded] int64
-  const int64_t* __restrict__ prefix_lens;                    // [bs_padded] int64
-  const int32_t* __restrict__ req_to_token;                   // [max_reqs, max_seq_len] int32
-  const int64_t* __restrict__ full_to_swa_lut;                // [lut_len] int64, may be nullptr when !HAS_SWA_LUT
-  const int64_t* __restrict__ verify_offsets_scratch;         // [bs_padded + 1] int64 (cumulative prefix sum)
-  const int32_t* __restrict__ verify_enable;                  // [1] int32 — 0 ⇒ skip scatter entirely
-  const int32_t* __restrict__ req_to_verify_expected_tokens;  // [max_reqs, max_context_len] int32, may be nullptr
-  const int64_t* __restrict__
-      expected_token_pool_valid_lens;  // [bs_padded] int64 per-req snapshot length; nullptr iff pool is null
+  const int64_t* __restrict__ req_pool_indices;                // [bs_padded] int64
+  const int64_t* __restrict__ prefix_lens;                     // [bs_padded] int64
+  const int32_t* __restrict__ req_to_token;                    // [max_reqs, max_seq_len] int32
+  const int64_t* __restrict__ full_to_swa_lut;                 // [lut_len] int64, may be nullptr when !HAS_SWA_LUT
+  const int64_t* __restrict__ verify_offsets_scratch;          // [bs_padded + 1] int64 (cumulative prefix sum)
+  const int32_t* __restrict__ verify_enable;                   // [1] int32 — 0 ⇒ skip scatter entirely
+  const int32_t* __restrict__ req_to_verify_expected_tokens;   // [max_reqs, max_context_len] int32, may be nullptr
+  const int64_t* __restrict__ expected_token_pool_valid_lens;  // [bs_padded] int64 per-req snapshot length; nullptr iff
+                                                               // pool is null
   // Outputs.
   int64_t* __restrict__ out_verify_slot_indices;        // [verify_capacity] int64
   int64_t* __restrict__ out_verify_expected_tokens;     // [verify_capacity] int64
