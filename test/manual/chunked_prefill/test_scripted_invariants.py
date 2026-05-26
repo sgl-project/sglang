@@ -678,6 +678,103 @@ class TestInvariantsBasic(ScriptedRuntimeTestCase):
                 f"finish; got {r.pending_middle_outputs}"
             )
 
+    def test_extend_batch_idx_monotonic_invariant(self):
+        """Invariant B6: req.extend_batch_idx is monotonic non-decreasing, except across retract resets.
+
+        Direct access to ``_scheduler`` internals is intentional; this is an
+        invariant-tier test (see direct-internals-access plan).
+        """
+        self.runtime.run(self._script_extend_batch_idx_monotonic_invariant)
+
+    # B6 — extend_batch_idx monotonic across consecutive iters for the
+    # same Req object; a regression is only allowed if the req was just
+    # retracted (is_retracted flipped from False to True).
+    @staticmethod
+    def _script_extend_batch_idx_monotonic_invariant(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        prev_extend_batch_idx: int = -1
+        prev_is_retracted: bool = False
+        for _ in range(DEFAULT_MAX_STEPS):
+            # Walk every scheduler structure to locate the raw Req — the
+            # ScriptedRuntime helper already covers chunked_req,
+            # waiting_queue, running_batch, and last_batch.
+            req = t._find_req_by_rid(r.rid)
+            if req is not None:
+                cur_extend_batch_idx = req.extend_batch_idx
+                cur_is_retracted = req.is_retracted
+                if prev_extend_batch_idx >= 0:
+                    if cur_extend_batch_idx < prev_extend_batch_idx:
+                        # Regression only allowed if retract just flipped.
+                        assert cur_is_retracted and not prev_is_retracted, (
+                            f"extend_batch_idx regressed without retract: "
+                            f"{prev_extend_batch_idx} -> {cur_extend_batch_idx}, "
+                            f"prev_is_retracted={prev_is_retracted}, "
+                            f"cur_is_retracted={cur_is_retracted}"
+                        )
+                prev_extend_batch_idx = cur_extend_batch_idx
+                prev_is_retracted = cur_is_retracted
+            if r.finished:
+                return
+            yield
+        raise AssertionError("req never finished")
+
+    def test_inflight_decrement_only_on_final_invariant(self):
+        """Invariant R1: req.inflight_middle_chunks decreases only when chunked_req slot is released or req finishes.
+
+        Direct access to ``_scheduler`` internals is intentional; this is an
+        invariant-tier test (see direct-internals-access plan).
+        """
+        self.runtime.run(self._script_inflight_decrement_only_on_final_invariant)
+
+    # R1 — every time inflight_middle_chunks drops between two
+    # consecutive observations, the chunked_req slot must have been
+    # released (no longer pointing at this req) or the req must have
+    # entered the finished state in the same iter.
+    @staticmethod
+    def _script_inflight_decrement_only_on_final_invariant(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        prev_inflight: int = 0
+        prev_was_chunked_slot: bool = False
+        prev_finished: bool = False
+        observed_decrement: bool = False
+        for _ in range(DEFAULT_MAX_STEPS):
+            s = t._scheduler
+            req = t._find_req_by_rid(r.rid)
+            cur_inflight = req.inflight_middle_chunks if req is not None else 0
+            cur_is_chunked_slot = (
+                s.chunked_req is not None and s.chunked_req.rid == r.rid
+            )
+            cur_finished = req.finished() if req is not None else True
+            if cur_inflight < prev_inflight:
+                observed_decrement = True
+                # Decrement legal iff: the chunked_req slot just released
+                # this req (prev was slot, cur is not) OR the req just
+                # entered finished state OR the req disappeared (req is
+                # None implies left every scheduler structure ~ finished).
+                slot_just_released = prev_was_chunked_slot and not cur_is_chunked_slot
+                finish_just_happened = (not prev_finished) and cur_finished
+                assert slot_just_released or finish_just_happened, (
+                    f"inflight_middle_chunks decreased ({prev_inflight} -> "
+                    f"{cur_inflight}) without chunked slot release or req "
+                    f"finish; prev_was_chunked_slot={prev_was_chunked_slot}, "
+                    f"cur_is_chunked_slot={cur_is_chunked_slot}, "
+                    f"prev_finished={prev_finished}, cur_finished={cur_finished}"
+                )
+            prev_inflight = cur_inflight
+            prev_was_chunked_slot = cur_is_chunked_slot
+            prev_finished = cur_finished
+            if r.finished:
+                break
+            yield
+        assert r.finished
+        # Sanity: a multi-chunk req must have triggered at least one
+        # decrement of inflight_middle_chunks across its lifecycle —
+        # otherwise the invariant is vacuously true.
+        assert observed_decrement, (
+            "test must observe at least one inflight_middle_chunks decrement "
+            "across the chunked lifecycle"
+        )
+
     def test_decode_side_chunked_req_always_none(self):
         """Pure decode workload: get_chunked_req_rid() is always None."""
         self.runtime.run(self._script_decode_side_chunked_req_always_none)

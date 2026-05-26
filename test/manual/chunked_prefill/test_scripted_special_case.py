@@ -18,6 +18,7 @@ address. Each test drives the scheduler through a specific branch.
 """
 
 import unittest
+from typing import Optional
 
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
@@ -1074,6 +1075,53 @@ class TestSpecialCaseHiCache(ScriptedRuntimeTestCase):
                 break
             yield
         assert r.finished
+
+    def test_hicache_cached_tokens_set_once_invariant(self):
+        """Invariant B5: HiCache cached_tokens_* fields written exactly once on the first chunk.
+
+        Direct access to ``_scheduler`` internals is intentional; this is an
+        invariant-tier test (see direct-internals-access plan).
+        """
+        self.runtime.run(self._script_hicache_cached_tokens_set_once_invariant)
+
+    # B5 — cached_tokens_device / cached_tokens_host /
+    # cached_tokens_storage are set on the first chunk admission and must
+    # not change again across subsequent chunks. Snapshot once they
+    # become observable (any field non-zero), then assert every later
+    # iter matches.
+    @staticmethod
+    def _script_hicache_cached_tokens_set_once_invariant(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        snap: Optional[tuple] = None
+        for _ in range(DEFAULT_MAX_STEPS):
+            req = t._find_req_by_rid(r.rid)
+            if req is not None:
+                cur = (
+                    req.cached_tokens_device,
+                    req.cached_tokens_host,
+                    req.cached_tokens_storage,
+                )
+                if snap is None:
+                    # Snap when the values become populated (any non-zero)
+                    # OR after the req has run for at least one iter. To
+                    # be robust against the "all zeros legitimately" case,
+                    # snap as soon as the req is observable in any
+                    # scheduler structure — the values are written on
+                    # first chunk admission and must not change after.
+                    snap = cur
+                else:
+                    assert cur == snap, (
+                        f"HiCache cached_tokens_* fields must be set exactly "
+                        f"once on first chunk; values changed: snap={snap}, "
+                        f"cur={cur}"
+                    )
+            if r.finished:
+                break
+            yield
+        assert r.finished
+        # Sanity: the req must actually chunk for the first-chunk write
+        # to be a meaningful event.
+        assert snap is not None, "test must observe the req in scheduler at least once"
 
     def test_init_load_back_called_once_per_request_with_hicache(self):
         """HiCache + multi-chunk req: init_load_back fires exactly once for the whole req, not once per chunk."""

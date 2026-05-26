@@ -463,6 +463,35 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
         for r in reqs:
             assert r.finished
 
+    def test_chunked_req_exclusive_of_batch_invariant(self):
+        """Invariant S2: chunked_req must never also appear in running_batch.reqs.
+
+        Direct access to ``_scheduler`` internals is intentional; this is an
+        invariant-tier test (see direct-internals-access plan).
+        """
+        self.runtime.run(self._script_chunked_req_exclusive_of_batch_invariant)
+
+    @staticmethod
+    def _script_chunked_req_exclusive_of_batch_invariant(t: ScriptedRuntime):
+        # Drive 2 long chunked reqs through admission. At every iter
+        # boundary, verify the scheduler's chunked_req slot (if any) is
+        # never simultaneously a member of running_batch.reqs.
+        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        for _ in range(DEFAULT_MAX_STEPS * 5):
+            s = t._scheduler
+            chunked = s.chunked_req
+            running = s.running_batch
+            if chunked is not None and running is not None:
+                assert chunked not in running.reqs, (
+                    f"chunked_req must be exclusive of running_batch.reqs; "
+                    f"chunked.rid={chunked.rid!r} appears in running_batch"
+                )
+            if r1.finished and r2.finished:
+                return
+            yield
+        raise AssertionError("r1 and r2 did not both finish within step budget")
+
     def test_two_chunked_one_decode(self):
         """2 chunked + 1 decode-only."""
         self.runtime.run(self._script_two_chunked_one_decode)
