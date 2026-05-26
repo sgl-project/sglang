@@ -147,7 +147,14 @@ class EmbeddingCacheController:
         self.access_order = {}
         self.access_lock = threading.Lock()
 
-        # 4. Statistics
+        # 4. RDMA / read reference counting
+        # {hash: ref_count} — entries with ref_count > 0 cannot be evicted.
+        # Incremented when an RDMA transfer (GET/PUT) is in flight or when
+        # get_embeddings() returns a view into cpu_pool.  Decremented after
+        # the RDMA completes or the caller releases the view.
+        self.ref_counts = {}
+
+        # 5. Statistics
         self.stats = {
             "total_allocated": 0,
             "total_evicted": 0,
@@ -155,7 +162,7 @@ class EmbeddingCacheController:
             "allocation_failures": 0,
         }
 
-        # 5. Task Tracking
+        # 6. Task Tracking
         self.ongoing_prefetch = {}  # {req_id: EmbeddingPrefetchOperation}
         self.prefetch_queue = Queue()
         self.insert_queue = Queue()
@@ -187,20 +194,42 @@ class EmbeddingCacheController:
                 del self.access_order[image_hash]
             self.access_order[image_hash] = time.time()
 
+    def _protect_hash(self, image_hash: str):
+        """Increment ref count to prevent eviction during RDMA or active read.
+
+        NOTE: Caller must hold self.lock.
+        """
+        self.ref_counts[image_hash] = self.ref_counts.get(image_hash, 0) + 1
+
+    def _release_hash(self, image_hash: str):
+        """Decrement ref count after RDMA completes or caller releases a view.
+
+        NOTE: Caller must hold self.lock.
+        """
+        if image_hash in self.ref_counts:
+            self.ref_counts[image_hash] -= 1
+            if self.ref_counts[image_hash] <= 0:
+                del self.ref_counts[image_hash]
+
     def _select_eviction_candidates(self, required_bytes: int) -> List[str]:
-        """Select LRU candidates to free up at least required_bytes."""
+        """Select LRU candidates to free up at least required_bytes.
+
+        NOTE: Caller must hold self.lock before calling this method.
+        """
         candidates = []
         freed_bytes = 0
 
         with self.access_lock:
             # Sort by access time (oldest first)
             # Python dicts are insertion-ordered; the first keys are the oldest.
-            sorted_hashes = self.access_order.items()
+            sorted_hashes = list(self.access_order.items())
 
         for image_hash, _ in sorted_hashes:
             if image_hash not in self.hash_to_metadata:
                 with self.access_lock:
                     self.access_order.pop(image_hash, None)
+                continue
+            if self.ref_counts.get(image_hash, 0) > 0:
                 continue
             metadata = self.hash_to_metadata[image_hash]
             size_bytes = metadata[3] if len(metadata) > 3 else 0
@@ -228,13 +257,22 @@ class EmbeddingCacheController:
             if image_hash not in self.hash_to_metadata:
                 continue
 
+            # Safety check: skip entries with in-flight RDMA or active reads
+            if self.ref_counts.get(image_hash, 0) > 0:
+                logger.warning(
+                    f"[Rank {self.tp_rank}] Skipping eviction of {image_hash}: "
+                    f"ref_count={self.ref_counts[image_hash]} (in-flight RDMA or active read)"
+                )
+                continue
+
             offset, num_tokens, dim, size_bytes = self.hash_to_metadata[image_hash][:4]
 
             # Free memory in allocator
             self.allocator.free(offset, size_bytes)
 
-            # Remove from metadata
+            # Remove from metadata and ref counts
             del self.hash_to_metadata[image_hash]
+            self.ref_counts.pop(image_hash, None)
 
             # Remove from access order
             with self.access_lock:
@@ -327,6 +365,7 @@ class EmbeddingCacheController:
 
                 self.hash_to_metadata[h] = (offset, num_tokens, dim, size_bytes)
                 self._update_access_time(h)
+                self._protect_hash(h)
                 keys.append(h)
                 ptrs.append(self.cpu_pool.data_ptr() + offset)
                 sizes.append(size_bytes)
@@ -374,6 +413,7 @@ class EmbeddingCacheController:
                 target_view.copy_(tensor.cpu())
                 self.hash_to_metadata[h] = (offset, num_tokens, dim, size_bytes)
                 self._update_access_time(h)
+                self._protect_hash(h)
 
                 keys.append(h)
                 ptrs.append(self.cpu_pool.data_ptr() + offset)
@@ -398,6 +438,10 @@ class EmbeddingCacheController:
                     f"Mooncake GET Finished: Req {op.req_id}, Successfully fetched {success_count}/{len(op.keys)} images."
                 )
                 op.mark_done(all(results))
+                # Release ref counts now that RDMA GET is complete
+                with self.lock:
+                    for h in op.keys:
+                        self._release_hash(h)
                 self.prefetch_queue.task_done()
                 processed_any = True
             except Empty:
@@ -409,6 +453,10 @@ class EmbeddingCacheController:
                 logger.info(
                     f"Mooncake PUT Finished: Successfully stored {len(op.keys)} keys in cluster."
                 )
+                # Release ref counts now that RDMA PUT is complete
+                with self.lock:
+                    for h in op.keys:
+                        self._release_hash(h)
                 self.insert_queue.task_done()
                 processed_any = True
             except Empty:
@@ -446,7 +494,13 @@ class EmbeddingCacheController:
         return False
 
     def get_embeddings(self, image_hashes: List[str]) -> List[torch.Tensor]:
-        """Final reconstruction for model input."""
+        """Final reconstruction for model input.
+
+        Returns views into the pinned cpu_pool.  Callers MUST call
+        release_embeddings() once they no longer need the returned
+        tensors (e.g. after .to(device) or torch.cat) so that the
+        entries can be evicted.
+        """
         with self.lock:
             tensors = []
             for h in image_hashes:
@@ -456,6 +510,7 @@ class EmbeddingCacheController:
                     continue
                 # Update access time for LRU
                 self._update_access_time(h)
+                self._protect_hash(h)
                 offset, num_tokens, dim, size_bytes = self.hash_to_metadata[h][:4]
                 tensors.append(
                     self.cpu_pool[offset : offset + size_bytes]
@@ -464,12 +519,24 @@ class EmbeddingCacheController:
                 )
             return tensors
 
+    def release_embeddings(self, image_hashes: List[str]):
+        """Release reference counts on embeddings after the caller is done.
+
+        Must be called once for every successful get_embeddings() call,
+        after the caller no longer needs the returned tensor views
+        (e.g. after .to(device) or torch.cat has copied the data).
+        """
+        with self.lock:
+            for h in image_hashes:
+                self._release_hash(h)
+
     def get_stats(self) -> dict:
         """Return cache statistics."""
         with self.lock:
             return {
                 **self.stats,
                 "num_cached": len(self.hash_to_metadata),
+                "num_protected": sum(1 for v in self.ref_counts.values() if v > 0),
                 "allocated_mb": self.allocator.get_allocated_size() / 1024**2,
                 "free_mb": self.allocator.get_free_size() / 1024**2,
                 "total_mb": self.total_pool_size_bytes / 1024**2,

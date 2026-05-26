@@ -798,8 +798,9 @@ class MMEncoder:
 
             # Fill in cache-hit embeddings (from prefetch or fallback)
             if prefetch_status.item() == 1 and hit_indices:
+                hit_hashes = [mm_hashes[i] for i in hit_indices]
                 cached_slices = self.mm_global_cache.get_embeddings(
-                    [mm_hashes[i] for i in hit_indices]
+                    hit_hashes
                 )
                 for i, idx in enumerate(hit_indices):
                     final_slices[idx] = cached_slices[i]
@@ -808,6 +809,12 @@ class MMEncoder:
                     final_slices[idx] = fallback_slices[i]
 
             mm_embedding = torch.cat(final_slices, dim=0)
+
+            # Release embedding cache references now that torch.cat has
+            # copied the data into a new tensor.  This allows the cache
+            # entries to be evicted under memory pressure.
+            if prefetch_status.item() == 1 and hit_indices:
+                self.mm_global_cache.release_embeddings(hit_hashes)
 
             # Background insert: store newly computed embeddings into global cache.
             # Includes both original misses and fallback-recomputed hits.
