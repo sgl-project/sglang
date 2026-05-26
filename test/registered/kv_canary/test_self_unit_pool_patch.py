@@ -106,6 +106,7 @@ class TestRealKvSources(PoolPatchHelper, CustomTestCase):
                     enable_chain_position_assert=enable_chain_position_assert,
                 ),
                 plan=plan,
+                check_verify_expected_token=True,
             )
 
 

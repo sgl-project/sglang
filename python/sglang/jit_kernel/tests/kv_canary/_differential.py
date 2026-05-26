@@ -189,6 +189,7 @@ def _run_both_verify(
             real_kv_hash_mode=real_kv_hash_mode,
         ),
         plan=plan_cuda,
+        check_verify_expected_token=True,
     )
     launch_canary_verify_kernel_torch_reference(
         context=VerifyOrWriteContext(
@@ -203,6 +204,7 @@ def _run_both_verify(
             real_kv_hash_mode=real_kv_hash_mode,
         ),
         plan=plan_ref,
+        check_verify_expected_token=True,
     )
     torch.cuda.synchronize()
 

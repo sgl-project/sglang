@@ -230,6 +230,7 @@ class TestSeedSlot:
                 real_kv_hash_mode=consts.RealKvHashMode.NONE,
             ),
             plan=verify_plan,
+            check_verify_expected_token=True,
         )
         torch.cuda.synchronize()
         assert int(verify_log.write_index[0].item()) == 0
@@ -623,6 +624,7 @@ class TestMockMode:
                 real_kv_hash_mode=consts.RealKvHashMode.NONE,
             ),
             plan=verify_plan,
+            check_verify_expected_token=True,
         )
         torch.cuda.synchronize()
         assert int(verify_log.write_index[0].item()) == 0

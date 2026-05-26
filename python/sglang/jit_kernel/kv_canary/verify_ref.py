@@ -18,6 +18,7 @@ def launch_canary_verify_kernel_torch_reference(
     *,
     context: VerifyOrWriteContext,
     plan: VerifyPlan,
+    check_verify_expected_token: bool,
 ) -> None:
     canary_buf = context.canary_buf
     kernel_kind = context.kernel_kind
@@ -47,9 +48,14 @@ def launch_canary_verify_kernel_torch_reference(
     slot_indices_host = plan.verify_slot_indices[:active].to(
         device=work_device, dtype=torch.int64
     )
-    expected_input_ids_host = plan.verify_expected_tokens[:active].to(
-        device=work_device, dtype=torch.int64
-    )
+    if check_verify_expected_token:
+        expected_input_ids_host = plan.verify_expected_tokens[:active].to(
+            device=work_device, dtype=torch.int64
+        )
+    else:
+        expected_input_ids_host = torch.full(
+            (active,), -1, dtype=torch.int64, device=work_device
+        )
     expected_positions_host = plan.verify_expected_positions[:active].to(
         device=work_device, dtype=torch.int64
     )
@@ -115,13 +121,13 @@ def launch_canary_verify_kernel_torch_reference(
         fail_reason = consts.FailReason(0)
         if stored_chain_hash != expected_chain_hash:
             fail_reason |= consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH
+        if check_verify_expected_token:
+            if expected_input_id != -1 and stored_token != expected_input_id:
+                fail_reason |= consts.FailReason.VERIFY_TOKEN_MISMATCH
         if stored_position != expected_position:
             fail_reason |= consts.FailReason.VERIFY_POSITION_MISMATCH
         if stored_real_kv_hash != expected_real_kv_hash:
             fail_reason |= consts.FailReason.VERIFY_REAL_KV_HASH_MISMATCH
-        # ``expected_input_id == -1`` mirrors the CUDA "skip token check" sentinel.
-        if expected_input_id != -1 and stored_token != expected_input_id:
-            fail_reason |= consts.FailReason.VERIFY_TOKEN_MISMATCH
 
         if fail_reason != consts.FailReason(0):
             row = [0] * consts.VIOLATION_FIELDS

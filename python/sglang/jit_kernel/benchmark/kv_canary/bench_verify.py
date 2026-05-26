@@ -237,6 +237,7 @@ def benchmark(
             launch_canary_verify_kernel(
                 context=context,
                 plan=plan,
+                check_verify_expected_token=True,
             )
 
     else:
@@ -303,6 +304,7 @@ def benchmark_kernel_kind(
         launch_canary_verify_kernel(
             context=context,
             plan=plan,
+            check_verify_expected_token=True,
         )
 
     return run_benchmark(fn)

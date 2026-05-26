@@ -298,6 +298,7 @@ def test_verify_multi_launch_100x_counter_linear() -> None:
                 real_kv_hash_mode=consts.RealKvHashMode.NONE,
             ),
             plan=plan_cuda,
+            check_verify_expected_token=True,
         )
 
     torch.cuda.synchronize()

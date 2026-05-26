@@ -1107,6 +1107,7 @@ class TestRealKvSource:
                     real_kv_hash_mode=consts.RealKvHashMode.NONE,
                 ),
                 plan=plan,
+                check_verify_expected_token=True,
             )
 
     def test_real_kv_source_holey_dim1(self) -> None:
@@ -1273,6 +1274,7 @@ class TestLayoutAndScheduling:
                 real_kv_hash_mode=consts.RealKvHashMode.NONE,
             ),
             plan=plan,
+            check_verify_expected_token=True,
         )
         torch.cuda.synchronize()
 

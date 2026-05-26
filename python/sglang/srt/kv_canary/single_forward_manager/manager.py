@@ -227,6 +227,7 @@ class SingleForwardManager:
                 violation_log=violation_log,
                 real_kv_hash_mode=self._config.real_kv_hash_mode,
                 enable_write_input_assert=enable_write_input_assert,
+                enable_verify_token_assert=self._config.enable_verify_token_assert,
             )
 
         return _PreOpsMaybeInsideGraphOutput(
@@ -264,6 +265,7 @@ class SingleForwardManager:
                 violation_log=violation_log,
                 real_kv_hash_mode=self._config.real_kv_hash_mode,
                 enable_write_input_assert=enable_write_input_assert,
+                enable_verify_token_assert=self._config.enable_verify_token_assert,
             )
 
         verify_plan_enable_combined = _torch_reduce_minimum(

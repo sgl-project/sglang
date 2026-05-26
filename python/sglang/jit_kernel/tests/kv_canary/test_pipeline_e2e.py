@@ -116,7 +116,11 @@ def _run_pipeline(
             expected_input_tokens=expected_input_tokens,
             expected_input_positions=expected_input_positions,
         )
-        launch_canary_verify_kernel(context=context, plan=plan_v)
+        launch_canary_verify_kernel(
+            context=context,
+            plan=plan_v,
+            check_verify_expected_token=True,
+        )
         torch.cuda.synchronize()
     else:
         launch_canary_write_kernel_torch_reference(
@@ -152,6 +156,7 @@ def _run_pipeline(
                 real_kv_hash_mode=real_kv_hash_mode,
             ),
             plan=plan_v,
+            check_verify_expected_token=True,
         )
 
     return plan_v, plan_w
@@ -730,6 +735,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
             real_kv_hash_mode=consts.RealKvHashMode.NONE,
         ),
         plan=plan_v_real,
+        check_verify_expected_token=True,
     )
     torch.cuda.synchronize()
 
@@ -746,6 +752,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
             real_kv_hash_mode=consts.RealKvHashMode.NONE,
         ),
         plan=plan_v_ref,
+        check_verify_expected_token=True,
     )
 
     # Step 3: write_index byte-equal; ring contents relaxed (atomic order not guaranteed under overflow).

@@ -68,6 +68,7 @@ def launch_endpoints_per_forward(
     violation_log: ViolationLog,
     real_kv_hash_mode: RealKvHashMode,
     enable_write_input_assert: bool,
+    enable_verify_token_assert: bool,
 ) -> None:
     positions = _canonicalize_boundary_int64(forward_batch.positions, _POSITIONS)
     out_cache_loc = _canonicalize_boundary_int64(forward_batch.out_cache_loc, _OUT_LOC)
@@ -103,6 +104,7 @@ def launch_endpoints_per_forward(
             positions=positions,
             out_cache_loc=out_cache_loc,
             enable_write_input_assert=enable_write_input_assert,
+            enable_verify_token_assert=enable_verify_token_assert,
             expected_inputs=expected_inputs,
             violation_log=violation_log,
             real_kv_hash_mode=real_kv_hash_mode,

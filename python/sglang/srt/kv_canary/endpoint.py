@@ -46,6 +46,7 @@ class CanaryEndpoint:
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
         enable_write_input_assert: bool,
+        enable_verify_token_assert: bool,
         expected_inputs: ExpectedInputs,
         violation_log: ViolationLog,
         real_kv_hash_mode: RealKvHashMode,
@@ -62,6 +63,7 @@ class CanaryEndpoint:
         launch_canary_verify_kernel(
             context=context,
             plan=verify_plan,
+            check_verify_expected_token=enable_verify_token_assert,
         )
 
         # SWA endpoints translate the per-token slot indices via a device tensor index op before invoking the write kernel.
@@ -105,6 +107,7 @@ class CanaryEndpoint:
                 real_kv_hash_mode=real_kv_hash_mode,
             ),
             plan=verify_plan,
+            check_verify_expected_token=False,
         )
 
     def _make_verify_or_write_context(
