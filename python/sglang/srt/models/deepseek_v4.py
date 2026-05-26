@@ -335,20 +335,30 @@ class MQALayer(nn.Module):
                         and (c4_layer_rank + 1) % self.index_topk_freq != 0
                     )
                 else:
+                    if isinstance(self.index_topk_pattern, str):
+                        self.index_topk_pattern = list(self.index_topk_pattern)
+                    invalid_pattern_values = set(self.index_topk_pattern) - {"F", "S"}
+                    if invalid_pattern_values:
+                        raise ValueError(
+                            "index_topk_pattern only supports 'F' for full indexer "
+                            f"layers and 'S' for shared layers, got "
+                            f"{sorted(invalid_pattern_values)}"
+                        )
                     if len(self.index_topk_pattern) == len(config.compress_ratios):
                         pattern_idx = layer_id
                         has_next_pattern = layer_id < len(self.index_topk_pattern) - 1
                         next_pattern_idx = layer_id + 1
-                    else:
-                        assert c4_layer_rank < len(self.index_topk_pattern), (
-                            f"index_topk_pattern length {len(self.index_topk_pattern)} "
-                            f"is too short for c4_layer_rank={c4_layer_rank}"
-                        )
+                    elif len(self.index_topk_pattern) == len(c4_layer_ids):
                         pattern_idx = c4_layer_rank
-                        has_next_pattern = (
-                            c4_layer_rank < len(self.index_topk_pattern) - 1
-                        )
+                        has_next_pattern = c4_layer_rank < len(c4_layer_ids) - 1
                         next_pattern_idx = c4_layer_rank + 1
+                    else:
+                        raise ValueError(
+                            "index_topk_pattern length must either match "
+                            f"num_hidden_layers ({len(config.compress_ratios)}) or "
+                            f"the number of C4 layers ({len(c4_layer_ids)}), got "
+                            f"{len(self.index_topk_pattern)}"
+                        )
                     self.skip_topk = self.index_topk_pattern[pattern_idx] == "S"
                     if has_next_pattern:
                         self.next_skip_topk = (
