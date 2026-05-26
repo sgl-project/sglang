@@ -9,12 +9,10 @@ from typing import Any, Callable, List
 
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
-    SGLDiffusionProfiler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 
 
 class SyncExecutor(PipelineExecutor):
@@ -30,45 +28,19 @@ class SyncExecutor(PipelineExecutor):
         run_stage: Callable[[PipelineStage, Any], Any],
     ) -> Any:
         """Execute all pipeline stages sequentially and step the profiler."""
-        # Match the warmup gating applied inside PipelineStage.__call__ so
-        # the executor wrapper doesn't leak a stage_<Name> range during
-        # server-side warmup.
-        # ``payload`` can be a single Req or a list of Req (execute_group);
-        # treat the group as warmup only if all entries agree.
-        if isinstance(payload, list):
-            is_warmup = bool(payload) and all(
-                getattr(p, "is_warmup", False) for p in payload
-            )
-        else:
-            is_warmup = getattr(payload, "is_warmup", False)
-        use_nvtx = server_args.enable_layerwise_nvtx_marker and not is_warmup
-        self.begin_component_residency_request(stages, payload, server_args)
-        try:
+
+        use_nvtx = self._should_use_stage_nvtx(payload, server_args)
+        with self._component_residency_request(stages, payload, server_args):
             for stage_index, stage in enumerate(stages):
-                # Use the stage's own registered name (set by ``add_stage``) so the
-                # umbrella NVTX range matches the per-submodule prefix emitted by
-                # ``ComponentResidencyManager`` (e.g. ``stage_denoising_stage``
-                # + ``denoising_stage.transformer.*``). ``_component_stage_name``
-                # returns ``_registered_stage_name or __class__.__name__`` directly
-                # — without consulting ``manager.state.stage_name``, which only
-                # advances inside ``before_stage`` and would otherwise leak the
-                # previous iteration's label onto the current stage's umbrella.
-                stage_name = getattr(
+                payload = self._run_stage_with_executor_hooks(
                     stage,
-                    "_component_stage_name",
-                    lambda: stage.__class__.__name__,
-                )()
-                self.before_stage(stage, stage_index, payload, server_args)
-                with maybe_nvtx_range(f"stage_{stage_name}", use_nvtx):
-                    payload = self.run_stage_with_context(
-                        stage, payload, server_args, run_stage
-                    )
-                self.after_stage(stage_index)
-                profiler = SGLDiffusionProfiler.get_instance()
-                if profiler:
-                    profiler.step_stage()
-        finally:
-            self.finish_component_residency_request()
+                    stage_index,
+                    payload,
+                    server_args,
+                    run_stage,
+                    use_nvtx,
+                )
+                self._step_stage_profiler()
         return payload
 
     def run_profile_all_stages(
