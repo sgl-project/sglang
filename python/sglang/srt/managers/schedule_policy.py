@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from array import array
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
@@ -84,7 +85,7 @@ IGNORE_EOS_RESERVE_TOKENS = 1
 def match_prefix_for_req(
     tree_cache: BasePrefixCache,
     req: Req,
-    token_ids: Optional[List[int]] = None,
+    token_ids: Optional[array[int]] = None,
     *,
     cow_mamba: bool = False,
     include_req: bool = False,
@@ -860,7 +861,14 @@ class PrefillAdder:
             if swa_needed >= self.rem_swa_tokens:
                 return AddReqResult.NO_TOKEN
 
-        if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+        if (
+            self.rem_chunk_tokens is None
+            and len(self.can_run_list) != 0
+            and real_input_tokens >= self.rem_input_tokens
+        ):
+            # If without chunked prefill:
+            # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
+            # - if the can_run_list is empty, always accept the first prefill request
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
@@ -888,7 +896,14 @@ class PrefillAdder:
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
-            if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+            if (
+                self.rem_chunk_tokens is None
+                and len(self.can_run_list) != 0
+                and input_tokens >= self.rem_input_tokens
+            ):
+                # If without chunked prefill:
+                # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
+                # - if the can_run_list is empty, always accept the first prefill request
                 return AddReqResult.OTHER
 
             if self.dllm_config is not None:
