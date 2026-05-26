@@ -48,6 +48,7 @@ from .mla_attention import (
 )
 from .mla_attention import DEFAULT_MAX_CONTEXT_LEN as MLA_DEFAULT_MAX_CONTEXT_LEN
 from .mla_attention import (
+    DEFAULT_QK_ROPE_HEAD_DIM,
     MLA_ATOL,
     MLA_RTOL,
     MLAAttentionCase,
@@ -889,6 +890,7 @@ def run_mla_eagle_verify_case(
     *,
     topk: int,
     kv_lora_rank: int = DEFAULT_KV_LORA_RANK,
+    qk_rope_head_dim: int = DEFAULT_QK_ROPE_HEAD_DIM,
     hidden_size: int = MLA_DEFAULT_HIDDEN_SIZE,
     max_context_len: int = MLA_DEFAULT_MAX_CONTEXT_LEN,
     dtype: torch.dtype = MLA_DEFAULT_DTYPE,
@@ -898,6 +900,7 @@ def run_mla_eagle_verify_case(
         testcase,
         case,
         kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
         hidden_size=hidden_size,
         max_context_len=max_context_len,
         dtype=dtype,
@@ -933,6 +936,7 @@ def run_mla_eagle_verify_cuda_graph_case(
     *,
     topk: int,
     kv_lora_rank: int = DEFAULT_KV_LORA_RANK,
+    qk_rope_head_dim: int = DEFAULT_QK_ROPE_HEAD_DIM,
     hidden_size: int = MLA_DEFAULT_HIDDEN_SIZE,
     max_context_len: int = MLA_DEFAULT_MAX_CONTEXT_LEN,
     dtype: torch.dtype = MLA_DEFAULT_DTYPE,
@@ -955,6 +959,7 @@ def run_mla_eagle_verify_cuda_graph_case(
         reference_fn=mla_attention_reference_with_custom_mask,
         build_kwargs=dict(
             kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
             hidden_size=hidden_size,
             max_context_len=max_context_len,
             dtype=dtype,
@@ -974,6 +979,7 @@ def run_mla_eagle_draft_extend_case(
     case: MLAAttentionCase,
     *,
     kv_lora_rank: int = DEFAULT_KV_LORA_RANK,
+    qk_rope_head_dim: int = DEFAULT_QK_ROPE_HEAD_DIM,
     hidden_size: int = MLA_DEFAULT_HIDDEN_SIZE,
     max_context_len: int = MLA_DEFAULT_MAX_CONTEXT_LEN,
     dtype: torch.dtype = MLA_DEFAULT_DTYPE,
@@ -985,6 +991,7 @@ def run_mla_eagle_draft_extend_case(
         testcase,
         case,
         kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
         hidden_size=hidden_size,
         max_context_len=max_context_len,
         dtype=dtype,

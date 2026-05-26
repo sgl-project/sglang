@@ -64,6 +64,7 @@ from .mla_attention import (
 )
 from .mla_attention import DEFAULT_MAX_CONTEXT_LEN as MLA_DEFAULT_MAX_CONTEXT_LEN
 from .mla_attention import (
+    DEFAULT_QK_ROPE_HEAD_DIM,
     MLA_ATOL,
     MLA_RTOL,
     MLAAttentionCase,
@@ -299,6 +300,7 @@ def run_mla_split_op_extend_case(
     breakable: bool,
     static_num_tokens: int | None = None,
     kv_lora_rank: int = DEFAULT_KV_LORA_RANK,
+    qk_rope_head_dim: int = DEFAULT_QK_ROPE_HEAD_DIM,
     hidden_size: int = MLA_DEFAULT_HIDDEN_SIZE,
     max_context_len: int = MLA_DEFAULT_MAX_CONTEXT_LEN,
     dtype: torch.dtype = MLA_DEFAULT_DTYPE,
@@ -322,6 +324,7 @@ def run_mla_split_op_extend_case(
         adapter=adapter,
         build_kwargs=dict(
             kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
             hidden_size=hidden_size,
             max_context_len=max_context_len,
             dtype=dtype,

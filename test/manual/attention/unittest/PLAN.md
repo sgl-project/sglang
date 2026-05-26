@@ -15,11 +15,14 @@ Implemented:
 - SWA attention backend correctness files exist under
   `test/manual/attention/unittest/swa/` for `triton` and `flashinfer`.
 - MLA attention backend correctness exists under
-  `test/manual/attention/unittest/mla/` for `triton`; its actual path now uses a
-  small DeepSeek-shaped absorb-MLA module that explicitly writes latent KV through
-  `get_token_to_kv_pool()` before calling `attn_mqa`, while its expected path is a
-  separate HF-style PyTorch reference module with copied random weights and no
-  `RadixAttention` or backend calls.
+  `test/manual/attention/unittest/mla/` for `triton` and `flashinfer`; its actual
+  path now uses a small DeepSeek-shaped absorb-MLA module that explicitly writes
+  latent KV through `get_token_to_kv_pool()` before calling `attn_mqa`, while its
+  expected path is a separate HF-style PyTorch reference module with copied
+  random weights and no `RadixAttention` or backend calls. The MLA fixture now
+  supports nonzero `qk_rope_head_dim` so shape-constrained MLA kernels can be
+  tested with realistic DeepSeek-like `kv_lora_rank=512`, `qk_rope_head_dim=64`
+  metadata.
 - GDN hybrid-linear attention backend correctness exists under
   `test/manual/attention/unittest/gdn/` for full-attention backends `torch_native`,
   `triton`, and `flashinfer` with linear-attention kernel backend `triton`; its
@@ -33,15 +36,16 @@ Implemented:
   decode batch and replay distinct request metadata/input tensors, so capture data
   is not identical to forward data.
 - Phase 3 CUDA graph decode replay now also covers SWA for `triton` and
-  `flashinfer`, plus GDN for `triton` and `flashinfer`. The SWA graph cases
-  currently use decode lengths within the configured window; an above-window Triton
-  SWA decode case exposes a backend/reference semantic mismatch before graph replay
-  and should be investigated separately from runner coverage.
+  `flashinfer`, MLA for `triton` and `flashinfer`, plus GDN for `triton` and
+  `flashinfer`. The SWA graph cases currently use decode lengths within the
+  configured window; an above-window Triton SWA decode case exposes a
+  backend/reference semantic mismatch before graph replay and should be
+  investigated separately from runner coverage.
 - Phase 3 PCG/BCG split-op replay now covers representative dense MHA/GQA
   extend for `triton`, `flashinfer`, `fa3`, `fa4`, and `flex_attention`, plus SWA
   extend, MLA extend, and GDN extend paths for both `triton` and `flashinfer`.
-  These tests use live backend metadata with a larger static token buffer to verify
-  `num_token_non_padded_cpu` slicing, not just exact-shape eager behavior.
+  These tests use live backend metadata with a larger static token buffer to
+  verify `num_token_non_padded_cpu` slicing, not just exact-shape eager behavior.
 - MLA split-op coverage exercises the absorb-MLA cached-KV path where
   `RadixAttention` receives `k/v=None`; the split-op wrapper now preserves that
   contract instead of assuming materialized K/V tensors.
@@ -52,13 +56,16 @@ Implemented:
   `NgramVerifyInput`. Dense `flashinfer` also covers `DRAFT_EXTEND` with ragged
   accepted-token counts for both EAGLE and Frozen-KV MTP draft-extend input tags.
   SWA `triton` covers EAGLE `TARGET_VERIFY` chain and tree masks combined with a
-  finite sliding window. MLA `triton` covers EAGLE `TARGET_VERIFY` chain masks.
+  finite sliding window. MLA `triton` covers EAGLE `TARGET_VERIFY` chain masks;
+  MLA `flashinfer` covers EAGLE chain verify and EAGLE draft-extend on a
+  supported DeepSeek-like shape.
 - Phase 4 target-verify CUDA-graph-style replay now covers representative valid
   backends with fixed capture batches and distinct replay metadata/input tensors:
   dense `triton` covers EAGLE tree, DFlash chain, and NGRAM chain; dense
   `flashinfer` covers EAGLE tree, Frozen-KV MTP chain, and DFlash chain; SWA
   `triton` covers EAGLE tree with sliding-window metadata; MLA `triton` covers
-  EAGLE tree with the absorb-MLA cached-KV path.
+  EAGLE tree with the absorb-MLA cached-KV path; MLA `flashinfer` covers EAGLE
+  chain with the absorb-MLA cached-KV path.
 - Phase 4 draft-extend CUDA-graph-style replay now covers dense `flashinfer` for
   EAGLE and Frozen-KV MTP `DRAFT_EXTEND` with ragged accepted-token counts. The
   capture batch uses a fixed max accepted-token count per request, while replay
@@ -77,6 +84,9 @@ Implemented:
   FlashInfer sliding-window metadata updater expects prefix lengths that are not
   supplied by the target-verify path (`prefix_lens=None`), so the Triton SWA spec
   tests cover the interaction for now.
+- FlashInfer MLA EAGLE tree verify (`topk=2`) is intentionally not enabled yet.
+  Chain verify (`topk=1`) passes, but the tree custom-mask path currently
+  mismatches the HF-style PyTorch reference on realistic MLA shapes.
 - FA3/FA4 decode CUDA-graph replay is intentionally not enabled yet. Dense eager
   and PCG/BCG split-op paths match the HF-style reference, but the shared decode
   CUDA-graph helper currently mismatches on replay for both FA backends.
@@ -139,6 +149,12 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
+- `python -m py_compile test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/common/cuda_graph_runner.py test/manual/attention/unittest/common/split_op_runner.py test/manual/attention/unittest/common/spec_runner.py test/manual/attention/unittest/mla/test_flashinfer.py`
+- `python test/manual/attention/unittest/mla/test_triton.py -v`
+- `python test/manual/attention/unittest/mla/test_flashinfer.py -v`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+  - Ran 47 tests in 22.115s after adding FlashInfer MLA coverage and nonzero
+    MLA rope-dimension fixture support.
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
   - Ran 41 tests in 21.629s after adding GDN torch-native coverage.
 - `python -m py_compile test/manual/attention/unittest/gdn/test_torch_native.py`
