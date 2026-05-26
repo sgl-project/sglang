@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.shared_hicache.source import (
 from sglang.srt.mem_cache.shared_hicache.target import SharedHiCacheTarget
 from sglang.srt.mem_cache.shared_hicache.transfer import (
     MooncakeSharedHiCacheTransferBackend,
+    SharedHiCacheTransferBackend,
     _get_or_init_mooncake_transfer_engine,
     make_shared_hicache_transfer_backend,
 )
@@ -135,15 +136,22 @@ class FakeTree:
         return SimpleNamespace(delta=0)
 
 
-class FakeDirectTransfer:
+class FakeDirectTransfer(SharedHiCacheTransferBackend):
     name = "mooncake"
-    enabled = True
-    target_session_id = "target-session"
-    target_kv_ptrs = [1]
-    target_kv_item_lens = [64]
 
-    def target_descriptor(self):
-        return {"backend": self.name, "session_id": self.target_session_id}
+    def __init__(self):
+        super().__init__(
+            target_session_id="target-session",
+            target_kv_ptrs=[1],
+            target_kv_item_lens=[64],
+        )
+
+    @property
+    def enabled(self):
+        return True
+
+    def transfer_pages(self, **kwargs):
+        pass
 
 
 class FakeMooncakeEngine:

@@ -3,8 +3,9 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Mapping, Optional, Protocol
+from typing import Any, Mapping, Optional
 
 import numpy as np
 import torch
@@ -19,17 +20,38 @@ from sglang.srt.mem_cache.shared_hicache.config import (
 logger = logging.getLogger(__name__)
 
 
-class SharedHiCacheTransferBackend(Protocol):
+class SharedHiCacheTransferBackend(ABC):
     name: str
-    target_session_id: str
-    target_kv_ptrs: list[int]
-    target_kv_item_lens: list[int]
+
+    def __init__(
+        self,
+        *,
+        target_session_id: str,
+        target_kv_ptrs,
+        target_kv_item_lens,
+        parallel_metadata: Optional[Mapping[str, int]] = None,
+    ):
+        if not getattr(self, "name", None):
+            raise ValueError("SharedHiCache transfer backend must define a name")
+        self.target_session_id = str(target_session_id)
+        self.target_kv_ptrs = [int(ptr) for ptr in target_kv_ptrs]
+        self.target_kv_item_lens = [int(length) for length in target_kv_item_lens]
+        self.parallel_metadata = {
+            key: int(value) for key, value in (parallel_metadata or {}).items()
+        }
 
     @property
+    @abstractmethod
     def enabled(self) -> bool: ...
 
-    def target_descriptor(self) -> dict[str, Any]: ...
+    def target_descriptor(self) -> dict[str, Any]:
+        return {
+            "backend": self.name,
+            "session_id": self.target_session_id,
+            **self.parallel_metadata,
+        }
 
+    @abstractmethod
     def transfer_pages(
         self,
         *,
@@ -41,7 +63,8 @@ class SharedHiCacheTransferBackend(Protocol):
         target_metadata: Optional[Mapping[str, Any]] = None,
     ) -> None: ...
 
-    def shutdown(self) -> None: ...
+    def shutdown(self) -> None:
+        pass
 
 
 def _target_kv_pool_from_scheduler(scheduler):
@@ -225,7 +248,7 @@ def _build_grouped_transfer_arrays(
     return src_addrs, dst_addrs, lengths, len(src_blocks)
 
 
-class MooncakeSharedHiCacheTransferBackend:
+class MooncakeSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
     """Mooncake-backed source-HiCache-host to target-GPU-device transfer helper."""
 
     name = "mooncake"
@@ -242,14 +265,14 @@ class MooncakeSharedHiCacheTransferBackend:
         custom_mem_pool=None,
         transfer_parallelism: Optional[int] = None,
     ):
+        super().__init__(
+            target_session_id=engine.get_session_id(),
+            target_kv_ptrs=target_kv_ptrs,
+            target_kv_item_lens=target_kv_item_lens,
+            parallel_metadata=parallel_metadata,
+        )
         self.engine = engine
         self.tree_cache = tree_cache
-        self.target_session_id = engine.get_session_id()
-        self.target_kv_ptrs = [int(ptr) for ptr in target_kv_ptrs]
-        self.target_kv_item_lens = [int(length) for length in target_kv_item_lens]
-        self.parallel_metadata = {
-            key: int(value) for key, value in (parallel_metadata or {}).items()
-        }
         self._target_registered = bool(target_registered)
         self._source_registered = False
         self._source_registered_ptrs: list[int] = []
@@ -345,17 +368,14 @@ class MooncakeSharedHiCacheTransferBackend:
         return self._source_registered
 
     def target_descriptor(self) -> dict[str, Any]:
-        return {
-            "backend": self.name,
-            "session_id": self.target_session_id,
-            "transport": {
-                "protocol": self.protocol,
-                "ib_device": self.ib_device,
-                "path_hint": self.path_hint,
-                "transfer_parallelism": self._transfer_parallelism,
-            },
-            **self.parallel_metadata,
+        descriptor = super().target_descriptor()
+        descriptor["transport"] = {
+            "protocol": self.protocol,
+            "ib_device": self.ib_device,
+            "path_hint": self.path_hint,
+            "transfer_parallelism": self._transfer_parallelism,
         }
+        return descriptor
 
     def _log_ready(self) -> None:
         if self.protocol == "rdma" and self.ib_device is None:
