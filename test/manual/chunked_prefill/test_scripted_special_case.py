@@ -822,7 +822,10 @@ class TestScriptedSpecialCase(CustomTestCase):
         execute_scripted_runtime(
             self._script_chunked_admission_trunc_lt_zero_returns_other,
             **base_engine_kwargs(
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+                # chunked_prefill_size < page_size forces
+                # ``trunc_len = rem // page_size * page_size = 0`` so the
+                # prefill_adder OTHER-return branch fires per iter.
+                chunked_prefill_size=8,
                 page_size=16,
             ),
         )
@@ -834,8 +837,29 @@ class TestScriptedSpecialCase(CustomTestCase):
         # iteration emits no new chunk. The req must still eventually
         # complete on a later iter when capacity recovers.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
+        # Drive the chunked path far enough to observe at least one
+        # iteration where the req was deferred (status == "waiting" and
+        # chunks_done did not advance from the prior observation). That is
+        # the externally visible signature of the OTHER-return path.
+        # NEW API NEEDED: t.last_admission_path() should expose the most
+        # recent add_one_req result so the test could pin the OTHER path
+        # directly instead of inferring it.
+        saw_deferred_iter = False
+        prev_chunks_done = r.chunks_done
+        for _ in range(DEFAULT_MAX_STEPS):
+            if r.finished:
+                break
+            cur_chunks_done = r.chunks_done
+            if r.status == "waiting" and cur_chunks_done == prev_chunks_done:
+                saw_deferred_iter = True
+            prev_chunks_done = cur_chunks_done
+            yield
         assert r.finished
+        assert saw_deferred_iter, (
+            "expected at least one iter where add_one_req returned OTHER "
+            "(req status == waiting and chunks_done did not advance); "
+            "chunked_prefill_size < page_size must defer admission"
+        )
 
     def test_chunked_truncation_align_size(self):
         """[c-P11c] deterministic + flashinfer + long prompt: each chunk boundary is page_size aligned."""
