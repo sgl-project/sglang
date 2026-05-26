@@ -421,7 +421,9 @@ class TestViolationField:
         cuda_log, _ = run_verify_diff(buf_pair=(cuda_buf, ref_buf), plan_pair=plan_pair)
 
         assert _n_violations(cuda_log) == 1
-        assert_only_bits_set(_fail_bits(cuda_log), consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH)
+        assert_only_bits_set(
+            _fail_bits(cuda_log), consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH
+        )
 
     def test_violation_position_mismatch(self) -> None:
         """Stored position differs from what the slot's chain reconstruction would yield → POSITION bit."""
@@ -433,7 +435,9 @@ class TestViolationField:
         cuda_log, _ = run_verify_diff(buf_pair=buf_pair, plan_pair=plan_pair)
 
         assert _n_violations(cuda_log) == 1
-        assert_only_bits_set(_fail_bits(cuda_log), consts.FailReason.VERIFY_POSITION_MISMATCH)
+        assert_only_bits_set(
+            _fail_bits(cuda_log), consts.FailReason.VERIFY_POSITION_MISMATCH
+        )
 
     def test_violation_position_diverges_from_plan(self) -> None:
         """Plan-supplied position contradicts stored position → POSITION bit (verify trusts plan, not +1)."""
@@ -444,7 +448,9 @@ class TestViolationField:
         plan_pair = _plan_pair_single(slot_idx=3, position=99)
         cuda_log, _ = run_verify_diff(buf_pair=buf_pair, plan_pair=plan_pair)
 
-        assert_only_bits_set(_fail_bits(cuda_log), consts.FailReason.VERIFY_POSITION_MISMATCH)
+        assert_only_bits_set(
+            _fail_bits(cuda_log), consts.FailReason.VERIFY_POSITION_MISMATCH
+        )
 
     def test_violation_prev_hash_mismatch(self) -> None:
         """Stored prev_hash differs from predecessor-derived expectation → CHAIN_HASH bit."""
@@ -474,7 +480,9 @@ class TestViolationField:
         )
         cuda_log, _ = run_verify_diff(buf_pair=(cuda_buf, ref_buf), plan_pair=plan_pair)
 
-        assert_only_bits_set(_fail_bits(cuda_log), consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH)
+        assert_only_bits_set(
+            _fail_bits(cuda_log), consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH
+        )
 
     def test_violation_real_kv_hash_mismatch(self) -> None:
         """Mutate one byte of a RealKvSource tensor after writing the chain → REAL_KV_HASH bit on verify."""
@@ -505,7 +513,9 @@ class TestViolationField:
             real_kv_hash_mode=consts.RealKvHashMode.ALL,
         )
 
-        assert_only_bits_set(_fail_bits(cuda_log), consts.FailReason.VERIFY_REAL_KV_HASH_MISMATCH)
+        assert_only_bits_set(
+            _fail_bits(cuda_log), consts.FailReason.VERIFY_REAL_KV_HASH_MISMATCH
+        )
 
     @pytest.mark.parametrize("bit_to_trigger", ["POSITION", "PREV_HASH", "REAL_KV"])
     @pytest.mark.parametrize("injection_position", ["head", "mid", "last"])
@@ -848,7 +858,9 @@ class TestRealKvHash:
             real_kv_hash_mode=mode,
         )
 
-        assert_only_bits_set(_fail_bits(cuda_log2), consts.FailReason.VERIFY_REAL_KV_HASH_MISMATCH)
+        assert_only_bits_set(
+            _fail_bits(cuda_log2), consts.FailReason.VERIFY_REAL_KV_HASH_MISMATCH
+        )
 
     def test_real_kv_hash_all_mode_with_multiple_sources(self) -> None:
         """ALL mode with count=2 page=16 bytes=128 sources: chain still verifies clean."""
