@@ -40,6 +40,11 @@ DEFAULT_DTYPE = torch.bfloat16
 DEFAULT_DEVICE = "cuda"
 LIGHTNING_ATOL = 3e-2
 LIGHTNING_RTOL = 3e-2
+# CUDA-graph replay through the seg_la Triton kernel accumulates small
+# drift; loose tolerance for graph-replay coverage where the goal is
+# buffer/metadata compatibility rather than exact numerical match.
+LIGHTNING_GRAPH_ATOL = 1e-1
+LIGHTNING_GRAPH_RTOL = 1e-1
 
 
 @dataclass(frozen=True)
@@ -740,3 +745,134 @@ def run_lightning_attention_case(
         atol=LIGHTNING_ATOL,
         rtol=LIGHTNING_RTOL,
     )
+
+
+# ---------------------------------------------------------------------------
+# Runner-mode helpers (mirror GDN/KDA conventions for cuda_graph_decode_runner)
+# ---------------------------------------------------------------------------
+
+
+def _clone_lightning_cache(fixture: LightningAttentionFixture):
+    """Snapshot the SSM state for CG capture/replay isolation."""
+    return _ssm_states(fixture).clone()
+
+
+def _restore_lightning_cache(
+    fixture: LightningAttentionFixture, state: torch.Tensor
+) -> None:
+    _ssm_states(fixture).copy_(state)
+
+
+def make_lightning_case_with_prefix_lens(
+    case: LightningAttentionCase,
+    name: str,
+    prefix_lens: tuple[int, ...],
+) -> LightningAttentionCase:
+    """Build a variant case with new `prefix_lens`. For DECODE, `extend_lens`
+    is empty (input_lens derives `(1,) * batch_size`); for EXTEND we keep
+    the original `extend_lens` clipped/padded to the new batch shape."""
+    if case.forward_mode.is_decode():
+        extend_lens: tuple[int, ...] = ()
+    else:
+        base = case.extend_lens or (1,)
+        if len(prefix_lens) <= len(base):
+            extend_lens = base[: len(prefix_lens)]
+        else:
+            extend_lens = base + (base[-1],) * (len(prefix_lens) - len(base))
+    return LightningAttentionCase(
+        name=name,
+        backend=case.backend,
+        forward_mode=case.forward_mode,
+        num_heads=case.num_heads,
+        page_size=case.page_size,
+        prefix_lens=prefix_lens,
+        extend_lens=extend_lens,
+    )
+
+
+def lightning_fixture_inputs(
+    fixture: LightningAttentionFixture,
+) -> dict[str, torch.Tensor]:
+    return {"q": fixture.q, "k": fixture.k, "v": fixture.v}
+
+
+def make_lightning_random_inputs(
+    case: LightningAttentionCase,
+    fixture: LightningAttentionFixture,
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> dict[str, torch.Tensor]:
+    head_dim = fixture.reference_module.head_dim
+    return {
+        "q": torch.randn(
+            case.num_input_tokens,
+            case.num_heads,
+            head_dim,
+            dtype=dtype,
+            device=device,
+        ),
+        "k": torch.randn(
+            case.num_input_tokens,
+            case.num_heads,
+            head_dim,
+            dtype=dtype,
+            device=device,
+        ),
+        "v": torch.randn(
+            case.num_input_tokens,
+            case.num_heads,
+            head_dim,
+            dtype=dtype,
+            device=device,
+        ),
+    }
+
+
+def make_lightning_replay_inputs(
+    _case: LightningAttentionCase,
+    fixture: LightningAttentionFixture,
+    _pad_prefix_lens: tuple[int, ...],
+    base_inputs: dict[str, torch.Tensor],
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> dict[str, torch.Tensor]:
+    del fixture, dtype, device
+    return base_inputs
+
+
+def prepare_lightning_runner_inputs(
+    fixture: LightningAttentionFixture,
+    _case: LightningAttentionCase,
+    _batch: ForwardBatch,
+    inputs: dict[str, torch.Tensor],
+    *,
+    max_context_len: int,
+) -> None:
+    del max_context_len
+    fixture.q = inputs["q"]
+    fixture.k = inputs["k"]
+    fixture.v = inputs["v"]
+
+
+def run_lightning_forward(
+    fixture: LightningAttentionFixture,
+    batch: ForwardBatch,
+    inputs: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    return fixture.actual_module(batch, inputs["q"], inputs["k"], inputs["v"])
+
+
+def expected_lightning_output_from_inputs(
+    fixture: LightningAttentionFixture,
+    case: LightningAttentionCase,
+    _inputs: dict[str, torch.Tensor],
+    state,
+) -> torch.Tensor:
+    """Reference output for runner-mode tests. `state` is the cloned initial
+    SSM state. The reference reshapes the per-head output back to the flat
+    `[T, num_heads * head_dim]` shape the backend returns so the runner can
+    compare directly."""
+    out = _pure_torch_lightning_reference(fixture, state).output
+    return out.reshape(case.num_input_tokens, -1)

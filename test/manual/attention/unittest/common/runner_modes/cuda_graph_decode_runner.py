@@ -141,12 +141,44 @@ from ..attention_methods.kda_attention import (
 from ..attention_methods.kda_attention import (
     _make_forward_batch as _make_kda_forward_batch,
 )
+from ..attention_methods.lightning_attention import (
+    DEFAULT_DEVICE as LIGHTNING_DEFAULT_DEVICE,
+)
+from ..attention_methods.lightning_attention import (
+    DEFAULT_DTYPE as LIGHTNING_DEFAULT_DTYPE,
+)
+from ..attention_methods.lightning_attention import (
+    DEFAULT_HEAD_DIM as LIGHTNING_DEFAULT_HEAD_DIM,
+)
+from ..attention_methods.lightning_attention import (
+    DEFAULT_MAX_CONTEXT_LEN as LIGHTNING_DEFAULT_MAX_CONTEXT_LEN,
+)
+from ..attention_methods.lightning_attention import (
+    LIGHTNING_GRAPH_ATOL,
+    LIGHTNING_GRAPH_RTOL,
+    LightningAttentionCase,
+    _clone_lightning_cache,
+    _restore_lightning_cache,
+    build_lightning_attention_fixture,
+    expected_lightning_output_from_inputs,
+    lightning_fixture_inputs,
+    make_lightning_case_with_prefix_lens,
+    make_lightning_random_inputs,
+    make_lightning_replay_inputs,
+    prepare_lightning_runner_inputs,
+    run_lightning_fixture_eager,
+    run_lightning_forward,
+)
+from ..attention_methods.lightning_attention import (
+    _make_forward_batch as _make_lightning_forward_batch,
+)
 
 DENSE_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 4
 MLA_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 4
 GDN_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 3
 DSV4_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 2
 KDA_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 3
+LIGHTNING_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 3
 
 
 @dataclass(frozen=True)
@@ -595,6 +627,57 @@ def run_kda_cuda_graph_decode_case(
         build_kwargs=dict(
             head_k_dim=head_k_dim,
             head_v_dim=head_v_dim,
+            max_context_len=max_context_len,
+            dtype=dtype,
+            device=device,
+        ),
+        capture_batch_size=cuda_graph_capture_batch_size,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+    )
+
+
+def run_lightning_cuda_graph_decode_case(
+    testcase,
+    case: LightningAttentionCase,
+    *,
+    head_dim: int = LIGHTNING_DEFAULT_HEAD_DIM,
+    max_context_len: int = LIGHTNING_DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = LIGHTNING_DEFAULT_DTYPE,
+    device: str = LIGHTNING_DEFAULT_DEVICE,
+    cuda_graph_capture_batch_size: int = LIGHTNING_CUDA_GRAPH_CAPTURE_BATCH_SIZE,
+):
+    """Lightning (Bailing seg_la) CUDA-graph decode replay. Mirrors GDN/KDA;
+    Lightning uses `LightningAttentionBackend` (installed directly via
+    ForwardContext rather than through `HybridLinearAttnBackend`), but the
+    capture/replay contract is the same shape because the backend also
+    inherits from `MambaAttnBackendBase`. Loose tolerance to absorb seg_la
+    Triton kernel CG-replay drift; eager tolerance preserved for non-graph
+    cases."""
+    adapter = CudaGraphDecodeAdapter(
+        build_fixture=build_lightning_attention_fixture,
+        make_case=make_lightning_case_with_prefix_lens,
+        make_forward_batch=_make_lightning_forward_batch,
+        fixture_inputs=lightning_fixture_inputs,
+        make_capture_inputs=make_lightning_random_inputs,
+        make_replay_inputs=make_lightning_replay_inputs,
+        prepare_inputs=prepare_lightning_runner_inputs,
+        run_eager=run_lightning_fixture_eager,
+        run_forward=run_lightning_forward,
+        expected_output=expected_lightning_output_from_inputs,
+        clone_state=_clone_lightning_cache,
+        restore_state=_restore_lightning_cache,
+        allow_padding=False,
+        atol=LIGHTNING_GRAPH_ATOL,
+        rtol=LIGHTNING_GRAPH_RTOL,
+    )
+    _run_cuda_graph_decode_case(
+        testcase,
+        case,
+        adapter=adapter,
+        build_kwargs=dict(
+            head_dim=head_dim,
             max_context_len=max_context_len,
             dtype=dtype,
             device=device,

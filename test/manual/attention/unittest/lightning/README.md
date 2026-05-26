@@ -19,7 +19,7 @@ Columns are runner modes; rows are the linear-attention kernel backend
 
 | Linear-attn kernel | Eager Phase 2 | CG decode | PCG extend | BCG extend | Verify eager | Verify CG | DE eager | DE CG | DE-V2 CG | EAGLE-draft runner | EAGLE-DE runner | FKVMTP runner |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `triton` | ✓ 10 input layouts (page 1/16/32, prefix/decode edges) | deferred: Hybrid CG decode + recurrent-cache snapshot path not wired | deferred | deferred | deferred: needs Hybrid recurrent-state buffer wiring | deferred | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
+| `triton` | ✓ 10 input layouts (page 1/16/32, prefix/decode edges) | ✓ decode page-boundary (uses `LIGHTNING_GRAPH_ATOL=1e-1` to absorb seg_la kernel CG-replay drift; eager `LIGHTNING_ATOL=3e-2` kept for non-graph cases) | deferred | deferred | deferred: needs verify-reference adaptation (`expected_lightning_*` only covers DECODE/EXTEND today) | deferred | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
 
 ## Input And Config Coverage
 
@@ -45,8 +45,14 @@ Columns are runner modes; rows are the linear-attention kernel backend
 
 ## Next Work
 
-- Add CUDA graph decode + PCG/BCG runner coverage. Lightning's recurrent
-  state lives in the same `Mamba2CacheParams.temporal` layout as GDN, so the
-  capture/replay flow should be adaptable from `cuda_graph_decode_runner`.
-- Add EAGLE chain/tree speculative target-verify coverage with the matching
-  recurrent-state buffer reset between capture and replay.
+- Add PCG/BCG runner coverage. CG decode already wired via
+  `run_lightning_cuda_graph_decode_case` (see above); the
+  `_clone_lightning_cache` / `_restore_lightning_cache` snapshot helpers
+  reuse `_ssm_states(fixture)` which points at the shared
+  `Mamba2CacheParams.temporal` buffer.
+- Add EAGLE chain/tree speculative target-verify coverage. The verify
+  reference needs to be authored against the seg_la per-token recurrence
+  (today `_pure_torch_lightning_reference` walks `case.input_lens`
+  request-by-request — TARGET_VERIFY draft trees would need a
+  parent-indices-aware variant analogous to KDA's
+  `expected_kda_verify_output_from_inputs`).
