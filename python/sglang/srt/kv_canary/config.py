@@ -42,11 +42,10 @@ class CanaryConfig:
             expected_input_positions[i]; mismatch records a violation. Only useful when something else
             (e.g. token_oracle.oracle_manager.fill_expected_inputs) is feeding the expected_* placeholders
             per forward — canary itself knows no oracle.
-        enable_req_token_ids_check: bool. True = real-model token-id validator. Per forward, build
-            expected_tokens from each req's own ``origin_input_ids + output_ids`` (1-req source-of-truth)
-            and feed them into the same write-kernel input-check path. Independent of input_check_mode /
-            TokenOracleManager — when this flag is on the manager routes fill_expected_inputs to the
-            real-model branch (req-based), not the mock-model oracle branch.
+        enable_req_token_ids_check: bool. True = real-model token-id validator: build
+            expected_tokens from each req's ``origin_input_ids + output_ids`` (snapshotted at
+            ForwardBatch.init_new), routed through the same write-kernel input-check path.
+            Independent of ``input_check_mode``; this branch wins when both are set.
         stats_print_every_n_steps: 0 disables periodic stats logging; positive N prints
             "canary protected N tokens, ran M sweep passes, K violations so far" every N forward steps.
     """

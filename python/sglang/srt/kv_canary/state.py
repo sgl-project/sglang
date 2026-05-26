@@ -83,15 +83,14 @@ class CanaryDeviceState:
             write_position assert. allocate() defaults to 1; CanaryManager zeros it during
             __init__ for the warmup window and mark_init_finished() flips it back to 1.
         req_to_expected_token_ids_pool: Optional int32 device tensor shape
-            [req_to_token_alloc_size, max_context_len]. Mirrors ReqToTokenPool layout (one row
-            per req slot, +1 padding row at index 0). pool[req_idx, p] holds the
-            source-of-truth token at logical position ``p`` for the req currently occupying
-            slot ``req_idx``. Allocated only when
-            ``CanaryConfig.enable_req_token_ids_check`` is True; otherwise None.
+            ``[req_to_token_alloc_size, max_context_len]``. Mirrors ReqToTokenPool layout;
+            ``pool[req_idx, p]`` = source-of-truth token at logical position ``p`` for the
+            req in slot ``req_idx``. Allocated only when
+            ``CanaryConfig.enable_req_token_ids_check`` is True.
         req_to_expected_token_ids_valid_lens: Optional int32 device tensor shape
-            [req_to_token_alloc_size]. ``valid_lens[req_idx]`` = ``len(origin_input_ids) +
-            len(output_ids)`` for the req in slot ``req_idx`` at the latest forward, i.e. the
-            count of pool entries that hold real (verifiable) tokens. Same gate as the pool.
+            ``[req_to_token_alloc_size]``. ``valid_lens[req_idx]`` =
+            ``len(origin_input_ids) + len(output_ids)`` for the req in slot ``req_idx``.
+            Same gate as the pool.
     """
 
     violation_log: ViolationLog

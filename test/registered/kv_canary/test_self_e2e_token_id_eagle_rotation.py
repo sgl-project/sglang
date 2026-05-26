@@ -51,13 +51,10 @@ class _EagleChunkedRotationBase(CanaryE2EBase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.extra_env = {"SGLANG_DISABLE_PR_26329_FIX": "1"} if cls.revert_pr else {}
+        cls.extra_env = {"SGLANG_DEBUG_REVERT_PR": "26329"} if cls.revert_pr else {}
         super().setUpClass()
 
     def test_chunked_rotation_token_id_mismatch(self) -> None:
-        # One long prompt forces ``ceil(prompt_tokens / chunked_prefill_size)``
-        # prefill chunks; the bug fires on the chunk-1 seg-end token's rotated
-        # input_id when ``SGLANG_DISABLE_PR_26329_FIX=1``.
         self.send_parallel_requests(
             n=1,
             assert_all_success=not self.revert_pr,

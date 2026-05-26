@@ -80,12 +80,6 @@ class CanaryE2EBase(CapturedServerE2EBase):
     def setUpClass(cls) -> None:
         cls._cfg = _MODE_CONFIGS[cls.model_mode]
         server_env = os.environ.copy()
-        # Enable the real-model token-id validator by default for every canary
-        # e2e test (bench_speed opts out by not inheriting CanaryE2EBase).
-        # Individual tests can still override via extra_env if they need to
-        # turn it off, but the validator is intentionally on for all logical
-        # correctness tests so a regression in any code path that mutates
-        # input_ids gets caught immediately.
         server_env.setdefault("SGLANG_KV_CANARY_ENABLE_REQ_TOKEN_IDS_CHECK", "1")
         server_env.update(cls.extra_env)
         if cls.model_mode == "swa":

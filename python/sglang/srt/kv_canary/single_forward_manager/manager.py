@@ -291,9 +291,6 @@ class SingleForwardManager:
         forward_batch: "ForwardBatch",
         expected_inputs_out: ExpectedInputs,
     ) -> None:
-        # Real-model branch wins when both flags are on: it has the stronger
-        # source-of-truth (per-req prompt+output) and does not need a mock
-        # oracle.
         if self._config.enable_req_token_ids_check:
             fill_expected_inputs_from_reqs(
                 forward_batch=forward_batch,
