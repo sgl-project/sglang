@@ -23,6 +23,8 @@ struct PlanEntriesParams {
   const int64_t* __restrict__ verify_offsets_scratch;         // [bs_padded + 1] int64 (cumulative prefix sum)
   const int32_t* __restrict__ verify_enable;                  // [1] int32 — 0 ⇒ skip scatter entirely
   const int32_t* __restrict__ req_to_verify_expected_tokens;  // [max_reqs, max_context_len] int32, may be nullptr
+  const int64_t* __restrict__
+      expected_token_pool_valid_lens;  // [bs_padded] int64 per-req snapshot length; nullptr iff pool is null
   // Outputs.
   int64_t* __restrict__ out_verify_slot_indices;        // [verify_capacity] int64
   int64_t* __restrict__ out_verify_expected_tokens;     // [verify_capacity] int64
@@ -33,7 +35,6 @@ struct PlanEntriesParams {
   int64_t verify_capacity;  // out_verify_*[verify_capacity]; scatter is clamped to this length.
   int64_t req_to_token_stride0;
   int64_t req_to_verify_expected_tokens_stride0;
-  int64_t req_to_verify_expected_tokens_size0;
   int32_t kv_token_id_vs_position_offset;  // 0 for target pools; +1 for EAGLE draft.
   int32_t swa_window_size;
 };
@@ -142,7 +143,8 @@ __global__ void plan_entries_persistent_kernel(
     int64_t out_expected_input_id = -1;
     if constexpr (HAS_VERIFY_EXPECTED_TOKEN_POOL) {
       const int64_t sot_pos = out_position + static_cast<int64_t>(params.kv_token_id_vs_position_offset);
-      if (sot_pos >= 0 && sot_pos < params.req_to_verify_expected_tokens_size0) {
+      const int64_t valid_len = params.expected_token_pool_valid_lens[req_id];
+      if (sot_pos >= 0 && sot_pos < valid_len) {
         const int32_t token =
             params.req_to_verify_expected_tokens[rp * params.req_to_verify_expected_tokens_stride0 + sot_pos];
         out_expected_input_id = static_cast<int64_t>(token);
@@ -175,6 +177,7 @@ struct PlanEntriesKernel {
       const tvm::ffi::TensorView verify_offsets_scratch,
       const tvm::ffi::TensorView verify_enable,
       const tvm::ffi::Optional<tvm::ffi::TensorView> req_to_verify_expected_tokens,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> expected_token_pool_valid_lens,
       const tvm::ffi::TensorView out_verify_slot_indices,
       const tvm::ffi::TensorView out_verify_expected_tokens,
       const tvm::ffi::TensorView out_verify_expected_positions,
@@ -224,6 +227,9 @@ struct PlanEntriesKernel {
     RuntimeCheck(
         req_to_verify_expected_tokens.has_value() == HAS_VERIFY_EXPECTED_TOKEN_POOL,
         "req_to_verify_expected_tokens presence does not match HAS_VERIFY_EXPECTED_TOKEN_POOL specialization");
+    RuntimeCheck(
+        expected_token_pool_valid_lens.has_value() == HAS_VERIFY_EXPECTED_TOKEN_POOL,
+        "expected_token_pool_valid_lens presence does not match HAS_VERIFY_EXPECTED_TOKEN_POOL specialization");
     if constexpr (HAS_SWA_LUT) {
       TensorMatcher({Nlut})  //
           .with_dtype<int64_t>()
@@ -235,6 +241,10 @@ struct PlanEntriesKernel {
           .with_dtype<int32_t>()
           .with_device<kDLCUDA>(device_)
           .verify(req_to_verify_expected_tokens.value());
+      TensorMatcher({Nbs})  //
+          .with_dtype<int64_t>()
+          .with_device<kDLCUDA>(device_)
+          .verify(expected_token_pool_valid_lens.value());
     }
     RuntimeCheck(Nscratch.unwrap() >= Nbs.unwrap() + 1, "verify_offsets_scratch length must be >= bs_padded + 1");
 
@@ -252,11 +262,12 @@ struct PlanEntriesKernel {
 
     const int32_t* expected_token_ids_ptr = nullptr;
     int64_t expected_token_ids_stride0 = 0;
-    int64_t expected_token_ids_max_context_len = 0;
+    const int64_t* expected_token_pool_valid_lens_ptr = nullptr;
     if constexpr (HAS_VERIFY_EXPECTED_TOKEN_POOL) {
       expected_token_ids_ptr = static_cast<const int32_t*>(req_to_verify_expected_tokens.value().data_ptr());
       expected_token_ids_stride0 = static_cast<int64_t>(Npool_cols.unwrap());
-      expected_token_ids_max_context_len = static_cast<int64_t>(Npool_cols.unwrap());
+      expected_token_pool_valid_lens_ptr =
+          static_cast<const int64_t*>(expected_token_pool_valid_lens.value().data_ptr());
     }
 
     const PlanEntriesParams params = PlanEntriesParams{
@@ -267,6 +278,7 @@ struct PlanEntriesKernel {
         .verify_offsets_scratch = static_cast<const int64_t*>(verify_offsets_scratch.data_ptr()),
         .verify_enable = static_cast<const int32_t*>(verify_enable.data_ptr()),
         .req_to_verify_expected_tokens = expected_token_ids_ptr,
+        .expected_token_pool_valid_lens = expected_token_pool_valid_lens_ptr,
         .out_verify_slot_indices = static_cast<int64_t*>(out_verify_slot_indices.data_ptr()),
         .out_verify_expected_tokens = static_cast<int64_t*>(out_verify_expected_tokens.data_ptr()),
         .out_verify_expected_positions = static_cast<int64_t*>(out_verify_expected_positions.data_ptr()),
@@ -275,7 +287,6 @@ struct PlanEntriesKernel {
         .verify_capacity = static_cast<int64_t>(Ncap.unwrap()),
         .req_to_token_stride0 = static_cast<int64_t>(Nmax_seq_len.unwrap()),
         .req_to_verify_expected_tokens_stride0 = expected_token_ids_stride0,
-        .req_to_verify_expected_tokens_size0 = expected_token_ids_max_context_len,
         .kv_token_id_vs_position_offset = kv_token_id_vs_position_offset,
         .swa_window_size = swa_window_size,
     };

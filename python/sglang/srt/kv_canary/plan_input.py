@@ -22,6 +22,14 @@ class PlanInput:
             [bs_capacity], int64. Extend → extend_prefix_lens; decode → seq_lens - 1.
         extend_seq_lens: Per-req tokens being written this step, shape [bs_capacity], int64.
             Extend length or all-ones for decode.
+        expected_token_pool_valid_lens: Per-req snapshot length on the verify-token pool,
+            shape [bs_capacity], int64. Equals
+            ``len(req.origin_input_ids) + len(req.output_ids)`` at the moment ``ForwardBatch``
+            was built. The plan kernel uses ``valid_lens[req_id]`` as the upper bound on
+            ``sot_pos`` when gathering the expected token; everything past the snapshot
+            (e.g. EAGLE draft / verify positions, or stale residue from a longer recycled
+            slot owner) returns the ``-1`` sentinel and the verify kernel skips the check.
+            Set only when ``CanaryConfig.enable_verify_token_assert`` is on.
 
     Allocated fresh per forward by :class:`SingleForwardManager`. The boundary
     ForwardBatch token/position/slot tensors must already be int64
@@ -31,11 +39,13 @@ class PlanInput:
     req_pool_indices: torch.Tensor
     prefix_lens: torch.Tensor
     extend_seq_lens: torch.Tensor
+    expected_token_pool_valid_lens: torch.Tensor
 
     def zero_(self) -> None:
         self.req_pool_indices.zero_()
         self.prefix_lens.zero_()
         self.extend_seq_lens.zero_()
+        self.expected_token_pool_valid_lens.zero_()
 
     @classmethod
     def allocate(
@@ -48,6 +58,9 @@ class PlanInput:
             req_pool_indices=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
             prefix_lens=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
             extend_seq_lens=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
+            expected_token_pool_valid_lens=torch.zeros(
+                bs_capacity, dtype=torch.int64, device=device
+            ),
         )
 
     def fill_from_forward_batch(self, *, forward_batch: "ForwardBatch") -> None:
@@ -69,6 +82,15 @@ class PlanInput:
             out_extend_seq_lens=self.extend_seq_lens[:bs],
             bs=bs,
         )
+
+        # Mirror the snapshot lens already captured on the forward batch. Padding rows
+        # stay at zero from ``zero_()`` so the plan kernel reads ``valid_len == 0`` and
+        # emits the ``-1`` sentinel for them.
+        req_all_ids_lens = forward_batch.req_all_ids_lens
+        if req_all_ids_lens is not None:
+            self.expected_token_pool_valid_lens[:bs].copy_(
+                req_all_ids_lens.to(torch.int64), non_blocking=True
+            )
 
 
 def _extract_prefix_lens_and_extend_seq_lens(
