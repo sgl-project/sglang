@@ -371,7 +371,9 @@ class TestPriorityPriority(ScriptedRuntimeTestCase):
 
     def test_priority_preempt_with_chunked_admission_same_yield(self):
         """Same yield: high-priority R1 + new long chunked R2 land while low-priority R3 runs; R3 preempted, R2 chunks_done starts; both finish."""
-        self.runtime.run(self._script_priority_preempt_with_chunked_admission_same_yield)
+        self.runtime.run(
+            self._script_priority_preempt_with_chunked_admission_same_yield
+        )
 
     # same-yield priority preempt + chunked admission combo.
     # Low-priority R3 is mid-flight; on the same yield we submit a
