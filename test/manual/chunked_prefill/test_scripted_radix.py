@@ -97,7 +97,8 @@ class TestScriptedRadix(CustomTestCase):
         yield from run_until_finished(r1)
 
         others = [
-            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2) for _ in range(9)
+            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+            for _ in range(9)
         ]
         yield from run_until_all_finished(others)
         for r in others:
@@ -358,9 +359,13 @@ class TestScriptedRadix(CustomTestCase):
         # observably take the "skip chunked-resume in priority calc" branch.
         # NEW API NEEDED: t.last_admission_path() returns the most recent
         # admission branch label, e.g. "priority_skip_chunked_resume".
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="high")
+        r1 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="high"
+        )
         yield from run_until(r1, lambda h: h.is_chunking)
-        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="low")
+        r2 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="low"
+        )
         saw_skip = False
         while not (r1.finished and r2.finished):
             path = t.last_admission_path()
@@ -371,7 +376,9 @@ class TestScriptedRadix(CustomTestCase):
             saw_skip
         ), "expected priority-skip-chunked-resume branch to fire at least once"
 
-    @unittest.skip("needs ScriptedRuntime radix hit_count query — wire up when t.engine_stats() exposes radix hit_count")
+    @unittest.skip(
+        "needs ScriptedRuntime radix hit_count query — wire up when t.engine_stats() exposes radix hit_count"
+    )
     def test_radix_chunked_stash_no_hit_count_inflation(self):
         """Chunked re-insert does not inflate radix hit_count via the self-referencing stash path."""
         execute_scripted_runtime(
@@ -393,18 +400,16 @@ class TestScriptedRadix(CustomTestCase):
         # prefix should be exactly 1 (the req's own lock_ref).
         stats = t.engine_stats()
         hit_count_first = stats["radix_hit_count_for_inflight_chunked"]
-        assert hit_count_first == 1, (
-            f"radix hit_count should be 1 at first commit, got {hit_count_first}"
-        )
+        assert (
+            hit_count_first == 1
+        ), f"radix hit_count should be 1 at first commit, got {hit_count_first}"
         # Drive through several more chunks; hit_count must not climb.
         for _ in range(20):
             if r.finished:
                 break
             stats = t.engine_stats()
             cur = stats["radix_hit_count_for_inflight_chunked"]
-            assert cur == 1, (
-                f"radix hit_count inflated by chunked re-insert: {cur} > 1"
-            )
+            assert cur == 1, f"radix hit_count inflated by chunked re-insert: {cur} > 1"
             yield
         yield from run_until_finished(r)
         assert r.finished
@@ -482,9 +487,9 @@ class TestScriptedRadix(CustomTestCase):
         r = t.start_req(prompt_len=prompt_len, max_new_tokens=2)
         yield from run_until_finished(r, max_steps=400)
         assert r.finished
-        assert r.chunks_done == 0, (
-            f"full prefix hit must skip chunked path; got chunks_done={r.chunks_done}"
-        )
+        assert (
+            r.chunks_done == 0
+        ), f"full prefix hit must skip chunked path; got chunks_done={r.chunks_done}"
 
     def test_radix_evict_race_concurrent_chunked_admit(self):
         """Radix evict racing a chunked admission acquires lock_ref before any page release."""
