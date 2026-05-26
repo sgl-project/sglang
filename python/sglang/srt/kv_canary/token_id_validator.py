@@ -136,9 +136,7 @@ def fill_expected_inputs_from_reqs(
     expected_inputs_out.positions[:num_tokens].copy_(positions.to(torch.int64))
 
     if pool is not None and valid_lens is not None and valid_lens_cpu is not None:
-        _refresh_pool_rows(
-            pool=pool, valid_lens=valid_lens, updates=pool_row_updates
-        )
+        _refresh_pool_rows(pool=pool, valid_lens=valid_lens, updates=pool_row_updates)
         valid_lens.copy_(
             torch.tensor(valid_lens_cpu, dtype=torch.int32, device=valid_lens.device)
         )
