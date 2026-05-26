@@ -30,7 +30,7 @@ def launch_plan_entries_kernel(
     verify_offsets_scratch: torch.Tensor,
     verify_enable: torch.Tensor,
     out_verify_slot_indices: torch.Tensor,
-    out_verify_positions: torch.Tensor,
+    out_verify_expected_positions: torch.Tensor,
     out_verify_prev_slot_indices: torch.Tensor,
     swa_window_size: int,
 ) -> None:
@@ -43,7 +43,7 @@ def launch_plan_entries_kernel(
         verify_offsets_scratch,
         verify_enable,
         out_verify_slot_indices,
-        out_verify_positions,
+        out_verify_expected_positions,
         out_verify_prev_slot_indices,
         int(swa_window_size),
     )

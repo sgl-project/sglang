@@ -251,7 +251,7 @@ def test_plan_byte_equal_across_repeated_launches_10x() -> None:
 
         n_verify = int(triton_v.verify_num_valid[0].item())
         snapshot_slots.append(triton_v.verify_slot_indices[:n_verify].clone())
-        snapshot_positions.append(triton_v.verify_positions[:n_verify].clone())
+        snapshot_positions.append(triton_v.verify_expected_positions[:n_verify].clone())
         snapshot_prevs.append(triton_v.verify_prev_slot_indices[:n_verify].clone())
         snapshot_write_offsets.append(triton_w.write_offsets.clone())
 
@@ -261,7 +261,7 @@ def test_plan_byte_equal_across_repeated_launches_10x() -> None:
         ), f"verify_slot_indices differs between launch 0 and {i}"
         assert torch.equal(
             snapshot_positions[0], snapshot_positions[i]
-        ), f"verify_positions differs between launch 0 and {i}"
+        ), f"verify_expected_positions differs between launch 0 and {i}"
         assert torch.equal(
             snapshot_prevs[0], snapshot_prevs[i]
         ), f"verify_prev_slot_indices differs between launch 0 and {i}"

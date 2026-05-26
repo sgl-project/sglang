@@ -136,7 +136,7 @@ def launch_canary_plan_kernels(
         verify_offsets_scratch=verify_offsets_scratch,
         verify_enable=verify_plan_out.enable,
         out_verify_slot_indices=verify_plan_out.verify_slot_indices,
-        out_verify_positions=verify_plan_out.verify_positions,
+        out_verify_expected_positions=verify_plan_out.verify_expected_positions,
         out_verify_prev_slot_indices=verify_plan_out.verify_prev_slot_indices,
         swa_window_size=int(swa_window_size),
     )

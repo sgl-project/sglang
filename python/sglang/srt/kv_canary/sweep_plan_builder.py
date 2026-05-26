@@ -51,7 +51,7 @@ def build_verify_plan_radix_sweep(
     verify_plan = VerifyPlan.allocate(verify_capacity=max(1, num_valid), device=device)
 
     verify_plan.verify_slot_indices[:num_valid].copy_(slot_indices)
-    verify_plan.verify_positions[:num_valid].copy_(positions)
+    verify_plan.verify_expected_positions[:num_valid].copy_(positions)
     verify_plan.verify_prev_slot_indices[:num_valid].copy_(prev_slot_indices)
     verify_plan.verify_num_valid.fill_(num_valid)
     verify_plan.enable.fill_(1)

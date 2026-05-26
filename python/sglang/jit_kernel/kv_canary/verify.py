@@ -172,7 +172,7 @@ class VerifyPlan:
     Fields:
         verify_slot_indices: Canary slot index per entry, shape [verify_capacity], int64. Already SWA-translated
             for the SWA group.
-        verify_positions: Expected sequence position per entry, shape [verify_capacity], int64.
+        verify_expected_positions: Expected sequence position per entry, shape [verify_capacity], int64.
         verify_prev_slot_indices: Chain predecessor slot per entry, shape [verify_capacity], int64. -1 = chain
             head (anchor on CANARY_CHAIN_ANCHOR). Explicit (not derived from verify_slot_indices[i-1])
             because chain heads, SWA window starts, cross-req boundaries, and radix-orphan extras break the
@@ -185,7 +185,7 @@ class VerifyPlan:
     """
 
     verify_slot_indices: torch.Tensor
-    verify_positions: torch.Tensor
+    verify_expected_positions: torch.Tensor
     verify_prev_slot_indices: torch.Tensor
     verify_num_valid: torch.Tensor
     enable: torch.Tensor
@@ -200,7 +200,7 @@ class VerifyPlan:
             verify_slot_indices=torch.empty(
                 verify_capacity, dtype=torch.int64, device=device
             ),
-            verify_positions=torch.empty(
+            verify_expected_positions=torch.empty(
                 verify_capacity, dtype=torch.int64, device=device
             ),
             verify_prev_slot_indices=torch.empty(
@@ -217,7 +217,7 @@ class VerifyPlan:
         """WARN: ONLY use it when testing plan kernel. Do not use it when testing verify or
         write kernel to avoid hiding bugs."""
         self.verify_slot_indices.zero_()
-        self.verify_positions.zero_()
+        self.verify_expected_positions.zero_()
         self.verify_prev_slot_indices.zero_()
         self.verify_num_valid.zero_()
         self.enable.zero_()
@@ -299,7 +299,7 @@ def launch_canary_verify_kernel(
 
     _assert_contiguous(canary_buf, "canary_buf")
     _assert_contiguous(plan.verify_slot_indices, "plan.verify_slot_indices")
-    _assert_contiguous(plan.verify_positions, "plan.verify_positions")
+    _assert_contiguous(plan.verify_expected_positions, "plan.verify_expected_positions")
     _assert_contiguous(plan.verify_prev_slot_indices, "plan.verify_prev_slot_indices")
     _assert_contiguous(plan.verify_num_valid, "plan.verify_num_valid")
     _assert_contiguous(plan.enable, "plan.enable")
@@ -316,7 +316,7 @@ def launch_canary_verify_kernel(
     module.canary_verify_step_cuda(
         canary_buf,
         plan.verify_slot_indices,
-        plan.verify_positions,
+        plan.verify_expected_positions,
         plan.verify_prev_slot_indices,
         plan.verify_num_valid,
         plan.enable,

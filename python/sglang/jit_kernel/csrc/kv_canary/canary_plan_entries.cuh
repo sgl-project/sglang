@@ -23,9 +23,9 @@ struct PlanEntriesParams {
   const int64_t* __restrict__ verify_offsets_scratch;  // [bs_padded + 1] int64 (cumulative prefix sum)
   const int32_t* __restrict__ verify_enable;           // [1] int32 — 0 ⇒ skip scatter entirely
   // Outputs.
-  int64_t* __restrict__ out_verify_slot_indices;       // [verify_capacity] int64
-  int64_t* __restrict__ out_verify_positions;          // [verify_capacity] int64
-  int64_t* __restrict__ out_verify_prev_slot_indices;  // [verify_capacity] int64
+  int64_t* __restrict__ out_verify_slot_indices;        // [verify_capacity] int64
+  int64_t* __restrict__ out_verify_expected_positions;  // [verify_capacity] int64
+  int64_t* __restrict__ out_verify_prev_slot_indices;   // [verify_capacity] int64
   // Sizes / strides.
   int32_t bs_padded;
   int64_t verify_capacity;  // out_verify_*[verify_capacity]; scatter is clamped to this length.
@@ -134,7 +134,7 @@ __global__ void plan_entries_persistent_kernel(
 
     // 4) Scatter. out_idx == tid since verify_offsets[req_id] + entry_idx == tid by construction.
     params.out_verify_slot_indices[tid] = out_slot;
-    params.out_verify_positions[tid] = out_position;
+    params.out_verify_expected_positions[tid] = out_position;
     params.out_verify_prev_slot_indices[tid] = out_prev_slot;
   }
 }
@@ -156,7 +156,7 @@ struct PlanEntriesKernel {
       const tvm::ffi::TensorView verify_offsets_scratch,
       const tvm::ffi::TensorView verify_enable,
       const tvm::ffi::TensorView out_verify_slot_indices,
-      const tvm::ffi::TensorView out_verify_positions,
+      const tvm::ffi::TensorView out_verify_expected_positions,
       const tvm::ffi::TensorView out_verify_prev_slot_indices,
       int32_t swa_window_size) {
     using namespace host;
@@ -187,7 +187,7 @@ struct PlanEntriesKernel {
         .with_dtype<int64_t>()
         .with_device<kDLCUDA>(device_)
         .verify(out_verify_slot_indices)
-        .verify(out_verify_positions)
+        .verify(out_verify_expected_positions)
         .verify(out_verify_prev_slot_indices);
     TensorMatcher({Nmax_reqs, Nmax_seq_len})  //
         .with_dtype<int32_t>()
@@ -219,7 +219,7 @@ struct PlanEntriesKernel {
         .verify_offsets_scratch = static_cast<const int64_t*>(verify_offsets_scratch.data_ptr()),
         .verify_enable = static_cast<const int32_t*>(verify_enable.data_ptr()),
         .out_verify_slot_indices = static_cast<int64_t*>(out_verify_slot_indices.data_ptr()),
-        .out_verify_positions = static_cast<int64_t*>(out_verify_positions.data_ptr()),
+        .out_verify_expected_positions = static_cast<int64_t*>(out_verify_expected_positions.data_ptr()),
         .out_verify_prev_slot_indices = static_cast<int64_t*>(out_verify_prev_slot_indices.data_ptr()),
         .bs_padded = static_cast<int32_t>(bs_padded),
         .verify_capacity = static_cast<int64_t>(Ncap.unwrap()),

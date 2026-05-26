@@ -115,7 +115,7 @@ class PlanInvariants:
             tail_end <= n_valid
         ), f"extras tail {tail_end} exceeds verify_num_valid {n_valid}"
         plan_slots = verify_plan.verify_slot_indices[tail_start:tail_end]
-        plan_positions = verify_plan.verify_positions[tail_start:tail_end]
+        plan_positions = verify_plan.verify_expected_positions[tail_start:tail_end]
         plan_prevs = verify_plan.verify_prev_slot_indices[tail_start:tail_end]
         assert torch.equal(plan_slots, extras_slot_indices[:extras_count])
         assert torch.equal(plan_positions, extras_positions[:extras_count])
@@ -150,7 +150,10 @@ class PlanInvariants:
         if derived_verify_count == 0:
             return
         positions_cpu = (
-            verify_plan.verify_positions[:derived_verify_count].detach().cpu().tolist()
+            verify_plan.verify_expected_positions[:derived_verify_count]
+            .detach()
+            .cpu()
+            .tolist()
         )
         prevs_cpu = (
             verify_plan.verify_prev_slot_indices[:derived_verify_count]

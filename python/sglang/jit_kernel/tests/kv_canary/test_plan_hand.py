@@ -494,7 +494,7 @@ class TestSwa:
         triton_v = plans[0][0]
         assert int(triton_v.verify_num_valid[0].item()) == 128
         # First verify entry should be at position 72.
-        assert int(triton_v.verify_positions[0].item()) == 72
+        assert int(triton_v.verify_expected_positions[0].item()) == 72
 
     def test_swa_lut_translates_verify_slots(self) -> None:
         """FULL slot → SWA slot translation is performed inside the plan kernel for verify_slot_indices."""
@@ -768,7 +768,9 @@ class TestMisc:
             assert torch.equal(
                 run1_v.verify_slot_indices, run2_v.verify_slot_indices
             ), label
-            assert torch.equal(run1_v.verify_positions, run2_v.verify_positions), label
+            assert torch.equal(
+                run1_v.verify_expected_positions, run2_v.verify_expected_positions
+            ), label
             assert torch.equal(
                 run1_v.verify_prev_slot_indices, run2_v.verify_prev_slot_indices
             ), label
@@ -880,8 +882,8 @@ class TestVerifyContent:
 
         assert int(plans[0][0].verify_num_valid[0].item()) == sum(prefix_values)
 
-    def test_plan_verify_positions_strictly_increment_per_req(self) -> None:
-        """Per req, verify_positions[verify_offsets[r]:verify_offsets[r+1]] == [window_start..prefix-1]."""
+    def test_plan_verify_expected_positions_strictly_increment_per_req(self) -> None:
+        """Per req, verify_expected_positions[verify_offsets[r]:verify_offsets[r+1]] == [window_start..prefix-1]."""
         req_to_token = make_req_to_token(
             kind="linear", max_reqs=4, max_seq_len=32, device=_DEVICE
         )
@@ -897,8 +899,8 @@ class TestVerifyContent:
 
         triton_v = plans[0][0]
         # Req 0: positions [0..5); Req 1: positions [0..8).
-        req0_positions = triton_v.verify_positions[:5].cpu().tolist()
-        req1_positions = triton_v.verify_positions[5:13].cpu().tolist()
+        req0_positions = triton_v.verify_expected_positions[:5].cpu().tolist()
+        req1_positions = triton_v.verify_expected_positions[5:13].cpu().tolist()
         assert req0_positions == [0, 1, 2, 3, 4]
         assert req1_positions == [0, 1, 2, 3, 4, 5, 6, 7]
 

@@ -170,9 +170,9 @@ def _materialize_verify_entries(
             verify_plan_out.verify_slot_indices.device
         )
     )
-    verify_plan_out.verify_positions[:total_verify].copy_(
-        positions_t.to(verify_plan_out.verify_positions.dtype).to(
-            verify_plan_out.verify_positions.device
+    verify_plan_out.verify_expected_positions[:total_verify].copy_(
+        positions_t.to(verify_plan_out.verify_expected_positions.dtype).to(
+            verify_plan_out.verify_expected_positions.device
         )
     )
     verify_plan_out.verify_prev_slot_indices[:total_verify].copy_(
