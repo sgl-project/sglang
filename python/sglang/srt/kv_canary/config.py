@@ -44,8 +44,8 @@ class CanaryConfig:
             per forward — canary itself knows no oracle.
         enable_req_token_ids_check: bool. True = real-model token-id validator: build
             expected_tokens from each req's ``origin_input_ids + output_ids`` (snapshotted at
-            ForwardBatch.init_new), routed through the same write-kernel input-check path.
-            Independent of ``input_check_mode``; this branch wins when both are set.
+            ForwardBatch.init_new) and compare against the canary's stored tokens at verify time.
+            Independent of ``input_check_mode``.
         stats_print_every_n_steps: 0 disables periodic stats logging; positive N prints
             "canary protected N tokens, ran M sweep passes, K violations so far" every N forward steps.
     """

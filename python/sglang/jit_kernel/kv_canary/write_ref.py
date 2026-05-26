@@ -140,9 +140,7 @@ def launch_canary_write_kernel_torch_reference(
                 mismatch_bits = consts.FailReason(0)
                 expected_token = int(expected_input_tokens_host[entry_idx].item())
                 expected_position = int(expected_input_positions_host[entry_idx].item())
-                # ``expected_token == -1`` is the plan-side sentinel for "skip token check"
-                # (out-of-range write entry or pool absent). Mirror canary_write.cuh.
-                if expected_token != -1 and token != expected_token:
+                if token != expected_token:
                     mismatch_bits |= consts.FailReason.WRITE_TOKEN_MISMATCH
                 if position != expected_position:
                     mismatch_bits |= consts.FailReason.WRITE_POSITION_MISMATCH

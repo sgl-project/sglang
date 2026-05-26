@@ -110,10 +110,7 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
       const int64_t expected_token = p.expected_input_tokens[entry_idx];
       const int64_t expected_position = p.expected_input_positions[entry_idx];
       FailReason mismatch_bits{};
-      // ``expected_token == -1`` is the plan-side sentinel for "no source-of-truth available for this
-      // write entry" (out-of-range vs valid_lens, or pool absent). Skip the token-mismatch check;
-      // position is still compared because the position kernel always has a deterministic answer.
-      if (expected_token != -1 && token != expected_token) {
+      if (token != expected_token) {
         mismatch_bits |= FailReason::kWriteTokenMismatch;
       }
       if (position != expected_position) {

@@ -49,9 +49,7 @@ class CanaryBufferGroup:
         slot_token_offset: Logical-position offset between a canary slot and the source-of-truth token it
             fingerprints. 0 for target-style pools (slot ``p`` stores K/V for token at position ``p``); 1 for
             EAGLE draft pools where the input_ids rotation makes slot ``p`` store K/V for token at position
-            ``p + 1``. Plan-side ``plan_write_expected_tokens_kernel`` adds this offset to each write entry's
-            ``write_pos`` before gathering the expected token from
-            ``CanaryDeviceState.req_to_expected_token_ids_pool``.
+            ``p + 1``.
     """
 
     kind: PoolKind

@@ -11,9 +11,6 @@ from sglang.jit_kernel.kv_canary.plan.offsets_kernel import (
     _PLAN_BS_BLOCK_SIZE,
     launch_plan_offsets_kernel,
 )
-from sglang.jit_kernel.kv_canary.plan.write_expected_tokens_kernel import (
-    launch_plan_write_expected_tokens_kernel,
-)
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
 
@@ -29,10 +26,6 @@ def launch_canary_plan_kernels(
     swa_window_size: int,
     full_to_swa_index_mapping: Optional[torch.Tensor],
     verify_capacity: int,
-    expected_token_pool: Optional[torch.Tensor] = None,
-    expected_token_valid_lens: Optional[torch.Tensor] = None,
-    slot_token_offset: int = 0,
-    out_expected_input_tokens: Optional[torch.Tensor] = None,
 ) -> None:
     """Fill verify_plan_out + write_plan_out from normalized canary plan inputs.
 
@@ -147,14 +140,3 @@ def launch_canary_plan_kernels(
         out_verify_prev_slot_indices=verify_plan_out.verify_prev_slot_indices,
         swa_window_size=int(swa_window_size),
     )
-
-    if out_expected_input_tokens is not None:
-        launch_plan_write_expected_tokens_kernel(
-            req_pool_indices=req_pool_indices,
-            prefix_lens=prefix_lens,
-            write_offsets=write_plan_out.write_offsets,
-            expected_token_pool=expected_token_pool,
-            expected_token_valid_lens=expected_token_valid_lens,
-            out_expected_input_tokens=out_expected_input_tokens,
-            slot_token_offset=int(slot_token_offset),
-        )
