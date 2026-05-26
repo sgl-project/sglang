@@ -147,16 +147,22 @@ def _scatter_req_token_ids_kernel(
     req_idx = tl.sum(le.to(tl.int32), axis=1) - 1  # [TOKEN_BLOCK] int32
 
     safe_req_idx = tl.where(tid_mask, req_idx, 0)  # [TOKEN_BLOCK] int32
-    starts = tl.load(offsets_ptr + safe_req_idx, mask=tid_mask, other=0)  # [TOKEN_BLOCK] int64
+    starts = tl.load(
+        offsets_ptr + safe_req_idx, mask=tid_mask, other=0
+    )  # [TOKEN_BLOCK] int64
     pos = tids - starts  # [TOKEN_BLOCK] int64
-    rp = tl.load(req_pool_indices_ptr + safe_req_idx, mask=tid_mask, other=0)  # [TOKEN_BLOCK] int64
+    rp = tl.load(
+        req_pool_indices_ptr + safe_req_idx, mask=tid_mask, other=0
+    )  # [TOKEN_BLOCK] int64
 
     # Bound writes by the pool's max_context_len so a token sequence longer than the
     # ReqToTokenPool row never spills into an adjacent row.
     in_row = pos < pool_max_context_len  # [TOKEN_BLOCK] bool
     write_mask = tid_mask & in_row  # [TOKEN_BLOCK] bool
 
-    val = tl.load(flat_in_ptr + tids, mask=tid_mask, other=0).to(tl.int32)  # [TOKEN_BLOCK] int32
+    val = tl.load(flat_in_ptr + tids, mask=tid_mask, other=0).to(
+        tl.int32
+    )  # [TOKEN_BLOCK] int32
     tl.store(pool_out_ptr + rp * pool_stride0 + pos, val, mask=write_mask)
 
 
