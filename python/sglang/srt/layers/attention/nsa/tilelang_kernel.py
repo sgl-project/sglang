@@ -1383,6 +1383,8 @@ def tilelang_sparse_fwd(
                     if _flydsl_mode == "1" or _flydsl_available():
                         indices_2d = indices.squeeze(1)  # [total_tokens, topk]
                         kv_2d = kv.squeeze(1)            # [num_pages, head_dim]
+                        import logging
+                        logging.getLogger(__name__).info("[FlyDSL] dispatching kernel q=%s kv=%s", q.shape, kv_2d.shape)
                         return flydsl_nsa_prefill(
                             q=q,
                             kv=kv_2d,
@@ -1390,6 +1392,11 @@ def tilelang_sparse_fwd(
                             sm_scale=sm_scale,
                         )
                 except Exception:
+                    import traceback, logging
+                    logging.getLogger(__name__).warning(
+                        "[FlyDSL] kernel failed, falling back:\n%s",
+                        traceback.format_exc()
+                    )
                     pass  # fall through to Triton / TileLang
 
             from sglang.srt.layers.attention.nsa.triton_decode.triton_mla_kernels_prefill_fused import (
