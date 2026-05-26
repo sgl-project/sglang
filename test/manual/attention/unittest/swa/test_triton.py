@@ -16,6 +16,7 @@ from common.dense_attention import (
     make_swa_prefix_input_config_cases,
     run_dense_attention_case,
 )
+from common.spec_runner import run_dense_spec_verify_case
 from common.split_op_runner import run_dense_split_op_extend_case
 
 
@@ -66,6 +67,36 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
             4,
         ),
     )
+    SPEC_VERIFY_CASES = (
+        (
+            DenseAttentionCase(
+                name="runner_eagle_verify_swa_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(3, 5),
+                extend_lens=(3, 3),
+                sliding_window_size=4,
+            ),
+            1,
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_eagle_verify_swa_tree",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(3, 5),
+                extend_lens=(3, 3),
+                sliding_window_size=4,
+            ),
+            2,
+        ),
+    )
 
     def test_projected_swa_attention_cases(self):
         for case in self.CASES:
@@ -92,6 +123,11 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
                         breakable=breakable,
                         static_num_tokens=static_num_tokens,
                     )
+
+    def test_runner_mode_spec_verify_cases(self):
+        for case, topk in self.SPEC_VERIFY_CASES:
+            with self.subTest(case=case.name, backend=case.backend, topk=topk):
+                run_dense_spec_verify_case(self, case, topk=topk, spec_kind="eagle")
 
 
 if __name__ == "__main__":

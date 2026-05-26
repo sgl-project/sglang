@@ -49,7 +49,8 @@ Implemented:
   metadata for `FrozenKVMTPVerifyInput`, `DFlashVerifyInput`, and
   `NgramVerifyInput`. Dense `flashinfer` also covers `DRAFT_EXTEND` with ragged
   accepted-token counts for both EAGLE and Frozen-KV MTP draft-extend input tags.
-  MLA `triton` covers EAGLE `TARGET_VERIFY` chain masks.
+  SWA `triton` covers EAGLE `TARGET_VERIFY` chain and tree masks combined with a
+  finite sliding window. MLA `triton` covers EAGLE `TARGET_VERIFY` chain masks.
 - The synthetic EAGLE verify helper uses realistic target-verify semantics:
   `ForwardBatch.seq_lens` represents prefix KV lengths, while `spec_info`
   supplies the draft tokens, positions, retrieve indices, and custom tree mask.
@@ -65,6 +66,10 @@ Implemented:
   reference on replay for both `triton` and `flashinfer`. This should be addressed
   with a production `CudaGraphRunner`-shaped fixture, or by fixing the replay
   metadata semantics, before adding green tests.
+- FlashInfer SWA `TARGET_VERIFY` is intentionally not enabled yet. The current
+  FlashInfer sliding-window metadata updater expects prefix lengths that are not
+  supplied by the target-verify path (`prefix_lens=None`), so the Triton SWA spec
+  tests cover the interaction for now.
 - Dense input-config cases now cover page size 1, zero-prefix exact page,
   zero-prefix input lengths below/equal/above a page, prefix-length exact page,
   total-length exact page, total-length crossing a page boundary, ragged
@@ -119,6 +124,8 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
+- `python -m py_compile test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/common/spec_runner.py`
+- `python test/manual/attention/unittest/swa/test_triton.py -v`
 - `python -m py_compile test/manual/attention/unittest/common/spec_runner.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py`
 - `python test/manual/attention/unittest/dense/test_triton.py -v`
 - `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
@@ -544,11 +551,14 @@ Current Layer A status:
   coverage, plus Frozen-KV MTP, DFlash, and NGRAM chain verify metadata coverage.
 - Dense `flashinfer`: EAGLE and Frozen-KV MTP `DRAFT_EXTEND` ragged accepted-token
   coverage.
+- SWA `triton`: EAGLE `TARGET_VERIFY` chain/tree custom-mask coverage with sliding
+  window enabled.
 - MLA `triton`: `TARGET_VERIFY` chain custom-mask coverage.
 - Deferred: Triton `DRAFT_EXTEND` until the fixture/reference semantics are
   clarified; target-verify CUDA-graph replay until the production runner-buffer path
-  is represented faithfully; GDN speculative verify until recurrent speculative-state
-  setup is represented faithfully.
+  is represented faithfully; FlashInfer SWA target verify until prefix-lens metadata
+  is available in its sliding-window updater; GDN speculative verify until recurrent
+  speculative-state setup is represented faithfully.
 
 #### Layer B: worker and draft-runner integration tests
 
