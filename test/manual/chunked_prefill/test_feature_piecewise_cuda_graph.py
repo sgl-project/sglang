@@ -24,8 +24,8 @@ Not registered with CI. Run by hand from
 """
 
 import unittest
-from test.manual.chunked_prefill.common import ChunkedRefactorTestBase
 
+from sglang.test.chunked_prefill_test_utils import ChunkedRefactorTestBase
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 

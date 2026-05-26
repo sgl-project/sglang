@@ -16,12 +16,12 @@ Not registered with CI. Run by hand from
 """
 
 import unittest
-from test.manual.chunked_prefill.common import (
+from typing import ClassVar
+
+from sglang.test.chunked_prefill_test_utils import (
     KV_CANARY_ARGS,
     ChunkedRefactorTestBase,
 )
-from typing import ClassVar
-
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )

@@ -24,7 +24,8 @@ Not registered with CI. Run by hand from
 """
 
 import unittest
-from test.manual.chunked_prefill.common import (
+
+from sglang.test.chunked_prefill_test_utils import (
     LONG_PROMPT_NUM_SHOTS,
     ChunkedRefactorTestBase,
 )
