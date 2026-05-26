@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
@@ -2194,6 +2195,11 @@ class NativeSparseAttnBackend(
 
         # Set MLA implementation only if not using MHA
         if not self.use_mha and self.enable_auto_select_prefill_impl:
+            # FlyDSL override: force tilelang path which dispatches to FlyDSL kernel
+            if os.environ.get("SGLANG_FLYDSL_PREFILL", "auto") not in ("0",):
+                if self.nsa_kv_cache_store_fp8:
+                    self.nsa_prefill_impl = "tilelang"
+                    return
             if self.nsa_kv_cache_store_fp8:
                 if (
                     is_blackwell()
