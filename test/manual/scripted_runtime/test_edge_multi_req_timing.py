@@ -32,16 +32,20 @@ def _script_hundred_short_reqs(t: ScriptedRuntime):
 
 def _script_two_hundred_short_reqs(t: ScriptedRuntime):
     # 200 short reqs: stability check.
+    # max_steps bumped to 20000 because per-yield admission is bounded
+    # by max_running_requests; engine default may admit far fewer than
+    # 200 per step.
     reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(200)]
-    yield from run_until_all_finished(reqs, max_steps=4000)
+    yield from run_until_all_finished(reqs, max_steps=20000)
     for r in reqs:
         assert r.finished
 
 
 def _script_five_hundred_short_reqs(t: ScriptedRuntime):
     # 500 short reqs: sustained pressure.
+    # max_steps bumped to 20000 for the same reason as the 200-req case.
     reqs = [t.start_req(prompt_len=8, max_new_tokens=1) for _ in range(500)]
-    yield from run_until_all_finished(reqs, max_steps=8000)
+    yield from run_until_all_finished(reqs, max_steps=20000)
     for r in reqs:
         assert r.finished
 
@@ -111,6 +115,9 @@ def _script_trickle_per_yield_50(t: ScriptedRuntime):
 
 def _script_submit_then_immediate_abort(t: ScriptedRuntime):
     # start_req then abort in same yield step: clean state.
+    # Note: same-step abort vs admission ordering is impl-defined;
+    # assertion holds either way (whether or not the req was admitted
+    # before the abort took effect, no KV/row should remain after).
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     t.abort(r)
     yield
