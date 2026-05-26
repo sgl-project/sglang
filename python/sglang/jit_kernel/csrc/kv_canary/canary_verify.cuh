@@ -91,17 +91,14 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
     if (stored_chain_hash != expected_chain_hash) {
       fail_reason_bits |= FailReason::kChainHash;
     }
+    if (expected_input_id != -1 && stored_token != expected_input_id) {
+      fail_reason_bits |= FailReason::kVerifyTokenMismatch;
+    }
     if (stored_position != expected_position) {
       fail_reason_bits |= FailReason::kPosition;
     }
     if (stored_real_kv_hash != expected_real_kv_hash) {
       fail_reason_bits |= FailReason::kRealKvHash;
-    }
-    // ``expected_input_id == -1`` is the plan-side sentinel for "no source-of-truth available for
-    // this entry" (out-of-range vs valid_lens, pool absent, or sweep over orphan slots). Skip the
-    // token-mismatch check in that case; otherwise compare against the canary slot's stored token.
-    if (expected_input_id != -1 && stored_token != expected_input_id) {
-      fail_reason_bits |= FailReason::kVerifyTokenMismatch;
     }
 
     if (fail_reason_bits != FailReason{}) {
