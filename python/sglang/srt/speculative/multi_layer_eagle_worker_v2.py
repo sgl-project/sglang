@@ -48,6 +48,7 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
+    maybe_detect_inf,
     maybe_detect_nan,
     maybe_detect_oob,
     record_stream_each,
@@ -425,6 +426,10 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 output.logits_output.next_token_logits,
                 f"draft_extend_for_prefill step {step}",
             )
+            maybe_detect_inf(
+                output.logits_output.next_token_logits,
+                f"draft_extend_for_prefill step {step}",
+            )
             probs = torch.softmax(output.logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             topk_p_list.append(topk_p)
@@ -764,6 +769,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
 
         # Sample
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
+        maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
         (
             predict,
             accept_lens,

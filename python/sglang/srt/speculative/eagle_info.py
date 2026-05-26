@@ -374,6 +374,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         sampling_info.top_ps, self.draft_token_num, dim=0
                     ),
                 )
+                maybe_detect_nan(
+                    target_probs, "verify: target_probs after top_p_renorm"
+                )
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
 
             draft_probs = torch.zeros(

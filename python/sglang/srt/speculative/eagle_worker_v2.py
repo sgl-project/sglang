@@ -63,6 +63,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     generate_token_bitmask,
     load_token_map,
+    maybe_detect_inf,
     maybe_detect_nan,
     maybe_detect_oob,
     record_stream_each,
@@ -483,6 +484,7 @@ class EagleDraftWorker(BaseDraftWorker):
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
+            maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
             if self.topk == 1:
                 # topk=1 → degenerate single-path tree; `topk_p` is unused
                 # downstream, so skip softmax and just argmax over logits.
@@ -586,6 +588,7 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch.mm_input_embeds = mm_input_embeds
         logits_output = self.draft_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
+        maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 
         # Update spec_info for the next draft step
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -647,6 +650,10 @@ class EagleDraftWorker(BaseDraftWorker):
             ).logits_output
 
         maybe_detect_nan(
+            draft_logits_output.next_token_logits,
+            f"draft_extend_for_decode (cuda_graph={can_cuda_graph})",
+        )
+        maybe_detect_inf(
             draft_logits_output.next_token_logits,
             f"draft_extend_for_decode (cuda_graph={can_cuda_graph})",
         )
@@ -1086,6 +1093,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Sample
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
+        maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
         (
             predict,
             accept_lens,
