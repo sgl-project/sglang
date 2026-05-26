@@ -51,9 +51,7 @@ class _EagleChunkedRotationBase(CanaryE2EBase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.extra_env = (
-            {"SGLANG_DISABLE_PR_26329_FIX": "1"} if cls.revert_pr else {}
-        )
+        cls.extra_env = {"SGLANG_DISABLE_PR_26329_FIX": "1"} if cls.revert_pr else {}
         super().setUpClass()
 
     def test_chunked_rotation_token_id_mismatch(self) -> None:
