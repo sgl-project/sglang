@@ -138,7 +138,7 @@ def make_base_config() -> CanaryConfig:
         sweep_interval=0,
         real_kv_hash_mode=consts.RealKvHashMode.NONE,
         input_check_mode=False,
-        enable_req_token_ids_check=False,
+        enable_req_token_ids_check=True,
         stats_print_every_n_steps=100,
     )
 

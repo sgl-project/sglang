@@ -173,7 +173,7 @@ class SingleForwardManager:
         if input_check_mode:
             self._fill_expected_inputs(
                 forward_batch=forward_batch,
-                expected_inputs_out=expected_inputs,
+                out_expected_inputs=expected_inputs,
             )
 
         plan_input.fill_from_forward_batch(forward_batch=forward_batch)
@@ -272,9 +272,9 @@ class SingleForwardManager:
     def _should_enable_input_check_for_launch(
         self, forward_batch: "ForwardBatch"
     ) -> bool:
-        if not (
-            self._config.input_check_mode or self._config.enable_req_token_ids_check
-        ):
+        if self._config.enable_req_token_ids_check:
+            return True
+        if not self._config.input_check_mode:
             return False
         forward_mode = forward_batch.forward_mode
         if (
@@ -289,12 +289,12 @@ class SingleForwardManager:
         self,
         *,
         forward_batch: "ForwardBatch",
-        expected_inputs_out: ExpectedInputs,
+        out_expected_inputs: ExpectedInputs,
     ) -> None:
         if self._config.enable_req_token_ids_check:
             fill_expected_inputs_from_reqs(
                 forward_batch=forward_batch,
-                expected_inputs_out=expected_inputs_out,
+                out_expected_inputs=out_expected_inputs,
                 pool=self._device_state.req_to_expected_token_ids_pool,
                 valid_lens=self._device_state.req_to_expected_token_ids_valid_lens,
             )
@@ -309,7 +309,7 @@ class SingleForwardManager:
             )
         manager.fill_expected_inputs(
             forward_batch=forward_batch,
-            expected_inputs_out=expected_inputs_out,
+            out_expected_inputs=out_expected_inputs,
         )
 
 

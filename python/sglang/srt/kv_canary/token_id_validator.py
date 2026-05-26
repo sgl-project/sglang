@@ -1,14 +1,7 @@
-"""Real-model token-id validator for kv_canary.
-
-When ``SGLANG_KV_CANARY_ENABLE_REQ_TOKEN_IDS_CHECK`` is on, every forward fills
-the canary write kernel's ``expected_tokens`` placeholder from each req's own
-``origin_input_ids + output_ids`` (the 1-req source-of-truth). The write kernel
-then asserts that ``forward_batch.input_ids[i]`` matches the expected token at
-the same slot for every token whose ``logical_pos`` is in-range; out-of-range
-tokens (speculative drafts, verify-stage proposals, prefill rotation bonus
-tail, etc.) get ``expected_tokens[i] = input_ids[i]`` so the write kernel's
-mismatch check becomes tautological and skips them.
-"""
+"""Real-model token-id validator for kv_canary: fills ``ExpectedInputs.tokens``
+from each req's snapshotted ``origin_input_ids + output_ids`` so the canary
+write kernel can flag any ``forward_batch.input_ids[i]`` mismatch against the
+1-req source-of-truth."""
 
 from __future__ import annotations
 
@@ -28,44 +21,15 @@ logger = logging.getLogger(__name__)
 def fill_expected_inputs_from_reqs(
     *,
     forward_batch: "ForwardBatch",
-    expected_inputs_out: ExpectedInputs,
+    out_expected_inputs: ExpectedInputs,
     pool: Optional[torch.Tensor],
     valid_lens: Optional[torch.Tensor],
 ) -> None:
-    """Real-model fill of ``expected_inputs_out`` from per-req prompt+output history.
-
-    Per forward:
-      1. Refresh the per-req pool row and ``valid_lens`` entry for every req in
-         this forward's batch.
-      2. Build a flat ``expected_tokens[num_tokens]`` on host by walking each
-         req's segment of the forward and looking up
-         ``seq[positions[i] + mode_offset]``.
-      3. Out-of-range tokens get ``expected_tokens[i] = input_ids[i]`` so the
-         write kernel's check is tautological and skips them — speculative
-         draft proposals, verify-stage proposals, or prefill rotation bonus
-         tail with no source-of-truth.
-      4. Single H2D copy into ``expected_inputs_out.tokens[:num_tokens]``;
-         ``expected_inputs_out.positions[:num_tokens]`` mirrors
-         ``forward_batch.positions``.
-
-    Forward-mode → ``logical_pos`` offset:
-      - ``is_extend()`` / ``is_decode_or_idle()``: 0
-      - ``is_draft_extend(include_v2=True)``: +1 (EAGLE rotation)
-      - ``is_target_verify()`` and any other mode: out-of-range for every
-        token → whole batch auto-skips via the tautological branch.
-
-    Args:
-        forward_batch: ``forward_batch.req_truth_seqs`` must be populated;
-            ``ForwardBatch.init_new`` snapshots it when the env flag is on.
-        expected_inputs_out: Pre-allocated capacity tensors; we overwrite the
-            first ``num_tokens`` entries.
-        pool: Optional device tensor shape
-            ``[req_to_token_alloc_size, max_context_len]``. Written but not
-            read by this path; kept for forward-compat with a future
-            kernel-side gather.
-        valid_lens: Optional device tensor shape ``[req_to_token_alloc_size]``.
-            Same as ``pool``.
-    """
+    """Fill ``out_expected_inputs.tokens`` per forward from each req's
+    snapshotted ``origin_input_ids + output_ids``; out-of-range positions
+    (speculative drafts, bonus tail) get ``input_ids[i]`` for tautological
+    skip. ``pool`` / ``valid_lens`` are written for future kernel-side gather
+    (currently unused by the host-side path)."""
     positions = forward_batch.positions
     input_ids = forward_batch.input_ids
     num_tokens = int(input_ids.shape[0])
@@ -74,8 +38,8 @@ def fill_expected_inputs_from_reqs(
 
     req_truth_seqs = forward_batch.req_truth_seqs
     if req_truth_seqs is None:
-        expected_inputs_out.tokens[:num_tokens].copy_(input_ids.to(torch.int64))
-        expected_inputs_out.positions[:num_tokens].copy_(positions.to(torch.int64))
+        out_expected_inputs.tokens[:num_tokens].copy_(input_ids.to(torch.int64))
+        out_expected_inputs.positions[:num_tokens].copy_(positions.to(torch.int64))
         return
 
     mode_offset = _logical_pos_offset(forward_batch=forward_batch)
@@ -117,8 +81,8 @@ def fill_expected_inputs_from_reqs(
     expected_tokens_tensor = torch.tensor(
         expected_tokens_host, dtype=torch.int64, device=input_ids.device
     )
-    expected_inputs_out.tokens[:num_tokens].copy_(expected_tokens_tensor)
-    expected_inputs_out.positions[:num_tokens].copy_(positions.to(torch.int64))
+    out_expected_inputs.tokens[:num_tokens].copy_(expected_tokens_tensor)
+    out_expected_inputs.positions[:num_tokens].copy_(positions.to(torch.int64))
 
     if pool is not None and valid_lens is not None and valid_lens_cpu is not None:
         _refresh_pool_rows(pool=pool, valid_lens=valid_lens, updates=pool_row_updates)

@@ -29,7 +29,7 @@ def make_config(
     sweep_interval: int = 0,
     real_kv_hash_mode: RealKvHashMode = RealKvHashMode.NONE,
     input_check_mode: bool = False,
-    enable_req_token_ids_check: bool = False,
+    enable_req_token_ids_check: bool = True,
     stats_print_every_n_steps: int = 100,
 ) -> CanaryConfig:
     return CanaryConfig(
