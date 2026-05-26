@@ -546,6 +546,79 @@ class TestScriptedInvariants(CustomTestCase):
                 assert cur >= last - 1, f"KV pool drifted: {last} -> {cur}"
             last = cur
 
+    def test_chunked_status_never_mid_chunk_running(self):
+        """Long chunked req's status only ever takes legal values across the chunked lifecycle."""
+        execute_scripted_runtime(
+            self._script_chunked_status_never_mid_chunk_running,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-Status1] chunked status legal-set — during chunked admission a
+    # req's externally observable status must remain in {waiting, running}
+    # while chunking, never a synthetic "mid-chunk" leak; once chunked
+    # completes it transitions to finished and never re-enters waiting.
+    @staticmethod
+    def _script_chunked_status_never_mid_chunk_running(t: ScriptedRuntime):
+        legal_pre_finish = {"waiting", "running", "unknown"}
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        for _ in range(DEFAULT_MAX_STEPS):
+            s = r.status
+            if r.finished:
+                assert s == "finished", f"finished req must report status 'finished', got {s!r}"
+                return
+            assert s in legal_pre_finish, (
+                f"chunked req observed illegal status {s!r}; "
+                f"legal pre-finish set is {legal_pre_finish}"
+            )
+            yield
+        raise AssertionError("req never finished")
+
+    def test_pending_middle_outputs_caps_at_one(self):
+        """Long chunked req's pending_middle_outputs is capped at 1 across its lifetime."""
+        execute_scripted_runtime(
+            self._script_pending_middle_outputs_caps_at_one,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-Status4 / revert e875cd36e4] pending_middle_outputs cap — at any
+    # iteration there must be at most one pending middle output; the
+    # revert of e875cd36e4 re-established this invariant.
+    @staticmethod
+    def _script_pending_middle_outputs_caps_at_one(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        max_observed = 0
+        for _ in range(DEFAULT_MAX_STEPS):
+            max_observed = max(max_observed, r.pending_middle_outputs)
+            if r.finished:
+                break
+            yield
+        assert r.finished
+        assert max_observed <= 1, (
+            f"pending_middle_outputs must be capped at 1 across the chunked "
+            f"lifecycle, observed max={max_observed}"
+        )
+
+    def test_status_never_finished_to_waiting(self):
+        """After finish, status never rolls back to waiting / running / unknown."""
+        execute_scripted_runtime(
+            self._script_status_never_finished_to_waiting,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-Status7] finished is terminal — once a req has finished, its
+    # observable status must never roll back to waiting / running /
+    # unknown across subsequent yields.
+    @staticmethod
+    def _script_status_never_finished_to_waiting(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=16, max_new_tokens=2)
+        yield from run_until_finished(r)
+        assert r.status == "finished"
+        for _ in range(50):
+            yield
+            assert r.status == "finished", (
+                f"status rolled back from finished to {r.status!r}"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
