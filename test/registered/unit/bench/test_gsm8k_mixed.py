@@ -80,7 +80,7 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
     def test_mode_0_all_share_standard_prefix(self):
         evaluator = self._make_eval()
         mode0_prefixes = {
-            evaluator._pick_prefix(i) for i in range(self.NUM_EXAMPLES) if i % 4 == 0
+            evaluator._build_prefix(i) for i in range(self.NUM_EXAMPLES) if i % 4 == 0
         }
         self.assertEqual(len(mode0_prefixes), 1)
         # Standard prefix must be non-empty.
@@ -89,7 +89,7 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
     def test_mode_1_uses_n_distinct_cluster_prefixes(self):
         evaluator = self._make_eval()
         mode1_prefixes = {
-            evaluator._pick_prefix(i) for i in range(self.NUM_EXAMPLES) if i % 4 == 1
+            evaluator._build_prefix(i) for i in range(self.NUM_EXAMPLES) if i % 4 == 1
         }
         # With NUM_EXAMPLES=40 (10 questions in mode 1) and NUM_CLUSTERS=3,
         # we must see exactly NUM_CLUSTERS distinct prefixes (cycling).
@@ -98,7 +98,7 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
     def test_mode_2_all_prefixes_unique(self):
         evaluator = self._make_eval()
         mode2_prefixes = [
-            evaluator._pick_prefix(i) for i in range(self.NUM_EXAMPLES) if i % 4 == 2
+            evaluator._build_prefix(i) for i in range(self.NUM_EXAMPLES) if i % 4 == 2
         ]
         # With NUM_SHOTS=4 sampled from a pool of 12, the chance of two
         # 4-element samples being identical (in order) is astronomically low.
@@ -109,13 +109,13 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
         evaluator = self._make_eval()
         for i in range(self.NUM_EXAMPLES):
             if i % 4 == 3:
-                self.assertEqual(evaluator._pick_prefix(i), "")
+                self.assertEqual(evaluator._build_prefix(i), "")
 
-    def test_pick_prefix_is_deterministic(self):
+    def test_build_prefix_is_deterministic(self):
         a = self._make_eval(seed=42)
         b = self._make_eval(seed=42)
         for i in range(self.NUM_EXAMPLES):
-            self.assertEqual(a._pick_prefix(i), b._pick_prefix(i))
+            self.assertEqual(a._build_prefix(i), b._build_prefix(i))
 
     def test_mode_2_seed_actually_matters(self):
         # Changing the seed must change at least one mode-2 prefix.
@@ -123,27 +123,25 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
         b = self._make_eval(seed=43)
         mode2_indices = [i for i in range(self.NUM_EXAMPLES) if i % 4 == 2]
         differences = sum(
-            1 for i in mode2_indices if a._pick_prefix(i) != b._pick_prefix(i)
+            1 for i in mode2_indices if a._build_prefix(i) != b._build_prefix(i)
         )
         self.assertGreater(differences, 0)
         # Modes 0/1/3 are seed-independent.
         for i in range(self.NUM_EXAMPLES):
             if i % 4 != 2:
-                self.assertEqual(a._pick_prefix(i), b._pick_prefix(i))
+                self.assertEqual(a._build_prefix(i), b._build_prefix(i))
 
-    def test_training_pool_excluded_from_test_lines(self):
-        # The pool (used for prefixes) must not overlap with the test
-        # questions, otherwise the model has seen the answer.
+    def test_random_pool_disjoint_from_test_lines(self):
         evaluator = self._make_eval(num_examples=None)
-        train_questions = {item["question"] for item in evaluator._train_pool}
+        train_questions = {item["question"] for item in evaluator._random_pool}
         test_questions = {item["question"] for item in evaluator._lines}
         self.assertEqual(train_questions & test_questions, set())
 
-    def test_mode_label_round_trip(self):
-        # The label tagged in metrics matches the mode index.
+    def test_per_mode_metric_key(self):
         evaluator = self._make_eval()
         for i in range(20):
-            self.assertEqual(evaluator._mode_label(i), _MODE_LABELS[i % 4])
+            metrics = evaluator._extra_sample_metrics(i, 1.0)
+            self.assertEqual(metrics, {f"score_{_MODE_LABELS[i % 4]}": 1.0})
 
     def test_insufficient_dataset_raises(self):
         tiny = os.path.join(self._tmpdir.name, "tiny.jsonl")
