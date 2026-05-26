@@ -5,7 +5,10 @@ export const GLM47Deployment = () => {
       name: 'hardware',
       title: 'Hardware Platform',
       items: [
-        { id: 'mi300x', label: 'MI300X', default: true },
+        { id: 'b200', label: 'B200', default: true },
+        { id: 'gb200', label: 'GB200', default: false },
+        { id: 'h200', label: 'H200', default: false },
+        { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false }
       ]
@@ -14,8 +17,18 @@ export const GLM47Deployment = () => {
       name: 'quantization',
       title: 'Quantization',
       items: [
-        { id: 'bf16', label: 'BF16', default: true },
-        { id: 'fp8', label: 'FP8', default: false }
+        { id: 'nvfp4', label: 'NVFP4', default: true },
+        { id: 'fp8', label: 'FP8', default: false },
+        { id: 'bf16', label: 'BF16', default: false }
+      ]
+    },
+    gpus: {
+      name: 'gpus',
+      title: 'Number of GPUs',
+      items: [
+        { id: '2', label: '2', default: false },
+        { id: '4', label: '4', default: true },
+        { id: '8', label: '8', default: false }
       ]
     },
     strategy: {
@@ -96,39 +109,72 @@ export const GLM47Deployment = () => {
 
   // Generate command
   const generateCommand = () => {
-    const { hardware, quantization, strategy, thinking, toolcall } = values;
+    const { hardware, quantization, gpus, strategy, thinking, toolcall } = values;
     const strategyArray = Array.isArray(strategy) ? strategy : [];
 
-    const modelSuffix = quantization === 'fp8' ? '-FP8' : '';
-    const modelName = `zai-org/GLM-4.7${modelSuffix}`;
+    const isNvidiaBlackwell = hardware === 'b200' || hardware === 'gb200';
+    const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x';
 
-    // Determine TP value based on hardware and quantization
-    let tpValue = 4; // Default for MI300X and MI325X
-    if (hardware === 'mi355x') {
-      tpValue = quantization === 'fp8' ? 2 : 4; // MI355X: TP=2 for FP8, TP=4 for BF16
+    // Map quantization to the supported set for this hardware. NVFP4 is only
+    // documented on Blackwell (B200, GB200); on H200/AMD, silently fall back
+    // to FP8 so the generated command stays valid (matches the §3.2 matrix).
+    let effectiveQuantization = quantization;
+    if (effectiveQuantization === 'nvfp4' && !isNvidiaBlackwell) {
+      effectiveQuantization = 'fp8';
+    }
+
+    // Pick model checkpoint by effectiveQuantization
+    let modelName = 'zai-org/GLM-4.7';
+    if (effectiveQuantization === 'nvfp4') {
+      modelName = 'nvidia/GLM-4.7-NVFP4';
+    } else if (effectiveQuantization === 'fp8') {
+      modelName = 'zai-org/GLM-4.7-FP8';
+    } else {
+      modelName = 'zai-org/GLM-4.7';
+    }
+
+    // Default TP = user-selected GPU count; DP splits a portion of that on AMD
+    let tpValue = parseInt(gpus, 10) || 4;
+    let dpValue = 1;
+    if (hardware === 'mi355x' && effectiveQuantization === 'fp8' && tpValue > 2) {
+      tpValue = Math.max(2, Math.min(tpValue, 4)); // MI355X FP8 sweet spot is TP=2
+    }
+    if (isAMD && strategyArray.includes('dp') && tpValue >= 2) {
+      dpValue = 2;
+      tpValue = Math.max(1, Math.floor(tpValue / dpValue));
     }
 
     let cmd = 'python -m sglang.launch_server \\\n';
     cmd += `  --model ${modelName}`;
+    cmd += ` \\\n  --tp-size ${tpValue}`;
 
-    // TP is mandatory
-    cmd += ` \\\n  --tp ${tpValue}`;
+    // NVIDIA Blackwell + NVFP4: enable EP when the user selected it
+    if (isNvidiaBlackwell && effectiveQuantization === 'nvfp4' && strategyArray.includes('ep')) {
+      cmd += ` \\\n  --ep ${tpValue}`;
+    }
 
     // MI300X/MI325X BF16 requires extra flags
-    if ((hardware === 'mi300x' || hardware === 'mi325x') && quantization === 'bf16') {
+    if ((hardware === 'mi300x' || hardware === 'mi325x') && effectiveQuantization === 'bf16') {
       cmd += ` \\\n  --max-context-length 8192 \\\n  --mem-fraction-static 0.9`;
     }
 
-    // Strategy-specific parameters
-    if (strategyArray.includes('dp')) {
-      cmd += ` \\\n  --dp 8 \\\n  --enable-dp-attention`;
-    }
-    if (strategyArray.includes('ep')) {
-      cmd += ` \\\n  --ep 8`;
+    // AMD-only strategies
+    if (isAMD) {
+      if (strategyArray.includes('dp')) {
+        cmd += ` \\\n  --dp ${dpValue} \\\n  --enable-dp-attention`;
+      }
+      if (strategyArray.includes('ep')) {
+        cmd += ` \\\n  --ep ${tpValue}`;
+      }
     }
     if (strategyArray.includes('mtp')) {
       cmd = 'SGLANG_ENABLE_SPEC_V2=1 ' + cmd;
       cmd += ` \\\n  --speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4`;
+    }
+
+    // NVIDIA Blackwell + NVFP4: leave headroom for cuda-graph capture
+    if (isNvidiaBlackwell && effectiveQuantization === 'nvfp4') {
+      cmd += ` \\\n  --mem-fraction-static 0.85`;
     }
 
     // Add tool call parser if enabled
@@ -138,7 +184,7 @@ export const GLM47Deployment = () => {
 
     // Add thinking parser if enabled
     if (thinking === 'enabled') {
-      cmd += ` \\\n  --reasoning-parser glm47`;
+      cmd += ` \\\n  --reasoning-parser glm45`;
     }
 
     return cmd;
