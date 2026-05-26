@@ -1,4 +1,3 @@
-import argparse
 import asyncio
 import json
 import pickle
@@ -23,8 +22,6 @@ from sglang.benchmark.datasets import DATASET_MAPPING, get_dataset
 from sglang.benchmark.datasets.common import DatasetRow
 from sglang.benchmark.datasets.custom import sample_custom_requests
 from sglang.benchmark.datasets.generated_shared_prefix import (
-    GeneratedSharedPrefixDataset,
-    _finite_positive_float,
     _zipf_group_probs,
     get_gen_prefix_cache_path,
     sample_generated_shared_prefix_requests,
@@ -665,10 +662,10 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         # Independent skew sanity check: rank-1 (hottest) > rank-N (coldest).
         self.assertGreater(per_group[0], per_group[3])
 
-    def test_zipf_bypasses_cache(self):
-        # Zipf neither reads nor writes the on-disk dataset cache; uniform
-        # mode still reads and writes it. Patch Path.home so the test owns
-        # the cache directory.
+    def test_zipf_uses_distinct_cache_from_uniform(self):
+        # The on-disk cache key includes group_distribution and zipf_alpha,
+        # so uniform mode, zipf alpha=1.0, and zipf alpha=2.0 each get their
+        # own file. Uniform mode never reads a zipf cache and vice versa.
         from sglang.benchmark.datasets import generated_shared_prefix as gsp_mod
 
         fake_home = self.tmpdir_path / "fakehome"
@@ -689,7 +686,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         )
 
         with patch.object(gsp_mod.Path, "home", return_value=fake_home):
-            cache_path = get_gen_prefix_cache_path(
+            uniform_path = get_gen_prefix_cache_path(
                 seed=common["seed"],
                 num_groups=common["num_groups"],
                 prompts_per_group=common["prompts_per_group"],
@@ -698,35 +695,55 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
                 output_len=common["output_len"],
                 tokenizer=self.tokenizer,
             )
-            self.assertFalse(cache_path.exists())
-
-            # Uniform mode writes the cache.
-            self._run_gsp(mode="uniform", **common)
-            self.assertTrue(cache_path.exists())
-            cached_bytes = cache_path.read_bytes()
-
-            # Overwrite the cache file with a sentinel payload. A subsequent
-            # uniform-mode call would return this sentinel; Zipf must NOT.
-            sentinel = [DatasetRow(prompt="SENTINEL", prompt_len=1, output_len=1)]
-            with open(cache_path, "wb") as f:
-                pickle.dump(sentinel, f)
-            cache_mtime_before = cache_path.stat().st_mtime_ns
-
-            # Zipf mode: cache file must be neither read nor written.
-            zipf_rows = self._run_gsp(mode="zipf", alpha=1.5, **common)
-            self.assertEqual(len(zipf_rows), 2 * 3)
-            self.assertNotEqual(zipf_rows, sentinel)
-            self.assertEqual(cache_path.stat().st_mtime_ns, cache_mtime_before)
-            self.assertEqual(cache_path.read_bytes(), pickle.dumps(sentinel))
-
-            # Restore real uniform cache; uniform mode still reads it back.
-            with open(cache_path, "wb") as f:
-                f.write(cached_bytes)
-            restored_rows = self._run_gsp(mode="uniform", **common)
-            self.assertEqual(
-                self._row_fields(restored_rows),
-                self._row_fields(pickle.loads(cached_bytes)),
+            zipf_path_a = get_gen_prefix_cache_path(
+                seed=common["seed"],
+                num_groups=common["num_groups"],
+                prompts_per_group=common["prompts_per_group"],
+                system_prompt_len=common["system_prompt_len"],
+                question_len=common["question_len"],
+                output_len=common["output_len"],
+                tokenizer=self.tokenizer,
+                group_distribution="zipf",
+                zipf_alpha=1.5,
             )
+            zipf_path_b = get_gen_prefix_cache_path(
+                seed=common["seed"],
+                num_groups=common["num_groups"],
+                prompts_per_group=common["prompts_per_group"],
+                system_prompt_len=common["system_prompt_len"],
+                question_len=common["question_len"],
+                output_len=common["output_len"],
+                tokenizer=self.tokenizer,
+                group_distribution="zipf",
+                zipf_alpha=2.0,
+            )
+            self.assertNotEqual(uniform_path, zipf_path_a)
+            self.assertNotEqual(zipf_path_a, zipf_path_b)
+
+            # Run each mode; each writes its own cache file.
+            self._run_gsp(mode="uniform", **common)
+            self._run_gsp(mode="zipf", alpha=1.5, **common)
+            self._run_gsp(mode="zipf", alpha=2.0, **common)
+            self.assertTrue(uniform_path.exists())
+            self.assertTrue(zipf_path_a.exists())
+            self.assertTrue(zipf_path_b.exists())
+
+            # Sentinel into the uniform cache: zipf must not read it.
+            sentinel = [DatasetRow(prompt="SENTINEL", prompt_len=1, output_len=1)]
+            with open(uniform_path, "wb") as f:
+                pickle.dump(sentinel, f)
+            zipf_rows = self._run_gsp(mode="zipf", alpha=1.5, **common)
+            self.assertNotEqual(zipf_rows, sentinel)
+
+            # Second zipf call with same args must load from cache (no
+            # regeneration). Mutate the zipf cache to a sentinel and confirm.
+            zipf_sentinel = [
+                DatasetRow(prompt="ZIPF_SENTINEL", prompt_len=1, output_len=1)
+            ]
+            with open(zipf_path_a, "wb") as f:
+                pickle.dump(zipf_sentinel, f)
+            reloaded = self._run_gsp(mode="zipf", alpha=1.5, **common)
+            self.assertEqual(reloaded, zipf_sentinel)
 
     def test_zipf_total_rows_and_unique_prompts(self):
         # Total returned row count under Zipf equals num_groups *
@@ -789,58 +806,6 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
     # ------------------------------------------------------------------
     # CLI / from_args validation
     # ------------------------------------------------------------------
-
-    def test_finite_positive_float_validator(self):
-        # The argparse-type validator accepts strictly positive finite floats
-        # and rejects zero, negatives, NaN, infinities, and unparsable input.
-        for good in ["0.001", "0.5", "1.5", "10", "1e3"]:
-            self.assertEqual(_finite_positive_float(good), float(good))
-        for bad in ["0", "-0.5", "nan", "inf", "-inf", "abc", ""]:
-            with self.assertRaises(argparse.ArgumentTypeError):
-                _finite_positive_float(bad)
-
-    def test_from_args_zipf_requires_alpha(self):
-        # from_args rejects zipf-without-alpha for in-process callers that
-        # bypass the CLI entry point.
-        args = make_args(
-            dataset_name="generated-shared-prefix",
-            gsp_group_distribution="zipf",
-            gsp_zipf_alpha=None,
-        )
-        with self.assertRaises(ValueError):
-            GeneratedSharedPrefixDataset.from_args(args)
-
-    def test_from_args_uniform_rejects_alpha(self):
-        # from_args rejects uniform-with-alpha for in-process callers that
-        # bypass the CLI entry point.
-        args = make_args(
-            dataset_name="generated-shared-prefix",
-            gsp_group_distribution="uniform",
-            gsp_zipf_alpha=1.0,
-        )
-        with self.assertRaises(ValueError):
-            GeneratedSharedPrefixDataset.from_args(args)
-
-    def test_from_args_rejects_bad_alpha(self):
-        # from_args defensively rejects bad alpha values (0, negative, NaN,
-        # ±inf) even when the CLI type validator is bypassed.
-        for bad in [0.0, -0.5, float("nan"), float("inf"), float("-inf")]:
-            args = make_args(
-                dataset_name="generated-shared-prefix",
-                gsp_group_distribution="zipf",
-                gsp_zipf_alpha=bad,
-            )
-            with self.assertRaises(ValueError):
-                GeneratedSharedPrefixDataset.from_args(args)
-
-    def test_from_args_rejects_unknown_distribution(self):
-        args = make_args(
-            dataset_name="generated-shared-prefix",
-            gsp_group_distribution="not-a-distribution",
-            gsp_zipf_alpha=None,
-        )
-        with self.assertRaises(ValueError):
-            GeneratedSharedPrefixDataset.from_args(args)
 
     def test_bench_serving_help_and_invalid_choice_argparse(self):
         # Subprocess-driven coverage of the live CLI: --help advertises both

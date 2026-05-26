@@ -1,5 +1,3 @@
-import argparse
-import math
 import pickle
 import random
 import uuid
@@ -19,23 +17,6 @@ from sglang.benchmark.datasets.common import (
     compute_random_lens,
     gen_prompt,
 )
-
-
-def _finite_positive_float(value) -> float:
-    """argparse-compatible type for a finite, strictly positive float.
-
-    Rejects NaN, infinities, zero, and negatives. Also used as a
-    defensive check in GeneratedSharedPrefixDataset.from_args.
-    """
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError) as exc:
-        raise argparse.ArgumentTypeError(
-            f"expected a finite float > 0, got {value!r}"
-        ) from exc
-    if not math.isfinite(parsed) or parsed <= 0:
-        raise argparse.ArgumentTypeError(f"expected a finite float > 0, got {value!r}")
-    return parsed
 
 
 def _zipf_group_probs(num_groups: int, alpha: float) -> np.ndarray:
@@ -73,32 +54,6 @@ class GeneratedSharedPrefixDataset(BaseDataset):
     @classmethod
     def from_args(cls, args: Namespace) -> "GeneratedSharedPrefixDataset":
         assert not getattr(args, "tokenize_prompt", False)
-        group_distribution = getattr(args, "gsp_group_distribution", "uniform")
-        zipf_alpha = getattr(args, "gsp_zipf_alpha", None)
-
-        if group_distribution not in ("uniform", "zipf"):
-            raise ValueError(
-                f"--gsp-group-distribution must be 'uniform' or 'zipf', "
-                f"got {group_distribution!r}"
-            )
-        if group_distribution == "zipf":
-            if zipf_alpha is None:
-                raise ValueError(
-                    "--gsp-group-distribution=zipf requires --gsp-zipf-alpha "
-                    "(a finite float > 0)"
-                )
-            if not math.isfinite(zipf_alpha) or zipf_alpha <= 0:
-                raise ValueError(
-                    f"--gsp-zipf-alpha must be a finite float > 0, got {zipf_alpha!r}"
-                )
-        else:
-            if zipf_alpha is not None:
-                raise ValueError(
-                    "--gsp-zipf-alpha is only meaningful with "
-                    "--gsp-group-distribution=zipf; remove --gsp-zipf-alpha "
-                    "or set --gsp-group-distribution=zipf"
-                )
-
         return cls(
             num_groups=args.gsp_num_groups,
             prompts_per_group=args.gsp_prompts_per_group,
@@ -111,8 +66,8 @@ class GeneratedSharedPrefixDataset(BaseDataset):
             send_routing_key=getattr(args, "gsp_send_routing_key", False),
             num_turns=getattr(args, "gsp_num_turns", 1),
             ordered=getattr(args, "gsp_ordered", False),
-            group_distribution=group_distribution,
-            zipf_alpha=zipf_alpha,
+            group_distribution=args.gsp_group_distribution,
+            zipf_alpha=args.gsp_zipf_alpha,
         )
 
     def load(
@@ -144,13 +99,24 @@ def get_gen_prefix_cache_path(
     question_len: int,
     output_len: int,
     tokenizer,
+    group_distribution: str = "uniform",
+    zipf_alpha: Optional[float] = None,
 ):
-    """Create cache directory under ~/.cache/sglang/benchmark"""
+    """Create cache directory under ~/.cache/sglang/benchmark.
+
+    The uniform-mode filename is preserved exactly as before so existing
+    on-disk caches remain valid. Non-default sampling modes get an extra
+    suffix encoding the parameters that affect the cached payload.
+    """
     cache_dir = Path.home() / ".cache" / "sglang" / "benchmark"
+
+    suffix = ""
+    if group_distribution != "uniform":
+        suffix = f"_{group_distribution}_{zipf_alpha}"
 
     cache_key = (
         f"gen_shared_prefix_{seed}_{num_groups}_{prompts_per_group}_"
-        f"{system_prompt_len}_{question_len}_{output_len}_"
+        f"{system_prompt_len}_{question_len}_{output_len}{suffix}_"
         f"{tokenizer.__class__.__name__}.pkl"
     )
     return cache_dir / cache_key
@@ -179,27 +145,15 @@ def sample_generated_shared_prefix_requests(
 
     When group_distribution is "zipf", each request's group is sampled by rank
     with probability 1/rank**zipf_alpha / sum_k(1/k**zipf_alpha); rank starts at
-    1 and group index 0 is the hottest. The on-disk cache is bypassed in this
-    mode. Sampling uses an isolated numpy.random.default_rng(seed) so the
-    shared question/system-prompt pool stays byte-identical to uniform mode for
-    the same seed and other args.
-    """
-    if group_distribution not in ("uniform", "zipf"):
-        raise ValueError(
-            f"group_distribution must be 'uniform' or 'zipf', got {group_distribution!r}"
-        )
-    if group_distribution == "zipf":
-        if zipf_alpha is None:
-            raise ValueError(
-                "group_distribution='zipf' requires zipf_alpha (a finite float > 0)"
-            )
-        if not math.isfinite(zipf_alpha) or zipf_alpha <= 0:
-            raise ValueError(
-                f"zipf_alpha must be a finite float > 0, got {zipf_alpha!r}"
-            )
-    elif zipf_alpha is not None:
-        raise ValueError("zipf_alpha is only meaningful with group_distribution='zipf'")
+    1 and group index 0 is the hottest. Sampling uses an isolated
+    numpy.random.default_rng(seed) so the shared question/system-prompt pool
+    stays byte-identical to uniform mode for the same seed and other args.
+    Zipf mode is cached on disk under a distinct key per (group_distribution,
+    zipf_alpha) value.
 
+    Validation of group_distribution / zipf_alpha is enforced at the CLI parse
+    boundary in bench_serving.py.
+    """
     cache_path = get_gen_prefix_cache_path(
         seed,
         num_groups,
@@ -208,19 +162,22 @@ def sample_generated_shared_prefix_requests(
         question_len,
         output_len,
         tokenizer,
+        group_distribution=group_distribution,
+        zipf_alpha=zipf_alpha,
     )
-    should_cache = (
-        group_distribution == "uniform"
-        and range_ratio == 1
-        and not send_routing_key
-        and num_turns == 1
-    )
+    # range_ratio != 1 / num_turns > 1 perturb the payload but are not in the
+    # cache key; send_routing_key embeds a per-run uuid + timestamp that is
+    # meaningless to cache. Bypass for these pre-existing reasons only.
+    should_cache = range_ratio == 1 and not send_routing_key and num_turns == 1
 
     # Try to load from cache first (only when caching is enabled).
     if should_cache and cache_path.exists():
         print(f"\nLoading cached generated input data from {cache_path}")
         with open(cache_path, "rb") as f:
             return pickle.load(f)
+
+    if not should_cache:
+        print(f"\nCache bypassed ({range_ratio=}, {send_routing_key=}, {num_turns=})")
 
     print(
         f"\nGenerating new input data... "
@@ -268,86 +225,53 @@ def sample_generated_shared_prefix_requests(
         for g in range(num_groups)
     ]
 
-    # Combine system prompts with questions
+    # Per-slot group assignment. Uniform mode is the identity assignment
+    # [0,0,...,1,1,...,N-1,N-1]; zipf mode samples from the rank distribution
+    # using an isolated RNG so the module-level random / numpy.random state
+    # that compute_random_lens / gen_prompt rely on is never perturbed -- this
+    # keeps the system-prompt and question pool byte-identical to uniform mode
+    # for the same seed and other args.
+    total_slots = num_groups * prompts_per_group
+    if group_distribution == "uniform":
+        assignment = np.repeat(np.arange(num_groups), prompts_per_group)
+    else:  # "zipf"
+        rng = np.random.default_rng(seed)
+        probs = _zipf_group_probs(num_groups, zipf_alpha)
+        assignment = rng.choice(num_groups, size=total_slots, replace=True, p=probs)
+
     input_requests = []
     total_input_tokens = 0
     total_output_tokens = 0
+    for slot_idx, sampled_g in enumerate(
+        tqdm(assignment, desc="Generating shared-prefix prompts")
+    ):
+        # src_(g,p) walks the question pool in uniform-enumeration order, so
+        # per-slot question text is reproducibly identical across modes.
+        src_g, src_p = divmod(slot_idx, prompts_per_group)
+        sampled_g = int(sampled_g)
 
-    if group_distribution == "zipf":
-        # Isolated RNG: never perturbs the module-level random / numpy.random
-        # state that compute_random_lens / gen_prompt rely on. This keeps the
-        # generated system-prompt and question pool byte-identical to uniform
-        # mode for the same seed and other args.
-        rng = np.random.default_rng(seed)
-        probs = _zipf_group_probs(num_groups, zipf_alpha)
-        total_slots = num_groups * prompts_per_group
-        sampled_groups = rng.choice(num_groups, size=total_slots, replace=True, p=probs)
+        system_prompt = system_prompts[sampled_g]
+        routing_key = (
+            f"{run_random_str}_{run_start_timestamp}_{sampled_g}"
+            if send_routing_key
+            else None
+        )
+        turn_questions = questions[src_g][src_p]
+        turn_prompts = [f"{system_prompt}\n\n{turn_questions[0]}"] + turn_questions[1:]
+        full_prompt = turn_prompts[0] if num_turns == 1 else turn_prompts
+        prompt_len = 1 if fast_prepare else len(tokenizer.encode(turn_prompts[0]))
+        output_len_val = int(output_lens[src_g, src_p])
 
-        for slot_idx in tqdm(
-            range(total_slots), desc="Generating zipf-sampled prompts"
-        ):
-            # Source slot index in the uniform enumeration: walks the question
-            # pool in the same order uniform mode does, so the per-slot
-            # question text is reproducibly identical.
-            src_g = slot_idx // prompts_per_group
-            src_p = slot_idx % prompts_per_group
-            sampled_g = int(sampled_groups[slot_idx])
-
-            system_prompt = system_prompts[sampled_g]
-            routing_key = (
-                f"{run_random_str}_{run_start_timestamp}_{sampled_g}"
-                if send_routing_key
-                else None
+        input_requests.append(
+            DatasetRow(
+                prompt=full_prompt,
+                prompt_len=prompt_len,
+                output_len=output_len_val,
+                routing_key=routing_key,
             )
-            turn_questions = questions[src_g][src_p]
-            turn_prompts = [f"{system_prompt}\n\n{turn_questions[0]}"] + turn_questions[
-                1:
-            ]
-            full_prompt = turn_prompts[0] if num_turns == 1 else turn_prompts
-            prompt_len = 1 if fast_prepare else len(tokenizer.encode(turn_prompts[0]))
-            output_len_val = int(output_lens[src_g, src_p])
-
-            input_requests.append(
-                DatasetRow(
-                    prompt=full_prompt,
-                    prompt_len=prompt_len,
-                    output_len=output_len_val,
-                    routing_key=routing_key,
-                )
-            )
-            total_input_tokens += prompt_len
-            total_output_tokens += output_len_val
-    else:
-        for group_idx in tqdm(range(num_groups), desc="Generating system prompt"):
-            system_prompt = system_prompts[group_idx]
-            routing_key = (
-                f"{run_random_str}_{run_start_timestamp}_{group_idx}"
-                if send_routing_key
-                else None
-            )
-            for prompt_idx in tqdm(
-                range(prompts_per_group), desc="Generating questions", leave=False
-            ):
-                turn_questions = questions[group_idx][prompt_idx]
-                turn_prompts = [
-                    f"{system_prompt}\n\n{turn_questions[0]}"
-                ] + turn_questions[1:]
-                full_prompt = turn_prompts[0] if num_turns == 1 else turn_prompts
-                prompt_len = (
-                    1 if fast_prepare else len(tokenizer.encode(turn_prompts[0]))
-                )
-                output_len_val = int(output_lens[group_idx, prompt_idx])
-
-                input_requests.append(
-                    DatasetRow(
-                        prompt=full_prompt,
-                        prompt_len=prompt_len,
-                        output_len=output_len_val,
-                        routing_key=routing_key,
-                    )
-                )
-                total_input_tokens += prompt_len
-                total_output_tokens += output_len_val
+        )
+        total_input_tokens += prompt_len
+        total_output_tokens += output_len_val
 
     if not ordered:
         random.shuffle(input_requests)

@@ -17,6 +17,7 @@ import asyncio
 import copy
 import importlib.util
 import json
+import math
 import os
 import random
 import shutil
@@ -39,7 +40,6 @@ from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
-from sglang.benchmark.datasets.generated_shared_prefix import _finite_positive_float
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.utils import (
     get_tokenizer,
@@ -1929,6 +1929,19 @@ def run_benchmark(args_: argparse.Namespace):
             profile_decode_url=getattr(args, "profile_decode_url", None),
         )
     )
+
+
+def _finite_positive_float(value) -> float:
+    """argparse type for a finite, strictly positive float."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"expected a finite float > 0, got {value!r}"
+        ) from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError(f"expected a finite float > 0, got {value!r}")
+    return parsed
 
 
 def _validate_parsed_gsp_args(
