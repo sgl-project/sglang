@@ -32,6 +32,7 @@ from common.attention_methods.dsv4_attention import (  # noqa: E402
     make_dsv4_cases,
     run_dsv4_attention_case,
     run_dsv4_compress_attention_case,
+    run_dsv4_draft_extend_attention_case,
     run_dsv4_target_verify_attention_case,
 )
 from common.runner_modes.cuda_graph_decode_runner import (  # noqa: E402
@@ -187,6 +188,24 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
                 compress_ratio=case.compress_ratio,
             ):
                 run_dsv4_target_verify_attention_case(self, case, topk=1)
+
+    # EAGLE DRAFT_EXTEND is SWA-only for DSV4 (see runner docstring).
+    DRAFT_EXTEND_CASES = (
+        DSV4AttentionCase(
+            name="dsv4_swa_eagle_draft_extend",
+            backend="dsv4",
+            forward_mode=ForwardMode.DRAFT_EXTEND,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(64, 96),
+            extend_lens=(2, 4),
+        ),
+    )
+
+    def test_eagle_draft_extend_cases(self):
+        for case in self.DRAFT_EXTEND_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_dsv4_draft_extend_attention_case(self, case)
 
 
 if __name__ == "__main__":

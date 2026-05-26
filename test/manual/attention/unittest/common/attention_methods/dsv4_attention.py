@@ -1313,6 +1313,68 @@ def run_dsv4_target_verify_attention_case(
     )
 
 
+def run_dsv4_draft_extend_attention_case(
+    testcase,
+    case: DSV4AttentionCase,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+) -> None:
+    """Math-faithful EAGLE `DRAFT_EXTEND` test for DSV4.
+
+    `compress_ratio` must be 0: `init_forward_metadata_draft_extend` hardcodes
+    `need_compress=False`, which leaves
+    `core_attn_metadata.c4_sparse_page_indices` /
+    `.c128_page_indices` / `.c4_flashmla_metadata` / `.c128_flashmla_metadata`
+    at None. The C4 path then crashes on
+    `extra_indices.shape[-1] % 64` and the C128 path crashes on
+    `flashmla.get_flashmla_metadata(128) is None` inside
+    `flash_mla.flash_mla_with_kvcache`. Production DSV4 + DRAFT_EXTEND is
+    therefore SWA-only by construction.
+    """
+    assert case.compress_ratio == 0, (
+        "DSV4 DRAFT_EXTEND is SWA-only — `init_forward_metadata_draft_extend` "
+        "uses `need_compress=False` so C4 / C128 metadata is unpopulated. See "
+        "`deepseek_v4_backend.py:636-663` and the 'Production-Unsupported' "
+        "section in dsv4/README.md."
+    )
+    assert case.forward_mode.is_draft_extend(include_v2=True), (
+        f"run_dsv4_draft_extend_attention_case requires DRAFT_EXTEND; got {case.forward_mode}"
+    )
+    from common.runner_modes.speculative_draft_extend_runner import (
+        _make_eagle_draft_extend_input,
+    )
+
+    fixture = build_dsv4_attention_fixture(testcase, case, dtype=dtype, device=device)
+    runner = fixture.runner
+    max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
+
+    _populate_swa_kv_cache(fixture, max_context_len=max_context_len, device=device)
+
+    fixture.forward_batch.spec_info = _make_eagle_draft_extend_input(
+        case, fixture.forward_batch, device=device,
+    )
+
+    q_input, _ = fixture.actual_module.project(fixture.input_hidden)
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+        fixture.backend.init_forward_metadata(fixture.forward_batch)
+        actual = fixture.backend.forward(
+            q=q_input,
+            k=q_input,
+            v=q_input,
+            layer=fixture.actual_module.attn,
+            forward_batch=fixture.forward_batch,
+            compress_ratio=0,
+            save_kv_cache=False,
+            attn_sink=fixture.actual_module.attn_sink,
+        )
+        expected = _pure_torch_dsv4_combined_reference(fixture, q_input)
+
+    torch.testing.assert_close(
+        actual.float(), expected.float(), atol=DSV4_ATOL, rtol=DSV4_RTOL
+    )
+
+
 def run_dsv4_compress_attention_case(
     testcase,
     case: DSV4AttentionCase,
