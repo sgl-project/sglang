@@ -16,6 +16,7 @@ from common.dense_attention import (
     run_dense_attention_case,
 )
 from common.spec_runner import (
+    run_dense_draft_extend_v2_cuda_graph_case,
     run_dense_spec_verify_case,
     run_dense_spec_verify_cuda_graph_case,
 )
@@ -198,6 +199,18 @@ class TestTritonDenseAttentionBackendCorrectness(CustomTestCase):
             "ngram",
         ),
     )
+    DRAFT_EXTEND_V2_CUDA_GRAPH_CASES = (
+        DenseAttentionCase(
+            name="runner_cuda_graph_eagle_draft_extend_v2_fixed_tokens",
+            backend="triton",
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(4, 7),
+            extend_lens=(3, 3),
+        ),
+    )
 
     def test_projected_dense_attention_cases(self):
         for case in self.CASES:
@@ -254,6 +267,11 @@ class TestTritonDenseAttentionBackendCorrectness(CustomTestCase):
                     topk=topk,
                     spec_kind=spec_kind,
                 )
+
+    def test_runner_mode_eagle_draft_extend_v2_cuda_graph_cases(self):
+        for case in self.DRAFT_EXTEND_V2_CUDA_GRAPH_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_dense_draft_extend_v2_cuda_graph_case(self, case)
 
 
 if __name__ == "__main__":

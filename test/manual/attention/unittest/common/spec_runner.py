@@ -301,6 +301,24 @@ def _make_draft_extend_input(
     raise ValueError(f"Unsupported draft-extend spec kind: {spec_kind}")
 
 
+def _make_eagle_draft_extend_v2_input(case, batch, *, device: str):
+    draft_extend_input = _make_eagle_draft_extend_input(case, batch, device=device)
+    draft_extend_input.extend_seq_lens_tensor = torch.tensor(
+        case.input_lens,
+        dtype=torch.int32,
+        device=device,
+    )
+    draft_extend_input.extend_seq_lens_cpu = list(case.input_lens)
+    return draft_extend_input
+
+
+def _set_draft_extend_v2_prefix_lens(batch, case, *, device: str):
+    prefix_lens = torch.tensor(case.prefix_lens, dtype=torch.int32, device=device)
+    batch.seq_lens = prefix_lens
+    batch.seq_lens_cpu = torch.tensor(case.prefix_lens, dtype=torch.int32, device="cpu")
+    batch.seq_lens_sum = sum(case.prefix_lens)
+
+
 def _target_verify_expected_output(
     *,
     reference_fn,
@@ -879,6 +897,158 @@ def run_dense_draft_extend_cuda_graph_case(
     torch.testing.assert_close(
         replay_actual[: case.num_input_tokens],
         graph_eager_actual,
+        atol=DENSE_ATOL,
+        rtol=DENSE_RTOL,
+    )
+
+
+def run_dense_draft_extend_v2_cuda_graph_case(
+    testcase,
+    case: DenseAttentionCase,
+    *,
+    head_dim: int = DEFAULT_HEAD_DIM,
+    hidden_size: int = DEFAULT_HIDDEN_SIZE,
+    max_context_len: int = DENSE_DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = DENSE_DEFAULT_DTYPE,
+    device: str = DENSE_DEFAULT_DEVICE,
+    cuda_graph_capture_batch_size: int = 4,
+):
+    if not case.forward_mode.is_draft_extend_v2():
+        raise ValueError("Draft-extend-v2 CUDA graph coverage expects DRAFT_EXTEND_V2.")
+    if case.batch_size > cuda_graph_capture_batch_size:
+        raise ValueError("Draft-extend-v2 capture batch must cover replay batch size.")
+    if len(set(case.input_lens)) != 1:
+        raise ValueError(
+            "Draft-extend-v2 CUDA graph coverage uses a fixed token count per request."
+        )
+
+    num_tokens_per_req = case.input_lens[0]
+    graph_fixture = build_dense_attention_fixture(
+        testcase,
+        case,
+        head_dim=head_dim,
+        hidden_size=hidden_size,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        disable_cuda_graph=False,
+        runner_batch_size=cuda_graph_capture_batch_size,
+    )
+    backend = graph_fixture.backend
+
+    capture_prefix_len = backend.get_cuda_graph_seq_len_fill_value()
+    capture_case = _make_dense_spec_case_with_lens(
+        case,
+        f"{case.name}_cuda_graph_capture",
+        (capture_prefix_len,) * cuda_graph_capture_batch_size,
+        (num_tokens_per_req,) * cuda_graph_capture_batch_size,
+    )
+    capture_inputs = make_dense_random_inputs(
+        capture_case,
+        graph_fixture,
+        dtype=dtype,
+        device=device,
+    )
+    capture_batch = _make_dense_forward_batch(
+        capture_case,
+        graph_fixture.runner,
+        max_context_len=max_context_len,
+        device=device,
+    )
+    _set_draft_extend_v2_prefix_lens(capture_batch, capture_case, device=device)
+    capture_batch.spec_info = _make_eagle_draft_extend_v2_input(
+        capture_case,
+        capture_batch,
+        device=device,
+    )
+    prepare_dense_runner_inputs(
+        graph_fixture,
+        capture_case,
+        capture_batch,
+        capture_inputs,
+        max_context_len=max_context_len,
+    )
+    capture_expected = expected_dense_output_from_inputs(
+        graph_fixture,
+        capture_case,
+        capture_inputs,
+        None,
+    )
+
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
+        _init_cuda_graph_capture_metadata(
+            backend,
+            cuda_graph_capture_batch_size,
+            capture_batch,
+        )
+        capture_actual = run_dense_forward(
+            graph_fixture,
+            capture_batch,
+            capture_inputs,
+        )
+        backend.on_after_cuda_graph_warmup()
+
+    replay_pad_prefix_lens = (capture_prefix_len,) * (
+        cuda_graph_capture_batch_size - case.batch_size
+    )
+    replay_case = _make_dense_spec_case_with_lens(
+        case,
+        f"{case.name}_cuda_graph_replay",
+        case.prefix_lens + replay_pad_prefix_lens,
+        case.input_lens + (num_tokens_per_req,) * len(replay_pad_prefix_lens),
+    )
+    graph_inputs = dense_fixture_inputs(graph_fixture)
+    replay_inputs = make_dense_padded_replay_inputs(
+        replay_case,
+        graph_fixture,
+        replay_pad_prefix_lens,
+        graph_inputs,
+        dtype=dtype,
+        device=device,
+    )
+    replay_batch = _make_dense_forward_batch(
+        replay_case,
+        graph_fixture.runner,
+        max_context_len=max_context_len,
+        device=device,
+    )
+    _set_draft_extend_v2_prefix_lens(replay_batch, replay_case, device=device)
+    replay_batch.spec_info = _make_eagle_draft_extend_v2_input(
+        replay_case,
+        replay_batch,
+        device=device,
+    )
+    prepare_dense_runner_inputs(
+        graph_fixture,
+        replay_case,
+        replay_batch,
+        replay_inputs,
+        max_context_len=max_context_len,
+    )
+    replay_expected = expected_dense_output_from_inputs(
+        graph_fixture,
+        replay_case,
+        replay_inputs,
+        None,
+    )
+
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
+        _init_cuda_graph_replay_metadata(
+            backend,
+            cuda_graph_capture_batch_size,
+            replay_batch,
+        )
+        replay_actual = run_dense_forward(graph_fixture, replay_batch, replay_inputs)
+
+    torch.testing.assert_close(
+        capture_actual,
+        capture_expected,
+        atol=DENSE_ATOL,
+        rtol=DENSE_RTOL,
+    )
+    torch.testing.assert_close(
+        replay_actual,
+        replay_expected,
         atol=DENSE_ATOL,
         rtol=DENSE_RTOL,
     )

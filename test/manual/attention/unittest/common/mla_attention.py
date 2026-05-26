@@ -222,7 +222,7 @@ class MockMLAModelRunner(ModelRunner):
         speculative_num_draft_tokens = (
             max(case.input_lens)
             if case.forward_mode.is_target_verify()
-            or case.forward_mode.is_draft_extend()
+            or case.forward_mode.is_draft_extend(include_v2=True)
             else 0
         )
         self.server_args = SimpleNamespace(
@@ -663,7 +663,7 @@ def _make_forward_batch(
         positions=torch.tensor(positions, dtype=torch.int64, device=device),
     )
 
-    if case.forward_mode.is_extend():
+    if case.forward_mode.is_extend(include_draft_extend_v2=True):
         extend_seq_lens = torch.tensor(input_lens, dtype=torch.int32, device=device)
         batch.extend_prefix_lens = torch.tensor(
             case.prefix_lens, dtype=torch.int32, device=device
