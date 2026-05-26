@@ -54,11 +54,7 @@ from sglang.srt.speculative.eagle_info_v2 import (
     fill_accepted_out_cache_loc,
     fill_bonus_tokens,
 )
-from sglang.srt.speculative.eagle_utils import (
-    TreeMaskMode,
-    _eagle_prefill_tail_tokens,
-    build_tree_kernel_efficient,
-)
+from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
@@ -564,13 +560,11 @@ class EagleDraftWorker(BaseDraftWorker):
         """
         # Construct input_ids
         if not batch.forward_mode.is_idle():
-            # Chunked-prefill-aware tail tokens (see PR #26329).
-            tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
             pt = 0
             for i, extend_len in enumerate(batch.extend_lens):
                 input_ids = batch.input_ids[pt : pt + extend_len]
                 batch.input_ids[pt : pt + extend_len] = torch.cat(
-                    (input_ids[1:], tail_tokens[i].reshape(1))
+                    (input_ids[1:], next_token_ids[i].reshape(1))
                 )
                 pt += extend_len
 
