@@ -72,7 +72,7 @@ runs:
           # Fallback to run-attempt URL if job_id lookup failed
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
         fi
-        body_json=$(printf '{"body":"@hnyls2002 %s - %s"}' "${ref_label}" "${run_url}")
+        body_json=$(printf '{"body":"@hnyls2002 [Coredump Tracker] %s - %s"}' "${ref_label}" "${run_url}")
         curl -sS -X POST \
           -H "Authorization: Bearer ${BOT_TOKEN}" \
           -H "Accept: application/vnd.github+json" \
