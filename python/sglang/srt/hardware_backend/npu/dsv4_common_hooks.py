@@ -99,8 +99,8 @@ def maybe_write_dsv4_decode(
     token_per_req: int,
 ) -> None:
     """Post-alloc_decode hook for DSV4. Spreads the new token slot ids
-    (one per req) into ``req_to_token_c{4,128}_state`` and into
-    ``req_to_token_c{4,128}`` for reqs that just crossed a ratio boundary.
+    (one per req for swa, gated by ratio boundary for c4/c128) into the
+    per-req tables on DSV4NPUReqToTokenPool.
 
     ``seq_lens_cpu`` is the POST-decode seq len (already incremented by
     ``token_per_req``); the new compressed tokens go at positions

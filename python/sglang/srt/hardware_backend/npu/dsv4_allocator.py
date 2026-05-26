@@ -19,10 +19,10 @@ Allocation flow:
   4. Bundle full / swa / c4 / c128 slot tensors into a
      :class:`DSV4OutCacheLoc` and stash on ``self._last_dsv4_alloc``.
 
-State-pool slots (``out_c4_state_loc`` / ``out_c128_state_loc``) are not
-allocated here — they are derived on the fly by the attention backend
-from raw KV slots via ``translate_kv_loc_to_compress_state_loc``. We
-emit empty placeholder tensors for those two fields.
+State pool slots are NOT in the bundle — they're derived on the fly by
+the attention backend via ``translate_kv_loc_to_compress_state_loc``
+(swa_page * ring_size + offset). State pool reads use flat indices (no
+PA_ND constraint), so no per-req allocator / table is needed.
 
 mem_cache/common.py fetches the bundle via ``get_last_dsv4_alloc()``
 after each alloc, stashes it on ``batch.out_cache_loc_dsv4``, and writes
@@ -38,6 +38,37 @@ import torch
 from sglang.srt.hardware_backend.npu.allocator_npu import NPUPagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc
+
+
+def get_last_loc(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
+) -> torch.Tensor:
+    """Return the slot id of the last token already allocated for each req,
+    or -1 when ``prefix_lens[i] == 0`` (fresh req with no prior allocation).
+
+    Mirrors ``iforgetmyname/sglang dsv4_release get_last_loc_torch`` —
+    looks up ``req_to_token[req, prefix_lens-1]``. Used by the c-pool
+    branch of :class:`DSV4NPUTokenToKVPoolAllocator` to anchor the paged
+    allocator's ``alloc_extend`` on the real previous tail slot rather
+    than the broken ``-1``-everywhere sentinel that the legacy code used
+    (which forced every cross-boundary decode to open a fresh c-pool
+    page, violating intra-page slot continuity assumed by the kernel's
+    ``cmp_block_table``).
+
+    Result dtype matches ``prefix_lens`` dtype (matches the caller's
+    last_loc convention; paged allocator's ``alloc_extend`` debug assert
+    requires ``(last_loc + 1) % page_size == prefix_lens % page_size``).
+    """
+    req_pool_indices = req_pool_indices.to(torch.int64)
+    safe_idx = (prefix_lens.to(torch.int64) - 1).clamp(min=0)
+    looked_up = req_to_token[req_pool_indices, safe_idx].to(prefix_lens.dtype)
+    return torch.where(
+        prefix_lens > 0,
+        looked_up,
+        torch.full_like(prefix_lens, -1),
+    )
 
 
 class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
@@ -89,16 +120,20 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             need_sort=need_sort,
         )
 
-        # Empty placeholder used for the unused state fields of DSV4OutCacheLoc.
-        # Cached as a single zero-length int64 tensor on the right device so we
-        # don't churn allocations on every alloc_extend / alloc_decode.
-        # TODO: allocate state pool slots here too. State pool is currently
-        # derived on-the-fly in the attention backend via
-        # translate_kv_loc_to_compress_state_loc; req_to_token_c{4,128}_state
-        # tables exist on DSV4NPUReqToTokenPool but stay zero-filled until
-        # this allocator emits real out_c{4,128}_state_loc values.
+        # Cached zero-length int64 tensor returned by _alloc_c_extend when a
+        # batch produces no new compressed tokens this step (e.g. decode of
+        # reqs that haven't yet closed a ratio chunk). Avoids per-step
+        # torch.empty churn.
         self._empty_loc = torch.empty((0,), dtype=torch.int64, device=device)
         self._last_dsv4_alloc: Optional[DSV4OutCacheLoc] = None
+
+        # Back-reference to DSV4NPUReqToTokenPool, wired by
+        # ``register_req_to_token_pool`` (called from the pool's
+        # ``register_dsv4_allocator``). Needed so ``_alloc_c_extend`` can
+        # look up real c-pool last_loc via ``get_last_loc`` on the
+        # per-req ``req_to_token_c{4,128}`` table. Stays None until
+        # registration; ``_alloc_c_extend`` asserts non-None.
+        self._req_to_token_pool = None
 
     # ------------------------------------------------------------------
     # Helpers
@@ -121,6 +156,14 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         diff = diff.clamp(min=0)
         return int(diff.sum().item())
 
+    def register_req_to_token_pool(self, req_to_token_pool) -> None:
+        """Wire the DSV4NPUReqToTokenPool back-ref so ``_alloc_c_extend``
+        can look up the real c-pool last_loc from the per-req
+        ``req_to_token_c{4,128}`` table. Called from
+        :meth:`DSV4NPUReqToTokenPool.register_dsv4_allocator` right after
+        the pool object is constructed."""
+        self._req_to_token_pool = req_to_token_pool
+
     def _alloc_c_extend(
         self,
         allocator: NPUPagedTokenToKVPoolAllocator,
@@ -128,15 +171,29 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         prefix_lens_cpu: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        last_loc_dtype: torch.dtype,
         ratio: int,
     ) -> torch.Tensor:
         """Allocate compressed slots for an extend operation at ``ratio``.
 
         Per-request prefix / seq lengths are translated from raw token
-        units to compressed units by integer-dividing by ``ratio``. last_loc
-        is used as the prefix tail-page anchor for the paged allocator's
-        ``alloc_extend``.
+        units to compressed units by integer-dividing by ``ratio``. The
+        c-pool last_loc is looked up from ``req_to_token_c{ratio}`` table
+        via :func:`get_last_loc` — this is the slot id of the previous
+        c-pool token for each req (or -1 for fresh reqs with no prior
+        c-pool allocation). The paged allocator then either continues
+        in the same page (slot = last_loc + 1) or opens a new page (at
+        ratio boundary), preserving intra-page slot continuity which the
+        kernel's ``cmp_block_table`` reader relies on.
+
+        The previous implementation hard-coded ``last_loc=-1`` everywhere,
+        which forced every cross-boundary decode to open a fresh c-pool
+        page; later writes for one req's consecutive compressed tokens
+        ended up scattered across many pages, breaking the kernel's
+        assumption that page-aligned chunks of ``page_size`` compressed
+        positions live in one physical page. Symptom: long-output AIME
+        decoded into garbage past raw seq_len ~= 512.
         """
         c_prefix = (prefix_lens // ratio).to(prefix_lens.dtype)
         c_seq = (seq_lens // ratio).to(seq_lens.dtype)
@@ -145,12 +202,27 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         c_extend = self._compute_c_extend_counts(prefix_lens_cpu, seq_lens_cpu, ratio)
         if c_extend == 0:
             return self._empty_loc
+
+        assert self._req_to_token_pool is not None, (
+            "DSV4NPUTokenToKVPoolAllocator.register_req_to_token_pool was not "
+            "called — c-pool last_loc lookup needs the per-req table back-ref. "
+            "Wire it from DSV4NPUReqToTokenPool.register_dsv4_allocator."
+        )
+        c_table = (
+            self._req_to_token_pool.req_to_token_c4
+            if ratio == 4
+            else self._req_to_token_pool.req_to_token_c128
+        )
+        c_last_loc = get_last_loc(c_table, req_pool_indices, c_prefix).to(
+            last_loc_dtype
+        )
+
         result = allocator.alloc_extend(
             c_prefix,
             c_prefix_cpu,
             c_seq,
             c_seq_cpu,
-            last_loc,
+            c_last_loc,
             c_extend,
         )
         if result is None:
@@ -175,6 +247,8 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         extend_num_tokens: int,
+        *,
+        req_pool_indices: Optional[torch.Tensor] = None,
     ):
         out_full_loc = super().alloc_extend(
             prefix_lens,
@@ -194,29 +268,30 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             "full_to_swa_index_mapping not initialized?"
         )
 
-        # Pass a dummy last_loc tensor (one -1 per req) to the c-pool extend.
-        # The compressed paged allocator uses last_loc to anchor the prefix
-        # tail page, but since compressed sequences grow monotonically inside
-        # their own pool and we don't track per-req c-pool tails, -1 makes
-        # the allocator start a fresh tail page each extend. That is wasteful
-        # if extend_num_tokens straddles a page boundary, but acceptable for
-        # an initial cut. TODO: track c-pool last_loc per-req.
-        c_last_loc = torch.full(
-            (prefix_lens.shape[0],), -1, dtype=last_loc.dtype, device=last_loc.device,
+        # req_pool_indices is REQUIRED for the c-pool last_loc lookup.
+        # mem_cache/common.py:alloc_paged_token_slots_extend passes it via
+        # the hasattr-gated extra_kwargs path when the allocator is a
+        # DSV4NPUTokenToKVPoolAllocator instance.
+        assert req_pool_indices is not None, (
+            "DSV4NPUTokenToKVPoolAllocator.alloc_extend requires req_pool_indices. "
+            "Caller (alloc_paged_token_slots_extend) must forward "
+            "batch.req_pool_indices."
         )
 
         out_c4_loc = self._alloc_c_extend(
             self.c4_attn_allocator,
             prefix_lens, prefix_lens_cpu,
             seq_lens, seq_lens_cpu,
-            c_last_loc,
+            req_pool_indices,
+            last_loc.dtype,
             ratio=4,
         )
         out_c128_loc = self._alloc_c_extend(
             self.c128_attn_allocator,
             prefix_lens, prefix_lens_cpu,
             seq_lens, seq_lens_cpu,
-            c_last_loc,
+            req_pool_indices,
+            last_loc.dtype,
             ratio=128,
         )
 
@@ -225,8 +300,6 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             out_swa_loc=out_swa_loc,
             out_c4_loc=out_c4_loc,
             out_c128_loc=out_c128_loc,
-            out_c4_state_loc=self._empty_loc,
-            out_c128_state_loc=self._empty_loc,
         )
         return out_full_loc
 
@@ -235,6 +308,8 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
+        *,
+        req_pool_indices: Optional[torch.Tensor] = None,
     ):
         out_full_loc = super().alloc_decode(seq_lens, seq_lens_cpu, last_loc)
         if out_full_loc is None:
@@ -244,26 +319,33 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         out_swa_loc = self.translate_loc_from_full_to_swa(out_full_loc)
 
         # For decode, we add one token per req. A new compressed-K token
-        # is emitted when seq_lens[i] % ratio == 0 (post-decode). We model
-        # this as an extend from (seq_lens - 1) // ratio to seq_lens // ratio.
+        # is emitted when seq_lens[i] % ratio == 0 (post-decode). Model
+        # this as an extend from (seq_lens-1)//ratio to seq_lens//ratio;
+        # _alloc_c_extend looks up real c-pool last_loc from req_to_token_c{ratio}
+        # via get_last_loc, ensuring intra-page slot continuity.
         prefix_lens = (seq_lens - 1).clamp(min=0)
         prefix_lens_cpu = (seq_lens_cpu - 1).clamp(min=0)
-        c_last_loc = torch.full(
-            (seq_lens.shape[0],), -1, dtype=last_loc.dtype, device=last_loc.device,
+
+        assert req_pool_indices is not None, (
+            "DSV4NPUTokenToKVPoolAllocator.alloc_decode requires req_pool_indices. "
+            "Caller (alloc_paged_token_slots_decode) must forward "
+            "batch.req_pool_indices."
         )
 
         out_c4_loc = self._alloc_c_extend(
             self.c4_attn_allocator,
             prefix_lens, prefix_lens_cpu,
             seq_lens, seq_lens_cpu,
-            c_last_loc,
+            req_pool_indices,
+            last_loc.dtype,
             ratio=4,
         )
         out_c128_loc = self._alloc_c_extend(
             self.c128_attn_allocator,
             prefix_lens, prefix_lens_cpu,
             seq_lens, seq_lens_cpu,
-            c_last_loc,
+            req_pool_indices,
+            last_loc.dtype,
             ratio=128,
         )
 
@@ -272,8 +354,6 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             out_swa_loc=out_swa_loc,
             out_c4_loc=out_c4_loc,
             out_c128_loc=out_c128_loc,
-            out_c4_state_loc=self._empty_loc,
-            out_c128_state_loc=self._empty_loc,
         )
         return out_full_loc
 

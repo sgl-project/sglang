@@ -237,9 +237,13 @@ def compute_local_num_token_non_padded(
 class DSV4OutCacheLoc:
     """Per-forward-pass KV cache allocation for DeepSeek-V4 on NPU.
 
-    Bundles slot indices for full/SWA pools and the four compressed pools
-    (c4/c128 KV + c4/c128 state). Populated by the NPU V4 allocator when
-    the model is DeepSeek-V4; left as ``None`` on ForwardBatch otherwise.
+    Bundles slot indices for full/SWA pools and the two compressed-KV pools
+    (c4/c128). Populated by the NPU V4 allocator when the model is
+    DeepSeek-V4; left as ``None`` on ForwardBatch otherwise.
+
+    State pool slots (c4_state / c128_state) are NOT in the bundle — they
+    are derived on-the-fly by the attention backend via
+    ``translate_kv_loc_to_compress_state_loc`` from raw KV slots.
 
     All fields are token-level slot ids in their respective pools (NOT page
     ids). Attention backends convert to page ids via ``// page_size`` when
@@ -250,8 +254,6 @@ class DSV4OutCacheLoc:
     out_swa_loc: torch.Tensor
     out_c4_loc: torch.Tensor
     out_c128_loc: torch.Tensor
-    out_c4_state_loc: torch.Tensor
-    out_c128_state_loc: torch.Tensor
 
 
 @dataclass

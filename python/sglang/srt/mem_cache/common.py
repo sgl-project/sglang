@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import torch
@@ -364,6 +364,7 @@ def alloc_paged_token_slots_extend(
     last_loc: torch.Tensor,
     extend_num_tokens: int,
     backup_state: bool = False,
+    req_pool_indices: Optional[torch.Tensor] = None,
 ):
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -374,6 +375,15 @@ def alloc_paged_token_slots_extend(
     if backup_state:
         state = allocator.backup_state()
 
+    # DSV4-NPU allocator additionally needs req_pool_indices to look up the
+    # c-pool last_loc from per-req tables. Gate via hasattr so non-DSV4
+    # allocators (no req_pool_indices kwarg in signature) stay unchanged.
+    extra_alloc_kwargs = {}
+    if req_pool_indices is not None and hasattr(
+        allocator, "register_req_to_token_pool"
+    ):
+        extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
+
     out_cache_loc = allocator.alloc_extend(
         prefix_lens,
         prefix_lens_cpu,
@@ -381,6 +391,7 @@ def alloc_paged_token_slots_extend(
         seq_lens_cpu,
         last_loc,
         extend_num_tokens,
+        **extra_alloc_kwargs,
     )
 
     if out_cache_loc is None:
@@ -474,6 +485,7 @@ def alloc_for_extend(
             seq_lens_cpu=batch.seq_lens_cpu,
             last_loc=torch.cat(last_loc),
             extend_num_tokens=batch.extend_num_tokens,
+            req_pool_indices=req_pool_indices_device,
         )
 
     # Write to req_to_token_pool
@@ -515,6 +527,7 @@ def alloc_paged_token_slots_decode(
     seq_lens_cpu: torch.Tensor,
     last_loc: torch.Tensor,
     token_per_req: int = 1,
+    req_pool_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -522,7 +535,18 @@ def alloc_paged_token_slots_decode(
     num_tokens = len(seq_lens) * allocator.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
 
-    out_cache_loc = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+    # DSV4-NPU allocator additionally needs req_pool_indices to look up the
+    # c-pool last_loc from per-req tables. Gate via hasattr so non-DSV4
+    # allocators stay unchanged.
+    extra_alloc_kwargs = {}
+    if req_pool_indices is not None and hasattr(
+        allocator, "register_req_to_token_pool"
+    ):
+        extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
+
+    out_cache_loc = allocator.alloc_decode(
+        seq_lens, seq_lens_cpu, last_loc, **extra_alloc_kwargs
+    )
 
     if out_cache_loc is None:
         error_msg = (
@@ -565,6 +589,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
             last_loc=last_loc,
             token_per_req=token_per_req,
+            req_pool_indices=batch.req_pool_indices,
         )
 
     # Write to req_to_token_pool

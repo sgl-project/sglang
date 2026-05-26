@@ -1,23 +1,27 @@
 """DSV4-NPU per-request mapping pool.
 
-Subclass of ``ReqToTokenPool`` that adds five auxiliary per-request tables
+Subclass of ``ReqToTokenPool`` that adds three auxiliary per-request tables
 needed by the DSV4 attention backend:
 
-  * ``req_to_token_swa``       — slot ids in the SWA full-pool view
-  * ``req_to_token_c4``        — slot ids in the c4 compressed-KV pool
-  * ``req_to_token_c128``      — slot ids in the c128 compressed-KV pool
-  * ``req_to_token_c4_state``  — slot ids in the c4 state-buffer pool
-  * ``req_to_token_c128_state``— slot ids in the c128 state-buffer pool
+  * ``req_to_token_swa``   — slot ids in the SWA full-pool view
+  * ``req_to_token_c4``    — slot ids in the c4 compressed-KV pool
+  * ``req_to_token_c128``  — slot ids in the c128 compressed-KV pool
 
-Each table is sized ``[size, max_context_len // ratio]`` for compressed
-pools and ``[size, max_context_len]`` for swa / state pools, mirroring the
-``req_to_token`` layout. Elements are token-level slot ids; the attention
-backend converts to page ids via ``// page_size`` when constructing PA_ND
-block tables.
+Compressed pools store 1 slot per ``ratio`` raw tokens, so their per-req
+table column count is ``max_context_len // ratio``. swa mirrors the raw
+token count. Elements are token-level slot ids; the attention backend
+converts to page ids via ``// page_size`` when constructing PA_ND block
+tables.
+
+State pools (c4 / c128) do NOT have per-req tables — their slots are
+derived on-the-fly by the attention backend via
+``translate_kv_loc_to_compress_state_loc(raw_loc, ratio)`` which folds
+each swa page into ``ring_size`` state slots. State pool reads from the
+compressor use flat indices (no PA_ND constraint), so the mapping is
+purely arithmetic and doesn't need a per-req allocator.
 
 Memory cost example (size=64, max_context_len=32K): swa 8MB + c4 2MB +
-c128 64KB + c4_state 8MB + c128_state 8MB ≈ 26MB extra on top of the base
-req_to_token (8MB). Negligible vs. the c4/c128 KV pools themselves.
+c128 64KB ≈ 10MB extra on top of the base req_to_token (8MB).
 
 The tables are populated by hooks in ``mem_cache/common.py`` immediately
 after a successful alloc_extend / alloc_decode, using the per-pool slot
@@ -56,10 +60,6 @@ class DSV4NPUReqToTokenPool(ReqToTokenPool):
             enable=enable_memory_saver
         )
 
-        # max_context_len is the max kv sequence length per request. Each
-        # compressed pool stores 1 token per `ratio` raw tokens, so its
-        # per-req table column count divides by ratio. State pools mirror
-        # the raw token count (one state entry per raw position).
         # Back-reference to the DSV4NPUTokenToKVPoolAllocator. Wired up via
         # ``register_dsv4_allocator`` after both are constructed (see
         # model_runner_kv_cache_mixin), so ``free(req)`` can release the
@@ -84,16 +84,6 @@ class DSV4NPUReqToTokenPool(ReqToTokenPool):
                 dtype=torch.int32,
                 device=device,
             )
-            self.req_to_token_c4_state = torch.zeros(
-                (self._alloc_size, max_context_len),
-                dtype=torch.int32,
-                device=device,
-            )
-            self.req_to_token_c128_state = torch.zeros(
-                (self._alloc_size, max_context_len),
-                dtype=torch.int32,
-                device=device,
-            )
 
     # ------------------------------------------------------------------
     # Per-pool write helpers. mem_cache/common.py calls these directly
@@ -111,12 +101,6 @@ class DSV4NPUReqToTokenPool(ReqToTokenPool):
     def write_c128(self, indices, values: torch.Tensor) -> None:
         self.req_to_token_c128[indices] = values
 
-    def write_c4_state(self, indices, values: torch.Tensor) -> None:
-        self.req_to_token_c4_state[indices] = values
-
-    def write_c128_state(self, indices, values: torch.Tensor) -> None:
-        self.req_to_token_c128_state[indices] = values
-
     def clear(self):
         super().clear()
         # No need to zero the auxiliary tables: they're indexed only by
@@ -126,8 +110,17 @@ class DSV4NPUReqToTokenPool(ReqToTokenPool):
 
     def register_dsv4_allocator(self, allocator) -> None:
         """Wire the DSV4NPUTokenToKVPoolAllocator back-ref so ``free(req)``
-        can release c4/c128 pool pages alongside the req_pool_idx slot."""
+        can release c4/c128 pool pages alongside the req_pool_idx slot.
+
+        Also wires the reverse direction: the allocator needs a back-ref
+        to this pool so its c-pool alloc path can look up the previous
+        compressed-token slot via ``get_last_loc`` on
+        ``req_to_token_c{4,128}``. Without the reverse wiring the
+        allocator falls back to a broken ``-1`` last_loc that opens a
+        fresh c-pool page on every cross-boundary decode."""
         self._dsv4_allocator = allocator
+        if hasattr(allocator, "register_req_to_token_pool"):
+            allocator.register_req_to_token_pool(self)
 
     def free(self, req):
         # Trigger c4/c128 pool free via the allocator's unified free path;

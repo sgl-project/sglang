@@ -1092,30 +1092,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
     ) -> torch.Tensor:
-        # [layer_probe] hang-localization probe. Tags each phase boundary
-        # only on layer 0/1 for the first 4 forwards, so we can read off
-        # the log AFTER a crash to see which rank's last printed marker
-        # is — the next phase is where it hung. Env-gated by
-        # SGLANG_LAYER_PROBE (default on; set =0 to silence).
-        import os as _os_lp, logging as _log_lp
-        _LP_ON = (
-            _os_lp.environ.get("SGLANG_LAYER_PROBE", "1") != "0"
-            and self.layer_id <= 1
-        )
-        if _LP_ON:
-            self._layer_call_ct = getattr(self, "_layer_call_ct", 0) + 1
-            _ct = self._layer_call_ct
-            _LP_ON = _ct <= 4
-            if _LP_ON:
-                _lp = _log_lp.getLogger("sglang.layer_probe")
-                _lp.warning(
-                    "[layer_probe L%d ct=%d] start  mode=%s shape=%s",
-                    self.layer_id, _ct, forward_batch.forward_mode,
-                    tuple(hidden_states.shape),
-                )
-
         residual = hidden_states
-        if _LP_ON: _lp.warning("[layer_probe L%d ct=%d] before hc_pre1", self.layer_id, _ct)
         hidden_states, post, comb, norm_fused = self.hc_pre(
             hidden_states,
             self.hc_attn_fn,
@@ -1124,23 +1101,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm=self.input_layernorm,
             forward_batch=forward_batch,
         )
-        if _LP_ON: _lp.warning("[layer_probe L%d ct=%d] after  hc_pre1  shape=%s", self.layer_id, _ct, tuple(hidden_states.shape))
         if not norm_fused:
             hidden_states = self.input_layernorm(hidden_states)
 
-        if _LP_ON: _lp.warning("[layer_probe L%d ct=%d] before self_attn", self.layer_id, _ct)
         hidden_states = self.self_attn(
             x=hidden_states,
             positions=positions,
             forward_batch=forward_batch,
         )
-        if _LP_ON: _lp.warning("[layer_probe L%d ct=%d] after  self_attn shape=%s", self.layer_id, _ct, tuple(hidden_states.shape))
 
-        if _LP_ON: _lp.warning("[layer_probe L%d ct=%d] before hc_post1", self.layer_id, _ct)
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
-        if _LP_ON: _lp.warning("[layer_probe L%d ct=%d] after  hc_post1 shape=%s", self.layer_id, _ct, tuple(hidden_states.shape))
         residual = hidden_states
-        if _LP_ON: _lp.warning("[layer_probe L%d ct=%d] before hc_pre2", self.layer_id, _ct)
         hidden_states, post, comb, norm_fused = self.hc_pre(
             hidden_states,
             self.hc_ffn_fn,
@@ -1149,7 +1120,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm=self.post_attention_layernorm,
             forward_batch=forward_batch,
         )
-        if _LP_ON: _lp.warning("[layer_probe L%d ct=%d] after  hc_pre2  shape=%s", self.layer_id, _ct, tuple(hidden_states.shape))
         if not norm_fused:
             hidden_states = self.post_attention_layernorm(hidden_states)
 
@@ -1190,14 +1160,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = _a2a_scatter_chunks[r].contiguous()
             input_ids = input_ids.tensor_split(s)[r].contiguous()
             input_ids_global = input_ids_global.tensor_split(s)[r].contiguous()
-        if _LP_ON: _lp.warning("[layer_probe L%d ct=%d] before mlp     shape=%s", self.layer_id, _ct, tuple(hidden_states.shape))
         hidden_states = self.mlp(
             hidden_states,
             forward_batch,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
         )
-        if _LP_ON: _lp.warning("[layer_probe L%d ct=%d] after  mlp     shape=%s", self.layer_id, _ct, tuple(hidden_states.shape))
         if _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_attention_tp_group()),
