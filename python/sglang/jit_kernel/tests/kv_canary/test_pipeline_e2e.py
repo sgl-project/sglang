@@ -875,6 +875,8 @@ def test_pipeline_token_mismatch_detected_via_pool() -> None:
 
     assert int(log_real.write_index[0].item()) == prefix_len
     assert int(log_ref.write_index[0].item()) == prefix_len
+    # Ring rows may land in any order; collect stored/expected pairs and compare as sets.
+    observed_pairs: set[tuple[int, int]] = set()
     for row_idx in range(prefix_len):
         fail_bits = int(
             log_real.ring[row_idx, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
@@ -886,8 +888,11 @@ def test_pipeline_token_mismatch_detected_via_pool() -> None:
         expected = int(
             log_real.ring[row_idx, consts.VIOLATION_FIELD_EXPECTED_TOKEN].item()
         )
-        assert stored == stored_tokens[row_idx]
-        assert expected == expected_tokens[row_idx]
+        observed_pairs.add((stored, expected))
+    expected_pairs = {
+        (stored_tokens[i], expected_tokens[i]) for i in range(prefix_len)
+    }
+    assert observed_pairs == expected_pairs
 
 
 def test_pipeline_eagle_offset_plus_1_byte_equal() -> None:
