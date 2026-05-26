@@ -424,6 +424,22 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertFalse(server_args.server_warmup)
         self.assertTrue(server_args.is_arg_explicitly_set("warmup"))
 
+    def test_disagg_role_disables_server_warmup(self):
+        with patch.object(
+            PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+        ):
+            server_args = ServerArgs.from_dict(
+                {
+                    "model_path": "/fake",
+                    "warmup": True,
+                    "server_warmup": True,
+                    "disagg_role": "server",
+                }
+            )
+
+        self.assertTrue(server_args.warmup)
+        self.assertFalse(server_args.server_warmup)
+
 
 class TestOffloadDefaults(unittest.TestCase):
     def _from_dict_with_pipeline_config(

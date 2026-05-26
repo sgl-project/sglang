@@ -664,6 +664,9 @@ class ServerArgs(DisaggArgsMixin):
             self.warmup = True
             self.server_warmup = False
 
+        if self.disagg_role != RoleType.MONOLITHIC:
+            self.server_warmup = False
+
         if not self.warmup:
             self.server_warmup = False
 
