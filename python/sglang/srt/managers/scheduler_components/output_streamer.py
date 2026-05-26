@@ -434,18 +434,29 @@ class _GenerationStreamAccumulator:
                 self.output_token_ids_logprobs_val.append([])
                 self.output_token_ids_logprobs_idx.append([])
 
-        if req.return_hidden_states:
-            self.output_hidden_states.append(req.hidden_states)
-        if req.return_routed_experts:
-            self.routed_experts.append(req.routed_experts)
-        if req.return_indexer_topk:
-            self.indexer_topk.append(req.indexer_topk)
+        self._append_optional_output(
+            self.output_hidden_states, req.return_hidden_states, req.hidden_states
+        )
+        self._append_optional_output(
+            self.routed_experts, req.return_routed_experts, req.routed_experts
+        )
+        self._append_optional_output(
+            self.indexer_topk, req.return_indexer_topk, req.indexer_topk
+        )
 
         if req.customized_info is not None:
             for k, v in req.customized_info.items():
                 if k not in self.customized_info:
                     self.customized_info[k] = []
                 self.customized_info[k].append(v[send_token_offset : len(output_ids_)])
+
+    def _append_optional_output(self, values: list, enabled: bool, value: Any) -> None:
+        if enabled:
+            if not values:
+                values.extend([None] * (len(self.rids) - 1))
+            values.append(value)
+        elif values:
+            values.append(None)
 
     def to_payload(
         self, *, load, dp_rank: int, is_idle_batch: bool, has_reqs: bool
