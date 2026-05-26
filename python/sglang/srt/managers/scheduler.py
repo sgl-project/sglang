@@ -2345,10 +2345,7 @@ class Scheduler(
         # exclusive — the chunked req is held aside and merged back only
         # after its final chunk. If both contain the same req, double
         # accounting / double release follows.
-        if (
-            self.chunked_req is not None
-            and self.chunked_req in self.running_batch.reqs
-        ):
+        if self.chunked_req is not None and self.chunked_req in self.running_batch.reqs:
             self._chunked_req_in_batch_violation_count += 1
 
         if self.enable_fpm:
@@ -2410,11 +2407,26 @@ class Scheduler(
 
             # Merge the new batch into the running batch.
             if not self.last_batch.is_empty():
+                # Capture before merge so we can self-check invariant S3
+                # against the post-merge running_batch contents below.
+                last_batch_chunked_req = self.last_batch.chunked_req
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
                 else:
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
+
+                # Invariant S3: in PP, last_batch.chunked_req must have
+                # been added to chunked_req_to_exclude above so it is
+                # filtered out before merge. If it still ends up inside
+                # running_batch.reqs after the merge, the exclude path
+                # was bypassed (see the chunked_req_to_exclude.add call
+                # ~40 lines above).
+                if (
+                    last_batch_chunked_req is not None
+                    and last_batch_chunked_req in self.running_batch.reqs
+                ):
+                    self._stale_chunked_req_merged_count += 1
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
