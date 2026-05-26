@@ -3,25 +3,26 @@
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
+from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 
 
-class TestScriptedRuntimeSmoke(CustomTestCase):
+class TestSmoke(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = dict(
+        model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+        tp_size=1,
+        dp_size=1,
+        pp_size=1,
+        disable_overlap_schedule=True,
+        disable_cuda_graph=True,
+    )
+
     def test_smoke(self):
         """Minimal end-to-end smoke for ScriptedRuntime launch and one req."""
-        execute_scripted_runtime(
-            self._smoke_script,
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            tp_size=1,
-            dp_size=1,
-            pp_size=1,
-            disable_overlap_schedule=True,
-            disable_cuda_graph=True,
-        )
+        self.runtime.run(self._smoke_script)
 
     @staticmethod
     def _smoke_script(t: ScriptedRuntime):
