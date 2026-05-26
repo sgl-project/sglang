@@ -1092,9 +1092,7 @@ class MHATokenToKVPool(KVCache):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         if envs.SGLANG_SPEC_OOB_DETECTION.get() and tgt_loc.numel() > 0:
-            # Async bound check: surfaces a clear assertion at the next sync
-            # instead of a CUDA illegal-address or silent KV-slot corruption
-            # (and downstream NaN logits) when callers pass stale indices.
+            # Catch stale indices here instead of as illegal-addr or silent KV corruption.
             size_limit = self.size + self.page_size
             torch._assert_async(
                 (
