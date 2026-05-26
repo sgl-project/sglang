@@ -301,12 +301,20 @@ echo "Other candidate cache locations on host:"
 for candidate in \
     /home/runner/sgl-data \
     /home/runner/sglang-data \
+    /home/runner/cache \
+    /home/runner/.cache \
     /sgl-data \
     /sglang-data \
     /mnt/sgl-data \
     /mnt/sglang-data \
+    /mnt/cache \
     /data/sgl-data \
-    /data/sglang-data; do
+    /data/sglang-data \
+    /run/sgl-data \
+    /run/sglang-data \
+    /run/cache \
+    /run/runner/sgl-data \
+    /run/runner/sglang-data; do
     if [[ -e "$candidate" ]]; then
         if [[ -d "$candidate" ]]; then
             size=$(du -sh "$candidate" 2>/dev/null | cut -f1)
@@ -321,11 +329,23 @@ echo ""
 echo "Host /home contents:"
 ls -la /home 2>/dev/null || echo "  (cannot list /home)"
 echo ""
+echo "Host /home/runner contents:"
+ls -la /home/runner 2>/dev/null || echo "  (cannot list /home/runner)"
+echo ""
 echo "Host /mnt contents:"
 ls -la /mnt 2>/dev/null || echo "  (cannot list /mnt)"
 echo ""
+echo "Host /run contents (often the persistent NVMe on MI runners):"
+ls -la /run 2>/dev/null || echo "  (cannot list /run)"
+echo ""
+echo "Host /data contents:"
+ls -la /data 2>/dev/null || echo "  (cannot list /data or does not exist)"
+echo ""
 echo "Host filesystem usage:"
-df -h 2>/dev/null | head -20 || true
+df -h 2>/dev/null | head -25 || true
+echo ""
+echo "Persistent-looking mounts (excluding tmpfs/overlay/proc/sys/cgroup):"
+awk '$3 != "tmpfs" && $3 != "overlay" && $3 != "proc" && $3 != "sysfs" && $3 != "cgroup" && $3 != "cgroup2" && $3 != "devpts" && $3 != "mqueue" {print $1, "->", $2, "type", $3}' /proc/mounts 2>/dev/null || true
 echo "=========================================="
 
 echo "Launching container: ci_sglang"
