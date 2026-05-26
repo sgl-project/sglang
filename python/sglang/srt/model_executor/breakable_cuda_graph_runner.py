@@ -120,6 +120,12 @@ class BreakableCudaGraphRunner:
         self.attention_layers = model_runner.attention_layers
         self.moe_layers = model_runner.moe_layers
         self.moe_fusions = model_runner.moe_fusions
+        self.use_static_attn_metadata_replay = (
+            model_runner.attn_backend.use_static_metadata_replay_breakable_cuda_graph
+        )
+        self.attn_metadata_buffers = (
+            {} if self.use_static_attn_metadata_replay else None
+        )
 
         # Resolve the inner transformer-stack module (the same boundary PCG draws
         # via patch_model). At replay we monkey-patch this module's forward with
@@ -336,11 +342,46 @@ class BreakableCudaGraphRunner:
         """Warmup the model with a forward pass."""
         num_tokens = self.capture_num_tokens[0]
         forward_batch = self._build_capture_forward_batch(num_tokens)
-        with forward_context(
-            ForwardContext(attn_backend=self.model_runner.attn_backend)
+        with (
+            forward_context(
+                ForwardContext(attn_backend=self.model_runner.attn_backend)
+            ),
+            set_forward_context(
+                forward_batch,
+                self.attention_layers,
+                self.quant_config,
+                self.moe_layers,
+                self.moe_fusions,
+            ),
         ):
-            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            self._init_forward_metadata_for_capture(forward_batch, num_tokens)
             self._run_forward(forward_batch, num_tokens)
+
+    def _init_forward_metadata_for_capture(self, forward_batch, num_tokens):
+        attn_backend = self.model_runner.attn_backend
+        if not self.use_static_attn_metadata_replay:
+            attn_backend.init_forward_metadata(forward_batch)
+            return
+        metadata = attn_backend.init_forward_metadata_capture_breakable_cuda_graph(
+            forward_batch
+        )
+        assert self.attn_metadata_buffers is not None
+        self.attn_metadata_buffers[num_tokens] = metadata
+
+    def _prepare_forward_metadata_for_replay(
+        self, forward_batch, static_forward_batch, num_tokens
+    ):
+        attn_backend = self.model_runner.attn_backend
+        if not self.use_static_attn_metadata_replay:
+            attn_backend.init_forward_metadata(forward_batch)
+            return
+        assert self.attn_metadata_buffers is not None
+        metadata = self.attn_metadata_buffers[num_tokens]
+        attn_backend.copy_forward_metadata_replay_breakable_cuda_graph(
+            metadata,
+            forward_batch,
+            static_forward_batch=static_forward_batch,
+        )
 
     def _capture_all(self):
         """Capture breakable CUDA graphs for all token sizes."""
@@ -403,7 +444,7 @@ class BreakableCudaGraphRunner:
     def _capture_one(self, num_tokens, pool, stream):
         """Capture a breakable CUDA graph for one token size."""
         forward_batch = self._build_capture_forward_batch(num_tokens)
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        self._init_forward_metadata_for_capture(forward_batch, num_tokens)
 
         def run_once():
             # Invalidate SWA loc cache — same fix as in cuda_graph_runner.run_once.
@@ -479,7 +520,9 @@ class BreakableCudaGraphRunner:
             original_layer_forward = self.layer_model.forward
             self.layer_model.forward = replay_layer_forward
             try:
-                self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+                self._prepare_forward_metadata_for_replay(
+                    forward_batch, static_forward_batch, static_num_tokens
+                )
                 with set_forward_context(
                     static_forward_batch,
                     self.attention_layers,

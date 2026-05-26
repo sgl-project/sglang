@@ -18,6 +18,8 @@ if TYPE_CHECKING:
 class AttentionBackend(ABC):
     """The base class of attention backends"""
 
+    use_static_metadata_replay_breakable_cuda_graph: bool = False
+
     @abstractmethod
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -52,6 +54,23 @@ class AttentionBackend(ABC):
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         """Init the metadata for a forward pass for replaying a cuda graph."""
+        raise NotImplementedError()
+
+    def init_forward_metadata_capture_breakable_cuda_graph(
+        self,
+        forward_batch: ForwardBatch,
+    ):
+        """Init static metadata for capturing a breakable CUDA graph."""
+        raise NotImplementedError()
+
+    def copy_forward_metadata_replay_breakable_cuda_graph(
+        self,
+        capture_metadata,
+        forward_batch: ForwardBatch,
+        *,
+        static_forward_batch: Optional[ForwardBatch] = None,
+    ) -> None:
+        """Refresh capture metadata before replaying a breakable CUDA graph."""
         raise NotImplementedError()
 
     def get_cuda_graph_seq_len_fill_value(self):
