@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler
 from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -25,8 +26,10 @@ class DmdDenoisingStage(DenoisingStage):
     Denoising stage for DMD.
     """
 
-    def __init__(self, transformer, scheduler) -> None:
-        super().__init__(transformer, scheduler)
+    def __init__(self, transformer, scheduler, transformer_2=None) -> None:
+        super().__init__(
+            transformer=transformer, scheduler=scheduler, transformer_2=transformer_2
+        )
         self.scheduler = FlowMatchEulerDiscreteScheduler(shift=8.0)
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
@@ -67,6 +70,7 @@ class DmdDenoisingStage(DenoisingStage):
         num_warmup_steps = prepared_vars["num_warmup_steps"]
         latents = prepared_vars["latents"]
         video_raw_latent_shape = latents.shape
+        scheduler = self.scheduler
 
         timesteps = torch.tensor(
             server_args.pipeline_config.dmd_denoising_steps,
@@ -88,7 +92,6 @@ class DmdDenoisingStage(DenoisingStage):
         )
 
         pos_cond_kwargs = prepared_vars["pos_cond_kwargs"]
-        prompt_embeds = prepared_vars["prompt_embeds"]
 
         denoising_loop_start_time = time.time()
         with self.progress_bar(total=len(timesteps)) as progress_bar:
@@ -98,8 +101,27 @@ class DmdDenoisingStage(DenoisingStage):
                     continue
 
                 with StageProfiler(
-                    f"denoising_step_{i}", logger=logger, timings=batch.timings
+                    f"denoising_step_{i}",
+                    logger=logger,
+                    metrics=batch.metrics,
+                    perf_dump_path_provided=batch.perf_dump_path is not None,
+                    record_as_step=True,
                 ):
+                    t_int = int(t.item())
+                    if self.transformer_2 is not None:
+                        current_model, current_guidance_scale = (
+                            self._select_and_manage_model(
+                                t_int=t_int,
+                                boundary_timestep=self._handle_boundary_ratio(
+                                    server_args, batch, scheduler
+                                ),
+                                server_args=server_args,
+                                batch=batch,
+                            )
+                        )
+                    else:
+                        current_model = self.transformer
+                        self._manage_dit_use_site(current_model, "transformer", batch)
                     # Expand latents for I2V
                     noise_latents = latents.clone()
                     latent_model_input = latents.to(target_dtype)
@@ -127,7 +149,7 @@ class DmdDenoisingStage(DenoisingStage):
 
                     # Predict noise residual
                     with torch.autocast(
-                        device_type="cuda",
+                        device_type=current_platform.device_type,
                         dtype=target_dtype,
                         enabled=autocast_enabled,
                     ):
@@ -140,20 +162,22 @@ class DmdDenoisingStage(DenoisingStage):
                             forward_batch=batch,
                         ):
                             # Run transformer
-                            pred_noise = self.transformer(
-                                latent_model_input.permute(0, 2, 1, 3, 4),
-                                prompt_embeds,
-                                t_expand,
+                            pred_noise = current_model(
+                                hidden_states=latent_model_input.permute(0, 2, 1, 3, 4),
+                                timestep=t_expand,
                                 guidance=guidance_expand,
                                 **image_kwargs,
                                 **pos_cond_kwargs,
                             ).permute(0, 2, 1, 3, 4)
 
+                        video_timesteps = t_expand[:, None].expand(
+                            -1, pred_noise.shape[1]
+                        )
                         pred_video = pred_noise_to_pred_video(
                             pred_noise=pred_noise.flatten(0, 1),
                             noise_input_latent=noise_latents.flatten(0, 1),
-                            timestep=t_expand,
-                            scheduler=self.scheduler,
+                            timestep=video_timesteps,
+                            scheduler=scheduler,
                         ).unflatten(0, pred_noise.shape[:2])
 
                         if i < len(timesteps) - 1:
@@ -166,7 +190,7 @@ class DmdDenoisingStage(DenoisingStage):
                                 generator=batch.generator[0],
                                 device=self.device,
                             )
-                            latents = self.scheduler.add_noise(
+                            latents = scheduler.add_noise(
                                 pred_video.flatten(0, 1),
                                 noise.flatten(0, 1),
                                 next_timestep,
@@ -177,7 +201,7 @@ class DmdDenoisingStage(DenoisingStage):
                         # Update progress bar
                         if i == len(timesteps) - 1 or (
                             (i + 1) > num_warmup_steps
-                            and (i + 1) % self.scheduler.order == 0
+                            and (i + 1) % scheduler.order == 0
                             and progress_bar is not None
                         ):
                             progress_bar.update()
@@ -200,3 +224,54 @@ class DmdDenoisingStage(DenoisingStage):
         )
 
         return batch
+
+    def _select_and_manage_model(
+        self,
+        t_int: int,
+        boundary_timestep: float | None,
+        server_args: ServerArgs,
+        batch: Req,
+    ):
+        if boundary_timestep is None or t_int >= boundary_timestep:
+            # High-noise stage
+            current_model = self.transformer
+            current_guidance_scale = batch.guidance_scale
+            current_phase = "transformer"
+        else:
+            # Low-noise stage
+            current_model = self.transformer_2
+            current_guidance_scale = batch.guidance_scale_2
+            current_phase = "transformer_2"
+
+        self._manage_dit_use_site(current_model, current_phase, batch)
+
+        assert current_model is not None, "The model for the current step is not set."
+        return current_model, current_guidance_scale
+
+    def _handle_boundary_ratio(
+        self,
+        server_args,
+        batch,
+        scheduler,
+    ):
+        """
+        (Wan2.2) Calculate timestep to switch from high noise expert to low noise expert
+        """
+        boundary_ratio = server_args.pipeline_config.dit_config.boundary_ratio
+        if batch.boundary_ratio is not None:
+            logger.info(
+                "Overriding boundary ratio from %s to %s",
+                boundary_ratio,
+                batch.boundary_ratio,
+            )
+            boundary_ratio = batch.boundary_ratio
+
+        if boundary_ratio is not None:
+            num_train_timesteps = getattr(scheduler, "num_train_timesteps", None)
+            if num_train_timesteps is None:
+                num_train_timesteps = scheduler.config.num_train_timesteps
+            boundary_timestep = boundary_ratio * num_train_timesteps
+        else:
+            boundary_timestep = None
+
+        return boundary_timestep

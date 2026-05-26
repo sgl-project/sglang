@@ -1,6 +1,6 @@
 import logging
 from http import HTTPStatus
-from typing import List, Union
+from typing import List, Optional, Union
 
 from fastapi import Request
 
@@ -12,12 +12,21 @@ from sglang.srt.entrypoints.openai.protocol import (
     TokenizeResponse,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 
 logger = logging.getLogger(__name__)
 
 
 class OpenAIServingTokenize(OpenAIServingBase):
     """Handler for /v1/tokenize requests"""
+
+    def __init__(self, tokenizer_manager, template_manager=None):
+        super().__init__(tokenizer_manager)
+        self.chat_serving: Optional[OpenAIServingChat] = (
+            OpenAIServingChat(tokenizer_manager, template_manager)
+            if template_manager is not None
+            else None
+        )
 
     def _request_id_prefix(self) -> str:
         return "tok-"
@@ -37,7 +46,11 @@ class OpenAIServingTokenize(OpenAIServingBase):
             tokenizer = self.tokenizer_manager.tokenizer
             max_model_len = getattr(tokenizer, "model_max_length", -1)
 
-            if isinstance(request.prompt, str):
+            if request.messages is not None:
+                token_ids = self._tokenize_chat_request(request)
+                tokens = token_ids
+                count = len(token_ids)
+            elif isinstance(request.prompt, str):
                 token_ids = tokenizer.encode(
                     request.prompt,
                     add_special_tokens=request.add_special_tokens,
@@ -61,6 +74,8 @@ class OpenAIServingTokenize(OpenAIServingBase):
             return TokenizeResponse(
                 tokens=tokens, count=count, max_model_len=max_model_len
             )
+        except ValueError as e:
+            return self.create_error_response(str(e))
         except Exception as e:
             logger.error("Error during tokenization", exc_info=True)
             return self.create_error_response(
@@ -68,6 +83,36 @@ class OpenAIServingTokenize(OpenAIServingBase):
                 err_type="InternalServerError",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
+
+    def _tokenize_chat_request(self, request: TokenizeRequest) -> List[int]:
+        if self.chat_serving is None:
+            raise ValueError("Chat template tokenization requires a template manager.")
+
+        chat_request = request.to_chat_completion_request()
+        validation_error = self.chat_serving._validate_request(chat_request)
+        if validation_error:
+            raise ValueError(validation_error)
+
+        is_multimodal = self.tokenizer_manager.model_config.is_multimodal
+        processed_messages = self.chat_serving._process_messages(
+            chat_request, is_multimodal
+        )
+
+        prompt_ids = processed_messages.prompt_ids
+        if isinstance(prompt_ids, list) and (
+            prompt_ids or not processed_messages.prompt
+        ):
+            return prompt_ids
+        if isinstance(prompt_ids, str):
+            return self.tokenizer_manager.tokenizer.encode(
+                prompt_ids, add_special_tokens=False
+            )
+        if processed_messages.prompt:
+            return self.tokenizer_manager.tokenizer.encode(
+                processed_messages.prompt, add_special_tokens=False
+            )
+
+        raise ValueError("Failed to render chat messages into token ids.")
 
 
 class OpenAIServingDetokenize(OpenAIServingBase):

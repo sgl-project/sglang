@@ -15,6 +15,10 @@ class TboAttnBackend(AttentionBackend):
         super().__init__()
         self.primary = primary
         self.children = children
+        # Dispatcher aliases the primary's pool refs so get_attn_backend()
+        # reads through TboAttnBackend resolve to the underlying pool.
+        self.token_to_kv_pool = primary.token_to_kv_pool
+        self.req_to_token_pool = primary.req_to_token_pool
 
     @classmethod
     def init_new(cls, creator: Callable[[], AttentionBackend]):
@@ -179,11 +183,17 @@ class TboAttnBackend(AttentionBackend):
             assert ans == child.get_cuda_graph_seq_len_fill_value()
         return ans
 
+    def forward(self, *args, **kwargs):
+        return self.primary.forward(*args, **kwargs)
+
     def forward_extend(self, *args, **kwargs):
         return self.primary.forward_extend(*args, **kwargs)
 
     def forward_decode(self, *args, **kwargs):
         return self.primary.forward_decode(*args, **kwargs)
+
+    def get_indexer_metadata(self, layer_id: int, forward_batch: "ForwardBatch"):
+        return self.primary.get_indexer_metadata(layer_id, forward_batch)
 
 
 def _init_forward_metadata_cuda_graph_split(

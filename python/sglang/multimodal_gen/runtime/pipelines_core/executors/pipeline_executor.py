@@ -9,7 +9,11 @@ import contextlib
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List
 
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+import torch
+
+from sglang.multimodal_gen.runtime.distributed import get_world_rank
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -29,7 +33,9 @@ class Timer(StageProfiler):
     """
 
     def __init__(self, name="Stage"):
-        super().__init__(stage_name=name, timings=None, simple_log=True, logger=logger)
+        super().__init__(
+            stage_name=name, logger=logger, metrics=None, log_stage_start_end=True
+        )
 
 
 class PipelineExecutor(ABC):
@@ -42,6 +48,115 @@ class PipelineExecutor(ABC):
 
     def __init__(self, server_args):
         self.server_args = server_args
+        self.component_residency_manager = None
+
+    def begin_component_residency_request(
+        self,
+        stages: List["PipelineStage"],
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> None:
+        self.component_residency_manager.begin_request(stages, batch, server_args)
+
+    def before_stage(
+        self,
+        stage: "PipelineStage",
+        stage_index: int,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> None:
+        stage.set_component_residency_manager(self.component_residency_manager)
+        self.component_residency_manager.before_stage(
+            stage, stage_index, batch, server_args
+        )
+
+    def after_stage(self, stage_index: int) -> None:
+        self.component_residency_manager.after_stage(stage_index)
+
+    def finish_component_residency_request(self) -> None:
+        self.component_residency_manager.finish_request()
+
+    def execute_with_profiling(
+        self,
+        stages: List["PipelineStage"],
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> OutputBatch:
+
+        with self.profile_execution(batch, dump_rank=0):
+            with current_platform.inference_mode():
+                batch = self.execute(stages, batch, server_args)
+
+        return batch
+
+    def execute_group_with_profiling(
+        self,
+        stages: List["PipelineStage"],
+        batches: list[Req],
+        server_args: ServerArgs,
+    ):
+        """Execute a grouped request under the same profiler as a single request."""
+        with self.profile_execution(batches[0], dump_rank=0):
+            with current_platform.inference_mode():
+                batches = self.execute_group(stages, batches, server_args)
+        return batches
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _stage_execution_context(stage: "PipelineStage", server_args: ServerArgs):
+        if PipelineExecutor._stage_needs_version_counters(stage, server_args):
+            # fsdp and cpu-offload hooks need tensor version counters
+            with torch.inference_mode(False), torch.no_grad():
+                yield
+            return
+        yield
+
+    @staticmethod
+    def _stage_needs_version_counters(
+        stage: "PipelineStage", server_args: ServerArgs
+    ) -> bool:
+        if server_args.use_fsdp_inference:
+            return True
+
+        stage_name = stage._active_component_stage_name()
+        for use in stage.component_uses(server_args, stage_name):
+            component_name = use.component_name
+            if server_args.dit_cpu_offload and component_name in (
+                "transformer",
+                "transformer_2",
+                "video_dit",
+                "audio_dit",
+            ):
+                return True
+            if server_args.text_encoder_cpu_offload and component_name.startswith(
+                "text_encoder"
+            ):
+                return True
+            if server_args.image_encoder_cpu_offload and component_name in (
+                "image_encoder",
+                "condition_image_encoder",
+            ):
+                return True
+            if server_args.vae_cpu_offload and component_name in (
+                "vae",
+                "video_vae",
+                "audio_vae",
+                "vocoder",
+                "spatial_upsampler",
+                "condition_image_encoder",
+            ):
+                return True
+        return False
+
+    def run_stage_with_context(
+        self,
+        stage: "PipelineStage",
+        payload,
+        server_args: ServerArgs,
+        run_stage,
+    ):
+        with self._stage_execution_context(stage, server_args):
+            return run_stage(stage, payload)
 
     @abstractmethod
     def execute(
@@ -49,7 +164,7 @@ class PipelineExecutor(ABC):
         stages: List["PipelineStage"],
         batch: Req,
         server_args: ServerArgs,
-    ) -> Req:
+    ) -> OutputBatch:
         """
         Execute the pipeline stages.
 
@@ -63,21 +178,39 @@ class PipelineExecutor(ABC):
         """
         raise NotImplementedError
 
+    def execute_group(
+        self,
+        stages: List["PipelineStage"],
+        batches: list[Req],
+        server_args: ServerArgs,
+    ):
+        """Execute all pipeline stages over a group of independent requests.
+
+        Executors own cross-rank scheduling, while stages own whether duplicate
+        work can be removed. The base executor simply calls
+        ``stage.run_grouped_requests`` for each stage in order.
+        """
+        for stage in stages:
+            batches = stage.run_grouped_requests(batches, server_args)
+        return batches
+
     @contextlib.contextmanager
-    def profile_execution(self, batch: Req, check_rank: int = 0, dump_rank: int = 0):
+    def profile_execution(self, batch: Req, dump_rank: int = 0):
         """
         Context manager for profiling execution.
         """
-        do_profile = batch.profile
-
+        do_profile = batch.profile and not batch.is_warmup
         if not do_profile:
+            # fast forward
             yield
             return
 
         request_id = batch.request_id
+        rank = get_world_rank()
+
         profiler = SGLDiffusionProfiler(
             request_id=request_id,
-            rank=check_rank,
+            rank=rank,
             full_profile=batch.profile_all_stages,
             num_steps=batch.num_profiled_timesteps,
             num_inference_steps=batch.num_inference_steps,
@@ -85,5 +218,4 @@ class PipelineExecutor(ABC):
         try:
             yield
         finally:
-            should_export = check_rank == 0
-            profiler.stop(export_trace=should_export, dump_rank=dump_rank)
+            profiler.stop(dump_rank=dump_rank)

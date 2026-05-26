@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 from sgl_kernel import kimi_k2_moe_fused_gate
@@ -121,4 +123,4 @@ def test_kimi_k2_specific_case(seq_length, num_experts, topk):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0/vllm/compilation/backend.py
 
 
@@ -19,20 +21,13 @@ from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
 from sglang.srt.compilation.compiler_interface import EagerAdapter, InductorAdaptor
 from sglang.srt.compilation.cuda_piecewise_backend import CUDAPiecewiseBackend
+from sglang.srt.compilation.npu_piecewise_backend import NPUPiecewiseBackend
 from sglang.srt.compilation.pass_manager import PostGradPassManager
-from sglang.srt.utils.common import rank0_log
+from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
+from sglang.srt.utils.common import is_npu
 
 logger = logging.getLogger(__name__)
-
-
-SPLIT_OPS = [
-    "sglang.unified_attention_with_output",
-    "sglang.gdn_with_output",
-]
-
-
-def add_split_ops(ops):
-    SPLIT_OPS.extend(ops)
 
 
 def make_compiler(config: CompilationConfig):
@@ -42,6 +37,37 @@ def make_compiler(config: CompilationConfig):
         return InductorAdaptor()
     else:
         raise ValueError(f"Unknown compiler: {config.compiler}")
+
+
+def make_backend(
+    graph: fx.GraphModule,
+    compile_config: CompilationConfig,
+    inductor_config: dict[str, Any],
+    graph_pool: Any,
+    piecewise_compile_index: int,
+    total_piecewise_compiles: int,
+    sym_shape_indices: list[int],
+    compiled_graph_for_general_shape: Callable,
+    sglang_backend,
+):
+
+    if current_platform.is_out_of_tree():
+        backend_cls = current_platform.get_piecewise_backend_cls()
+    elif is_npu():
+        backend_cls = NPUPiecewiseBackend
+    else:
+        backend_cls = CUDAPiecewiseBackend
+    return backend_cls(
+        graph,
+        compile_config,
+        inductor_config,
+        graph_pool,
+        piecewise_compile_index,
+        total_piecewise_compiles,
+        sym_shape_indices,
+        compiled_graph_for_general_shape,
+        sglang_backend,
+    )
 
 
 class CompilerManager:
@@ -302,7 +328,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                 )
             )
 
-            self.module.__dict__[target] = CUDAPiecewiseBackend(
+            self.module.__dict__[target] = make_backend(
                 submod,
                 self.compile_config,
                 self.inductor_config,
@@ -358,7 +384,6 @@ class SGLangBackend:
         config: CompilationConfig,
         graph_pool: Any,
     ):
-        rank0_log(f"Initializing SGLangBackend")
         assert graph_pool is not None
         self.graph_pool = graph_pool
 
@@ -377,10 +402,7 @@ class SGLangBackend:
         self.inductor_config["post_grad_custom_post_pass"] = self.post_grad_pass_manager
 
     def __call__(self, graph: fx.GraphModule, example_inputs) -> Callable:
-        rank0_log(f"SGLangBackend __call__")
-        base_cache_dir = os.path.expanduser(
-            os.getenv("SGLANG_CACHE_DIR", "~/.cache/sglang/")
-        )
+        base_cache_dir = envs.SGLANG_CACHE_DIR.get()
 
         cache_hash = self.compiler_manager.compute_hash()
         cache_dir = os.path.join(
@@ -406,7 +428,7 @@ class SGLangBackend:
 
         self.split_gm, self.piecewise_graphs = split_graph(
             graph,
-            SPLIT_OPS,
+            self.compile_config.split_ops,
         )
         from torch._dynamo.utils import lazy_format_graph_code
 
@@ -448,8 +470,6 @@ class SGLangBackend:
                 src = src.replace("<lambda>", "GraphModule")
                 with open(graph_path, "w") as f:
                     f.write(src)
-
-                rank0_log(f"Computation graph saved to {graph_path}")
 
         self._called = True
         return self.split_gm

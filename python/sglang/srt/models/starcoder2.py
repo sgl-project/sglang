@@ -20,7 +20,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/starcoder2.py
-""" PyTorch Starcoder2 model."""
+"""PyTorch Starcoder2 model."""
+
 from collections.abc import Iterable
 from typing import Optional, Tuple
 
@@ -80,7 +81,7 @@ class Starcoder2Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.rope_theta = config.rope_theta
+        self.rope_theta = config.rope_parameters["rope_theta"]
         self.max_position_embeddings = config.max_position_embeddings
         self.use_bias = config.use_bias
 
