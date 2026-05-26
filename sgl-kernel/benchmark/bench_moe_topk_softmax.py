@@ -144,7 +144,7 @@ if IS_CI:
 else:
     num_tokens_range = [128, 512, 1024, 2048, 4096, 8192, 16384, 32768]
     num_experts_range = [32, 64, 128, 256, 12, 512]
-    topk_range = [1, 2, 4, 8]
+    topk_range = [1, 2, 4, 8, 10]
 
 configs = list(itertools.product(num_tokens_range, num_experts_range, topk_range))
 

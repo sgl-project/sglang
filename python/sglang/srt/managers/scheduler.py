@@ -20,6 +20,7 @@ import os
 import signal
 import sys
 import time
+from array import array
 from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
@@ -144,7 +145,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -960,6 +960,7 @@ class Scheduler(
         )
         self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
 
+        # TODO(Jialin): Migrate pad_input_ids implementations to return array.
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
 
@@ -1741,6 +1742,29 @@ class Scheduler(
         else:
             return MultimodalInputs.from_processor_output(mm_inputs_dict)
 
+    @staticmethod
+    def _try_apply_padded_mm_input_ids(recv_req, req, image_inputs) -> bool:
+        """setup origin_input_ids with trying to reuse existing MultimodalInputs.padded_input_ids first,
+        if absent, call pad_input_ids_func"""
+        padded_input_ids = image_inputs.padded_input_ids
+        if padded_input_ids is None or recv_req.input_ids is None:
+            return False
+
+        recv_input_len = len(recv_req.input_ids)
+        if len(padded_input_ids) != recv_input_len:
+            return False
+
+        prefix_len = len(req.origin_input_ids) - recv_input_len
+        if prefix_len < 0:
+            return False
+
+        padded_input_ids = array("q", padded_input_ids)
+        if prefix_len == 0:
+            req.origin_input_ids = padded_input_ids
+        else:
+            req.origin_input_ids = req.origin_input_ids[:prefix_len] + padded_input_ids
+        return True
+
     def _maybe_compute_mrope_positions(self, req) -> None:
         """Compute M-RoPE positions when they are missing (e.g. gRPC preprocessed path)."""
         if self._mm_processor is None:
@@ -1783,8 +1807,7 @@ class Scheduler(
             if recv_req.input_embeds is not None:
                 # Generate fake input_ids based on the length of input_embeds
                 seq_length = len(recv_req.input_embeds)
-                fake_input_ids = [1] * seq_length
-                recv_req.input_ids = fake_input_ids
+                recv_req.input_ids = array("q", [1]) * seq_length
 
             if recv_req.bootstrap_port is None:
                 # Use default bootstrap port
@@ -1909,9 +1932,12 @@ class Scheduler(
             # The following steps are already fast, execute locally on each rank.
             # Expand a single image token into multiple dummy tokens for receiving image embeddings.
             # The pad function is model-specific and can be None for some backends.
-            if self.pad_input_ids_func:
-                req.origin_input_ids = self.pad_input_ids_func(
-                    req.origin_input_ids, image_inputs
+            if (
+                not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
+                and self.pad_input_ids_func
+            ):
+                req.origin_input_ids = array(
+                    "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
                 )
             req.extend_image_inputs(image_inputs)
             self._maybe_compute_mrope_positions(req)
@@ -2182,9 +2208,13 @@ class Scheduler(
             # The `pad_input_ids_func` is model-specific and may be None for
             # embedding models or models not requiring special padding.
             # If None, `req.origin_input_ids` is expected to be correctly populated already.
-            if self.pad_input_ids_func:
-                req.origin_input_ids = self.pad_input_ids_func(
-                    req.origin_input_ids, image_inputs
+            if (
+                not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
+                and self.pad_input_ids_func
+            ):
+                # See companion call site above for the array.array wrap rationale.
+                req.origin_input_ids = array(
+                    "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
                 )
 
             req.extend_image_inputs(image_inputs)
@@ -2842,25 +2872,18 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
-                # Spec v2 pre-isolation CPU mirror prep: D2H new_seq_lens_buf
-                # into batch.seq_lens_cpu + set seq_lens_sum. For non-spec_v2,
-                # ForwardBatch.init_new lazily computes the sum.
-                if batch.is_spec_v2:
-                    # FIXME: make this optional to different backends.
-                    self.future_map.resolve_seq_lens_cpu(batch)
+                # Self-gates on batch.spec_info.future_indices; non-spec_v2
+                # no-ops (ForwardBatch.init_new lazily computes the sum).
+                self.future_map.resolve_seq_lens_cpu(batch)
 
                 with self._overlap_forward_isolation(batch):
-                    future_indices = FutureIndices(indices=batch.req_pool_indices)
+                    future_indices = batch.req_pool_indices
 
-                    # Spec_v2 worker fires this between sample-end and
-                    # draft_extend; publish moves the fence to verify-end so
-                    # schedule prep can overlap with draft_extend.
+                    # Spec_v2 fires on_publish mid-worker (between verify and
+                    # draft_extend) so schedule prep can overlap with draft_extend.
+                    # Non-spec has no later work — scheduler publishes after return.
                     fwd_kwargs = (
-                        {
-                            "on_verify_complete": partial(
-                                self.future_map.publish, future_indices
-                            )
-                        }
+                        {"on_publish": partial(self.future_map.publish, future_indices)}
                         if batch.is_spec_v2
                         else {}
                     )
@@ -2872,6 +2895,8 @@ class Scheduler(
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
+                        if not batch.is_spec_v2:
+                            self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
                         # ring slot as the SB attr snapshot).
@@ -2895,16 +2920,11 @@ class Scheduler(
                         else:
                             batch_result.future_indices = future_indices
 
-                # Placeholder for next iter's resolve_future to look up the
-                # real token from token_ids_buf via the negated indices.
-                batch.input_ids = -future_indices.indices
+                self.future_map.set_input_ids_sentinel(batch, future_indices)
 
                 if batch.is_spec_v2:
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
-                    # Schedule-stream sentinel between iters; next iter's
-                    # resolve_future reassigns batch.seq_lens from new_seq_lens_buf.
-                    batch.seq_lens = -future_indices.indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
@@ -3821,6 +3841,13 @@ def run_scheduler_process(
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
+        # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands
+        # of NCCL/TCPStore tracebacks before they finally die.
+        if envs.SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION.get():
+            try:
+                os.killpg(os.getpgrp(), signal.SIGKILL)
+            except Exception:
+                pass
     finally:
         if scheduler is not None:
             # FPM has a background ZMQ publisher thread that needs explicit
