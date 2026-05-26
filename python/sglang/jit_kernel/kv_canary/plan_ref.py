@@ -21,7 +21,7 @@ def launch_canary_plan_kernels_torch_reference(
     full_to_swa_index_mapping: Optional[torch.Tensor],
     verify_capacity: int,
     req_to_verify_expected_tokens: Optional[torch.Tensor],
-    expected_token_pool_valid_lens: Optional[torch.Tensor],
+    req_to_verify_expected_tokens_valid_lens: Optional[torch.Tensor],
     kv_token_id_vs_position_offset: int,
 ) -> None:
     """Python reference for :func:`launch_canary_plan_kernels`. Same signature & byte-equal semantics."""
@@ -50,18 +50,18 @@ def launch_canary_plan_kernels_torch_reference(
         lut = full_to_swa_index_mapping.detach().to(device=work_device)
 
     expected_token_pool_host: Optional[torch.Tensor] = None
-    expected_token_pool_valid_lens_host: Optional[torch.Tensor] = None
+    req_to_verify_expected_tokens_valid_lens_host: Optional[torch.Tensor] = None
     if req_to_verify_expected_tokens is not None:
         expected_token_pool_host = req_to_verify_expected_tokens.detach().to(
             device=work_device, dtype=torch.int64
         )
-        if expected_token_pool_valid_lens is None:
+        if req_to_verify_expected_tokens_valid_lens is None:
             raise ValueError(
                 "kv-canary: launch_canary_plan_kernels_torch_reference requires "
-                "expected_token_pool_valid_lens when req_to_verify_expected_tokens is set"
+                "req_to_verify_expected_tokens_valid_lens when req_to_verify_expected_tokens is set"
             )
-        expected_token_pool_valid_lens_host = (
-            expected_token_pool_valid_lens.detach().to(
+        req_to_verify_expected_tokens_valid_lens_host = (
+            req_to_verify_expected_tokens_valid_lens.detach().to(
                 device=work_device, dtype=torch.int64
             )
         )
@@ -77,7 +77,7 @@ def launch_canary_plan_kernels_torch_reference(
         work_device=work_device,
         bs=bs,
         expected_token_pool_host=expected_token_pool_host,
-        expected_token_pool_valid_lens_host=expected_token_pool_valid_lens_host,
+        req_to_verify_expected_tokens_valid_lens_host=req_to_verify_expected_tokens_valid_lens_host,
         kv_token_id_vs_position_offset=int(kv_token_id_vs_position_offset),
     )
 
@@ -136,7 +136,7 @@ def _materialize_verify_entries(
     work_device: torch.device,
     bs: int,
     expected_token_pool_host: Optional[torch.Tensor],
-    expected_token_pool_valid_lens_host: Optional[torch.Tensor],
+    req_to_verify_expected_tokens_valid_lens_host: Optional[torch.Tensor],
     kv_token_id_vs_position_offset: int,
 ) -> int:
     out_slots: list[int] = []
@@ -158,8 +158,8 @@ def _materialize_verify_entries(
         verify_len = max(0, prefix_len - window_start)
 
         valid_len_r = (
-            int(expected_token_pool_valid_lens_host[r].item())
-            if expected_token_pool_valid_lens_host is not None
+            int(req_to_verify_expected_tokens_valid_lens_host[r].item())
+            if req_to_verify_expected_tokens_valid_lens_host is not None
             else 0
         )
 

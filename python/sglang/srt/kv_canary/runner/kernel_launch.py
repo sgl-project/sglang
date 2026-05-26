@@ -42,7 +42,7 @@ def invoke_plan(
 ) -> None:
     window = swa_window_size if group.kind is PoolKind.SWA else 0
     valid_lens = (
-        plan_input.expected_token_pool_valid_lens
+        plan_input.req_to_verify_expected_tokens_valid_lens
         if req_to_verify_expected_tokens is not None
         else None
     )
@@ -57,7 +57,7 @@ def invoke_plan(
         full_to_swa_index_mapping=group.swa_index_lut,
         verify_capacity=int(verify_plan.verify_slot_indices.shape[0]),
         req_to_verify_expected_tokens=req_to_verify_expected_tokens,
-        expected_token_pool_valid_lens=valid_lens,
+        req_to_verify_expected_tokens_valid_lens=valid_lens,
         kv_token_id_vs_position_offset=group.kv_token_id_vs_position_offset,
     )
 

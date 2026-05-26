@@ -22,7 +22,7 @@ class PlanInput:
             [bs_capacity], int64. Extend → extend_prefix_lens; decode → seq_lens - 1.
         extend_seq_lens: Per-req tokens being written this step, shape [bs_capacity], int64.
             Extend length or all-ones for decode.
-        expected_token_pool_valid_lens: Per-req snapshot length on the verify-token pool,
+        req_to_verify_expected_tokens_valid_lens: Per-req snapshot length on the verify-token pool,
             shape [bs_capacity], int64. Equals
             ``len(req.origin_input_ids) + len(req.output_ids)`` at the moment ``ForwardBatch``
             was built. The plan kernel uses ``valid_lens[req_id]`` as the upper bound on
@@ -39,13 +39,13 @@ class PlanInput:
     req_pool_indices: torch.Tensor
     prefix_lens: torch.Tensor
     extend_seq_lens: torch.Tensor
-    expected_token_pool_valid_lens: torch.Tensor
+    req_to_verify_expected_tokens_valid_lens: torch.Tensor
 
     def zero_(self) -> None:
         self.req_pool_indices.zero_()
         self.prefix_lens.zero_()
         self.extend_seq_lens.zero_()
-        self.expected_token_pool_valid_lens.zero_()
+        self.req_to_verify_expected_tokens_valid_lens.zero_()
 
     @classmethod
     def allocate(
@@ -58,7 +58,7 @@ class PlanInput:
             req_pool_indices=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
             prefix_lens=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
             extend_seq_lens=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
-            expected_token_pool_valid_lens=torch.zeros(
+            req_to_verify_expected_tokens_valid_lens=torch.zeros(
                 bs_capacity, dtype=torch.int64, device=device
             ),
         )
@@ -88,7 +88,7 @@ class PlanInput:
         # emits the ``-1`` sentinel for them.
         req_all_ids_lens = forward_batch.req_all_ids_lens
         if req_all_ids_lens is not None:
-            self.expected_token_pool_valid_lens[:bs].copy_(
+            self.req_to_verify_expected_tokens_valid_lens[:bs].copy_(
                 req_all_ids_lens.to(torch.int64), non_blocking=True
             )
 

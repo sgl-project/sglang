@@ -34,7 +34,7 @@ def launch_plan_entries_kernel(
     verify_offsets_scratch: torch.Tensor,
     verify_enable: torch.Tensor,
     req_to_verify_expected_tokens: Optional[torch.Tensor],
-    expected_token_pool_valid_lens: Optional[torch.Tensor],
+    req_to_verify_expected_tokens_valid_lens: Optional[torch.Tensor],
     out_verify_slot_indices: torch.Tensor,
     out_verify_expected_tokens: torch.Tensor,
     out_verify_expected_positions: torch.Tensor,
@@ -44,18 +44,18 @@ def launch_plan_entries_kernel(
 ) -> None:
     has_swa_lut = full_to_swa_index_mapping is not None
     has_verify_expected_token_pool = req_to_verify_expected_tokens is not None
-    if has_verify_expected_token_pool and expected_token_pool_valid_lens is None:
+    if has_verify_expected_token_pool and req_to_verify_expected_tokens_valid_lens is None:
         raise ValueError(
             "kv-canary: launch_plan_entries_kernel requires "
-            "expected_token_pool_valid_lens when req_to_verify_expected_tokens is set"
+            "req_to_verify_expected_tokens_valid_lens when req_to_verify_expected_tokens is set"
         )
     if (
         not has_verify_expected_token_pool
-        and expected_token_pool_valid_lens is not None
+        and req_to_verify_expected_tokens_valid_lens is not None
     ):
         raise ValueError(
             "kv-canary: launch_plan_entries_kernel cannot accept "
-            "expected_token_pool_valid_lens without req_to_verify_expected_tokens"
+            "req_to_verify_expected_tokens_valid_lens without req_to_verify_expected_tokens"
         )
     module = _jit_plan_entries_module(has_swa_lut, has_verify_expected_token_pool)
     module.plan_entries(
@@ -66,7 +66,7 @@ def launch_plan_entries_kernel(
         verify_offsets_scratch,
         verify_enable,
         req_to_verify_expected_tokens,
-        expected_token_pool_valid_lens,
+        req_to_verify_expected_tokens_valid_lens,
         out_verify_slot_indices,
         out_verify_expected_tokens,
         out_verify_expected_positions,

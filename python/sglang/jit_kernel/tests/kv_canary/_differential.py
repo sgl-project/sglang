@@ -51,7 +51,7 @@ def _run_both_plan(
     active_verify_entries: Optional[int] = None,
     active_write_reqs: Optional[int] = None,
     req_to_verify_expected_tokens: Optional[torch.Tensor] = None,
-    expected_token_pool_valid_lens: Optional[torch.Tensor] = None,
+    req_to_verify_expected_tokens_valid_lens: Optional[torch.Tensor] = None,
     kv_token_id_vs_position_offset: int = 0,
 ) -> None:
     _ = extras
@@ -61,9 +61,9 @@ def _run_both_plan(
     # explicitly building a per-req lens tensor.
     if (
         req_to_verify_expected_tokens is not None
-        and expected_token_pool_valid_lens is None
+        and req_to_verify_expected_tokens_valid_lens is None
     ):
-        expected_token_pool_valid_lens = torch.full(
+        req_to_verify_expected_tokens_valid_lens = torch.full(
             (int(req_pool_indices.shape[0]),),
             int(req_to_verify_expected_tokens.shape[1]),
             dtype=torch.int64,
@@ -80,7 +80,7 @@ def _run_both_plan(
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=verify_capacity,
         req_to_verify_expected_tokens=req_to_verify_expected_tokens,
-        expected_token_pool_valid_lens=expected_token_pool_valid_lens,
+        req_to_verify_expected_tokens_valid_lens=req_to_verify_expected_tokens_valid_lens,
         kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
     )
     launch_canary_plan_kernels_torch_reference(
@@ -94,7 +94,7 @@ def _run_both_plan(
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=int(ref_verify.verify_slot_indices.shape[0]),
         req_to_verify_expected_tokens=req_to_verify_expected_tokens,
-        expected_token_pool_valid_lens=expected_token_pool_valid_lens,
+        req_to_verify_expected_tokens_valid_lens=req_to_verify_expected_tokens_valid_lens,
         kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
     )
     torch.cuda.synchronize()
@@ -518,7 +518,7 @@ def run_plan_diff(
     active_verify_entries: Optional[int] = None,
     active_write_reqs: Optional[int] = None,
     req_to_verify_expected_tokens: Optional[torch.Tensor] = None,
-    expected_token_pool_valid_lens: Optional[torch.Tensor] = None,
+    req_to_verify_expected_tokens_valid_lens: Optional[torch.Tensor] = None,
     kv_token_id_vs_position_offset: int = 0,
 ) -> None:
     """Thin wrapper around ``_run_both_plan`` that unpacks ``((triton_v, triton_w), (ref_v, ref_w))``
@@ -541,6 +541,6 @@ def run_plan_diff(
         active_verify_entries=active_verify_entries,
         active_write_reqs=active_write_reqs,
         req_to_verify_expected_tokens=req_to_verify_expected_tokens,
-        expected_token_pool_valid_lens=expected_token_pool_valid_lens,
+        req_to_verify_expected_tokens_valid_lens=req_to_verify_expected_tokens_valid_lens,
         kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
     )
