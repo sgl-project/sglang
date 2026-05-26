@@ -51,6 +51,7 @@ class VerifyFuzzInputs:
     real_kv_sources_ref: tuple[RealKvSource, ...]
     real_kv_hash_mode: consts.RealKvHashMode
     ring_capacity: int
+    check_verify_expected_token: bool
 
 
 def _draw_random_verify_inputs(rng: random.Random) -> VerifyFuzzInputs:
@@ -105,10 +106,23 @@ def _draw_random_verify_inputs(rng: random.Random) -> VerifyFuzzInputs:
             positions=positions,
         )
 
+    check_verify_expected_token = rng.random() < 0.5
+    expected_input_ids: list[int] = []
+    for i in range(plan_size):
+        # Always pick a value; with check=False the kernel must not deref this column.
+        if rng.random() < 0.3:
+            expected_input_ids.append(-1)
+        elif rng.random() < 0.5:
+            expected_input_ids.append(int(tokens[i]))
+        else:
+            mutated = (int(tokens[i]) ^ 0x1) & 0xFFFFFFFF
+            expected_input_ids.append(mutated)
+
     plan_cuda, plan_ref = make_verify_plan_pair(
         slot_indices=slot_indices,
         positions=positions,
         prev_slot_indices=prev_slot_indices,
+        expected_input_ids=expected_input_ids if plan_size > 0 else None,
         capacity=max(plan_size, 1),
         device=_DEVICE,
     )
@@ -123,6 +137,7 @@ def _draw_random_verify_inputs(rng: random.Random) -> VerifyFuzzInputs:
         real_kv_sources_ref=sources_ref,
         real_kv_hash_mode=hash_mode,
         ring_capacity=ring_capacity,
+        check_verify_expected_token=check_verify_expected_token,
     )
 
 
@@ -144,6 +159,7 @@ def _run_one(inputs: VerifyFuzzInputs) -> None:
         real_kv_hash_mode=inputs.real_kv_hash_mode,
         kernel_kind=inputs.kernel_kind,
         assert_equal=False,
+        check_verify_expected_token=inputs.check_verify_expected_token,
     )
     assert int(cuda_log.kernel_run_counter[0].item()) == int(
         ref_log.kernel_run_counter[0].item()
@@ -168,7 +184,8 @@ def _summarize(inputs: VerifyFuzzInputs) -> str:
         f"plan_size={n_active} kind={inputs.kernel_kind.name} "
         f"hash_mode={inputs.real_kv_hash_mode.name} "
         f"sources={len(inputs.real_kv_sources_cuda)} "
-        f"ring={inputs.ring_capacity}"
+        f"ring={inputs.ring_capacity} "
+        f"check_token={inputs.check_verify_expected_token}"
     )
 
 

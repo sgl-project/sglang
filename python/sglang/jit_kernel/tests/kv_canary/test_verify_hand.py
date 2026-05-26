@@ -2015,6 +2015,7 @@ class TestVerifyExpectedInputIds:
         *,
         stored_token: int,
         expected_input_id: int,
+        check_verify_expected_token: bool = True,
     ) -> FakeViolationLog:
         buf_pair = make_canary_buf_pair(
             num_slots=16, slot_stride_bytes=32, device=_DEVICE
@@ -2036,6 +2037,7 @@ class TestVerifyExpectedInputIds:
         cuda_log, ref_log = run_verify_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
+            check_verify_expected_token=check_verify_expected_token,
         )
         return cuda_log
 
@@ -2058,3 +2060,74 @@ class TestVerifyExpectedInputIds:
         assert_only_bits_set(fail_bits, int(consts.FailReason.VERIFY_TOKEN_MISMATCH))
         assert int(row[consts.VIOLATION_FIELD_STORED_TOKEN]) == 42
         assert int(row[consts.VIOLATION_FIELD_EXPECTED_TOKEN]) == 99
+
+    def test_check_disabled_never_raises_token_mismatch(self) -> None:
+        """check_verify_expected_token=False: token mismatch is silently ignored byte-equal CUDA vs ref."""
+        log = self._run(
+            stored_token=42,
+            expected_input_id=99,
+            check_verify_expected_token=False,
+        )
+        assert int(log.write_index[0].item()) == 0
+
+    def test_check_disabled_does_not_read_expected_tokens_tensor(self) -> None:
+        """check_verify_expected_token=False with garbage expected_input_id: kernel must not deref the tensor."""
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
+        stamp_pair(
+            buf_pair,
+            slot_idx=1,
+            token=42,
+            position=0,
+            prev_hash=chain_anchor_signed(),
+        )
+        garbage_value = (1 << 63) - 1
+        plan_pair = make_verify_plan_pair(
+            slot_indices=[1],
+            positions=[0],
+            prev_slot_indices=[-1],
+            expected_input_ids=[garbage_value],
+            device=_DEVICE,
+        )
+        cuda_log, _ = run_verify_diff(
+            buf_pair=buf_pair,
+            plan_pair=plan_pair,
+            check_verify_expected_token=False,
+        )
+        assert int(cuda_log.write_index[0].item()) == 0
+
+    def test_token_and_position_both_mismatch_set_both_bits(self) -> None:
+        """token mismatch + position mismatch: both fail bits set; expected_token row carries the gathered id."""
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
+        slot_idx = 5
+        stamp_pair(
+            buf_pair,
+            slot_idx=slot_idx,
+            token=42,
+            position=10,
+            prev_hash=chain_anchor_signed(),
+        )
+        plan_pair = make_verify_plan_pair(
+            slot_indices=[slot_idx],
+            positions=[99],
+            prev_slot_indices=[-1],
+            expected_input_ids=[123],
+            device=_DEVICE,
+        )
+        cuda_log, _ = run_verify_diff(
+            buf_pair=buf_pair,
+            plan_pair=plan_pair,
+            check_verify_expected_token=True,
+        )
+        assert int(cuda_log.write_index[0].item()) == 1
+        row = cuda_log.ring[0].tolist()
+        fail_bits = int(row[consts.VIOLATION_FIELD_FAIL_REASON_BITS])
+        expected_bits = int(consts.FailReason.VERIFY_TOKEN_MISMATCH) | int(
+            consts.FailReason.VERIFY_POSITION_MISMATCH
+        )
+        assert_only_bits_set(fail_bits, expected_bits)
+        assert int(row[consts.VIOLATION_FIELD_STORED_TOKEN]) == 42
+        assert int(row[consts.VIOLATION_FIELD_EXPECTED_TOKEN]) == 123

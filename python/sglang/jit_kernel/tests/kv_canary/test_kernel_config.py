@@ -312,6 +312,57 @@ def test_verify_multi_launch_100x_counter_linear() -> None:
     )
 
 
+def test_verify_check_disabled_byte_equal() -> None:
+    """check_verify_expected_token True vs False produce equivalent violation logs on a clean plan."""
+    plan_true_cuda, plan_true_ref = _build_verify_plan_5_entries(device=_DEVICE)
+    plan_false_cuda, plan_false_ref = _build_verify_plan_5_entries(device=_DEVICE)
+
+    cuda_buf_true, ref_buf_true = make_canary_buf_pair(
+        num_slots=16, slot_stride_bytes=32, device=_DEVICE
+    )
+    cuda_buf_false, ref_buf_false = make_canary_buf_pair(
+        num_slots=16, slot_stride_bytes=32, device=_DEVICE
+    )
+    cuda_log_true, ref_log_true = make_log_pair(capacity=64, device=_DEVICE)
+    cuda_log_false, ref_log_false = make_log_pair(capacity=64, device=_DEVICE)
+
+    _run_both_verify(
+        cuda_canary_buf=cuda_buf_true,
+        ref_canary_buf=ref_buf_true,
+        plan_cuda=plan_true_cuda,
+        plan_ref=plan_true_ref,
+        cuda_log=cuda_log_true,
+        ref_log=ref_log_true,
+        real_kv_sources_cuda=(),
+        real_kv_sources_ref=(),
+        real_kv_hash_mode=consts.RealKvHashMode.NONE,
+        kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+        check_verify_expected_token=True,
+    )
+    _run_both_verify(
+        cuda_canary_buf=cuda_buf_false,
+        ref_canary_buf=ref_buf_false,
+        plan_cuda=plan_false_cuda,
+        plan_ref=plan_false_ref,
+        cuda_log=cuda_log_false,
+        ref_log=ref_log_false,
+        real_kv_sources_cuda=(),
+        real_kv_sources_ref=(),
+        real_kv_hash_mode=consts.RealKvHashMode.NONE,
+        kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+        check_verify_expected_token=False,
+    )
+
+    assert int(cuda_log_true.write_index[0].item()) == 0
+    assert int(cuda_log_false.write_index[0].item()) == 0
+    assert torch.equal(cuda_log_true.ring, cuda_log_false.ring)
+    assert torch.equal(cuda_log_true.write_index, cuda_log_false.write_index)
+    assert torch.equal(cuda_log_true.slot_run_counter, cuda_log_false.slot_run_counter)
+    assert torch.equal(
+        cuda_log_true.kernel_run_counter, cuda_log_false.kernel_run_counter
+    )
+
+
 @pytest.mark.parametrize("per_req_present", [False, True])
 def test_plan_per_req_present_or_absent(per_req_present: bool) -> None:
     max_reqs = 4

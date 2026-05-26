@@ -70,6 +70,9 @@ def _run_pipeline(
     real_kv_hash_mode: consts.RealKvHashMode,
     verify_capacity: int,
     write_req_capacity: int,
+    req_to_verify_expected_tokens: Optional[torch.Tensor] = None,
+    kv_token_id_vs_position_offset: int = 0,
+    check_verify_expected_token: bool = True,
 ) -> tuple[VerifyPlan, WritePlan]:
     _ = extras
     plan_v = VerifyPlan.allocate(verify_capacity=verify_capacity, device=_DEVICE)
@@ -90,8 +93,8 @@ def _run_pipeline(
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=verify_capacity,
-        req_to_verify_expected_tokens=None,
-        kv_token_id_vs_position_offset=0,
+        req_to_verify_expected_tokens=req_to_verify_expected_tokens,
+        kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
     )
 
     if real:
@@ -119,7 +122,7 @@ def _run_pipeline(
         launch_canary_verify_kernel(
             context=context,
             plan=plan_v,
-            check_verify_expected_token=True,
+            check_verify_expected_token=check_verify_expected_token,
         )
         torch.cuda.synchronize()
     else:
@@ -156,7 +159,7 @@ def _run_pipeline(
                 real_kv_hash_mode=real_kv_hash_mode,
             ),
             plan=plan_v,
-            check_verify_expected_token=True,
+            check_verify_expected_token=check_verify_expected_token,
         )
 
     return plan_v, plan_w
@@ -187,6 +190,9 @@ def _run_both_and_assert_pipeline_equal(
     write_req_capacity: int = 16,
     assert_ring_equal: bool = True,
     initial_canary_buf: Optional[torch.Tensor] = None,
+    req_to_verify_expected_tokens: Optional[torch.Tensor] = None,
+    kv_token_id_vs_position_offset: int = 0,
+    check_verify_expected_token: bool = True,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -237,6 +243,9 @@ def _run_both_and_assert_pipeline_equal(
         real_kv_hash_mode=real_kv_hash_mode,
         verify_capacity=verify_capacity,
         write_req_capacity=write_req_capacity,
+        req_to_verify_expected_tokens=req_to_verify_expected_tokens,
+        kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
+        check_verify_expected_token=check_verify_expected_token,
     )
 
     plan_v_real, plan_w_real = _run_pipeline(
@@ -808,3 +817,136 @@ def test_pipeline_kernel_kind_propagates(kernel_kind: CanaryLaunchTag) -> None:
     assert int(log_ref.ring[0, consts.VIOLATION_FIELD_KERNEL_KIND].item()) == int(
         kernel_kind
     )
+
+
+def test_pipeline_token_mismatch_detected_via_pool() -> None:
+    """plan-pool gather + verify-token check: stamped wrong token id raises VERIFY_TOKEN_MISMATCH."""
+    max_seq_len = 16
+    max_reqs = 4
+    prefix_len = 4
+    req_to_token = make_req_to_token(
+        kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE
+    )
+
+    req_pool_indices = torch.tensor([1], dtype=torch.int64, device=_DEVICE)
+    prefix_lens = torch.tensor([prefix_len], dtype=torch.int64, device=_DEVICE)
+    extend_seq_lens = torch.tensor([0], dtype=torch.int64, device=_DEVICE)
+    input_ids = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
+    positions = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
+    out_cache_loc = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
+
+    expected_tokens = [1000 + pos for pos in range(prefix_len)]
+    pool = torch.full(
+        (max_reqs, max_seq_len), -999, dtype=torch.int32, device=_DEVICE
+    )
+    for pos, token in enumerate(expected_tokens):
+        pool[1, pos] = token
+
+    stored_tokens = [token + 1 for token in expected_tokens]
+
+    initial_buf = make_canary_buf(num_slots=64, device=_DEVICE)
+    initial_ref = initial_buf.clone()
+    prefix_slots = [1 * max_seq_len + pos for pos in range(prefix_len)]
+    stamp_clean_chain(
+        cuda_buf=initial_buf,
+        ref_buf=initial_ref,
+        slot_indices=prefix_slots,
+        tokens=stored_tokens,
+        positions=list(range(prefix_len)),
+    )
+
+    _, _, log_real, log_ref, _, _, _, _ = _run_both_and_assert_pipeline_equal(
+        req_pool_indices=req_pool_indices,
+        prefix_lens=prefix_lens,
+        extend_seq_lens=extend_seq_lens,
+        input_ids=input_ids,
+        positions=positions,
+        out_cache_loc=out_cache_loc,
+        req_to_token=req_to_token,
+        num_slots=64,
+        extras=empty_extras(),
+        swa_window_size=0,
+        full_to_swa_index_mapping=None,
+        initial_canary_buf=initial_buf,
+        req_to_verify_expected_tokens=pool,
+        kv_token_id_vs_position_offset=0,
+        check_verify_expected_token=True,
+    )
+
+    assert int(log_real.write_index[0].item()) == prefix_len
+    assert int(log_ref.write_index[0].item()) == prefix_len
+    # Ring rows may land in any order; collect stored/expected pairs and compare as sets.
+    observed_pairs: set[tuple[int, int]] = set()
+    for row_idx in range(prefix_len):
+        fail_bits = int(
+            log_real.ring[row_idx, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
+        )
+        assert (
+            fail_bits & int(consts.FailReason.VERIFY_TOKEN_MISMATCH)
+        ), f"row {row_idx}: VERIFY_TOKEN_MISMATCH bit missing in {fail_bits:#b}"
+        stored = int(log_real.ring[row_idx, consts.VIOLATION_FIELD_STORED_TOKEN].item())
+        expected = int(
+            log_real.ring[row_idx, consts.VIOLATION_FIELD_EXPECTED_TOKEN].item()
+        )
+        observed_pairs.add((stored, expected))
+    expected_pairs = {
+        (stored_tokens[i], expected_tokens[i]) for i in range(prefix_len)
+    }
+    assert observed_pairs == expected_pairs
+
+
+def test_pipeline_eagle_offset_plus_1_byte_equal() -> None:
+    """plan-pool + offset=+1 full pipeline: stamped tokens match pool[rp, pos+1], no violations CUDA vs ref byte-equal."""
+    max_seq_len = 16
+    max_reqs = 4
+    prefix_len = 4
+    req_to_token = make_req_to_token(
+        kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE
+    )
+
+    req_pool_indices = torch.tensor([1], dtype=torch.int64, device=_DEVICE)
+    prefix_lens = torch.tensor([prefix_len], dtype=torch.int64, device=_DEVICE)
+    extend_seq_lens = torch.tensor([0], dtype=torch.int64, device=_DEVICE)
+    input_ids = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
+    positions = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
+    out_cache_loc = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
+
+    stored_tokens = [2000 + pos for pos in range(prefix_len)]
+    pool = torch.full(
+        (max_reqs, max_seq_len), -999, dtype=torch.int32, device=_DEVICE
+    )
+    for pos in range(prefix_len):
+        # offset=+1 means kernel gathers from pool[rp, pos + 1], so place stored_tokens[pos] there.
+        pool[1, pos + 1] = stored_tokens[pos]
+
+    initial_buf = make_canary_buf(num_slots=64, device=_DEVICE)
+    initial_ref = initial_buf.clone()
+    prefix_slots = [1 * max_seq_len + pos for pos in range(prefix_len)]
+    stamp_clean_chain(
+        cuda_buf=initial_buf,
+        ref_buf=initial_ref,
+        slot_indices=prefix_slots,
+        tokens=stored_tokens,
+        positions=list(range(prefix_len)),
+    )
+
+    _, _, log_real, log_ref, _, _, _, _ = _run_both_and_assert_pipeline_equal(
+        req_pool_indices=req_pool_indices,
+        prefix_lens=prefix_lens,
+        extend_seq_lens=extend_seq_lens,
+        input_ids=input_ids,
+        positions=positions,
+        out_cache_loc=out_cache_loc,
+        req_to_token=req_to_token,
+        num_slots=64,
+        extras=empty_extras(),
+        swa_window_size=0,
+        full_to_swa_index_mapping=None,
+        initial_canary_buf=initial_buf,
+        req_to_verify_expected_tokens=pool,
+        kv_token_id_vs_position_offset=1,
+        check_verify_expected_token=True,
+    )
+
+    assert int(log_real.write_index[0].item()) == 0
+    assert int(log_ref.write_index[0].item()) == 0
