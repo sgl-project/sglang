@@ -625,6 +625,8 @@ def build_dsv4_attention_fixture(
     # the same trailing window so this works without enabling C4/C128.
     # The pool capacity (`swa_size`) and `max_context_len` are sized in
     # `build_dsv4_attention_fixture` so the full KV fits.
+    if compression_ratios is None:
+        compression_ratios = [case.compress_ratio]
     seed = 7100 + len(case.name)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -921,6 +923,9 @@ def _full_kv_locs_per_req(
     return out
 
 
+_DSV4_EXTRA_ENTRIES = 32
+
+
 def prepare_dsv4_runner_inputs(
     fixture: DSV4AttentionFixture,
     case: DSV4AttentionCase,
@@ -930,8 +935,11 @@ def prepare_dsv4_runner_inputs(
     max_context_len: int,
 ) -> None:
     """Project K for prefix + input hidden in `inputs` and write the packed
-    FP8 nope + BF16 rope representation into the SWA cache so the backend's
-    SWA read path sees the matching values."""
+    FP8 nope + BF16 rope representation into the SWA cache. For
+    `case.compress_ratio in (4, 128)` also populate the corresponding C4/C128
+    extra cache so the flash_mla `extra_k_cache` read path sees valid
+    quantized K values.
+    """
     del batch
     all_k_parts: list[torch.Tensor] = []
     all_locs_parts: list[torch.Tensor] = []
@@ -960,13 +968,26 @@ def prepare_dsv4_runner_inputs(
         loc=torch.cat(all_locs_parts, dim=0),
         k_bf16=torch.cat(all_k_parts, dim=0),
     )
+    if case.compress_ratio in (4, 128):
+        _populate_extra_kv_cache(fixture, layer_id=0, num_entries=_DSV4_EXTRA_ENTRIES)
+
+
+def _seed_c4_if_needed(fixture: DSV4AttentionFixture) -> None:
+    """For compress_ratio=4, seed `c4_sparse_page_indices` to the entries the
+    fixture wrote via `_populate_extra_kv_cache` (the C4Indexer would normally
+    populate this; the smoke fixture skips the indexer). No-op for other
+    compress_ratios.
+    """
+    if fixture.case.compress_ratio == 4:
+        fixture.backend._maybe_upgrade_forward_metadata()
+        _seed_c4_sparse_indices(fixture, num_entries=_DSV4_EXTRA_ENTRIES)
 
 
 def run_dsv4_fixture_eager(fixture: DSV4AttentionFixture) -> torch.Tensor:
-    """Eager forward that also re-initializes the forward metadata. Used as
-    the eager baseline before graph capture/replay; the existing
-    `run_dsv4_attention_case` already exercises this end-to-end including
-    the reference comparison.
+    """Eager forward that re-initialises the forward metadata. For
+    `case.compress_ratio in (4, 128)` populates the extra K cache and seeds
+    the C4 sparse indices before invoking `forward` so the actual path and
+    the combined reference attend to matching SWA + extra-K entries.
     """
     case = fixture.case
     runner = fixture.runner
@@ -974,9 +995,12 @@ def run_dsv4_fixture_eager(fixture: DSV4AttentionFixture) -> torch.Tensor:
     full_kv_locs_per_req = _populate_swa_kv_cache(
         fixture, max_context_len=max_context_len, device=runner.device
     )
+    if case.compress_ratio in (4, 128):
+        _populate_extra_kv_cache(fixture, layer_id=0, num_entries=_DSV4_EXTRA_ENTRIES)
     q_input, _ = fixture.actual_module.project(fixture.input_hidden)
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
         fixture.backend.init_forward_metadata(fixture.forward_batch)
+        _seed_c4_if_needed(fixture)
         actual = fixture.backend.forward(
             q=q_input,
             k=q_input,
@@ -998,11 +1022,15 @@ def run_dsv4_forward(
 ) -> torch.Tensor:
     """Forward call used after the runner harness has already invoked
     `init_forward_metadata_capture_cuda_graph` / `_replay_cuda_graph` on the
-    backend. Projects Q from `inputs['input_hidden']` and calls `forward`.
+    backend. Projects Q from `inputs['input_hidden']`, applies the C4 sparse
+    index seeding (no-op for compress_ratio in {0, 128}) so the harness's
+    capture+replay metadata reaches the same flash_mla call shape the eager
+    path uses, then calls `forward`.
     """
     case = fixture.case
     q_input, _ = fixture.actual_module.project(inputs["input_hidden"])
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+        _seed_c4_if_needed(fixture)
         out = fixture.backend.forward(
             q=q_input,
             k=q_input,
@@ -1022,13 +1050,17 @@ def expected_dsv4_output_from_inputs(
     inputs: dict[str, Any],
     _state: Any,
 ) -> torch.Tensor:
-    """Pure PyTorch SWA reference built from `inputs`. The actual path is
-    expected to have already written the corresponding K into the SWA cache
-    via `prepare_dsv4_runner_inputs`; the reference unpacks back from the
-    cache to absorb FP8 quant noise consistently."""
+    """Pure-PyTorch reference. For compress_ratio=0 (SWA-only) projects Q from
+    `inputs['input_hidden']` and slides a sliding-window reference over the
+    K's written into the SWA cache. For compress_ratio in (4, 128) projects Q
+    the same way but reads SWA + extra metadata indices from the upgraded
+    `DSV4AttnMetadata` so the reference picks up exactly the slots the
+    backend attends to."""
     runner = fixture.runner
     max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
     q_input, _ = fixture.actual_module.project(inputs["input_hidden"])
+    if case.compress_ratio in (4, 128):
+        return _pure_torch_dsv4_combined_reference(fixture, q_input).float()
     full_kv_locs_per_req = _full_kv_locs_per_req(
         case, max_context_len=max_context_len, device=runner.device
     )
@@ -1044,13 +1076,29 @@ def _populate_extra_kv_cache(
     num_entries: int = 32,
 ) -> int:
     """Write `num_entries` packed FP8-nope/BF16-rope K vectors into the C4 or
-    C128 extra cache via the production `set_extra_key_buffer` path. Returns
+    C128 extra cache via the production `set_extra_key_buffer` path. Uses a
+    case-derived seed for the random K so eager / capture / replay fixtures
+    (rebuilt with the same case name) populate the same extra cache. Returns
     `num_entries` so callers can use the same count when manually populating
     `c4_sparse_page_indices` to point at the entries we just wrote.
     """
     pool = fixture.runner.token_to_kv_pool
     device = fixture.runner.device
-    rand_k = torch.randn(num_entries, DSV4_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    # Save/restore the global RNG state so we don't perturb downstream Q/K
+    # projection randomness that build_dsv4_attention_fixture deliberately
+    # seeded.
+    cpu_state = torch.random.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state(device=device)
+    try:
+        case_seed = 8200 + len(fixture.case.name) * 13 + layer_id
+        torch.manual_seed(case_seed)
+        torch.cuda.manual_seed_all(case_seed)
+        rand_k = torch.randn(
+            num_entries, DSV4_HEAD_DIM, dtype=torch.bfloat16, device=device
+        )
+    finally:
+        torch.random.set_rng_state(cpu_state)
+        torch.cuda.set_rng_state(cuda_state, device=device)
     pack = quant_to_nope_fp8_rope_bf16_pack_triton(rand_k)
     loc = torch.arange(num_entries, dtype=torch.int64, device=device)
     pool.set_extra_key_buffer(layer_id=layer_id, loc=loc, cache_nope_fp8_rope_bf16_pack=pack)
@@ -1083,10 +1131,19 @@ def _pure_torch_dsv4_combined_reference(
     unpacks K from those slots through `_unpack_packed_kv_at_locs`, then runs
     softmax(q @ k.T) * scaling with the attention-sink virtual-key correction.
 
-    Requires `backend.forward_metadata` to already be a `DSV4Metadata` (call
-    `backend._maybe_upgrade_forward_metadata()` or `backend.forward()` first).
+    Forces the lazy `DSV4RawDecodeMetadata → DSV4Metadata` upgrade before
+    reading metadata so this works both pre-forward (where the upgrade has
+    not happened) and post-`on_after_cuda_graph_warmup` (which intentionally
+    rolls `forward_metadata` back to the captured raw to be re-upgraded
+    inside the CUDA graph).
     """
     case = fixture.case
+    # Re-apply the C4 seeding too, since `on_after_cuda_graph_warmup` rolls
+    # `forward_metadata` back to the raw captured value (which clears
+    # `c4_sparse_page_indices` back to all -1 on the next upgrade) — the
+    # reference must observe the same seeded indices the backend forward saw.
+    _seed_c4_if_needed(fixture)
+    fixture.backend._maybe_upgrade_forward_metadata()
     md = fixture.backend.forward_metadata.core_metadata
     pool = fixture.runner.token_to_kv_pool
     swa_kv_pool = pool.swa_kv_pool

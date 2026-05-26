@@ -59,6 +59,24 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
             page_size=DSV4_PAGE_SIZE,
             prefix_lens=(32, 96),
         ),
+        DSV4AttentionCase(
+            name="runner_cuda_graph_dsv4_c4_decode",
+            backend="dsv4",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(64,),
+            compress_ratio=4,
+        ),
+        DSV4AttentionCase(
+            name="runner_cuda_graph_dsv4_c128_decode",
+            backend="dsv4",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(128,),
+            compress_ratio=128,
+        ),
     )
     # SWA + C4 / SWA + C128 cases. Each pre-populates the extra K cache directly
     # via `set_extra_key_buffer`, lets `init_forward_metadata` populate the
