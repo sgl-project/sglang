@@ -3168,15 +3168,27 @@ class ServerArgs:
                 self.moe_runner_backend = "flashinfer_trtllm"
             elif self.moe_runner_backend not in [
                 "cutlass",
+                "deep_gemm",
                 "flashinfer_trtllm",
                 "flashinfer_trtllm_routed",
             ]:
                 logger.warning(
-                    "mxfp8 quantization supports only cutlass, flashinfer_trtllm, "
-                    "or flashinfer_trtllm_routed backends. "
+                    "mxfp8 quantization supports only cutlass, deep_gemm, "
+                    "flashinfer_trtllm, or flashinfer_trtllm_routed backends. "
                     f"Overriding {self.moe_runner_backend!r}."
                 )
                 self.moe_runner_backend = "flashinfer_trtllm"
+            if (
+                self.moe_runner_backend == "deep_gemm"
+                and not self.enforce_piecewise_cuda_graph
+            ):
+                if not self.disable_piecewise_cuda_graph:
+                    logger.warning(
+                        "Disabling piecewise CUDA graph for mxfp8 with "
+                        "--moe-runner-backend deep_gemm because DeepGEMM MoE "
+                        "captures large per-expert scratch buffers."
+                    )
+                self.disable_piecewise_cuda_graph = True
 
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [

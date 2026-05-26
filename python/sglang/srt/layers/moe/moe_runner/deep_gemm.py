@@ -119,6 +119,22 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     block_shape: Optional[List[int]] = None
     # DSV4 mxfp4 layout flag; selects recipe_a=(1,128)/recipe_b=(1,32) downstream.
     is_fp4_experts: bool = False
+    # MXFP8 uses 1D1D FP8 recipes with UE8M0 scales every 32 K elements.
+    is_mxfp8: bool = False
+
+
+def _fp8_recipes(
+    quant_info: DeepGemmMoeQuantInfo,
+) -> Tuple[Optional[Tuple[int, int]], Optional[Tuple[int, int]]]:
+    if quant_info.is_fp4_experts:
+        return (1, 128), (1, 32)
+    if quant_info.is_mxfp8:
+        return (1, 32), (1, 32)
+    return None, None
+
+
+def _fp8_activation_group_size(quant_info: DeepGemmMoeQuantInfo) -> int:
+    return 32 if quant_info.is_mxfp8 else 128
 
 
 class DeepGemmRunnerCore(MoeRunnerCore):
@@ -183,11 +199,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
-        scale_block_size = 128
-
-        recipe_a, recipe_b = (
-            ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
-        )
+        scale_block_size = _fp8_activation_group_size(quant_info)
+        recipe_a, recipe_b = _fp8_recipes(quant_info)
 
         w13_weight_fp8 = (
             quant_info.w13_weight,
@@ -377,9 +390,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         w13_scale = quant_info.w13_scale
         w2_scale = quant_info.w2_scale
 
-        recipe_a, recipe_b = (
-            ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
-        )
+        recipe_a, recipe_b = _fp8_recipes(quant_info)
+        scale_block_size = _fp8_activation_group_size(quant_info)
 
         hidden_states_device = running_state["hidden_states_device"]
 
@@ -443,7 +455,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant(
             gateup_output,
             masked_m,
-            group_size=128,
+            group_size=scale_block_size,
             topk=self.config.top_k,
             swiglu_limit=swiglu_limit_arg,
             swizzle=self.use_swizzle,
@@ -592,6 +604,7 @@ def pre_permute_standard_to_deep_gemm(
             hidden_states,
             runner_config.top_k,
             quant_info.block_shape,
+            scale_ue8m0=quant_info.is_mxfp8 and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         )
     )
 
@@ -661,6 +674,12 @@ def pre_permute_deepep_ll_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
+    if quant_info.is_mxfp8:
+        raise NotImplementedError(
+            "DeepGEMM MXFP8 MoE does not support DeepEP low-latency dispatch yet; "
+            "use the standard or DeepEP normal dispatcher."
+        )
+
     hidden_states, hidden_states_scale, topk_ids, topk_weights, masked_m, expected_m = (
         dispatch_output
     )
@@ -734,10 +753,16 @@ def pre_permute_deepep_normal_to_deep_gemm(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+    scale_group_size = _fp8_activation_group_size(quant_info)
+    scale_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+    scale_size = (
+        ceil_div(K // scale_group_size, 4) if scale_ue8m0 else K // scale_group_size
+    )
+
+    if scale_ue8m0:
         # TODO check whether need `zeros`
         input_tensor_scale = torch.zeros(
-            (ceil_div(K // 128, 4), all_tokens),
+            (scale_size, all_tokens),
             device=hidden_states.device,
             dtype=torch.int,
         ).transpose(0, 1)
@@ -773,7 +798,8 @@ def pre_permute_deepep_normal_to_deep_gemm(
         input_tensor_scale,
         m_indices,
         output_index,
-        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        scale_ue8m0=scale_ue8m0,
+        quant_group_size=scale_group_size,
     )
     dispose_tensor(hidden_states)
     if hidden_states_scale is not None:

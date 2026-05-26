@@ -173,7 +173,7 @@ class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTest
             ),
         },
         {
-            "name": "deep_gemm_dense_flashinfer_trtllm_routed_mxfp8",
+            "name": "deep_gemm_mxfp8",
             "other_args": (
                 "--base-gpu-id",
                 "0",
@@ -182,7 +182,7 @@ class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTest
                 "--fp8-gemm-backend",
                 "deep_gemm",
                 "--moe-runner-backend",
-                "flashinfer_trtllm_routed",
+                "deep_gemm",
             ),
         },
     )

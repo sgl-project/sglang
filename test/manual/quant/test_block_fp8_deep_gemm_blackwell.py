@@ -5,6 +5,7 @@ from typing import List, Tuple
 import torch
 from deep_gemm import fp8_gemm_nt
 
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_utils import (
     deepgemm_w8a8_mxfp8_linear,
     mxfp8_group_quantize,
@@ -289,6 +290,55 @@ class TestDeepGemmBlackwell(CustomTestCase):
         torch.testing.assert_close(
             out, ref_out.to(torch.bfloat16), atol=1e-1, rtol=1e-2
         )
+
+    def test_deep_gemm_mxfp8_masked_grouped_moe(self):
+        torch.manual_seed(1)
+        num_groups, max_m, n, k = 4, 256, 512, 1024
+        expected_m = 160
+        masked_m = torch.tensor([17, 64, 0, 129], dtype=torch.int32, device="cuda")
+
+        a = torch.empty(
+            (num_groups, max_m, k), dtype=torch.bfloat16, device="cuda"
+        ).normal_(0, 0.2)
+        b = torch.empty(
+            (num_groups, n, k), dtype=torch.bfloat16, device="cuda"
+        ).normal_(0, 0.2)
+
+        a_q, a_s = mxfp8_group_quantize(a.view(-1, k))
+        a_q = a_q.view_as(a)
+        a_s = a_s.view(num_groups, max_m, k // 32)
+        b_q, b_s = mxfp8_group_quantize(b.view(-1, k))
+        b_q = b_q.view_as(b)
+        b_s = b_s.view(num_groups, n, k // 32)
+
+        a_s_deepgemm = transform_mxfp8_scale_ue8m0(a_s)
+        b_s_deepgemm = transform_mxfp8_scale_ue8m0(b_s)
+
+        out = torch.empty((num_groups, max_m, n), dtype=torch.bfloat16, device="cuda")
+        with torch.inference_mode():
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                (a_q, a_s_deepgemm),
+                (b_q, b_s_deepgemm),
+                out,
+                masked_m,
+                expected_m,
+                recipe_a=(1, 32),
+                recipe_b=(1, 32),
+            )
+
+            for group_id, m in enumerate(masked_m.tolist()):
+                if m == 0:
+                    continue
+                ref_out = (
+                    mxfp8_dequant(a_q[group_id, :m], a_s[group_id, :m], torch.float32)
+                    @ mxfp8_dequant(b_q[group_id], b_s[group_id], torch.float32).t()
+                )
+                torch.testing.assert_close(
+                    out[group_id, :m],
+                    ref_out.to(torch.bfloat16),
+                    atol=1e-1,
+                    rtol=1e-2,
+                )
 
 
 if __name__ == "__main__":
