@@ -10,11 +10,11 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from common.cuda_graph_runner import run_dense_cuda_graph_decode_case
 from common.dense_attention import (
     DenseAttentionCase,
     make_swa_no_prefix_input_config_cases,
     run_dense_attention_case,
-    run_dense_cuda_graph_decode_case,
 )
 
 

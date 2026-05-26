@@ -59,6 +59,9 @@ Implemented:
   PyTorch modules or functions; they may receive copied weights from the actual
   module, but must not call SGLang attention modules, SGLang backend wrappers, or
   SGLang kernel helpers.
+- Runner mechanics are isolated under `common/*_runner.py`. Attention-method
+  helpers build modules, inputs, references, and metadata; runner files own CUDA
+  graph/PCG/BCG capture and replay orchestration.
 - RoPE is intentionally omitted from the current unit-level runner x attention
   tests. These tests feed post-RoPE-equivalent Q/K tensors because rotary math is
   orthogonal to runner/backend metadata compatibility.
@@ -80,7 +83,10 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
-- `python -m py_compile test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/gdn/test_triton.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/swa/test_flashinfer.py`
+- `python -m py_compile test/manual/attention/unittest/common/cuda_graph_runner.py test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/mla/test_triton.py test/manual/attention/unittest/gdn/test_triton.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/swa/test_flashinfer.py`
+- `python test/manual/attention/unittest/dense/test_triton.py -v`
+- `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
+- `python test/manual/attention/unittest/mla/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_flashinfer.py -v`
 - `python test/manual/attention/unittest/gdn/test_triton.py -v`
@@ -105,7 +111,10 @@ Tests are organized by attention method first and attention backend second:
 ```text
 test/manual/attention/unittest/
   common/
+    cuda_graph_runner.py
     dense_attention.py
+    gdn_attention.py
+    mla_attention.py
   dense/
     test_torch_native.py
     test_triton.py
@@ -124,6 +133,9 @@ test/manual/attention/unittest/
 
 Each `test_<attn_backend>.py` file verifies one attention method against one
 attention backend across supported runner modes, forward modes, and input configs.
+Runner implementations such as CUDA graph capture/replay live in isolated
+`common/*_runner.py` files and are imported by the attention-method tests; do not
+duplicate runner orchestration inside each attention method helper.
 Speculative decoding is not an attention-method folder; it is represented as
 `ForwardMode`, runner mode, and synthetic spec metadata cases inside the affected
 attention-method folder.
@@ -698,6 +710,8 @@ Optional dispatch-path cases:
 Initial implementation slice:
 - `common/dense_attention.py` contains a projected attention target that owns
   Q/K/V/O projections and dispatches through `RadixAttention`.
+- `common/cuda_graph_runner.py` owns CUDA graph capture/replay helpers for dense/SWA,
+  MLA, and GDN. Attention-method files only enumerate cases and call runner helpers.
 - `dense/test_torch_native.py`, `dense/test_triton.py`, and
   `dense/test_flashinfer.py` cover representative MHA, GQA, and MQA cases.
 - Dense tests exercise page size 1, exact-page extend, page-boundary decode
@@ -719,7 +733,7 @@ Initial implementation slice:
 
 ---
 
-### Phase 3 — Runner integration tests (`test/manual/attention/unittest/test_runner_integration.py`)
+### Phase 3 — Runner integration tests (`test/manual/attention/unittest/common/*_runner.py`)
 
 Use a smaller representative subset from Phase 2. The goal is runner bookkeeping, not
 another full correctness matrix.

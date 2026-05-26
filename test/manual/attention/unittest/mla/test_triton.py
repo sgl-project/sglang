@@ -9,11 +9,11 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from common.cuda_graph_runner import run_mla_cuda_graph_decode_case
 from common.mla_attention import (
     MLAAttentionCase,
     make_mla_cases,
     run_mla_attention_case,
-    run_mla_cuda_graph_decode_case,
 )
 
 
