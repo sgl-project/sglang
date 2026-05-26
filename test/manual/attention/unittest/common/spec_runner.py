@@ -50,6 +50,7 @@ from .gdn_attention import DEFAULT_MAX_CONTEXT_LEN as GDN_DEFAULT_MAX_CONTEXT_LE
 from .gdn_attention import (
     GDN_ATOL,
     GDN_RTOL,
+    GDN_TREE_ATOL,
     GDNAttentionCase,
     _clone_gdn_cache,
 )
@@ -57,7 +58,7 @@ from .gdn_attention import _make_forward_batch as _make_gdn_forward_batch
 from .gdn_attention import (
     _restore_gdn_cache,
     build_gdn_attention_fixture,
-    expected_gdn_output_from_inputs,
+    expected_gdn_verify_output_from_inputs,
     gdn_fixture_inputs,
     make_gdn_case_with_prefix_lens,
     make_gdn_random_inputs,
@@ -1089,8 +1090,6 @@ def run_gdn_eagle_verify_case(
     dtype: torch.dtype = GDN_DEFAULT_DTYPE,
     device: str = GDN_DEFAULT_DEVICE,
 ):
-    if topk != 1:
-        raise ValueError("GDN EAGLE verify coverage currently models chain drafts.")
     fixture = build_gdn_attention_fixture(
         testcase,
         case,
@@ -1109,18 +1108,20 @@ def run_gdn_eagle_verify_case(
     )
     inputs = gdn_fixture_inputs(fixture)
     initial_state = _clone_gdn_cache(fixture)
-    expected = expected_gdn_output_from_inputs(
+    expected = expected_gdn_verify_output_from_inputs(
         fixture,
         case,
         inputs,
         initial_state,
+        topk=topk,
     )
 
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
         fixture.backend.init_forward_metadata(fixture.forward_batch)
         actual = run_gdn_forward(fixture, fixture.forward_batch, inputs)
 
-    torch.testing.assert_close(actual, expected, atol=GDN_ATOL, rtol=GDN_RTOL)
+    atol = GDN_TREE_ATOL if topk > 1 else GDN_ATOL
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=GDN_RTOL)
 
 
 def _prepare_gdn_verify_batch(case, batch, *, topk: int, device: str) -> None:
@@ -1145,8 +1146,6 @@ def run_gdn_eagle_verify_cuda_graph_case(
     device: str = GDN_DEFAULT_DEVICE,
     cuda_graph_capture_batch_size: int | None = None,
 ):
-    if topk != 1:
-        raise ValueError("GDN EAGLE verify CUDA graph coverage models chain drafts.")
     cuda_graph_capture_batch_size = cuda_graph_capture_batch_size or case.batch_size
     if case.batch_size != cuda_graph_capture_batch_size:
         raise ValueError("GDN verify graph coverage currently uses unpadded replay.")
@@ -1191,11 +1190,12 @@ def run_gdn_eagle_verify_cuda_graph_case(
         capture_inputs,
         max_context_len=max_context_len,
     )
-    capture_expected = expected_gdn_output_from_inputs(
+    capture_expected = expected_gdn_verify_output_from_inputs(
         graph_fixture,
         capture_case,
         capture_inputs,
         initial_state,
+        topk=topk,
     )
 
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
@@ -1232,11 +1232,12 @@ def run_gdn_eagle_verify_cuda_graph_case(
         replay_inputs,
         max_context_len=max_context_len,
     )
-    replay_expected = expected_gdn_output_from_inputs(
+    replay_expected = expected_gdn_verify_output_from_inputs(
         graph_fixture,
         replay_case,
         replay_inputs,
         initial_state,
+        topk=topk,
     )
 
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
@@ -1247,16 +1248,17 @@ def run_gdn_eagle_verify_cuda_graph_case(
         )
         replay_actual = run_gdn_forward(graph_fixture, replay_batch, replay_inputs)
 
+    atol = GDN_TREE_ATOL if topk > 1 else GDN_ATOL
     torch.testing.assert_close(
         capture_actual,
         capture_expected,
-        atol=GDN_ATOL,
+        atol=atol,
         rtol=GDN_RTOL,
     )
     torch.testing.assert_close(
         replay_actual,
         replay_expected,
-        atol=GDN_ATOL,
+        atol=atol,
         rtol=GDN_RTOL,
     )
 

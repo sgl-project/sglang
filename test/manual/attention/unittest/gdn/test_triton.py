@@ -65,6 +65,19 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
             ),
             1,
         ),
+        (
+            GDNAttentionCase(
+                name="runner_eagle_verify_gdn_tree",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(5, 6),
+                extend_lens=(3, 3),
+            ),
+            2,
+        ),
     )
     EAGLE_VERIFY_CUDA_GRAPH_CASES = (
         (
@@ -79,6 +92,19 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
                 extend_lens=(3, 3),
             ),
             1,
+        ),
+        (
+            GDNAttentionCase(
+                name="runner_cuda_graph_eagle_verify_gdn_tree",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(5, 6),
+                extend_lens=(3, 3),
+            ),
+            2,
         ),
     )
 

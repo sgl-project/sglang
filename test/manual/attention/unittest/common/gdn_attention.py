@@ -35,6 +35,7 @@ DEFAULT_DTYPE = torch.bfloat16
 DEFAULT_DEVICE = "cuda"
 GDN_ATOL = 3e-2
 GDN_RTOL = 3e-2
+GDN_TREE_ATOL = 5e-2
 
 
 @dataclass(frozen=True)
@@ -902,6 +903,83 @@ def expected_gdn_output_from_inputs(
     state,
 ) -> torch.Tensor:
     return _pure_torch_gdn_reference(fixture, state[1]).output
+
+
+def _gdn_verify_parent_indices(draft_token_num: int, topk: int) -> tuple[int, ...]:
+    if topk == 1:
+        return tuple(range(-1, draft_token_num - 1))
+    if draft_token_num != 3:
+        raise ValueError("Tree GDN verify reference currently expects 3 draft tokens.")
+    return (-1, 0, 0)
+
+
+def expected_gdn_verify_output_from_inputs(
+    fixture: GDNAttentionFixture,
+    case: GDNAttentionCase,
+    inputs: dict[str, torch.Tensor],
+    state,
+    *,
+    topk: int,
+) -> torch.Tensor:
+    module = fixture.reference_module
+    q, k, v = module.split_qkv(inputs["mixed_qkv"])
+    cache_indices = _cache_indices(fixture)
+    g, beta = _pure_torch_gdn_gating(module, inputs["a"], inputs["b"])
+    q = q.float()
+    k = k.float()
+    v = v.float()
+
+    initial_ssm_states = state[1]
+    outputs = torch.empty(
+        1,
+        case.num_input_tokens,
+        case.num_v_heads,
+        module.head_v_dim,
+        dtype=torch.float32,
+        device=fixture.runner.device,
+    )
+    q_head_ratio = case.num_v_heads // case.num_k_heads
+    start = 0
+
+    for req_idx, input_len in enumerate(case.input_lens):
+        parent_indices = _gdn_verify_parent_indices(input_len, topk)
+        state_idx = cache_indices[req_idx]
+        root_state = initial_ssm_states[state_idx].float().clone()
+        token_states = []
+
+        for offset, parent_idx in enumerate(parent_indices):
+            token_idx = start + offset
+            state_for_token = (
+                root_state.clone()
+                if parent_idx < 0
+                else token_states[parent_idx].clone()
+            )
+
+            for v_head in range(case.num_v_heads):
+                k_head = v_head // q_head_ratio
+                q_vec = q[0, token_idx, k_head]
+                k_vec = k[0, token_idx, k_head]
+                v_vec = v[0, token_idx, v_head]
+
+                q_norm = q_vec / torch.sqrt(torch.sum(q_vec * q_vec) + 1e-6)
+                k_norm = k_vec / torch.sqrt(torch.sum(k_vec * k_vec) + 1e-6)
+                q_norm = q_norm * (module.head_k_dim**-0.5)
+
+                head_state = state_for_token[v_head]
+                head_state = head_state * torch.exp(g[token_idx, v_head])
+                residual_v = v_vec - torch.sum(head_state * k_norm.unsqueeze(0), dim=1)
+                residual_v = residual_v * beta[token_idx, v_head]
+                head_state = head_state + residual_v.unsqueeze(1) * k_norm.unsqueeze(0)
+                state_for_token[v_head] = head_state
+                outputs[0, token_idx, v_head] = torch.sum(
+                    head_state * q_norm.unsqueeze(0), dim=1
+                )
+
+            token_states.append(state_for_token)
+
+        start += input_len
+
+    return outputs.to(inputs["mixed_qkv"].dtype)
 
 
 def run_gdn_attention_case(

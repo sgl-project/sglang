@@ -30,7 +30,9 @@ Implemented:
   `triton`, and `flashinfer` with linear-attention kernel backend `triton`; its
   expected path is now a separate reference module plus pure PyTorch gated-delta
   recurrence, not the Triton/FLA GDN kernels. The FlashInfer GDN file uses 64-dim
-  heads to satisfy FlashInfer SM90 prefill kernel constraints.
+  heads to satisfy FlashInfer SM90 prefill kernel constraints. GDN tree-verify
+  tests use a scoped `5e-2` absolute tolerance for bf16 recurrent-kernel
+  accumulation differences; chain verify and non-spec GDN paths keep `3e-2`.
 - Phase 3 dense runner integration is implemented for representative attention
   backends: eager mode for `torch_native`, and CUDA-graph metadata capture/replay
   decode mode for `triton` and `flashinfer`. Runner coverage now includes MHA,
@@ -62,7 +64,8 @@ Implemented:
   finite sliding window. MLA `triton` covers EAGLE `TARGET_VERIFY` chain masks;
   MLA `flashinfer` and `flashmla` cover EAGLE chain verify and EAGLE draft-extend
   on supported DeepSeek-like shapes. GDN `triton` and `flashinfer` cover EAGLE
-  chain verify against the pure PyTorch gated-delta recurrence reference.
+  chain and tree verify against the pure PyTorch gated-delta recurrence
+  reference.
 - Phase 4 target-verify CUDA-graph-style replay now covers representative valid
   backends with fixed capture batches and distinct replay metadata/input tensors:
   dense `triton` covers EAGLE tree, DFlash chain, and NGRAM chain; dense
@@ -70,7 +73,7 @@ Implemented:
   `triton` covers EAGLE tree with sliding-window metadata; MLA `triton` covers
   EAGLE tree with the absorb-MLA cached-KV path; MLA `flashinfer` and `flashmla`
   cover EAGLE chain with the absorb-MLA cached-KV path; GDN `triton` and
-  `flashinfer` cover EAGLE chain with speculative Mamba state buffers.
+  `flashinfer` cover EAGLE chain and tree with speculative Mamba state buffers.
 - Phase 4 draft-extend CUDA-graph-style replay now covers dense `flashinfer` for
   EAGLE and Frozen-KV MTP `DRAFT_EXTEND` with ragged accepted-token counts. The
   capture batch uses a fixed max accepted-token count per request, while replay
@@ -180,6 +183,13 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
+- `python -m py_compile test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/common/spec_runner.py test/manual/attention/unittest/gdn/test_triton.py test/manual/attention/unittest/gdn/test_flashinfer.py`
+- `python test/manual/attention/unittest/gdn/test_triton.py -v`
+  - Ran 5 tests in 1.228s after adding GDN EAGLE tree verify/replay coverage.
+- `python test/manual/attention/unittest/gdn/test_flashinfer.py -v`
+  - Ran 5 tests in 1.329s after adding GDN EAGLE tree verify/replay coverage.
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+  - Ran 60 tests in 22.611s after adding GDN EAGLE tree verify/replay coverage.
 - `python -m py_compile test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/common/spec_runner.py test/manual/attention/unittest/gdn/test_triton.py test/manual/attention/unittest/gdn/test_flashinfer.py`
 - `python test/manual/attention/unittest/gdn/test_triton.py -v`
   - Ran 5 tests in 1.179s after adding GDN EAGLE chain verify and CUDA-graph
