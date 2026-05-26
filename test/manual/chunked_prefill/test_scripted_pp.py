@@ -1,18 +1,19 @@
 """PP × chunked: naive ScriptedRuntime smoke.
 
 Submit one long-prompt request that must be chunked across at least
-two scheduler iterations, with ``pp_size=2`` and ``tp_size=2`` so the
-chunked req crosses microbatch boundaries.
+two scheduler iterations, with ``pp_size=2`` so the chunked req crosses
+microbatch boundaries.
 
 Asserts the request reaches ``finished`` and went through >= 2 chunks.
 Does not attempt to reproduce the 309b6dc last-chunk-in-flight race —
 that lives in ``test_scripted_regression_309b6dc.py``.
 
-Requires 4 GPUs. ScriptedRuntime must support ``pp_size > 1`` / ``tp_size > 1``
-(see wishlist §4 P2 (12)).
+Requires 2 GPUs. ScriptedRuntime must support ``pp_size > 1`` (see
+wishlist §4 P2 (12)).
 """
 
 import unittest
+from typing import Any, Dict
 
 from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
@@ -27,18 +28,20 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 
 
+def _pp_engine_kwargs(*, pp_size: int = 2, **overrides: Any) -> Dict[str, Any]:
+    return base_engine_kwargs(
+        model_path=DEFAULT_MODEL_NAME_FOR_TEST,
+        pp_size=pp_size,
+        **overrides,
+    )
+
+
 class TestScriptedPP(CustomTestCase):
     def test_naive_pp_chunked(self):
         """PP × chunked: naive ScriptedRuntime smoke."""
         execute_scripted_runtime(
             self._script_naive_pp_chunked,
-            **base_engine_kwargs(
-                model_path=DEFAULT_MODEL_NAME_FOR_TEST,
-                tp_size=2,
-                pp_size=2,
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-                enable_dynamic_chunking=True,
-            ),
+            **_pp_engine_kwargs(enable_dynamic_chunking=True),
         )
 
     @staticmethod
@@ -53,12 +56,7 @@ class TestScriptedPP(CustomTestCase):
         """PP=2 chunked req must finalize exactly once across microbatches."""
         execute_scripted_runtime(
             self._script_pp_chunked_no_double_finalize,
-            **base_engine_kwargs(
-                model_path=DEFAULT_MODEL_NAME_FOR_TEST,
-                tp_size=2,
-                pp_size=2,
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-            ),
+            **_pp_engine_kwargs(),
         )
 
     # [b-02b1785f0a] PP cross-mb _handle_finished_req must not double-finalize:
@@ -77,12 +75,7 @@ class TestScriptedPP(CustomTestCase):
         """PP=2 abort on chunked req in both mb_other and waiting_queue dedups cleanly."""
         execute_scripted_runtime(
             self._script_pp_abort_during_inflight_chunk,
-            **base_engine_kwargs(
-                model_path=DEFAULT_MODEL_NAME_FOR_TEST,
-                tp_size=2,
-                pp_size=2,
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-            ),
+            **_pp_engine_kwargs(),
         )
 
     # [b-b823c16e60] PP abort_request must dedup across batch_rids:
@@ -101,12 +94,7 @@ class TestScriptedPP(CustomTestCase):
         """PP=2 last-chunk-in-flight across microbatches must not corrupt decode KV."""
         execute_scripted_runtime(
             self._script_pp_last_chunk_cross_mb_kv_correctness,
-            **base_engine_kwargs(
-                model_path=DEFAULT_MODEL_NAME_FOR_TEST,
-                tp_size=2,
-                pp_size=2,
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-            ),
+            **_pp_engine_kwargs(),
         )
 
     # [b-69ef71edc4] PP last-chunk cross-mb KV correctness:
@@ -129,12 +117,7 @@ class TestScriptedPP(CustomTestCase):
         """PP=2 single chunked req across 4+ chunks aggregates chunks_done correctly."""
         execute_scripted_runtime(
             self._script_pp_multi_microbatch_chunks_done_aggregation,
-            **base_engine_kwargs(
-                model_path=DEFAULT_MODEL_NAME_FOR_TEST,
-                tp_size=2,
-                pp_size=2,
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-            ),
+            **_pp_engine_kwargs(),
         )
 
     # [a-PP1] PP=2 chunks_done aggregation across mbs — single chunked req
@@ -156,12 +139,7 @@ class TestScriptedPP(CustomTestCase):
         """PP=4 long chunked req completes with no microbatch residue."""
         execute_scripted_runtime(
             self._script_pp_size_4_chunked_completes,
-            **base_engine_kwargs(
-                model_path=DEFAULT_MODEL_NAME_FOR_TEST,
-                tp_size=1,
-                pp_size=4,
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-            ),
+            **_pp_engine_kwargs(pp_size=4),
         )
 
     # [a-PP3] PP=4 chunked completion — verifies the cross-mb bookkeeping
@@ -179,12 +157,7 @@ class TestScriptedPP(CustomTestCase):
         """PP=2 with one chunked req per microbatch — both complete; per-mb in-flight bounded."""
         execute_scripted_runtime(
             self._script_pp_two_chunked_one_per_mb_simultaneous,
-            **base_engine_kwargs(
-                model_path=DEFAULT_MODEL_NAME_FOR_TEST,
-                tp_size=2,
-                pp_size=2,
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-            ),
+            **_pp_engine_kwargs(),
         )
 
     # [a-PP4] PP=2, one chunked per mb — chunked_in_flight_count must stay
@@ -209,12 +182,7 @@ class TestScriptedPP(CustomTestCase):
         """PP=2 retract of chunked req mid-mb cleans cross-mb exclude set."""
         execute_scripted_runtime(
             self._script_pp_retract_chunked_in_middle_mb,
-            **base_engine_kwargs(
-                model_path=DEFAULT_MODEL_NAME_FOR_TEST,
-                tp_size=2,
-                pp_size=2,
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-            ),
+            **_pp_engine_kwargs(),
         )
 
     # [a-PP5] PP=2 mid-mb chunked retract — exclude set must drop the
@@ -233,12 +201,7 @@ class TestScriptedPP(CustomTestCase):
         """PP last_batch.chunked_req stale pointer must be excluded from new batch."""
         execute_scripted_runtime(
             self._script_pp_chunked_req_to_exclude_pp_context,
-            **base_engine_kwargs(
-                model_path=DEFAULT_MODEL_NAME_FOR_TEST,
-                tp_size=2,
-                pp_size=2,
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-            ),
+            **_pp_engine_kwargs(),
         )
 
     # [c-S11] PP-path exclude set — last_batch.chunked_req can be stale
@@ -259,13 +222,7 @@ class TestScriptedPP(CustomTestCase):
         """PP=2 + pdmux split-prefill + chunked must not trip merge_batch assert."""
         execute_scripted_runtime(
             self._script_pp_split_prefill_chunked_no_merge_assert,
-            **base_engine_kwargs(
-                model_path=DEFAULT_MODEL_NAME_FOR_TEST,
-                tp_size=2,
-                pp_size=2,
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-                enable_pdmux=True,
-            ),
+            **_pp_engine_kwargs(enable_pdmux=True),
         )
 
     # [c-T1+T2 / b-34c02d6a67] pdmux + chunked — split-prefill filter must
@@ -299,13 +256,7 @@ class TestScriptedPP(CustomTestCase):
         """PP=2 + dynamic chunking — last_chunked_prefill_size set per iter by predictor."""
         execute_scripted_runtime(
             self._script_pp_dynamic_chunking_predictor,
-            **base_engine_kwargs(
-                model_path=DEFAULT_MODEL_NAME_FOR_TEST,
-                tp_size=2,
-                pp_size=2,
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-                enable_dynamic_chunking=True,
-            ),
+            **_pp_engine_kwargs(enable_dynamic_chunking=True),
         )
 
     # [c-T3 / S4 / S15] dynamic chunking under PP — predictor must populate
