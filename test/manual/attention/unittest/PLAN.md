@@ -143,6 +143,12 @@ Implemented:
   and inter-chunk grouping with distinct `query`, `query_succ`, and
   `query_inter` projection weights. Sparse-attention and critical-token
   references remain future work.
+- DSA has a first locally runnable Phase 2 fixture in
+  `common/attention_methods/dsa_attention.py`. It builds a DeepSeek-DSA-shaped
+  runner with real `DSATokenToKVPool`, exercises the `dsa` backend's
+  MHA_ONE_SHOT dense prefill fallback for no-prefix and prefix extend batches,
+  and compares against the independent dense PyTorch reference. Sparse/indexer
+  top-k prefill/decode remains future work.
 - FA3/FA4 CUDA-graph replay is intentionally not enabled yet. Dense eager and
   PCG/BCG split-op paths match the HF-style reference, but the shared decode
   CUDA-graph helper currently mismatches on replay for both FA backends. Local
@@ -231,14 +237,21 @@ Next implementation steps:
 - Expand Phase 2 to additional attention methods/backends with method-specific
   fixtures rather than forcing them through the dense harness. Priority candidates:
   hardware-gated MLA kernels (`cutlass_mla`, `trtllm_mla`/`tokenspeed_mla` where
-  hardware and KV dtype support them), dual-chunk sparse layouts, and
-  DSA/DSV4-style methods.
+  hardware and KV dtype support them), dual-chunk sparse layouts, DSA
+  sparse/indexer paths, and DSV4-style methods.
 - Keep `torch_native` SWA out of the matrix until the backend honors
   `RadixAttention.sliding_window_size`.
 - Defer Phase 2 expansion for additional backends until representative Phase 3 and
   Phase 4 tests are passing.
 
 Latest verification:
+- Added DSA MHA_ONE_SHOT dense prefill fallback Phase 2 coverage with a real
+  `DSATokenToKVPool` and independent dense PyTorch reference.
+- `python -m py_compile test/manual/attention/unittest/common/attention_methods/dsa_attention.py test/manual/attention/unittest/dsa/test_dsa.py`
+- `python test/manual/attention/unittest/dsa/test_dsa.py -v`
+  - Ran 1 test in 0.517s after adding DSA dense fallback coverage.
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+  - Ran 73 tests in 27.402s after adding DSA dense fallback coverage.
 - Added non-sparse cross-chunk `dual_chunk_flash_attn` Phase 2 coverage with
   distinct packed query streams for intra, successor, and inter chunk groups.
 - `python -m py_compile test/manual/attention/unittest/common/attention_methods/dual_chunk_attention.py test/manual/attention/unittest/dual_chunk/test_dual_chunk_flash_attn.py`
@@ -462,6 +475,7 @@ test/manual/attention/unittest/
   common/
     attention_methods/
       dense_attention.py
+      dsa_attention.py
       dual_chunk_attention.py
       gdn_attention.py
       mla_attention.py
@@ -480,6 +494,8 @@ test/manual/attention/unittest/
     test_flashinfer.py
   dual_chunk/
     test_dual_chunk_flash_attn.py
+  dsa/
+    test_dsa.py
   swa/
     test_triton.py
     test_flashinfer.py
