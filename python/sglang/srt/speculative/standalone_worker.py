@@ -159,8 +159,8 @@ class StandaloneWorker(EAGLEWorker):
                 f"same vocabulary as the target model, but got "
                 f"target vocab_size={target_vocab_size} and "
                 f"draft vocab_size={draft_vocab_size}. "
-                f"To use draft models with different vocabularies, use "
-                f"--speculative-algorithm TLI instead."
+                f"Use a draft model with a matching vocabulary, or a speculative "
+                f"algorithm that supports heterogeneous vocabularies."
             )
         if (
             target_tokenizer is not None
@@ -173,6 +173,6 @@ class StandaloneWorker(EAGLEWorker):
                 "STANDALONE speculative decoding requires the draft model to share the "
                 "same vocabulary as the target model, but the two tokenizers have "
                 "different token-to-id mappings even though their vocab sizes match. "
-                "To use draft models with different vocabularies, use "
-                "--speculative-algorithm TLI instead."
+                "Use a draft model with a matching vocabulary, or a speculative "
+                "algorithm that supports heterogeneous vocabularies."
             )

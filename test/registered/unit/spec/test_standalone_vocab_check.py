@@ -51,19 +51,16 @@ class TestStandaloneVocabCheck(CustomTestCase):
                 _tok(_VOCAB_DIFFERENT_SIZE),
             )
         self.assertIn("vocab_size", str(ctx.exception))
-        self.assertIn("TLI", str(ctx.exception))
 
     def test_same_size_different_mapping_raises(self):
         """Same vocab_size but different token strings must raise ValueError."""
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertRaises(ValueError):
             _validate(
                 len(_VOCAB),
                 len(_VOCAB_DIFFERENT_MAPPING),
                 _tok(_VOCAB),
                 _tok(_VOCAB_DIFFERENT_MAPPING),
             )
-        # vocab sizes happen to match here, so we hit the mapping check
-        self.assertIn("TLI", str(ctx.exception))
 
     def test_tokenizer_without_get_vocab_skips_mapping_check(self):
         """Tokenizer types that lack get_vocab() (e.g. TiktokenTokenizer) must not raise."""
@@ -94,21 +91,6 @@ class TestStandaloneVocabCheck(CustomTestCase):
         msg = str(ctx.exception)
         self.assertIn("1000", msg)
         self.assertIn("2000", msg)
-
-    def test_error_message_suggests_tli_for_size_mismatch(self):
-        """Both size-mismatch and mapping-mismatch errors suggest TLI."""
-        with self.assertRaises(ValueError) as ctx:
-            _validate(1000, 2000, None, None)
-        self.assertIn("TLI", str(ctx.exception))
-
-        with self.assertRaises(ValueError) as ctx:
-            _validate(
-                len(_VOCAB),
-                len(_VOCAB_DIFFERENT_MAPPING),
-                _tok(_VOCAB),
-                _tok(_VOCAB_DIFFERENT_MAPPING),
-            )
-        self.assertIn("TLI", str(ctx.exception))
 
 
 if __name__ == "__main__":
