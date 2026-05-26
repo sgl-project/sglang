@@ -21,6 +21,11 @@ import torch
 from sglang.srt.utils.custom_op import register_custom_op
 
 
+class DualGemmPerTensorQuantHopper:
+    def __init__(self):
+        pass
+
+
 def _cutedsl_dual_gemm_fake(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -56,8 +61,6 @@ def cutedsl_dual_gemm(
         w_scale: Weight scale tensor, required for FP8. Supports:
             numel()==1 : single per-tensor scale for both gate & up
             numel()==2 : fused per-tensor from MergedColumnParallelLinear
-                         (w_scale[0] for gate, w_scale[1] for up)
-            numel()>2  : per-channel (2*N,) — gate at index 0, up at index N
         o_scale: Per-tensor output scale (scalar float32), required for FP8
     """
     N = w.shape[1] // 2
