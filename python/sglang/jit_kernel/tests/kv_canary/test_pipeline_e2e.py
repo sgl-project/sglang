@@ -298,37 +298,57 @@ def _run_both_and_assert_pipeline_equal(
     )
 
 
-def test_pipeline_basic_5_step_single_req() -> None:
-    """Single req, prefix_len=0, extend_seq_len=5: basic plan→write→verify byte-equal."""
-    max_seq_len = 16
-    req_to_token = make_req_to_token(
-        kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE
-    )
-    req_pool_indices = torch.tensor([1], dtype=torch.int64, device=_DEVICE)
-    prefix_lens = torch.tensor([0], dtype=torch.int64, device=_DEVICE)
-    extend_seq_lens = torch.tensor([5], dtype=torch.int64, device=_DEVICE)
-    input_ids = torch.tensor([10, 20, 30, 40, 50], dtype=torch.int64, device=_DEVICE)
-    positions = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int64, device=_DEVICE)
-    out_cache_loc = torch.tensor(
-        [
-            1 * max_seq_len + 0,
-            1 * max_seq_len + 1,
-            1 * max_seq_len + 2,
-            1 * max_seq_len + 3,
-            1 * max_seq_len + 4,
-        ],
-        dtype=torch.int64,
-        device=_DEVICE,
+def _t(values: list[int]) -> torch.Tensor:
+    return torch.tensor(values, dtype=torch.int64, device=_DEVICE)
+
+
+def _linear_r2t(*, max_reqs: int = 4, max_seq_len: int = 16) -> torch.Tensor:
+    return make_req_to_token(
+        kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE
     )
 
+
+def _zero_no_write_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(input_ids, positions, out_cache_loc)`` zero placeholders for extend_seq_lens=0 tests."""
+    zeros = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
+    return zeros.clone(), zeros.clone(), zeros.clone()
+
+
+def _contiguous_out_cache_loc(
+    *, req_pool_idx: int, start: int, count: int, max_seq_len: int = 16
+) -> torch.Tensor:
+    return _t([req_pool_idx * max_seq_len + start + i for i in range(count)])
+
+
+def _stamp_linear_prefix(
+    *,
+    initial_buf: torch.Tensor,
+    initial_ref: torch.Tensor,
+    req_pool_idx: int,
+    prefix_len: int,
+    tokens: list[int],
+    max_seq_len: int = 16,
+) -> None:
+    """Stamp clean chain for slots ``[rp*max_seq_len + 0 .. + prefix_len)`` at positions ``0..prefix_len``."""
+    stamp_clean_chain(
+        cuda_buf=initial_buf,
+        ref_buf=initial_ref,
+        slot_indices=[req_pool_idx * max_seq_len + pos for pos in range(prefix_len)],
+        tokens=tokens,
+        positions=list(range(prefix_len)),
+    )
+
+
+def test_pipeline_basic_5_step_single_req() -> None:
+    """Single req, prefix_len=0, extend_seq_len=5: basic plan→write→verify byte-equal."""
     _run_both_and_assert_pipeline_equal(
-        req_pool_indices=req_pool_indices,
-        prefix_lens=prefix_lens,
-        extend_seq_lens=extend_seq_lens,
-        input_ids=input_ids,
-        positions=positions,
-        out_cache_loc=out_cache_loc,
-        req_to_token=req_to_token,
+        req_pool_indices=_t([1]),
+        prefix_lens=_t([0]),
+        extend_seq_lens=_t([5]),
+        input_ids=_t([10, 20, 30, 40, 50]),
+        positions=_t([0, 1, 2, 3, 4]),
+        out_cache_loc=_contiguous_out_cache_loc(req_pool_idx=1, start=0, count=5),
+        req_to_token=_linear_r2t(),
         num_slots=64,
         extras=empty_extras(),
         swa_window_size=0,
@@ -339,34 +359,22 @@ def test_pipeline_basic_5_step_single_req() -> None:
 def test_pipeline_multi_req_mixed_extend_decode() -> None:
     """bs=3: pure extend req, decode req (prefix+1 extend), and padding sentinel row."""
     max_seq_len = 16
-    req_to_token = make_req_to_token(
-        kind="linear", max_reqs=8, max_seq_len=max_seq_len, device=_DEVICE
-    )
-    req_pool_indices = torch.tensor([1, 2, 0], dtype=torch.int64, device=_DEVICE)
-    prefix_lens = torch.tensor([0, 5, 0], dtype=torch.int64, device=_DEVICE)
-    extend_seq_lens = torch.tensor([4, 1, 0], dtype=torch.int64, device=_DEVICE)
-    input_ids = torch.tensor([11, 12, 13, 14, 21], dtype=torch.int64, device=_DEVICE)
-    positions = torch.tensor([0, 1, 2, 3, 5], dtype=torch.int64, device=_DEVICE)
-    out_cache_loc = torch.tensor(
-        [
-            1 * max_seq_len + 0,
-            1 * max_seq_len + 1,
-            1 * max_seq_len + 2,
-            1 * max_seq_len + 3,
-            2 * max_seq_len + 5,
-        ],
-        dtype=torch.int64,
-        device=_DEVICE,
-    )
-
     _run_both_and_assert_pipeline_equal(
-        req_pool_indices=req_pool_indices,
-        prefix_lens=prefix_lens,
-        extend_seq_lens=extend_seq_lens,
-        input_ids=input_ids,
-        positions=positions,
-        out_cache_loc=out_cache_loc,
-        req_to_token=req_to_token,
+        req_pool_indices=_t([1, 2, 0]),
+        prefix_lens=_t([0, 5, 0]),
+        extend_seq_lens=_t([4, 1, 0]),
+        input_ids=_t([11, 12, 13, 14, 21]),
+        positions=_t([0, 1, 2, 3, 5]),
+        out_cache_loc=_t(
+            [
+                1 * max_seq_len + 0,
+                1 * max_seq_len + 1,
+                1 * max_seq_len + 2,
+                1 * max_seq_len + 3,
+                2 * max_seq_len + 5,
+            ]
+        ),
+        req_to_token=_linear_r2t(max_reqs=8, max_seq_len=max_seq_len),
         num_slots=128,
         extras=empty_extras(),
         swa_window_size=0,
@@ -378,83 +386,55 @@ def test_pipeline_multi_req_mixed_extend_decode() -> None:
 def test_pipeline_swa_window() -> None:
     """SWA window=4, prefix_len=6: verify covers window [2,6), write covers extend tokens."""
     max_seq_len = 16
-    num_slots_full = 64
     max_reqs = 4
-    req_to_token = make_req_to_token(
-        kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE
-    )
-
-    swa_window_size = 4
-    full_pool_size = max_reqs * max_seq_len
-
     full_to_swa_index_mapping = torch.arange(
-        full_pool_size + 1, dtype=torch.int64, device=_DEVICE
-    )
-
-    req_pool_indices = torch.tensor([1], dtype=torch.int64, device=_DEVICE)
-    prefix_lens = torch.tensor([6], dtype=torch.int64, device=_DEVICE)
-    extend_seq_lens = torch.tensor([2], dtype=torch.int64, device=_DEVICE)
-    input_ids = torch.tensor([100, 101], dtype=torch.int64, device=_DEVICE)
-    positions = torch.tensor([6, 7], dtype=torch.int64, device=_DEVICE)
-    out_cache_loc = torch.tensor(
-        [
-            full_to_swa_index_mapping[1 * max_seq_len + 6].item(),
-            full_to_swa_index_mapping[1 * max_seq_len + 7].item(),
-        ],
-        dtype=torch.int64,
-        device=_DEVICE,
+        max_reqs * max_seq_len + 1, dtype=torch.int64, device=_DEVICE
     )
 
     _run_both_and_assert_pipeline_equal(
-        req_pool_indices=req_pool_indices,
-        prefix_lens=prefix_lens,
-        extend_seq_lens=extend_seq_lens,
-        input_ids=input_ids,
-        positions=positions,
-        out_cache_loc=out_cache_loc,
-        req_to_token=req_to_token,
-        num_slots=num_slots_full,
+        req_pool_indices=_t([1]),
+        prefix_lens=_t([6]),
+        extend_seq_lens=_t([2]),
+        input_ids=_t([100, 101]),
+        positions=_t([6, 7]),
+        out_cache_loc=_t(
+            [
+                full_to_swa_index_mapping[1 * max_seq_len + 6].item(),
+                full_to_swa_index_mapping[1 * max_seq_len + 7].item(),
+            ]
+        ),
+        req_to_token=_linear_r2t(max_reqs=max_reqs, max_seq_len=max_seq_len),
+        num_slots=64,
         extras=empty_extras(),
-        swa_window_size=swa_window_size,
+        swa_window_size=4,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
     )
 
 
 def test_pipeline_sweep_no_write() -> None:
     """All extend_seq_lens=0: write_step is no-op, verify sweeps prefix, buf unchanged."""
-    max_seq_len = 16
     prefix_len = 4
-    req_to_token = make_req_to_token(
-        kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE
-    )
-
-    req_pool_indices = torch.tensor([1], dtype=torch.int64, device=_DEVICE)
-    prefix_lens = torch.tensor([prefix_len], dtype=torch.int64, device=_DEVICE)
-    extend_seq_lens = torch.tensor([0], dtype=torch.int64, device=_DEVICE)
-    input_ids = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
-    positions = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
-    out_cache_loc = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
+    input_ids, positions, out_cache_loc = _zero_no_write_inputs()
 
     initial_buf = make_canary_buf(num_slots=64, device=_DEVICE)
     initial_ref = initial_buf.clone()
-    prefix_slots = [1 * max_seq_len + pos for pos in range(prefix_len)]
-    stamp_clean_chain(
-        cuda_buf=initial_buf,
-        ref_buf=initial_ref,
-        slot_indices=prefix_slots,
+    _stamp_linear_prefix(
+        initial_buf=initial_buf,
+        initial_ref=initial_ref,
+        req_pool_idx=1,
+        prefix_len=prefix_len,
         tokens=[100 + pos for pos in range(prefix_len)],
-        positions=list(range(prefix_len)),
     )
 
     buf_real, buf_ref, log_real, log_ref, plan_v_real, plan_w_real, _, _ = (
         _run_both_and_assert_pipeline_equal(
-            req_pool_indices=req_pool_indices,
-            prefix_lens=prefix_lens,
-            extend_seq_lens=extend_seq_lens,
+            req_pool_indices=_t([1]),
+            prefix_lens=_t([prefix_len]),
+            extend_seq_lens=_t([0]),
             input_ids=input_ids,
             positions=positions,
             out_cache_loc=out_cache_loc,
-            req_to_token=req_to_token,
+            req_to_token=_linear_r2t(),
             num_slots=64,
             extras=empty_extras(),
             swa_window_size=0,
@@ -484,32 +464,17 @@ def test_pipeline_sweep_no_write() -> None:
 )
 def test_pipeline_real_kv_mode(real_kv_hash_mode: consts.RealKvHashMode) -> None:
     """real_kv_hash_mode OFF/PARTIAL/ALL: real and ref use cloned sources to prevent ALL-mode hash aliasing."""
-    max_seq_len = 16
-    req_to_token = make_req_to_token(
-        kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE
-    )
-    req_pool_indices = torch.tensor([1], dtype=torch.int64, device=_DEVICE)
-    prefix_lens = torch.tensor([0], dtype=torch.int64, device=_DEVICE)
-    extend_seq_lens = torch.tensor([3], dtype=torch.int64, device=_DEVICE)
-    input_ids = torch.tensor([5, 6, 7], dtype=torch.int64, device=_DEVICE)
-    positions = torch.tensor([0, 1, 2], dtype=torch.int64, device=_DEVICE)
-    out_cache_loc = torch.tensor(
-        [1 * max_seq_len + 0, 1 * max_seq_len + 1, 1 * max_seq_len + 2],
-        dtype=torch.int64,
-        device=_DEVICE,
-    )
-
     sources_real = make_real_kv_sources(count=2, num_slots=64, device=_DEVICE)
     sources_ref = clone_real_kv_sources(sources_real)
 
     _run_both_and_assert_pipeline_equal(
-        req_pool_indices=req_pool_indices,
-        prefix_lens=prefix_lens,
-        extend_seq_lens=extend_seq_lens,
-        input_ids=input_ids,
-        positions=positions,
-        out_cache_loc=out_cache_loc,
-        req_to_token=req_to_token,
+        req_pool_indices=_t([1]),
+        prefix_lens=_t([0]),
+        extend_seq_lens=_t([3]),
+        input_ids=_t([5, 6, 7]),
+        positions=_t([0, 1, 2]),
+        out_cache_loc=_contiguous_out_cache_loc(req_pool_idx=1, start=0, count=3),
+        req_to_token=_linear_r2t(),
         num_slots=64,
         extras=empty_extras(),
         real_kv_sources_real=sources_real,
@@ -520,41 +485,22 @@ def test_pipeline_real_kv_mode(real_kv_hash_mode: consts.RealKvHashMode) -> None
 
 def test_pipeline_pseudo_mode_on_match() -> None:
     """enable_write_verify_inputs=ON, expected==actual: zero violations, buf byte-equal."""
-    max_seq_len = 16
-    req_to_token = make_req_to_token(
-        kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE
-    )
-    req_pool_indices = torch.tensor([1], dtype=torch.int64, device=_DEVICE)
-    prefix_lens = torch.tensor([0], dtype=torch.int64, device=_DEVICE)
-    extend_seq_lens = torch.tensor([4], dtype=torch.int64, device=_DEVICE)
-    input_ids = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device=_DEVICE)
-    positions = torch.tensor([0, 1, 2, 3], dtype=torch.int64, device=_DEVICE)
-    out_cache_loc = torch.tensor(
-        [
-            1 * max_seq_len + 0,
-            1 * max_seq_len + 1,
-            1 * max_seq_len + 2,
-            1 * max_seq_len + 3,
-        ],
-        dtype=torch.int64,
-        device=_DEVICE,
-    )
-    expected_input_tokens = input_ids.clone()
-    expected_input_positions = positions.clone()
+    input_ids = _t([1, 2, 3, 4])
+    positions = _t([0, 1, 2, 3])
 
     _, _, log_real, log_ref, _, _, _, _ = _run_both_and_assert_pipeline_equal(
-        req_pool_indices=req_pool_indices,
-        prefix_lens=prefix_lens,
-        extend_seq_lens=extend_seq_lens,
+        req_pool_indices=_t([1]),
+        prefix_lens=_t([0]),
+        extend_seq_lens=_t([4]),
         input_ids=input_ids,
         positions=positions,
-        out_cache_loc=out_cache_loc,
-        req_to_token=req_to_token,
+        out_cache_loc=_contiguous_out_cache_loc(req_pool_idx=1, start=0, count=4),
+        req_to_token=_linear_r2t(),
         num_slots=64,
         extras=empty_extras(),
         enable_write_verify_inputs=True,
-        expected_input_tokens=expected_input_tokens,
-        expected_input_positions=expected_input_positions,
+        expected_input_tokens=input_ids.clone(),
+        expected_input_positions=positions.clone(),
     )
 
     assert int(log_real.write_index[0].item()) == 0
@@ -563,39 +509,22 @@ def test_pipeline_pseudo_mode_on_match() -> None:
 
 def test_pipeline_pseudo_mode_on_token_mismatch_then_verify_clean() -> None:
     """enable_write_verify_inputs=ON, expected tokens all wrong: write records N violations."""
-    max_seq_len = 16
-    req_to_token = make_req_to_token(
-        kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE
-    )
-    req_pool_indices = torch.tensor([1], dtype=torch.int64, device=_DEVICE)
-    prefix_lens = torch.tensor([0], dtype=torch.int64, device=_DEVICE)
-    extend_seq_lens = torch.tensor([3], dtype=torch.int64, device=_DEVICE)
     n_tokens = 3
-    input_ids = torch.tensor([10, 20, 30], dtype=torch.int64, device=_DEVICE)
-    positions = torch.tensor([0, 1, 2], dtype=torch.int64, device=_DEVICE)
-    out_cache_loc = torch.tensor(
-        [1 * max_seq_len + 0, 1 * max_seq_len + 1, 1 * max_seq_len + 2],
-        dtype=torch.int64,
-        device=_DEVICE,
-    )
-    expected_input_tokens = torch.tensor(
-        [99, 99, 99], dtype=torch.int64, device=_DEVICE
-    )
-    expected_input_positions = positions.clone()
+    positions = _t([0, 1, 2])
 
     _, _, log_real, log_ref, _, _, _, _ = _run_both_and_assert_pipeline_equal(
-        req_pool_indices=req_pool_indices,
-        prefix_lens=prefix_lens,
-        extend_seq_lens=extend_seq_lens,
-        input_ids=input_ids,
+        req_pool_indices=_t([1]),
+        prefix_lens=_t([0]),
+        extend_seq_lens=_t([3]),
+        input_ids=_t([10, 20, 30]),
         positions=positions,
-        out_cache_loc=out_cache_loc,
-        req_to_token=req_to_token,
+        out_cache_loc=_contiguous_out_cache_loc(req_pool_idx=1, start=0, count=3),
+        req_to_token=_linear_r2t(),
         num_slots=64,
         extras=empty_extras(),
         enable_write_verify_inputs=True,
-        expected_input_tokens=expected_input_tokens,
-        expected_input_positions=expected_input_positions,
+        expected_input_tokens=_t([99, 99, 99]),
+        expected_input_positions=positions.clone(),
         ring_capacity=64,
     )
 
@@ -607,25 +536,16 @@ def test_pipeline_pseudo_mode_on_token_mismatch_then_verify_clean() -> None:
 
 def test_pipeline_empty_batch() -> None:
     """bs=1 with req_pool_idx=0 (padding): write and verify are no-op, kernel_run_counter == 2 (write+verify)."""
-    max_seq_len = 16
-    req_to_token = make_req_to_token(
-        kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE
-    )
-    req_pool_indices = torch.tensor([0], dtype=torch.int64, device=_DEVICE)
-    prefix_lens = torch.tensor([0], dtype=torch.int64, device=_DEVICE)
-    extend_seq_lens = torch.tensor([0], dtype=torch.int64, device=_DEVICE)
-    input_ids = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
-    positions = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
-    out_cache_loc = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
+    input_ids, positions, out_cache_loc = _zero_no_write_inputs()
 
     _, _, log_real, log_ref, _, _, _, _ = _run_both_and_assert_pipeline_equal(
-        req_pool_indices=req_pool_indices,
-        prefix_lens=prefix_lens,
-        extend_seq_lens=extend_seq_lens,
+        req_pool_indices=_t([0]),
+        prefix_lens=_t([0]),
+        extend_seq_lens=_t([0]),
         input_ids=input_ids,
         positions=positions,
         out_cache_loc=out_cache_loc,
-        req_to_token=req_to_token,
+        req_to_token=_linear_r2t(),
         num_slots=64,
         extras=empty_extras(),
     )
@@ -639,40 +559,24 @@ def test_pipeline_negative_slot_swa_out_of_window() -> None:
     """SWA: some out_cache_loc entries map to -1 (out-of-window); write_step skips them, buf unchanged."""
     max_seq_len = 16
     max_reqs = 4
-    full_pool_size = max_reqs * max_seq_len
-    req_to_token = make_req_to_token(
-        kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE
-    )
-    swa_window_size = 4
 
     full_to_swa_index_mapping = torch.arange(
-        full_pool_size + 1, dtype=torch.int64, device=_DEVICE
+        max_reqs * max_seq_len + 1, dtype=torch.int64, device=_DEVICE
     )
     full_to_swa_index_mapping[1 * max_seq_len + 6] = -1
     full_to_swa_index_mapping[1 * max_seq_len + 7] = -1
 
-    req_pool_indices = torch.tensor([1], dtype=torch.int64, device=_DEVICE)
-    prefix_lens = torch.tensor([6], dtype=torch.int64, device=_DEVICE)
-    extend_seq_lens = torch.tensor([4], dtype=torch.int64, device=_DEVICE)
-    input_ids = torch.tensor([100, 101, 102, 103], dtype=torch.int64, device=_DEVICE)
-    positions = torch.tensor([6, 7, 8, 9], dtype=torch.int64, device=_DEVICE)
-    out_cache_loc = torch.tensor(
-        [-1, -1, 1 * max_seq_len + 8, 1 * max_seq_len + 9],
-        dtype=torch.int64,
-        device=_DEVICE,
-    )
-
     _run_both_and_assert_pipeline_equal(
-        req_pool_indices=req_pool_indices,
-        prefix_lens=prefix_lens,
-        extend_seq_lens=extend_seq_lens,
-        input_ids=input_ids,
-        positions=positions,
-        out_cache_loc=out_cache_loc,
-        req_to_token=req_to_token,
+        req_pool_indices=_t([1]),
+        prefix_lens=_t([6]),
+        extend_seq_lens=_t([4]),
+        input_ids=_t([100, 101, 102, 103]),
+        positions=_t([6, 7, 8, 9]),
+        out_cache_loc=_t([-1, -1, 1 * max_seq_len + 8, 1 * max_seq_len + 9]),
+        req_to_token=_linear_r2t(max_reqs=max_reqs, max_seq_len=max_seq_len),
         num_slots=128,
         extras=empty_extras(),
-        swa_window_size=swa_window_size,
+        swa_window_size=4,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
     )
 
@@ -681,17 +585,13 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
     """Verify detects >capacity violations when prev_hash is pre-corrupted; write_index byte-equal, ring relaxed."""
     max_seq_len = 16
     max_reqs = 4
-    req_to_token = make_req_to_token(
-        kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE
-    )
+    req_to_token = _linear_r2t(max_reqs=max_reqs, max_seq_len=max_seq_len)
     n_slots = 8
 
-    req_pool_indices = torch.tensor([1], dtype=torch.int64, device=_DEVICE)
-    prefix_lens = torch.tensor([n_slots], dtype=torch.int64, device=_DEVICE)
-    extend_seq_lens = torch.tensor([0], dtype=torch.int64, device=_DEVICE)
-    input_ids = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
-    positions = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
-    out_cache_loc = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
+    req_pool_indices = _t([1])
+    prefix_lens = _t([n_slots])
+    extend_seq_lens = _t([0])
+    input_ids, positions, out_cache_loc = _zero_no_write_inputs()
 
     num_slots = max_reqs * max_seq_len
 
@@ -792,15 +692,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
 def test_pipeline_kernel_kind_propagates(kernel_kind: CanaryLaunchTag) -> None:
     """Different CanaryLaunchTag values: violation ring's kernel_kind field matches on both sides."""
     max_seq_len = 16
-    req_to_token = make_req_to_token(
-        kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE
-    )
-    req_pool_indices = torch.tensor([1], dtype=torch.int64, device=_DEVICE)
-    prefix_lens = torch.tensor([1], dtype=torch.int64, device=_DEVICE)
-    extend_seq_lens = torch.tensor([0], dtype=torch.int64, device=_DEVICE)
-    input_ids = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
-    positions = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
-    out_cache_loc = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
+    input_ids, positions, out_cache_loc = _zero_no_write_inputs()
 
     initial_buf = make_canary_buf(num_slots=64, device=_DEVICE)
     write_slot_fields(
@@ -813,13 +705,13 @@ def test_pipeline_kernel_kind_propagates(kernel_kind: CanaryLaunchTag) -> None:
     )
 
     _, _, log_real, log_ref, _, _, _, _ = _run_both_and_assert_pipeline_equal(
-        req_pool_indices=req_pool_indices,
-        prefix_lens=prefix_lens,
-        extend_seq_lens=extend_seq_lens,
+        req_pool_indices=_t([1]),
+        prefix_lens=_t([1]),
+        extend_seq_lens=_t([0]),
         input_ids=input_ids,
         positions=positions,
         out_cache_loc=out_cache_loc,
-        req_to_token=req_to_token,
+        req_to_token=_linear_r2t(max_seq_len=max_seq_len),
         num_slots=64,
         extras=empty_extras(),
         kernel_kind=kernel_kind,
@@ -841,16 +733,7 @@ def test_pipeline_token_mismatch_detected_via_pool() -> None:
     max_seq_len = 16
     max_reqs = 4
     prefix_len = 4
-    req_to_token = make_req_to_token(
-        kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE
-    )
-
-    req_pool_indices = torch.tensor([1], dtype=torch.int64, device=_DEVICE)
-    prefix_lens = torch.tensor([prefix_len], dtype=torch.int64, device=_DEVICE)
-    extend_seq_lens = torch.tensor([0], dtype=torch.int64, device=_DEVICE)
-    input_ids = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
-    positions = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
-    out_cache_loc = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
+    input_ids, positions, out_cache_loc = _zero_no_write_inputs()
 
     expected_tokens = [1000 + pos for pos in range(prefix_len)]
     pool = torch.full((max_reqs, max_seq_len), -999, dtype=torch.int32, device=_DEVICE)
@@ -861,23 +744,23 @@ def test_pipeline_token_mismatch_detected_via_pool() -> None:
 
     initial_buf = make_canary_buf(num_slots=64, device=_DEVICE)
     initial_ref = initial_buf.clone()
-    prefix_slots = [1 * max_seq_len + pos for pos in range(prefix_len)]
-    stamp_clean_chain(
-        cuda_buf=initial_buf,
-        ref_buf=initial_ref,
-        slot_indices=prefix_slots,
+    _stamp_linear_prefix(
+        initial_buf=initial_buf,
+        initial_ref=initial_ref,
+        req_pool_idx=1,
+        prefix_len=prefix_len,
         tokens=stored_tokens,
-        positions=list(range(prefix_len)),
+        max_seq_len=max_seq_len,
     )
 
     _, _, log_real, log_ref, _, _, _, _ = _run_both_and_assert_pipeline_equal(
-        req_pool_indices=req_pool_indices,
-        prefix_lens=prefix_lens,
-        extend_seq_lens=extend_seq_lens,
+        req_pool_indices=_t([1]),
+        prefix_lens=_t([prefix_len]),
+        extend_seq_lens=_t([0]),
         input_ids=input_ids,
         positions=positions,
         out_cache_loc=out_cache_loc,
-        req_to_token=req_to_token,
+        req_to_token=_linear_r2t(max_reqs=max_reqs, max_seq_len=max_seq_len),
         num_slots=64,
         extras=empty_extras(),
         swa_window_size=0,
@@ -913,16 +796,7 @@ def test_pipeline_eagle_offset_plus_1_byte_equal() -> None:
     max_seq_len = 16
     max_reqs = 4
     prefix_len = 4
-    req_to_token = make_req_to_token(
-        kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE
-    )
-
-    req_pool_indices = torch.tensor([1], dtype=torch.int64, device=_DEVICE)
-    prefix_lens = torch.tensor([prefix_len], dtype=torch.int64, device=_DEVICE)
-    extend_seq_lens = torch.tensor([0], dtype=torch.int64, device=_DEVICE)
-    input_ids = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
-    positions = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
-    out_cache_loc = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
+    input_ids, positions, out_cache_loc = _zero_no_write_inputs()
 
     stored_tokens = [2000 + pos for pos in range(prefix_len)]
     pool = torch.full((max_reqs, max_seq_len), -999, dtype=torch.int32, device=_DEVICE)
@@ -932,23 +806,23 @@ def test_pipeline_eagle_offset_plus_1_byte_equal() -> None:
 
     initial_buf = make_canary_buf(num_slots=64, device=_DEVICE)
     initial_ref = initial_buf.clone()
-    prefix_slots = [1 * max_seq_len + pos for pos in range(prefix_len)]
-    stamp_clean_chain(
-        cuda_buf=initial_buf,
-        ref_buf=initial_ref,
-        slot_indices=prefix_slots,
+    _stamp_linear_prefix(
+        initial_buf=initial_buf,
+        initial_ref=initial_ref,
+        req_pool_idx=1,
+        prefix_len=prefix_len,
         tokens=stored_tokens,
-        positions=list(range(prefix_len)),
+        max_seq_len=max_seq_len,
     )
 
     _, _, log_real, log_ref, _, _, _, _ = _run_both_and_assert_pipeline_equal(
-        req_pool_indices=req_pool_indices,
-        prefix_lens=prefix_lens,
-        extend_seq_lens=extend_seq_lens,
+        req_pool_indices=_t([1]),
+        prefix_lens=_t([prefix_len]),
+        extend_seq_lens=_t([0]),
         input_ids=input_ids,
         positions=positions,
         out_cache_loc=out_cache_loc,
-        req_to_token=req_to_token,
+        req_to_token=_linear_r2t(max_reqs=max_reqs, max_seq_len=max_seq_len),
         num_slots=64,
         extras=empty_extras(),
         swa_window_size=0,
