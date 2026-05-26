@@ -18,6 +18,9 @@ from common.attention_methods.dense_attention import (
 from common.runner_modes.cuda_graph_decode_runner import (
     run_dense_cuda_graph_decode_case,
 )
+from common.runner_modes.eagle_draft_runner import (
+    run_dense_eagle_draft_cuda_graph_runner_case,
+)
 from common.runner_modes.speculative_draft_extend_runner import (
     run_dense_draft_extend_cuda_graph_case,
     run_dense_eagle_draft_extend_case,
@@ -268,6 +271,34 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
             "frozen_kv_mtp",
         ),
     )
+    EAGLE_DRAFT_RUNNER_CASES = (
+        (
+            DenseAttentionCase(
+                name="runner_eagle_draft_decode_cuda_graph_chain",
+                backend="flashinfer",
+                forward_mode=ForwardMode.DECODE,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+            ),
+            1,
+            3,
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_eagle_draft_decode_cuda_graph_tree",
+                backend="flashinfer",
+                forward_mode=ForwardMode.DECODE,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=1,
+                prefix_lens=(4, 7),
+            ),
+            2,
+            4,
+        ),
+    )
 
     def test_projected_dense_attention_cases(self):
         for case in self.CASES:
@@ -369,6 +400,18 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
                     head_dim=self.HEAD_DIM,
                     hidden_size=self.HIDDEN_SIZE,
                     spec_kind=spec_kind,
+                )
+
+    def test_runner_mode_eagle_draft_cuda_graph_runner_cases(self):
+        for case, topk, num_draft_tokens in self.EAGLE_DRAFT_RUNNER_CASES:
+            with self.subTest(case=case.name, backend=case.backend, topk=topk):
+                run_dense_eagle_draft_cuda_graph_runner_case(
+                    self,
+                    case,
+                    topk=topk,
+                    speculative_num_draft_tokens=num_draft_tokens,
+                    head_dim=self.HEAD_DIM,
+                    hidden_size=self.HIDDEN_SIZE,
                 )
 
 

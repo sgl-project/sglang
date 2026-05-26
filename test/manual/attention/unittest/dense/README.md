@@ -9,8 +9,8 @@ copied random projection weights, not from another SGLang attention backend.
 | Backend | Phase 2: method correctness | Phase 3: runner compatibility | Phase 4: speculative modes | Status |
 |---|---|---|---|---|
 | `torch_native` | Full dense input-shape sweep plus MHA/GQA/MQA configs | Eager decode/extend runner checks | Not enabled | `TARGET_VERIFY` probe currently fails in torch-native SDPA extend metadata handling. |
-| `triton` | Full dense input-shape sweep plus MHA/GQA/MQA configs | CUDA graph decode for MHA/GQA/MQA; PCG/BCG extend for MHA/GQA | EAGLE/Frozen-KV-MTP/DFlash/NGRAM verify; verify CUDA graph for EAGLE/DFlash/NGRAM; EAGLE `DRAFT_EXTEND_V2` CUDA graph | `DRAFT_EXTEND` is intentionally blocked by a reference mismatch. |
-| `flashinfer` | Full dense sweep with `head_dim=64` for SM90 prefill constraints | CUDA graph decode for MHA/GQA/MQA; PCG/BCG extend for MHA/GQA | EAGLE/Frozen-KV-MTP/DFlash/NGRAM verify; verify CUDA graph for EAGLE/Frozen-KV-MTP/DFlash; EAGLE/Frozen-KV-MTP `DRAFT_EXTEND` eager and CUDA graph | `DRAFT_EXTEND_V2` is not enabled yet. |
+| `triton` | Full dense input-shape sweep plus MHA/GQA/MQA configs | CUDA graph decode for MHA/GQA/MQA; PCG/BCG extend for MHA/GQA | EAGLE/Frozen-KV-MTP/DFlash/NGRAM verify; verify CUDA graph for EAGLE/DFlash/NGRAM; production `EAGLEDraftCudaGraphRunner` chain/tree replay; EAGLE `DRAFT_EXTEND_V2` CUDA graph | `DRAFT_EXTEND` is intentionally blocked by a reference mismatch. |
+| `flashinfer` | Full dense sweep with `head_dim=64` for SM90 prefill constraints | CUDA graph decode for MHA/GQA/MQA; PCG/BCG extend for MHA/GQA | EAGLE/Frozen-KV-MTP/DFlash/NGRAM verify; verify CUDA graph for EAGLE/Frozen-KV-MTP/DFlash; production `EAGLEDraftCudaGraphRunner` chain/tree replay; EAGLE/Frozen-KV-MTP `DRAFT_EXTEND` eager and CUDA graph | `DRAFT_EXTEND_V2` is not enabled yet. |
 | `fa3` | Full dense input-shape sweep plus MHA/GQA/MQA configs | PCG/BCG extend | Not enabled | Decode/speculative CUDA graph replay currently mismatches the PyTorch reference. |
 | `fa4` | Full dense input-shape sweep plus MHA/GQA/MQA configs | PCG/BCG extend | Not enabled | Same current graph blocker as `fa3`. |
 | `flex_attention` | Full dense input-shape sweep plus MHA/GQA/MQA configs | PCG/BCG extend | Not enabled | Backend mask callback compatibility is covered; graph/spec coverage is still open. |
@@ -27,5 +27,7 @@ copied random projection weights, not from another SGLang attention backend.
 ## Next Work
 
 - Debug Triton `DRAFT_EXTEND` metadata/reference mismatch.
+- Extend production draft-runner integration to MLA and other draft runners once
+  method-specific fixtures expose realistic draft-model forward contracts.
 - Debug FA3/FA4 CUDA graph replay and speculative graph mismatches.
 - Add backend-specific graph coverage for `trtllm_mha` once local hardware and metadata behavior allow it.
