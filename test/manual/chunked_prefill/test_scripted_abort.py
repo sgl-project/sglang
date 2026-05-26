@@ -606,6 +606,84 @@ class TestScriptedAbort(CustomTestCase):
         assert t.chunked_in_flight_count() == 0
         assert t.is_idle, "engine must be idle after the only chunked req is aborted"
 
+    def test_chunked_req_then_abort_then_new_short_in_one_yield(self):
+        """Mid-chunk R1: abort R1 and start a short R2 in the same yield; R2 admits fresh and chunked slot is no longer R1."""
+        execute_scripted_runtime(
+            self._script_chunked_req_then_abort_then_new_short_in_one_yield,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-NEW] same-yield abort + new-req combo. While R1 is mid-chunk,
+    # abort R1 and submit a fresh short R2 in the same yield step. R2
+    # must admit cleanly, and the scheduler's chunked_req slot must no
+    # longer reference R1 (either None or R2's rid if R2 also chunked,
+    # though R2 is short so should be None).
+    @staticmethod
+    def _script_chunked_req_then_abort_then_new_short_in_one_yield(t: ScriptedRuntime):
+        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r1, lambda h: h.is_chunking)
+        assert t.get_chunked_req_rid() == r1.rid, (
+            f"r1 should hold the chunked slot before abort; got "
+            f"{t.get_chunked_req_rid()!r}"
+        )
+
+        t.abort(r1)
+        r2 = t.start_req(prompt_len=16, max_new_tokens=2)
+        yield
+
+        # After the same-yield combo, r1 must be torn down and the
+        # chunked slot must not still reference r1.
+        # NEW API NEEDED: t.get_chunked_req_rid() — current scheduler
+        # chunked_req rid or None.
+        cur = t.get_chunked_req_rid()
+        assert cur != r1.rid, (
+            f"chunked slot still points to aborted r1; got {cur!r}"
+        )
+        assert r1.kv_pages == 0
+        yield from run_until_finished(r2)
+        assert r2.finished, "fresh r2 must admit and complete after combo step"
+
+    def test_force_retract_then_abort_same_yield(self):
+        """Force_retract + abort on the same handle in the same yield: clean state, no double-free, finish_event_count <= 1."""
+        execute_scripted_runtime(
+            self._script_force_retract_then_abort_same_yield,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-NEW] same-yield combo of force_retract + abort. Both operations
+    # tear resources down; doing them in the same yield step must not
+    # double-free and must not emit two finish events. All resources
+    # released and the finalize counter capped at 1.
+    @staticmethod
+    def _script_force_retract_then_abort_same_yield(t: ScriptedRuntime):
+        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r1, lambda h: h.is_chunking)
+        assert r1.kv_pages > 0
+
+        t.force_retract(r1)
+        t.abort(r1)
+        yield
+
+        assert r1.kv_pages == 0, (
+            f"force_retract + abort same yield must release KV; got "
+            f"{r1.kv_pages}"
+        )
+        assert r1.row_idx is None, (
+            f"force_retract + abort same yield must release row; got "
+            f"{r1.row_idx}"
+        )
+        assert r1.lock_refs == 0, (
+            f"force_retract + abort same yield must release lock_refs; "
+            f"got {r1.lock_refs}"
+        )
+        assert r1.finish_event_count <= 1, (
+            f"force_retract + abort same yield must not double-finalize; "
+            f"got {r1.finish_event_count} events"
+        )
+        # No double-free crash means the engine survived; one more yield
+        # to confirm the scheduler can keep stepping.
+        yield
+
     def test_abort_chunked_with_baton_handoff(self):
         """Abort the in-flight chunked req while a waiting chunked req takes the baton."""
         execute_scripted_runtime(
