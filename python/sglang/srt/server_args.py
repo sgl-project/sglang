@@ -3074,11 +3074,12 @@ class ServerArgs:
                 self.moe_runner_backend = "flashinfer_trtllm"
             elif self.moe_runner_backend not in [
                 "cutlass",
+                "deep_gemm",
                 "flashinfer_trtllm",
                 "flashinfer_trtllm_routed",
             ]:
                 logger.warning(
-                    "mxfp8 quantization supports only cutlass, flashinfer_trtllm, "
+                    "mxfp8 quantization supports only cutlass, deep_gemm, flashinfer_trtllm, "
                     "or flashinfer_trtllm_routed backends. "
                     f"Overriding {self.moe_runner_backend!r}."
                 )
