@@ -3911,7 +3911,9 @@ def run_scheduler_process(
         if server_args.scripted_runtime_fn_path is not None:
             # In scripted_runtime test mode the parent test process expects to
             # observe failures via the traceback file + non-zero exit code,
-            # not via SIGQUIT (which would kill the test runner itself).
+            # not via SIGQUIT (which would kill the test runner itself) nor
+            # via the pgroup SIGKILL that production uses to suppress sibling
+            # NCCL/TCPStore noise.
             if server_args.scripted_runtime_traceback_path:
                 try:
                     with open(server_args.scripted_runtime_traceback_path, "w") as f:
@@ -3924,6 +3926,13 @@ def run_scheduler_process(
             scripted_runtime_exit_code = 1
         else:
             parent_process.send_signal(signal.SIGQUIT)
+            # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands
+            # of NCCL/TCPStore tracebacks before they finally die.
+            if envs.SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION.get():
+                try:
+                    os.killpg(os.getpgrp(), signal.SIGKILL)
+                except Exception:
+                    pass
     finally:
         if scheduler is not None:
             # FPM has a background ZMQ publisher thread that needs explicit
