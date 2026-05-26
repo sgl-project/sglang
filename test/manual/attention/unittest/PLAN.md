@@ -2,7 +2,7 @@
 
 ## Current progress
 
-Last updated: 2026-05-27
+Last updated: 2026-05-28
 
 Implemented:
 - Shared dense MHA/GQA correctness helpers exist in
@@ -353,6 +353,52 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Wired KDA + Lightning CUDA-graph decode runner adapters mirroring the
+  GDN pattern. Both adapters reuse the existing
+  `_clone_*_cache` / `_restore_*_cache` snapshot helpers that point at
+  the shared `Mamba2CacheParams.temporal` buffer. Tolerance loosened to
+  `1e-1` (vs eager `3e-2`) for CG decode to absorb the Triton recurrent
+  kernel's per-element drift; this matches the DSV4 graph-test pattern.
+- Wired KDA EAGLE chain + tree verify (eager + CG) and Lightning EAGLE
+  chain verify (eager + CG). For KDA the fixture now exposes both
+  `a, b` (post-forward-mode transform, fed to the actual module) and
+  `a_raw, b_raw` (raw inputs, fed to `_pure_torch_kda_gating` inside the
+  verify reference) via `kda_fixture_inputs` + `make_kda_random_inputs`,
+  resolving a structural shape mismatch where
+  `expected_kda_verify_output_from_inputs` expected raw shapes but the
+  inputs dict carried shaped ones. Lightning tree verify is
+  intentionally not covered — `seg_la.py` has no parent-indices /
+  retrieve-index plumbing and processes draft tokens as a chain
+  regardless of tree shape, so a tree clone of KDA's test diverges ~5x.
+- Fixed FlashInfer SWA EXTEND-with-prefix correctness in the merge_state
+  branch. Two bugs combined: (a) `forward_return_lse` calls didn't pass
+  `window_left`; (b) `update_sliding_window`'s
+  `paged_kernel_lens = min(seq_lens, window + extend_lens)` reads
+  cache positions `[prefix_len, seq_len)` that are unwritten when
+  `use_ragged=True`. Fix in `flashinfer_backend.py:866-893` and
+  `update_sliding_window`: `paged_kernel_lens = prefix_lens`,
+  `kv_start_idx = 0`, plus a per-(q, k) custom mask
+  `k >= prefix_len + q - window_left` plumbed through
+  `cross_attention_custom_mask` (FlashInfer's mask kernel anchors Q at
+  `kv_len - qo_len + qo_idx`, so the window_left convention alone is
+  insufficient). FlashInfer SWA decode reclassified from
+  `_SWA_DECODE_MIN_SEQ_LEN_WINDOW` to `_SWA_DECODE_EXTEND_WINDOW` to
+  match its `clamp(seq_lens, max=window+1)` metadata convention; the
+  above-window decode case is now also enabled.
+- Wired DSV4 production `EAGLEDraftCudaGraphRunner` integration (chain,
+  SWA only — `topk in [0,1]` per backend assertion, `compress_ratio=0`
+  per `DeepseekV4ModelNextN` hardcode). Wired DSV4 production
+  `EAGLEDraftExtendCudaGraphRunner` integration (SWA only — DRAFT_EXTEND
+  uses `need_compress=False`). Both use the shared
+  `eagle_draft_runner.py` adapter pattern; the draft test required a new
+  `init_eager_metadata` adapter hook to do per-step init with reshaped
+  out_cache_loc (DSV4's strict `init_forward_metadata_decode` assertion
+  fires on the multi-step batch shape), and the draft-extend test
+  required a new `pre_replay` adapter hook to set the out-of-band
+  `_replay_forward_batch` attribute that
+  `DeepseekV4AttnBackend.init_forward_metadata_replay_cuda_graph` reads
+  (the multi-step DECODE wrapper sets it internally; the single-backend
+  DRAFT_EXTEND path does not).
 - Expanded Mamba2 EXTEND coverage from 1 case to 7 cases by switching
   `mamba/test_mamba2.py` to consume `make_mamba2_cases('triton')`:
   zero-prefix exact-page (16 tokens), zero-prefix below-page (8 tokens),
