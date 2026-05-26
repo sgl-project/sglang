@@ -12,14 +12,17 @@ Columns are runner modes; rows are `compress_ratio` modes of the single
 `dsv4` backend. Cells use:
 - **✓ \<variants\>** — exercised, with the config variants listed in the cell
 - **—** — not applicable / not exercised
-- **blocked: \<reason\>** — production-unsupported, not a follow-up
+- **production-unreachable: \<reason\>** — production never invokes this
+  combination, so the test runner asserts against it at the call site
+- **blocked: \<reason\>** — would crash on a hard assertion if attempted;
+  also asserted against at the call site
 - **deferred: \<reason\>** — could land later, currently disabled
 
 | `compress_ratio` | Eager Phase 2 | CG decode | PCG extend | BCG extend | Verify eager | Verify CG | DE eager | DE CG | DE-V2 CG | EAGLE-draft runner | EAGLE-DE runner | FKVMTP runner |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `0` (SWA-only) | ✓ EXTEND no-prefix / prefix-within-window / nonzero `attn_sink` / above-window EXTEND + DECODE within-window / multi-request / above-window | ✓ DECODE within-window + multi-request | — | — | ✓ EAGLE chain (topk=1) `prefix_lens=(64,96)` | — | ✓ EAGLE ragged-accept | — | — | — | — | — |
-| `4` (C4) | ✓ EXTEND `prefix_lens=(64,)`, `extend_lens=(16,)` + DECODE `prefix_lens=(64,)` (extra K cache written directly via `set_extra_key_buffer`; `c4_sparse_page_indices` seeded manually because indexer is bypassed) | ✓ DECODE `prefix_lens=(64,)` | — | — | ✓ EAGLE chain (topk=1) `prefix_lens=(64,96)` | — | — | — | — | — | — | — |
-| `128` (C128) | ✓ EXTEND `prefix_lens=(128,)`, `extend_lens=(16,)` + DECODE `prefix_lens=(128,)` | ✓ DECODE `prefix_lens=(128,)` | — | — | ✓ EAGLE chain (topk=1) `prefix_lens=(128,160)` | — | — | — | — | — | — | — |
+| `0` (SWA-only) | ✓ EXTEND no-prefix / prefix-within-window / nonzero `attn_sink` / above-window EXTEND + DECODE within-window / multi-request / above-window | ✓ DECODE within-window + multi-request | — | — | ✓ EAGLE chain (topk=1) `prefix_lens=(64,96)` | ✓ EAGLE chain CG `prefix_lens=(64,96)` | ✓ EAGLE ragged-accept | ✓ EAGLE uniform `extend_lens=(4,4)` | — | — | — | — |
+| `4` (C4) | ✓ EXTEND `prefix_lens=(64,)`, `extend_lens=(16,)` + DECODE `prefix_lens=(64,)` (extra K cache written directly via `set_extra_key_buffer`; `c4_sparse_page_indices` seeded manually because indexer is bypassed) | ✓ DECODE `prefix_lens=(64,)` | — | — | ✓ EAGLE chain (topk=1) `prefix_lens=(64,96)` | ✓ EAGLE chain CG `prefix_lens=(64,96)` | production-unreachable: draft layer is SWA-only | production-unreachable: draft layer is SWA-only | — | — | — | — |
+| `128` (C128) | ✓ EXTEND `prefix_lens=(128,)`, `extend_lens=(16,)` + DECODE `prefix_lens=(128,)` | ✓ DECODE `prefix_lens=(128,)` | — | — | ✓ EAGLE chain (topk=1) `prefix_lens=(128,160)` | ✓ EAGLE chain CG `prefix_lens=(128,160)` | production-unreachable: draft layer is SWA-only | production-unreachable: draft layer is SWA-only | — | — | — | — |
 
 ## Input And Config Coverage
 
@@ -37,14 +40,25 @@ Columns are runner modes; rows are `compress_ratio` modes of the single
 
 ## Reference Implementation Notes
 
-- The reference reads the same SWA cache buffer that the backend wrote and
-  dequantizes it byte-for-byte (FP8 nope × UE8M0 scale + BF16 rope) — this is
-  necessary because FP8 quantization is the production path and the test
-  cannot independently produce the same packed bytes.
-- For C4/C128, the reference reads the upgraded `DSV4AttnMetadata` to learn
-  which slots the kernel will attend to, then unpacks and softmaxes those
-  exact slots. This couples the reference to the production metadata builder
-  (intentionally — the compressor itself is bypassed).
+- The reference is a **vanilla PyTorch softmax** over the projected BF16 K
+  the fixture stashes on `fixture._swa_bf16_k_per_req` (and
+  `fixture._extra_bf16_k` for the C4/C128 cases). It does NOT read bytes
+  back from the production cache — that would couple the test to
+  `quant_to_nope_fp8_rope_bf16_pack_triton` / `set_swa_key_buffer_radix`
+  and a silent pack/write bug would corrupt both paths identically. The
+  vanilla BF16 K diverges from the FP8-dequantized K that `flash_mla`
+  reads by the FP8 quant noise; the `DSV4_ATOL = DSV4_RTOL = 5e-2`
+  tolerance absorbs that (graph-replay cases use a slightly looser
+  `DSV4_GRAPH_ATOL = 1e-1` to absorb the additional accumulation drift
+  introduced by `use_prefill_cuda_graph=True` padding).
+- For C4/C128, the reference reads the upgraded `DSV4AttnMetadata`'s
+  per-q-token `swa_page_indices` / `c4_sparse_page_indices` /
+  `c128_page_indices` to learn which entries the kernel attends to. The
+  reference rebuilds metadata for the current batch on every call (the
+  speculative graph runner invokes `expected_output` before
+  `init_forward_metadata*`) and reseeds `c4_sparse_page_indices` after
+  `on_after_cuda_graph_warmup` so it observes the same indices the
+  backend forward saw.
 - The attention-sink correction is applied by appending a virtual key with
   per-head score `attn_sink` and value `0`. With the default
   `attn_sink_value=-1e30` this is a numerical no-op; the
@@ -53,6 +67,26 @@ Columns are runner modes; rows are `compress_ratio` modes of the single
 
 ## Production-Unsupported
 
+- **`compress_ratio in {4, 128}` + `DRAFT_EXTEND` (eager OR CUDA-graph)** —
+  *production-unreachable*, not "broken". The DSV4 draft model
+  (`deepseek_v4_nextn.DeepseekV4ModelNextN`) is a single decoder layer
+  built with `compress_ratio_override=COMPRESS_RATIO_NEXTN_LAYER = 0`
+  (`python/sglang/srt/models/deepseek_v4_nextn.py:47,105`), which flows
+  through `MQALayer.__init__` at `deepseek_v4.py:232-237` and forces the
+  draft layer to SWA-only regardless of `config.compress_ratios`.
+  Production therefore never invokes `forward(compress_ratio=4 or 128,
+  forward_mode=DRAFT_EXTEND)`; the target model uses C4/C128 only in
+  DECODE / TARGET_VERIFY paths (which DO populate the C4/C128 metadata
+  via `need_compress=True`). If a test were to attempt the combination,
+  `init_forward_metadata_draft_extend` at `deepseek_v4_backend.py:636-663`
+  hardcodes `need_compress=False`, leaving `c4_sparse_page_indices` /
+  `c128_flashmla_metadata` at None and `forward(compress_ratio=4)` would
+  trip `extra_indices.shape[-1]` / `forward(compress_ratio=128)` would
+  trip a flash_mla `tile_scheduler_metadata` assert. The runner asserts
+  `case.compress_ratio == 0` at the call site for both
+  `run_dsv4_draft_extend_attention_case` and
+  `run_dsv4_eagle_draft_extend_cuda_graph_case` to make this unreachable
+  state loud at the test level.
 - **MTP `topk > 1`** — `deepseek_v4_backend.py:369` asserts `self.topk in [0, 1]`.
   Same in the HIP radix variant (`deepseek_v4_backend_hip_radix.py:363`). DSV4
   speculative draft-extend / target-verify is *always* chain (`topk=1`);
@@ -73,10 +107,6 @@ Columns are runner modes; rows are `compress_ratio` modes of the single
 
 ## Next Work
 
-- Add Verify CUDA-graph capture/replay for SWA + C4 + C128 once the lazy
-  metadata upgrade and `c4_sparse_page_indices` seeding are stable across
-  capture+replay.
-- Add EAGLE `DRAFT_EXTEND` CUDA-graph runner coverage (eager DE is enabled).
 - Optional: model the `Compressor` and `C4Indexer` paths so the C4/C128 cases
   no longer bypass them. Today only the `extra_k_cache + extra_indices`
   integration into `flash_mla` is verified, not the compressor math itself.
