@@ -392,7 +392,9 @@ class TestScriptedLifecycle(CustomTestCase):
             r = t.start_req(prompt_len=16, max_new_tokens=2)
             yield from run_until_finished(r)
         final = t.engine_stats()["kv_pool_free"]
-        assert final >= baseline - 1, f"KV pool drift: baseline={baseline}, final={final}"
+        assert (
+            final >= baseline - 1
+        ), f"KV pool drift: baseline={baseline}, final={final}"
 
     @unittest.skip("needs ScriptedRuntime.shutdown — wire up when harness adds the API")
     def test_engine_shutdown_during_chunked(self):
