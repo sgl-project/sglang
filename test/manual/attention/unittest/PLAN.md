@@ -37,7 +37,9 @@ Implemented:
   progress summary. Implemented folders are `dense/`, `swa/`, `mla/`, `gdn/`,
   `dual_chunk/`, plus DSA dense fallback and sparse top-k coverage, and an
   initial KDA (Kimi Delta Attention) linear-attention fixture under `kda/` with
-  an eager EXTEND Triton case. `dsv4/` remains a deferred method fixture
+  an eager EXTEND Triton case, plus an initial Lightning (Bailing-style
+  segmented linear attention) fixture under `lightning/` with an eager EXTEND
+  Triton case. `dsv4/` remains a deferred method fixture
   because it needs a DeepSeekV4-specific packed-cache reference.
 - Phase 3 dense runner integration is implemented for representative attention
   backends: eager mode for `torch_native`, and CUDA-graph metadata capture/replay
@@ -260,6 +262,18 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Added initial Lightning (Bailing-style segmented linear attention) Phase 2
+  fixture with a `ProjectedLightningAttention` actual module (wraps
+  `RadixAttention` and installs `LightningAttentionBackend` directly via
+  `ForwardContext` rather than going through `HybridLinearAttnBackend`, since
+  Lightning's layer wrapper is plain `RadixAttention` and the hybrid wrapper
+  routes `RadixAttention` to the full backend) and a pure-PyTorch per-token
+  seg_la recurrence reference (`state_t = state_{t-1} * exp(-slope_h) + outer(k_t, v_t)`,
+  `o_t = q_t @ state_t * head_dim**-0.5`).
+- `python -m py_compile test/manual/attention/unittest/common/attention_methods/lightning_attention.py test/manual/attention/unittest/lightning/test_triton.py`
+- `python test/manual/attention/unittest/lightning/test_triton.py -v`
+  - Ran 1 test in 0.681s after adding eager Lightning EXTEND Triton coverage
+    (no-prefix, exact-page extend, page_size=16).
 - Added initial KDA (Kimi Delta Attention) linear-attention Phase 2 fixture with
   a `ProjectedKDAAttention` actual module (wraps `RadixLinearAttention` via
   `KDAAttnBackend` + `HybridLinearAttnBackend`) and an independent pure-PyTorch
@@ -523,6 +537,7 @@ test/manual/attention/unittest/
       dual_chunk_attention.py
       gdn_attention.py
       kda_attention.py
+      lightning_attention.py
       mla_attention.py
     runner_modes/
       cuda_graph_decode_runner.py
@@ -542,6 +557,8 @@ test/manual/attention/unittest/
   dsa/
     test_dsa.py
   kda/
+    test_triton.py
+  lightning/
     test_triton.py
   swa/
     test_triton.py
