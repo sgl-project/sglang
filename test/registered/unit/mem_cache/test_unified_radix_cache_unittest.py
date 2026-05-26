@@ -382,6 +382,33 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         removed_cpu = self._removed_events(tree, StorageMedium.CPU)
         self.assertCountEqual([e.block_hashes[0] for e in removed_cpu], stored_hashes)
 
+    def test_hicache_reinsert_evicted_node_emits_gpu_store(self):
+        tree, allocator, _ = build_fixture(
+            self.cfg, enable_kv_cache_events=True
+        )
+        self._init_hicache(tree)
+        tree.take_events()  # Clear reset / init events.
+
+        seq = [1, 2, 3, 4]
+        self._insert(tree, allocator, seq)
+        stored_gpu = self._stored_events(tree, StorageMedium.GPU)
+        self.assertEqual(len(stored_gpu), 2)
+        stored_hashes = [e.block_hashes[0] for e in stored_gpu]
+
+        node = self._leaf_for(tree, seq)
+        self._backup_node(tree, node)
+        self._stored_events(tree, StorageMedium.CPU)
+
+        tree.evict(EvictParams(num_tokens=len(seq)))
+        self._removed_events(tree, StorageMedium.GPU)
+        self.assertTrue(node.evicted)
+        self.assertTrue(node.backuped)
+
+        self._insert(tree, allocator, seq)
+        restored_gpu = self._stored_events(tree, StorageMedium.GPU)
+        self.assertFalse(node.evicted)
+        self.assertCountEqual([e.block_hashes[0] for e in restored_gpu], stored_hashes)
+
 
 class UnifiedRadixCacheSuite:
 

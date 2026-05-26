@@ -895,6 +895,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(node)
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
+        self._record_store_event(node, medium=StorageMedium.GPU)
 
     def _insert_helper(
         self,
