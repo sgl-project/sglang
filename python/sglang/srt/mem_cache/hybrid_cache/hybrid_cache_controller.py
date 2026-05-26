@@ -13,6 +13,7 @@ import torch
 from sglang.srt.managers.cache_controller import CacheOperation as BaseCacheOperation
 from sglang.srt.managers.cache_controller import (
     HiCacheAck,
+    make_timing_event,
 )
 from sglang.srt.managers.cache_controller import (
     HiCacheController as BaseHiCacheController,
@@ -490,6 +491,11 @@ class HybridCacheController(BaseHiCacheController):
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
+
+        ack_start_event = make_timing_event()
+        ack_finish_event = make_timing_event()
+        ack_start_event.record()
+
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             for i in range(self.layer_num):
@@ -514,6 +520,7 @@ class HybridCacheController(BaseHiCacheController):
                         self.io_backend,
                     )
                 producer_event.complete(i)
+            ack_finish_event.record()
             self._record_transfer_indices_on_stream(
                 self.load_stream,
                 host_indices,
@@ -522,9 +529,10 @@ class HybridCacheController(BaseHiCacheController):
             )
         self.ack_load_queue.append(
             HiCacheAck(
-                producer_event.start_event,
-                producer_event.finish_event,
+                ack_start_event,
+                ack_finish_event,
                 op.node_ids,
+                num_tokens=len(op.host_indices),
             )
         )
         return producer_id
