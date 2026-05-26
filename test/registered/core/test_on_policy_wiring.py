@@ -822,5 +822,84 @@ class TestOnPolicyHelpers(unittest.TestCase):
         self.assertTrue(hasattr(torch.ops, "tp_inv_ops"))
 
 
+class TestStableTopKSoftmax(unittest.TestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    def test_fused_stable_topk_softmax_matches_reference_ids(self):
+        from sglang.srt.tp_invariant_ops import stable_topk, stable_topk_softmax
+
+        logits = torch.tensor(
+            [
+                [1.0, 1.0, 0.5, -0.25, 0.0, 2.0, 2.0, -1.0],
+                [0.0, -0.5, 0.25, 0.25, 0.25, -1.0, 3.0, 2.0],
+            ],
+            device="cuda",
+            dtype=torch.float32,
+        )
+        scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+        expected_values, expected_ids = stable_topk(scores, 3)
+        expected_values = expected_values / expected_values.sum(dim=-1, keepdim=True)
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_TRUE_ON_POLICY_STABLE_TOPK_SOFTMAX": "1"},
+        ):
+            actual_values, actual_ids = stable_topk_softmax(logits, 3)
+
+        torch.testing.assert_close(actual_ids, expected_ids)
+        torch.testing.assert_close(actual_values, expected_values, rtol=1e-6, atol=1e-6)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    def test_fused_stable_topk_softmax_can_emit_int32_ids(self):
+        from sglang.srt.tp_invariant_ops import stable_topk, stable_topk_softmax
+
+        logits = torch.randn(8, 16, device="cuda", dtype=torch.float32)
+        scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+        expected_values, expected_ids = stable_topk(scores, 4)
+        expected_values = expected_values / expected_values.sum(dim=-1, keepdim=True)
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_TRUE_ON_POLICY_STABLE_TOPK_SOFTMAX": "1"},
+        ):
+            actual_values, actual_ids = stable_topk_softmax(
+                logits, 4, ids_dtype=torch.int32
+            )
+
+        self.assertEqual(actual_ids.dtype, torch.int32)
+        torch.testing.assert_close(actual_ids.long(), expected_ids)
+        torch.testing.assert_close(actual_values, expected_values, rtol=1e-6, atol=1e-6)
+
+
+class TestTrueOnPolicyRMSNorm(unittest.TestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    def test_rmsnorm_block_size_env_accepts_power_of_two(self):
+        from sglang.srt.batch_invariant_ops import true_on_policy_rms_norm
+
+        x = torch.randn(2, 2048, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(2048, device="cuda", dtype=torch.float32)
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_TRUE_ON_POLICY_RMSNORM_BLOCK_SIZE": "2048"},
+        ):
+            out = true_on_policy_rms_norm(x, weight, eps=1e-6)
+
+        self.assertEqual(out.shape, x.shape)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    def test_rmsnorm_block_size_env_rejects_non_power_of_two(self):
+        from sglang.srt.batch_invariant_ops import true_on_policy_rms_norm
+
+        x = torch.randn(2, 128, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(128, device="cuda", dtype=torch.float32)
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_TRUE_ON_POLICY_RMSNORM_BLOCK_SIZE": "1536"},
+        ):
+            with self.assertRaisesRegex(ValueError, "positive power of two"):
+                true_on_policy_rms_norm(x, weight, eps=1e-6)
+
+
 if __name__ == "__main__":
     unittest.main()
