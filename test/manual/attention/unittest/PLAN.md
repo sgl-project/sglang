@@ -124,6 +124,7 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
 - `python -m py_compile test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/common/spec_runner.py`
 - `python test/manual/attention/unittest/swa/test_triton.py -v`
 - `python -m py_compile test/manual/attention/unittest/common/spec_runner.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py`
