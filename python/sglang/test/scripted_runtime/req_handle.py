@@ -1,7 +1,12 @@
 """ReqHandle: handle for a request submitted via ScriptedRuntime.
 
-Hides the raw ``Req`` so test scripts cannot assert on scheduler
-internals — preserves the harness's refactor-safety.
+Convenience handle exposing a stable, named subset of req state for
+the common test patterns. Test scripts are also explicitly allowed to
+reach into ``t._scheduler`` (the raw ``Scheduler`` object) to assert
+invariants on scheduler internals — see the project plan
+``2026-05-26-direct-internals-access-plan.md`` for the rationale.
+Coupling tests to internals is accepted as the price of catching
+regressions that aren't otherwise observable.
 """
 
 from __future__ import annotations
