@@ -54,6 +54,14 @@ class SanaWMPipelineConfig(PipelineConfig):
 
     task_type: ModelTaskType = ModelTaskType.TI2V
 
+    # SanaWMBeforeDenoisingStage._splice_first_frame handles condition-image
+    # resize + VAE-encode itself, so bypass the framework's generic TI2V
+    # preprocessing in InputValidationStage. Without this, the framework path
+    # reads `vae_config.arch_config.scale_factor_spatial` which LTXVideoVAEArchConfig
+    # does not expose (it uses `spatial_compression_ratio` instead). LTX-2 sets
+    # the same flag for the same reason -- both are TI2V on LTXVideoVAEConfig.
+    skip_input_image_preprocess: bool = True
+
     # --- Guidance ---
     # SANA-WM uses standard CFG via guidance_scale; no embedded guidance token.
     should_use_guidance: bool = False

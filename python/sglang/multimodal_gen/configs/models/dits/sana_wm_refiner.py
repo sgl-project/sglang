@@ -46,11 +46,18 @@ class SanaWMRefinerArchConfig(DiTArchConfig):
     base_width: int = 2048
     causal_offset: int = 1
 
-    # Map Diffusers-style FF param keys to sglang LTX2FeedForward naming.
+    # Map Diffusers-style param keys to sglang's LTX-2 primitive naming.
+    # The refiner reuses LTX2Attention / LTX2FeedForward, so it inherits the
+    # same naming differences vs Diffusers:
+    #   * ff.net.0.proj / ff.net.2 -> proj_in / proj_out  (LTX2FeedForward)
+    #   * norm_q / norm_k          -> q_norm / k_norm     (LTX2Attention)
+    # Keep this aligned with LTX2ArchConfig.param_names_mapping in ltx_2.py.
     param_names_mapping: dict = field(
         default_factory=lambda: {
             r"^(transformer_blocks\.\d+\.ff)\.net\.0\.proj\.(.*)$": r"\1.proj_in.\2",
             r"^(transformer_blocks\.\d+\.ff)\.net\.2\.(.*)$": r"\1.proj_out.\2",
+            r"(.*)\.norm_q\.(.*)$": r"\1.q_norm.\2",
+            r"(.*)\.norm_k\.(.*)$": r"\1.k_norm.\2",
         }
     )
 

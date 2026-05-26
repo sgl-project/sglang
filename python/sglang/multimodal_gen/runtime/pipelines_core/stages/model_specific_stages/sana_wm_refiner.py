@@ -30,6 +30,9 @@ from torch import nn
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.models.dits.sana_wm_refiner_transformer import (
     pack_latents,
     unpack_latents,
@@ -133,6 +136,34 @@ class SanaWMLTX2RefinerStage(PipelineStage):
     @property
     def role_affinity(self) -> RoleType:
         return RoleType.DENOISER
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        # Declare every component this stage forwards through so
+        # ComponentResidencyManager moves them onto GPU before the stage runs.
+        # Without this, `dit_cpu_offload=True` keeps the refiner sub-modules on
+        # CPU and the first matmul fails with "mat2 is on cpu" vs cuda inputs.
+        # The tokenizer stays on CPU (no nn.Module weights to ferry).
+        stage_name = self._component_stage_name(stage_name)
+        return [
+            ComponentUse(
+                stage_name=stage_name,
+                component_name="transformer_2",
+                target_dtype=self.dtype,
+                memory_intensive=True,
+            ),
+            ComponentUse(
+                stage_name=stage_name,
+                component_name="connectors",
+                target_dtype=self.dtype,
+            ),
+            ComponentUse(
+                stage_name=stage_name,
+                component_name="text_encoder_2",
+                target_dtype=self.dtype,
+            ),
+        ]
 
     @staticmethod
     def _prompts_for_batch(batch: Req, batch_size: int) -> list[str]:
