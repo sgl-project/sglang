@@ -29,3 +29,11 @@ class Flux2KleinSamplingParams(Flux2SamplingParams):
     # Klein is step-distilled, so default to 4 steps
     guidance_scale: float = 1.0
     num_inference_steps: int = 4
+
+
+@dataclass
+class Flux2KleinBaseSamplingParams(FluxSamplingParams):
+    # Klein-base is undistilled
+    num_inference_steps: int = 50
+    guidance_scale: float = 4.0
+    negative_prompt: str = ""
