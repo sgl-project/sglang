@@ -412,9 +412,21 @@ class Compressor(nn.Module):
             # NPU path: run the full compress flow inline. Writes go straight
             # to the kv pool via set_compress_*_buffer, so there's nothing
             # for forward_core_compressor to write afterwards.
-            if envs.SGLANG_DSV4_NPU_FUSED_COMPRESSOR.get():
-                self._forward_npu_fused(x, forward_batch.positions, forward_batch)
-                return None
+            #
+            # Fused path (_forward_npu_fused) is decode-only: it reads write
+            # locations from fm.c{ratio}_loc, which _compute_compress_locs
+            # populates only in its is_decode branch. Prefill / extend keep
+            # the per-request forward_npu path, which derives write_locs
+            # inline via req_to_token_c{4,128}[req_pool, pos_in_req]. The
+            # per-request loop is safe in non-decode modes because prefill /
+            # extend are never CUDA-graph-captured under our setup
+            # (--cuda-graph-bs only enumerates decode bs values), so the
+            # capture-time loop-skip bug (decode-graph-only) does not apply.
+            if (
+                envs.SGLANG_DSV4_NPU_FUSED_COMPRESSOR.get()
+                and forward_batch.forward_mode.is_decode()
+            ):
+                return self._forward_npu_fused(x, forward_batch.positions, forward_batch)
             return self.forward_npu(x, forward_batch.positions, forward_batch)
 
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)

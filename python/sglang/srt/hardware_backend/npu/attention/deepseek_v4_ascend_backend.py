@@ -387,9 +387,22 @@ class DeepseekV4AscendAttnBackend(
         # fm.actual_seq_lengths_kv has shape (bs,) (bound in capture); clamp to 1 so
         # padded slots (real seq_lens=0 beyond raw_bs) and capture-time zero seq_lens
         # don't trip the kernel's seqused_kv >= 1 validation.
-        fm.actual_seq_lengths_kv.copy_(
-            seq_lens[:bs].to(torch.int32).clamp(min=1)
+        #
+        # Source: the device-side `seq_lens` arg is `buffers.seq_lens[:bs]` which is
+        # NOT populated under the NPU graph runner — that runner refreshes seq_lens
+        # for the captured graph via Graph.update(cpu_update_input={...}) targeting
+        # `actual_seq_lengths_kv` directly, leaving `buffers.seq_lens` at the init
+        # fill (0). The CPU param `seq_lens_cpu` IS populated (CPU-side .copy_ in
+        # populate_from_forward_batch is synchronous), so use it as the live source.
+        assert seq_lens_cpu is not None, (
+            "V4 graph replay requires seq_lens_cpu — buffers.seq_lens is stale on "
+            "NPU (Graph.update only refreshes fm.actual_seq_lengths_kv inside the "
+            "captured graph, not the device-side buffers.seq_lens)."
         )
+        live_seq_lens = seq_lens_cpu[:bs].to(
+            device=seq_lens.device, dtype=torch.int32
+        )
+        fm.actual_seq_lengths_kv.copy_(live_seq_lens.clamp(min=1))
 
         # Phase 3: compress locs via shared helper (Task 2 _compute_compress_locs).
         pool = forward_batch.token_to_kv_pool
@@ -401,7 +414,7 @@ class DeepseekV4AscendAttnBackend(
             pool=pool,
             req_to_token=req_to_token,
             req_pool_indices=req_pool_indices[:bs],
-            seq_lens=seq_lens[:bs].to(torch.int32),
+            seq_lens=live_seq_lens,
             out_cache_loc=out_cache_loc,
             is_decode=forward_mode.is_decode(),
             bs=bs,
@@ -935,7 +948,10 @@ class DeepseekV4AscendAttnBackend(
                         else out_cache_loc_dsv4.out_c128_loc
                     )
                     if bundle_loc.numel() > 0:
-                        should_compress = (seq_lens % ratio) == 0
+                        valid = seq_lens > 0
+                        should_compress = ((seq_lens % ratio) == 0) & valid
+                        # from sglang.srt.layers.dp_attention import get_attention_dp_rank
+                        # print(f"[dsv4-compress] dp_rank={get_attention_dp_rank()} seq_lens={seq_lens.tolist()} should_compress={should_compress.tolist()}", flush=True)
                         idx = torch.nonzero(
                             should_compress, as_tuple=False
                         ).flatten()
