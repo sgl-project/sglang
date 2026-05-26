@@ -17,6 +17,9 @@
 # `_required_config_modules`, because the framework verifier resolves every
 # required module key as a literal top-level subdir of the materialized model.
 
+from sglang.multimodal_gen.configs.models.dits.sana_wm_refiner import (
+    SanaWMRefinerConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
@@ -133,12 +136,34 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
             component_path = self._resolve_component_path(
                 server_args, module_name, subpath
             )
-            module, memory_usage = PipelineComponentLoader.load_component(
-                component_name=module_name,
-                component_model_path=component_path,
-                transformers_or_diffusers=library,
-                server_args=server_args,
-            )
+            # `transformer_2` is a different model class
+            # (`SanaWMLTX2VideoRefiner`) than stage-1's
+            # `SanaWMTransformer3DModel` and needs its own DiT config
+            # (`SanaWMRefinerConfig`). `TransformerLoader` keys its
+            # `dit_config` lookup on the *normalized* component name, so both
+            # `transformer` and `transformer_2` resolve to
+            # `pipeline_config.dit_config`. Temporarily swap in the refiner
+            # config for this one load.
+            #
+            # TODO: replace with a framework-level "per-component dit_config"
+            # mechanism (e.g. `TransformerLoader` consulting
+            # `pipeline_config.dit_config_2` for `transformer_2`) once that
+            # exists. See the SANA-WM PR's follow-up notes.
+            saved_dit_config = None
+            if module_name == "transformer_2":
+                saved_dit_config = server_args.pipeline_config.dit_config
+                server_args.pipeline_config.dit_config = SanaWMRefinerConfig()
+            try:
+                module, memory_usage = PipelineComponentLoader.load_component(
+                    component_name=module_name,
+                    component_model_path=component_path,
+                    transformers_or_diffusers=library,
+                    server_args=server_args,
+                )
+            finally:
+                if saved_dit_config is not None:
+                    server_args.pipeline_config.dit_config = saved_dit_config
+
             self.modules[module_name] = module
             self.memory_usages[module_name] = memory_usage
 
