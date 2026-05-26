@@ -353,6 +353,16 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Investigated Mamba2 PCG/BCG split-op extend. Blocked at the
+  `MambaMixer2.forward` projection step assert
+  (`num_actual_tokens == projected_states.shape[0]`,
+  `mamba.py:467`): the mixer projects ALL rows of `hidden_states`
+  before the per-layer `num_token_non_padded_cpu` slicing kicks in, so
+  the shared `_run_split_op_extend_case`'s token-padding trips the
+  assert. The runner-adapter plumbing
+  (`make_mamba2_token_padded_inputs`, `mamba2_attention_layers`,
+  `run_mamba2_split_op_extend_case`) is in place for when the gate is
+  resolved; the test method is intentionally not added.
 - Enabled Mamba2 DECODE in the fixture by installing the global
   selective-state-update backend via
   `initialize_mamba_selective_state_update_backend(server_args)` in
