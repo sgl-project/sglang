@@ -141,9 +141,13 @@ class SingleForwardManager:
                 f"CanaryLaunchCapacities.from_args"
             )
 
-        self._populate_expected_token_pool(forward_batch=maybe_inaccurate_forward_batch)
+        self._populate_expected_token_pool(
+            forward_batch=maybe_inaccurate_forward_batch
+        )
 
-    def _populate_expected_token_pool(self, *, forward_batch: "ForwardBatch") -> None:
+    def _populate_expected_token_pool(
+        self, *, forward_batch: "ForwardBatch"
+    ) -> None:
         """Refill the device-side source-of-truth pool and valid_lens before
         the cuda graph captures the gather kernel. No-op when the flag is off
         or the batch carries no req-truth snapshot (capture-time synthetic
@@ -194,9 +198,7 @@ class SingleForwardManager:
         req_indices_device = torch.tensor(
             req_pool_indices_host, dtype=torch.int64, pin_memory=True
         ).to(valid_lens.device, non_blocking=True)
-        valid_lens_device_slice = valid_lens_host.to(
-            valid_lens.device, non_blocking=True
-        )
+        valid_lens_device_slice = valid_lens_host.to(valid_lens.device, non_blocking=True)
         # Scatter per-req valid lens into the global slot-indexed tensor. Slots
         # not touched this forward keep their previous value (kernel only reads
         # slots referenced by req_pool_indices, so stale rows are inert).
