@@ -248,6 +248,66 @@ def _cat_optional_tensors(
     return torch.cat([neg, pos], dim=0)
 
 
+def _text_sequence_dim(tensor: torch.Tensor) -> int:
+    return -2 if tensor.ndim >= 3 else -1
+
+
+def _pad_text_sequence(
+    tensor: torch.Tensor | None,
+    target_length: int,
+) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    seq_dim = _text_sequence_dim(tensor)
+    current_length = tensor.shape[seq_dim]
+    if current_length == target_length:
+        return tensor
+    if current_length > target_length:
+        index = [slice(None)] * tensor.ndim
+        index[seq_dim] = slice(0, target_length)
+        return tensor[tuple(index)]
+
+    pad_shape = list(tensor.shape)
+    pad_shape[seq_dim] = target_length - current_length
+    padding = torch.zeros(pad_shape, device=tensor.device, dtype=tensor.dtype)
+    return torch.cat([tensor, padding], dim=seq_dim)
+
+
+def _default_attention_mask_for_embeds(embeds: torch.Tensor) -> torch.Tensor:
+    return torch.ones(
+        (embeds.shape[0], embeds.shape[-2]),
+        device=embeds.device,
+        dtype=torch.long,
+    )
+
+
+def _align_sana_wm_cfg_text_conditions(
+    pos_embeds: torch.Tensor,
+    neg_embeds: torch.Tensor | None,
+    pos_mask: torch.Tensor | None,
+    neg_mask: torch.Tensor | None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    if neg_embeds is None:
+        return pos_embeds, neg_embeds, pos_mask, neg_mask
+
+    target_length = max(pos_embeds.shape[-2], neg_embeds.shape[-2])
+    pos_embeds = _pad_text_sequence(pos_embeds, target_length)
+    neg_embeds = _pad_text_sequence(neg_embeds, target_length)
+
+    if pos_mask is None:
+        pos_mask = _default_attention_mask_for_embeds(pos_embeds)
+    if neg_mask is None:
+        neg_mask = _default_attention_mask_for_embeds(neg_embeds)
+    pos_mask = _pad_text_sequence(pos_mask, target_length)
+    neg_mask = _pad_text_sequence(neg_mask, target_length)
+    return pos_embeds, neg_embeds, pos_mask, neg_mask
+
+
 class SanaWMDenoisingStage(DenoisingStage):
     """SANA-WM stage-1 sampler matching NVlabs ``flow_euler_ltx``.
 
@@ -312,6 +372,12 @@ class SanaWMDenoisingStage(DenoisingStage):
             )
             if neg_embeds is None:
                 raise ValueError("SANA-WM CFG requires negative prompt embeds.")
+
+            pos_embeds, neg_embeds, pos_mask, neg_mask = (
+                _align_sana_wm_cfg_text_conditions(
+                    pos_embeds, neg_embeds, pos_mask, neg_mask
+                )
+            )
 
         extra = batch.extra or {}
         camera_conditions = _to_device_dtype(

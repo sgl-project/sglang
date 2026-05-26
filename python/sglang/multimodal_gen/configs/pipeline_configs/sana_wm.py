@@ -109,7 +109,9 @@ class SanaWMPipelineConfig(PipelineConfig):
     text_encoder_extra_args: list[dict] = field(
         default_factory=lambda: [
             {
-                "padding": True,
+                # Match NVlabs SANA-WM prompt encoding: positive and negative
+                # branches must have the same token dimension for CFG concat.
+                "padding": "max_length",
                 "return_attention_mask": True,
             }
         ]

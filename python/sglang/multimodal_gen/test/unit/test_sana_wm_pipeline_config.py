@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
     SanaWMBeforeDenoisingStage,
     SanaWMDenoisingStage,
+    _align_sana_wm_cfg_text_conditions,
     configure_sana_wm_ltx2_vae_for_long_video,
 )
 from sglang.multimodal_gen.runtime.utils.model_overlay import (
@@ -72,6 +73,10 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
     def test_get_model_deployment_config_enables_dit_layerwise_offload(self) -> None:
         deployment = self.config.get_model_deployment_config()
         self.assertTrue(deployment.auto_dit_layerwise_offload)
+
+    def test_text_encoder_padding_matches_cfg_concat_contract(self) -> None:
+        self.assertEqual(self.config.text_encoder_extra_args[0]["padding"], "max_length")
+        self.assertTrue(self.config.text_encoder_extra_args[0]["return_attention_mask"])
 
     def test_prepare_neg_cond_kwargs_keeps_camera_for_cfg(self) -> None:
         camera_conditions = torch.zeros(1, 49, 20)
@@ -184,6 +189,25 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
                 "tile_sample_stride_num_frames": 80,
             },
         )
+
+    def test_cfg_text_conditions_pad_positive_and_negative_to_same_length(self) -> None:
+        pos = torch.ones(1, 173, 4)
+        neg = torch.ones(1, 1, 4) * 2
+        pos_mask = torch.ones(1, 173, dtype=torch.long)
+        neg_mask = torch.ones(1, 1, dtype=torch.long)
+
+        pos, neg, pos_mask, neg_mask = _align_sana_wm_cfg_text_conditions(
+            pos, neg, pos_mask, neg_mask
+        )
+
+        self.assertEqual(pos.shape, (1, 173, 4))
+        self.assertEqual(neg.shape, (1, 173, 4))
+        self.assertEqual(pos_mask.shape, (1, 173))
+        self.assertEqual(neg_mask.shape, (1, 173))
+        self.assertTrue(torch.equal(neg[:, :1], torch.ones(1, 1, 4) * 2))
+        self.assertTrue(torch.equal(neg[:, 1:], torch.zeros(1, 172, 4)))
+        self.assertTrue(torch.equal(neg_mask[:, :1], torch.ones(1, 1, dtype=torch.long)))
+        self.assertTrue(torch.equal(neg_mask[:, 1:], torch.zeros(1, 172, dtype=torch.long)))
 
 
 class TestSanaWMSamplingParams(unittest.TestCase):
