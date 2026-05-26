@@ -27,6 +27,9 @@ from common.attention_methods.mamba2_attention import (
     make_mamba2_cases,
     run_mamba2_attention_case,
 )
+from common.runner_modes.cuda_graph_decode_runner import (
+    run_mamba2_cuda_graph_decode_case,
+)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -49,10 +52,32 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
         prefix_lens=(4, 0, 0),
     )
 
+    CUDA_GRAPH_CASES = (
+        Mamba2AttentionCase(
+            name="runner_cuda_graph_mamba2_decode_page_boundary",
+            backend="triton",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=DEFAULT_NUM_HEADS,
+            head_dim=DEFAULT_HEAD_DIM,
+            state_size=DEFAULT_STATE_SIZE,
+            n_groups=DEFAULT_N_GROUPS,
+            conv_kernel=DEFAULT_CONV_KERNEL,
+            mamba_chunk_size=DEFAULT_MAMBA_CHUNK_SIZE,
+            hidden_size=DEFAULT_HIDDEN_SIZE,
+            page_size=16,
+            prefix_lens=(14, 15, 16),
+        ),
+    )
+
     def test_projected_mamba2_attention_cases(self):
         for case in self.CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_mamba2_attention_case(self, case)
+
+    def test_runner_mode_cuda_graph_decode_cases(self):
+        for case in self.CUDA_GRAPH_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_mamba2_cuda_graph_decode_case(self, case)
 
     def test_mamba2_replay_metadata_padding_indices(self):
         # Drive `init_forward_metadata_replay_cuda_graph` directly with

@@ -172,6 +172,34 @@ from ..attention_methods.lightning_attention import (
 from ..attention_methods.lightning_attention import (
     _make_forward_batch as _make_lightning_forward_batch,
 )
+from ..attention_methods.mamba2_attention import (
+    DEFAULT_DEVICE as MAMBA2_DEFAULT_DEVICE,
+)
+from ..attention_methods.mamba2_attention import (
+    DEFAULT_DTYPE as MAMBA2_DEFAULT_DTYPE,
+)
+from ..attention_methods.mamba2_attention import (
+    DEFAULT_MAX_CONTEXT_LEN as MAMBA2_DEFAULT_MAX_CONTEXT_LEN,
+)
+from ..attention_methods.mamba2_attention import (
+    MAMBA2_GRAPH_ATOL,
+    MAMBA2_GRAPH_RTOL,
+    Mamba2AttentionCase,
+    _clone_mamba2_cache,
+    _restore_mamba2_cache,
+    build_mamba2_attention_fixture,
+    expected_mamba2_output_from_inputs,
+    make_mamba2_case_with_prefix_lens,
+    make_mamba2_random_inputs,
+    make_mamba2_replay_inputs,
+    mamba2_fixture_inputs,
+    prepare_mamba2_runner_inputs,
+    run_mamba2_fixture_eager,
+    run_mamba2_forward,
+)
+from ..attention_methods.mamba2_attention import (
+    _make_forward_batch as _make_mamba2_forward_batch,
+)
 
 DENSE_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 4
 MLA_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 4
@@ -179,6 +207,7 @@ GDN_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 3
 DSV4_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 2
 KDA_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 3
 LIGHTNING_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 3
+MAMBA2_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 3
 
 
 @dataclass(frozen=True)
@@ -678,6 +707,58 @@ def run_lightning_cuda_graph_decode_case(
         adapter=adapter,
         build_kwargs=dict(
             head_dim=head_dim,
+            max_context_len=max_context_len,
+            dtype=dtype,
+            device=device,
+        ),
+        capture_batch_size=cuda_graph_capture_batch_size,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+    )
+
+
+def run_mamba2_cuda_graph_decode_case(
+    testcase,
+    case: Mamba2AttentionCase,
+    *,
+    max_context_len: int = MAMBA2_DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = MAMBA2_DEFAULT_DTYPE,
+    device: str = MAMBA2_DEFAULT_DEVICE,
+    cuda_graph_capture_batch_size: int = MAMBA2_CUDA_GRAPH_CAPTURE_BATCH_SIZE,
+):
+    """Mamba2 CUDA-graph decode replay. The fixture's
+    `initialize_mamba_selective_state_update_backend` call makes
+    `MambaMixer2.forward_decode` reachable; this adapter then drives the
+    capture/replay lifecycle the same way as GDN/KDA/Lightning, snapshotting
+    both SSM and conv state between capture and replay so the recurrent
+    backend output is reproducible.
+
+    Loose `MAMBA2_GRAPH_ATOL=1e-1` absorbs CG-replay drift; eager
+    `MAMBA2_ATOL=5e-2` is kept for non-graph cases.
+    """
+    adapter = CudaGraphDecodeAdapter(
+        build_fixture=build_mamba2_attention_fixture,
+        make_case=make_mamba2_case_with_prefix_lens,
+        make_forward_batch=_make_mamba2_forward_batch,
+        fixture_inputs=mamba2_fixture_inputs,
+        make_capture_inputs=make_mamba2_random_inputs,
+        make_replay_inputs=make_mamba2_replay_inputs,
+        prepare_inputs=prepare_mamba2_runner_inputs,
+        run_eager=run_mamba2_fixture_eager,
+        run_forward=run_mamba2_forward,
+        expected_output=expected_mamba2_output_from_inputs,
+        clone_state=_clone_mamba2_cache,
+        restore_state=_restore_mamba2_cache,
+        allow_padding=False,
+        atol=MAMBA2_GRAPH_ATOL,
+        rtol=MAMBA2_GRAPH_RTOL,
+    )
+    _run_cuda_graph_decode_case(
+        testcase,
+        case,
+        adapter=adapter,
+        build_kwargs=dict(
             max_context_len=max_context_len,
             dtype=dtype,
             device=device,

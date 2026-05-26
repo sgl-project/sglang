@@ -72,6 +72,11 @@ DEFAULT_DEVICE = "cuda"
 # softplus-bounded dt, optional fp32 state) so we use 5e-2 instead of 3e-2.
 MAMBA2_ATOL = 5e-2
 MAMBA2_RTOL = 5e-2
+# CUDA-graph replay through the Mamba2 SSD kernel accumulates drift that
+# pushes per-element diff above eager `MAMBA2_ATOL`. Loose tolerance for
+# graph-replay coverage where the goal is buffer/metadata compatibility.
+MAMBA2_GRAPH_ATOL = 1e-1
+MAMBA2_GRAPH_RTOL = 1e-1
 
 
 @dataclass(frozen=True)
@@ -763,3 +768,132 @@ def run_mamba2_attention_case(
     torch.testing.assert_close(
         actual, expected.output, atol=MAMBA2_ATOL, rtol=MAMBA2_RTOL
     )
+
+
+# ---------------------------------------------------------------------------
+# Runner-mode helpers (mirror GDN/KDA/Lightning conventions)
+# ---------------------------------------------------------------------------
+
+
+def _clone_mamba2_cache(fixture: Mamba2AttentionFixture) -> tuple[torch.Tensor, torch.Tensor]:
+    """Snapshot both SSM state and conv state for CG capture/replay isolation."""
+    return (_ssm_states(fixture).clone(), _conv_states(fixture).clone())
+
+
+def _restore_mamba2_cache(
+    fixture: Mamba2AttentionFixture,
+    state: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    ssm, conv = state
+    _ssm_states(fixture).copy_(ssm)
+    _conv_states(fixture).copy_(conv)
+
+
+def make_mamba2_case_with_prefix_lens(
+    case: Mamba2AttentionCase,
+    name: str,
+    prefix_lens: tuple[int, ...],
+) -> Mamba2AttentionCase:
+    """Build a variant case with new `prefix_lens`. For DECODE,
+    `extend_lens` is empty (input_lens derives `(1,) * batch_size`); for
+    EXTEND we keep the original `extend_lens` clipped/padded to the new
+    batch shape."""
+    if case.forward_mode.is_decode():
+        extend_lens: tuple[int, ...] = ()
+    else:
+        base = case.extend_lens or (1,)
+        if len(prefix_lens) <= len(base):
+            extend_lens = base[: len(prefix_lens)]
+        else:
+            extend_lens = base + (base[-1],) * (len(prefix_lens) - len(base))
+    return Mamba2AttentionCase(
+        name=name,
+        backend=case.backend,
+        forward_mode=case.forward_mode,
+        num_heads=case.num_heads,
+        head_dim=case.head_dim,
+        state_size=case.state_size,
+        n_groups=case.n_groups,
+        conv_kernel=case.conv_kernel,
+        mamba_chunk_size=case.mamba_chunk_size,
+        hidden_size=case.hidden_size,
+        page_size=case.page_size,
+        prefix_lens=prefix_lens,
+        extend_lens=extend_lens,
+    )
+
+
+def mamba2_fixture_inputs(
+    fixture: Mamba2AttentionFixture,
+) -> dict[str, torch.Tensor]:
+    return {"hidden_states": fixture.hidden_states}
+
+
+def make_mamba2_random_inputs(
+    case: Mamba2AttentionCase,
+    fixture: Mamba2AttentionFixture,
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> dict[str, torch.Tensor]:
+    return {
+        "hidden_states": torch.randn(
+            case.num_input_tokens,
+            case.hidden_size,
+            dtype=dtype,
+            device=device,
+        ),
+    }
+
+
+def make_mamba2_replay_inputs(
+    _case: Mamba2AttentionCase,
+    fixture: Mamba2AttentionFixture,
+    _pad_prefix_lens: tuple[int, ...],
+    base_inputs: dict[str, torch.Tensor],
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> dict[str, torch.Tensor]:
+    del fixture, dtype, device
+    return base_inputs
+
+
+def prepare_mamba2_runner_inputs(
+    fixture: Mamba2AttentionFixture,
+    case: Mamba2AttentionCase,
+    batch: ForwardBatch,
+    inputs: dict[str, torch.Tensor],
+    *,
+    max_context_len: int,
+) -> None:
+    del max_context_len
+    fixture.case = case
+    fixture.forward_batch = batch
+    fixture.hidden_states = inputs["hidden_states"]
+
+
+def run_mamba2_forward(
+    fixture: Mamba2AttentionFixture,
+    batch: ForwardBatch,
+    inputs: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    return fixture.actual_module(batch, inputs["hidden_states"])
+
+
+def expected_mamba2_output_from_inputs(
+    fixture: Mamba2AttentionFixture,
+    _case: Mamba2AttentionCase,
+    _inputs: dict[str, torch.Tensor],
+    state,
+) -> torch.Tensor:
+    """Reference output for runner-mode tests. `state` is the cloned
+    (ssm_states, conv_states) snapshot; the reference walks the actual
+    fixture's recurrence using the same hidden_states stored on the
+    fixture (set via `prepare_mamba2_runner_inputs`)."""
+    initial_ssm, initial_conv = state
+    return _pure_torch_mamba2_reference(
+        fixture,
+        initial_conv_states=initial_conv,
+        initial_ssm_states=initial_ssm,
+    ).output

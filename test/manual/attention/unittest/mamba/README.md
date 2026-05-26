@@ -21,7 +21,7 @@ Columns are runner modes; rows are the SSM kernel backend
 
 | SSM kernel | Eager Phase 2 | CG decode | PCG extend | BCG extend | Verify eager | Verify CG | DE eager | DE CG | DE-V2 CG | EAGLE-draft runner | EAGLE-DE runner | FKVMTP runner |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `triton` (`Mamba2AttnBackend`) | ✓ EXTEND zero-prefix exact-page / below-page / above-page, with-prefix, multi-request zero-prefix / ragged, page_size=1 (7 variants) + DECODE page-boundary + DECODE bsz=1 nonzero-prefix (9 variants total) | metadata-only: `init_forward_metadata_replay_cuda_graph` with `seq_lens_cpu=[5,1,1]` to cover the M21 padding-count mutation in `_replay_metadata`; full forward replay blocked by baseline `enable_symm_mem` bug | deferred | deferred | deferred | deferred | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
+| `triton` (`Mamba2AttnBackend`) | ✓ EXTEND zero-prefix exact-page / below-page / above-page, with-prefix, multi-request zero-prefix / ragged, page_size=1 (7 variants) + DECODE page-boundary + DECODE bsz=1 nonzero-prefix (9 variants total) | ✓ decode page-boundary (full forward replay with SSM+conv state snapshot/restore via `_clone_mamba2_cache`/`_restore_mamba2_cache`; uses `MAMBA2_GRAPH_ATOL=1e-1` to absorb chunked-scan kernel CG-replay drift; eager `MAMBA2_ATOL=5e-2` kept for non-graph cases). Plus the M21 metadata-only padding test (`seq_lens_cpu=[5,1,1]`). | deferred | deferred | deferred | deferred | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
 
 ## Hybrid dispatch fan-out tests (MagicMock-based)
 
@@ -97,6 +97,8 @@ call.
 
 ## Next Work
 
-- Add CUDA graph decode replay with recurrent state isolation
-  (`MambaMixer2.forward_decode` is now reachable; the missing piece is
-  the recurrent-cache snapshot/restore plumbing modeled on GDN/KDA).
+- Add PCG/BCG split-op extend runner coverage (modeled on KDA/GDN).
+  The Mamba2 forward uses `hidden_states` rather than separate q/k/v,
+  so the per-head-vs-flat shape mismatch that blocks Lightning split-op
+  doesn't apply here — but the static-token padding helper still needs
+  authoring (`make_mamba2_token_padded_inputs`).
