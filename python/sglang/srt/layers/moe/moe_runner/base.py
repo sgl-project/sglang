@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextvars
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple, TypeGuard
+from typing import TYPE_CHECKING, Any, Callable, Generator, Optional, Tuple, TypeGuard
 
 import torch
 
@@ -24,6 +26,20 @@ if TYPE_CHECKING:
         DispatchOutput,
         DispatchOutputFormat,
     )
+
+
+_moe_output_buf: contextvars.ContextVar[Optional[torch.Tensor]] = (
+    contextvars.ContextVar("moe_output_buf", default=None)
+)
+
+
+@contextmanager
+def moe_output_buffer_ctx(buf: torch.Tensor) -> Generator[None, None, None]:
+    token = _moe_output_buf.set(buf)
+    try:
+        yield
+    finally:
+        _moe_output_buf.reset(token)
 
 
 @dataclass
