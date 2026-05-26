@@ -10,7 +10,7 @@ non-generator script rejection, lambda-as-script rejection, etc.) see
 launch?" smoke see ``test_scripted_runtime_smoke.py``.
 
 What the demo covers:
-1. Engine launch via :func:`execute_scripted_runtime` (one line).
+1. Engine launch via :class:`ScriptedRuntimeTestCase` (one ENGINE_KWARGS dict).
 2. Submitting requests with :meth:`ScriptedRuntime.start_req`.
 3. Observing request status via :class:`ReqHandle`.
 4. The bare-``yield`` primitive as the single "step the scheduler"
@@ -24,28 +24,29 @@ What the demo covers:
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
 from sglang.test.scripted_runtime.req_handle import ReqHandle
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
+from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 
 
-class TestScriptedRuntimeDemo(CustomTestCase):
+class TestDemo(ScriptedRuntimeTestCase):
     """Single test that walks through every feature for didactic value."""
+
+    ENGINE_KWARGS = dict(
+        model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+        tp_size=1,
+        dp_size=1,
+        pp_size=1,
+        disable_overlap_schedule=True,
+        disable_cuda_graph=True,
+    )
 
     def test_demo(self):
         """Didactic walk-through of every ScriptedRuntime API in one script."""
-        execute_scripted_runtime(
-            self._demo_script,
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            tp_size=1,
-            dp_size=1,
-            pp_size=1,
-            disable_overlap_schedule=True,
-            disable_cuda_graph=True,
-        )
+        self.runtime.run(self._demo_script)
 
     @staticmethod
     def _demo_script(t: ScriptedRuntime):
@@ -157,17 +158,17 @@ class TestScriptedRuntimeDemo(CustomTestCase):
         # ----------------------------------------------------------------
         # Part 6 — Clean shutdown.
         #
-        # When this generator returns (here implicitly), every rank in
-        # the scheduler subprocess raises ScriptedRuntimeFinished after a
-        # cross-rank cpu broadcast of (done=True, exc=None). The scheduler
-        # subprocesses exit with code 0, the test process unblocks from
-        # ``wait_for_completion``, and ``execute_scripted_runtime``
-        # returns normally. No SIGQUIT, no leftover Engine state.
+        # When this generator returns (here implicitly), the router
+        # captures completion and reports "ok" back to the caller; the
+        # next ``self.runtime.run(...)`` call dispatches another
+        # sub-script on the same engine. The engine itself is torn down
+        # by :meth:`ScriptedRuntimeTestCase.tearDownClass` after every
+        # ``test_*`` in this class has run.
         #
         # If you raise from this generator (e.g. an ``assert`` fails),
-        # the same machinery captures the traceback, writes it to a temp
-        # file, and ``execute_scripted_runtime`` re-raises an
-        # ``AssertionError`` on the caller side carrying that text.
+        # the router catches the traceback and sends it back over the
+        # socket; ``self.runtime.run`` re-raises an ``AssertionError`` on
+        # the caller side carrying that text.
         # ----------------------------------------------------------------
 
 
