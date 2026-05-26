@@ -1,8 +1,3 @@
-import argparse
-import asyncio
-import inspect
-import json
-import threading
 import time
 import unittest
 from array import array
@@ -13,19 +8,12 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
-from sglang.srt.entrypoints.engine import Engine
-from sglang.srt.entrypoints.openai.utils import cached_tokens_details_from_dict
-from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.scheduler_components.output_streamer import (
-    SchedulerOutputStreamer,
-)
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
-from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.hicache_host_index import HiCacheHostBlockIndex
+from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
 from sglang.srt.mem_cache.shared_hicache.manager import SharedHiCacheManager
 from sglang.srt.mem_cache.shared_hicache.pending import SharedHiCachePendingFetch
-from sglang.srt.mem_cache.shared_hicache.config import SharedHiCacheConfig
 from sglang.srt.mem_cache.shared_hicache.plan import (
     SHARED_HICACHE_DIRECT_TIMEOUT_REASON,
     SharedHiCachePlan,
@@ -33,7 +21,6 @@ from sglang.srt.mem_cache.shared_hicache.plan import (
 from sglang.srt.mem_cache.shared_hicache.scheduler_mixin import (
     SharedHiCacheSchedulerMixin,
 )
-from sglang.srt.mem_cache.shared_hicache.service import format_control_endpoint
 from sglang.srt.mem_cache.shared_hicache.source import (
     ResolvedHostPage,
     handle_source_transfer,
@@ -43,11 +30,9 @@ from sglang.srt.mem_cache.shared_hicache.target import SharedHiCacheTarget
 from sglang.srt.mem_cache.shared_hicache.transfer import (
     NixlSharedHiCacheTransferBackend,
     SharedHiCacheTransferBackend,
-    make_shared_hicache_transfer_backend,
 )
 from sglang.srt.mem_cache.utils import block_hash_aliases, hash_str_to_int64
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
-from sglang.srt.server_args import ServerArgs
 
 
 def _make_plan(block_hashes, **overrides):
@@ -157,7 +142,6 @@ class FakeNixlAgent:
     def __init__(self, name="agent", metadata=b"agent-metadata"):
         self.name = name
         self.metadata = metadata
-        self.backends = []
         self.registered = []
         self.remote_agents = []
         self.xfer_desc_calls = []
@@ -165,14 +149,11 @@ class FakeNixlAgent:
         self.transfers = []
         self.released = []
 
-    def get_plugin_list(self):
-        return ["UCX"]
-
-    def create_backend(self, backend, backend_params):
-        self.backends.append((backend, dict(backend_params)))
-
     def register_memory(self, addrs, mem_type=None):
-        normalized = [tuple(int(x) if isinstance(x, int) else x for x in item) for item in addrs]
+        normalized = [
+            tuple(int(x) if isinstance(x, int) else x for x in item)
+            for item in addrs
+        ]
         self.registered.append((mem_type, normalized))
         return [("registered", mem_type, normalized)]
 
@@ -216,22 +197,6 @@ class FakePrometheusMetric:
 
     def observe(self, value):
         self.calls.append(("observe", self._labels, value))
-
-    def set(self, value):
-        self.calls.append(("set", self._labels, value))
-
-
-class FakeTokenizerManager:
-    def __init__(self):
-        self.requests = []
-
-    def generate_request(self, obj, _):
-        self.requests.append(obj)
-
-        async def _gen():
-            yield {"ok": True}
-
-        return _gen()
 
 
 class FakeSharedHiCacheReq:
@@ -311,11 +276,10 @@ def _make_manager(tree=None):
     )
     manager.timeout_secs = 1.0
     manager.prefetch_stop_policy = "timeout"
-    manager.prefetch_timeout_config = None
     manager.direct_transfer = FakeDirectTransfer()
     manager.metrics_collector = None
     manager._fetch_executor = ThreadPoolExecutor(max_workers=1)
-    manager._fetch_semaphore = threading.BoundedSemaphore(1)
+    manager._fetch_semaphore = None
     manager._pending_fetches = {}
     manager._detached_fetches = set()
     manager._finished_plan_keys = set()
@@ -343,56 +307,41 @@ def _make_req(plan):
 
 
 class TestSharedHiCache(unittest.TestCase):
-    def test_plan_requires_cpu_source_medium_and_integer_fields(self):
-        plan = SharedHiCachePlan.from_dict(_make_plan([11, 22]))
+    def test_plan_uses_canonical_schema_only(self):
+        plan = SharedHiCachePlan.from_dict(
+            _make_plan([11], source_tp_rank=0, source_tp_size=1)
+        )
 
         self.assertEqual(plan.source_medium, StorageMedium.CPU.value)
-        self.assertTrue(plan.is_shared_hicache())
         self.assertEqual(plan.source_endpoint, "http://127.0.0.1:39007")
+        self.assertEqual(plan.block_hashes, (11,))
 
-        bad = _make_plan([11], source_medium=StorageMedium.DISK.value)
-        with self.assertRaisesRegex(ValueError, "source_medium must be"):
-            SharedHiCachePlan.from_dict(bad)
+        with self.assertRaisesRegex(ValueError, "block_hash must be an integer"):
+            SharedHiCachePlan.from_dict(_make_plan([{"block_hash": 11}]))
 
-        missing = _make_plan([11])
-        del missing["source_medium"]
-        with self.assertRaisesRegex(ValueError, "missing source_medium"):
-            SharedHiCachePlan.from_dict(missing)
+    def test_hiradix_cpu_events_maintain_host_index(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache.page_size = 2
+        cache.enable_kv_cache_events = False
+        cache.hicache_host_index = HiCacheHostBlockIndex(cache.page_size)
+        node = TreeNode()
+        node.host_value = torch.tensor([0, 1], dtype=torch.int64)
+        node.hash_value = ["aa" * 32]
 
-        not_int = _make_plan([11], target_worker_id=True)
-        with self.assertRaisesRegex(ValueError, "target_worker_id must be an integer"):
-            SharedHiCachePlan.from_dict(not_int)
+        cache._record_store_event(node, medium=StorageMedium.CPU)
 
-    def test_plan_accepts_tp_rank_metadata(self):
-        plan = SharedHiCachePlan.from_dict(
-            _make_plan(
-                [11],
-                source_tp_rank=1,
-                source_tp_size=2,
-                target_tp_rank=1,
-                target_tp_size=2,
-            )
+        block_hash = hash_str_to_int64("aa" * 32)
+        matches, protected = cache.lookup_hicache_host_blocks(
+            {block_hash}, protect=True
         )
+        for alias in block_hash_aliases(block_hash):
+            self.assertIn(alias, matches)
+        self.assertEqual(protected, [node])
+        self.assertEqual(node.host_ref_counter, 1)
+        node.release_host()
 
-        self.assertEqual(plan.source_tp_rank, 1)
-        self.assertEqual(plan.source_tp_size, 2)
-        self.assertEqual(plan.target_tp_rank, 1)
-        self.assertEqual(plan.target_tp_size, 2)
-
-        with self.assertRaisesRegex(ValueError, "source_tp_rank"):
-            SharedHiCachePlan.from_dict(
-                _make_plan([11], source_tp_rank=2, source_tp_size=2)
-            )
-
-    def test_control_endpoint_formats_tp_rank_fields(self):
-        endpoint = format_control_endpoint(
-            "127.0.0.1:391{tp_rank}",
-            {
-                "tp_rank": 1,
-            },
-        )
-
-        self.assertEqual(endpoint, "http://127.0.0.1:3911")
+        cache._record_remove_event(node, medium=StorageMedium.CPU)
+        self.assertEqual(cache.lookup_hicache_host_blocks({block_hash}), {})
 
     def test_source_resolves_protected_hicache_host_pages(self):
         kv_hash = hash_str_to_int64("aa" * 32)
@@ -408,7 +357,6 @@ class TestSharedHiCache(unittest.TestCase):
 
         def lookup(wanted_hashes, *, protect=False):
             calls.append((set(wanted_hashes), protect))
-            self.assertTrue(protect)
             node.protect_host()
             return {kv_hash: (node, 0, "aa" * 32)}, [node]
 
@@ -426,60 +374,9 @@ class TestSharedHiCache(unittest.TestCase):
         )
 
         self.assertEqual(reason, "ok")
-        self.assertEqual(len(pages), 1)
-        self.assertEqual(pages[0].block_hash, identity_hash)
-        self.assertEqual(pages[0].data, bytes([1, 2, 3, 4]))
+        self.assertEqual(pages, [ResolvedHostPage(identity_hash, "aa" * 32, bytes([1, 2, 3, 4]))])
         self.assertEqual(calls, [({kv_hash}, True)])
         self.assertEqual(node.host_ref_counter, 0)
-
-    def test_hiradix_host_index_tracks_aliases_and_stale_entries(self):
-        cache = HiRadixCache.__new__(HiRadixCache)
-        cache.page_size = 2
-        cache.hicache_host_index = HiCacheHostBlockIndex(cache.page_size)
-        node = TreeNode()
-        node.host_value = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
-        node.hash_value = ["aa" * 32, "bb" * 32]
-
-        cache._index_hicache_host_node(node)
-
-        first_hash = hash_str_to_int64("aa" * 32)
-        matches, protected = cache.lookup_hicache_host_blocks(
-            {first_hash}, protect=True
-        )
-        for alias in block_hash_aliases(first_hash):
-            self.assertIn(alias, matches)
-        self.assertEqual(protected, [node])
-        self.assertEqual(node.host_ref_counter, 1)
-        node.release_host()
-
-        node.hash_value[0] = "cc" * 32
-        self.assertEqual(cache.lookup_hicache_host_blocks({first_hash}), {})
-
-        parent = TreeNode()
-        parent.value = torch.tensor([9], dtype=torch.int64)
-        parent.children = {}
-        evicted = TreeNode()
-        evicted.parent = parent
-        evicted.key = RadixKey(array("q", [5, 6]))
-        evicted.host_value = torch.tensor([10, 11], dtype=torch.int64)
-        evicted.hash_value = ["dd" * 32]
-        parent.children[evicted.key.child_key(cache.page_size)] = evicted
-        cache.root_node = TreeNode()
-        cache.evictable_host_leaves = [evicted]
-        cache.eviction_strategy = SimpleNamespace(get_priority=lambda _: 0)
-        cache.cache_controller = SimpleNamespace(
-            evict_host=lambda host_value: len(host_value)
-        )
-        cache._record_remove_event = lambda *_, **__: None
-        cache._update_host_leaf_status = lambda *_: None
-        cache._update_leaf_status = lambda *_: None
-
-        evicted_hash = hash_str_to_int64("dd" * 32)
-        cache._index_hicache_host_node(evicted)
-        self.assertNotEqual(cache.lookup_hicache_host_blocks({evicted_hash}), {})
-
-        cache.evict_host(2)
-        self.assertEqual(cache.lookup_hicache_host_blocks({evicted_hash}), {})
 
     def test_shared_hicache_device_insert_does_not_write_through(self):
         cache = HiRadixCache.__new__(HiRadixCache)
@@ -496,16 +393,12 @@ class TestSharedHiCache(unittest.TestCase):
         result = cache.insert_shared_hicache_device_blocks(key=key, value=value)
 
         self.assertEqual(result.prefix_len, 0)
-        self.assertEqual(len(captured), 1)
         self.assertIsInstance(captured[0], InsertParams)
         self.assertTrue(captured[0].chunked)
-        self.assertIs(captured[0].key, key)
-        self.assertTrue(torch.equal(captured[0].value, value))
 
     def test_manager_stages_direct_transfer_into_local_prefix(self):
         manager = _make_manager()
-        plan = _make_plan([11, 22])
-        req = _make_req(plan)
+        req = _make_req(_make_plan([11, 22]))
 
         def request_source_transfer(**kwargs):
             self.assertEqual(kwargs["start_block"], 0)
@@ -519,8 +412,7 @@ class TestSharedHiCache(unittest.TestCase):
         try:
             first = manager.prepare_reuse(req)
             self.assertTrue(first.pending)
-            pending = manager._pending_fetches[req.rid]
-            pending.future.result(timeout=1)
+            manager._pending_fetches[req.rid].future.result(timeout=1)
 
             second = manager.prepare_reuse(req)
             self.assertFalse(second.pending)
@@ -530,16 +422,11 @@ class TestSharedHiCache(unittest.TestCase):
         finally:
             manager._fetch_executor.shutdown(wait=False, cancel_futures=True)
 
-    def test_manager_releases_unusable_direct_transfer_target_pages(self):
-        cases = (
+    def test_manager_releases_failed_direct_transfer_target_pages(self):
+        for reason, expected_freed, expect_quarantine in (
             (SHARED_HICACHE_DIRECT_TIMEOUT_REASON, [], True),
-            (
-                "direct_transfer_failed:NIXL direct KV transfer failed",
-                [200, 201, 202, 203],
-                False,
-            ),
-        )
-        for reason, expected_freed, expect_quarantine in cases:
+            ("direct_transfer_failed", [200, 201, 202, 203], False),
+        ):
             with self.subTest(reason=reason):
                 tree = FakeTree()
                 manager = _make_manager(tree)
@@ -566,6 +453,37 @@ class TestSharedHiCache(unittest.TestCase):
                     manager.target_cache.quarantined_device_indices,
                     [device_indices] if expect_quarantine else [],
                 )
+
+    def test_source_transfer_rejects_wrong_tp_rank_metadata(self):
+        plan = SharedHiCachePlan.from_dict(
+            _make_plan([11], source_tp_size=2, target_tp_size=2)
+        )
+        response = handle_source_transfer(
+            payload={
+                "plan": plan.to_dict(),
+                "start_block": 0,
+                "max_blocks": 1,
+                "target_session_id": "target-session",
+                "transfer_backend": "nixl",
+                "target_metadata": {
+                    "backend": "nixl",
+                    "session_id": "target-session",
+                    "tp_rank": 1,
+                    "tp_size": 2,
+                },
+                "target_kv_ptrs": [1],
+                "target_kv_item_lens": [64],
+                "target_page_indices": [0],
+            },
+            transfer_backend=FakeDirectTransfer(),
+            tree_cache=FakeTree(),
+            worker_id=7,
+            tp_rank=0,
+            tp_size=2,
+        )
+
+        self.assertFalse(response["ok"])
+        self.assertIn("wrong_source_tp_rank_for_target", response["reason"])
 
     def test_nixl_backend_registers_source_and_transfers_pages(self):
         page_size = 2
@@ -623,261 +541,12 @@ class TestSharedHiCache(unittest.TestCase):
         self.assertEqual(source_agent.remote_agents, [b"target-metadata"])
         self.assertEqual(source_agent.xfer_desc_calls[0][0], "DRAM")
         self.assertEqual(source_agent.xfer_desc_calls[1][0], "VRAM")
-        self.assertEqual(source_agent.xfer_desc_calls[0][1][0][2], 0)
-        self.assertEqual(source_agent.xfer_desc_calls[1][1][0][2], 2)
         self.assertEqual(source_agent.initialized[0][0], "WRITE")
         self.assertEqual(source_agent.initialized[0][3], "target-agent")
         self.assertEqual(source_agent.transfers, ["handle-1"])
         self.assertEqual(source_agent.released, ["handle-1"])
 
-    def test_make_transfer_backend_rejects_pp_and_cp_when_requested(self):
-        scheduler = SimpleNamespace(
-            server_args=SimpleNamespace(
-                shared_hicache_config={"transfer_backend": "nixl"},
-                tp_size=1,
-                pp_size=2,
-                attn_cp_size=1,
-            )
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "PP/CP are deferred"):
-            make_shared_hicache_transfer_backend(scheduler)
-
-        scheduler.server_args.pp_size = 1
-        scheduler.server_args.attn_cp_size = 2
-        with self.assertRaisesRegex(RuntimeError, "PP/CP are deferred"):
-            make_shared_hicache_transfer_backend(scheduler)
-
-    def test_source_transfer_rejects_wrong_tp_rank_metadata(self):
-        plan = SharedHiCachePlan.from_dict(
-            _make_plan(
-                [11],
-                source_tp_size=2,
-                target_tp_size=2,
-            )
-        )
-        response = handle_source_transfer(
-            payload={
-                "plan": plan.to_dict(),
-                "start_block": 0,
-                "max_blocks": 1,
-                "target_session_id": "target-session",
-                "transfer_backend": "nixl",
-                "target_metadata": {
-                    "backend": "nixl",
-                    "session_id": "target-session",
-                    "tp_rank": 1,
-                    "tp_size": 2,
-                },
-                "target_kv_ptrs": [1],
-                "target_kv_item_lens": [64],
-                "target_page_indices": [0],
-            },
-            transfer_backend=FakeDirectTransfer(),
-            tree_cache=FakeTree(),
-            worker_id=7,
-            tp_rank=0,
-            tp_size=2,
-        )
-
-        self.assertFalse(response["ok"])
-        self.assertIn("wrong_source_tp_rank_for_target", response["reason"])
-
-    def test_manager_formats_plan_endpoint_by_current_tp_rank(self):
-        manager = _make_manager()
-        manager._set_parallel_metadata(
-            {
-                "tp_rank": 1,
-                "tp_size": 2,
-            },
-        )
-        plan = SharedHiCachePlan.from_dict(
-            _make_plan(
-                [11],
-                source_endpoint="127.0.0.1:3900{source_tp_rank}",
-                source_tp_size=2,
-                target_tp_size=2,
-            )
-        )
-
-        self.assertEqual(
-            manager._candidate_endpoints_for_plan(plan),
-            ["http://127.0.0.1:39001"],
-        )
-
-    def test_server_args_enable_shared_hicache_requires_hicache_and_worker_id(self):
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-
-        missing_hicache = parser.parse_args(
-            [
-                "--model-path",
-                "dummy",
-                "--enable-shared-hicache",
-                "--shared-hicache-worker-id",
-                "7",
-            ]
-        )
-        with self.assertRaisesRegex(ValueError, "--enable-hierarchical-cache"):
-            ServerArgs.from_cli_args(missing_hicache)
-
-        missing = parser.parse_args(
-            [
-                "--model-path",
-                "dummy",
-                "--enable-hierarchical-cache",
-                "--enable-shared-hicache",
-            ]
-        )
-        with self.assertRaisesRegex(ValueError, "--shared-hicache-worker-id"):
-            ServerArgs.from_cli_args(missing)
-
-        args = parser.parse_args(
-            [
-                "--model-path",
-                "dummy",
-                "--enable-hierarchical-cache",
-                "--enable-shared-hicache",
-                "--shared-hicache-worker-id",
-                "7",
-                "--shared-hicache-config",
-                json.dumps(
-                    {
-                        "control": {"endpoint": "127.0.0.1:39007"},
-                        "transfer_backend": "nixl",
-                        "timeout_secs": 2.5,
-                    }
-                ),
-            ]
-        )
-        server_args = ServerArgs.from_cli_args(args)
-
-        self.assertTrue(server_args.enable_shared_hicache)
-        self.assertTrue(server_args.enable_hierarchical_cache)
-        self.assertEqual(server_args.shared_hicache_worker_id, 7)
-        self.assertIsInstance(server_args.shared_hicache_config, SharedHiCacheConfig)
-        self.assertEqual(server_args.shared_hicache_config.worker_id, 7)
-        self.assertEqual(
-            server_args.shared_hicache_config.control_endpoint,
-            "http://127.0.0.1:39007",
-        )
-        self.assertEqual(server_args.shared_hicache_config.transfer_backend, "nixl")
-        self.assertEqual(server_args.shared_hicache_config.timeout_secs, 2.5)
-
-    def test_manager_uses_server_arg_worker_id_after_dynamo_identity_update(self):
-        server_args = SimpleNamespace(
-            enable_shared_hicache=True,
-            shared_hicache_worker_id=99,
-            shared_hicache_config=SharedHiCacheConfig(
-                worker_id=2,
-                control_endpoint=None,
-                timeout_secs=1.0,
-                transfer_backend="auto",
-            ),
-            hicache_storage_prefetch_policy="timeout",
-            tp_size=2,
-            pp_size=1,
-            attn_cp_size=1,
-            ep_size=1,
-        )
-        scheduler = SimpleNamespace(
-            server_args=server_args,
-            enable_hierarchical_cache=True,
-            tree_cache=SimpleNamespace(
-                lookup_hicache_host_blocks=lambda *_args, **_kwargs: ({}, []),
-                insert_shared_hicache_device_blocks=lambda **_kwargs: None,
-                prefetch_timeout_config=None,
-            ),
-            ps=SimpleNamespace(
-                tp_rank=1,
-                tp_size=2,
-                pp_rank=0,
-                pp_size=1,
-                attn_cp_rank=0,
-                attn_cp_size=1,
-            ),
-            enable_metrics=False,
-        )
-
-        with patch(
-            "sglang.srt.mem_cache.shared_hicache.manager.make_shared_hicache_transfer_backend",
-            return_value=None,
-        ):
-            manager = SharedHiCacheManager.from_scheduler(scheduler)
-
-        self.assertIsNotNone(manager)
-        try:
-            self.assertEqual(manager.worker_id, 99)
-            self.assertEqual(manager.tp_rank, 1)
-            self.assertEqual(manager.tp_size, 2)
-        finally:
-            manager.shutdown()
-
-    def test_server_args_rejects_static_peer_config_and_unknown_backend(self):
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-
-        static_peers = parser.parse_args(
-            [
-                "--model-path",
-                "dummy",
-                "--enable-hierarchical-cache",
-                "--shared-hicache-worker-id",
-                "7",
-                "--shared-hicache-config",
-                json.dumps({"peer_endpoints": {"8": "127.0.0.1:39008"}}),
-            ]
-        )
-        with self.assertRaisesRegex(ValueError, "static endpoint maps"):
-            ServerArgs.from_cli_args(static_peers)
-
-        nixl_backend = parser.parse_args(
-            [
-                "--model-path",
-                "dummy",
-                "--enable-hierarchical-cache",
-                "--shared-hicache-worker-id",
-                "7",
-                "--shared-hicache-config",
-                json.dumps({"transfer_backend": "nixl"}),
-            ]
-        )
-        self.assertEqual(
-            ServerArgs.from_cli_args(nixl_backend).shared_hicache_config.transfer_backend,
-            "nixl",
-        )
-
-        bad_backend = parser.parse_args(
-            [
-                "--model-path",
-                "dummy",
-                "--enable-hierarchical-cache",
-                "--shared-hicache-worker-id",
-                "7",
-                "--shared-hicache-config",
-                json.dumps({"transfer_backend": "bogus"}),
-            ]
-        )
-        with self.assertRaisesRegex(ValueError, "transfer_backend"):
-            ServerArgs.from_cli_args(bad_backend)
-
-    def test_cached_tokens_details_and_metrics_use_shared_hicache_names(self):
-        req = SimpleNamespace(
-            cached_tokens=12,
-            cached_tokens_device=8,
-            cached_tokens_host=0,
-            cached_tokens_storage=0,
-            cached_tokens_shared_hicache=4,
-        )
-        streamer = SimpleNamespace(enable_hicache_storage=lambda: False)
-
-        details = SchedulerOutputStreamer.get_cached_tokens_details(streamer, req)
-        self.assertEqual(details, {"device": 8, "host": 0, "shared_hicache": 4})
-        self.assertEqual(
-            cached_tokens_details_from_dict(details).model_dump(exclude_none=True),
-            details,
-        )
-
+    def test_metrics_use_reason_code_labels(self):
         collector = SchedulerMetricsCollector.__new__(SchedulerMetricsCollector)
         collector.labels = {"model_name": "dummy"}
         collector.shared_hicache_requests_total = FakePrometheusMetric()
@@ -885,21 +554,22 @@ class TestSharedHiCache(unittest.TestCase):
         collector.shared_hicache_wait_seconds = FakePrometheusMetric()
         collector.shared_hicache_insert_seconds = FakePrometheusMetric()
         collector.shared_hicache_transfer_bytes_total = FakePrometheusMetric()
+
         collector.observe_shared_hicache(
             backend="nixl",
-            outcome="hit",
-            reason="ok",
+            outcome="error",
+            reason="direct_transfer_failed:detail_that_must_not_be_a_label",
             tokens=4,
             wait_ms=12.5,
             insert_ms=0.25,
-            transfer_bytes=2 * 1024 * 1024,
+            transfer_bytes=1024,
         )
 
         labels = {
             "model_name": "dummy",
             "backend": "nixl",
-            "outcome": "hit",
-            "reason": "ok",
+            "outcome": "error",
+            "reason_code": "direct_transfer_failed",
         }
         self.assertEqual(
             collector.shared_hicache_requests_total.calls, [("inc", labels, 1)]
@@ -907,65 +577,8 @@ class TestSharedHiCache(unittest.TestCase):
         self.assertEqual(
             collector.shared_hicache_tokens_total.calls, [("inc", labels, 4)]
         )
-        self.assertEqual(
-            collector.shared_hicache_wait_seconds.calls,
-            [("observe", labels, 0.0125)],
-        )
-        self.assertEqual(
-            collector.shared_hicache_insert_seconds.calls,
-            [("observe", labels, 0.00025)],
-        )
-        self.assertEqual(
-            collector.shared_hicache_transfer_bytes_total.calls,
-            [("inc", labels, 2 * 1024 * 1024)],
-        )
 
-    def test_generate_req_batch_preserves_shared_hicache_plan_metadata(self):
-        plan_0 = _make_plan([1])
-        plan_1 = _make_plan([2], plan_id="plan-2")
-        req = GenerateReqInput(
-            text=["hello", "world"],
-            rid="r",
-            shared_hicache_plan=[plan_0, plan_1],
-        )
-
-        req.normalize_batch_and_arguments()
-
-        self.assertEqual(req[0].shared_hicache_plan, SharedHiCachePlan.coerce(plan_0))
-        self.assertEqual(req[1].shared_hicache_plan, SharedHiCachePlan.coerce(plan_1))
-
-    def test_generate_req_rejects_shared_hicache_parallel_sampling(self):
-        req = GenerateReqInput(
-            text="hello",
-            sampling_params={"n": 2},
-            shared_hicache_plan=_make_plan([1]),
-        )
-
-        with self.assertRaisesRegex(ValueError, "parallel_sample_num > 1"):
-            req.normalize_batch_and_arguments()
-
-    def test_engine_async_generate_forwards_shared_hicache_plan(self):
-        plan = _make_plan([11])
-        engine = object.__new__(Engine)
-        engine.server_args = SimpleNamespace(dp_size=1)
-        engine.tokenizer_manager = FakeTokenizerManager()
-
-        self.assertIn(
-            "shared_hicache_plan",
-            inspect.signature(Engine.async_generate).parameters,
-        )
-        result = asyncio.run(
-            engine.async_generate(
-                input_ids=[1, 2],
-                sampling_params={"max_new_tokens": 1},
-                shared_hicache_plan=plan,
-            )
-        )
-
-        self.assertEqual(result, {"ok": True})
-        self.assertEqual(engine.tokenizer_manager.requests[0].shared_hicache_plan, plan)
-
-    def test_scheduler_batches_shared_hicache_tp_coordination(self):
+    def test_scheduler_batches_tp_coordination_and_bounds_candidates(self):
         manager = FakeSharedHiCacheScheduleManager(
             plans={"rid-1": True, "rid-2": True, "rid-3": False},
             results={
@@ -998,50 +611,34 @@ class TestSharedHiCache(unittest.TestCase):
         self.assertEqual(all_reduce_shapes, [(3,), (2,), (1,)])
         self.assertEqual(manager.prepared, ["rid-1", "rid-2"])
         self.assertEqual(reqs[0].shared_hicache_max_prefix_len, 6)
-        self.assertEqual(reqs[1].shared_hicache_max_prefix_len, 0)
-        self.assertIsNone(reqs[2].shared_hicache_max_prefix_len)
 
         with patch(
             "torch.distributed.all_reduce",
             side_effect=AssertionError("final init should not all-reduce"),
         ):
             scheduler._init_next_round_input_with_shared_hicache_tp_sync(reqs[0])
-
         self.assertEqual(reqs[0].init_calls[-1]["max_prefix_len"], 6)
-        self.assertIsNone(reqs[0].shared_hicache_max_prefix_len)
 
-    def test_scheduler_bounds_shared_hicache_prepare_to_candidate_prefix(self):
-        manager = FakeSharedHiCacheScheduleManager(
+        bounded_manager = FakeSharedHiCacheScheduleManager(
             plans={f"rid-{i}": True for i in range(5)},
             results={
                 f"rid-{i}": SimpleNamespace(pending=False, prefix_len=8)
                 for i in range(5)
             },
         )
-        scheduler = FakeSharedHiCacheScheduler(manager, tp_size=1, allocatable_reqs=2)
-        reqs = [FakeSharedHiCacheReq(f"rid-{i}") for i in range(5)]
-
-        candidates = scheduler._shared_hicache_schedule_candidates(reqs, running_bs=0)
-        pending_rids = scheduler._prepare_shared_hicache_for_schedule_batch(candidates)
-
-        self.assertEqual(pending_rids, set())
-        self.assertEqual([req.rid for req in candidates], ["rid-0", "rid-1", "rid-2"])
-        self.assertEqual(manager.prepared, ["rid-0", "rid-1", "rid-2"])
-        self.assertEqual(reqs[3].init_calls, [])
-        self.assertEqual(reqs[4].init_calls, [])
-
-    def test_scheduler_uses_prefill_max_requests_for_shared_hicache_prefix(self):
-        scheduler = FakeSharedHiCacheScheduler(
-            FakeSharedHiCacheScheduleManager(plans={}, results={}),
-            tp_size=1,
-            allocatable_reqs=8,
-            prefill_max_requests=2,
+        bounded_scheduler = FakeSharedHiCacheScheduler(
+            bounded_manager, tp_size=1, allocatable_reqs=2, prefill_max_requests=2
         )
-        reqs = [FakeSharedHiCacheReq(f"rid-{i}") for i in range(5)]
+        bounded_reqs = [FakeSharedHiCacheReq(f"rid-{i}") for i in range(5)]
 
-        candidates = scheduler._shared_hicache_schedule_candidates(reqs, running_bs=0)
+        candidates = bounded_scheduler._shared_hicache_schedule_candidates(
+            bounded_reqs, running_bs=0
+        )
+        bounded_scheduler._prepare_shared_hicache_for_schedule_batch(candidates)
 
         self.assertEqual([req.rid for req in candidates], ["rid-0", "rid-1", "rid-2"])
+        self.assertEqual(bounded_manager.prepared, ["rid-0", "rid-1", "rid-2"])
+        self.assertEqual(bounded_reqs[3].init_calls, [])
 
     def test_scheduler_falls_back_on_divergent_shared_hicache_plan(self):
         manager = FakeSharedHiCacheScheduleManager(

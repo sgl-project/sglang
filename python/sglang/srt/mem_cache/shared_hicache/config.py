@@ -111,51 +111,13 @@ def normalize_shared_hicache_server_config(
         return True, config_data.worker_id, config_data
 
     config: Dict[str, Any] = dict(config_data or {})
-    if any(
-        key in config
-        for key in (
-            "endpoint",
-            "peer_endpoints",
-            "static_peer_endpoints",
-            "http_control",
-        )
-    ):
-        raise ValueError(
-            "shared_hicache_config static endpoint maps are not supported; put the "
-            "local bind endpoint under control.endpoint and let each SharedHiCache "
-            "plan provide source_endpoint"
-        )
-    if "fetch_workers" in config:
-        raise ValueError(
-            "shared_hicache_config.fetch_workers is not supported; use "
-            "SGLANG_SHARED_HICACHE_FETCH_WORKERS"
-        )
-    if "transfer_parallelism" in config:
-        raise ValueError(
-            "shared_hicache_config.transfer_parallelism is not supported; use "
-            "SGLANG_SHARED_HICACHE_TRANSFER_PARALLELISM"
-        )
-
     control_config = config.get("control") or {}
     if not isinstance(control_config, dict):
         raise ValueError("shared_hicache_config.control must be a JSON object")
-    if any(
-        key in control_config
-        for key in ("workers", "peer_endpoints", "static_peer_endpoints")
-    ):
-        raise ValueError(
-            "shared_hicache_config.control static worker maps are not supported; "
-            "use source_endpoint from each SharedHiCache plan"
-        )
 
     transfer_config = config.get("transfer") or {}
     if not isinstance(transfer_config, dict):
         raise ValueError("shared_hicache_config.transfer must be a JSON object")
-    if "parallelism" in transfer_config:
-        raise ValueError(
-            "shared_hicache_config.transfer.parallelism is not supported; use "
-            "SGLANG_SHARED_HICACHE_TRANSFER_PARALLELISM"
-        )
 
     if "worker_id" in config:
         worker_id = config["worker_id"]
@@ -163,12 +125,6 @@ def normalize_shared_hicache_server_config(
         raise ValueError("--enable-shared-hicache requires --shared-hicache-worker-id")
     if not isinstance(worker_id, int) or isinstance(worker_id, bool) or worker_id < 0:
         raise ValueError("shared_hicache_worker_id must be a non-negative integer")
-
-    if "control_backend" in config or "backend" in control_config:
-        raise ValueError(
-            "shared_hicache_config.control.backend is not supported; "
-            "SharedHiCache plans carry the source endpoint directly"
-        )
 
     transfer_backend_name = str(
         config.get("transfer_backend", transfer_config.get("backend", "auto"))

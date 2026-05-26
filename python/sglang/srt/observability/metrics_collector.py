@@ -41,6 +41,10 @@ SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STAT
 logger = logging.getLogger(__name__)
 
 
+def _shared_hicache_reason_code(reason: str) -> str:
+    return str(reason or "unknown").split(":", 1)[0] or "unknown"
+
+
 @dataclass
 class QueueCount:
     """Holds both the total count and optional per-priority breakdown for a queue."""
@@ -551,15 +555,19 @@ class SchedulerMetricsCollector:
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
-            shared_hicache_labels = list(labels.keys()) + ["backend", "outcome", "reason"]
+            shared_hicache_labels = list(labels.keys()) + [
+                "backend",
+                "outcome",
+                "reason_code",
+            ]
             self.shared_hicache_requests_total = Counter(
                 name="sglang:shared_hicache_requests_total",
-                documentation="Shared HiCache KV reuse requests by backend, outcome, and reason.",
+                documentation="Shared HiCache KV reuse requests by backend, outcome, and reason code.",
                 labelnames=shared_hicache_labels,
             )
             self.shared_hicache_tokens_total = Counter(
                 name="sglang:shared_hicache_tokens_total",
-                documentation="Tokens staged by Shared HiCache KV reuse by backend, outcome, and reason.",
+                documentation="Tokens staged by Shared HiCache KV reuse by backend, outcome, and reason code.",
                 labelnames=shared_hicache_labels,
             )
             self.shared_hicache_wait_seconds = Histogram(
@@ -581,7 +589,7 @@ class SchedulerMetricsCollector:
             )
             shared_hicache_quarantine_labels = list(labels.keys()) + [
                 "backend",
-                "reason",
+                "reason_code",
             ]
             self.shared_hicache_quarantine_events_total = Counter(
                 name="sglang:shared_hicache_quarantine_events_total",
@@ -1121,7 +1129,7 @@ class SchedulerMetricsCollector:
             **self.labels,
             "backend": backend,
             "outcome": outcome,
-            "reason": reason,
+            "reason_code": _shared_hicache_reason_code(reason),
         }
         requests_total.labels(**labels).inc(1)
 
@@ -1160,7 +1168,7 @@ class SchedulerMetricsCollector:
         event_labels = {
             **self.labels,
             "backend": backend,
-            "reason": reason,
+            "reason_code": _shared_hicache_reason_code(reason),
         }
         gauge_labels = {
             **self.labels,

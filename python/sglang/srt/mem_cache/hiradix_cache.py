@@ -662,6 +662,16 @@ class HiRadixCache(RadixCache):
     ) -> InsertResult:
         return self.insert(InsertParams(key=key, value=value, chunked=True))
 
+    def _record_store_event(self, node, medium=None):
+        super()._record_store_event(node, medium=medium)
+        if medium == StorageMedium.CPU:
+            self._index_hicache_host_node(node)
+
+    def _record_remove_event(self, node, medium=None):
+        if medium == StorageMedium.CPU:
+            self._drop_hicache_host_node(node)
+        super()._record_remove_event(node, medium=medium)
+
     def get_height(self, node: TreeNode):
         height = 0
         while node != self.root_node:
@@ -785,7 +795,6 @@ class HiRadixCache(RadixCache):
                         self._record_store_event(
                             backuped_node, medium=StorageMedium.CPU
                         )
-                        self._index_hicache_host_node(backuped_node)
                         if self.enable_storage:
                             self.write_backup_storage(backuped_node)
                 self.cache_controller.ack_write_queue.clear()
@@ -813,7 +822,6 @@ class HiRadixCache(RadixCache):
                 backuped_node = self.ongoing_write_through.pop(ack_id)
                 # DMA confirmed -- block is now on host.
                 self._record_store_event(backuped_node, medium=StorageMedium.CPU)
-                self._index_hicache_host_node(backuped_node)
                 self.dec_lock_ref(backuped_node)
                 if self.enable_storage:
                     self.write_backup_storage(backuped_node)
@@ -984,7 +992,6 @@ class HiRadixCache(RadixCache):
 
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit remove(CPU) so the router drops the host-tier entry.
-            self._drop_hicache_host_node(x)
             self._record_remove_event(x, medium=StorageMedium.CPU)
             num_evicted += self.cache_controller.evict_host(x.host_value)
 
@@ -1381,7 +1388,6 @@ class HiRadixCache(RadixCache):
             # Publish the newly materialized host suffix immediately so downstream
             # cache indexers can resolve descendants that extend this L2-only prefix.
             self._record_store_event(new_node, medium=StorageMedium.CPU)
-            self._index_hicache_host_node(new_node)
 
         return matched_length
 

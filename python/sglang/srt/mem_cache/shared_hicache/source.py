@@ -222,10 +222,10 @@ def _coerce_int(value: Any, field_name: str) -> int:
 
 def _coerce_transfer_int(value: Any, field_name: str) -> int:
     if isinstance(value, bool):
-        raise ValueError(f"{field_name}_contains_non_integer:{value!r}")
+        raise ValueError(f"{field_name}_contains_non_integer")
     if isinstance(value, (int, np.integer)):
         return int(value)
-    raise ValueError(f"{field_name}_contains_non_integer:{value!r}")
+    raise ValueError(f"{field_name}_contains_non_integer")
 
 
 def _coerce_transfer_int_list(raw: Any, field_name: str) -> list[int]:
@@ -347,7 +347,7 @@ def _parse_target_kv_metadata(
             None,
             None,
             None,
-            f"target_kv_ptrs_len_{len(target_kv_ptrs)}!=target_kv_item_lens_len_{len(target_kv_item_lens)}",
+            "target_kv_item_lens_count_mismatch",
         )
 
     uint64_max = int(np.iinfo(np.uint64).max)
@@ -361,25 +361,19 @@ def _parse_target_kv_metadata(
         try:
             expected_item_lens = [int(length) for length in expected_item_lens]
         except (TypeError, ValueError) as err:
-            return None, None, None, f"local_target_kv_item_lens:{err}"
+            return None, None, None, "local_target_kv_item_lens_invalid"
         if len(expected_item_lens) != len(target_kv_item_lens):
             return (
                 None,
                 None,
                 None,
-                f"target_kv_item_lens_count_mismatch:expected={len(expected_item_lens)}:got={len(target_kv_item_lens)}",
+                "target_kv_item_lens_count_mismatch",
             )
         for idx, (expected, actual) in enumerate(
             zip(expected_item_lens, target_kv_item_lens)
         ):
             if expected != actual:
-                return (
-                    None,
-                    None,
-                    None,
-                    "target_kv_item_lens_mismatch:"
-                    f"idx={idx}:expected={expected}:got={actual}",
-                )
+                return None, None, None, "target_kv_item_lens_mismatch"
 
     return target_session_id, target_kv_ptrs, target_kv_item_lens, None
 
@@ -524,10 +518,7 @@ def handle_source_transfer(
             if len(target_page_indices_list) < len(pages):
                 return {
                     "ok": False,
-                    "reason": (
-                        "malformed_transfer_request:"
-                        f"target_page_indices_too_short:{len(target_page_indices_list)}<{len(pages)}"
-                    ),
+                    "reason": "malformed_transfer_request:target_page_indices_too_short",
                     "block_size_tokens": tree_cache.page_size,
                 }
             target_page_indices_list = target_page_indices_list[: len(pages)]
@@ -545,11 +536,9 @@ def handle_source_transfer(
             except Exception as err:
                 transfer_ms = (time.perf_counter() - transfer_start) * 1000
                 if _is_timeout_error(err):
-                    failure_reason = (
-                        f"{SHARED_HICACHE_DIRECT_TIMEOUT_REASON}:source:{err}"
-                    )
+                    failure_reason = SHARED_HICACHE_DIRECT_TIMEOUT_REASON
                 else:
-                    failure_reason = f"direct_transfer_failed:{err}"
+                    failure_reason = "direct_transfer_failed"
                 logger.warning(
                     "SharedHiCache source direct transfer failed pages=%d resolve_ms=%.3f transfer_ms=%.3f reason=%s",
                     len(pages),

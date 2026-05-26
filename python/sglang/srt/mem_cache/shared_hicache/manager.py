@@ -90,9 +90,6 @@ class SharedHiCacheManager:
         self.prefetch_stop_policy = getattr(
             server_args, "hicache_storage_prefetch_policy", "timeout"
         )
-        self.prefetch_timeout_config = getattr(
-            tree_cache, "prefetch_timeout_config", None
-        )
         self.direct_transfer = direct_transfer
         self.metrics_collector = metrics_collector
         if not self._direct_transfer_enabled():
@@ -124,7 +121,6 @@ class SharedHiCacheManager:
         )
         self._finished_plan_keys: set[tuple[str, str]] = set()
         self._finished_plan_prefix_lens: dict[tuple[str, str], int] = {}
-        self.max_control_body_bytes = SHARED_HICACHE_MAX_CONTROL_BODY_BYTES
         self._direct_transfer_shutdown_done = False
         self._direct_transfer_shutdown_deferred = False
         self._direct_transfer_shutdown_lock = threading.Lock()
@@ -134,7 +130,7 @@ class SharedHiCacheManager:
                 endpoint=self.endpoint,
                 worker_id=self.worker_id,
                 worker_limit=worker_limit,
-                max_body_bytes=self._max_control_body_bytes,
+                max_body_bytes=lambda: SHARED_HICACHE_MAX_CONTROL_BODY_BYTES,
                 direct_transfer_enabled=self._direct_transfer_enabled,
                 handle_source_transfer=self._handle_source_transfer,
             )
@@ -269,15 +265,6 @@ class SharedHiCacheManager:
         direct_transfer = getattr(self, "direct_transfer", None)
         return direct_transfer is not None and bool(
             getattr(direct_transfer, "enabled", False)
-        )
-
-    def _max_control_body_bytes(self) -> int:
-        return int(
-            getattr(
-                self,
-                "max_control_body_bytes",
-                SHARED_HICACHE_MAX_CONTROL_BODY_BYTES,
-            )
         )
 
     def _try_acquire_fetch_worker(self) -> bool:

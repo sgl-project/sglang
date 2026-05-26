@@ -131,7 +131,7 @@ def start_source_transfer_server(
                         400,
                         {
                             "ok": False,
-                            "reason": f"malformed_control_payload:json:{err}",
+                            "reason": "malformed_control_payload:json",
                         },
                     )
                     return
@@ -178,7 +178,9 @@ def start_source_transfer_server(
                 )
             except Exception as err:
                 logger.exception("Shared HiCache source transfer failed")
-                self._write_json(500, {"ok": False, "reason": str(err)})
+                self._write_json(
+                    500, {"ok": False, "reason": "source_transfer_exception"}
+                )
             finally:
                 exit_resolver()
 
@@ -289,7 +291,7 @@ def request_source_transfer(
             UnicodeDecodeError,
         ) as err:
             if is_timeout_error(err):
-                last_reason = f"{SHARED_HICACHE_DIRECT_TIMEOUT_REASON}:{err}"
+                last_reason = SHARED_HICACHE_DIRECT_TIMEOUT_REASON
                 logger.warning(
                     "Shared HiCache direct transfer timed out endpoint=%s ms=%.3f; target pages will be quarantined reason=%s",
                     endpoint,
@@ -297,7 +299,7 @@ def request_source_transfer(
                     last_reason,
                 )
                 return [], last_reason
-            last_reason = f"source_transfer_failed:{err}"
+            last_reason = "source_transfer_failed"
             logger.debug(
                 "Shared HiCache direct transfer request failed endpoint=%s ms=%.3f request_encode_ms=%.3f http_read_ms=%.3f response_decode_ms=%.3f request_bytes=%d response_bytes=%d reason=%s",
                 endpoint,
@@ -356,7 +358,7 @@ def request_source_transfer(
             )
             parse_ms = (time.perf_counter() - parse_start) * 1000
         except (TypeError, KeyError, ValueError) as err:
-            last_reason = f"malformed_source_transfer_response:{err}"
+            last_reason = "malformed_source_transfer_response"
             logger.debug(
                 "Shared HiCache direct transfer returned malformed pages endpoint=%s ms=%.3f request_encode_ms=%.3f http_read_ms=%.3f response_decode_ms=%.3f request_bytes=%d response_bytes=%d reason=%s",
                 endpoint,

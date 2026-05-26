@@ -64,12 +64,6 @@ def _coerce_array(value: Any, field_name: str) -> list[Any]:
 
 
 def _coerce_block_hash(value: Any) -> int:
-    if isinstance(value, Mapping):
-        for key in ("block_hash", "hash", "value", "0"):
-            if key in value:
-                return _coerce_int(value[key], "block_hash")
-        if len(value) == 1:
-            return _coerce_int(next(iter(value.values())), "block_hash")
     return _coerce_int(value, "block_hash")
 
 
@@ -78,13 +72,6 @@ def expand_block_hash_aliases(values: Iterable[int]) -> set[int]:
     for value in values:
         aliases.update(block_hash_aliases(value))
     return aliases
-
-
-def _first_present(data: Mapping[str, Any], *names: str, default: Any = None) -> Any:
-    for name in names:
-        if name in data:
-            return data[name]
-    return default
 
 
 @dataclass(frozen=True)
@@ -113,16 +100,13 @@ class SharedHiCachePlan:
         if not isinstance(data, Mapping):
             raise ValueError("SharedHiCache plan must be a mapping")
 
-        block_hashes_raw = _first_present(data, "block_hashes", "hashes")
-        if block_hashes_raw is None:
+        if "block_hashes" not in data:
             raise ValueError("SharedHiCache plan missing block_hashes")
         block_hashes = tuple(
             _coerce_block_hash(item)
-            for item in _coerce_array(block_hashes_raw, "block_hashes")
+            for item in _coerce_array(data["block_hashes"], "block_hashes")
         )
-        kv_block_hashes_raw = _first_present(
-            data, "kv_block_hashes", "source_block_hashes", default=()
-        )
+        kv_block_hashes_raw = data.get("kv_block_hashes", ())
         if kv_block_hashes_raw is None:
             kv_block_hashes_raw = ()
         kv_block_hashes = tuple(
@@ -135,30 +119,19 @@ class SharedHiCachePlan:
             )
 
         planned_prefix_blocks = _coerce_int(
-            _first_present(
-                data,
-                "planned_prefix_blocks",
-                "planned_blocks",
-                "num_blocks",
-                default=len(block_hashes),
-            ),
+            data.get("planned_prefix_blocks", len(block_hashes)),
             "planned_prefix_blocks",
         )
         if planned_prefix_blocks < 0:
             raise ValueError("planned_prefix_blocks must be non-negative")
         start_block_index = _coerce_int(
-            _first_present(data, "start_block_index", default=0),
+            data.get("start_block_index", 0),
             "start_block_index",
         )
         if start_block_index < 0:
             raise ValueError("start_block_index must be non-negative")
 
-        source_endpoint = _first_present(
-            data,
-            "source_endpoint",
-            "source_control_endpoint",
-            default=None,
-        )
+        source_endpoint = data.get("source_endpoint")
         if source_endpoint is not None:
             if not isinstance(source_endpoint, str) or not source_endpoint.strip():
                 raise ValueError("source_endpoint must be a non-empty string")
@@ -166,8 +139,8 @@ class SharedHiCachePlan:
 
         try:
             plan = cls(
-                plan_id=str(_first_present(data, "plan_id", default="")),
-                request_id=str(_first_present(data, "request_id", default="")),
+                plan_id=str(data.get("plan_id", "")),
+                request_id=str(data.get("request_id", "")),
                 target_worker_id=_coerce_int(
                     data["target_worker_id"], "target_worker_id"
                 ),
@@ -181,35 +154,33 @@ class SharedHiCachePlan:
                 block_hashes=block_hashes,
                 planned_prefix_blocks=min(planned_prefix_blocks, len(block_hashes)),
                 block_size_tokens=_coerce_int(
-                    _first_present(data, "block_size_tokens", "block_size"),
+                    data["block_size_tokens"],
                     "block_size_tokens",
                 ),
                 created_at_ms=_coerce_int(
-                    _first_present(data, "created_at_ms", default=0), "created_at_ms"
+                    data.get("created_at_ms", 0), "created_at_ms"
                 ),
                 expires_at_ms=_coerce_int(data["expires_at_ms"], "expires_at_ms"),
                 start_block_index=start_block_index,
                 plan_version=_coerce_int(
-                    _first_present(
-                        data, "plan_version", default=SHARED_HICACHE_PLAN_VERSION
-                    ),
+                    data.get("plan_version", SHARED_HICACHE_PLAN_VERSION),
                     "plan_version",
                 ),
                 kv_block_hashes=kv_block_hashes,
                 source_tp_rank=_coerce_optional_int(
-                    _first_present(data, "source_tp_rank", default=None),
+                    data.get("source_tp_rank"),
                     "source_tp_rank",
                 ),
                 source_tp_size=_coerce_positive_int(
-                    _first_present(data, "source_tp_size", default=1),
+                    data.get("source_tp_size", 1),
                     "source_tp_size",
                 ),
                 target_tp_rank=_coerce_optional_int(
-                    _first_present(data, "target_tp_rank", default=None),
+                    data.get("target_tp_rank"),
                     "target_tp_rank",
                 ),
                 target_tp_size=_coerce_positive_int(
-                    _first_present(data, "target_tp_size", default=1),
+                    data.get("target_tp_size", 1),
                     "target_tp_size",
                 ),
             )

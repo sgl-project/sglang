@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -322,6 +323,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         self._source_registered = False
         self._source_registered_ptrs: list[int] = []
         self._remote_agents: set[str] = set()
+        self._transfer_lock = threading.Lock()
         self._gpu_id = int(gpu_id)
         if transfer_parallelism is None:
             transfer_parallelism = default_shared_hicache_transfer_parallelism()
@@ -501,38 +503,39 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         target_kv_item_lens: list[int],
         target_metadata: Optional[Mapping[str, Any]] = None,
     ) -> None:
-        target_agent_name, target_gpu_id = self._add_remote_target(target_metadata)
-        source_kv_ptrs, source_kv_item_lens = self._source_host_buf_infos()
-        src_addrs, dst_addrs, lengths, num_blocks = _build_grouped_transfer_arrays(
-            source_page_indices=source_page_indices,
-            target_page_indices=target_page_indices,
-            source_kv_ptrs=source_kv_ptrs,
-            target_kv_ptrs=target_kv_ptrs,
-            source_kv_item_lens=source_kv_item_lens,
-            target_kv_item_lens=target_kv_item_lens,
-        )
-        if src_addrs.size == 0:
-            return
+        with self._transfer_lock:
+            target_agent_name, target_gpu_id = self._add_remote_target(target_metadata)
+            source_kv_ptrs, source_kv_item_lens = self._source_host_buf_infos()
+            src_addrs, dst_addrs, lengths, num_blocks = _build_grouped_transfer_arrays(
+                source_page_indices=source_page_indices,
+                target_page_indices=target_page_indices,
+                source_kv_ptrs=source_kv_ptrs,
+                target_kv_ptrs=target_kv_ptrs,
+                source_kv_item_lens=source_kv_item_lens,
+                target_kv_item_lens=target_kv_item_lens,
+            )
+            if src_addrs.size == 0:
+                return
 
-        src_descs = self.agent.get_xfer_descs(
-            _nixl_req_array(src_addrs, lengths, 0), "DRAM"
-        )
-        dst_descs = self.agent.get_xfer_descs(
-            _nixl_req_array(dst_addrs, lengths, target_gpu_id), "VRAM"
-        )
-        if src_descs is None or dst_descs is None:
-            raise RuntimeError("NIXL direct KV transfer descriptor creation failed")
-        start = time.perf_counter()
-        handle = self.agent.initialize_xfer(
-            "WRITE",
-            src_descs,
-            dst_descs,
-            target_agent_name,
-        )
-        if not handle:
-            raise RuntimeError("NIXL direct KV transfer initialization failed")
-        self._wait_for_transfer(handle)
-        transfer_ms = (time.perf_counter() - start) * 1000
+            src_descs = self.agent.get_xfer_descs(
+                _nixl_req_array(src_addrs, lengths, 0), "DRAM"
+            )
+            dst_descs = self.agent.get_xfer_descs(
+                _nixl_req_array(dst_addrs, lengths, target_gpu_id), "VRAM"
+            )
+            if src_descs is None or dst_descs is None:
+                raise RuntimeError("NIXL direct KV transfer descriptor creation failed")
+            start = time.perf_counter()
+            handle = self.agent.initialize_xfer(
+                "WRITE",
+                src_descs,
+                dst_descs,
+                target_agent_name,
+            )
+            if not handle:
+                raise RuntimeError("NIXL direct KV transfer initialization failed")
+            self._wait_for_transfer(handle)
+            transfer_ms = (time.perf_counter() - start) * 1000
         logger.info(
             "SharedHiCache NIXL transferred blocks=%d slices=%d bytes=%d ms=%.3f",
             num_blocks,
