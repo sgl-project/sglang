@@ -29,522 +29,522 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 from sglang.test.test_utils import CustomTestCase
 
 
-def _script_status_unknown_before_submit(t: ScriptedRuntime):
-    # A bare ReqHandle whose rid was never submitted reports "unknown".
-    bogus = ReqHandle(rid="never-submitted", runtime=t)
-    assert bogus.status == "unknown"
-    yield
-
-
-def _script_status_finished_after_done(t: ScriptedRuntime):
-    # After finish, r.status == "finished" (not unknown).
-    r = t.start_req(prompt_len=16, max_new_tokens=2)
-    yield from run_until_finished(r)
-    assert r.status == "finished"
-
-
-def _script_chunks_done_monotone_invariant(t: ScriptedRuntime):
-    # chunks_done is non-decreasing across yield steps.
-    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-    prev = 0
-    for _ in range(DEFAULT_MAX_STEPS):
-        cur = r.chunks_done
-        assert cur >= prev, f"chunks_done regressed: {prev} -> {cur}"
-        prev = cur
-        if r.finished:
-            return
-        yield
-    raise AssertionError("req never finished")
-
-
-def _script_kv_pages_zero_after_finish(t: ScriptedRuntime):
-    # kv_pages drops to 0 after the req finishes.
-    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-    yield from run_until_finished(r)
-    assert r.kv_pages == 0
-
-
-def _script_kv_pages_positive_mid_chunk(t: ScriptedRuntime):
-    # Mid-chunked, kv_pages > 0.
-    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-    yield from run_until(r, lambda h: h.is_chunking)
-    assert r.kv_pages > 0
-    yield from run_until_finished(r)
-
-
-def _script_batch_composition_consistent_with_status(t: ScriptedRuntime):
-    # If r.status == "running" then r.rid appears in batch_composition.
-    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-    for _ in range(DEFAULT_MAX_STEPS):
-        if r.status == "running":
-            comp = t.batch_composition()
-            all_rids = (
-                comp.get("prefill", [])
-                + comp.get("decode", [])
-                + comp.get("chunked", [])
-            )
-            assert r.rid in all_rids, f"running but not in batch_composition: {comp}"
-        if r.finished:
-            return
-        yield
-    raise AssertionError("req never finished")
-
-
-def _script_is_idle_excludes_chunked_in_flight(t: ScriptedRuntime):
-    # t.is_idle and chunked_in_flight_count > 0 are mutually exclusive.
-    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-    for _ in range(DEFAULT_MAX_STEPS):
-        if t.chunked_in_flight_count() > 0:
-            assert not t.is_idle, "is_idle must be False when chunked is in flight"
-        if r.finished:
-            return
-        yield
-    raise AssertionError("req never finished")
-
-
-def _script_finish_event_count_exactly_one(t: ScriptedRuntime):
-    # Every normally-completed req emits exactly one finish event.
-    r = t.start_req(prompt_len=16, max_new_tokens=2)
-    yield from run_until_finished(r)
-    assert r.finish_event_count == 1
-
-
-def _script_kv_pages_non_negative(t: ScriptedRuntime):
-    # kv_pages never negative.
-    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-    for _ in range(DEFAULT_MAX_STEPS):
-        assert r.kv_pages >= 0
-        if r.finished:
-            return
-        yield
-    raise AssertionError("req never finished")
-
-
-def _script_pending_middle_outputs_non_negative(t: ScriptedRuntime):
-    # pending_middle_outputs non-negative invariant.
-    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-    for _ in range(DEFAULT_MAX_STEPS):
-        assert r.pending_middle_outputs >= 0
-        if r.finished:
-            return
-        yield
-
-
-def _script_inflight_middle_chunks_non_negative(t: ScriptedRuntime):
-    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-    for _ in range(DEFAULT_MAX_STEPS):
-        assert r.inflight_middle_chunks >= 0
-        if r.finished:
-            return
-        yield
-
-
-def _script_lock_refs_non_negative(t: ScriptedRuntime):
-    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-    for _ in range(DEFAULT_MAX_STEPS):
-        assert r.lock_refs >= 0
-        if r.finished:
-            return
-        yield
-
-
-def _script_chunked_in_flight_count_le_one(t: ScriptedRuntime):
-    # main-upstream invariant: at most one chunked req in flight.
-    reqs = [
-        t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2) for _ in range(3)
-    ]
-    for _ in range(DEFAULT_MAX_STEPS * 3):
-        assert t.chunked_in_flight_count() <= 1
-        if all(r.finished for r in reqs):
-            return
-        yield
-
-
-def _script_status_transition_monotone(t: ScriptedRuntime):
-    # The unknown -> waiting -> running -> finished status rank is *not*
-    # strictly monotone because retract / double-retract can drop the
-    # req back to waiting one or more times. Instead, observe that
-    # chunks_done is non-decreasing across the lifetime — that is the
-    # real progress invariant a chunked req must satisfy.
-    r = t.start_req(prompt_len=16, max_new_tokens=2)
-    prev_chunks_done = 0
-    for _ in range(DEFAULT_MAX_STEPS):
-        cur_chunks_done = r.chunks_done
-        assert (
-            cur_chunks_done >= prev_chunks_done
-        ), f"chunks_done regressed: {cur_chunks_done} < {prev_chunks_done}"
-        prev_chunks_done = cur_chunks_done
-        if r.finished:
-            return
-        yield
-
-
-def _script_active_reqs_listing(t: ScriptedRuntime):
-    # NEW API NEEDED: t.list_active_reqs() returns the currently-running
-    # set of ReqHandle objects.
-    r1 = t.start_req(prompt_len=16, max_new_tokens=4)
-    r2 = t.start_req(prompt_len=16, max_new_tokens=4)
-    yield
-    actives = t.list_active_reqs()
-    rids = {h.rid for h in actives}
-    assert r1.rid in rids or r2.rid in rids
-    yield from run_until_all_finished([r1, r2])
-    actives_after = t.list_active_reqs()
-    assert all(h.rid not in (r1.rid, r2.rid) for h in actives_after)
-
-
-def _script_batch_composition_disjoint_subsets(t: ScriptedRuntime):
-    # prefill / decode / chunked subsets must be disjoint.
-    r1 = t.start_req(prompt_len=16, max_new_tokens=2)
-    r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-    for _ in range(DEFAULT_MAX_STEPS):
-        comp = t.batch_composition()
-        prefill = set(comp.get("prefill", []))
-        decode = set(comp.get("decode", []))
-        chunked = set(comp.get("chunked", []))
-        assert prefill & decode == set()
-        assert prefill & chunked == set()
-        assert decode & chunked == set()
-        if r1.finished and r2.finished:
-            return
-        yield
-
-
-def _script_finished_means_chunks_done_stable(t: ScriptedRuntime):
-    # Once finished, chunks_done value should not change.
-    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-    yield from run_until_finished(r)
-    snap = r.chunks_done
-    for _ in range(10):
-        yield
-        assert r.chunks_done == snap
-
-
-def _script_finished_means_kv_pages_stays_zero(t: ScriptedRuntime):
-    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-    yield from run_until_finished(r)
-    for _ in range(10):
-        yield
-        assert r.kv_pages == 0
-
-
-def _script_engine_stats_keys_present(t: ScriptedRuntime):
-    # engine_stats returns a dict with expected keys.
-    stats = t.engine_stats()
-    assert isinstance(stats, dict)
-    assert "kv_pool_free" in stats
-    assert "row_pool_free" in stats
-    yield
-
-
-def _script_kv_pool_recovers_to_baseline(t: ScriptedRuntime):
-    # Full lifecycle: pool counts return to baseline after all done.
-    before = t.engine_stats()["kv_pool_free"]
-    reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(8)]
-    yield from run_until_all_finished(reqs)
-    after = t.engine_stats()["kv_pool_free"]
-    assert after >= before
-
-
-def _script_hundred_reqs_no_leak(t: ScriptedRuntime):
-    # 100 reqs end-to-end: KV/row/lock_ref pool counts return to baseline.
-    baseline = t.engine_stats()
-    reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(100)]
-    yield from run_until_all_finished(reqs, max_steps=4000)
-    final = t.engine_stats()
-    assert (
-        final["kv_pool_free"] >= baseline["kv_pool_free"]
-    ), f"KV leak: {baseline['kv_pool_free']} -> {final['kv_pool_free']}"
-    assert final["row_pool_free"] >= baseline["row_pool_free"]
-
-
-def _script_two_hundred_reqs_no_leak(t: ScriptedRuntime):
-    baseline = t.engine_stats()
-    reqs = [t.start_req(prompt_len=8, max_new_tokens=1) for _ in range(200)]
-    yield from run_until_all_finished(reqs, max_steps=8000)
-    final = t.engine_stats()
-    assert final["kv_pool_free"] >= baseline["kv_pool_free"]
-
-
-def _script_five_hundred_reqs_no_leak(t: ScriptedRuntime):
-    baseline = t.engine_stats()
-    reqs = [t.start_req(prompt_len=8, max_new_tokens=1) for _ in range(500)]
-    yield from run_until_all_finished(reqs, max_steps=15000)
-    final = t.engine_stats()
-    assert final["kv_pool_free"] >= baseline["kv_pool_free"]
-
-
-def _script_long_lived_engine_reps_chunked(t: ScriptedRuntime):
-    # 20 rounds × 5 reqs each; scheduler internal counters stay healthy.
-    baseline = t.engine_stats()
-    for _ in range(20):
-        reqs = [
-            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-            for _ in range(5)
-        ]
-        yield from run_until_all_finished(reqs, max_steps=2000)
-    final = t.engine_stats()
-    assert final["kv_pool_free"] >= baseline["kv_pool_free"]
-
-
-def _script_sustained_long_chunked_load(t: ScriptedRuntime):
-    # Sustained: 30 long chunked reqs.
-    reqs = [
-        t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        for _ in range(30)
-    ]
-    yield from run_until_all_finished(reqs, max_steps=8000)
-
-
-def _script_round_robin_short_and_chunked(t: ScriptedRuntime):
-    # 50 short followed by 5 chunked, 5 rounds.
-    for _ in range(5):
-        shorts = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(10)]
-        chunked = [
-            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-            for _ in range(1)
-        ]
-        yield from run_until_all_finished(shorts + chunked, max_steps=2000)
-
-
-def _script_long_decode_then_many_short(t: ScriptedRuntime):
-    # One very long decode + many short.
-    long_decode = t.start_req(prompt_len=16, max_new_tokens=256)
-    shorts = [t.start_req(prompt_len=8, max_new_tokens=2) for _ in range(50)]
-    yield from run_until_all_finished([long_decode] + shorts, max_steps=4000)
-
-
-def _script_chunked_in_flight_count_never_above_one_long_run(t: ScriptedRuntime):
-    # 50 chunked reqs over many yields; verify invariant at every step.
-    # Step budget bumped to DEFAULT_MAX_STEPS * 60 because 50 chunked
-    # reqs with VERY_LONG_PROMPT_LEN each can take many chunk
-    # iterations and the original *30 budget was borderline-tight.
-    reqs = [
-        t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        for _ in range(50)
-    ]
-    for _ in range(DEFAULT_MAX_STEPS * 60):
-        assert t.chunked_in_flight_count() <= 1
-        if all(r.finished for r in reqs):
-            return
-        yield
-
-
-def _script_engine_stats_monotone_after_each_batch(t: ScriptedRuntime):
-    # After each batch finishes, kv_pool_free non-decreasing vs end-of-prev-batch.
-    last = None
-    for _ in range(10):
-        reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(8)]
-        yield from run_until_all_finished(reqs)
-        cur = t.engine_stats()["kv_pool_free"]
-        if last is not None:
-            assert cur >= last - 1, f"KV pool drifted: {last} -> {cur}"
-        last = cur
-
-
 class TestScriptedInvariants(CustomTestCase):
     def test_status_unknown_before_submit(self):
         """A bare ReqHandle whose rid was never submitted reports "unknown"."""
         execute_scripted_runtime(
-            _script_status_unknown_before_submit,
+            self._script_status_unknown_before_submit,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_status_unknown_before_submit(t: ScriptedRuntime):
+        # A bare ReqHandle whose rid was never submitted reports "unknown".
+        bogus = ReqHandle(rid="never-submitted", runtime=t)
+        assert bogus.status == "unknown"
+        yield
 
     def test_status_finished_after_done(self):
         """After finish, r.status == "finished" (not unknown)."""
         execute_scripted_runtime(
-            _script_status_finished_after_done,
+            self._script_status_finished_after_done,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_status_finished_after_done(t: ScriptedRuntime):
+        # After finish, r.status == "finished" (not unknown).
+        r = t.start_req(prompt_len=16, max_new_tokens=2)
+        yield from run_until_finished(r)
+        assert r.status == "finished"
 
     def test_chunks_done_monotone_invariant(self):
         """Chunks_done is non-decreasing across yield steps."""
         execute_scripted_runtime(
-            _script_chunks_done_monotone_invariant,
+            self._script_chunks_done_monotone_invariant,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_chunks_done_monotone_invariant(t: ScriptedRuntime):
+        # chunks_done is non-decreasing across yield steps.
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        prev = 0
+        for _ in range(DEFAULT_MAX_STEPS):
+            cur = r.chunks_done
+            assert cur >= prev, f"chunks_done regressed: {prev} -> {cur}"
+            prev = cur
+            if r.finished:
+                return
+            yield
+        raise AssertionError("req never finished")
 
     def test_kv_pages_zero_after_finish(self):
         """Kv_pages drops to 0 after the req finishes."""
         execute_scripted_runtime(
-            _script_kv_pages_zero_after_finish,
+            self._script_kv_pages_zero_after_finish,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_kv_pages_zero_after_finish(t: ScriptedRuntime):
+        # kv_pages drops to 0 after the req finishes.
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until_finished(r)
+        assert r.kv_pages == 0
 
     def test_kv_pages_positive_mid_chunk(self):
         """Mid-chunked, kv_pages > 0."""
         execute_scripted_runtime(
-            _script_kv_pages_positive_mid_chunk,
+            self._script_kv_pages_positive_mid_chunk,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_kv_pages_positive_mid_chunk(t: ScriptedRuntime):
+        # Mid-chunked, kv_pages > 0.
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking)
+        assert r.kv_pages > 0
+        yield from run_until_finished(r)
 
     def test_batch_composition_consistent_with_status(self):
         """If r.status == "running" then r.rid appears in batch_composition."""
         execute_scripted_runtime(
-            _script_batch_composition_consistent_with_status,
+            self._script_batch_composition_consistent_with_status,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_batch_composition_consistent_with_status(t: ScriptedRuntime):
+        # If r.status == "running" then r.rid appears in batch_composition.
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        for _ in range(DEFAULT_MAX_STEPS):
+            if r.status == "running":
+                comp = t.batch_composition()
+                all_rids = (
+                    comp.get("prefill", [])
+                    + comp.get("decode", [])
+                    + comp.get("chunked", [])
+                )
+                assert r.rid in all_rids, f"running but not in batch_composition: {comp}"
+            if r.finished:
+                return
+            yield
+        raise AssertionError("req never finished")
 
     def test_is_idle_excludes_chunked_in_flight(self):
         """T.is_idle and chunked_in_flight_count > 0 are mutually exclusive."""
         execute_scripted_runtime(
-            _script_is_idle_excludes_chunked_in_flight,
+            self._script_is_idle_excludes_chunked_in_flight,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_is_idle_excludes_chunked_in_flight(t: ScriptedRuntime):
+        # t.is_idle and chunked_in_flight_count > 0 are mutually exclusive.
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        for _ in range(DEFAULT_MAX_STEPS):
+            if t.chunked_in_flight_count() > 0:
+                assert not t.is_idle, "is_idle must be False when chunked is in flight"
+            if r.finished:
+                return
+            yield
+        raise AssertionError("req never finished")
 
     def test_finish_event_count_exactly_one(self):
         """Every normally-completed req emits exactly one finish event."""
         execute_scripted_runtime(
-            _script_finish_event_count_exactly_one,
+            self._script_finish_event_count_exactly_one,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_finish_event_count_exactly_one(t: ScriptedRuntime):
+        # Every normally-completed req emits exactly one finish event.
+        r = t.start_req(prompt_len=16, max_new_tokens=2)
+        yield from run_until_finished(r)
+        assert r.finish_event_count == 1
 
     def test_kv_pages_non_negative(self):
         """Kv_pages never negative."""
         execute_scripted_runtime(
-            _script_kv_pages_non_negative,
+            self._script_kv_pages_non_negative,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_kv_pages_non_negative(t: ScriptedRuntime):
+        # kv_pages never negative.
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        for _ in range(DEFAULT_MAX_STEPS):
+            assert r.kv_pages >= 0
+            if r.finished:
+                return
+            yield
+        raise AssertionError("req never finished")
 
     def test_pending_middle_outputs_non_negative(self):
         """Pending_middle_outputs non-negative invariant."""
         execute_scripted_runtime(
-            _script_pending_middle_outputs_non_negative,
+            self._script_pending_middle_outputs_non_negative,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_pending_middle_outputs_non_negative(t: ScriptedRuntime):
+        # pending_middle_outputs non-negative invariant.
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        for _ in range(DEFAULT_MAX_STEPS):
+            assert r.pending_middle_outputs >= 0
+            if r.finished:
+                return
+            yield
 
     def test_inflight_middle_chunks_non_negative(self):
         """Inflight_middle_chunks counter stays non-negative across all yields."""
         execute_scripted_runtime(
-            _script_inflight_middle_chunks_non_negative,
+            self._script_inflight_middle_chunks_non_negative,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_inflight_middle_chunks_non_negative(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        for _ in range(DEFAULT_MAX_STEPS):
+            assert r.inflight_middle_chunks >= 0
+            if r.finished:
+                return
+            yield
 
     def test_lock_refs_non_negative(self):
         """Lock_refs counter stays non-negative across all yields."""
         execute_scripted_runtime(
-            _script_lock_refs_non_negative,
+            self._script_lock_refs_non_negative,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_lock_refs_non_negative(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        for _ in range(DEFAULT_MAX_STEPS):
+            assert r.lock_refs >= 0
+            if r.finished:
+                return
+            yield
 
     def test_chunked_in_flight_count_le_one(self):
         """Main-upstream invariant: at most one chunked req in flight."""
         execute_scripted_runtime(
-            _script_chunked_in_flight_count_le_one,
+            self._script_chunked_in_flight_count_le_one,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_chunked_in_flight_count_le_one(t: ScriptedRuntime):
+        # main-upstream invariant: at most one chunked req in flight.
+        reqs = [
+            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2) for _ in range(3)
+        ]
+        for _ in range(DEFAULT_MAX_STEPS * 3):
+            assert t.chunked_in_flight_count() <= 1
+            if all(r.finished for r in reqs):
+                return
+            yield
 
     def test_status_transition_monotone(self):
         """Chunks_done is non-decreasing across the chunked req's lifetime."""
         execute_scripted_runtime(
-            _script_status_transition_monotone,
+            self._script_status_transition_monotone,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_status_transition_monotone(t: ScriptedRuntime):
+        # The unknown -> waiting -> running -> finished status rank is *not*
+        # strictly monotone because retract / double-retract can drop the
+        # req back to waiting one or more times. Instead, observe that
+        # chunks_done is non-decreasing across the lifetime — that is the
+        # real progress invariant a chunked req must satisfy.
+        r = t.start_req(prompt_len=16, max_new_tokens=2)
+        prev_chunks_done = 0
+        for _ in range(DEFAULT_MAX_STEPS):
+            cur_chunks_done = r.chunks_done
+            assert (
+                cur_chunks_done >= prev_chunks_done
+            ), f"chunks_done regressed: {cur_chunks_done} < {prev_chunks_done}"
+            prev_chunks_done = cur_chunks_done
+            if r.finished:
+                return
+            yield
 
     def test_active_reqs_listing(self):
         """NEW API NEEDED: t.list_active_reqs() returns the currently-running set of ReqHandle objects."""
         execute_scripted_runtime(
-            _script_active_reqs_listing,
+            self._script_active_reqs_listing,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_active_reqs_listing(t: ScriptedRuntime):
+        # NEW API NEEDED: t.list_active_reqs() returns the currently-running
+        # set of ReqHandle objects.
+        r1 = t.start_req(prompt_len=16, max_new_tokens=4)
+        r2 = t.start_req(prompt_len=16, max_new_tokens=4)
+        yield
+        actives = t.list_active_reqs()
+        rids = {h.rid for h in actives}
+        assert r1.rid in rids or r2.rid in rids
+        yield from run_until_all_finished([r1, r2])
+        actives_after = t.list_active_reqs()
+        assert all(h.rid not in (r1.rid, r2.rid) for h in actives_after)
 
     def test_batch_composition_disjoint_subsets(self):
         """Prefill / decode / chunked subsets must be disjoint."""
         execute_scripted_runtime(
-            _script_batch_composition_disjoint_subsets,
+            self._script_batch_composition_disjoint_subsets,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_batch_composition_disjoint_subsets(t: ScriptedRuntime):
+        # prefill / decode / chunked subsets must be disjoint.
+        r1 = t.start_req(prompt_len=16, max_new_tokens=2)
+        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        for _ in range(DEFAULT_MAX_STEPS):
+            comp = t.batch_composition()
+            prefill = set(comp.get("prefill", []))
+            decode = set(comp.get("decode", []))
+            chunked = set(comp.get("chunked", []))
+            assert prefill & decode == set()
+            assert prefill & chunked == set()
+            assert decode & chunked == set()
+            if r1.finished and r2.finished:
+                return
+            yield
 
     def test_finished_means_chunks_done_stable(self):
         """Once finished, chunks_done value should not change."""
         execute_scripted_runtime(
-            _script_finished_means_chunks_done_stable,
+            self._script_finished_means_chunks_done_stable,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_finished_means_chunks_done_stable(t: ScriptedRuntime):
+        # Once finished, chunks_done value should not change.
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until_finished(r)
+        snap = r.chunks_done
+        for _ in range(10):
+            yield
+            assert r.chunks_done == snap
 
     def test_finished_means_kv_pages_stays_zero(self):
         """After finish, kv_pages remains 0 across subsequent yields."""
         execute_scripted_runtime(
-            _script_finished_means_kv_pages_stays_zero,
+            self._script_finished_means_kv_pages_stays_zero,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_finished_means_kv_pages_stays_zero(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until_finished(r)
+        for _ in range(10):
+            yield
+            assert r.kv_pages == 0
 
     def test_engine_stats_keys_present(self):
         """Engine_stats returns a dict with expected keys."""
         execute_scripted_runtime(
-            _script_engine_stats_keys_present,
+            self._script_engine_stats_keys_present,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_engine_stats_keys_present(t: ScriptedRuntime):
+        # engine_stats returns a dict with expected keys.
+        stats = t.engine_stats()
+        assert isinstance(stats, dict)
+        assert "kv_pool_free" in stats
+        assert "row_pool_free" in stats
+        yield
 
     def test_kv_pool_recovers_to_baseline(self):
         """Full lifecycle: pool counts return to baseline after all done."""
         execute_scripted_runtime(
-            _script_kv_pool_recovers_to_baseline,
+            self._script_kv_pool_recovers_to_baseline,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_kv_pool_recovers_to_baseline(t: ScriptedRuntime):
+        # Full lifecycle: pool counts return to baseline after all done.
+        before = t.engine_stats()["kv_pool_free"]
+        reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(8)]
+        yield from run_until_all_finished(reqs)
+        after = t.engine_stats()["kv_pool_free"]
+        assert after >= before
 
     def test_hundred_reqs_no_leak(self):
         """100 reqs end-to-end: KV/row/lock_ref pool counts return to baseline."""
         execute_scripted_runtime(
-            _script_hundred_reqs_no_leak,
+            self._script_hundred_reqs_no_leak,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_hundred_reqs_no_leak(t: ScriptedRuntime):
+        # 100 reqs end-to-end: KV/row/lock_ref pool counts return to baseline.
+        baseline = t.engine_stats()
+        reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(100)]
+        yield from run_until_all_finished(reqs, max_steps=4000)
+        final = t.engine_stats()
+        assert (
+            final["kv_pool_free"] >= baseline["kv_pool_free"]
+        ), f"KV leak: {baseline['kv_pool_free']} -> {final['kv_pool_free']}"
+        assert final["row_pool_free"] >= baseline["row_pool_free"]
 
     def test_two_hundred_reqs_no_leak(self):
         """200 short reqs end-to-end leave KV pool >= baseline."""
         execute_scripted_runtime(
-            _script_two_hundred_reqs_no_leak,
+            self._script_two_hundred_reqs_no_leak,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_two_hundred_reqs_no_leak(t: ScriptedRuntime):
+        baseline = t.engine_stats()
+        reqs = [t.start_req(prompt_len=8, max_new_tokens=1) for _ in range(200)]
+        yield from run_until_all_finished(reqs, max_steps=8000)
+        final = t.engine_stats()
+        assert final["kv_pool_free"] >= baseline["kv_pool_free"]
 
     def test_five_hundred_reqs_no_leak(self):
         """500 short reqs end-to-end leave KV pool >= baseline."""
         execute_scripted_runtime(
-            _script_five_hundred_reqs_no_leak,
+            self._script_five_hundred_reqs_no_leak,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_five_hundred_reqs_no_leak(t: ScriptedRuntime):
+        baseline = t.engine_stats()
+        reqs = [t.start_req(prompt_len=8, max_new_tokens=1) for _ in range(500)]
+        yield from run_until_all_finished(reqs, max_steps=15000)
+        final = t.engine_stats()
+        assert final["kv_pool_free"] >= baseline["kv_pool_free"]
 
     def test_long_lived_engine_reps_chunked(self):
         """20 rounds × 5 reqs each; scheduler internal counters stay healthy."""
         execute_scripted_runtime(
-            _script_long_lived_engine_reps_chunked,
+            self._script_long_lived_engine_reps_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_long_lived_engine_reps_chunked(t: ScriptedRuntime):
+        # 20 rounds × 5 reqs each; scheduler internal counters stay healthy.
+        baseline = t.engine_stats()
+        for _ in range(20):
+            reqs = [
+                t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+                for _ in range(5)
+            ]
+            yield from run_until_all_finished(reqs, max_steps=2000)
+        final = t.engine_stats()
+        assert final["kv_pool_free"] >= baseline["kv_pool_free"]
 
     def test_sustained_long_chunked_load(self):
         """Sustained: 30 long chunked reqs."""
         execute_scripted_runtime(
-            _script_sustained_long_chunked_load,
+            self._script_sustained_long_chunked_load,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_sustained_long_chunked_load(t: ScriptedRuntime):
+        # Sustained: 30 long chunked reqs.
+        reqs = [
+            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+            for _ in range(30)
+        ]
+        yield from run_until_all_finished(reqs, max_steps=8000)
 
     def test_round_robin_short_and_chunked(self):
         """50 short followed by 5 chunked, 5 rounds."""
         execute_scripted_runtime(
-            _script_round_robin_short_and_chunked,
+            self._script_round_robin_short_and_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_round_robin_short_and_chunked(t: ScriptedRuntime):
+        # 50 short followed by 5 chunked, 5 rounds.
+        for _ in range(5):
+            shorts = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(10)]
+            chunked = [
+                t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+                for _ in range(1)
+            ]
+            yield from run_until_all_finished(shorts + chunked, max_steps=2000)
 
     def test_long_decode_then_many_short(self):
         """One very long decode + many short."""
         execute_scripted_runtime(
-            _script_long_decode_then_many_short,
+            self._script_long_decode_then_many_short,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_long_decode_then_many_short(t: ScriptedRuntime):
+        # One very long decode + many short.
+        long_decode = t.start_req(prompt_len=16, max_new_tokens=256)
+        shorts = [t.start_req(prompt_len=8, max_new_tokens=2) for _ in range(50)]
+        yield from run_until_all_finished([long_decode] + shorts, max_steps=4000)
 
     def test_chunked_in_flight_count_never_above_one_long_run(self):
         """50 chunked reqs over many yields; verify invariant at every step."""
         execute_scripted_runtime(
-            _script_chunked_in_flight_count_never_above_one_long_run,
+            self._script_chunked_in_flight_count_never_above_one_long_run,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_chunked_in_flight_count_never_above_one_long_run(t: ScriptedRuntime):
+        # 50 chunked reqs over many yields; verify invariant at every step.
+        # Step budget bumped to DEFAULT_MAX_STEPS * 60 because 50 chunked
+        # reqs with VERY_LONG_PROMPT_LEN each can take many chunk
+        # iterations and the original *30 budget was borderline-tight.
+        reqs = [
+            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+            for _ in range(50)
+        ]
+        for _ in range(DEFAULT_MAX_STEPS * 60):
+            assert t.chunked_in_flight_count() <= 1
+            if all(r.finished for r in reqs):
+                return
+            yield
 
     def test_engine_stats_monotone_after_each_batch(self):
         """After each batch finishes, kv_pool_free non-decreasing vs end-of-prev-batch."""
         execute_scripted_runtime(
-            _script_engine_stats_monotone_after_each_batch,
+            self._script_engine_stats_monotone_after_each_batch,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
+
+    @staticmethod
+    def _script_engine_stats_monotone_after_each_batch(t: ScriptedRuntime):
+        # After each batch finishes, kv_pool_free non-decreasing vs end-of-prev-batch.
+        last = None
+        for _ in range(10):
+            reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(8)]
+            yield from run_until_all_finished(reqs)
+            cur = t.engine_stats()["kv_pool_free"]
+            if last is not None:
+                assert cur >= last - 1, f"KV pool drifted: {last} -> {cur}"
+            last = cur
 
 
 if __name__ == "__main__":
