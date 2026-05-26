@@ -23,7 +23,7 @@ struct PlanEntriesParams {
   const int64_t* __restrict__ verify_offsets_scratch;  // [bs_padded + 1] int64 (cumulative prefix sum)
   const int32_t* __restrict__ verify_enable;           // [1] int32 — 0 ⇒ skip scatter entirely
   // Source-of-truth token pool for verify-time SOT check. May be nullptr when !HAS_TOKEN_POOL.
-  const int32_t* __restrict__ expected_token_pool;     // [pool_rows, pool_cols] int32
+  const int32_t* __restrict__ expected_token_pool;        // [pool_rows, pool_cols] int32
   const int32_t* __restrict__ expected_token_valid_lens;  // [pool_rows] int32
   // Outputs.
   int64_t* __restrict__ out_verify_slot_indices;       // [verify_capacity] int64
@@ -36,7 +36,7 @@ struct PlanEntriesParams {
   int64_t req_to_token_stride0;
   int64_t expected_token_pool_stride0;  // only meaningful when HAS_TOKEN_POOL
   int32_t swa_window_size;
-  int32_t slot_token_offset;            // logical-position offset (0 target, 1 EAGLE draft)
+  int32_t slot_token_offset;  // logical-position offset (0 target, 1 EAGLE draft)
 };
 
 // Binary search for the largest req_id such that verify_offsets[req_id] <= tid. Pre-condition: tid is
