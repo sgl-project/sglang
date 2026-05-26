@@ -639,6 +639,176 @@ class TestScriptedInvariants(CustomTestCase):
                 r.status == "finished"
             ), f"status rolled back from finished to {r.status!r}"
 
+    def test_chunks_done_strictly_increases_no_plateaus(self):
+        """Across consecutive non-finished yields while chunking, chunks_done is strictly increasing (no plateaus)."""
+        execute_scripted_runtime(
+            self._script_chunks_done_strictly_increases_no_plateaus,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-NEW] chunks_done should make forward progress on every iter
+    # the chunked req is actively chunking — a plateau (two consecutive
+    # mid-chunk yields with the same chunks_done) would indicate the
+    # scheduler stalled or wasted an iter on an in-flight chunked req.
+    @staticmethod
+    def _script_chunks_done_strictly_increases_no_plateaus(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        # Wait until the req actually enters chunked admission so the
+        # first sample is meaningful.
+        yield from run_until(r, lambda h: h.is_chunking)
+        prev_chunks_done = r.chunks_done
+        prev_was_chunking = r.is_chunking
+        for _ in range(DEFAULT_MAX_STEPS):
+            yield
+            if r.finished:
+                return
+            cur_chunks_done = r.chunks_done
+            cur_is_chunking = r.is_chunking
+            # Between two consecutive iterations where the req is
+            # actively chunking (not just sitting in waiting awaiting
+            # admission), chunks_done must strictly advance.
+            if prev_was_chunking and cur_is_chunking:
+                assert cur_chunks_done > prev_chunks_done, (
+                    f"chunks_done plateau between consecutive mid-chunk "
+                    f"yields: {prev_chunks_done} -> {cur_chunks_done}"
+                )
+            prev_chunks_done = cur_chunks_done
+            prev_was_chunking = cur_is_chunking
+        raise AssertionError("req never finished")
+
+    def test_output_tokens_len_equals_max_new_tokens_chunked(self):
+        """Ignore_eos + chunked: len(output_tokens) == max_new_tokens after finish."""
+        execute_scripted_runtime(
+            self._script_output_tokens_len_equals_max_new_tokens_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-NEW] output-state contract: when ignore_eos=True forces decode
+    # to run to completion across max_new_tokens iters, the recorded
+    # output_tokens list must contain exactly N tokens regardless of
+    # how many chunks the prefill spanned.
+    @staticmethod
+    def _script_output_tokens_len_equals_max_new_tokens_chunked(t: ScriptedRuntime):
+        n: int = 8
+        # NEW API NEEDED: start_req(..., ignore_eos=True) — sampling kwarg
+        # passthrough so decode runs to max_new_tokens.
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN,
+            max_new_tokens=n,
+            ignore_eos=True,
+        )
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done >= 2, (
+            f"VERY_LONG_PROMPT_LEN should chunk; got chunks_done={r.chunks_done}"
+        )
+        # NEW API NEEDED: r.output_tokens — list[int] of decoded tokens.
+        assert len(r.output_tokens) == n, (
+            f"ignore_eos=True + max_new_tokens={n} must produce exactly "
+            f"{n} output tokens; got len(output_tokens)={len(r.output_tokens)}"
+        )
+
+    def test_num_input_tokens_equals_prompt_len_for_chunked(self):
+        """Chunked req's num_input_tokens equals prompt_len even after multi-chunk admission."""
+        execute_scripted_runtime(
+            self._script_num_input_tokens_equals_prompt_len_for_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-NEW] output-state contract: r.num_input_tokens must reflect the
+    # original prompt length regardless of how many chunks the prefill
+    # took. Pre-fix bugs in some refactor branches accidentally reported
+    # the size of the *last* chunk, not the whole prompt.
+    @staticmethod
+    def _script_num_input_tokens_equals_prompt_len_for_chunked(t: ScriptedRuntime):
+        prompt_len: int = VERY_LONG_PROMPT_LEN
+        r = t.start_req(prompt_len=prompt_len, max_new_tokens=2)
+        yield from run_until_finished(r)
+        assert r.finished
+        # NEW API NEEDED: r.num_input_tokens — total prompt token count
+        # observable on the handle after finish.
+        assert r.num_input_tokens == prompt_len, (
+            f"num_input_tokens must equal prompt_len after chunked finish; "
+            f"expected {prompt_len}, got {r.num_input_tokens}"
+        )
+
+    def test_chunked_in_flight_count_exactly_zero_after_finish(self):
+        """After finish, chunked_in_flight_count() stays exactly 0 for several idle yields."""
+        execute_scripted_runtime(
+            self._script_chunked_in_flight_count_exactly_zero_after_finish,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-NEW] post-finish invariant: a long chunked req must observe
+    # chunked_in_flight_count() == 1 while in flight, then == 0 for at
+    # least 3 idle yields after finish. Guards against stale chunked_req
+    # pointers leaking into the in-flight counter.
+    @staticmethod
+    def _script_chunked_in_flight_count_exactly_zero_after_finish(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking)
+        assert t.chunked_in_flight_count() == 1, (
+            f"chunked_in_flight_count should be 1 mid-chunk; got "
+            f"{t.chunked_in_flight_count()}"
+        )
+        yield from run_until_finished(r)
+        for _ in range(3):
+            yield
+            assert t.chunked_in_flight_count() == 0, (
+                f"chunked_in_flight_count must be 0 after finish; got "
+                f"{t.chunked_in_flight_count()}"
+            )
+
+    def test_pending_middle_outputs_zero_at_idle_yields(self):
+        """After finish + 5 idle yields, pending_middle_outputs is 0."""
+        execute_scripted_runtime(
+            self._script_pending_middle_outputs_zero_at_idle_yields,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-NEW] post-finish invariant: once a chunked req finishes, the
+    # pending_middle_outputs counter on the handle must drain to 0 and
+    # stay there across idle yields. Guards against the e875cd36e4-style
+    # bump leaking past finish.
+    @staticmethod
+    def _script_pending_middle_outputs_zero_at_idle_yields(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until_finished(r)
+        for _ in range(5):
+            yield
+            assert r.pending_middle_outputs == 0, (
+                f"pending_middle_outputs must be 0 at idle yields after "
+                f"finish; got {r.pending_middle_outputs}"
+            )
+
+    def test_decode_side_chunked_req_always_none(self):
+        """[c-S25 control] pure decode workload: get_chunked_req_rid() is always None."""
+        execute_scripted_runtime(
+            self._script_decode_side_chunked_req_always_none,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [c-S25 control] scheduler.py decode-side branch: when the workload
+    # is pure decode (no req with a chunked prefill), the scheduler's
+    # chunked_req slot must remain None across the entire lifetime.
+    # Negative control for the chunked admission paths — proves the
+    # chunked slot is not accidentally populated by short-prompt reqs.
+    @staticmethod
+    def _script_decode_side_chunked_req_always_none(t: ScriptedRuntime):
+        # Submit several short reqs so the engine is not idle — the
+        # scheduler is actively decoding, but no req triggers chunking.
+        reqs = [t.start_req(prompt_len=8, max_new_tokens=16) for _ in range(4)]
+        for _ in range(50):
+            # NEW API NEEDED: t.get_chunked_req_rid() — current
+            # scheduler.chunked_req rid (or None).
+            assert t.get_chunked_req_rid() is None, (
+                f"pure decode workload must keep chunked_req None; got "
+                f"{t.get_chunked_req_rid()!r}"
+            )
+            if all(r.finished for r in reqs):
+                return
+            yield
+
 
 if __name__ == "__main__":
     unittest.main()
