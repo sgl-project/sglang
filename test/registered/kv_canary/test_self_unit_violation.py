@@ -51,7 +51,7 @@ class TestViolationReporter(CustomTestCase):
             stored_chain_hash=0x1111111111111111,
             expected_aux=0x2222222222222222,
             fail_reason_bits=int(
-                FailReason.CHAIN_HASH | FailReason.POSITION | FailReason.REAL_KV_HASH
+                FailReason.VERIFY_CHAIN_HASH_MISMATCH | FailReason.VERIFY_POSITION_MISMATCH | FailReason.VERIFY_REAL_KV_HASH_MISMATCH
             ),
         )
         out = _format_violation(
@@ -148,7 +148,7 @@ class TestViolationReporter(CustomTestCase):
 
     def test_format_violation_unknown_kernel_kind_renders_unknown_label(self) -> None:
         """Verify unknown kernel kinds render an unknown label."""
-        row = _make_row(fail_reason_bits=int(FailReason.CHAIN_HASH))
+        row = _make_row(fail_reason_bits=int(FailReason.VERIFY_CHAIN_HASH_MISMATCH))
         row[consts.VIOLATION_FIELD_KERNEL_KIND] = 9999
         out = _format_violation(
             row=row, total=1, ring_overflow=False, step_when_pumped=0
@@ -199,13 +199,13 @@ class TestLogOrRaiseViolation(CustomTestCase):
         """Log mode with 3 valid rows emits 3 warnings, each a full _format_violation snapshot for that row."""
         rows = [
             _make_row(
-                slot_idx=11, position=101, fail_reason_bits=int(FailReason.CHAIN_HASH)
+                slot_idx=11, position=101, fail_reason_bits=int(FailReason.VERIFY_CHAIN_HASH_MISMATCH)
             ),
             _make_row(
-                slot_idx=22, position=202, fail_reason_bits=int(FailReason.POSITION)
+                slot_idx=22, position=202, fail_reason_bits=int(FailReason.VERIFY_POSITION_MISMATCH)
             ),
             _make_row(
-                slot_idx=33, position=303, fail_reason_bits=int(FailReason.REAL_KV_HASH)
+                slot_idx=33, position=303, fail_reason_bits=int(FailReason.VERIFY_REAL_KV_HASH_MISMATCH)
             ),
         ]
         reporter = _make_reporter(rows=rows, write_index=3, ring_capacity=4, mode="log")
@@ -256,13 +256,13 @@ class TestLogOrRaiseViolation(CustomTestCase):
         """Raise mode raises a single RuntimeError whose text is the 3 formatted rows joined with single newlines."""
         rows = [
             _make_row(
-                slot_idx=11, position=101, fail_reason_bits=int(FailReason.CHAIN_HASH)
+                slot_idx=11, position=101, fail_reason_bits=int(FailReason.VERIFY_CHAIN_HASH_MISMATCH)
             ),
             _make_row(
-                slot_idx=22, position=202, fail_reason_bits=int(FailReason.POSITION)
+                slot_idx=22, position=202, fail_reason_bits=int(FailReason.VERIFY_POSITION_MISMATCH)
             ),
             _make_row(
-                slot_idx=33, position=303, fail_reason_bits=int(FailReason.REAL_KV_HASH)
+                slot_idx=33, position=303, fail_reason_bits=int(FailReason.VERIFY_REAL_KV_HASH_MISMATCH)
             ),
         ]
         reporter = _make_reporter(

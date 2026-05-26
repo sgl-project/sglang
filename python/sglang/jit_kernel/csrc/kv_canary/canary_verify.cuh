@@ -89,16 +89,16 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
 
     FailReason fail_reason_bits{};
     if (stored_chain_hash != expected_chain_hash) {
-      fail_reason_bits |= FailReason::kChainHash;
+      fail_reason_bits |= FailReason::kVerifyChainHashMismatch;
     }
     if (expected_input_id != -1 && stored_token != expected_input_id) {
       fail_reason_bits |= FailReason::kVerifyTokenMismatch;
     }
     if (stored_position != expected_position) {
-      fail_reason_bits |= FailReason::kPosition;
+      fail_reason_bits |= FailReason::kVerifyPositionMismatch;
     }
     if (stored_real_kv_hash != expected_real_kv_hash) {
-      fail_reason_bits |= FailReason::kRealKvHash;
+      fail_reason_bits |= FailReason::kVerifyRealKvHashMismatch;
     }
 
     if (fail_reason_bits != FailReason{}) {

@@ -114,11 +114,11 @@ def launch_canary_verify_kernel_torch_reference(
 
         fail_reason = consts.FailReason(0)
         if stored_chain_hash != expected_chain_hash:
-            fail_reason |= consts.FailReason.CHAIN_HASH
+            fail_reason |= consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH
         if stored_position != expected_position:
-            fail_reason |= consts.FailReason.POSITION
+            fail_reason |= consts.FailReason.VERIFY_POSITION_MISMATCH
         if stored_real_kv_hash != expected_real_kv_hash:
-            fail_reason |= consts.FailReason.REAL_KV_HASH
+            fail_reason |= consts.FailReason.VERIFY_REAL_KV_HASH_MISMATCH
         # ``expected_input_id == -1`` mirrors the CUDA "skip token check" sentinel.
         if expected_input_id != -1 and stored_token != expected_input_id:
             fail_reason |= consts.FailReason.VERIFY_TOKEN_MISMATCH

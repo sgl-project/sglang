@@ -301,7 +301,7 @@ class TestChain:
         cuda_log, _ = run_verify_diff(buf_pair=buf_pair, plan_pair=plan_pair)
         assert int(cuda_log.write_index[0].item()) == 1
         bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
-        assert bits & consts.FailReason.CHAIN_HASH
+        assert bits & consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH
 
     def test_chain_head_prev_hash_equals_splitmix64_anchor_random_50(self) -> None:
         random.seed(0)
@@ -378,7 +378,7 @@ class TestViolationField:
         fail_bits = int(
             cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
         )
-        assert_only_bits_set(fail_bits, consts.FailReason.CHAIN_HASH)
+        assert_only_bits_set(fail_bits, consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH)
 
     def test_violation_position_mismatch(self) -> None:
         """Stored position differs from what the slot's chain reconstruction would yield → POSITION bit."""
@@ -403,7 +403,7 @@ class TestViolationField:
         fail_bits = int(
             cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
         )
-        assert_only_bits_set(fail_bits, consts.FailReason.POSITION)
+        assert_only_bits_set(fail_bits, consts.FailReason.VERIFY_POSITION_MISMATCH)
 
     def test_violation_position_diverges_from_plan(self) -> None:
         """Plan-supplied position contradicts stored position → POSITION bit (verify trusts plan, not +1)."""
@@ -427,7 +427,7 @@ class TestViolationField:
         fail_bits = int(
             cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
         )
-        assert_only_bits_set(fail_bits, consts.FailReason.POSITION)
+        assert_only_bits_set(fail_bits, consts.FailReason.VERIFY_POSITION_MISMATCH)
 
     def test_violation_prev_hash_mismatch(self) -> None:
         """Stored prev_hash differs from predecessor-derived expectation → CHAIN_HASH bit."""
@@ -462,7 +462,7 @@ class TestViolationField:
         fail_bits = int(
             cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
         )
-        assert_only_bits_set(fail_bits, consts.FailReason.CHAIN_HASH)
+        assert_only_bits_set(fail_bits, consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH)
 
     def test_violation_real_kv_hash_mismatch(self) -> None:
         """Mutate one byte of a RealKvSource tensor after writing the chain → REAL_KV_HASH bit on verify."""
@@ -503,7 +503,7 @@ class TestViolationField:
         fail_bits = int(
             cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
         )
-        assert_only_bits_set(fail_bits, consts.FailReason.REAL_KV_HASH)
+        assert_only_bits_set(fail_bits, consts.FailReason.VERIFY_REAL_KV_HASH_MISMATCH)
 
     @pytest.mark.parametrize("bit_to_trigger", ["POSITION", "PREV_HASH", "REAL_KV"])
     @pytest.mark.parametrize("injection_position", ["head", "mid", "last"])
@@ -524,9 +524,9 @@ class TestViolationField:
         corrupt_slot = slot_indices[corruption_index]
 
         expected_bit = {
-            "POSITION": consts.FailReason.POSITION,
-            "PREV_HASH": consts.FailReason.CHAIN_HASH,
-            "REAL_KV": consts.FailReason.REAL_KV_HASH,
+            "POSITION": consts.FailReason.VERIFY_POSITION_MISMATCH,
+            "PREV_HASH": consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH,
+            "REAL_KV": consts.FailReason.VERIFY_REAL_KV_HASH_MISMATCH,
         }[bit_to_trigger]
 
         if bit_to_trigger == "REAL_KV":
@@ -691,10 +691,10 @@ class TestViolationField:
         assert int(cuda_log.write_index[0].item()) == 1
         bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
         assert (
-            bits & consts.FailReason.POSITION
+            bits & consts.FailReason.VERIFY_POSITION_MISMATCH
         ), f"expected POSITION bit, got {bits:#b}"
         assert (
-            bits & consts.FailReason.CHAIN_HASH
+            bits & consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH
         ) == 0, f"chain hash bit unexpectedly set: {bits:#b}"
 
 
@@ -905,7 +905,7 @@ class TestRealKvHash:
         fail_bits = int(
             cuda_log2.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
         )
-        assert_only_bits_set(fail_bits, consts.FailReason.REAL_KV_HASH)
+        assert_only_bits_set(fail_bits, consts.FailReason.VERIFY_REAL_KV_HASH_MISMATCH)
 
     def test_real_kv_hash_all_mode_with_multiple_sources(self) -> None:
         """ALL mode with count=2 page=16 bytes=128 sources: chain still verifies clean."""
@@ -1010,7 +1010,7 @@ class TestRealKvHash:
         assert int(cuda_log.write_index[0].item()) >= 1
         bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
         assert (
-            bits & consts.FailReason.REAL_KV_HASH
+            bits & consts.FailReason.VERIFY_REAL_KV_HASH_MISMATCH
         ), f"expected REAL_KV_HASH bit, got {bits:#b}"
 
     def test_real_kv_off_does_not_deref_real_kv_sources(self) -> None:
@@ -1698,7 +1698,7 @@ class TestViolationRing:
         first_row_fail = int(
             cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
         )
-        assert first_row_fail & consts.FailReason.POSITION
+        assert first_row_fail & consts.FailReason.VERIFY_POSITION_MISMATCH
 
     def test_violation_ring_overflow_counter_still_increments(self) -> None:
         """Ring capacity exceeded → rows beyond are dropped but ``write_index`` still grows."""
@@ -1811,7 +1811,7 @@ class TestViolationRing:
         expected_token_val = -1
         stored_chain_hash_val = anchor_hash_signed
         expected_aux_val = anchor_hash_signed
-        fail_reason_bits_val = consts.FailReason.POSITION
+        fail_reason_bits_val = consts.FailReason.VERIFY_POSITION_MISMATCH
 
         expected_bytes = struct.pack(
             "<8q",
