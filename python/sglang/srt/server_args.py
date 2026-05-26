@@ -721,12 +721,22 @@ class ServerArgs:
     cuda_graph_tc_compiler_prefill: Optional[str] = None
 
     # Legacy CLI inputs that fold into ``cuda_graph_config`` (with a CLI
-    # deprecation warning). Internal-only after parsing.
+    # deprecation warning). Internal-only after parsing — also accepted as
+    # ``Engine(...)`` / ``ServerArgs(...)`` kwargs so old Python-API
+    # callers keep working alongside the deprecated CLI flags.
     disable_cuda_graph: bool = False
     disable_prefill_cuda_graph: bool = False
     disable_decode_cuda_graph: bool = False
+    enable_breakable_cuda_graph: bool = False
+    disable_piecewise_cuda_graph: bool = False
+    enforce_piecewise_cuda_graph: bool = False
     prefill_cuda_graph_backend: Optional[str] = None
     decode_cuda_graph_backend: Optional[str] = None
+    cuda_graph_max_bs: Optional[int] = None
+    cuda_graph_bs: Optional[List[int]] = None
+    piecewise_cuda_graph_max_tokens: Optional[int] = None
+    piecewise_cuda_graph_tokens: Optional[List[int]] = None
+    piecewise_cuda_graph_compiler: Optional[str] = None
     enable_layerwise_nvtx_marker: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
@@ -1345,10 +1355,26 @@ class ServerArgs:
             _set(Phase.PREFILL, "backend", Backend.DISABLED)
         if self.disable_decode_cuda_graph:
             _set(Phase.DECODE, "backend", Backend.DISABLED)
+        if self.enable_breakable_cuda_graph:
+            _set(Phase.PREFILL, "backend", Backend.BREAKABLE)
+        if self.disable_piecewise_cuda_graph:
+            _set(Phase.PREFILL, "backend", Backend.DISABLED)
+        if self.enforce_piecewise_cuda_graph:
+            _set(Phase.PREFILL, "backend", Backend.TC_PIECEWISE)
         if self.prefill_cuda_graph_backend is not None:
             _set(Phase.PREFILL, "backend", self.prefill_cuda_graph_backend)
         if self.decode_cuda_graph_backend is not None:
             _set(Phase.DECODE, "backend", self.decode_cuda_graph_backend)
+        if self.cuda_graph_max_bs is not None:
+            _set(Phase.DECODE, "max_bs", self.cuda_graph_max_bs)
+        if self.cuda_graph_bs is not None:
+            _set(Phase.DECODE, "bs", self.cuda_graph_bs)
+        if self.piecewise_cuda_graph_max_tokens is not None:
+            _set(Phase.PREFILL, "max_bs", self.piecewise_cuda_graph_max_tokens)
+        if self.piecewise_cuda_graph_tokens is not None:
+            _set(Phase.PREFILL, "bs", self.piecewise_cuda_graph_tokens)
+        if self.piecewise_cuda_graph_compiler is not None:
+            _set(Phase.PREFILL, "tc_compiler", self.piecewise_cuda_graph_compiler)
 
         # ---- Per-phase convenience flags ----
         if self.cuda_graph_backend_decode is not None:
