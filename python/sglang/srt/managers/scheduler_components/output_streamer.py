@@ -34,6 +34,27 @@ logger = logging.getLogger(__name__)
 DEFAULT_FORCE_STREAM_INTERVAL = envs.SGLANG_FORCE_STREAM_INTERVAL.get()
 
 
+def _append_optional_per_request_field(
+    field: Optional[List[Any]],
+    should_return: bool,
+    value: Any,
+    emitted_count: int,
+) -> Optional[List[Any]]:
+    """Append an optional per-request output while preserving batch alignment.
+
+    `None` means the field is absent for the whole batch. Once any request in a
+    batch enables the field, previous and later requests without that field must
+    occupy a `None` slot so the list stays aligned with `rids`.
+    """
+    if field is None:
+        if not should_return:
+            return None
+        field = [None] * (emitted_count - 1)
+
+    field.append(value if should_return else None)
+    return field
+
+
 @dataclass(kw_only=True, slots=True)
 class SchedulerOutputStreamer:
     send_to_detokenizer: zmq.Socket
@@ -256,9 +277,9 @@ class _GenerationStreamAccumulator:
     spec_num_correct_drafts: list = field(default_factory=list)
     spec_correct_drafts_histogram: list = field(default_factory=list)
     retraction_counts: list = field(default_factory=list)
-    output_hidden_states: list = field(default_factory=list)
-    routed_experts: list = field(default_factory=list)
-    indexer_topk: list = field(default_factory=list)
+    output_hidden_states: Optional[list] = None
+    routed_experts: Optional[list] = None
+    indexer_topk: Optional[list] = None
     customized_info: dict = field(default_factory=dict)
     time_stats: list = field(default_factory=list)
     input_token_logprobs_val: Optional[list] = None
@@ -434,12 +455,24 @@ class _GenerationStreamAccumulator:
                 self.output_token_ids_logprobs_val.append([])
                 self.output_token_ids_logprobs_idx.append([])
 
-        if req.return_hidden_states:
-            self.output_hidden_states.append(req.hidden_states)
-        if req.return_routed_experts:
-            self.routed_experts.append(req.routed_experts)
-        if req.return_indexer_topk:
-            self.indexer_topk.append(req.indexer_topk)
+        self.output_hidden_states = _append_optional_per_request_field(
+            self.output_hidden_states,
+            req.return_hidden_states,
+            req.hidden_states,
+            len(self.rids),
+        )
+        self.routed_experts = _append_optional_per_request_field(
+            self.routed_experts,
+            req.return_routed_experts,
+            req.routed_experts,
+            len(self.rids),
+        )
+        self.indexer_topk = _append_optional_per_request_field(
+            self.indexer_topk,
+            req.return_indexer_topk,
+            req.indexer_topk,
+            len(self.rids),
+        )
 
         if req.customized_info is not None:
             for k, v in req.customized_info.items():
@@ -486,9 +519,9 @@ class _GenerationStreamAccumulator:
             output_token_ids_logprobs_val=self.output_token_ids_logprobs_val,
             output_token_ids_logprobs_idx=self.output_token_ids_logprobs_idx,
             output_token_entropy_val=None,
-            output_hidden_states=self.output_hidden_states or None,
-            routed_experts=self.routed_experts or None,
-            indexer_topk=self.indexer_topk or None,
+            output_hidden_states=self.output_hidden_states,
+            routed_experts=self.routed_experts,
+            indexer_topk=self.indexer_topk,
             customized_info=self.customized_info,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,

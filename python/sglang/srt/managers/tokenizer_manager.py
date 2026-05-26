@@ -1773,7 +1773,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     ]
 
             if getattr(recv_obj, "output_hidden_states", None):
-                meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+                val = recv_obj.output_hidden_states[i]
+                if val is not None:
+                    meta_info["hidden_states"] = val
             if getattr(recv_obj, "routed_experts", None):
                 val = recv_obj.routed_experts[i]
                 if val is not None:
