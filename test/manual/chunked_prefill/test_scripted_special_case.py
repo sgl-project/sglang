@@ -616,7 +616,9 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
 
     def test_scheduler_continues_with_only_chunked_req_no_waiting(self):
         """Mid-chunk single long req: waiting_queue empty but scheduler keeps running until finish."""
-        self.runtime.run(self._script_scheduler_continues_with_only_chunked_req_no_waiting)
+        self.runtime.run(
+            self._script_scheduler_continues_with_only_chunked_req_no_waiting
+        )
 
     # scheduler.py: when the only inflight work is a chunked
     # req (waiting_queue is empty), the event loop must not flip to
@@ -970,7 +972,9 @@ class TestSpecialCaseHiCache(ScriptedRuntimeTestCase):
 
     def test_init_load_back_called_once_per_request_with_hicache(self):
         """HiCache + multi-chunk req: init_load_back fires exactly once for the whole req, not once per chunk."""
-        self.runtime.run(self._script_init_load_back_called_once_per_request_with_hicache)
+        self.runtime.run(
+            self._script_init_load_back_called_once_per_request_with_hicache
+        )
 
     # schedule_batch.py / hicache integration: the
     # ``init_load_back`` hook bridges the HiCache off-GPU prefix into
