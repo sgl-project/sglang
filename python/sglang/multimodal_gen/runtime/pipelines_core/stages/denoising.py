@@ -1351,22 +1351,28 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # registered by the residency manager at the use-site.
         use_nvtx = self._apply_nvtx_gate(ctx.is_warmup)
 
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=ctx.target_dtype,
-            enabled=ctx.autocast_enabled,
-        ), maybe_nvtx_range("denoising_loop", use_nvtx):
+        with (
+            torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=ctx.target_dtype,
+                enabled=ctx.autocast_enabled,
+            ),
+            maybe_nvtx_range("denoising_loop", use_nvtx),
+        ):
             with self.progress_bar(total=ctx.num_inference_steps) as progress_bar:
                 for step_index, t_host in enumerate(timesteps_cpu):
                     # Use ``:.4g`` so flow-matching schedulers (e.g. FLUX) that
                     # use non-integer timesteps keep their precision in markers.
                     step_marker = f"denoising_step_{step_index}_t{t_host.item():.4g}"
-                    with maybe_nvtx_range(step_marker, use_nvtx), StageProfiler(
-                        f"denoising_step_{step_index}",
-                        logger=logger,
-                        metrics=batch.metrics,
-                        perf_dump_path_provided=batch.perf_dump_path is not None,
-                        record_as_step=True,
+                    with (
+                        maybe_nvtx_range(step_marker, use_nvtx),
+                        StageProfiler(
+                            f"denoising_step_{step_index}",
+                            logger=logger,
+                            metrics=batch.metrics,
+                            perf_dump_path_provided=batch.perf_dump_path is not None,
+                            record_as_step=True,
+                        ),
                     ):
                         step = self._prepare_step_state(
                             ctx,

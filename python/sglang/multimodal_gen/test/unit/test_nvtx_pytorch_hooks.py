@@ -37,27 +37,30 @@ class TestMaybeNvtxRange(unittest.TestCase):
                 raise RuntimeError("boom")
 
     def test_disabled_does_not_call_nvtx(self) -> None:
-        with patch.object(nvtx_pytorch_hooks.nvtx, "range_push") as push, patch.object(
-            nvtx_pytorch_hooks.nvtx, "range_pop"
-        ) as pop:
+        with (
+            patch.object(nvtx_pytorch_hooks.nvtx, "range_push") as push,
+            patch.object(nvtx_pytorch_hooks.nvtx, "range_pop") as pop,
+        ):
             with maybe_nvtx_range("never", enabled=False):
                 pass
         push.assert_not_called()
         pop.assert_not_called()
 
     def test_enabled_calls_matched_push_pop(self) -> None:
-        with patch.object(nvtx_pytorch_hooks.nvtx, "range_push") as push, patch.object(
-            nvtx_pytorch_hooks.nvtx, "range_pop"
-        ) as pop:
+        with (
+            patch.object(nvtx_pytorch_hooks.nvtx, "range_push") as push,
+            patch.object(nvtx_pytorch_hooks.nvtx, "range_pop") as pop,
+        ):
             with maybe_nvtx_range("stage_X", enabled=True):
                 pass
         push.assert_called_once_with("stage_X")
         pop.assert_called_once_with()
 
     def test_enabled_pops_on_exception(self) -> None:
-        with patch.object(nvtx_pytorch_hooks.nvtx, "range_push") as push, patch.object(
-            nvtx_pytorch_hooks.nvtx, "range_pop"
-        ) as pop:
+        with (
+            patch.object(nvtx_pytorch_hooks.nvtx, "range_push") as push,
+            patch.object(nvtx_pytorch_hooks.nvtx, "range_pop") as pop,
+        ):
             with self.assertRaises(RuntimeError):
                 with maybe_nvtx_range("stage_X", enabled=True):
                     raise RuntimeError("boom")
@@ -68,8 +71,9 @@ class TestMaybeNvtxRange(unittest.TestCase):
         """Regression: torch.cuda.nvtx.range() str-formats its argument,
         which would raise on a marker containing a literal ``{``. The helper
         calls range_push directly to sidestep that."""
-        with patch.object(nvtx_pytorch_hooks.nvtx, "range_push"), patch.object(
-            nvtx_pytorch_hooks.nvtx, "range_pop"
+        with (
+            patch.object(nvtx_pytorch_hooks.nvtx, "range_push"),
+            patch.object(nvtx_pytorch_hooks.nvtx, "range_pop"),
         ):
             with maybe_nvtx_range("layer in={1, 2, 3}", enabled=True):
                 pass
@@ -124,9 +128,10 @@ class TestDiffusionNvtxHooks(unittest.TestCase):
         dummy = torch.nn.Linear(2, 2)
         hooks._module_to_name_map[dummy] = "dummy"
         hooks.set_enabled(False)
-        with patch.object(nvtx_pytorch_hooks.nvtx, "range_push") as push, patch.object(
-            nvtx_pytorch_hooks.nvtx, "range_pop"
-        ) as pop:
+        with (
+            patch.object(nvtx_pytorch_hooks.nvtx, "range_push") as push,
+            patch.object(nvtx_pytorch_hooks.nvtx, "range_pop") as pop,
+        ):
             hooks._forward_pre_hook(dummy, (torch.zeros(2),), {})
             hooks._forward_hook(dummy, (), None)
         push.assert_not_called()
@@ -139,9 +144,10 @@ class TestDiffusionNvtxHooks(unittest.TestCase):
         dummy = torch.nn.Linear(2, 2)
         hooks._module_to_name_map[dummy] = "dummy"
         hooks.set_enabled(True)
-        with patch.object(nvtx_pytorch_hooks.nvtx, "range_push") as push, patch.object(
-            nvtx_pytorch_hooks.nvtx, "range_pop"
-        ) as pop:
+        with (
+            patch.object(nvtx_pytorch_hooks.nvtx, "range_push") as push,
+            patch.object(nvtx_pytorch_hooks.nvtx, "range_pop") as pop,
+        ):
             hooks._forward_pre_hook(dummy, (torch.zeros(2, 3),), {})
             hooks._forward_hook(dummy, (), None)
         push.assert_called_once()
@@ -169,9 +175,10 @@ class TestDiffusionNvtxHooks(unittest.TestCase):
         hooks = DiffusionNvtxHooks()
         hooks.register_hooks(model, prefix="raising")
         hooks.set_enabled(True)
-        with patch.object(nvtx_pytorch_hooks.nvtx, "range_push") as push, patch.object(
-            nvtx_pytorch_hooks.nvtx, "range_pop"
-        ) as pop:
+        with (
+            patch.object(nvtx_pytorch_hooks.nvtx, "range_push") as push,
+            patch.object(nvtx_pytorch_hooks.nvtx, "range_pop") as pop,
+        ):
             with self.assertRaises(RuntimeError):
                 model(torch.zeros(2))
         # One push from the pre-hook, one pop from the post-hook fired via
