@@ -1378,12 +1378,7 @@ class DecodeTransferQueue:
                 ):
                     self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
-    def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> bool:
-        """
-        Returns:
-            True if the request should be removed from the queue (success or corruption)
-            False if metadata not ready yet (keep in queue for next poll)
-        """
+    def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         idx = decode_req.metadata_buffer_index
         (
             output_id,
@@ -1409,11 +1404,24 @@ class DecodeTransferQueue:
         if _is_fake_transfer(decode_req.req, self.scheduler.server_args):
             pass
         elif actual_room == 0:
-            # Case 1: Metadata not ready yet (actual_room == 0)
-            # Keep request in queue and wait for next poll
-            return False
+            # Should never happen: _poll_with_metadata_gate already confirmed
+            # readiness on all TP ranks. Abort deterministically to avoid
+            # cross-rank queue divergence.
+            logger.error(
+                f"Metadata unexpectedly not ready after readiness gate: "
+                f"request {decode_req.req.rid}, bootstrap_room={expected_room}, "
+                f"metadata_buffer_index={idx}"
+            )
+            prepare_abort(
+                decode_req.req,
+                "Metadata corruption detected - bootstrap_room mismatch",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            return
         elif actual_room != expected_room:
-            # Case 2: Real corruption detected (mismatch)
+            # Real corruption detected (mismatch)
             # Abort the request and remove from the queue
             error_msg = (
                 f"Context corruption detected: Request {decode_req.req.rid} "
@@ -1430,9 +1438,9 @@ class DecodeTransferQueue:
             )
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
-            return True
+            return
 
-        # Case 3: Success - commit the transfer
+        # Success - commit the transfer
         decode_req.req.output_ids.append(output_id[0].item())
         decode_req.req.cached_tokens = cached_tokens[0].item()
         decode_req.req.cached_tokens_device = cached_tokens[1].item()
@@ -1464,11 +1472,24 @@ class DecodeTransferQueue:
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
-        return True
+        return
+
+    def _poll_with_metadata_gate(self) -> List[int]:
+        return poll_and_all_reduce(
+            [dr.kv_receiver for dr in self.queue],
+            self.gloo_group,
+            decode_reqs=self.queue,
+            metadata_buffers=self.metadata_buffers,
+            server_args=self.scheduler.server_args,
+        )
 
     def _poll_with_staging(self) -> list:
         return poll_and_all_reduce_with_staging(
-            self.queue, self.staging_handler, self.gloo_group
+            self.queue,
+            self.staging_handler,
+            self.gloo_group,
+            metadata_buffers=self.metadata_buffers,
+            server_args=self.scheduler.server_args,
         )
 
     def _init_staging_handler(self, kv_manager):
@@ -1489,9 +1510,7 @@ class DecodeTransferQueue:
         if self.enable_staging:
             polls = self._poll_with_staging()
         else:
-            polls = poll_and_all_reduce(
-                [dr.kv_receiver for dr in self.queue], self.gloo_group
-            )
+            polls = self._poll_with_metadata_gate()
 
         transferred_reqs = []
         indices_to_remove = set()
@@ -1524,26 +1543,23 @@ class DecodeTransferQueue:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
-                should_remove = self._commit_transfer_to_req(decode_req)
-                if should_remove:
-                    indices_to_remove.add(i)
-                    # Check if request was aborted due to corruption
-                    if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-                        self.scheduler.output_streamer.stream_output(
-                            [decode_req.req],
-                            decode_req.req.return_logprob,
+                self._commit_transfer_to_req(decode_req)
+                indices_to_remove.add(i)
+                # Check if request was aborted due to corruption
+                if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                    self.scheduler.output_streamer.stream_output(
+                        [decode_req.req],
+                        decode_req.req.return_logprob,
+                    )
+                    if self.scheduler.enable_hisparse:
+                        self.scheduler.hisparse_coordinator.request_finished(
+                            decode_req.req
                         )
-                        if self.scheduler.enable_hisparse:
-                            self.scheduler.hisparse_coordinator.request_finished(
-                                decode_req.req
-                            )
-                        release_kv_cache(
-                            decode_req.req, self.tree_cache, is_insert=False
-                        )
-                        if self.scheduler.metrics_reporter.enable_metrics:
-                            self.scheduler.metrics_collector.increment_transfer_failed_reqs()
-                    else:
-                        transferred_reqs.append(decode_req.req)
+                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                    if self.scheduler.metrics_reporter.enable_metrics:
+                        self.scheduler.metrics_collector.increment_transfer_failed_reqs()
+                else:
+                    transferred_reqs.append(decode_req.req)
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
