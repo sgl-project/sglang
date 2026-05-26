@@ -501,7 +501,9 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_chunked_req_then_abort_then_new_short_in_one_yield(self):
         """Mid-chunk R1: abort R1 and start a short R2 in the same yield; R2 admits fresh and chunked slot is no longer R1."""
-        self.runtime.run(self._script_chunked_req_then_abort_then_new_short_in_one_yield)
+        self.runtime.run(
+            self._script_chunked_req_then_abort_then_new_short_in_one_yield
+        )
 
     # same-yield abort + new-req combo. While R1 is mid-chunk,
     # abort R1 and submit a fresh short R2 in the same yield step. R2
