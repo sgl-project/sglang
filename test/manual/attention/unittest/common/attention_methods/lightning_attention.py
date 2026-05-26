@@ -876,3 +876,92 @@ def expected_lightning_output_from_inputs(
     compare directly."""
     out = _pure_torch_lightning_reference(fixture, state).output
     return out.reshape(case.num_input_tokens, -1)
+
+
+def _lightning_verify_parent_indices(
+    draft_token_num: int, topk: int
+) -> tuple[int, ...]:
+    """Parent indices for the EAGLE draft tree shape used by the verify tests.
+    Matches KDA's `_kda_verify_parent_indices` convention: chain (topk=1) is a
+    linear chain `(-1, 0, 1, ...)`; tree (topk=2 with 3 draft tokens) is the
+    root + two-branch shape `(-1, 0, 0)`."""
+    if topk == 1:
+        return tuple(range(-1, draft_token_num - 1))
+    if draft_token_num != 3:
+        raise ValueError(
+            "Tree Lightning verify reference currently expects 3 draft tokens."
+        )
+    return (-1, 0, 0)
+
+
+def expected_lightning_verify_output_from_inputs(
+    fixture: LightningAttentionFixture,
+    case: LightningAttentionCase,
+    inputs: dict[str, torch.Tensor],
+    state: torch.Tensor,
+    *,
+    topk: int,
+) -> torch.Tensor:
+    """Per-draft-token seg_la recurrence with parent-index sharing.
+
+    Mirrors `expected_kda_verify_output_from_inputs`: for each draft token,
+    start from the parent's post-recurrence state (or the request's root
+    state for the first), apply the per-head decay+outer-product update,
+    save the resulting state under the token's index so child draft tokens
+    in the tree can read it.
+
+    Returns shape `[num_input_tokens, num_heads * head_dim]` to match the
+    backend's flat output.
+    """
+    head_dim = fixture.reference_module.head_dim
+    slopes = fixture.reference_module.slope_for_layer(0)
+    decay = torch.exp(-slopes)
+    softmax_scale = head_dim**-0.5
+
+    q = inputs["q"].float()
+    k = inputs["k"].float()
+    v = inputs["v"].float()
+
+    outputs = torch.empty(
+        case.num_input_tokens,
+        case.num_heads,
+        head_dim,
+        dtype=torch.float32,
+        device=fixture.runner.device,
+    )
+    cache_indices = _cache_indices(fixture)
+    start = 0
+
+    for req_idx, input_len in enumerate(case.input_lens):
+        parent_indices = _lightning_verify_parent_indices(input_len, topk)
+        state_idx = cache_indices[req_idx]
+        has_initial = case.prefix_lens[req_idx] > 0
+        if has_initial:
+            root_state = state[state_idx].float().clone()
+        else:
+            root_state = torch.zeros(
+                case.num_heads,
+                head_dim,
+                head_dim,
+                dtype=torch.float32,
+                device=fixture.runner.device,
+            )
+
+        token_states: list[torch.Tensor] = []
+        for offset, parent_idx in enumerate(parent_indices):
+            t = start + offset
+            parent_state = (
+                root_state.clone()
+                if parent_idx < 0
+                else token_states[parent_idx].clone()
+            )
+            new_state = torch.empty_like(parent_state)
+            for h in range(case.num_heads):
+                new_state[h] = parent_state[h] * decay[h] + torch.outer(
+                    k[t, h], v[t, h]
+                )
+                outputs[t, h] = (q[t, h] @ new_state[h]) * softmax_scale
+            token_states.append(new_state)
+        start += input_len
+
+    return outputs.to(fixture.q.dtype).reshape(case.num_input_tokens, -1)

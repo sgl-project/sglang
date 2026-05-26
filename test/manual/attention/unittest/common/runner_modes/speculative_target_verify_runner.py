@@ -94,6 +94,35 @@ from ..attention_methods.kda_attention import (
 from ..attention_methods.kda_attention import (
     _make_forward_batch as _make_kda_forward_batch,
 )
+from ..attention_methods.lightning_attention import (
+    DEFAULT_DEVICE as LIGHTNING_DEFAULT_DEVICE,
+)
+from ..attention_methods.lightning_attention import (
+    DEFAULT_DTYPE as LIGHTNING_DEFAULT_DTYPE,
+)
+from ..attention_methods.lightning_attention import (
+    DEFAULT_HEAD_DIM as LIGHTNING_DEFAULT_HEAD_DIM,
+)
+from ..attention_methods.lightning_attention import (
+    DEFAULT_MAX_CONTEXT_LEN as LIGHTNING_DEFAULT_MAX_CONTEXT_LEN,
+)
+from ..attention_methods.lightning_attention import (
+    LIGHTNING_ATOL,
+    LIGHTNING_RTOL,
+    LightningAttentionCase,
+    _clone_lightning_cache,
+    _restore_lightning_cache,
+    build_lightning_attention_fixture,
+    expected_lightning_verify_output_from_inputs,
+    lightning_fixture_inputs,
+    make_lightning_case_with_prefix_lens,
+    make_lightning_random_inputs,
+    prepare_lightning_runner_inputs,
+    run_lightning_forward,
+)
+from ..attention_methods.lightning_attention import (
+    _make_forward_batch as _make_lightning_forward_batch,
+)
 from ..attention_methods.mla_attention import DEFAULT_DEVICE as MLA_DEFAULT_DEVICE
 from ..attention_methods.mla_attention import DEFAULT_DTYPE as MLA_DEFAULT_DTYPE
 from ..attention_methods.mla_attention import (
@@ -979,6 +1008,135 @@ def run_kda_eagle_verify_cuda_graph_case(
         build_kwargs=dict(
             head_k_dim=head_k_dim,
             head_v_dim=head_v_dim,
+            max_context_len=max_context_len,
+            dtype=dtype,
+            device=device,
+        ),
+        capture_batch_size=cuda_graph_capture_batch_size,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+    )
+
+
+def run_lightning_eagle_verify_case(
+    testcase,
+    case: LightningAttentionCase,
+    *,
+    topk: int,
+    head_dim: int = LIGHTNING_DEFAULT_HEAD_DIM,
+    max_context_len: int = LIGHTNING_DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = LIGHTNING_DEFAULT_DTYPE,
+    device: str = LIGHTNING_DEFAULT_DEVICE,
+    # Loose tolerance mirrors KDA's verify: the seg_la kernel's per-token
+    # recurrence accumulates precision drift versus the pure-Python
+    # reference even without CG capture/replay.
+    atol: float = 1e-1,
+    rtol: float = 1e-1,
+):
+    fixture = build_lightning_attention_fixture(
+        testcase,
+        case,
+        head_dim=head_dim,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+    )
+    _prepare_target_verify_batch(fixture.forward_batch, case, device)
+    fixture.forward_batch.spec_info = _make_eagle_verify_input(
+        case,
+        fixture.forward_batch,
+        topk=topk,
+        device=device,
+    )
+    inputs = lightning_fixture_inputs(fixture)
+    initial_state = _clone_lightning_cache(fixture)
+    expected = expected_lightning_verify_output_from_inputs(
+        fixture,
+        case,
+        inputs,
+        initial_state,
+        topk=topk,
+    )
+
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+        fixture.backend.init_forward_metadata(fixture.forward_batch)
+        actual = run_lightning_forward(fixture, fixture.forward_batch, inputs)
+
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+
+
+def _prepare_lightning_verify_batch(case, batch, *, topk: int, device: str) -> None:
+    _prepare_target_verify_batch(batch, case, device)
+    batch.spec_info = _make_eagle_verify_input(
+        case,
+        batch,
+        topk=topk,
+        device=device,
+    )
+
+
+def run_lightning_eagle_verify_cuda_graph_case(
+    testcase,
+    case: LightningAttentionCase,
+    *,
+    topk: int,
+    head_dim: int = LIGHTNING_DEFAULT_HEAD_DIM,
+    max_context_len: int = LIGHTNING_DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = LIGHTNING_DEFAULT_DTYPE,
+    device: str = LIGHTNING_DEFAULT_DEVICE,
+    cuda_graph_capture_batch_size: int | None = None,
+    atol: float = 1e-1,
+    rtol: float = 1e-1,
+):
+    cuda_graph_capture_batch_size = cuda_graph_capture_batch_size or case.batch_size
+    adapter = SpeculativeCudaGraphAdapter(
+        build_fixture=build_lightning_attention_fixture,
+        make_capture_case=lambda base, name, capture_prefix_len, bs: (
+            make_lightning_case_with_prefix_lens(
+                base, name, (capture_prefix_len,) * bs
+            )
+        ),
+        make_replay_case=lambda base, name, _pad_prefix_lens: (
+            make_lightning_case_with_prefix_lens(base, name, base.prefix_lens)
+        ),
+        make_forward_batch=_make_lightning_forward_batch,
+        fixture_inputs=lightning_fixture_inputs,
+        make_capture_inputs=make_lightning_random_inputs,
+        make_replay_inputs=lambda _case, fixture, *_args, **_kwargs: (
+            lightning_fixture_inputs(fixture)
+        ),
+        prepare_batch=lambda spec_case, batch: _prepare_lightning_verify_batch(
+            spec_case,
+            batch,
+            topk=topk,
+            device=device,
+        ),
+        prepare_inputs=prepare_lightning_runner_inputs,
+        run_forward=run_lightning_forward,
+        expected_output=lambda fixture, spec_case, inputs, state: (
+            expected_lightning_verify_output_from_inputs(
+                fixture,
+                spec_case,
+                inputs,
+                state,
+                topk=topk,
+            )
+        ),
+        clone_state=_clone_lightning_cache,
+        restore_state=_restore_lightning_cache,
+        allow_padding=False,
+        run_graph_eager=False,
+        compare_replay_to_graph_eager=False,
+        atol=atol,
+        rtol=rtol,
+    )
+    run_speculative_cuda_graph_case(
+        testcase,
+        case,
+        adapter=adapter,
+        build_kwargs=dict(
+            head_dim=head_dim,
             max_context_len=max_context_len,
             dtype=dtype,
             device=device,

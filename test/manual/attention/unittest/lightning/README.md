@@ -19,7 +19,7 @@ Columns are runner modes; rows are the linear-attention kernel backend
 
 | Linear-attn kernel | Eager Phase 2 | CG decode | PCG extend | BCG extend | Verify eager | Verify CG | DE eager | DE CG | DE-V2 CG | EAGLE-draft runner | EAGLE-DE runner | FKVMTP runner |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `triton` | ✓ 10 input layouts (page 1/16/32, prefix/decode edges) | ✓ decode page-boundary (uses `LIGHTNING_GRAPH_ATOL=1e-1` to absorb seg_la kernel CG-replay drift; eager `LIGHTNING_ATOL=3e-2` kept for non-graph cases) | deferred | deferred | deferred: needs verify-reference adaptation (`expected_lightning_*` only covers DECODE/EXTEND today) | deferred | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
+| `triton` | ✓ 10 input layouts (page 1/16/32, prefix/decode edges) | ✓ decode page-boundary (uses `LIGHTNING_GRAPH_ATOL=1e-1` to absorb seg_la kernel CG-replay drift; eager `LIGHTNING_ATOL=3e-2` kept for non-graph cases) | deferred | deferred | ✓ EAGLE chain (topk=1) only — see "Production-Unsupported" below for why tree is omitted. Uses `atol=1e-1` because the verify reference's pure-Python per-token recurrence drifts ~0.07 vs the seg_la Triton kernel. | ✓ EAGLE chain CG (same `1e-1` tolerance) | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
 
 ## Input And Config Coverage
 
@@ -42,17 +42,22 @@ Columns are runner modes; rows are the linear-attention kernel backend
   Lightning inherits the `MambaAttnBackendBase` capture/replay contract, so
   `ValueError("Invalid forward mode")` at `hybrid_linear_attn_backend.py:509,
   572` applies. Draft-extend graph runners are structurally unreachable.
+- **EAGLE tree (topk>1) verify** — `seg_la.py` has no parent-indices /
+  retrieve-index plumbing; the kernel processes draft tokens as a chain
+  regardless of the input tree shape. A tree-shaped verify produces
+  large divergence (~5x off) vs the parent-indices-aware reference. The
+  `intermediate_state_indices` / `intermediate_ssm` plumbing in
+  `lightning_backend.py:307-329` is per-request, not per-token, so it
+  cannot replay parent state forks. Only chain (topk=1) is covered.
 
 ## Next Work
 
-- Add PCG/BCG runner coverage. CG decode already wired via
-  `run_lightning_cuda_graph_decode_case` (see above); the
-  `_clone_lightning_cache` / `_restore_lightning_cache` snapshot helpers
-  reuse `_ssm_states(fixture)` which points at the shared
-  `Mamba2CacheParams.temporal` buffer.
-- Add EAGLE chain/tree speculative target-verify coverage. The verify
-  reference needs to be authored against the seg_la per-token recurrence
-  (today `_pure_torch_lightning_reference` walks `case.input_lens`
-  request-by-request — TARGET_VERIFY draft trees would need a
-  parent-indices-aware variant analogous to KDA's
-  `expected_kda_verify_output_from_inputs`).
+- Add PCG/BCG runner coverage. CG decode + EAGLE chain verify already
+  wired (see above); the `_clone_lightning_cache` /
+  `_restore_lightning_cache` snapshot helpers reuse `_ssm_states(fixture)`
+  which points at the shared `Mamba2CacheParams.temporal` buffer.
+- EAGLE tree verify is gated by the `seg_la` kernel itself (no
+  parent-indices support); landing it requires a kernel-side change to
+  thread parent indices through `intermediate_ssm` so each draft token
+  forks from its parent's saved state rather than the prior chain
+  position. Out of scope for unit tests.
