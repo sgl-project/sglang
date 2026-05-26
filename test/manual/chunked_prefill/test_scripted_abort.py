@@ -65,7 +65,9 @@ class TestScriptedAbort(CustomTestCase):
         assert (
             r.row_idx is None
         ), f"abort must release row; r.row_idx={r.row_idx} after abort"
-        assert r.lock_refs == 0, f"abort must release lock_refs; r.lock_refs={r.lock_refs}"
+        assert (
+            r.lock_refs == 0
+        ), f"abort must release lock_refs; r.lock_refs={r.lock_refs}"
 
     def test_abort_at_chunk_0(self):
         """Abort during chunk_0 (first chunk not yet flushed)."""
@@ -277,7 +279,8 @@ class TestScriptedAbort(CustomTestCase):
     def _script_abort_five_chunked_in_a_row(t: ScriptedRuntime):
         # 5 chunked reqs submitted; abort all 5 sequentially.
         reqs = [
-            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2) for _ in range(5)
+            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+            for _ in range(5)
         ]
         yield from run_until(reqs[0], lambda h: h.is_chunking)
         for r in reqs:
@@ -454,7 +457,8 @@ class TestScriptedAbort(CustomTestCase):
     def _script_abort_in_separate_yields(t: ScriptedRuntime):
         # Submit 3 chunked, abort in 3 separate yield steps.
         reqs = [
-            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2) for _ in range(3)
+            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+            for _ in range(3)
         ]
         yield from run_until(reqs[0], lambda h: h.is_chunking)
         for r in reqs:
@@ -636,9 +640,7 @@ class TestScriptedAbort(CustomTestCase):
         # NEW API NEEDED: t.get_chunked_req_rid() — current scheduler
         # chunked_req rid or None.
         cur = t.get_chunked_req_rid()
-        assert cur != r1.rid, (
-            f"chunked slot still points to aborted r1; got {cur!r}"
-        )
+        assert cur != r1.rid, f"chunked slot still points to aborted r1; got {cur!r}"
         assert r1.kv_pages == 0
         yield from run_until_finished(r2)
         assert r2.finished, "fresh r2 must admit and complete after combo step"
@@ -665,12 +667,10 @@ class TestScriptedAbort(CustomTestCase):
         yield
 
         assert r1.kv_pages == 0, (
-            f"force_retract + abort same yield must release KV; got "
-            f"{r1.kv_pages}"
+            f"force_retract + abort same yield must release KV; got " f"{r1.kv_pages}"
         )
         assert r1.row_idx is None, (
-            f"force_retract + abort same yield must release row; got "
-            f"{r1.row_idx}"
+            f"force_retract + abort same yield must release row; got " f"{r1.row_idx}"
         )
         assert r1.lock_refs == 0, (
             f"force_retract + abort same yield must release lock_refs; "
