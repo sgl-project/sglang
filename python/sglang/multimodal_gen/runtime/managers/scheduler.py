@@ -58,6 +58,7 @@ from sglang.multimodal_gen.runtime.server_args import (
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
+from sglang.multimodal_gen.runtime.utils.request_logger import DiffusionRequestLogger
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
 
 logger = init_logger(__name__)
@@ -163,6 +164,14 @@ class Scheduler(SchedulerDisaggMixin):
         # Maximum consecutive errors before terminating the event loop
         self._max_consecutive_errors = 3
         self._consecutive_error_count = 0
+
+        # Request logging
+        self.request_logger = DiffusionRequestLogger(
+            log_requests=self.server_args.log_requests,
+            log_requests_level=self.server_args.log_requests_level,
+            log_requests_format=self.server_args.log_requests_format,
+            log_requests_target=self.server_args.log_requests_target,
+        )
 
         self._init_disagg_state(server_args, local_rank)
 
@@ -324,6 +333,10 @@ class Scheduler(SchedulerDisaggMixin):
                 )
             else:
                 logger.info("Processing warmup req...")
+
+        # Log the requests
+        for req in reqs:
+            self.request_logger.log_received_request(req=req)
 
         # Use the head request trace context for scheduler-side dispatch work.
         req = reqs[0]
@@ -1202,6 +1215,18 @@ class Scheduler(SchedulerDisaggMixin):
                 ):
                     is_warmup = self._is_warmup_item(processed_req)
                     self._log_warmup_result(output_batch, is_warmup)
+
+                    # Log finished requests
+                    reqs_to_log = (
+                        processed_req
+                        if isinstance(processed_req, list) and processed_req
+                        else [processed_req] if isinstance(processed_req, Req) else []
+                    )
+                    for req in reqs_to_log:
+                        self.request_logger.log_finished_request(
+                            req=req,
+                            output_batch=output_batch,
+                        )
 
                     self.return_result(output_batch, identity, is_warmup=is_warmup)
             except zmq.ZMQError as e:
