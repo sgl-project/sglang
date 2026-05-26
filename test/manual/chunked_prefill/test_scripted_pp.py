@@ -263,7 +263,9 @@ class TestScriptedPP(CustomTestCase):
         yield from run_until_finished(r2, max_steps=400)
         assert r2.finished
 
-    @unittest.skip("requires real pp_size>1 + pdmux topology — wire up when fixture lands")
+    @unittest.skip(
+        "requires real pp_size>1 + pdmux topology — wire up when fixture lands"
+    )
     def test_pp_split_prefill_chunked_no_merge_assert(self):
         """PP=2 + pdmux split-prefill + chunked must not trip merge_batch assert."""
         execute_scripted_runtime(
@@ -285,7 +287,9 @@ class TestScriptedPP(CustomTestCase):
         yield from run_until_finished(r, max_steps=800)
         # Concrete observable signal that pdmux + chunked actually exercised
         # the merge_batch defense path: engine survived AND chunking happened.
-        assert r.finished, "engine died before req finished — merge_batch assert may have tripped"
+        assert (
+            r.finished
+        ), "engine died before req finished — merge_batch assert may have tripped"
         assert r.chunks_done >= 2, (
             f"pdmux + chunked path must produce >=2 chunks to exercise "
             f"split_prefill_batch filter; got chunks_done={r.chunks_done}"
@@ -302,7 +306,9 @@ class TestScriptedPP(CustomTestCase):
                 f"{stats['merge_batch_assert_violations']}"
             )
 
-    @unittest.skip("requires real pp_size>1 + dynamic chunking telemetry — wire up when fixture lands")
+    @unittest.skip(
+        "requires real pp_size>1 + dynamic chunking telemetry — wire up when fixture lands"
+    )
     def test_pp_dynamic_chunking_predictor(self):
         """PP=2 + dynamic chunking — last_chunked_prefill_size set per iter by predictor."""
         execute_scripted_runtime(
@@ -332,7 +338,9 @@ class TestScriptedPP(CustomTestCase):
                 break
             yield
         assert r.finished
-        assert observed_non_none, "dynamic chunking predictor never produced a non-None size"
+        assert (
+            observed_non_none
+        ), "dynamic chunking predictor never produced a non-None size"
 
 
 if __name__ == "__main__":
