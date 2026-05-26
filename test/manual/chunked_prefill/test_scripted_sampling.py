@@ -542,15 +542,6 @@ class TestScriptedSampling(CustomTestCase):
             f">= logprob_start_len={start_len}, got {len(input_lp)}"
         )
 
-    @unittest.skip(
-        "needs ScriptedRuntime stream-event capture: start_req(stream=True) "
-        "passthrough plus a ReqHandle.stream_events buffer that records "
-        "when each output token is delivered. Once available, drive a "
-        "VERY_LONG_PROMPT_LEN chunked req with stream=True, run_until "
-        "chunks_done reaches the final chunk index, assert "
-        "stream_events == [] (no mid-chunk emission), then run_until_finished "
-        "and assert stream_events has one event per output token."
-    )
     def test_chunked_streaming_no_mid_chunk_output(self):
         """Stream=True + chunked: no output events fire until the last chunk finishes."""
         execute_scripted_runtime(
