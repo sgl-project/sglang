@@ -119,14 +119,14 @@ def launch_scatter_req_token_ids_kernel(
 
 @triton.jit
 def _scatter_req_token_ids_kernel(
-    flat_in_ptr,             # [num_tokens] int64
-    offsets_ptr,             # [num_batch + 1] int64
-    req_pool_indices_ptr,    # [num_batch] int64
-    pool_out_ptr,            # [num_rows, pool_max_context_len] int32, row stride = pool_stride0
-    num_tokens,              # scalar int32
-    num_batch,               # scalar int32
-    pool_stride0,            # scalar int32 (row stride of pool_out in elements)
-    pool_max_context_len,    # scalar int32 (dim-1 length of pool_out)
+    flat_in_ptr,  # [num_tokens] int64
+    offsets_ptr,  # [num_batch + 1] int64
+    req_pool_indices_ptr,  # [num_batch] int64
+    pool_out_ptr,  # [num_rows, pool_max_context_len] int32, row stride = pool_stride0
+    num_tokens,  # scalar int32
+    num_batch,  # scalar int32
+    pool_stride0,  # scalar int32 (row stride of pool_out in elements)
+    pool_max_context_len,  # scalar int32 (dim-1 length of pool_out)
     TOKEN_BLOCK: tl.constexpr,
     BATCH_BLOCK: tl.constexpr,
 ):
