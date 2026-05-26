@@ -862,7 +862,6 @@ class TestSharedHiCache(unittest.TestCase):
         plan_1 = _make_plan([2], plan_id="plan-2")
         req = GenerateReqInput(
             text=["hello", "world"],
-            sampling_params={"n": 2},
             rid="r",
             shared_hicache_plan=[plan_0, plan_1],
         )
@@ -871,8 +870,16 @@ class TestSharedHiCache(unittest.TestCase):
 
         self.assertEqual(req[0].shared_hicache_plan, SharedHiCachePlan.coerce(plan_0))
         self.assertEqual(req[1].shared_hicache_plan, SharedHiCachePlan.coerce(plan_1))
-        self.assertEqual(req[2].shared_hicache_plan, SharedHiCachePlan.coerce(plan_0))
-        self.assertEqual(req[3].shared_hicache_plan, SharedHiCachePlan.coerce(plan_1))
+
+    def test_generate_req_rejects_shared_hicache_parallel_sampling(self):
+        req = GenerateReqInput(
+            text="hello",
+            sampling_params={"n": 2},
+            shared_hicache_plan=_make_plan([1]),
+        )
+
+        with self.assertRaisesRegex(ValueError, "parallel_sample_num > 1"):
+            req.normalize_batch_and_arguments()
 
     def test_engine_async_generate_forwards_shared_hicache_plan(self):
         plan = _make_plan([11])

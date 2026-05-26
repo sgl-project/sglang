@@ -1462,8 +1462,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             for i in range(batch_size):
                 tmp_obj = copy.copy(objs[i])
                 tokenized_obj = copy.copy(tokenized_objs[i])
-                tmp_obj.shared_hicache_plan = objs[i].shared_hicache_plan
-                tokenized_obj.shared_hicache_plan = tokenized_objs[i].shared_hicache_plan
                 # Ensure independent mm_items so wrap_shm_features won't mutate the original
                 if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
                     tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
@@ -1483,8 +1481,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for _ in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
-                    tmp_obj.shared_hicache_plan = None
-                    tokenized_obj.shared_hicache_plan = None
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
                     if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
                         tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)

@@ -359,7 +359,6 @@ class GenerateReqInput(BaseReq):
         # Determine parallel sample count
         if self.sampling_params is None:
             self.parallel_sample_num = 1
-            return
         elif isinstance(self.sampling_params, dict):
             self.parallel_sample_num = self.sampling_params.get("n", 1)
         else:  # isinstance(self.sampling_params, list):
@@ -369,6 +368,11 @@ class GenerateReqInput(BaseReq):
                     raise ValueError(
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
+
+        if self.shared_hicache_plan is not None and self.parallel_sample_num != 1:
+            raise ValueError(
+                "shared_hicache_plan does not support parallel_sample_num > 1"
+            )
 
         # If using parallel sampling with a single example, convert to batch
         if self.parallel_sample_num > 1 and self.is_single:
@@ -629,8 +633,12 @@ class GenerateReqInput(BaseReq):
                 )
             self.shared_hicache_plan = [
                 SharedHiCachePlan.coerce(plan) for plan in self.shared_hicache_plan
-            ] * self.parallel_sample_num
+            ]
         else:
+            if self.batch_size != 1:
+                raise ValueError(
+                    "shared_hicache_plan must be a list when batch size is greater than 1."
+                )
             plan = SharedHiCachePlan.coerce(self.shared_hicache_plan)
             self.shared_hicache_plan = [plan] * num
 

@@ -220,7 +220,9 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
-from sglang.srt.mem_cache.shared_hicache.manager import SharedHiCacheManager
+from sglang.srt.mem_cache.shared_hicache.scheduler_mixin import (
+    SharedHiCacheSchedulerMixin,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -291,6 +293,7 @@ class Scheduler(
     SchedulerPPMixin,
     SchedulerDllmMixin,
     SchedulerMlxOverlapMixin,
+    SharedHiCacheSchedulerMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
@@ -701,7 +704,7 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
-            release_shared_hicache_request=self._release_shared_hicache_request,
+            _release_shared_hicache_request=self._release_shared_hicache_request,
         )
 
         self.is_initializing = False
@@ -997,9 +1000,6 @@ class Scheduler(
                 context_len=self.model_config.context_len,
                 startup_available_gpu_memory_gb=avail_mem,
             )
-
-    def init_shared_hicache(self):
-        self.shared_hicache_manager = SharedHiCacheManager.from_scheduler(self)
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
@@ -2033,130 +2033,6 @@ class Scheduler(
                     last_hash,
                     prefix_keys,
                 )
-
-    def _prepare_shared_hicache_for_schedule(self, req: Req) -> bool:
-        shared_hicache_manager = getattr(self, "shared_hicache_manager", None)
-        if shared_hicache_manager is None:
-            return True
-
-        has_reuse_plan = shared_hicache_manager.has_reuse_plan(req)
-        any_rank_has_plan, all_ranks_have_plan = self._sync_shared_hicache_bool(
-            has_reuse_plan
-        )
-        if not any_rank_has_plan:
-            return True
-        if not all_ranks_have_plan:
-            logger.warning(
-                "SharedHiCache plan availability diverged across TP ranks for rid=%s; "
-                "falling back to local prefill",
-                req.rid,
-            )
-            req.shared_hicache_plan = None
-            release = getattr(shared_hicache_manager, "release_request", None)
-            if release is not None:
-                try:
-                    release(req.rid)
-                except Exception:
-                    logger.debug(
-                        "Failed to release SharedHiCache state after TP fallback",
-                        exc_info=True,
-                    )
-            return True
-
-        pending = False
-        try:
-            # Probe the current local prefix without taking COW allocations.
-            # The final schedule path below recomputes the prefix after remote pages land.
-            req.init_next_round_input(self.tree_cache, cow_mamba=False)
-            result = shared_hicache_manager.prepare_reuse(req)
-            pending = result.pending
-        except Exception:
-            logger.exception(
-                "SharedHiCache failed for rid=%s; continuing with local prefill",
-                req.rid,
-            )
-            req.shared_hicache_plan = None
-            release = getattr(shared_hicache_manager, "release_request", None)
-            if release is not None:
-                try:
-                    release(req.rid)
-                except Exception:
-                    logger.debug(
-                        "Failed to release SharedHiCache state after error",
-                        exc_info=True,
-                    )
-            pending = False
-        any_rank_pending, _ = self._sync_shared_hicache_bool(pending)
-        if any_rank_pending:
-            return False
-
-        local_prefix_len = int(getattr(result, "prefix_len", 0))
-        common_prefix_len = self._sync_shared_hicache_int_min(local_prefix_len)
-        if common_prefix_len > 0:
-            req.shared_hicache_max_prefix_len = common_prefix_len
-            if common_prefix_len != local_prefix_len:
-                logger.debug(
-                    "SharedHiCache clamped TP prefix for rid=%s local=%d common=%d",
-                    req.rid,
-                    local_prefix_len,
-                    common_prefix_len,
-                )
-        return True
-
-    def _sync_shared_hicache_bool(self, value: bool) -> tuple[bool, bool]:
-        group_size = self.ps.tp_size
-        group = self.tp_cpu_group
-        if group_size <= 1:
-            return value, value
-
-        flag = torch.tensor([1 if value else 0], dtype=torch.int32)
-        torch.distributed.all_reduce(
-            flag,
-            op=torch.distributed.ReduceOp.SUM,
-            group=group,
-        )
-        count = int(flag.item())
-        return count > 0, count == group_size
-
-    def _sync_shared_hicache_int_min(self, value: int) -> int:
-        group_size = self.ps.tp_size
-        group = self.tp_cpu_group
-        if group_size <= 1:
-            return int(value)
-
-        tensor = torch.tensor([int(value)], dtype=torch.int64)
-        torch.distributed.all_reduce(
-            tensor,
-            op=torch.distributed.ReduceOp.MIN,
-            group=group,
-        )
-        return int(tensor.item())
-
-    def _shared_hicache_tp_sync_enabled(self) -> bool:
-        if getattr(self, "shared_hicache_manager", None) is None:
-            return False
-        return self.ps.tp_size > 1
-
-    def _init_next_round_input_with_shared_hicache_tp_sync(self, req: Req) -> None:
-        if not self._shared_hicache_tp_sync_enabled():
-            req.init_next_round_input(self.tree_cache)
-            req.shared_hicache_max_prefix_len = None
-            return
-
-        requested_cap = req.shared_hicache_max_prefix_len
-        req.init_next_round_input(self.tree_cache, cow_mamba=False)
-        common_prefix_len = self._sync_shared_hicache_int_min(len(req.prefix_indices))
-        if requested_cap is not None:
-            common_prefix_len = min(common_prefix_len, int(requested_cap))
-
-        req.shared_hicache_max_prefix_len = common_prefix_len
-        req.init_next_round_input(self.tree_cache)
-        req.shared_hicache_max_prefix_len = None
-
-    def _release_shared_hicache_request(self, rid: str) -> None:
-        shared_hicache_manager = getattr(self, "shared_hicache_manager", None)
-        if shared_hicache_manager is not None:
-            shared_hicache_manager.release_request(rid)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
