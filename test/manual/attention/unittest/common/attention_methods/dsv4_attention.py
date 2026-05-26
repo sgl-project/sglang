@@ -395,6 +395,17 @@ class ProjectedDSV4Attention(nn.Module):
             dtype=dtype,
             device=device,
         )
+        # Production DSV4 has an `o_proj` mapping multi-head output back to
+        # hidden_size. We only add it for the EAGLE draft path (forward()
+        # method); the rest of the fixture bypasses `forward()` and runs
+        # the backend output through the test's own reduction.
+        self.o_proj = nn.Linear(
+            num_heads * DSV4_V_HEAD_DIM,
+            hidden_size,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
         self.attn = RadixAttention(
             num_heads=num_heads,
             head_dim=DSV4_HEAD_DIM,
@@ -418,6 +429,50 @@ class ProjectedDSV4Attention(nn.Module):
         q = self.q_proj(hidden_states).view(-1, self.num_heads, DSV4_HEAD_DIM)
         k = self.k_proj(hidden_states).view(-1, 1, DSV4_HEAD_DIM)
         return q, k
+
+    def forward(self, hidden_states: torch.Tensor, forward_batch):
+        """Production-style draft forward: project Q/K, write K to the SWA
+        pool at `forward_batch.out_cache_loc`, then run the active backend.
+
+        Mirrors `python/sglang/srt/models/deepseek_v4.py::AbsorbMQAv4.forward`
+        for `compress_ratio=0`: K is written via `set_swa_key_buffer_radix`
+        before the attention call, the backend is invoked with
+        `save_kv_cache=False`, and the attn_sink correction is forwarded
+        via the `attn_sink` kwarg.
+
+        Returns a flat `[num_tokens, hidden_size]` tensor (matching the
+        backend's output shape) so the EAGLE draft runner harness can pipe
+        it through `lm_head`.
+        """
+        from sglang.srt.model_executor.forward_context import (
+            get_forward_context,
+        )
+
+        q, k = self.project(hidden_states)
+        ctx = get_forward_context()
+        attn_backend = ctx.attn_backend
+        if forward_batch.out_cache_loc is not None:
+            # `quant_to_nope_fp8_rope_bf16_pack_triton` expects 2D
+            # `[num_tokens, hidden_dim]`; `project` returns 3D
+            # `[num_tokens, 1, hidden_dim]`.
+            k_flat = k.reshape(k.shape[0], -1).to(torch.bfloat16)
+            pack = quant_to_nope_fp8_rope_bf16_pack_triton(k_flat)
+            attn_backend.token_to_kv_pool.set_swa_key_buffer_radix(
+                layer_id=self.attn.layer_id,
+                raw_loc=forward_batch.out_cache_loc.to(torch.int64),
+                cache_nope_fp8_rope_bf16_pack=pack,
+            )
+        out = attn_backend.forward(
+            q=q,
+            k=k,
+            v=k,
+            layer=self.attn,
+            forward_batch=forward_batch,
+            compress_ratio=0,
+            save_kv_cache=False,
+            attn_sink=self.attn_sink,
+        )
+        return self.o_proj(out.reshape(out.shape[0], -1))
 
 
 def _write_swa_cache(

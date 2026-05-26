@@ -38,6 +38,9 @@ from common.attention_methods.dsv4_attention import (  # noqa: E402
 from common.runner_modes.cuda_graph_decode_runner import (  # noqa: E402
     run_dsv4_cuda_graph_decode_case,
 )
+from common.runner_modes.eagle_draft_runner import (  # noqa: E402
+    run_dsv4_eagle_draft_cuda_graph_runner_case,
+)
 from common.runner_modes.speculative_draft_extend_runner import (  # noqa: E402
     run_dsv4_eagle_draft_extend_cuda_graph_case,
 )
@@ -278,6 +281,27 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
         for case in self.EAGLE_DRAFT_EXTEND_CUDA_GRAPH_CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_dsv4_eagle_draft_extend_cuda_graph_case(self, case)
+
+    # Production EAGLE draft graph runner (chain only, SWA only). The runner
+    # routes through `DeepseekV4MultiStepBackend` (one `DeepseekV4AttnBackend`
+    # per draft step), captures a fixed batch, and replays distinct request
+    # metadata. The fixture's `ProjectedDSV4Attention.forward` writes K via
+    # `set_swa_key_buffer_radix` exactly like the production model.
+    PRODUCTION_EAGLE_DRAFT_RUNNER_CASES = (
+        DSV4AttentionCase(
+            name="runner_production_eagle_draft_dsv4_swa_chain",
+            backend="dsv4",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(32, 64),
+        ),
+    )
+
+    def test_runner_mode_production_eagle_draft_cuda_graph_runner_cases(self):
+        for case in self.PRODUCTION_EAGLE_DRAFT_RUNNER_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_dsv4_eagle_draft_cuda_graph_runner_case(self, case)
 
 
 if __name__ == "__main__":

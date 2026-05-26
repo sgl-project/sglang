@@ -80,6 +80,18 @@ from ..attention_methods.mla_attention import (
     build_mla_attention_fixture,
     prepare_mla_runner_inputs,
 )
+from ..attention_methods.dsv4_attention import (
+    DSV4_ATOL,
+    DSV4_HEAD_DIM,
+    DSV4_PAGE_SIZE,
+    DSV4_RTOL,
+    DSV4_SWA_WINDOW,
+    DSV4AttentionCase,
+    build_dsv4_attention_fixture,
+)
+from ..attention_methods.dsv4_attention import (
+    _token_loc as _dsv4_token_loc,
+)
 
 
 def _assert_draft_outputs_close(actual, expected, settings) -> None:
@@ -120,6 +132,13 @@ class EagleDraftCudaGraphRunnerAdapter:
     assert_outputs_close: Callable[[Any, Any, EagleDraftRunnerSettings], None] = (
         _assert_draft_outputs_close
     )
+    # Optional override for the eager pre-draft init path. Default mirrors
+    # dense/MLA: one `init_forward_metadata` call before the multi-step
+    # loop. DSV4 needs to override this because its
+    # `init_forward_metadata_decode` strictly asserts
+    # `out_cache_loc.shape[0] == bs`, which is not the case for the
+    # multi-step batch (`shape = bs * topk * num_steps`).
+    init_eager_metadata: Callable[[Any, ForwardBatch, EagleDraftRunnerSettings], None] = None
 
 
 def _assert_draft_extend_outputs_close(actual, expected, settings) -> None:
@@ -494,8 +513,14 @@ def _build_frozen_kv_mtp_fixture(
 def _run_eagle_draft_eager(
     worker: _EagleDraftWorkerHarness,
     batch: ForwardBatch,
+    *,
+    init_eager_metadata: Callable[..., None] | None = None,
+    settings: EagleDraftRunnerSettings | None = None,
 ):
-    worker.draft_attn_backend.init_forward_metadata(batch)
+    if init_eager_metadata is not None:
+        init_eager_metadata(worker, batch, settings)
+    else:
+        worker.draft_attn_backend.init_forward_metadata(batch)
     return worker.draft_forward(batch)
 
 
@@ -631,7 +656,12 @@ def run_eagle_draft_cuda_graph_runner_case(
         )
         adapter.prepare_replay_state(eager_fixture, case, draft_inputs, settings)
         eager_batch = adapter.make_forward_batch(case, draft_inputs, settings)
-        expected = _run_eagle_draft_eager(eager_worker, eager_batch)
+        expected = _run_eagle_draft_eager(
+            eager_worker,
+            eager_batch,
+            init_eager_metadata=adapter.init_eager_metadata,
+            settings=settings,
+        )
 
         graph_fixture, graph_worker, graph_backend = _build_eagle_draft_fixture(
             testcase,
@@ -1962,6 +1992,288 @@ def run_mla_eagle_draft_extend_v2_cuda_graph_runner_case(
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
             hidden_size=hidden_size,
+            max_context_len=max_context_len,
+            dtype=dtype,
+            device=device,
+        ),
+        settings=settings,
+    )
+
+
+# ---------------------------------------------------------------------------
+# DSV4 EAGLE draft CUDA-graph runner adapter
+# ---------------------------------------------------------------------------
+#
+# DSV4 production speculative decoding is always chain (topk=1; tree spec is
+# structurally impossible because `deepseek_v4_backend.py:369` asserts
+# `self.topk in [0, 1]`). The draft model `DeepseekV4ModelNextN` is a single
+# decoder layer hardcoded to `compress_ratio_override=0` (SWA-only). So
+# DSV4 EAGLE draft graph runner coverage is restricted to topk=1, SWA-only.
+
+
+class _DSV4EagleDraftForward:
+    """Minimal DSV4 draft model forward.
+
+    Mirrors `_MLAEagleDraftForward` but routes through
+    `ProjectedDSV4Attention.forward` which production-style writes K to the
+    SWA pool before invoking the active step backend.
+    """
+
+    def __init__(
+        self,
+        *,
+        module,
+        hidden_size: int,
+        vocab_size: int,
+        dtype: torch.dtype,
+        device: str,
+    ):
+        self.module = module
+        self.token_embed = nn.Embedding(
+            vocab_size, hidden_size, dtype=dtype, device=device
+        )
+        self.lm_head = nn.Linear(
+            hidden_size, vocab_size, bias=False, dtype=dtype, device=device
+        )
+
+    def __call__(self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool):
+        del skip_attn_backend_init
+        spec_info = forward_batch.spec_info
+        hidden_states = spec_info.hidden_states
+        if hidden_states is None:
+            raise ValueError("EAGLE draft runner tests expect hidden-state drafts.")
+
+        token_hidden = self.token_embed(forward_batch.input_ids)
+        hidden_states = hidden_states + token_hidden
+        hidden_states = self.module(hidden_states, forward_batch)
+        logits = self.lm_head(hidden_states).float()
+        return SimpleNamespace(
+            logits_output=LogitsProcessorOutput(
+                next_token_logits=logits,
+                hidden_states=hidden_states,
+            )
+        )
+
+
+def _make_dsv4_model_forward(fixture, settings: EagleDraftRunnerSettings):
+    return _DSV4EagleDraftForward(
+        module=fixture.actual_module,
+        hidden_size=settings.hidden_size,
+        vocab_size=settings.vocab_size,
+        dtype=settings.dtype,
+        device=settings.device,
+    )
+
+
+def _make_dsv4_draft_inputs(
+    case: DSV4AttentionCase,
+    settings: EagleDraftRunnerSettings,
+) -> dict[str, torch.Tensor]:
+    with _seeded_rng(9180 + len(case.name), device=settings.device):
+        topk_index = (
+            torch.arange(
+                case.batch_size * settings.topk,
+                dtype=torch.int64,
+                device=settings.device,
+            ).view(case.batch_size, settings.topk)
+            + 5
+        ) % settings.vocab_size
+        topk_p = torch.linspace(
+            0.55,
+            0.95,
+            steps=case.batch_size * settings.topk,
+            dtype=torch.float32,
+            device=settings.device,
+        ).view(case.batch_size, settings.topk)
+        topk_p = topk_p / topk_p.sum(dim=-1, keepdim=True)
+        return {
+            "hidden_states": torch.randn(
+                case.batch_size,
+                settings.hidden_size,
+                dtype=settings.dtype,
+                device=settings.device,
+            ),
+            "topk_p": topk_p,
+            "topk_index": topk_index,
+        }
+
+
+def _prepare_dsv4_draft_replay_state(
+    fixture,
+    case: DSV4AttentionCase,
+    _draft_inputs,
+    settings: EagleDraftRunnerSettings,
+) -> None:
+    # Map every (req, position) the draft will write/read to a real slot in
+    # the SWA pool. DSV4 chain draft writes one new token per step at
+    # `prefix_len + step` (topk == 1).
+    runner = fixture.runner
+    max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
+    for req_idx, prefix_len in enumerate(case.prefix_lens):
+        for pos in range(prefix_len):
+            runner.req_to_token_pool.req_to_token[req_idx, pos] = _dsv4_token_loc(
+                req_idx, pos, max_context_len=max_context_len
+            )
+        for step in range(settings.speculative_num_steps):
+            pos = prefix_len + step
+            runner.req_to_token_pool.req_to_token[req_idx, pos] = _dsv4_token_loc(
+                req_idx, pos, max_context_len=max_context_len
+            )
+
+
+def _check_dsv4_draft_cache_layout(
+    case: DSV4AttentionCase,
+    settings: EagleDraftRunnerSettings,
+) -> None:
+    if case.compress_ratio != 0:
+        raise ValueError(
+            "DSV4 EAGLE draft runner coverage is SWA-only. Production "
+            "`DeepseekV4ModelNextN` hardcodes `compress_ratio_override=0` so "
+            "C4/C128 + draft is unreachable."
+        )
+    if settings.topk != 1:
+        raise ValueError(
+            "DSV4 speculative decoding asserts `topk in [0, 1]` "
+            "(`deepseek_v4_backend.py:369`); tree draft is structurally "
+            "impossible."
+        )
+    if case.page_size != DSV4_PAGE_SIZE:
+        raise ValueError(
+            f"DSV4 backend asserts page_size == {DSV4_PAGE_SIZE} "
+            f"(got {case.page_size})."
+        )
+    for prefix_len in case.prefix_lens:
+        if prefix_len + settings.speculative_num_steps > DSV4_SWA_WINDOW:
+            raise ValueError(
+                "Prefix + speculative steps exceed the SWA window; the "
+                "fixture currently only covers within-window draft."
+            )
+
+
+def _init_dsv4_eager_metadata(
+    worker,
+    batch: ForwardBatch,
+    settings: EagleDraftRunnerSettings,
+) -> None:
+    """Per-step DSV4 init for the eager comparison path.
+
+    `DeepseekV4AttnBackend.init_forward_metadata_decode` strictly asserts
+    `out_cache_loc.shape[0] == bs`, but the multi-step draft batch carries
+    `bs * topk * num_steps` cache locs. Mirror the production semantics by
+    initializing each step's backend with the step-specific cache loc
+    slice; production EAGLE worker overwrites `forward_batch.out_cache_loc`
+    before each per-step forward.
+    """
+    bs = batch.batch_size
+    topk = settings.topk
+    multi_step_backend = worker.draft_attn_backend
+    full_out = batch.out_cache_loc
+    per_step = full_out.reshape(bs, topk, settings.speculative_num_steps).permute(
+        (2, 0, 1)
+    ).reshape(settings.speculative_num_steps, -1)
+    saved_out = batch.out_cache_loc
+    try:
+        for i, attn_backend in enumerate(multi_step_backend.attn_backends):
+            batch.out_cache_loc = per_step[i]
+            attn_backend.init_forward_metadata(batch)
+    finally:
+        batch.out_cache_loc = saved_out
+
+
+def _make_dsv4_eagle_draft_forward_batch(
+    case: DSV4AttentionCase,
+    draft_inputs: dict[str, torch.Tensor],
+    settings: EagleDraftRunnerSettings,
+) -> ForwardBatch:
+    out_cache_locs = []
+    for req_idx, prefix_len in enumerate(case.prefix_lens):
+        for step in range(settings.speculative_num_steps):
+            out_cache_locs.append(
+                _dsv4_token_loc(
+                    req_idx,
+                    prefix_len + step,
+                    max_context_len=settings.max_context_len,
+                )
+            )
+
+    spec_info = EagleDraftInput(
+        topk_p=draft_inputs["topk_p"].clone(),
+        topk_index=draft_inputs["topk_index"].clone(),
+        hidden_states=draft_inputs["hidden_states"].clone(),
+        capture_hidden_mode=CaptureHiddenMode.LAST,
+        num_tokens_per_req=settings.topk,
+        num_tokens_for_logprob_per_req=settings.topk,
+    )
+    seq_lens = torch.tensor(
+        case.prefix_lens,
+        dtype=torch.int32,
+        device=settings.device,
+    )
+    return ForwardBatch(
+        forward_mode=ForwardMode.DECODE,
+        batch_size=case.batch_size,
+        input_ids=None,
+        req_pool_indices=torch.arange(
+            case.batch_size,
+            dtype=torch.int32,
+            device=settings.device,
+        ),
+        seq_lens=seq_lens,
+        seq_lens_cpu=torch.tensor(case.prefix_lens, dtype=torch.int32, device="cpu"),
+        out_cache_loc=torch.tensor(
+            out_cache_locs,
+            dtype=torch.int64,
+            device=settings.device,
+        ),
+        seq_lens_sum=sum(case.prefix_lens),
+        positions=seq_lens.repeat_interleave(settings.topk).to(torch.int64),
+        spec_algorithm=SpeculativeAlgorithm.EAGLE,
+        spec_info=spec_info,
+        capture_hidden_mode=CaptureHiddenMode.LAST,
+    )
+
+
+def run_dsv4_eagle_draft_cuda_graph_runner_case(
+    testcase,
+    case: DSV4AttentionCase,
+    *,
+    topk: int = 1,
+    speculative_num_steps: int = 3,
+    speculative_num_draft_tokens: int = 3,
+    cuda_graph_capture_batch_size: int = 4,
+    hidden_size: int = DSV4_HEAD_DIM,
+    max_context_len: int = 256,
+    vocab_size: int = 64,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+):
+    settings = EagleDraftRunnerSettings(
+        topk=topk,
+        speculative_num_steps=speculative_num_steps,
+        speculative_num_draft_tokens=speculative_num_draft_tokens,
+        capture_batch_size=cuda_graph_capture_batch_size,
+        hidden_size=hidden_size,
+        vocab_size=vocab_size,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        atol=DSV4_ATOL,
+        rtol=DSV4_RTOL,
+    )
+    adapter = EagleDraftCudaGraphRunnerAdapter(
+        build_fixture=build_dsv4_attention_fixture,
+        make_model_forward=_make_dsv4_model_forward,
+        make_draft_inputs=_make_dsv4_draft_inputs,
+        prepare_replay_state=_prepare_dsv4_draft_replay_state,
+        make_forward_batch=_make_dsv4_eagle_draft_forward_batch,
+        check_case=_check_dsv4_draft_cache_layout,
+        init_eager_metadata=_init_dsv4_eager_metadata,
+    )
+    run_eagle_draft_cuda_graph_runner_case(
+        testcase,
+        case,
+        adapter=adapter,
+        build_kwargs=dict(
             max_context_len=max_context_len,
             dtype=dtype,
             device=device,
