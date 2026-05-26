@@ -316,14 +316,6 @@ class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
         self.assertGreater(metrics["score"], 0.87)
 
 
-@unittest.skipIf(
-    is_in_ci(),
-    "Mamba+extra_buffer on Nemotron-Nano-9B-v2 scores 0.7-0.82 in CI "
-    "vs the 0.87 threshold; the Mamba-only sibling lands at 0.9 with the "
-    "same model, so extra_buffer degrades accuracy here. Match the GDN "
-    "sibling's 'temporarily disable the flaky test' skip until the "
-    "extra_buffer codepath for Mamba is fixed.",
-)
 class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):

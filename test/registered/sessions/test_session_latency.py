@@ -343,15 +343,11 @@ class TestSessionLatency(CustomTestCase):
             f"tail_avg(last {TAIL_TURNS})={tail_avg:.1f}ms  "
             f"ratio={ratio:.2f}"
         )
-        # 1.20 instead of 1.15: under shared CI runner load the tail-vs-head
-        # ratio reproducibly lands at ~1.16-1.17 even on a clean PR. The
-        # purpose of this assertion is to catch a regression like 2x-3x
-        # slowdown, so the looser bound still does its job.
         self.assertLessEqual(
             ratio,
-            1.20,
+            1.15,
             f"streaming latency should stay flat across turns "
-            f"(head={head_avg:.1f}ms, tail={tail_avg:.1f}ms, ratio={ratio:.2f} > 1.20)",
+            f"(head={head_avg:.1f}ms, tail={tail_avg:.1f}ms, ratio={ratio:.2f} > 1.15)",
         )
 
     def test_streaming_session_correctness(self):

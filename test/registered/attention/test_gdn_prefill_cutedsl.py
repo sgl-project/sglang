@@ -137,9 +137,7 @@ def test_gdn_chunk_cutedsl_correctness(num_seqs: int, state_dtype: torch.dtype):
     assert o_error.max().item() < 2e-3
     assert o_error.mean().item() < 6e-5
     assert state_error.max().item() < 2e-2
-    # Bumped from 6e-4 (the upstream vLLM port value): on Blackwell the
-    # fp32 state path with num_seqs=1 reproducibly lands at ~6.9e-4.
-    assert state_error.mean().item() < 8e-4
+    assert state_error.mean().item() < 6e-4
     core_attn_out_error = (
         actual_core_attn_out.float() - actual_o.squeeze(0).float()
     ).abs()
@@ -169,7 +167,7 @@ def test_gdn_chunk_cutedsl_correctness(num_seqs: int, state_dtype: torch.dtype):
     assert no_buffer_o_error.max().item() < 2e-3
     assert no_buffer_o_error.mean().item() < 6e-5
     assert no_buffer_state_error.max().item() < 2e-2
-    assert no_buffer_state_error.mean().item() < 8e-4
+    assert no_buffer_state_error.mean().item() < 6e-4
     assert buffer_o_error.max().item() == 0
     assert buffer_state_error.max().item() == 0
 
