@@ -24,6 +24,15 @@ weights and no SGLang backend calls.
 - Nonzero MLA rope dimension support is present, but RoPE math is intentionally
   orthogonal to the runner/backend matrix.
 
+## Current Progress
+
+- Phase 2 eager correctness covers the locally runnable MLA backends with a
+  separate absorb-style PyTorch reference.
+- Phase 3 coverage includes CUDA graph decode and paged/chunked extend replay
+  for Triton, FlashInfer MLA, and FlashMLA.
+- Phase 4 now includes both synthetic EAGLE verify coverage and production
+  EAGLE draft-runner graph replay for the stable backend/mode combinations.
+
 ## Next Work
 
 - Debug FlashInfer MLA tree custom-mask semantics.

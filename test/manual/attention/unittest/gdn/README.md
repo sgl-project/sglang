@@ -18,6 +18,15 @@ PyTorch gated-delta recurrence reference, not Triton/FLA GDN kernels.
 - GDN uses speculative Mamba state buffers for target verify coverage.
 - The split-op tests verify live-token slicing with a larger static token buffer.
 
+## Current Progress
+
+- Phase 2 eager correctness covers representative GDN input layouts against a
+  pure PyTorch recurrence reference.
+- Phase 3 coverage exercises CUDA graph decode on Triton and FlashInfer, plus
+  paged/chunked and batch-chunked extend paths.
+- Phase 4 EAGLE chain/tree coverage includes recurrent state buffers and graph
+  replay for the currently stable full-attention backends.
+
 ## Next Work
 
 - Add additional linear-attention kernel backend variants when available.

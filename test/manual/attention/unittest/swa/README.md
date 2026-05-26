@@ -17,6 +17,8 @@ masking, not a second backend call.
 - SWA has representative Phase 2 and Phase 3 coverage for `triton` and `flashinfer`.
 - Phase 4 coverage is intentionally concentrated on `triton`, where the synthetic
   verify metadata path currently matches the independent reference.
+- `torch_native` remains excluded until the backend applies
+  `RadixAttention.sliding_window_size` consistently.
 
 ## Next Work
 

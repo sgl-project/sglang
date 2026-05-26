@@ -24,8 +24,18 @@ copied random projection weights, not from another SGLang attention backend.
 - Decode page-boundary batches and batch-size-1 decode.
 - Attention config coverage for MHA, GQA, and MQA is separate from input-layout coverage.
 
+## Current Progress
+
+- Phase 2 eager correctness covers all locally runnable dense backends with an
+  independent PyTorch reference.
+- Phase 3 runner coverage includes CUDA graph decode where supported plus
+  paged/chunked and batch-chunked extend paths.
+- Phase 4 now covers synthetic verify runners and production draft-runner graph
+  replay for the Triton and FlashInfer paths whose metadata matches the reference.
+
 ## Next Work
 
+- Debug torch-native target-verify extend metadata.
 - Debug Triton `DRAFT_EXTEND` metadata/reference mismatch.
 - Debug FA3/FA4 CUDA graph replay and speculative graph mismatches.
 - Add backend-specific graph coverage for `trtllm_mha` once local hardware and metadata behavior allow it.
