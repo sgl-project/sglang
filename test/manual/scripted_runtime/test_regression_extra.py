@@ -58,6 +58,8 @@ def _script_filter_batch_exclude_in_flight_other_mb(t: ScriptedRuntime):
 def _script_chunked_req_marker_pp_filter_exclusion(t: ScriptedRuntime):
     # 33f981ce93 / 11db3a4192: re-add ScheduleBatch.chunked_req marker
     # for PP cross-mb filter exclusion.
+    # TODO(round-3): recreate the specific bug shape; this currently
+    # is a forward-pointing smoke.
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
     yield from run_until_finished(r)
 
@@ -65,6 +67,8 @@ def _script_chunked_req_marker_pp_filter_exclusion(t: ScriptedRuntime):
 def _script_v1_swa_chunked_tests_dropped(t: ScriptedRuntime):
     # a94e842611 / daf9c42f17: dropped v1 SWA chunked-req tests. Verifies
     # the v2 path is what runs (no v1 codepath revival).
+    # TODO(round-3): recreate the specific bug shape; this currently
+    # is a forward-pointing smoke.
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     yield from run_until_finished(r)
 
@@ -153,12 +157,14 @@ def _script_chunked_resume_waiting_queue_holding(t: ScriptedRuntime):
         if r.finished:
             break
         yield
-    # Expectation depends on impl; just assert it finished cleanly.
+    assert saw_waiting, "expected to observe chunked-resume in waiting_queue state"
 
 
 def _script_unified_admission_via_add_one_req(t: ScriptedRuntime):
     # 74f1d8bbab: unify chunked admission via add_one_req reuse +
     # has_pending_chunk. Smoke: chunked admission works.
+    # TODO(round-3): recreate the specific bug shape; this currently
+    # is a forward-pointing smoke.
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     yield from run_until_finished(r)
 
@@ -166,6 +172,8 @@ def _script_unified_admission_via_add_one_req(t: ScriptedRuntime):
 def _script_alloc_assert_no_is_chunked(t: ScriptedRuntime):
     # 9b361aef46: drop is_chunked from req_to_token_pool alloc assert.
     # Smoke: alloc + chunked does not hit a stale assert.
+    # TODO(round-3): recreate the specific bug shape; this currently
+    # is a forward-pointing smoke.
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     yield from run_until_finished(r)
 
@@ -190,6 +198,10 @@ def _script_waiting_queue_pending_tokens_subtract_prefix(t: ScriptedRuntime):
 
 def _script_abort_dedup_dual_queue_holding(t: ScriptedRuntime):
     # de3859646b: abort_request dedup for chunked-resume dual-queue holding.
+    # The double-abort here is intentionally same-tick: both calls happen
+    # before the next yield so the scheduler must dedup them in a single
+    # iteration. Inserting a yield between them would test sequential
+    # idempotence instead, which is a different code path.
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     yield from run_until(r, lambda h: h.is_chunking)
     t.abort(r)
