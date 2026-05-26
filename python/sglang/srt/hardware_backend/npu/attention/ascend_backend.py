@@ -2059,7 +2059,7 @@ class AscendAttnBackend(AttentionBackend):
                         actual_seq_len_kv = (
                             self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                         )
-                    block_size = 128
+                    block_size = self.page_size
                     max_model_len = block_tables.shape[-1] * block_size
                     swa_mask = self.ascend_attn_mask_builder.get_swa_mask(
                         self.forward_metadata.seq_lens, max_model_len, layer.sliding_window_size
