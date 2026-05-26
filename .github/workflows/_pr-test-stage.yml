@@ -176,7 +176,7 @@ jobs:
         if: failure()
         with:
           artifact-suffix: ${{ matrix.partition }}
-          tracker-issue: "2"
+          tracker-issue: "26340"
           bot-token: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
 
       - name: Cleanup venv

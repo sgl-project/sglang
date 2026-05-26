@@ -12,13 +12,13 @@ inputs:
     default: "7"
   tracker-issue:
     description: |
-      If set, post a one-line comment to sgl-project/sglang-ci-stats issue
+      If set, post a one-line comment to sgl-project/sglang issue
       #<tracker-issue> when at least one coredump is detected. Requires
-      `bot-token` with issues:write on that repo.
+      `bot-token` with issues:write on sgl-project/sglang.
     required: false
     default: ""
   bot-token:
-    description: Token with issues:write on sgl-project/sglang-ci-stats. Required when tracker-issue is set.
+    description: PAT with issues:write on sgl-project/sglang. Required when tracker-issue is set.
     required: false
     default: ""
 
@@ -66,7 +66,7 @@ runs:
           -H "Authorization: Bearer ${BOT_TOKEN}" \
           -H "Accept: application/vnd.github+json" \
           -H "X-GitHub-Api-Version: 2022-11-28" \
-          "https://api.github.com/repos/sgl-project/sglang-ci-stats/issues/${TRACKER_ISSUE}/comments" \
+          "https://api.github.com/repos/sgl-project/sglang/issues/${TRACKER_ISSUE}/comments" \
           -d "${body_json}"
 
     - name: Cleanup CUDA coredumps
