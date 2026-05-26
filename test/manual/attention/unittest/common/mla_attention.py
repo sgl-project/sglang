@@ -835,6 +835,17 @@ def make_mla_case_with_prefix_lens(
     name: str,
     prefix_lens: tuple[int, ...],
 ) -> MLAAttentionCase:
+    extend_lens = ()
+    if not case.forward_mode.is_decode():
+        if not case.input_lens:
+            raise ValueError("Non-decode cases require input lengths.")
+        if len(prefix_lens) <= len(case.input_lens):
+            extend_lens = case.input_lens[: len(prefix_lens)]
+        else:
+            extend_lens = case.input_lens + (case.input_lens[-1],) * (
+                len(prefix_lens) - len(case.input_lens)
+            )
+
     return MLAAttentionCase(
         name=name,
         backend=case.backend,
@@ -842,6 +853,7 @@ def make_mla_case_with_prefix_lens(
         num_heads=case.num_heads,
         page_size=case.page_size,
         prefix_lens=prefix_lens,
+        extend_lens=extend_lens,
     )
 
 

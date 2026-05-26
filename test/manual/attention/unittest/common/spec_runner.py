@@ -12,6 +12,10 @@ from sglang.srt.speculative.frozen_kv_mtp_info import (
 )
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 
+from .cuda_graph_runner import (
+    _init_cuda_graph_capture_metadata,
+    _init_cuda_graph_replay_metadata,
+)
 from .dense_attention import DEFAULT_DEVICE as DENSE_DEFAULT_DEVICE
 from .dense_attention import DEFAULT_DTYPE as DENSE_DEFAULT_DTYPE
 from .dense_attention import (
@@ -23,10 +27,17 @@ from .dense_attention import (
     DENSE_ATOL,
     DENSE_RTOL,
     DenseAttentionCase,
+)
+from .dense_attention import _make_forward_batch as _make_dense_forward_batch
+from .dense_attention import (
     build_dense_attention_fixture,
     dense_attention_reference_with_custom_mask,
     dense_fixture_inputs,
     expected_dense_output_from_inputs,
+    make_dense_case_with_prefix_lens,
+    make_dense_padded_replay_inputs,
+    make_dense_random_inputs,
+    prepare_dense_runner_inputs,
     run_dense_forward,
 )
 from .mla_attention import DEFAULT_DEVICE as MLA_DEFAULT_DEVICE
@@ -40,10 +51,17 @@ from .mla_attention import (
     MLA_ATOL,
     MLA_RTOL,
     MLAAttentionCase,
+)
+from .mla_attention import _make_forward_batch as _make_mla_forward_batch
+from .mla_attention import (
     build_mla_attention_fixture,
     expected_mla_output_from_inputs,
+    make_mla_case_with_prefix_lens,
+    make_mla_padded_replay_inputs,
+    make_mla_random_inputs,
     mla_attention_reference_with_custom_mask,
     mla_fixture_inputs,
+    prepare_mla_runner_inputs,
     run_mla_forward,
 )
 
@@ -282,6 +300,231 @@ def _make_draft_extend_input(
     raise ValueError(f"Unsupported draft-extend spec kind: {spec_kind}")
 
 
+def _target_verify_expected_output(
+    *,
+    reference_fn,
+    fixture,
+    case,
+    inputs,
+    topk: int,
+    device: str,
+):
+    masks_by_req, _ = _make_custom_masks(case, topk=topk, device=device)
+    return reference_fn(
+        fixture.reference_module,
+        case,
+        inputs["prefix_hidden"],
+        inputs["input_hidden"],
+        masks_by_req,
+    )
+
+
+def _prepare_spec_verify_batch(
+    case,
+    batch,
+    *,
+    topk: int,
+    spec_kind: SpecVerifyKind,
+    device: str,
+) -> None:
+    _prepare_target_verify_batch(batch, case, device)
+    batch.spec_info = _make_spec_verify_input(
+        case,
+        batch,
+        topk=topk,
+        device=device,
+        spec_kind=spec_kind,
+    )
+
+
+def _run_spec_verify_cuda_graph_case(
+    testcase,
+    case,
+    *,
+    topk: int,
+    spec_kind: SpecVerifyKind,
+    build_fixture,
+    make_case_with_prefix_lens,
+    make_forward_batch,
+    fixture_inputs,
+    make_capture_inputs,
+    make_replay_inputs,
+    prepare_inputs,
+    run_forward,
+    reference_fn,
+    build_kwargs: dict,
+    max_context_len: int,
+    dtype: torch.dtype,
+    device: str,
+    capture_batch_size: int,
+    atol: float,
+    rtol: float,
+):
+    draft_token_num = _check_target_verify_case(case)
+    if case.batch_size > capture_batch_size:
+        raise ValueError("Spec verify CUDA graph capture must cover replay batch size.")
+
+    graph_fixture = build_fixture(
+        testcase,
+        case,
+        **build_kwargs,
+        disable_cuda_graph=False,
+        runner_batch_size=capture_batch_size,
+    )
+    backend = graph_fixture.backend
+    backend.init_cuda_graph_state(
+        max_bs=capture_batch_size,
+        max_num_tokens=capture_batch_size * draft_token_num,
+    )
+
+    graph_batch = graph_fixture.forward_batch
+    _prepare_spec_verify_batch(
+        case,
+        graph_batch,
+        topk=topk,
+        spec_kind=spec_kind,
+        device=device,
+    )
+    graph_inputs = fixture_inputs(graph_fixture)
+    graph_expected = _target_verify_expected_output(
+        reference_fn=reference_fn,
+        fixture=graph_fixture,
+        case=case,
+        inputs=graph_inputs,
+        topk=topk,
+        device=device,
+    )
+
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
+        backend.init_forward_metadata(graph_batch)
+        graph_eager_actual = run_forward(graph_fixture, graph_batch, graph_inputs)
+
+    torch.testing.assert_close(
+        graph_eager_actual,
+        graph_expected,
+        atol=atol,
+        rtol=rtol,
+    )
+
+    capture_prefix_len = backend.get_cuda_graph_seq_len_fill_value()
+    capture_case = make_case_with_prefix_lens(
+        case,
+        f"{case.name}_cuda_graph_capture",
+        (capture_prefix_len,) * capture_batch_size,
+    )
+    capture_inputs = make_capture_inputs(
+        capture_case,
+        graph_fixture,
+        dtype=dtype,
+        device=device,
+    )
+    capture_batch = make_forward_batch(
+        capture_case,
+        graph_fixture.runner,
+        max_context_len=max_context_len,
+        device=device,
+    )
+    _prepare_spec_verify_batch(
+        capture_case,
+        capture_batch,
+        topk=topk,
+        spec_kind=spec_kind,
+        device=device,
+    )
+    prepare_inputs(
+        graph_fixture,
+        capture_case,
+        capture_batch,
+        capture_inputs,
+        max_context_len=max_context_len,
+    )
+    capture_expected = _target_verify_expected_output(
+        reference_fn=reference_fn,
+        fixture=graph_fixture,
+        case=capture_case,
+        inputs=capture_inputs,
+        topk=topk,
+        device=device,
+    )
+
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
+        _init_cuda_graph_capture_metadata(
+            backend,
+            capture_batch_size,
+            capture_batch,
+        )
+        capture_actual = run_forward(graph_fixture, capture_batch, capture_inputs)
+        backend.on_after_cuda_graph_warmup()
+
+    replay_pad_prefix_lens = (capture_prefix_len,) * (
+        capture_batch_size - case.batch_size
+    )
+    replay_case = make_case_with_prefix_lens(
+        case,
+        f"{case.name}_cuda_graph_replay",
+        case.prefix_lens + replay_pad_prefix_lens,
+    )
+    replay_inputs = make_replay_inputs(
+        replay_case,
+        graph_fixture,
+        replay_pad_prefix_lens,
+        graph_inputs,
+        dtype=dtype,
+        device=device,
+    )
+    replay_batch = make_forward_batch(
+        replay_case,
+        graph_fixture.runner,
+        max_context_len=max_context_len,
+        device=device,
+    )
+    _prepare_spec_verify_batch(
+        replay_case,
+        replay_batch,
+        topk=topk,
+        spec_kind=spec_kind,
+        device=device,
+    )
+    prepare_inputs(
+        graph_fixture,
+        replay_case,
+        replay_batch,
+        replay_inputs,
+        max_context_len=max_context_len,
+    )
+    replay_expected = _target_verify_expected_output(
+        reference_fn=reference_fn,
+        fixture=graph_fixture,
+        case=replay_case,
+        inputs=replay_inputs,
+        topk=topk,
+        device=device,
+    )
+
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
+        _init_cuda_graph_replay_metadata(backend, capture_batch_size, replay_batch)
+        replay_actual = run_forward(graph_fixture, replay_batch, replay_inputs)
+
+    torch.testing.assert_close(
+        capture_actual,
+        capture_expected,
+        atol=atol,
+        rtol=rtol,
+    )
+    torch.testing.assert_close(
+        replay_actual,
+        replay_expected,
+        atol=atol,
+        rtol=rtol,
+    )
+    torch.testing.assert_close(
+        replay_actual[: case.num_input_tokens],
+        graph_eager_actual,
+        atol=atol,
+        rtol=rtol,
+    )
+
+
 def run_dense_spec_verify_case(
     testcase,
     case: DenseAttentionCase,
@@ -349,6 +592,49 @@ def run_dense_eagle_verify_case(
         max_context_len=max_context_len,
         dtype=dtype,
         device=device,
+    )
+
+
+def run_dense_spec_verify_cuda_graph_case(
+    testcase,
+    case: DenseAttentionCase,
+    *,
+    topk: int,
+    spec_kind: SpecVerifyKind = "eagle",
+    head_dim: int = DEFAULT_HEAD_DIM,
+    hidden_size: int = DEFAULT_HIDDEN_SIZE,
+    max_context_len: int = DENSE_DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = DENSE_DEFAULT_DTYPE,
+    device: str = DENSE_DEFAULT_DEVICE,
+    cuda_graph_capture_batch_size: int = 4,
+):
+    _run_spec_verify_cuda_graph_case(
+        testcase,
+        case,
+        topk=topk,
+        spec_kind=spec_kind,
+        build_fixture=build_dense_attention_fixture,
+        make_case_with_prefix_lens=make_dense_case_with_prefix_lens,
+        make_forward_batch=_make_dense_forward_batch,
+        fixture_inputs=dense_fixture_inputs,
+        make_capture_inputs=make_dense_random_inputs,
+        make_replay_inputs=make_dense_padded_replay_inputs,
+        prepare_inputs=prepare_dense_runner_inputs,
+        run_forward=run_dense_forward,
+        reference_fn=dense_attention_reference_with_custom_mask,
+        build_kwargs=dict(
+            head_dim=head_dim,
+            hidden_size=hidden_size,
+            max_context_len=max_context_len,
+            dtype=dtype,
+            device=device,
+        ),
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        capture_batch_size=cuda_graph_capture_batch_size,
+        atol=DENSE_ATOL,
+        rtol=DENSE_RTOL,
     )
 
 
@@ -432,6 +718,48 @@ def run_mla_eagle_verify_case(
         actual = run_mla_forward(fixture, fixture.forward_batch, inputs)
 
     torch.testing.assert_close(actual, expected, atol=MLA_ATOL, rtol=MLA_RTOL)
+
+
+def run_mla_eagle_verify_cuda_graph_case(
+    testcase,
+    case: MLAAttentionCase,
+    *,
+    topk: int,
+    kv_lora_rank: int = DEFAULT_KV_LORA_RANK,
+    hidden_size: int = MLA_DEFAULT_HIDDEN_SIZE,
+    max_context_len: int = MLA_DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = MLA_DEFAULT_DTYPE,
+    device: str = MLA_DEFAULT_DEVICE,
+    cuda_graph_capture_batch_size: int = 4,
+):
+    _run_spec_verify_cuda_graph_case(
+        testcase,
+        case,
+        topk=topk,
+        spec_kind="eagle",
+        build_fixture=build_mla_attention_fixture,
+        make_case_with_prefix_lens=make_mla_case_with_prefix_lens,
+        make_forward_batch=_make_mla_forward_batch,
+        fixture_inputs=mla_fixture_inputs,
+        make_capture_inputs=make_mla_random_inputs,
+        make_replay_inputs=make_mla_padded_replay_inputs,
+        prepare_inputs=prepare_mla_runner_inputs,
+        run_forward=run_mla_forward,
+        reference_fn=mla_attention_reference_with_custom_mask,
+        build_kwargs=dict(
+            kv_lora_rank=kv_lora_rank,
+            hidden_size=hidden_size,
+            max_context_len=max_context_len,
+            dtype=dtype,
+            device=device,
+        ),
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        capture_batch_size=cuda_graph_capture_batch_size,
+        atol=MLA_ATOL,
+        rtol=MLA_RTOL,
+    )
 
 
 def run_mla_eagle_draft_extend_case(

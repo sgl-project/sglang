@@ -860,6 +860,17 @@ def make_dense_case_with_prefix_lens(
     name: str,
     prefix_lens: tuple[int, ...],
 ) -> DenseAttentionCase:
+    extend_lens = ()
+    if not case.forward_mode.is_decode():
+        if not case.input_lens:
+            raise ValueError("Non-decode cases require input lengths.")
+        if len(prefix_lens) <= len(case.input_lens):
+            extend_lens = case.input_lens[: len(prefix_lens)]
+        else:
+            extend_lens = case.input_lens + (case.input_lens[-1],) * (
+                len(prefix_lens) - len(case.input_lens)
+            )
+
     return DenseAttentionCase(
         name=name,
         backend=case.backend,
@@ -868,6 +879,7 @@ def make_dense_case_with_prefix_lens(
         num_kv_heads=case.num_kv_heads,
         page_size=case.page_size,
         prefix_lens=prefix_lens,
+        extend_lens=extend_lens,
         sliding_window_size=case.sliding_window_size,
     )
 

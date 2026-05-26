@@ -52,6 +52,12 @@ Implemented:
   accepted-token counts for both EAGLE and Frozen-KV MTP draft-extend input tags.
   SWA `triton` covers EAGLE `TARGET_VERIFY` chain and tree masks combined with a
   finite sliding window. MLA `triton` covers EAGLE `TARGET_VERIFY` chain masks.
+- Phase 4 target-verify CUDA-graph-style replay now covers representative valid
+  backends with fixed capture batches and distinct replay metadata/input tensors:
+  dense `triton` covers EAGLE tree, DFlash chain, and NGRAM chain; dense
+  `flashinfer` covers EAGLE tree, Frozen-KV MTP chain, and DFlash chain; SWA
+  `triton` covers EAGLE tree with sliding-window metadata; MLA `triton` covers
+  EAGLE tree with the absorb-MLA cached-KV path.
 - The synthetic EAGLE verify helper uses realistic target-verify semantics:
   `ForwardBatch.seq_lens` represents prefix KV lengths, while `spec_info`
   supplies the draft tokens, positions, retrieve indices, and custom tree mask.
@@ -62,11 +68,6 @@ Implemented:
   layouts, while FlashInfer `DRAFT_EXTEND` passes. Keep this as a focused follow-up
   on Triton draft-extend metadata/reference semantics rather than weakening Phase 4
   checks.
-- Target-verify CUDA-graph replay is intentionally not enabled yet. A synthetic
-  fixed-capture-batch helper passed capture warmup but mismatched the HF-style
-  reference on replay for both `triton` and `flashinfer`. This should be addressed
-  with a production `CudaGraphRunner`-shaped fixture, or by fixing the replay
-  metadata semantics, before adding green tests.
 - FlashInfer SWA `TARGET_VERIFY` is intentionally not enabled yet. The current
   FlashInfer sliding-window metadata updater expects prefix lengths that are not
   supplied by the target-verify path (`prefix_lens=None`), so the Triton SWA spec
@@ -115,23 +116,32 @@ Implemented:
   orthogonal to runner/backend metadata compatibility.
 
 In progress:
-- Phase 4 CUDA-graph worker-runner coverage remains open for target verify and
-  draft runners. The next useful unit slice should model the production
-  `CudaGraphRunner` buffer path rather than calling backend replay metadata in
-  isolation.
+- Phase 4 draft-runner coverage remains open for `DRAFT_EXTEND` /
+  `DRAFT_EXTEND_V2` CUDA graph runners. Target-verify replay now has a
+  fixed-capture-batch unit helper; the next draft-runner slice should mirror the
+  production draft-runner buffer lifecycle before enabling new green tests.
 
 Next implementation steps:
-- Finish Phase 4 speculative metadata coverage for representative valid backends
-  before adding more Phase 2 backend files.
-- After representative Phase 2/3/4 coverage is stable, expand Phase 2 to additional
-  attention backends such as `flashmla`, `cutlass_mla`, `trtllm_mha`,
-  `trtllm_mla`, `fa3`, `fa4`, `dual_chunk_flash_attn`, and `flex_attention`.
+- Finish Phase 4 draft-runner coverage for representative valid backends before
+  broadening the speculative matrix.
+- Expand Phase 2 to additional attention methods/backends with method-specific
+  fixtures rather than forcing them through the dense harness. Priority candidates:
+  supported-shape MLA kernels (`flashinfer` MLA, `flashmla`, `cutlass_mla`,
+  `trtllm_mla`/`tokenspeed_mla` where hardware supports them), dual-chunk
+  attention, and DSA/DSV4-style methods.
 - Keep `torch_native` SWA out of the matrix until the backend honors
   `RadixAttention.sliding_window_size`.
 - Defer Phase 2 expansion for additional backends until representative Phase 3 and
   Phase 4 tests are passing.
 
 Latest verification:
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+  - Ran 35 tests in 21.392s after adding Phase 4 target-verify CUDA-graph-style replay.
+- `python -m py_compile test/manual/attention/unittest/common/spec_runner.py test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/mla/test_triton.py`
+- `python test/manual/attention/unittest/dense/test_triton.py -v`
+- `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
+- `python test/manual/attention/unittest/swa/test_triton.py -v`
+- `python test/manual/attention/unittest/mla/test_triton.py -v`
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
   - Ran 31 tests in 21.303s after adding FA3, FA4, and Flex dense coverage.
 - `python -m py_compile python/sglang/srt/layers/attention/torch_flex_backend.py test/manual/attention/unittest/dense/test_flex_attention.py`
@@ -550,8 +560,8 @@ module output directly.
 |---|---|
 | **Spec info** | `EagleVerifyInput`, EAGLE v2 verify input, `FrozenKVMTPInfo`, `DFlashVerifyInput`, `NGRAM` verify input |
 | **Forward mode** | `TARGET_VERIFY`, `DRAFT_EXTEND`, `DRAFT_EXTEND_V2` |
-| **topk** | 1 and 4 |
-| **num_draft_steps** | 1 and 4 |
+| **topk** | 1 and representative `>1` tree layouts (currently 2 in unit tests; add 4 for worker-shaped fixtures) |
+| **num_draft_steps** | 1 and representative multi-step layouts |
 | **Backend** | Representative valid backends first, usually `triton` and `flashinfer`; expand only after synthetic spec metadata and graph replay are stable |
 | **Execution mode** | eager and CUDA graph where supported |
 
@@ -570,16 +580,22 @@ Also test:
 Current Layer A status:
 - Dense `triton` and `flashinfer`: EAGLE `TARGET_VERIFY` chain/tree custom-mask
   coverage, plus Frozen-KV MTP, DFlash, and NGRAM chain verify metadata coverage.
+- Dense `triton` and `flashinfer`: CUDA-graph-style target-verify replay with a
+  fixed padded capture batch and distinct replay input tensors. Triton covers
+  EAGLE tree, DFlash chain, and NGRAM chain; FlashInfer covers EAGLE tree,
+  Frozen-KV MTP chain, and DFlash chain.
 - Dense `flashinfer`: EAGLE and Frozen-KV MTP `DRAFT_EXTEND` ragged accepted-token
   coverage.
 - SWA `triton`: EAGLE `TARGET_VERIFY` chain/tree custom-mask coverage with sliding
-  window enabled.
-- MLA `triton`: `TARGET_VERIFY` chain custom-mask coverage.
+  window enabled, including CUDA-graph-style target-verify replay for a tree mask.
+- MLA `triton`: `TARGET_VERIFY` chain custom-mask coverage plus
+  CUDA-graph-style target-verify replay for a tree mask.
 - Deferred: Triton `DRAFT_EXTEND` until the fixture/reference semantics are
-  clarified; target-verify CUDA-graph replay until the production runner-buffer path
-  is represented faithfully; FlashInfer SWA target verify until prefix-lens metadata
-  is available in its sliding-window updater; GDN speculative verify until recurrent
-  speculative-state setup is represented faithfully.
+  clarified; production draft-runner (`DRAFT_EXTEND` / `DRAFT_EXTEND_V2`) graph
+  coverage until the draft-runner buffer lifecycle is represented faithfully;
+  FlashInfer SWA target verify until prefix-lens metadata is available in its
+  sliding-window updater; GDN speculative verify until recurrent speculative-state
+  setup is represented faithfully.
 
 #### Layer B: worker and draft-runner integration tests
 

@@ -15,7 +15,10 @@ from common.mla_attention import (
     make_mla_cases,
     run_mla_attention_case,
 )
-from common.spec_runner import run_mla_eagle_verify_case
+from common.spec_runner import (
+    run_mla_eagle_verify_case,
+    run_mla_eagle_verify_cuda_graph_case,
+)
 from common.split_op_runner import run_mla_split_op_extend_case
 
 
@@ -60,6 +63,20 @@ class TestTritonMLAAttentionBackendCorrectness(CustomTestCase):
             1,
         ),
     )
+    EAGLE_VERIFY_CUDA_GRAPH_CASES = (
+        (
+            MLAAttentionCase(
+                name="runner_cuda_graph_eagle_verify_mla_tree",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            2,
+        ),
+    )
 
     def test_tiny_deepseek_mla_attention_cases(self):
         for case in self.CASES:
@@ -91,6 +108,11 @@ class TestTritonMLAAttentionBackendCorrectness(CustomTestCase):
         for case, topk in self.EAGLE_VERIFY_CASES:
             with self.subTest(case=case.name, backend=case.backend, topk=topk):
                 run_mla_eagle_verify_case(self, case, topk=topk)
+
+    def test_runner_mode_eagle_verify_cuda_graph_cases(self):
+        for case, topk in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:
+            with self.subTest(case=case.name, backend=case.backend, topk=topk):
+                run_mla_eagle_verify_cuda_graph_case(self, case, topk=topk)
 
 
 if __name__ == "__main__":
