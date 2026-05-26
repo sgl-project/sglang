@@ -64,6 +64,12 @@ class DSV4AttentionCase:
     extend_lens: tuple[int, ...]
     # compress_ratio is fixed at 0 for this slice; C4/C128 are follow-ups.
     compress_ratio: int = 0
+    # Per-head attention-sink value. The DSV4 backend forwards this to flash_mla
+    # as a virtual-key score; the reference appends a virtual key with the same
+    # score and value=0. The default (-1e30) effectively disables the sink so
+    # the reference reduces to plain softmax(q @ k.T); finite values exercise
+    # the sink correction path.
+    attn_sink_value: float = -1e30
 
     @property
     def batch_size(self) -> int:
@@ -102,6 +108,18 @@ def make_dsv4_cases(backend: str) -> tuple[DSV4AttentionCase, ...]:
             name="dsv4_swa_extend_prefix_within_window",
             prefix_lens=(48,),
             extend_lens=(16,),
+            **common,
+        ),
+        # Non-zero attention-sink case. The sink contributes meaningful probability
+        # mass at exp(0)=1 per head, so both the backend and the reference must
+        # apply the same virtual-key correction for outputs to match. With
+        # attn_sink_value=-1e30 the sink correction is effectively a no-op; this
+        # case is the only one that actually verifies the correction logic.
+        DSV4AttentionCase(
+            name="dsv4_swa_extend_nonzero_attn_sink",
+            prefix_lens=(48,),
+            extend_lens=(16,),
+            attn_sink_value=0.0,
             **common,
         ),
     )
@@ -283,6 +301,7 @@ class ProjectedDSV4Attention(nn.Module):
         hidden_size: int,
         dtype: torch.dtype,
         device: str,
+        attn_sink_value: float = -1e30,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -309,11 +328,14 @@ class ProjectedDSV4Attention(nn.Module):
             layer_id=0,
             v_head_dim=DSV4_V_HEAD_DIM,
         )
-        # Zero attention sink == identity scaling (exp(lse)/(exp(lse)+exp(0))
-        # is still a meaningful sink, but for ease of reference we keep it at
-        # -inf-equivalent by passing a fixed value the reference also applies).
+        # Per-head attention sink. Forwarded to flash_mla as a virtual-key score;
+        # the reference appends a virtual key with the same score and value=0.
+        # Default (-1e30) makes the sink contribution numerically negligible so
+        # the reference reduces to plain softmax(q @ k.T).
         self.attn_sink = nn.Parameter(
-            torch.full((num_heads,), -1e30, dtype=torch.float32, device=device),
+            torch.full(
+                (num_heads,), attn_sink_value, dtype=torch.float32, device=device
+            ),
             requires_grad=False,
         )
 
@@ -617,6 +639,7 @@ def build_dsv4_attention_fixture(
         hidden_size=DSV4_HEAD_DIM,
         dtype=dtype,
         device=device,
+        attn_sink_value=case.attn_sink_value,
     )
     prefix_hidden = [
         torch.randn(length, DSV4_HEAD_DIM, dtype=dtype, device=device)
