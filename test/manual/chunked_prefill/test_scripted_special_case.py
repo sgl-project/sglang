@@ -298,10 +298,23 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
     def _script_chunked_req_reset_to_none(t: ScriptedRuntime):
         # scheduler.py:3596 — chunked_req=None reset path. After all
         # chunked reqs finish, scheduler.chunked_req should be None.
+        # In-loop verification: across the whole chunked window, the
+        # getter must report r.rid when chunking; immediately after
+        # finish it must be None.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
-        cur = t.get_chunked_req_rid()
-        assert cur is None
+        saw_chunking_match = False
+        for _ in range(DEFAULT_MAX_STEPS):
+            if r.is_chunking and t.get_chunked_req_rid() == r.rid:
+                saw_chunking_match = True
+            if r.finished:
+                break
+            yield
+        assert r.finished
+        assert (
+            saw_chunking_match
+        ), "must observe scheduler.chunked_req == r at least once during chunking"
+        # And the reset to None must have happened.
+        assert t.get_chunked_req_rid() is None
 
     @unittest.skip(
         "requires real disaggregation prefill/decode split — single-engine "
@@ -349,12 +362,23 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
     @staticmethod
     def _script_idle_path_chunked_req_none(t: ScriptedRuntime):
         # scheduler.py:3174 — idle path checks chunked_req is None.
-        # If we have no in-flight req, scheduler is idle.
+        # With no in-flight req, the scheduler must idle AND the chunked
+        # slot must be None. Both invariants hold together.
         # Give the scheduler a few yields to settle into the idle state
         # (initial setup may keep is_idle False for one or two iterations).
         for _ in range(5):
             yield
         assert t.is_idle
+        assert t.get_chunked_req_rid() is None, (
+            f"with no in-flight reqs, chunked slot must be None; "
+            f"got {t.get_chunked_req_rid()!r}"
+        )
+        # The idle invariant: across more yields, the scheduler stays
+        # idle (no spurious wakeups when chunked_req is None).
+        for _ in range(5):
+            assert t.is_idle, "scheduler must remain idle with no work"
+            assert t.get_chunked_req_rid() is None
+            yield
 
     def test_admission_path_with_chunked_inflight_flag(self):
         """Scheduler.py:2593 — add_one_req called with has_chunked_req=True."""
@@ -552,15 +576,29 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
     def _script_load_inquirer_pending_tokens_dedup_chunked(t: ScriptedRuntime):
         # scheduler.py load-inquirer path: when a chunked req sits
         # in both running_batch and waiting_queue (the dual-queue holding
-        # state), the pending-token tally must dedup. Observe via the
-        # snapshot helper.
+        # state), the pending-token tally must dedup. Verified at EVERY
+        # mid-chunk yield to catch dedup regressions that only show up
+        # transiently.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
-
-        snap = t.load_inquirer_snapshot()
-        # Each req contributes its remaining tokens exactly once.
-        assert snap["pending_tokens_count_for_rid"](r.rid) <= r.remaining_prompt_tokens
-        yield from run_until_finished(r)
+        saw_chunking = False
+        for _ in range(DEFAULT_MAX_STEPS):
+            if r.is_chunking:
+                saw_chunking = True
+                snap = t.load_inquirer_snapshot()
+                pending = snap["pending_tokens_count_for_rid"](r.rid)
+                assert pending <= r.remaining_prompt_tokens, (
+                    f"load_inquirer tallied {pending} tokens for r but only "
+                    f"{r.remaining_prompt_tokens} are still pending — "
+                    "dual-queue dedup violated"
+                )
+            if r.finished:
+                break
+            yield
+        assert r.finished
+        assert (
+            saw_chunking
+        ), "test must observe the dual-queue chunked state at least once"
 
     def test_chunked_forced_admission_avoids_leak(self):
         """Non-SWA + rem_total_tokens <= 0: chunked req force-admitted to avoid pool leak (comment 677)."""
