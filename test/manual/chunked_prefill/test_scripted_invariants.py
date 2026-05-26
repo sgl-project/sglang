@@ -591,16 +591,31 @@ class TestScriptedInvariants(CustomTestCase):
     @staticmethod
     def _script_pending_middle_outputs_caps_at_one(t: ScriptedRuntime):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        max_observed = 0
+        # Sample BEFORE the first yield, AFTER every yield (including the
+        # finish iter), and for several yields AFTER r.finished to verify
+        # the counter is reset and stays at 0. The lifetime maximum must
+        # be exactly 1 — proves chunking happened (>=1) and the cap held
+        # (<=1).
+        running_max = r.pending_middle_outputs
+        running_max_post_finish = 0
+        post_finish_samples = 0
         for _ in range(DEFAULT_MAX_STEPS):
-            max_observed = max(max_observed, r.pending_middle_outputs)
-            if r.finished:
-                break
             yield
-        assert r.finished
-        assert max_observed <= 1, (
-            f"pending_middle_outputs must be capped at 1 across the chunked "
-            f"lifecycle, observed max={max_observed}"
+            cur = r.pending_middle_outputs
+            running_max = max(running_max, cur)
+            if r.finished:
+                running_max_post_finish = max(running_max_post_finish, cur)
+                post_finish_samples += 1
+                if post_finish_samples >= 5:
+                    break
+        assert r.finished, "req never finished"
+        assert running_max == 1, (
+            f"pending_middle_outputs must reach exactly 1 across the chunked "
+            f"lifecycle (the cap from revert e875cd36e4); observed max={running_max}"
+        )
+        assert running_max_post_finish == 0, (
+            f"pending_middle_outputs must be reset to 0 after finish; "
+            f"observed max post-finish={running_max_post_finish}"
         )
 
     def test_status_never_finished_to_waiting(self):
