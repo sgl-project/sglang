@@ -566,8 +566,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if envs.SGLANG_KV_CANARY_ENABLE_REQ_TOKEN_IDS_CHECK.get():
             ret.req_truth_seqs = [
-                list(req.origin_input_ids) + list(req.output_ids)
-                for req in batch.reqs
+                list(req.origin_input_ids) + list(req.output_ids) for req in batch.reqs
             ]
 
         if batch.extend_input_logprob_token_ids is not None:
