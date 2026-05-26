@@ -135,6 +135,18 @@ class EagleDraftWorker(BaseDraftWorker):
             server_args.speculative_algorithm
         )
 
+        # topk=1 chain has degenerate parent_list and top_scores_index — pre-fill
+        # constant buffers so draft_forward can skip cat+topk+sort+gather kernels.
+        self._topk1_parent_proto = None
+        self._topk1_score_idx_proto = None
+        if self.topk == 1:
+            n_extra = self.speculative_num_draft_tokens - 1
+            max_bs = max(1, server_args.cuda_graph_max_bs or 1)
+            parents = torch.arange(-1, n_extra - 1, dtype=torch.long).repeat(max_bs, 1)
+            indices = torch.arange(n_extra, dtype=torch.long).repeat(max_bs, 1)
+            self._topk1_parent_proto = parents.to(self.device)
+            self._topk1_score_idx_proto = indices.to(self.device)
+
         # Do not capture cuda graph in `TpModelWorker` init,
         # will capture later with init_cuda_graphs()
         backup_disable_cuda_graph = server_args.disable_cuda_graph
@@ -505,6 +517,17 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch.positions.add_(1)
 
         # Organize the results
+        if self.topk == 1:
+            # Chain topology: draft_tokens = concat of per-step tokens; the
+            # full-length topk/sort/gather over score_list collapses to an
+            # identity. parent_list and top_scores_index are runtime-invariant
+            # constants pre-allocated on the worker.
+            bs = token_list[0].shape[0]
+            draft_tokens = torch.cat(token_list, dim=1)
+            top_scores_index = self._topk1_score_idx_proto[:bs]
+            parent_list = self._topk1_parent_proto[:bs]
+            return parent_list, top_scores_index, draft_tokens
+
         score_list = torch.cat(score_list, dim=1).flatten(
             1
         )  # b, n, topk; n= 1 + (num_steps-1) * self.topk
