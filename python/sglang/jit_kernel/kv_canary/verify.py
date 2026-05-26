@@ -282,8 +282,10 @@ def launch_canary_verify_kernel(
               prev_slot_idx == -1 anchors at splitmix64(CANARY_CHAIN_ANCHOR).
           (c) For each src in real_kv_sources: read src.read_bytes leading bytes from src.tensor[...] (per the
               RealKvSource access invariant) and splitmix64-fold into running_real_kv_hash.
-        - Compare expected vs stored (chain hash, position, real_kv_hash) and accumulate fail_reason bits; if
-          non-zero → record_violation().
+        - Compare expected vs stored (chain hash, position, real_kv_hash, and source-of-truth token when
+          ``plan.verify_expected_tokens[entry_idx] != -1``) and accumulate fail_reason bits; if non-zero →
+          record_violation(). The ``-1`` sentinel skips the SOT-token check for entries the plan side
+          marked as out-of-scope (speculative draft decode slots, EAGLE rotation bonus tail).
         - record_violation(): idx = atomicAdd(violation_write_index, 1); if idx < ring_capacity, atomic-write
           the 8 int64 fields to violation_ring[idx] (kernel_kind, slot_idx, position, stored vs expected
           fields, fail_reason).
@@ -314,6 +316,7 @@ def launch_canary_verify_kernel(
     _assert_contiguous(plan.verify_slot_indices, "plan.verify_slot_indices")
     _assert_contiguous(plan.verify_positions, "plan.verify_positions")
     _assert_contiguous(plan.verify_prev_slot_indices, "plan.verify_prev_slot_indices")
+    _assert_contiguous(plan.verify_expected_tokens, "plan.verify_expected_tokens")
     _assert_contiguous(plan.verify_num_valid, "plan.verify_num_valid")
     _assert_contiguous(plan.enable, "plan.enable")
     _assert_contiguous(context.violation_ring, "violation_ring")
@@ -331,6 +334,7 @@ def launch_canary_verify_kernel(
         plan.verify_slot_indices,
         plan.verify_positions,
         plan.verify_prev_slot_indices,
+        plan.verify_expected_tokens,
         plan.verify_num_valid,
         plan.enable,
         int(context.kernel_kind),

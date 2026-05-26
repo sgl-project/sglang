@@ -27,6 +27,7 @@ struct VerifyKernelParams {
   const int64_t* verify_slot_indices;
   const int64_t* verify_positions;
   const int64_t* verify_prev_slot_indices;
+  const int64_t* verify_expected_tokens;
   const int32_t* verify_num_valid;
   const int32_t* verify_enable;
   int32_t verify_capacity;
@@ -85,6 +86,12 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
         real_kv_fold_sources(p.sources, p.num_sources, slot_idx, p.real_kv_hash_mode);
     const int64_t expected_real_kv_hash = static_cast<int64_t>(expected_real_kv_hash_u64);
 
+    // ``-1`` sentinel = plan side opted out of the SOT check for this entry (drafted but uncommitted
+    // tokens, EAGLE rotation bonus tail). Keep ``expected_token == 0`` in the recorded violation row when
+    // skipped so chain_hash / position / real_kv_hash mismatches still print the legacy ``expected_token=0``.
+    const int64_t expected_token = p.verify_expected_tokens[entry_idx];
+    const bool check_token = (expected_token != -1);
+
     FailReason fail_reason_bits{};
     if (stored_chain_hash != expected_chain_hash) {
       fail_reason_bits |= FailReason::kChainHash;
@@ -95,6 +102,9 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
     if (stored_real_kv_hash != expected_real_kv_hash) {
       fail_reason_bits |= FailReason::kRealKvHash;
     }
+    if (check_token && stored_token != expected_token) {
+      fail_reason_bits |= FailReason::kVerifyTokenMismatch;
+    }
 
     if (fail_reason_bits != FailReason{}) {
       record_violation(
@@ -103,7 +113,7 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
               /* slot_idx = */ slot_idx,
               /* position = */ stored_position,
               /* stored_token = */ stored_token,
-              /* expected_token = */ 0,
+              /* expected_token = */ check_token ? expected_token : 0,
               /* stored_chain_hash = */ stored_chain_hash,
               /* expected_aux = */ expected_chain_hash,
               /* fail_reason_bits = */ static_cast<int64_t>(fail_reason_bits),
@@ -137,6 +147,7 @@ inline void canary_verify_step_cuda(
     tvm::ffi::TensorView verify_slot_indices,
     tvm::ffi::TensorView verify_positions,
     tvm::ffi::TensorView verify_prev_slot_indices,
+    tvm::ffi::TensorView verify_expected_tokens,
     tvm::ffi::TensorView verify_num_valid,
     tvm::ffi::TensorView verify_enable,
     int64_t kernel_kind,
@@ -166,7 +177,8 @@ inline void canary_verify_step_cuda(
       .with_device<kDLCUDA>(device_)
       .verify(verify_slot_indices)
       .verify(verify_positions)
-      .verify(verify_prev_slot_indices);
+      .verify(verify_prev_slot_indices)
+      .verify(verify_expected_tokens);
   TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(verify_num_valid);
   TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(verify_enable);
 
@@ -237,6 +249,7 @@ inline void canary_verify_step_cuda(
   p.verify_slot_indices = static_cast<const int64_t*>(verify_slot_indices.data_ptr());
   p.verify_positions = static_cast<const int64_t*>(verify_positions.data_ptr());
   p.verify_prev_slot_indices = static_cast<const int64_t*>(verify_prev_slot_indices.data_ptr());
+  p.verify_expected_tokens = static_cast<const int64_t*>(verify_expected_tokens.data_ptr());
   p.verify_num_valid = static_cast<const int32_t*>(verify_num_valid.data_ptr());
   p.verify_enable = static_cast<const int32_t*>(verify_enable.data_ptr());
   p.verify_capacity = verify_capacity;

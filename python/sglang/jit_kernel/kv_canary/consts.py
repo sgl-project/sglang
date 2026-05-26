@@ -37,6 +37,7 @@ class FailReason(IntFlag):
     REAL_KV_HASH = 1 << 2
     WRITE_TOKEN_MISMATCH = 1 << 3
     WRITE_POSITION_MISMATCH = 1 << 4
+    VERIFY_TOKEN_MISMATCH = 1 << 5
 
 
 MAX_REAL_KV_SOURCES: Final[int] = 4
