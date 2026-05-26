@@ -870,6 +870,16 @@ class Req(ReqDllmMixin):
         # holding" for the original fix.
         self.abort_double_release_count: int = 0
 
+        # Regression instrumentation for invariant C2: with page_size > 1,
+        # the partial-page tail past cache_protected_len in
+        # req.prefix_indices must be freed exactly once across the
+        # cache_unfinished_req / cache_finished_req sequence. Tracks the
+        # last freed prefix-len so a repeat free of the same range is
+        # detectable; see radix_cache.cache_unfinished_req for the
+        # cache_protected_len explanation.
+        self.partial_page_tail_double_free_count: int = 0
+        self._last_partial_tail_free_end: int = -1
+
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
         # processed.
@@ -1357,6 +1367,9 @@ class Req(ReqDllmMixin):
         self.indexer_topk = None
         self.last_node = None
         self.cache_protected_len = 0
+        # Invariant C2: reset partial-tail free tracker so post-retract
+        # cache_unfinished_req calls are not flagged as double frees.
+        self._last_partial_tail_free_end = -1
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
         self.extend_input_len = 0

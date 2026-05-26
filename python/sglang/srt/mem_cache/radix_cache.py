@@ -515,6 +515,22 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         new_prefix_len = result.prefix_len
 
+        # Invariant C2: with page_size > 1, the partial tail beyond
+        # cache_protected_len must be freed exactly once across the
+        # cache_unfinished_req / cache_finished_req sequence. If we are
+        # about to free a [cache_protected_len, new_prefix_len) range
+        # whose upper bound is at or below the last freed range, the
+        # same memory would be released twice. See the comment a few
+        # lines below about cache_protected_len for the full bug
+        # history.
+        if (
+            new_prefix_len > req.cache_protected_len
+            and new_prefix_len <= req._last_partial_tail_free_end
+        ):
+            req.partial_page_tail_double_free_count += 1
+        if new_prefix_len > req.cache_protected_len:
+            req._last_partial_tail_free_end = new_prefix_len
+
         self.token_to_kv_pool_allocator.free(
             kv_indices[req.cache_protected_len : new_prefix_len]
         )
