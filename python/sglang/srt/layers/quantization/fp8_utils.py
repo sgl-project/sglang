@@ -1117,6 +1117,9 @@ def deepgemm_w8a8_mxfp8_linear(
         else:
             raise TypeError("DeepGEMM MXFP8 input_scale must be uint8 or int32.")
 
+    if q_input.dtype != torch.float8_e4m3fn:
+        raise TypeError("DeepGEMM MXFP8 input must be FP8 E4M3.")
+
     if x_scale.shape != (m, k // 128):
         raise ValueError(
             "DeepGEMM MXFP8 input scale must have shape "

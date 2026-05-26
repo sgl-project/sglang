@@ -1,6 +1,6 @@
 import logging
 from contextlib import contextmanager
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Sequence, Tuple
 
 import torch
 
@@ -161,18 +161,60 @@ def grouped_gemm_nt_f8f8bf16_contig(
 
 
 def grouped_gemm_nt_bf16_contig(
-    a: torch.Tensor, b: torch.Tensor, d: torch.Tensor, m_indices: torch.Tensor
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: torch.Tensor,
+    m_indices: torch.Tensor,
+    num_tokens_per_expert: Optional[Sequence[int]] = None,
 ):
     m, k = a.shape
     num_groups, n, _ = b.shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG
 
-    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, m_indices)
+    grouped_fn = getattr(deep_gemm, "m_grouped_bf16_gemm_nt_contiguous", None)
+    if grouped_fn is not None:
+        with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+            grouped_fn(a, b, d, m_indices)
+        return
+
+    if num_tokens_per_expert is None:
+        raise AttributeError(
+            "The installed deep_gemm package does not expose "
+            "m_grouped_bf16_gemm_nt_contiguous, and num_tokens_per_expert was "
+            "not provided for the per-expert BF16 fallback."
+        )
+
+    _grouped_gemm_nt_bf16_contig_fallback(a, b, d, num_tokens_per_expert)
 
 
-def has_grouped_gemm_nt_bf16_contig() -> bool:
-    return hasattr(deep_gemm, "m_grouped_bf16_gemm_nt_contiguous")
+def _grouped_gemm_nt_bf16_contig_fallback(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: torch.Tensor,
+    num_tokens_per_expert: Sequence[int],
+) -> None:
+    if len(num_tokens_per_expert) != b.shape[0]:
+        raise ValueError(
+            "num_tokens_per_expert length must match the number of expert groups: "
+            f"{len(num_tokens_per_expert)} != {b.shape[0]}."
+        )
+
+    start = 0
+    for expert_id, count in enumerate(num_tokens_per_expert):
+        end = start + int(count)
+        if end > start:
+            gemm_nt_bf16bf16f32(
+                a[start:end],
+                b[expert_id],
+                d[start:end],
+            )
+        start = end
+
+    if start != a.shape[0]:
+        raise ValueError(
+            "num_tokens_per_expert does not sum to the grouped BF16 input tokens: "
+            f"{start} != {a.shape[0]}."
+        )
 
 
 def gemm_nt_f8f8bf16(

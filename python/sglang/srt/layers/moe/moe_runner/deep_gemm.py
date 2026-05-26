@@ -333,12 +333,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             dtype=torch.bfloat16,
         )
 
-        self._run_bf16_contiguous_grouped_gemm(
+        deep_gemm_wrapper.grouped_gemm_nt_bf16_contig(
             hidden_states,
             w13_weight,
             gateup_output,
             m_indices,
-            running_state,
+            running_state.get("num_recv_tokens_per_expert"),
         )
 
         dispose_tensor(hidden_states)
@@ -364,51 +364,15 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
-        self._run_bf16_contiguous_grouped_gemm(
+        deep_gemm_wrapper.grouped_gemm_nt_bf16_contig(
             down_input,
             w2_weight,
             down_output,
             m_indices,
-            running_state,
+            running_state.get("num_recv_tokens_per_expert"),
         )
 
         return down_output
-
-    @staticmethod
-    def _run_bf16_contiguous_grouped_gemm(
-        hidden_states: torch.Tensor,
-        weight: torch.Tensor,
-        output: torch.Tensor,
-        m_indices: torch.Tensor,
-        running_state: dict,
-    ) -> None:
-        if deep_gemm_wrapper.has_grouped_gemm_nt_bf16_contig():
-            deep_gemm_wrapper.grouped_gemm_nt_bf16_contig(
-                hidden_states,
-                weight,
-                output,
-                m_indices,
-            )
-            return
-
-        num_tokens_per_expert = running_state.get("num_recv_tokens_per_expert")
-        if num_tokens_per_expert is None:
-            raise AttributeError(
-                "The installed deep_gemm package does not expose "
-                "m_grouped_bf16_gemm_nt_contiguous, and token counts were not "
-                "provided for the per-expert BF16 fallback."
-            )
-
-        start = 0
-        for expert_id, count in enumerate(num_tokens_per_expert):
-            end = start + int(count)
-            if end > start:
-                deep_gemm_wrapper.gemm_nt_bf16bf16f32(
-                    hidden_states[start:end],
-                    weight[expert_id],
-                    output[start:end],
-                )
-            start = end
 
     def _run_masked_gemm(
         self,
