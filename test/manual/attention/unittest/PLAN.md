@@ -353,6 +353,30 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Added Mamba2 `HybridLinearAttnBackend` dispatch fan-out tests
+  (`test_hybrid_dispatch_*` in `mamba/test_mamba2.py`) mirroring GDN's 3
+  MagicMock-based spy tests. Covers M19/M20 dispatch-layer slice
+  mutations on `init_forward_metadata`,
+  `init_forward_metadata_replay_cuda_graph`, and
+  `init_forward_metadata_capture_cuda_graph`.
+- Added KDA PCG/BCG split-op extend runner adapter
+  (`run_kda_split_op_extend_case`) mirroring GDN. Required generalizing
+  `make_kda_token_padded_inputs` to handle the 4D non-DECODE `a` shape
+  now exposed by `kda_fixture_inputs`. Lightning split-op is
+  deliberately deferred — Lightning's `forward_extend` flattens to
+  `[T, num_heads * head_dim]` at `lightning_backend.py:335`, but
+  `RadixAttention.forward` under piecewise CG writes through a per-head
+  output (`radix_attention.py:124-137`), so the shared
+  `_run_split_op_extend_case` trips a shape mismatch when comparing
+  eager (flat) vs piecewise (per-head) actuals. KDA and GDN avoid this
+  because their backends keep per-head shape on return.
+- Added Lightning EAGLE chain verify (eager + CG) via
+  `expected_lightning_verify_output_from_inputs` (per-draft-token
+  seg_la recurrence with parent-index sharing). Lightning tree verify
+  is structurally blocked — `linear/seg_la.py` has no parent-indices /
+  retrieve-index plumbing and processes draft tokens as a chain
+  regardless of tree shape; a tree-shaped verify diverges ~5x vs the
+  parent-indices-aware reference.
 - Wired KDA + Lightning CUDA-graph decode runner adapters mirroring the
   GDN pattern. Both adapters reuse the existing
   `_clone_*_cache` / `_restore_*_cache` snapshot helpers that point at
