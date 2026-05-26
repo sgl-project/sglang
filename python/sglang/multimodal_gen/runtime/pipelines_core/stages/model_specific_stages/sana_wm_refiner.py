@@ -30,6 +30,7 @@ from torch import nn
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -289,17 +290,27 @@ class SanaWMLTX2RefinerStage(PipelineStage):
             )
             timestep[:, n_context_tokens:] = sigma
 
-            velocity_tokens = self.transformer(
-                hidden_states=full_tokens.to(self.dtype),
-                encoder_hidden_states=prompt_embeds,
-                timestep=timestep,
-                encoder_attention_mask=additive,
-                num_frames=T_full,
-                height=H_full,
-                width=W_full,
-                fps=fps,
-                n_context_tokens=n_context_tokens,
-            )
+            # The framework's attention layer (layers/attention/layer.py)
+            # reads attn metadata from the active forward context. The refiner
+            # DiT goes through LTX2Attention -> framework attn, so we must
+            # establish a forward context here -- same pattern as DenoisingStage
+            # and TextEncodingStage. attn_metadata=None is acceptable since
+            # this is an inference forward (no KV cache / paged attention).
+            with set_forward_context(
+                current_timestep=step_idx,
+                attn_metadata=None,
+            ):
+                velocity_tokens = self.transformer(
+                    hidden_states=full_tokens.to(self.dtype),
+                    encoder_hidden_states=prompt_embeds,
+                    timestep=timestep,
+                    encoder_attention_mask=additive,
+                    num_frames=T_full,
+                    height=H_full,
+                    width=W_full,
+                    fps=fps,
+                    n_context_tokens=n_context_tokens,
+                )
             velocity_5d = unpack_latents(
                 velocity_tokens,
                 num_frames=T_full,

@@ -328,8 +328,15 @@ class SanaWMLTX2VideoRefiner(CachableDiT, LayerwiseOffloadableModuleMixin):
             quant_config=quant_config,
         )
 
+        # LTX2AudioVideoRotaryPosEmbed expects `dim` to be the *total* hidden
+        # size (num_heads * head_dim), not the per-head dim. It internally
+        # reshapes cos/sin to (B, T, num_heads, head_dim/2). Passing
+        # `attention_head_dim` here would size the RoPE to head_dim/num_heads
+        # and produce a (1, num_heads, L, 2) cos/sin that won't match
+        # LTX2Attention's q/k. See LTX2Transformer3DAVModel.__init__ in
+        # ltx_2.py for the canonical convention (`dim=self.hidden_size`).
         self.rope = LTX2AudioVideoRotaryPosEmbed(
-            dim=self.attention_head_dim,
+            dim=self.hidden_size,
             patch_size=self.patch_size,
             patch_size_t=self.patch_size_t,
             base_num_frames=int(arch.base_num_frames),
