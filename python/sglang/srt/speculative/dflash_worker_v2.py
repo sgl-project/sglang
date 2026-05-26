@@ -1,5 +1,5 @@
 import logging
-from typing import Optional
+from typing import List, Optional
 
 import torch
 
@@ -70,6 +70,62 @@ class DFlashWorkerV2(DFlashWorker):
         supports_gpu_triton = is_cuda() or is_hip()
         self._use_triton_prepare_block = supports_gpu_triton
         self._use_triton_accept_bonus = supports_gpu_triton
+        self._accept_bonus_buffer_cap: int = 0
+        self._accept_bonus_buffer_slot: int = 0
+        self._accept_len_buf: Optional[torch.Tensor] = None
+        self._commit_lens_bufs: List[torch.Tensor] = []
+        self._bonus_id_bufs: List[torch.Tensor] = []
+        self._out_tokens_bufs: List[torch.Tensor] = []
+        self._new_seq_lens_bufs: List[torch.Tensor] = []
+
+    def _ensure_accept_bonus_buffers(self, bs: int) -> None:
+        if self._accept_bonus_buffer_cap >= int(bs):
+            return
+
+        new_cap = max(
+            int(bs),
+            (
+                self._accept_bonus_buffer_cap * 2
+                if self._accept_bonus_buffer_cap > 0
+                else int(bs)
+            ),
+        )
+        device = self.device
+        block_size = int(self.block_size)
+        self._accept_len_buf = torch.empty((new_cap,), dtype=torch.int32, device=device)
+        self._commit_lens_bufs = [
+            torch.empty((new_cap,), dtype=torch.int32, device=device) for _ in range(2)
+        ]
+        self._bonus_id_bufs = [
+            torch.empty((new_cap,), dtype=torch.int32, device=device) for _ in range(2)
+        ]
+        self._out_tokens_bufs = [
+            torch.empty((new_cap, block_size), dtype=torch.int64, device=device)
+            for _ in range(2)
+        ]
+        self._new_seq_lens_bufs = [
+            torch.empty((new_cap,), dtype=torch.int64, device=device) for _ in range(2)
+        ]
+        self._accept_bonus_buffer_cap = new_cap
+
+    def _next_accept_bonus_buffers(self, bs: int) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        self._ensure_accept_bonus_buffers(bs)
+        assert self._accept_len_buf is not None
+        slot = self._accept_bonus_buffer_slot
+        self._accept_bonus_buffer_slot = (slot + 1) % 2
+        return (
+            self._accept_len_buf[:bs],
+            self._commit_lens_bufs[slot][:bs],
+            self._bonus_id_bufs[slot][:bs],
+            self._out_tokens_bufs[slot][:bs],
+            self._new_seq_lens_bufs[slot][:bs],
+        )
 
     def _validate_phase1_sampling_support(
         self, model_worker_batch: ScheduleBatch
@@ -103,7 +159,7 @@ class DFlashWorkerV2(DFlashWorker):
             topk_p=torch.empty((bs, 0), device=device, dtype=torch.float32),
             topk_index=torch.empty((bs, 0), device=device, dtype=torch.int64),
             verified_id=verified_id.to(dtype=torch.int32),
-            new_seq_lens=seq_lens.to(dtype=torch.int32),
+            new_seq_lens=seq_lens.to(dtype=torch.int64),
             hidden_states=torch.empty((bs, 0), device=device, dtype=torch.float16),
             verify_done=verify_done,
             cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
@@ -123,7 +179,7 @@ class DFlashWorkerV2(DFlashWorker):
             topk_p=torch.empty((bs, 0), device=device, dtype=torch.float32),
             topk_index=torch.empty((bs, 0), device=device, dtype=torch.int64),
             verified_id=verified_id.to(dtype=torch.int32),
-            new_seq_lens=new_seq_lens.to(dtype=torch.int32),
+            new_seq_lens=new_seq_lens.to(dtype=torch.int64),
             hidden_states=torch.empty((bs, 0), device=device, dtype=torch.float16),
             verify_done=verify_done,
             cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
@@ -229,7 +285,7 @@ class DFlashWorkerV2(DFlashWorker):
             empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
             next_draft_input = self._make_next_draft_input_decode(
                 verified_id=torch.empty((0,), device=self.device, dtype=torch.int32),
-                new_seq_lens=torch.empty((0,), device=self.device, dtype=torch.int32),
+                new_seq_lens=torch.empty((0,), device=self.device, dtype=torch.int64),
             )
             if on_publish is not None:
                 on_publish(next_draft_input.new_seq_lens)
@@ -485,6 +541,7 @@ class DFlashWorkerV2(DFlashWorker):
             )
 
         candidates = draft_tokens
+        new_seq_lens = None
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
@@ -511,14 +568,13 @@ class DFlashWorkerV2(DFlashWorker):
             )
             if self._use_triton_accept_bonus:
                 try:
-                    accept_len = torch.empty((bs,), dtype=torch.int32, device=device)
-                    commit_lens = torch.empty((bs,), dtype=torch.int32, device=device)
-                    bonus = torch.empty((bs,), dtype=candidates.dtype, device=device)
-                    out_tokens = torch.empty(
-                        (bs, int(self.block_size)),
-                        dtype=candidates.dtype,
-                        device=device,
-                    )
+                    (
+                        accept_len,
+                        commit_lens,
+                        bonus,
+                        out_tokens,
+                        new_seq_lens,
+                    ) = self._next_accept_bonus_buffers(bs)
                     _compute_dflash_accept_bonus_triton_unchecked(
                         candidates=candidates,
                         target_top1=target_predict,
@@ -526,6 +582,8 @@ class DFlashWorkerV2(DFlashWorker):
                         commit_lens_out=commit_lens,
                         bonus_ids_out=bonus,
                         out_tokens_out=out_tokens,
+                        prefix_lens=prefix_lens,
+                        new_seq_lens_out=new_seq_lens,
                     )
                 except Exception as e:
                     self._use_triton_accept_bonus = False
@@ -539,7 +597,9 @@ class DFlashWorkerV2(DFlashWorker):
                     )
                     commit_lens = accept_len.to(torch.int32) + 1  # [bs]
                     out_tokens = torch.empty(
-                        (bs, int(self.block_size)), dtype=torch.int64, device=device
+                        (bs, int(self.block_size)),
+                        dtype=torch.int64,
+                        device=device,
                     )
                     if int(self.block_size) > 1:
                         out_tokens[:, : int(self.block_size) - 1].copy_(
@@ -573,7 +633,8 @@ class DFlashWorkerV2(DFlashWorker):
                 commit_lens=commit_lens,
             )
 
-        new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+        if new_seq_lens is None:
+            new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         if on_publish is not None:
             on_publish(new_seq_lens)
 

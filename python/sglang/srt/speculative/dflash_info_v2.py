@@ -41,7 +41,8 @@ class DFlashDraftInputV2(SpecInput):
     """Draft-side state carried across overlap iterations (spec-v2)."""
 
     # Legacy Eagle-shaped fields kept only for dataclass compatibility. DFLASH
-    # overlap only relays verified_id/new_seq_lens through FutureMap.
+    # overlap carries new_seq_lens / verified_id directly in the common
+    # no-shape-change path; FutureMap remains the fallback for filter/merge.
     topk_p: torch.Tensor
     topk_index: torch.Tensor
     verified_id: torch.Tensor
@@ -55,6 +56,7 @@ class DFlashDraftInputV2(SpecInput):
     planning_seq_lens_sum: Optional[int] = None
     reserved_seq_lens_cpu: Optional[torch.Tensor] = None
     reserved_seq_lens_sum: Optional[int] = None
+    direct_carry_valid: bool = True
     _prepare_committed_kv_lens_cpu_buf: Optional[torch.Tensor] = None
     _prepare_planning_kv_lens_cpu_buf: Optional[torch.Tensor] = None
     _prepare_batch_seq_lens_cpu_buf: Optional[torch.Tensor] = None
@@ -121,7 +123,7 @@ class DFlashDraftInputV2(SpecInput):
             topk_p=torch.empty((0, 0), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, 0), device=device, dtype=torch.int64),
             verified_id=torch.empty((0,), device=device, dtype=torch.int32),
-            new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
+            new_seq_lens=torch.empty((0,), device=device, dtype=torch.int64),
             hidden_states=torch.empty((0, 0), device=device, dtype=torch.float16),
             verify_done=None,
         )
@@ -163,7 +165,6 @@ class DFlashDraftInputV2(SpecInput):
             raise ValueError(
                 f"DFLASH invalid speculative_num_draft_tokens={block_size}."
             )
-
         page_size = batch.token_to_kv_pool_allocator.page_size
         nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
         committed_seq_lens_sum = 0
@@ -290,6 +291,7 @@ class DFlashDraftInputV2(SpecInput):
 
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
+            self.direct_carry_valid = False
             return
 
         self.topk_p = self.topk_p[new_indices]
@@ -332,6 +334,7 @@ class DFlashDraftInputV2(SpecInput):
             self.future_indices = torch.cat(
                 [self.future_indices, spec_info.future_indices]
             )
+            self.direct_carry_valid = False
             return
 
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p], dim=0)

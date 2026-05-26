@@ -11,12 +11,16 @@ def _dflash_accept_bonus_contig_kernel(
     commit_lens_out_ptr,
     bonus_ids_out_ptr,
     out_tokens_ptr,
+    prefix_lens_ptr,
+    new_seq_lens_out_ptr,
     candidates_row_stride,
     target_row_stride,
     accept_stride,
     commit_stride,
     bonus_stride,
     out_tokens_row_stride,
+    prefix_lens_stride,
+    new_seq_lens_stride,
     block_size,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -42,10 +46,12 @@ def _dflash_accept_bonus_contig_kernel(
 
     commit_len = accept_len + 1
     bonus_id = tl.load(target_row_ptr + accept_len.to(tl.int64))
+    new_seq_len = tl.load(prefix_lens_ptr + row * prefix_lens_stride) + commit_len
 
     tl.store(accept_lens_out_ptr + row * accept_stride, accept_len)
     tl.store(commit_lens_out_ptr + row * commit_stride, commit_len)
     tl.store(bonus_ids_out_ptr + row * bonus_stride, bonus_id)
+    tl.store(new_seq_lens_out_ptr + row * new_seq_lens_stride, new_seq_len)
 
     out_val = tl.where(draft_mask, candidate_tail, 0)
     out_val = tl.where(cols == accept_len, bonus_id, out_val)
@@ -75,6 +81,8 @@ def _compute_dflash_accept_bonus_triton_unchecked(
     commit_lens_out: torch.Tensor,
     bonus_ids_out: torch.Tensor,
     out_tokens_out: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    new_seq_lens_out: torch.Tensor,
 ) -> None:
     batch_size, block_size = candidates.shape
     if batch_size == 0:
@@ -100,6 +108,12 @@ def _compute_dflash_accept_bonus_triton_unchecked(
         raise ValueError(
             "DFLASH Triton accept_bonus requires contiguous bonus_ids_out."
         )
+    if prefix_lens.ndim != 1:
+        raise ValueError("DFLASH Triton accept_bonus requires 1D prefix_lens.")
+    if not new_seq_lens_out.is_contiguous():
+        raise ValueError(
+            "DFLASH Triton accept_bonus requires contiguous new_seq_lens_out."
+        )
 
     block = triton.next_power_of_2(block_size)
     num_warps = _pick_num_warps(block)
@@ -110,12 +124,16 @@ def _compute_dflash_accept_bonus_triton_unchecked(
         commit_lens_out,
         bonus_ids_out,
         out_tokens_out,
+        prefix_lens,
+        new_seq_lens_out,
         candidates.stride(0),
         target_top1.stride(0),
         accept_lens_out.stride(0),
         commit_lens_out.stride(0),
         bonus_ids_out.stride(0),
         out_tokens_out.stride(0),
+        prefix_lens.stride(0),
+        new_seq_lens_out.stride(0),
         block_size,
         BLOCK_SIZE=block,
         num_warps=num_warps,
