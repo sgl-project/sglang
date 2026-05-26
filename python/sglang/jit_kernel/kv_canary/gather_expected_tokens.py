@@ -131,13 +131,9 @@ def _validate_inputs(
     if pool.ndim != 2:
         raise ValueError(f"kv-canary: pool must be 2-D, got shape {tuple(pool.shape)}")
     if valid_lens.dtype != torch.int32:
-        raise ValueError(
-            f"kv-canary: valid_lens must be int32, got {valid_lens.dtype}"
-        )
+        raise ValueError(f"kv-canary: valid_lens must be int32, got {valid_lens.dtype}")
     if input_ids.dtype != torch.int64:
-        raise ValueError(
-            f"kv-canary: input_ids must be int64, got {input_ids.dtype}"
-        )
+        raise ValueError(f"kv-canary: input_ids must be int64, got {input_ids.dtype}")
     if out_expected_tokens.dtype != torch.int64:
         raise ValueError(
             f"kv-canary: out_expected_tokens must be int64, got "
@@ -228,9 +224,9 @@ def _gather_expected_tokens_kernel(
 
     pos_in_seq = prefix_per_token + (token_offs - req_start)
     logical_pos = pos_in_seq + mode_offset
-    vlen = tl.load(
-        valid_lens_ptr + rpi_per_token, mask=token_mask, other=0
-    ).to(tl.int64)  # [TOKEN_BLOCK]
+    vlen = tl.load(valid_lens_ptr + rpi_per_token, mask=token_mask, other=0).to(
+        tl.int64
+    )  # [TOKEN_BLOCK]
     in_range = (logical_pos >= 0) & (logical_pos < vlen)
 
     safe_pos = tl.where(in_range, logical_pos, 0)
@@ -238,7 +234,9 @@ def _gather_expected_tokens_kernel(
         pool_ptr + rpi_per_token * pool_stride0 + safe_pos,
         mask=token_mask & in_range,
         other=0,
-    ).to(tl.int64)  # [TOKEN_BLOCK]
+    ).to(
+        tl.int64
+    )  # [TOKEN_BLOCK]
 
     fallback = tl.load(input_ids_ptr + token_offs, mask=token_mask, other=0)
     out = tl.where(in_range, pool_gather, fallback)
