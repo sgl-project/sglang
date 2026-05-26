@@ -38,6 +38,7 @@ def get_first_generation_req(req_or_group: Any) -> Req | None:
 
 
 def is_warmup_req(req_or_group: Any) -> bool:
+    """either server-based or req-based"""
     req = get_first_generation_req(req_or_group)
     return req.is_warmup if req is not None else False
 
@@ -50,6 +51,7 @@ def is_server_based_warmup(req_or_group: Any) -> bool:
 
 
 def should_return_warmup_result(req_or_group: Any) -> bool:
+    # server-based warmup needs to return to the http server to finish the startup
     req = get_first_generation_req(req_or_group)
     return (
         req is not None

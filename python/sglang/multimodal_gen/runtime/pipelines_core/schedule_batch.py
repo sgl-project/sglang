@@ -398,7 +398,7 @@ class OutputBatch:
     noise_pred: torch.Tensor | None = None
     peak_memory_mb: float = 0.0
 
-    def drop_warmup_payload(self) -> None:
+    def drop_payload_for_warmup(self) -> None:
         self.output = None
         self.audio = None
         self.trajectory_timesteps = None

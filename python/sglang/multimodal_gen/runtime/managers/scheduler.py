@@ -606,12 +606,12 @@ class Scheduler(SchedulerDisaggMixin):
         self,
         output_batch: OutputBatch,
         identity: bytes | None = None,
-        is_warmup: bool = False,
+        should_not_return: bool = False,
     ):
         """
         replies to client, only on rank 0
         """
-        if not is_warmup and self.receiver is not None and identity is not None:
+        if not should_not_return and self.receiver is not None and identity is not None:
             # if the server is local, use temp file to spill the frame array instead of
             # leaving it in OutputBatch to be pickled later
             if is_local_endpoint(self.server_args.scheduler_endpoint):
@@ -1166,10 +1166,15 @@ class Scheduler(SchedulerDisaggMixin):
                     self._log_warmup_result(output_batch, processed_req, is_warmup)
 
                     if is_warmup and should_return_warmup_result(processed_req):
-                        output_batch.drop_warmup_payload()
-                        self.return_result(output_batch, identity, is_warmup=False)
+                        # only keep the necessary lightweight payloads
+                        output_batch.drop_payload_for_warmup()
+                        self.return_result(
+                            output_batch, identity, should_not_return=False
+                        )
                     else:
-                        self.return_result(output_batch, identity, is_warmup=is_warmup)
+                        self.return_result(
+                            output_batch, identity, should_not_return=is_warmup
+                        )
             except zmq.ZMQError as e:
                 # Reply failed; log and keep loop alive to accept future requests
                 logger.error(f"ZMQ error sending reply: {e}")
