@@ -13,12 +13,21 @@ All tests are CPU-only; no model loading, no distributed init.
 
 import unittest
 from collections import deque
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
+    Flux2FinetunedPipelineConfig,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
+    ImageVAEEncodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
 )
@@ -204,7 +213,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_based_expected = {
             ModelTaskType.T2I: False,
             ModelTaskType.T2V: False,
-            ModelTaskType.TI2I: False,
+            ModelTaskType.TI2I: True,
             ModelTaskType.TI2V: True,
             ModelTaskType.I2I: True,
             ModelTaskType.I2V: True,
@@ -226,7 +235,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
                 task_type.name,
             )
 
-    def test_server_based_warmup_does_not_force_optional_image_input(self):
+    def test_server_based_warmup_keeps_ti2i_image_input(self):
         server_args = MagicMock()
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
@@ -239,11 +248,12 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             reqs = build_warmup_reqs(
                 server_args,
                 warmup_resolutions=None,
+                warmup_input_path="/tmp/warmup.png",
                 use_model_sampling_defaults=True,
                 server_based_warmup=True,
             )
 
-        self.assertIsNone(reqs[0].image_path)
+        self.assertEqual(reqs[0].image_path, ["/tmp/warmup.png"])
 
     def test_server_based_warmup_keeps_required_image_input(self):
         server_args = MagicMock()
@@ -284,6 +294,92 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             )
 
         self.assertEqual(reqs[0].image_path, ["/tmp/warmup.png"])
+
+
+class TestFlux2FinetunedVaeEncodePreprocess(unittest.TestCase):
+    def test_single_frame_custom_vae_encode_input_is_4d(self):
+        config = Flux2FinetunedPipelineConfig()
+        vae = MagicMock()
+        vae.bn = None
+
+        image = torch.zeros(1, 3, 1, 32, 32)
+        output = config.preprocess_vae_encode(image, vae)
+
+        self.assertEqual(tuple(output.shape), (1, 3, 32, 32))
+
+    def test_standard_flux2_vae_encode_input_stays_5d(self):
+        config = Flux2FinetunedPipelineConfig()
+        vae = MagicMock()
+        vae.bn = object()
+
+        image = torch.zeros(1, 3, 1, 32, 32)
+        output = config.preprocess_vae_encode(image, vae)
+
+        self.assertIs(output, image)
+
+    def test_custom_vae_already_patchified_encode_latents_stay_128_channels(self):
+        config = Flux2FinetunedPipelineConfig()
+        config.dit_config.arch_config.in_channels = 128
+        vae = MagicMock()
+        vae.bn = None
+
+        image_latents = torch.zeros(1, config.dit_config.arch_config.in_channels, 8, 8)
+        output = config.postprocess_vae_encode(image_latents, vae)
+
+        self.assertIs(output, image_latents)
+
+    def test_standard_flux2_vae_encode_latents_are_patchified(self):
+        config = Flux2FinetunedPipelineConfig()
+        vae = MagicMock()
+        vae.bn = object()
+
+        image_latents = torch.zeros(1, 32, 8, 8)
+        output = config.postprocess_vae_encode(image_latents, vae)
+
+        self.assertEqual(
+            tuple(output.shape),
+            (1, image_latents.shape[1] * 4, 4, 4),
+        )
+
+
+class TestImageVaeEncodingLatentRetrieval(unittest.TestCase):
+    def test_encode_scale_and_shift_allows_missing_shift(self):
+        latents = torch.ones(1, 4, 2, 2)
+        scaling_factor = torch.full((1, 1, 1, 1), 2.0)
+
+        output = ImageVAEEncodingStage.scale_and_shift_encode_latents(
+            latents, scaling_factor, None
+        )
+
+        self.assertTrue(torch.equal(output, torch.full_like(latents, 2.0)))
+
+    def test_retrieve_latents_accepts_encoder_output_latent(self):
+        stage = object.__new__(ImageVAEEncodingStage)
+        latents = torch.zeros(1, 32, 8, 8)
+        encoder_output = SimpleNamespace(latent=latents)
+
+        self.assertIs(
+            stage.retrieve_latents(encoder_output, sample_mode="argmax"),
+            latents,
+        )
+        self.assertIs(
+            stage.retrieve_latents(encoder_output, sample_mode="sample"),
+            latents,
+        )
+
+    def test_retrieve_latents_accepts_encoder_output_latents(self):
+        stage = object.__new__(ImageVAEEncodingStage)
+        latents = torch.zeros(1, 32, 8, 8)
+        encoder_output = SimpleNamespace(latents=latents)
+
+        self.assertIs(
+            stage.retrieve_latents(encoder_output, sample_mode="argmax"),
+            latents,
+        )
+        self.assertIs(
+            stage.retrieve_latents(encoder_output, sample_mode="sample"),
+            latents,
+        )
 
 
 class TestInputValidationCfgParallelGuard(unittest.TestCase):
