@@ -714,27 +714,18 @@ class HiRadixCache(RadixCache):
         if host_indices is not None:
             node.host_value = host_indices.clone()
             assert len(node.host_value) > 0
-            # Record (node, backup_len): _split_node may later slice this
-            # node's key/hash_value/host_value into clones across a parent
-            # chain, but the slices still point at the same host slots, so
-            # ack-time walk-and-concat exactly recovers the enqueue snapshot.
+            # Record backup_len for ack-time walk-and-concat after split.
             self.ongoing_write_through[node.id] = (node, len(node.key))
             if not write_back:
-                # no need to lock nodes if write back
                 self.inc_lock_ref(node)
-            # Note: store(CPU) event is deferred to writing_check() after the
-            # async DMA transfer is confirmed complete.
         else:
             return 0
 
         return len(host_indices)
 
     def write_backup_storage(self, node: TreeNode, backup_len: Optional[int] = None):
-        # When `backup_len` is given and the node has been split since
-        # enqueue, walk node.parent and concat key/hash_value/host_value to
-        # recover the enqueue-time snapshot.  prefix_keys is anchored at the
-        # chain top (NOT node) so a freshly inserted split parent's hashes
-        # don't double-count the recovered prefix.
+        # Recover pre-split data via walk-and-concat if node was split.
+        # prefix_keys anchored at chain top to avoid double-counting.
         if backup_len is None or len(node.key) == backup_len:
             top, key, hash_value, host_value = (
                 node,
@@ -760,9 +751,7 @@ class HiRadixCache(RadixCache):
         node.protect_host()
 
     def _concat_split_chain(self, node: TreeNode, backup_len: int):
-        """Walk node.parent until accumulated key length covers backup_len,
-        then concat parent-first.  _split_node slices into clones at the same
-        host slots, so concat reproduces the enqueue snapshot exactly."""
+        """Recover enqueue-time key/hash/host by walking the split chain."""
         chain, accumulated = [], 0
         current = node
         while current is not self.root_node and accumulated < backup_len:
@@ -776,20 +765,22 @@ class HiRadixCache(RadixCache):
         chain.reverse()  # parent-first
         top = chain[0]
         if top.key.is_bigram:
-            # Each segment shares its first raw token with the previous
-            # segment's last; drop the overlap on every segment except the first.
+            # Bigram segments share boundary tokens; drop overlap after first.
             token_ids = list(chain[0].key.token_ids)
             for n in chain[1:]:
                 token_ids.extend(n.key.token_ids[1:])
         else:
-            token_ids = [t for n in chain for t in n.key.token_ids]
+            token_ids = []
+            for n in chain:
+                token_ids.extend(n.key.token_ids)
         key = RadixKey(token_ids, top.key.extra_key, top.key.is_bigram)
 
-        hash_value = (
-            [h for n in chain for h in n.hash_value]
-            if all(n.hash_value is not None for n in chain)
-            else None
-        )
+        if all(n.hash_value is not None for n in chain):
+            hash_value = []
+            for n in chain:
+                hash_value.extend(n.hash_value)
+        else:
+            hash_value = None
         host_value = torch.cat([n.host_value for n in chain])
         return top, key, hash_value, host_value
 
