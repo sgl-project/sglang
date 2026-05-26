@@ -113,9 +113,7 @@ def _build_verify_inputs(case: BenchCase, *, device: torch.device) -> Tuple[
 
     num_valid = torch.tensor([total_entries], dtype=torch.int32, device=device)
     enable = torch.ones(1, dtype=torch.int32, device=device)
-    expected_input_ids = torch.full(
-        (capacity,), -1, dtype=torch.int64, device=device
-    )
+    expected_input_ids = torch.full((capacity,), -1, dtype=torch.int64, device=device)
     plan = VerifyPlan(
         verify_slot_indices=slot_indices,
         verify_expected_input_ids=expected_input_ids,
