@@ -36,6 +36,7 @@ def _script_naive_swa_chunked(t: ScriptedRuntime):
 
 class TestScriptedHybridSWA(CustomTestCase):
     def test_naive_swa_chunked(self):
+        """Chunked prompt crosses the SWA window boundary at least once."""
         execute_scripted_runtime(
             _script_naive_swa_chunked,
             **base_engine_kwargs(

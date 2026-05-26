@@ -159,6 +159,7 @@ class TestScriptedRuntimeDemo(CustomTestCase):
     """Single test that walks through every feature for didactic value."""
 
     def test_demo(self):
+        """Didactic walk-through of every ScriptedRuntime API in one script."""
         execute_scripted_runtime(
             _demo_script,
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,

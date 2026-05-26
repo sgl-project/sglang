@@ -306,6 +306,7 @@ def _script_retract_then_re_chunk(t: ScriptedRuntime):
 
 class TestScriptedPriority(CustomTestCase):
     def test_naive_priority_chunked(self):
+        """Priority scheduling × chunked: naive ScriptedRuntime smoke plus retract/preempt edge cases."""
         execute_scripted_runtime(
             _script_naive_priority_chunked,
             **base_engine_kwargs(
@@ -315,12 +316,14 @@ class TestScriptedPriority(CustomTestCase):
         )
 
     def test_retract_mid_chunk_releases_kv(self):
+        """KV pressure mid-chunk causes the chunked-resume req to be retracted."""
         execute_scripted_runtime(
             _script_retract_mid_chunk_releases_kv,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_priority_preempt_chunked(self):
+        """Priority preemption — a high-priority req shows up while a low-priority chunked-resume holds resources."""
         execute_scripted_runtime(
             _script_priority_preempt_chunked,
             **base_engine_kwargs(
@@ -330,12 +333,14 @@ class TestScriptedPriority(CustomTestCase):
         )
 
     def test_retract_and_resume(self):
+        """Retract chunked mid-stream, release pressure, then complete normally."""
         execute_scripted_runtime(
             _script_retract_and_resume,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_disagg_retract_resets_send_state(self):
+        """Disagg mode retract — disaggregation send-side state must reset on chunked-resume retract (414efd4a27)."""
         execute_scripted_runtime(
             _script_disagg_retract_resets_send_state,
             **base_engine_kwargs(
@@ -345,36 +350,42 @@ class TestScriptedPriority(CustomTestCase):
         )
 
     def test_force_retract_at_chunk_0(self):
+        """Force retract before first chunk completes."""
         execute_scripted_runtime(
             _script_force_retract_at_chunk_0,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_force_retract_at_chunk_mid(self):
+        """Force retract in the middle of chunked extend."""
         execute_scripted_runtime(
             _script_force_retract_at_chunk_mid,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_force_retract_at_last_chunk(self):
+        """Force retract during the last chunk's admit."""
         execute_scripted_runtime(
             _script_force_retract_at_last_chunk,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_force_retract_then_readmit(self):
+        """Force retract; next yield re-admits and completes."""
         execute_scripted_runtime(
             _script_force_retract_then_readmit,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_retract_one_admit_one(self):
+        """Force retract r1 + simultaneously admit r2."""
         execute_scripted_runtime(
             _script_retract_one_admit_one,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_priority_preempt_chunked_victim(self):
+        """Submit chunked low-priority, then high-priority new req."""
         execute_scripted_runtime(
             _script_priority_preempt_chunked_victim,
             **base_engine_kwargs(
@@ -384,6 +395,7 @@ class TestScriptedPriority(CustomTestCase):
         )
 
     def test_preempt_five_victims(self):
+        """5 chunked reqs preempted simultaneously."""
         execute_scripted_runtime(
             _script_preempt_five_victims,
             **base_engine_kwargs(
@@ -393,36 +405,42 @@ class TestScriptedPriority(CustomTestCase):
         )
 
     def test_retract_during_decode(self):
+        """Retract during pure decode (no chunked); ensure clean."""
         execute_scripted_runtime(
             _script_retract_during_decode,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_retract_then_abort_idempotent(self):
+        """Retract + abort same step; final state stable."""
         execute_scripted_runtime(
             _script_retract_then_abort_idempotent,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_disagg_retract_resets_send_state_extra(self):
+        """Disagg path: retract must reset send-side state (414efd4a27)."""
         execute_scripted_runtime(
             _script_disagg_retract_resets_send_state_extra,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_retract_chunked_resume_in_waiting(self):
+        """Chunked-resume already in waiting → force retract on it."""
         execute_scripted_runtime(
             _script_retract_chunked_resume_in_waiting,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_two_retracts_same_yield(self):
+        """Two reqs force_retracted in the same yield step."""
         execute_scripted_runtime(
             _script_two_retracts_same_yield,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_priority_preempt_release_invariant(self):
+        """Each preemption releases the victim's kv_pages strictly to 0."""
         execute_scripted_runtime(
             _script_priority_preempt_release_invariant,
             **base_engine_kwargs(
@@ -432,6 +450,7 @@ class TestScriptedPriority(CustomTestCase):
         )
 
     def test_retract_then_re_chunk(self):
+        """Retract a mid-chunk req; verify subsequent re-chunk completes without prefix_indices residue."""
         execute_scripted_runtime(
             _script_retract_then_re_chunk,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),

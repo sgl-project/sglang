@@ -368,18 +368,21 @@ def _script_mamba_pool_idx_cleanup_skip_chunked_resume(t: ScriptedRuntime):
 
 class TestScriptedSpecialCase(CustomTestCase):
     def test_dllm_stash_path(self):
+        """DLLM staging queue intersects ``stash_chunked_request`` at scheduler.py:2335."""
         execute_scripted_runtime(
             _script_dllm_stash_path,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_chunked_in_flight_no_idle(self):
+        """``self.chunked_req is not None`` early-exit bypass at scheduler.py:2487 / 2499."""
         execute_scripted_runtime(
             _script_chunked_in_flight_no_idle,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_dynamic_chunking_history_len(self):
+        """Dynamic chunking reads ``history_len`` from ``self.chunked_req.prefix_indices`` (scheduler.py:2516-2517)."""
         execute_scripted_runtime(
             _script_dynamic_chunking_history_len,
             **base_engine_kwargs(
@@ -389,12 +392,14 @@ class TestScriptedSpecialCase(CustomTestCase):
         )
 
     def test_add_chunked_req_path(self):
+        """``adder.add_chunked_req`` path (scheduler.py:2541-2548)."""
         execute_scripted_runtime(
             _script_add_chunked_req_path,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_chunked_scheduled_last_iter_flag(self):
+        """``_chunked_req_scheduled_last_iter`` toggling under hybrid-SWA early-return (scheduler.py:2544-2548)."""
         execute_scripted_runtime(
             _script_chunked_scheduled_last_iter_flag,
             **base_engine_kwargs(
@@ -406,132 +411,154 @@ class TestScriptedSpecialCase(CustomTestCase):
         )
 
     def test_admission_with_chunked_in_flight(self):
+        """``add_one_req`` kwarg ``has_chunked_req=True`` propagation (scheduler.py:2593)."""
         execute_scripted_runtime(
             _script_admission_with_chunked_in_flight,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_new_chunked_req_first_chunk(self):
+        """``adder.new_chunked_req`` assignment on first chunk (scheduler.py:2636-2642)."""
         execute_scripted_runtime(
             _script_new_chunked_req_first_chunk,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_inflight_middle_chunks_counter(self):
+        """``inflight_middle_chunks += 1`` every iteration the chunked req is admitted (scheduler.py:2644-2645)."""
         execute_scripted_runtime(
             _script_inflight_middle_chunks_counter,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_chunked_req_passes_through_batch(self):
+        """``chunked_req=self.chunked_req`` wiring into ScheduleBatch (scheduler.py:2658)."""
         execute_scripted_runtime(
             _script_chunked_req_passes_through_batch,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_no_idle_during_chunked(self):
+        """Idle path bypass — ``chunked_req is None`` check in ``check_idle`` (scheduler.py:3174)."""
         execute_scripted_runtime(
             _script_no_idle_during_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_abort_excludes_chunked_req(self):
+        """Abort path's ``chunked_req_to_exclude`` plumbing (scheduler.py:3568-3596)."""
         execute_scripted_runtime(
             _script_abort_excludes_chunked_req,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_last_batch_chunked_req_pp_context(self):
+        """Scheduler.py:2363-2369 — last_batch tracks the chunked_req in the PP context (chunked_req_to_exclude path)."""
         execute_scripted_runtime(
             _script_last_batch_chunked_req_pp_context,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_chunked_req_to_exclude_set_add(self):
+        """Scheduler.py:2366 — chunked_req_to_exclude.add(last_batch.chunked_req)."""
         execute_scripted_runtime(
             _script_chunked_req_to_exclude_set_add,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_chunked_req_to_exclude_update_reqs(self):
+        """Scheduler.py:2369 — chunked_req_to_exclude.update(last_batch.reqs)."""
         execute_scripted_runtime(
             _script_chunked_req_to_exclude_update_reqs,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_schedule_batch_init_new_chunked_req(self):
+        """Scheduler.py:2658 — ScheduleBatch.init_new(chunked_req=self.chunked_req)."""
         execute_scripted_runtime(
             _script_schedule_batch_init_new_chunked_req,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_mem_check_chunked_req_kwarg(self):
+        """Scheduler.py:2676-2677 — mem check called with chunked_req=..."""
         execute_scripted_runtime(
             _script_mem_check_chunked_req_kwarg,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_get_chunked_req_lambda_getter(self):
+        """Scheduler.py:680 — get_chunked_req lambda."""
         execute_scripted_runtime(
             _script_get_chunked_req_lambda_getter,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_chunked_req_scheduled_last_iter_flip(self):
+        """Scheduler.py: _chunked_req_scheduled_last_iter flip logic."""
         execute_scripted_runtime(
             _script_chunked_req_scheduled_last_iter_flip,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_chunked_req_reset_to_none(self):
+        """Scheduler.py:3596 — chunked_req=None reset path."""
         execute_scripted_runtime(
             _script_chunked_req_reset_to_none,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_disagg_prefill_chunked_path(self):
+        """Disaggregation/prefill.py — chunked req in disagg prefill mode."""
         execute_scripted_runtime(
             _script_disagg_prefill_chunked_path,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_disagg_decode_waiting_queue_kv_held(self):
+        """Disaggregation/decode.py — waiting_queue reqs hold KV in decode mode."""
         execute_scripted_runtime(
             _script_disagg_decode_waiting_queue_kv_held,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_dllm_staging_double_pending_middle_outputs(self):
+        """Dllm/mixin/scheduler.py — DLLM staging AND chunked admission both incrementing pending_middle_outputs (double-source)."""
         execute_scripted_runtime(
             _script_dllm_staging_double_pending_middle_outputs,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_staging_handler_chunked(self):
+        """Disaggregation/common/staging_handler.py — chunked interaction."""
         execute_scripted_runtime(
             _script_staging_handler_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_mooncake_conn_chunked(self):
+        """Disaggregation/mooncake/conn.py — chunked path in conn layer."""
         execute_scripted_runtime(
             _script_mooncake_conn_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_nixl_conn_chunked(self):
+        """Disaggregation/nixl/conn.py — chunked path."""
         execute_scripted_runtime(
             _script_nixl_conn_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_idle_path_chunked_req_none(self):
+        """Scheduler.py:3174 — idle path checks chunked_req is None."""
         execute_scripted_runtime(
             _script_idle_path_chunked_req_none,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_dynamic_chunking_history_len_extra(self):
+        """Scheduler.py:2516-2517 — dynamic chunking reads history_len from chunked_req."""
         execute_scripted_runtime(
             _script_dynamic_chunking_history_len_extra,
             **base_engine_kwargs(
@@ -541,36 +568,42 @@ class TestScriptedSpecialCase(CustomTestCase):
         )
 
     def test_admission_path_with_chunked_inflight_flag(self):
+        """Scheduler.py:2593 — add_one_req called with has_chunked_req=True."""
         execute_scripted_runtime(
             _script_admission_path_with_chunked_inflight_flag,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_inflight_counter_increments_each_chunk(self):
+        """Scheduler.py:2644-2645 — inflight_middle_chunks += 1 per chunk."""
         execute_scripted_runtime(
             _script_inflight_counter_increments_each_chunk,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_filter_batch_exclude_chunked_flag(self):
+        """Filter_batch + chunked: exclude_chunked_req branch."""
         execute_scripted_runtime(
             _script_filter_batch_exclude_chunked_flag,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_pdmux_split_prefill_batch(self):
+        """34c02d6a67: filter chunked-resume from split_prefill_batch."""
         execute_scripted_runtime(
             _script_pdmux_split_prefill_batch,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_streaming_session_kv_committed_bound(self):
+        """116584e8fa: bound streaming-session chunked stash by kv_committed_len."""
         execute_scripted_runtime(
             _script_streaming_session_kv_committed_bound,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_mamba_pool_idx_cleanup_skip_chunked_resume(self):
+        """Dbdcdde245: skip mamba_pool_idx cleanup for chunked-resume on NO_TOKEN."""
         execute_scripted_runtime(
             _script_mamba_pool_idx_cleanup_skip_chunked_resume,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),

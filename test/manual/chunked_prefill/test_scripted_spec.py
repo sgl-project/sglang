@@ -31,6 +31,7 @@ def _script_naive_spec_chunked(t: ScriptedRuntime):
 
 class TestScriptedSpec(CustomTestCase):
     def test_naive_spec_chunked(self):
+        """Speculative decoding × chunked: naive ScriptedRuntime smoke."""
         execute_scripted_runtime(
             _script_naive_spec_chunked,
             **base_engine_kwargs(

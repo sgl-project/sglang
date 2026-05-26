@@ -35,6 +35,7 @@ def _script_naive_pp_chunked(t: ScriptedRuntime):
 
 class TestScriptedPP(CustomTestCase):
     def test_naive_pp_chunked(self):
+        """PP × chunked: naive ScriptedRuntime smoke."""
         execute_scripted_runtime(
             _script_naive_pp_chunked,
             **base_engine_kwargs(

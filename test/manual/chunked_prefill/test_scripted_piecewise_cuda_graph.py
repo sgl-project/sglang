@@ -27,6 +27,7 @@ def _script_naive_piecewise_cg_chunked(t: ScriptedRuntime):
 
 class TestScriptedPiecewiseCG(CustomTestCase):
     def test_naive_piecewise_cg_chunked(self):
+        """Piecewise CUDA graph capture runs alongside chunked prefill."""
         # Note: deliberately *do not* pass disable_cuda_graph=True so
         # piecewise capture runs; ``base_engine_kwargs`` defaults it off
         # for compatibility with all the other tests, so override here.

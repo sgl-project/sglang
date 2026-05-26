@@ -34,6 +34,7 @@ def _script_naive_disagg_chunked(t: ScriptedRuntime):
 
 class TestScriptedDisagg(CustomTestCase):
     def test_naive_disagg_chunked(self):
+        """Disagg x chunked: prefill engine chunks long prompt and hands off to decode."""
         # When ScriptedRuntime grows disagg topology support, the
         # decode-side engine kwargs go through ``decode_engine_kwargs=``
         # (or similar) — see wishlist §4 P3 (16).

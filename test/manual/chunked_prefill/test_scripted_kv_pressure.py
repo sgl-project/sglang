@@ -178,36 +178,42 @@ def _script_kv_pressure_with_radix_evict(t: ScriptedRuntime):
 
 class TestScriptedKVPressure(CustomTestCase):
     def test_kv_almost_empty_then_abort(self):
+        """KV almost empty (1 page left), chunked req in flight, abort it."""
         execute_scripted_runtime(
             _script_kv_almost_empty_then_abort,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_kv_full_chunked_new_req_retracts(self):
+        """KV pool full → new chunked req submitted → must retract or OOM-path cleanly, not deadlock."""
         execute_scripted_runtime(
             _script_kv_full_chunked_new_req_retracts,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_kv_full_chunked_plus_decode_retract(self):
+        """KV full, chunked + decode coexist, priority retract → victim is whichever scheduler picks; both must release cleanly afterward."""
         execute_scripted_runtime(
             _script_kv_full_chunked_plus_decode_retract,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_row_pool_tight_admits_after_release(self):
+        """Row pool tight; N+1 req enters waiting; after some finish, N+1 is admitted."""
         execute_scripted_runtime(
             _script_row_pool_tight_admits_after_release,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_lock_refs_tight_concurrent_prefix(self):
+        """Many concurrent reqs share same prefix; lock_refs tight."""
         execute_scripted_runtime(
             _script_lock_refs_tight_concurrent_prefix,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_priority_preempt_multiple_chunked(self):
+        """Priority preemption + multiple chunked reqs preempt each other."""
         execute_scripted_runtime(
             _script_priority_preempt_multiple_chunked,
             **base_engine_kwargs(
@@ -217,36 +223,42 @@ class TestScriptedKVPressure(CustomTestCase):
         )
 
     def test_kv_at_one_page_chunked_completes(self):
+        """KV with only 1 free page; a tiny chunked req still completes."""
         execute_scripted_runtime(
             _script_kv_at_one_page_chunked_completes,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_kv_recovery_after_full(self):
+        """KV near-exhausted -> recovery path: every existing req finishes, then a fresh req can be admitted using all the pages."""
         execute_scripted_runtime(
             _script_kv_recovery_after_full,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_kv_pressure_with_retract_resume(self):
+        """Chunked req mid-prefill, then KV pressure forces retract."""
         execute_scripted_runtime(
             _script_kv_pressure_with_retract_resume,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_cumulative_alloc_does_not_grow_unbounded(self):
+        """50 reqs; cumulative bytes alloc'd never NaN / negative."""
         execute_scripted_runtime(
             _script_cumulative_alloc_does_not_grow_unbounded,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_engine_stats_pool_invariant(self):
+        """Track engine stats before / after a run — pool counts return to baseline."""
         execute_scripted_runtime(
             _script_engine_stats_pool_invariant,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_kv_pressure_with_radix_evict(self):
+        """KV pressure triggers radix eviction; subsequent submission re-chunks."""
         execute_scripted_runtime(
             _script_kv_pressure_with_radix_evict,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),

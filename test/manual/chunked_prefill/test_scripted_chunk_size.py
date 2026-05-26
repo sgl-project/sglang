@@ -319,36 +319,42 @@ def _script_chunk_size_two_long_prompt(t: ScriptedRuntime):
 
 class TestScriptedChunkSize(CustomTestCase):
     def test_exact_chunk_size(self):
+        """Prompt_len == chunk_size → no chunking, single-shot prefill."""
         execute_scripted_runtime(
             _script_exact_chunk_size,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_one_token_over(self):
+        """Prompt_len == chunk_size + 1 → exactly two chunks, second is 1 token."""
         execute_scripted_runtime(
             _script_one_token_over,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_two_chunks_exact(self):
+        """Prompt_len == 2 * chunk_size → exactly 2 chunks."""
         execute_scripted_runtime(
             _script_two_chunks_exact,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_three_chunks_one_decode(self):
+        """Prompt_len == 3 * chunk_size, max_new_tokens=1 → 3 chunks + 1 decode."""
         execute_scripted_runtime(
             _script_three_chunks_one_decode,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_tiny_prompt(self):
+        """Prompt_len == 1 → no chunking; req runs straight through decode."""
         execute_scripted_runtime(
             _script_tiny_prompt,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_radix_hit_minus_one(self):
+        """Radix hit leaving 1 fresh token does not engage chunked path."""
         # Radix cache is on by default; pass explicitly to make the
         # dependency obvious — if someone flips the default later, the
         # test still pins what it needs.
@@ -361,138 +367,161 @@ class TestScriptedChunkSize(CustomTestCase):
         )
 
     def test_chunk_size_one_token(self):
+        """Chunk_size = 1: every token is its own chunk."""
         execute_scripted_runtime(
             _script_chunk_size_one_token,
             **base_engine_kwargs(chunked_prefill_size=1),
         )
 
     def test_chunk_size_two_prompt_one(self):
+        """Chunk_size = 2, prompt_len = 1: single-shot, no chunking."""
         execute_scripted_runtime(
             _script_chunk_size_two_prompt_one,
             **base_engine_kwargs(chunked_prefill_size=2),
         )
 
     def test_chunk_size_two_prompt_two(self):
+        """Chunk_size = 2, prompt_len = 2: equal, single-shot."""
         execute_scripted_runtime(
             _script_chunk_size_two_prompt_two,
             **base_engine_kwargs(chunked_prefill_size=2),
         )
 
     def test_chunk_size_two_prompt_five(self):
+        """Chunk_size = 2, prompt_len = 5: chunks_done == 3 (2 + 2 + 1)."""
         execute_scripted_runtime(
             _script_chunk_size_two_prompt_five,
             **base_engine_kwargs(chunked_prefill_size=2),
         )
 
     def test_chunk_size_equals_max_prefill_tokens(self):
+        """Chunk_size == max_prefill_tokens: prompt fits in one shot."""
         execute_scripted_runtime(
             _script_chunk_size_equals_max_prefill_tokens,
             **base_engine_kwargs(chunked_prefill_size=1024, max_prefill_tokens=1024),
         )
 
     def test_chunk_size_exceeds_max_prefill_tokens(self):
+        """Chunk_size > max_prefill_tokens: engine should reject or cap."""
         execute_scripted_runtime(
             _script_chunk_size_exceeds_max_prefill_tokens,
             **base_engine_kwargs(chunked_prefill_size=2048, max_prefill_tokens=1024),
         )
 
     def test_chunk_size_4096_prompt_4097(self):
+        """Chunk_size = 4096, prompt_len = 4097: 2 chunks (4096 + 1)."""
         execute_scripted_runtime(
             _script_chunk_size_4096_prompt_4097,
             **base_engine_kwargs(chunked_prefill_size=4096),
         )
 
     def test_chunk_size_256_prompt_10x(self):
+        """Chunk_size = 256, prompt_len = 10 * 256 = 2560: chunks_done == 10."""
         execute_scripted_runtime(
             _script_chunk_size_256_prompt_10x,
             **base_engine_kwargs(chunked_prefill_size=256),
         )
 
     def test_chunk_size_256_prompt_100x(self):
+        """Chunk_size = 256, prompt_len = 100 * 256 = 25600: long-prompt stability test."""
         execute_scripted_runtime(
             _script_chunk_size_256_prompt_100x,
             **base_engine_kwargs(chunked_prefill_size=256),
         )
 
     def test_chunk_size_16_prompt_1024(self):
+        """High fragmentation: chunk_size = 16, prompt_len = 1024 = 64 chunks."""
         execute_scripted_runtime(
             _script_chunk_size_16_prompt_1024,
             **base_engine_kwargs(chunked_prefill_size=16),
         )
 
     def test_chunk_size_4_prompt_4(self):
+        """Chunk_size = 4, prompt_len = 4: single-shot, no chunking."""
         execute_scripted_runtime(
             _script_chunk_size_4_prompt_4,
             **base_engine_kwargs(chunked_prefill_size=4),
         )
 
     def test_chunk_size_4_prompt_5(self):
+        """Chunk_size = 4, prompt_len = 5: chunks_done == 2 (4 + 1)."""
         execute_scripted_runtime(
             _script_chunk_size_4_prompt_5,
             **base_engine_kwargs(chunked_prefill_size=4),
         )
 
     def test_chunk_size_8_prompt_64(self):
+        """Chunk_size = 8, prompt_len = 64: exactly 8 chunks."""
         execute_scripted_runtime(
             _script_chunk_size_8_prompt_64,
             **base_engine_kwargs(chunked_prefill_size=8),
         )
 
     def test_chunk_size_32_prompt_33(self):
+        """Chunk_size = 32, prompt_len = 33: 2 chunks, second is 1 token."""
         execute_scripted_runtime(
             _script_chunk_size_32_prompt_33,
             **base_engine_kwargs(chunked_prefill_size=32),
         )
 
     def test_chunk_size_64_prompt_127(self):
+        """Chunk_size = 64, prompt_len = 127: 2 chunks (64 + 63)."""
         execute_scripted_runtime(
             _script_chunk_size_64_prompt_127,
             **base_engine_kwargs(chunked_prefill_size=64),
         )
 
     def test_chunk_size_64_prompt_128(self):
+        """Chunk_size = 64, prompt_len = 128: 2 chunks (64 + 64)."""
         execute_scripted_runtime(
             _script_chunk_size_64_prompt_128,
             **base_engine_kwargs(chunked_prefill_size=64),
         )
 
     def test_chunk_size_64_prompt_129(self):
+        """Chunk_size = 64, prompt_len = 129: 3 chunks (64 + 64 + 1)."""
         execute_scripted_runtime(
             _script_chunk_size_64_prompt_129,
             **base_engine_kwargs(chunked_prefill_size=64),
         )
 
     def test_chunk_size_128_prompt_512(self):
+        """Chunk_size = 128, prompt_len = 512: 4 chunks."""
         execute_scripted_runtime(
             _script_chunk_size_128_prompt_512,
             **base_engine_kwargs(chunked_prefill_size=128),
         )
 
     def test_chunk_size_1024_prompt_4096(self):
+        """Chunk_size = 1024, prompt_len = 4096: 4 chunks."""
         execute_scripted_runtime(
             _script_chunk_size_1024_prompt_4096,
             **base_engine_kwargs(chunked_prefill_size=1024),
         )
 
     def test_chunks_done_monotone_under_chunk_size_1(self):
+        """Invariant: chunks_done is monotone non-decreasing across yields."""
         execute_scripted_runtime(
             _script_chunks_done_monotone_under_chunk_size_1,
             **base_engine_kwargs(chunked_prefill_size=1),
         )
 
     def test_chunks_done_monotone_under_chunk_size_16(self):
+        """Invariant: chunks_done monotone with a larger chunk size."""
         execute_scripted_runtime(
             _script_chunks_done_monotone_under_chunk_size_16,
             **base_engine_kwargs(chunked_prefill_size=16),
         )
 
     def test_chunk_size_one_long_prompt(self):
+        """Chunk_size = 1, prompt_len = 64: stress fragmentation."""
         execute_scripted_runtime(
             _script_chunk_size_one_long_prompt,
             **base_engine_kwargs(chunked_prefill_size=1),
         )
 
     def test_chunk_size_two_long_prompt(self):
+        """Chunk_size = 2, prompt_len = 64: 32 chunks."""
         execute_scripted_runtime(
             _script_chunk_size_two_long_prompt,
             **base_engine_kwargs(chunked_prefill_size=2),

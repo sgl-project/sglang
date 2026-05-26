@@ -35,6 +35,7 @@ def _script_naive_hisparse_chunked(t: ScriptedRuntime):
 
 class TestScriptedHiSparse(CustomTestCase):
     def test_naive_hisparse_chunked(self):
+        """Long enough to trigger both chunked prefill and a hisparse staging transfer mid-chunk."""
         execute_scripted_runtime(
             _script_naive_hisparse_chunked,
             **base_engine_kwargs(

@@ -30,6 +30,7 @@ def _script_naive_dp_attention_chunked(t: ScriptedRuntime):
 
 class TestScriptedDPAttention(CustomTestCase):
     def test_naive_dp_attention_chunked(self):
+        """DP attention × chunked: naive ScriptedRuntime smoke."""
         execute_scripted_runtime(
             _script_naive_dp_attention_chunked,
             **base_engine_kwargs(

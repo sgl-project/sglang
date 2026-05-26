@@ -441,6 +441,7 @@ def _script_abort_dedup_dual_queue_holding(t: ScriptedRuntime):
 
 class TestScriptedRegression(CustomTestCase):
     def test_lora_drainer_chunked_resume(self):
+        """5ed4faf0ab "Bypass LoRA scheduling gate for chunked-resume reqs"."""
         execute_scripted_runtime(
             _script_lora_drainer_chunked_resume,
             **base_engine_kwargs(
@@ -452,18 +453,21 @@ class TestScriptedRegression(CustomTestCase):
         )
 
     def test_abort_waiting_releases_all(self):
+        """96d4749094 "Release row + KV + lock_ref when aborting a chunked-resume req from waiting_queue"."""
         execute_scripted_runtime(
             _script_abort_waiting_releases_all,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_pause_covers_waiting_chunked(self):
+        """F38e69f87d "Extend pause(retract) to waiting chunked-resume reqs"."""
         execute_scripted_runtime(
             _script_pause_covers_waiting_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_pp_abort_dedup(self):
+        """B823c16e60 "Include PP microbatch reqs in abort_request batch_rids dedup"."""
         execute_scripted_runtime(
             _script_pp_abort_dedup,
             **base_engine_kwargs(
@@ -474,6 +478,7 @@ class TestScriptedRegression(CustomTestCase):
         )
 
     def test_disagg_retract_resets_send(self):
+        """414efd4a27 "Reset disagg send-side state on chunked-resume retract"."""
         execute_scripted_runtime(
             _script_disagg_retract_resets_send,
             **base_engine_kwargs(
@@ -483,12 +488,14 @@ class TestScriptedRegression(CustomTestCase):
         )
 
     def test_pending_middle_outputs_invariant(self):
+        """B3a7b9f2a1 "Bump pending_middle_outputs for last-chunk admits + decrement-first output proc"."""
         execute_scripted_runtime(
             _script_pending_middle_outputs_invariant,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_pp_other_mb_chunked_exclude(self):
+        """69ef71edc4 "Conditionally exclude in-flight other-mb chunked-resume reqs (PP, max_new_tokens > 1)"."""
         execute_scripted_runtime(
             _script_pp_other_mb_chunked_exclude,
             **base_engine_kwargs(
@@ -499,6 +506,7 @@ class TestScriptedRegression(CustomTestCase):
         )
 
     def test_pdmux_filter_chunked(self):
+        """34c02d6a67 "Filter chunked-resume reqs from split_prefill_batch before pdmux merge"."""
         execute_scripted_runtime(
             _script_pdmux_filter_chunked,
             **base_engine_kwargs(
@@ -508,6 +516,7 @@ class TestScriptedRegression(CustomTestCase):
         )
 
     def test_priority_skips_chunked_in_prefix_match(self):
+        """Aaf3752d2b "Skip chunked-resume reqs in calc_priority prefix matching"."""
         execute_scripted_runtime(
             _script_priority_skips_chunked_in_prefix_match,
             **base_engine_kwargs(
@@ -517,18 +526,21 @@ class TestScriptedRegression(CustomTestCase):
         )
 
     def test_mamba_chunked_resume_no_token(self):
+        """Dbdcdde245 "Skip mamba_pool_idx cleanup for chunked-resume on NO_TOKEN"."""
         execute_scripted_runtime(
             _script_mamba_chunked_resume_no_token,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_streaming_session_stash_bound(self):
+        """116584e8fa "Bound streaming-session chunked stash by kv_committed_len"."""
         execute_scripted_runtime(
             _script_streaming_session_stash_bound,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_chunked_resume_priority_in_sort(self):
+        """Bf5b4e9a10 "Give chunked-resume reqs priority in LPM and DFS_WEIGHT sorts"."""
         # Use LPM policy explicitly — the bf5b4e9a10 fix was in LPM /
         # DFS_WEIGHT sort paths, so the default (FCFS) won't exercise it.
         execute_scripted_runtime(
@@ -540,114 +552,133 @@ class TestScriptedRegression(CustomTestCase):
         )
 
     def test_rename_inflight_to_pending_middle_outputs(self):
+        """14adb09546: rename inflight_middle_chunks -> pending_middle_outputs."""
         execute_scripted_runtime(
             _script_rename_inflight_to_pending_middle_outputs,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_revert_bump_pending_middle_outputs(self):
+        """E875cd36e4: revert of pending_middle_outputs bump."""
         execute_scripted_runtime(
             _script_revert_bump_pending_middle_outputs,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_filter_batch_exclude_in_flight_other_mb(self):
+        """5c523049db / 45347ca3a3: exclude in-flight other-mb reqs in filter_batch."""
         execute_scripted_runtime(
             _script_filter_batch_exclude_in_flight_other_mb,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_chunked_req_marker_pp_filter_exclusion(self):
+        """33f981ce93 / 11db3a4192: re-add ScheduleBatch.chunked_req marker for PP cross-mb filter exclusion."""
         execute_scripted_runtime(
             _script_chunked_req_marker_pp_filter_exclusion,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_v1_swa_chunked_tests_dropped(self):
+        """A94e842611 / daf9c42f17: dropped v1 SWA chunked-req tests."""
         execute_scripted_runtime(
             _script_v1_swa_chunked_tests_dropped,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_stage_a_chunk_stash_iter_boundary(self):
+        """678bba26f0: Stage A chunk-stash runs at iter boundary, not mid-iter."""
         execute_scripted_runtime(
             _script_stage_a_chunk_stash_iter_boundary,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_chunked_resume_tail_counted_page_size_gt1(self):
+        """B433e1ea35: count chunked-resume tail in runtime mem check when page_size > 1."""
         execute_scripted_runtime(
             _script_chunked_resume_tail_counted_page_size_gt1,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_merge_batch_assert_widened(self):
+        """36ec1d7269: widen merge_batch assert to match filter_batch predicate."""
         execute_scripted_runtime(
             _script_merge_batch_assert_widened,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_host_hit_length_reset_unconditional(self):
+        """D7fa48baad: reset host_hit_length unconditionally in prepare_for_extend."""
         execute_scripted_runtime(
             _script_host_hit_length_reset_unconditional,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_add_one_req_reuse_gate_has_pending_chunk(self):
+        """A79ba1b2f7: tighten add_one_req reuse gate to has_pending_chunk."""
         execute_scripted_runtime(
             _script_add_one_req_reuse_gate_has_pending_chunk,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_filter_batch_explicit_exclude_chunked_flag(self):
+        """Fd3dcca22f: refactor filter_batch to explicit exclude_chunked_req flag."""
         execute_scripted_runtime(
             _script_filter_batch_explicit_exclude_chunked_flag,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_retract_all_filter_batch_args(self):
+        """F0388931bf: retract_all was passing List[Req] to filter_batch as keep_indices (wrong)."""
         execute_scripted_runtime(
             _script_retract_all_filter_batch_args,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_is_chunked_renamed_pending_middle_outputs(self):
+        """B9d5d6ed5f: rename Req.is_chunked -> Req.pending_middle_outputs."""
         execute_scripted_runtime(
             _script_is_chunked_renamed_pending_middle_outputs,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_chunked_resume_waiting_queue_holding(self):
+        """C445a82cf5: switch chunked-resume to waiting_queue holding; delete chunked_req fields."""
         execute_scripted_runtime(
             _script_chunked_resume_waiting_queue_holding,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_unified_admission_via_add_one_req(self):
+        """74f1d8bbab: unify chunked admission via add_one_req reuse + has_pending_chunk."""
         execute_scripted_runtime(
             _script_unified_admission_via_add_one_req,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_alloc_assert_no_is_chunked(self):
+        """9b361aef46: drop is_chunked from req_to_token_pool alloc assert."""
         execute_scripted_runtime(
             _script_alloc_assert_no_is_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_cache_unfinished_req_row_bound(self):
+        """1c3bf8e7db: bound cache_unfinished_req row read by kv_committed_len."""
         execute_scripted_runtime(
             _script_cache_unfinished_req_row_bound,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_waiting_queue_pending_tokens_subtract_prefix(self):
+        """C79a73bec4: subtract prefix_indices from waiting_queue pending tokens sum."""
         execute_scripted_runtime(
             _script_waiting_queue_pending_tokens_subtract_prefix,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_abort_dedup_dual_queue_holding(self):
+        """De3859646b: abort_request dedup for chunked-resume dual-queue holding."""
         execute_scripted_runtime(
             _script_abort_dedup_dual_queue_holding,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),

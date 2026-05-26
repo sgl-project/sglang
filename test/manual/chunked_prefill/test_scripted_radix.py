@@ -240,6 +240,7 @@ def _script_radix_calc_priority_skip_chunked_resume(t: ScriptedRuntime):
 
 class TestScriptedRadix(CustomTestCase):
     def test_naive_radix_chunked(self):
+        """First request populates the radix tree with a long shared prefix."""
         execute_scripted_runtime(
             _script_naive_radix_chunked,
             **base_engine_kwargs(
@@ -249,6 +250,7 @@ class TestScriptedRadix(CustomTestCase):
         )
 
     def test_radix_disabled_chunks_every_time(self):
+        """Radix disabled — every same-prompt re-submission chunks fresh."""
         execute_scripted_runtime(
             _script_radix_disabled_chunks_every_time,
             **base_engine_kwargs(
@@ -258,36 +260,42 @@ class TestScriptedRadix(CustomTestCase):
         )
 
     def test_radix_full_prefix_hit_nine_reqs(self):
+        """Submit 10 identical reqs."""
         execute_scripted_runtime(
             _script_radix_full_prefix_hit_nine_reqs,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_radix_hit_full_prefix(self):
+        """Warm prefix exactly = chunk_size; second prompt = prefix + 1 token."""
         execute_scripted_runtime(
             _script_radix_hit_full_prefix,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_radix_hit_partial_then_chunk_tail(self):
+        """Prefix == 2 * chunk_size."""
         execute_scripted_runtime(
             _script_radix_hit_partial_then_chunk_tail,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_radix_evict_then_resubmit_rechunks(self):
+        """Submit, force radix evict, resubmit same prompt → re-chunks."""
         execute_scripted_runtime(
             _script_radix_evict_then_resubmit_rechunks,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_radix_resume_init_next_round_path(self):
+        """Chunked resume after partial radix hit — verifies the ``init_next_round_input`` no-tree-cache branch is reached."""
         execute_scripted_runtime(
             _script_radix_resume_init_next_round_path,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_radix_lpm_policy_chunked_priority(self):
+        """LPM policy: chunked-resume reqs get sort priority (bf5b4e9a10)."""
         execute_scripted_runtime(
             _script_radix_lpm_policy_chunked_priority,
             **base_engine_kwargs(
@@ -297,6 +305,7 @@ class TestScriptedRadix(CustomTestCase):
         )
 
     def test_radix_dfs_weight_policy_chunked(self):
+        """DFS_WEIGHT policy + chunked."""
         execute_scripted_runtime(
             _script_radix_dfs_weight_policy_chunked,
             **base_engine_kwargs(
@@ -306,36 +315,42 @@ class TestScriptedRadix(CustomTestCase):
         )
 
     def test_radix_lock_ref_concurrent_chunked(self):
+        """Concurrent chunked reqs all sharing a long prefix → many lock_refs."""
         execute_scripted_runtime(
             _script_radix_lock_ref_concurrent_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_radix_partial_hit_exact_chunk_boundary(self):
+        """Hit equals exactly the chunk boundary; second req tail = chunk_size."""
         execute_scripted_runtime(
             _script_radix_partial_hit_exact_chunk_boundary,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_radix_warmup_helper(self):
+        """Warm radix without going through start_req."""
         execute_scripted_runtime(
             _script_radix_warmup_helper,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_radix_two_distinct_prefixes(self):
+        """Two warm prefixes; later reqs hit one or the other."""
         execute_scripted_runtime(
             _script_radix_two_distinct_prefixes,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_radix_full_prefix_minus_one(self):
+        """Prefix length = chunk_size - 1; new prompt = chunk_size."""
         execute_scripted_runtime(
             _script_radix_full_prefix_minus_one,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_radix_prefix_match_with_priority(self):
+        """Priority high + radix partial hit: high-priority req still hits cache."""
         execute_scripted_runtime(
             _script_radix_prefix_match_with_priority,
             **base_engine_kwargs(
@@ -345,6 +360,7 @@ class TestScriptedRadix(CustomTestCase):
         )
 
     def test_radix_calc_priority_skip_chunked_resume(self):
+        """Aaf3752d2b: skip chunked-resume reqs in calc_priority prefix matching."""
         execute_scripted_runtime(
             _script_radix_calc_priority_skip_chunked_resume,
             **base_engine_kwargs(

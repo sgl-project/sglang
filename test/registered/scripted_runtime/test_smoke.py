@@ -19,6 +19,7 @@ def _smoke_script(t: ScriptedRuntime):
 
 class TestScriptedRuntimeSmoke(CustomTestCase):
     def test_smoke(self):
+        """Minimal end-to-end smoke for ScriptedRuntime launch and one req."""
         execute_scripted_runtime(
             _smoke_script,
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,

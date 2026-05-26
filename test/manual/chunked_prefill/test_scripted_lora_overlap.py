@@ -38,6 +38,7 @@ def _script_naive_lora_overlap_chunked(t: ScriptedRuntime):
 
 class TestScriptedLoRAOverlap(CustomTestCase):
     def test_naive_lora_overlap_chunked(self):
+        """LoRA overlap loading × chunked: naive ScriptedRuntime smoke."""
         execute_scripted_runtime(
             _script_naive_lora_overlap_chunked,
             **base_engine_kwargs(

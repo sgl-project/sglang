@@ -388,210 +388,245 @@ def _script_parallel_with_priority(t: ScriptedRuntime):
 
 class TestScriptedMultiReq(CustomTestCase):
     def test_at_most_one_chunked_in_flight(self):
+        """Two long requests submitted back-to-back; main-upstream invariant says at most one is chunked-in-flight at any moment."""
         execute_scripted_runtime(
             _script_at_most_one_chunked_in_flight,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_second_chunked_waits(self):
+        """R1 chunked mid-stream + r2 submitted long."""
         execute_scripted_runtime(
             _script_second_chunked_waits,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_chunked_plus_decode_in_batch(self):
+        """R1 chunked mid-stream + r2 short decode-only."""
         execute_scripted_runtime(
             _script_chunked_plus_decode_in_batch,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_hundred_short_reqs(self):
+        """100 short reqs back-to-back: all complete, no leak."""
         execute_scripted_runtime(
             _script_hundred_short_reqs,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_two_hundred_short_reqs(self):
+        """200 short reqs: stability check."""
         execute_scripted_runtime(
             _script_two_hundred_short_reqs,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_five_hundred_short_reqs(self):
+        """500 short reqs: sustained pressure."""
         execute_scripted_runtime(
             _script_five_hundred_short_reqs,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_mixed_ten_chunked_ten_short(self):
+        """10 chunked + 10 short, all submitted back-to-back."""
         execute_scripted_runtime(
             _script_mixed_ten_chunked_ten_short,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_submit_during_chunk_mid(self):
+        """R1 in mid-chunk; r2 submitted after 1 yield; r3 after another."""
         execute_scripted_runtime(
             _script_submit_during_chunk_mid,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_five_identical_prompts(self):
+        """5 identical prompts: r1 chunks; r2..r5 hit radix."""
         execute_scripted_runtime(
             _script_five_identical_prompts,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_sibling_shared_prefix(self):
+        """Two reqs share the first N tokens: each runs to completion."""
         execute_scripted_runtime(
             _script_sibling_shared_prefix,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_trickle_per_yield_50(self):
+        """Submit one new req per yield for 50 yields."""
         execute_scripted_runtime(
             _script_trickle_per_yield_50,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_submit_then_immediate_abort(self):
+        """Start_req then abort in same yield step: clean state."""
         execute_scripted_runtime(
             _script_submit_then_immediate_abort,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_rid_reuse_after_finish(self):
+        """Submit r1, wait for finish, then submit r2 with same rid."""
         execute_scripted_runtime(
             _script_rid_reuse_after_finish,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_concurrent_short_and_long(self):
+        """5 short + 1 long, all concurrent; verify long does not starve."""
         execute_scripted_runtime(
             _script_concurrent_short_and_long,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_three_long_back_to_back(self):
+        """Three long chunked reqs submitted back-to-back."""
         execute_scripted_runtime(
             _script_three_long_back_to_back,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_alternating_long_short(self):
+        """Alternate long / short submissions, 10 total."""
         execute_scripted_runtime(
             _script_alternating_long_short,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_burst_then_pause_then_burst(self):
+        """Burst 10, wait, burst 10 more."""
         execute_scripted_runtime(
             _script_burst_then_pause_then_burst,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_submit_pause_n_resubmit_same_rid(self):
+        """Submit and complete r1, then 200 yields, then resubmit with same rid."""
         execute_scripted_runtime(
             _script_submit_pause_n_resubmit_same_rid,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_submit_during_decode_of_other(self):
+        """R1 in decode phase; submit r2 (chunked)."""
         execute_scripted_runtime(
             _script_submit_during_decode_of_other,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_unique_rids_distinct(self):
+        """Many reqs with unique explicit rids."""
         execute_scripted_runtime(
             _script_unique_rids_distinct,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_chunked_reqs_each_yield_15(self):
+        """15 chunked reqs trickled one per yield."""
         execute_scripted_runtime(
             _script_chunked_reqs_each_yield_15,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_two_small_parallel(self):
+        """Two short parallel reqs both finish."""
         execute_scripted_runtime(
             _script_two_small_parallel,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_three_small_parallel(self):
+        """Three short parallel reqs all finish."""
         execute_scripted_runtime(
             _script_three_small_parallel,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_five_small_parallel(self):
+        """Five short parallel reqs all finish."""
         execute_scripted_runtime(
             _script_five_small_parallel,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_ten_small_parallel(self):
+        """Ten short parallel reqs all finish."""
         execute_scripted_runtime(
             _script_ten_small_parallel,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_one_chunked_plus_many_short(self):
+        """1 long chunked + 5 short, all parallel."""
         execute_scripted_runtime(
             _script_one_chunked_plus_many_short,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_multiple_chunked_staggered(self):
+        """Submit chunked reqs every few yields, serial chunking."""
         execute_scripted_runtime(
             _script_multiple_chunked_staggered,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_eight_concurrent_chunked(self):
+        """8 chunked reqs submitted together."""
         execute_scripted_runtime(
             _script_eight_concurrent_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_decode_only_batch(self):
+        """10 short reqs — pure decode batch."""
         execute_scripted_runtime(
             _script_decode_only_batch,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_mixed_prefill_lengths(self):
+        """Variable prompt lengths in same batch."""
         execute_scripted_runtime(
             _script_mixed_prefill_lengths,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_two_chunked_one_decode(self):
+        """2 chunked + 1 decode-only."""
         execute_scripted_runtime(
             _script_two_chunked_one_decode,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_batch_with_finish_event_count(self):
+        """Each req emits exactly 1 finish event."""
         execute_scripted_runtime(
             _script_batch_with_finish_event_count,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_batch_state_query_during_run(self):
+        """Query batch_composition every step while batch is active."""
         execute_scripted_runtime(
             _script_batch_state_query_during_run,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_mixed_lengths_then_more_arrivals(self):
+        """First batch starts; midway, more reqs arrive."""
         execute_scripted_runtime(
             _script_mixed_lengths_then_more_arrivals,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_parallel_with_priority(self):
+        """3 normal + 2 high-priority reqs."""
         execute_scripted_runtime(
             _script_parallel_with_priority,
             **base_engine_kwargs(

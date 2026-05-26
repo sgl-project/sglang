@@ -344,174 +344,203 @@ def _script_engine_stats_monotone_after_each_batch(t: ScriptedRuntime):
 
 class TestScriptedInvariants(CustomTestCase):
     def test_status_unknown_before_submit(self):
+        """A bare ReqHandle whose rid was never submitted reports "unknown"."""
         execute_scripted_runtime(
             _script_status_unknown_before_submit,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_status_finished_after_done(self):
+        """After finish, r.status == "finished" (not unknown)."""
         execute_scripted_runtime(
             _script_status_finished_after_done,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_chunks_done_monotone_invariant(self):
+        """Chunks_done is non-decreasing across yield steps."""
         execute_scripted_runtime(
             _script_chunks_done_monotone_invariant,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_kv_pages_zero_after_finish(self):
+        """Kv_pages drops to 0 after the req finishes."""
         execute_scripted_runtime(
             _script_kv_pages_zero_after_finish,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_kv_pages_positive_mid_chunk(self):
+        """Mid-chunked, kv_pages > 0."""
         execute_scripted_runtime(
             _script_kv_pages_positive_mid_chunk,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_batch_composition_consistent_with_status(self):
+        """If r.status == "running" then r.rid appears in batch_composition."""
         execute_scripted_runtime(
             _script_batch_composition_consistent_with_status,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_is_idle_excludes_chunked_in_flight(self):
+        """T.is_idle and chunked_in_flight_count > 0 are mutually exclusive."""
         execute_scripted_runtime(
             _script_is_idle_excludes_chunked_in_flight,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_finish_event_count_exactly_one(self):
+        """Every normally-completed req emits exactly one finish event."""
         execute_scripted_runtime(
             _script_finish_event_count_exactly_one,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_kv_pages_non_negative(self):
+        """Kv_pages never negative."""
         execute_scripted_runtime(
             _script_kv_pages_non_negative,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_pending_middle_outputs_non_negative(self):
+        """Pending_middle_outputs non-negative invariant."""
         execute_scripted_runtime(
             _script_pending_middle_outputs_non_negative,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_inflight_middle_chunks_non_negative(self):
+        """Inflight_middle_chunks counter stays non-negative across all yields."""
         execute_scripted_runtime(
             _script_inflight_middle_chunks_non_negative,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_lock_refs_non_negative(self):
+        """Lock_refs counter stays non-negative across all yields."""
         execute_scripted_runtime(
             _script_lock_refs_non_negative,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_chunked_in_flight_count_le_one(self):
+        """Main-upstream invariant: at most one chunked req in flight."""
         execute_scripted_runtime(
             _script_chunked_in_flight_count_le_one,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_status_transition_monotone(self):
+        """Chunks_done is non-decreasing across the chunked req's lifetime."""
         execute_scripted_runtime(
             _script_status_transition_monotone,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_active_reqs_listing(self):
+        """NEW API NEEDED: t.list_active_reqs() returns the currently-running set of ReqHandle objects."""
         execute_scripted_runtime(
             _script_active_reqs_listing,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_batch_composition_disjoint_subsets(self):
+        """Prefill / decode / chunked subsets must be disjoint."""
         execute_scripted_runtime(
             _script_batch_composition_disjoint_subsets,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_finished_means_chunks_done_stable(self):
+        """Once finished, chunks_done value should not change."""
         execute_scripted_runtime(
             _script_finished_means_chunks_done_stable,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_finished_means_kv_pages_stays_zero(self):
+        """After finish, kv_pages remains 0 across subsequent yields."""
         execute_scripted_runtime(
             _script_finished_means_kv_pages_stays_zero,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_engine_stats_keys_present(self):
+        """Engine_stats returns a dict with expected keys."""
         execute_scripted_runtime(
             _script_engine_stats_keys_present,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_kv_pool_recovers_to_baseline(self):
+        """Full lifecycle: pool counts return to baseline after all done."""
         execute_scripted_runtime(
             _script_kv_pool_recovers_to_baseline,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_hundred_reqs_no_leak(self):
+        """100 reqs end-to-end: KV/row/lock_ref pool counts return to baseline."""
         execute_scripted_runtime(
             _script_hundred_reqs_no_leak,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_two_hundred_reqs_no_leak(self):
+        """200 short reqs end-to-end leave KV pool >= baseline."""
         execute_scripted_runtime(
             _script_two_hundred_reqs_no_leak,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_five_hundred_reqs_no_leak(self):
+        """500 short reqs end-to-end leave KV pool >= baseline."""
         execute_scripted_runtime(
             _script_five_hundred_reqs_no_leak,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_long_lived_engine_reps_chunked(self):
+        """20 rounds × 5 reqs each; scheduler internal counters stay healthy."""
         execute_scripted_runtime(
             _script_long_lived_engine_reps_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_sustained_long_chunked_load(self):
+        """Sustained: 30 long chunked reqs."""
         execute_scripted_runtime(
             _script_sustained_long_chunked_load,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_round_robin_short_and_chunked(self):
+        """50 short followed by 5 chunked, 5 rounds."""
         execute_scripted_runtime(
             _script_round_robin_short_and_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_long_decode_then_many_short(self):
+        """One very long decode + many short."""
         execute_scripted_runtime(
             _script_long_decode_then_many_short,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_chunked_in_flight_count_never_above_one_long_run(self):
+        """50 chunked reqs over many yields; verify invariant at every step."""
         execute_scripted_runtime(
             _script_chunked_in_flight_count_never_above_one_long_run,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_engine_stats_monotone_after_each_batch(self):
+        """After each batch finishes, kv_pool_free non-decreasing vs end-of-prev-batch."""
         execute_scripted_runtime(
             _script_engine_stats_monotone_after_each_batch,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),

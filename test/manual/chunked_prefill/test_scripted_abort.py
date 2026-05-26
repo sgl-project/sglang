@@ -325,30 +325,35 @@ def _script_abort_finish_event_count_at_most_one(t: ScriptedRuntime):
 
 class TestScriptedAbort(CustomTestCase):
     def test_abort_waiting_chunked_resume(self):
+        """Abort a chunked-resume req while it's still in waiting_queue (chunked-resume parked between chunks)."""
         execute_scripted_runtime(
             _script_abort_waiting_chunked_resume,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_abort_at_chunk_0(self):
+        """Abort during chunk_0 (first chunk not yet flushed)."""
         execute_scripted_runtime(
             _script_abort_at_chunk_0,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_abort_at_chunk_mid(self):
+        """Abort at chunk_mid (some chunks done, some pending)."""
         execute_scripted_runtime(
             _script_abort_at_chunk_mid,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_abort_at_last_chunk(self):
+        """Aborting at last chunk zeros pending_middle_outputs to prevent revival."""
         execute_scripted_runtime(
             _script_abort_at_last_chunk,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_abort_at_last_chunk_in_flight_pp(self):
+        """Abort at last_chunk_in_flight under PP (forward still in flight when the abort hits)."""
         execute_scripted_runtime(
             _script_abort_at_last_chunk_in_flight_pp,
             **base_engine_kwargs(
@@ -359,102 +364,119 @@ class TestScriptedAbort(CustomTestCase):
         )
 
     def test_abort_one_does_not_disturb_other(self):
+        """Abort one chunked req does not disturb another in flight."""
         execute_scripted_runtime(
             _script_abort_one_does_not_disturb_other,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_abort_with_zero_yield(self):
+        """Submit + abort same step (zero yields between)."""
         execute_scripted_runtime(
             _script_abort_with_zero_yield,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_abort_at_admission_step(self):
+        """Submit, yield once (admission), abort."""
         execute_scripted_runtime(
             _script_abort_at_admission_step,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_abort_then_start_same_step_new_rid(self):
+        """Abort one req; in the same yield step, submit a different rid."""
         execute_scripted_runtime(
             _script_abort_then_start_same_step_new_rid,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_abort_then_start_same_step_same_rid(self):
+        """Abort r1; resubmit with the same rid — must work as a fresh req."""
         execute_scripted_runtime(
             _script_abort_then_start_same_step_same_rid,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_abort_five_chunked_in_a_row(self):
+        """5 chunked reqs submitted; abort all 5 sequentially."""
         execute_scripted_runtime(
             _script_abort_five_chunked_in_a_row,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_abort_unknown_rid_noop(self):
+        """Abort an rid that was never submitted: no exception, no state change."""
         execute_scripted_runtime(
             _script_abort_unknown_rid_noop,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_abort_after_finish_noop(self):
+        """Submit r1, wait for finish, then abort: no-op."""
         execute_scripted_runtime(
             _script_abort_after_finish_noop,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_abort_during_waiting_timeout(self):
+        """Chunked-resume in waiting_queue + abort timeout cleanup hits."""
         execute_scripted_runtime(
             _script_abort_during_waiting_timeout,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_abort_chunk_first(self):
+        """Abort while the very first chunk is still in progress."""
         execute_scripted_runtime(
             _script_abort_chunk_first,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_abort_chunk_last(self):
+        """Abort while the last chunk is in progress."""
         execute_scripted_runtime(
             _script_abort_chunk_last,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_abort_penultimate_chunk(self):
+        """Abort 1 chunk before the final one."""
         execute_scripted_runtime(
             _script_abort_penultimate_chunk,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_double_abort_idempotent(self):
+        """Call abort twice on the same handle: second call is a no-op."""
         execute_scripted_runtime(
             _script_double_abort_idempotent,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_abort_during_decode(self):
+        """R1 has finished prefill, is in decode; abort mid-decode."""
         execute_scripted_runtime(
             _script_abort_during_decode,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_abort_one_of_three_others_finish(self):
+        """Three reqs in batch, abort middle one, other two finish."""
         execute_scripted_runtime(
             _script_abort_one_of_three_others_finish,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_abort_in_separate_yields(self):
+        """Submit 3 chunked, abort in 3 separate yield steps."""
         execute_scripted_runtime(
             _script_abort_in_separate_yields,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_abort_finish_event_count_at_most_one(self):
+        """Aborted req should not emit a normal finish event."""
         execute_scripted_runtime(
             _script_abort_finish_event_count_at_most_one,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),

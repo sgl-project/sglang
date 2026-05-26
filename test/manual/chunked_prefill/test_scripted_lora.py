@@ -43,6 +43,7 @@ def _script_naive_lora_chunked(t: ScriptedRuntime):
 
 class TestScriptedLoRA(CustomTestCase):
     def test_naive_lora_chunked(self):
+        """Chunked prefill path runs with LoRA enabled at engine level."""
         execute_scripted_runtime(
             _script_naive_lora_chunked,
             **base_engine_kwargs(

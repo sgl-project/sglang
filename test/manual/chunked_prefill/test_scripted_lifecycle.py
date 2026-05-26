@@ -227,144 +227,168 @@ def _script_seq_engine_stats_stable(t: ScriptedRuntime):
 
 class TestScriptedLifecycle(CustomTestCase):
     def test_small_prompt_short_decode(self):
+        """Tiny prompt + tiny decode."""
         execute_scripted_runtime(
             _script_small_prompt_short_decode,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_medium_prompt_medium_decode(self):
+        """Prompt <= chunk_size + medium decode."""
         execute_scripted_runtime(
             _script_medium_prompt_medium_decode,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_long_prompt_short_decode(self):
+        """Multi-chunk prefill + short decode."""
         execute_scripted_runtime(
             _script_long_prompt_short_decode,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_long_prompt_long_decode(self):
+        """Multi-chunk prefill + long decode."""
         execute_scripted_runtime(
             _script_long_prompt_long_decode,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_tiny_prompt_long_decode(self):
+        """1-token prompt, long decode."""
         execute_scripted_runtime(
             _script_tiny_prompt_long_decode,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_chunk_size_minus_one_prompt(self):
+        """Prompt_len = chunk_size - 1 + short decode."""
         execute_scripted_runtime(
             _script_chunk_size_minus_one_prompt,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_chunk_size_plus_two_prompt(self):
+        """Prompt_len = chunk_size + 2."""
         execute_scripted_runtime(
             _script_chunk_size_plus_two_prompt,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_just_over_2x_chunk_size(self):
+        """Prompt_len = 2 * chunk_size + 1."""
         execute_scripted_runtime(
             _script_just_over_2x_chunk_size,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_five_x_chunk_size(self):
+        """5 chunks exactly."""
         execute_scripted_runtime(
             _script_five_x_chunk_size,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_ten_x_chunk_size(self):
+        """10 chunks exactly."""
         execute_scripted_runtime(
             _script_ten_x_chunk_size,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_status_progression_happy_path(self):
+        """Verify status progresses unknown → waiting → running → finished."""
         execute_scripted_runtime(
             _script_status_progression_happy_path,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_long_prompt_only_one_decode(self):
+        """Max_new_tokens = 1: minimum decode."""
         execute_scripted_runtime(
             _script_long_prompt_only_one_decode,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_kv_pages_consistent_during_run(self):
+        """Kv_pages > 0 during running, == 0 after finish."""
         execute_scripted_runtime(
             _script_kv_pages_consistent_during_run,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_row_idx_recycled_after_finish(self):
+        """After finish, row_idx becomes None."""
         execute_scripted_runtime(
             _script_row_idx_recycled_after_finish,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_two_seq_clean_handoff(self):
+        """Two sequential reqs complete cleanly one after the other."""
         execute_scripted_runtime(
             _script_two_seq_clean_handoff,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_five_seq_clean(self):
+        """Five sequential reqs each complete cleanly."""
         execute_scripted_runtime(
             _script_five_seq_clean,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_radix_partial_seq(self):
+        """R1 prompt becomes radix prefix; r2 = r1.prompt + extra."""
         execute_scripted_runtime(
             _script_radix_partial_seq,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_alternating_short_long_seq(self):
+        """Alternate short / long across 6 reqs."""
         execute_scripted_runtime(
             _script_alternating_short_long_seq,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_seq_with_growing_prompt(self):
+        """Prompt_len grows: each new req longer than the previous."""
         execute_scripted_runtime(
             _script_seq_with_growing_prompt,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_seq_with_shrinking_prompt(self):
+        """Sequential reqs with shrinking prompt lengths all finish."""
         execute_scripted_runtime(
             _script_seq_with_shrinking_prompt,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_seq_with_idle_yields_between(self):
+        """Insert idle yields between completion and next submission."""
         execute_scripted_runtime(
             _script_seq_with_idle_yields_between,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_chunked_then_short_seq(self):
+        """Long chunked, then short, then long, then short."""
         execute_scripted_runtime(
             _script_chunked_then_short_seq,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_seq_finish_events_one_each(self):
+        """Each sequential req emits exactly one finish event."""
         execute_scripted_runtime(
             _script_seq_finish_events_one_each,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_seq_engine_stats_stable(self):
+        """Engine KV pool stays at baseline across a sequence of reqs."""
         execute_scripted_runtime(
             _script_seq_engine_stats_stable,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),

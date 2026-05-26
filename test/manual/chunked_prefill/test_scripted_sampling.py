@@ -324,186 +324,217 @@ def _script_sampling_diversity_two_reqs(t: ScriptedRuntime):
 
 class TestScriptedSampling(CustomTestCase):
     def test_max_new_tokens_zero_rejected(self):
+        """Max_new_tokens = 0: engine should reject the req with a sampling validation error."""
         execute_scripted_runtime(
             _script_max_new_tokens_zero_rejected,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_max_new_tokens_one_long_chunked(self):
+        """Max_new_tokens = 1 with a long chunked prompt: completes after 1 decode."""
         execute_scripted_runtime(
             _script_max_new_tokens_one_long_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_max_new_tokens_1000_long_chunked(self):
+        """Max_new_tokens = 1000: long decode after chunked prefill."""
         execute_scripted_runtime(
             _script_max_new_tokens_1000_long_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_greedy_chunked_deterministic(self):
+        """Temperature = 0 (greedy) + chunked: same prompt gives same output."""
         execute_scripted_runtime(
             _script_greedy_chunked_deterministic,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_return_logprob_chunked(self):
+        """Return_logprob = True + chunked: logprob array length matches output."""
         execute_scripted_runtime(
             _script_return_logprob_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_ignore_eos_chunked(self):
+        """Ignore_eos = True + early EOS production + chunked: still runs to max_new_tokens; doesn't shortcut on EOS."""
         execute_scripted_runtime(
             _script_ignore_eos_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_stop_str_chunked(self):
+        """Stop=["xyz"] + chunked: stops at stop_str, doesn't reach max_new_tokens."""
         execute_scripted_runtime(
             _script_stop_str_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_top_p_chunked(self):
+        """Top_p sampling + chunked: doesn't hang or crash."""
         execute_scripted_runtime(
             _script_top_p_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_top_k_chunked(self):
+        """Top_k sampling + chunked."""
         execute_scripted_runtime(
             _script_top_k_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_top_p_top_k_combined_chunked(self):
+        """Top_p AND top_k together + chunked."""
         execute_scripted_runtime(
             _script_top_p_top_k_combined_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_high_temperature_chunked(self):
+        """High temperature + chunked: stable output, no crash."""
         execute_scripted_runtime(
             _script_high_temperature_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_greedy_two_sequential_reqs(self):
+        """Greedy + chunked, 2 sequential reqs — verify second matches first."""
         execute_scripted_runtime(
             _script_greedy_two_sequential_reqs,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_greedy_chunked_with_radix_hit(self):
+        """Greedy + chunked + radix prefix hit."""
         execute_scripted_runtime(
             _script_greedy_chunked_with_radix_hit,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_return_logprob_top_logprobs_chunked(self):
+        """Return_logprob + top_logprobs_num + chunked."""
         execute_scripted_runtime(
             _script_return_logprob_top_logprobs_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_multiple_stop_strs_chunked(self):
+        """Multiple stop strings + chunked."""
         execute_scripted_runtime(
             _script_multiple_stop_strs_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_stop_token_ids_chunked(self):
+        """Stop_token_ids + chunked."""
         execute_scripted_runtime(
             _script_stop_token_ids_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_min_new_tokens_chunked(self):
+        """Min_new_tokens > 0 + chunked + ignore_eos forced by minimum."""
         execute_scripted_runtime(
             _script_min_new_tokens_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_repetition_penalty_chunked(self):
+        """Repetition_penalty + chunked."""
         execute_scripted_runtime(
             _script_repetition_penalty_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_frequency_penalty_chunked(self):
+        """Frequency_penalty + chunked."""
         execute_scripted_runtime(
             _script_frequency_penalty_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_presence_penalty_chunked(self):
+        """Presence_penalty + chunked."""
         execute_scripted_runtime(
             _script_presence_penalty_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_explicit_rid_chunked(self):
+        """Explicit rid + chunked: handle uses given rid."""
         execute_scripted_runtime(
             _script_explicit_rid_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_default_sampling_chunked(self):
+        """All defaults + chunked: just complete cleanly."""
         execute_scripted_runtime(
             _script_default_sampling_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_greedy_chunked(self):
+        """Greedy (temperature=0) sampling over chunked prompt completes."""
         execute_scripted_runtime(
             _script_greedy_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_high_temperature_short(self):
+        """Short prompt with high temperature (1.8) finishes cleanly."""
         execute_scripted_runtime(
             _script_high_temperature_short,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_high_temperature_chunked_extra(self):
+        """Chunked long prompt with high temperature (1.8) finishes cleanly."""
         execute_scripted_runtime(
             _script_high_temperature_chunked_extra,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_low_temperature_short(self):
+        """Short prompt with low temperature (0.1) finishes cleanly."""
         execute_scripted_runtime(
             _script_low_temperature_short,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_default_top_p(self):
+        """Top_p=0.95 sampling on a short prompt finishes cleanly."""
         execute_scripted_runtime(
             _script_default_top_p,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_default_top_k(self):
+        """Top_k=50 sampling on a short prompt finishes cleanly."""
         execute_scripted_runtime(
             _script_default_top_k,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_combined_sampling_chunked(self):
+        """All sampling knobs on at once."""
         execute_scripted_runtime(
             _script_combined_sampling_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_default_sampling_short(self):
+        """Default sampling parameters on a short prompt finish cleanly."""
         execute_scripted_runtime(
             _script_default_sampling_short,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
     def test_sampling_diversity_two_reqs(self):
+        """Two reqs with same prompt and non-greedy temp: outputs may differ."""
         execute_scripted_runtime(
             _script_sampling_diversity_two_reqs,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),

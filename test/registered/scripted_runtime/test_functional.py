@@ -386,29 +386,35 @@ def _script_api_smoke_start_req_explicit_rid(t: ScriptedRuntime):
 
 class TestScriptedRuntimeFunctional(CustomTestCase):
     def test_start_req_returns_req_handle(self):
+        """start_req returns a ReqHandle with the expected auto-assigned rid."""
         execute_scripted_runtime(
             _script_start_req_returns_req_handle, **_COMMON_ENGINE_KWARGS
         )
 
     def test_multiple_yields_advance_scheduler(self):
+        """Multiple bare yields advance the scheduler by one iteration each."""
         execute_scripted_runtime(
             _script_multiple_yields_advance_scheduler, **_COMMON_ENGINE_KWARGS
         )
 
     def test_multiple_reqs_in_one_script(self):
+        """A single script can submit multiple reqs with distinct rids."""
         execute_scripted_runtime(
             _script_multiple_reqs_in_one_script, **_COMMON_ENGINE_KWARGS
         )
 
     def test_empty_script_returns_immediately(self):
+        """Generator script that never yields returns without error."""
         execute_scripted_runtime(_script_empty_return, **_COMMON_ENGINE_KWARGS)
 
     def test_script_raises_assertion_surfaces_to_caller(self):
+        """AssertionError from script body surfaces back to the caller."""
         with self.assertRaises(AssertionError) as ctx:
             execute_scripted_runtime(_script_assertion_failure, **_COMMON_ENGINE_KWARGS)
         self.assertIn("boom", str(ctx.exception))
 
     def test_script_raises_runtime_error_surfaces_to_caller(self):
+        """RuntimeError from script body surfaces back to the caller as AssertionError."""
         with self.assertRaises(AssertionError) as ctx:
             execute_scripted_runtime(_script_runtime_error, **_COMMON_ENGINE_KWARGS)
         err_text = str(ctx.exception)
@@ -416,15 +422,18 @@ class TestScriptedRuntimeFunctional(CustomTestCase):
         self.assertIn("simulated runtime error", err_text)
 
     def test_non_generator_script_function_errors_cleanly(self):
+        """Non-generator script function is rejected with a clear error."""
         with self.assertRaises(AssertionError) as ctx:
             execute_scripted_runtime(_script_not_a_generator, **_COMMON_ENGINE_KWARGS)
         self.assertIn("must be a generator", str(ctx.exception))
 
     def test_invalid_qualified_name_errors_before_engine(self):
+        """Lambda script (no qualified name) is rejected before engine launch."""
         with self.assertRaises((ValueError, TypeError, AttributeError)):
             execute_scripted_runtime(lambda t: None, **_COMMON_ENGINE_KWARGS)
 
     def test_script_imported_from_pytest_file(self):
+        """Spawn-mode sys.path forwarding lets subprocess import the script."""
         # Exercises spawn-mode sys.path forwarding: this file's directory
         # is not normally on the subprocess's sys.path.
         execute_scripted_runtime(
@@ -432,16 +441,19 @@ class TestScriptedRuntimeFunctional(CustomTestCase):
         )
 
     def test_yield_before_start_req(self):
+        """Yielding before any start_req call is safe."""
         execute_scripted_runtime(
             _script_yield_before_start_req, **_COMMON_ENGINE_KWARGS
         )
 
     def test_status_for_unknown_rid(self):
+        """ReqHandle for a never-submitted rid reports 'unknown' status."""
         execute_scripted_runtime(
             _script_status_for_unknown_rid, **_COMMON_ENGINE_KWARGS
         )
 
     def test_assertion_failure_traceback_points_to_script_line(self):
+        """Assertion failure traceback names the failing script function."""
         with self.assertRaises(AssertionError) as ctx:
             execute_scripted_runtime(
                 _script_assertion_with_status, **_COMMON_ENGINE_KWARGS
@@ -458,203 +470,246 @@ class TestScriptedRuntimeFunctional(CustomTestCase):
     # ============================================================
 
     def test_api_smoke_r_finished(self):
+        """ReqHandle.finished returns True once the req completes."""
         execute_scripted_runtime(_script_api_smoke_r_finished, **_COMMON_ENGINE_KWARGS)
 
     def test_api_smoke_r_chunks_done(self):
+        """ReqHandle.chunks_done is readable as an int."""
         execute_scripted_runtime(
             _script_api_smoke_r_chunks_done, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_r_is_chunking(self):
+        """ReqHandle.is_chunking is readable as a bool."""
         execute_scripted_runtime(
             _script_api_smoke_r_is_chunking, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_r_kv_pages(self):
+        """ReqHandle.kv_pages is readable as a non-negative int."""
         execute_scripted_runtime(_script_api_smoke_r_kv_pages, **_COMMON_ENGINE_KWARGS)
 
     def test_api_smoke_r_row_idx(self):
+        """ReqHandle.row_idx is readable (may be None pre-assignment)."""
         execute_scripted_runtime(_script_api_smoke_r_row_idx, **_COMMON_ENGINE_KWARGS)
 
     def test_api_smoke_r_lock_refs(self):
+        """ReqHandle.lock_refs is readable as a non-negative int."""
         execute_scripted_runtime(_script_api_smoke_r_lock_refs, **_COMMON_ENGINE_KWARGS)
 
     def test_api_smoke_r_pending_middle_outputs(self):
+        """ReqHandle.pending_middle_outputs is readable as an int."""
         execute_scripted_runtime(
             _script_api_smoke_r_pending_middle_outputs, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_r_inflight_middle_chunks(self):
+        """ReqHandle.inflight_middle_chunks is readable as an int."""
         execute_scripted_runtime(
             _script_api_smoke_r_inflight_middle_chunks, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_r_finish_event_count(self):
+        """ReqHandle.finish_event_count is readable as an int."""
         execute_scripted_runtime(
             _script_api_smoke_r_finish_event_count, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_r_disagg_send_state(self):
+        """ReqHandle.disagg_send_state is readable (None outside disagg)."""
         execute_scripted_runtime(
             _script_api_smoke_r_disagg_send_state, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_r_output_tokens(self):
+        """ReqHandle.output_tokens is a list after the req finishes."""
         execute_scripted_runtime(
             _script_api_smoke_r_output_tokens, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_r_logprobs(self):
+        """ReqHandle.logprobs is readable when return_logprob=True."""
         execute_scripted_runtime(_script_api_smoke_r_logprobs, **_COMMON_ENGINE_KWARGS)
 
     def test_api_smoke_r_cumulative_kv_alloc_bytes(self):
+        """ReqHandle.cumulative_kv_alloc_bytes is non-negative."""
         execute_scripted_runtime(
             _script_api_smoke_r_cumulative_kv_alloc_bytes, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_t_is_idle(self):
+        """ScriptedRuntime.is_idle is readable as a bool."""
         execute_scripted_runtime(_script_api_smoke_t_is_idle, **_COMMON_ENGINE_KWARGS)
 
     def test_api_smoke_t_abort(self):
+        """ScriptedRuntime.abort runs without exception on an in-flight req."""
         execute_scripted_runtime(_script_api_smoke_t_abort, **_COMMON_ENGINE_KWARGS)
 
     def test_api_smoke_t_force_retract(self):
+        """ScriptedRuntime.force_retract runs without exception on an in-flight req."""
         execute_scripted_runtime(
             _script_api_smoke_t_force_retract, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_t_exhaust_kv(self):
+        """ScriptedRuntime.exhaust_kv leaves the requested page slack."""
         execute_scripted_runtime(
             _script_api_smoke_t_exhaust_kv, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_t_exhaust_row_pool(self):
+        """ScriptedRuntime.exhaust_row_pool leaves the requested row slack."""
         execute_scripted_runtime(
             _script_api_smoke_t_exhaust_row_pool, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_t_exhaust_lock_refs(self):
+        """ScriptedRuntime.exhaust_lock_refs leaves the requested ref slack."""
         execute_scripted_runtime(
             _script_api_smoke_t_exhaust_lock_refs, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_t_force_lora_drainer_reject(self):
+        """ScriptedRuntime.force_lora_drainer_reject runs without exception."""
         execute_scripted_runtime(
             _script_api_smoke_t_force_lora_drainer_reject, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_t_batch_composition(self):
+        """ScriptedRuntime.batch_composition returns a dict."""
         execute_scripted_runtime(
             _script_api_smoke_t_batch_composition, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_t_chunked_in_flight_count(self):
+        """ScriptedRuntime.chunked_in_flight_count returns a non-negative int."""
         execute_scripted_runtime(
             _script_api_smoke_t_chunked_in_flight_count, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_t_list_active_reqs(self):
+        """ScriptedRuntime.list_active_reqs returns a list."""
         execute_scripted_runtime(
             _script_api_smoke_t_list_active_reqs, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_t_force_preempt(self):
+        """ScriptedRuntime.force_preempt runs without exception on a victim/by pair."""
         execute_scripted_runtime(
             _script_api_smoke_t_force_preempt, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_t_last_admission_path(self):
+        """ScriptedRuntime.last_admission_path returns None or a str."""
         execute_scripted_runtime(
             _script_api_smoke_t_last_admission_path, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_t_last_scheduler_path(self):
+        """ScriptedRuntime.last_scheduler_path returns None or a str."""
         execute_scripted_runtime(
             _script_api_smoke_t_last_scheduler_path, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_t_engine_stats(self):
+        """ScriptedRuntime.engine_stats returns a dict."""
         execute_scripted_runtime(
             _script_api_smoke_t_engine_stats, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_t_warmup_radix(self):
+        """ScriptedRuntime.warmup_radix accepts prompt_tokens without exception."""
         execute_scripted_runtime(
             _script_api_smoke_t_warmup_radix, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_t_evict_radix(self):
+        """ScriptedRuntime.evict_radix runs without exception."""
         execute_scripted_runtime(
             _script_api_smoke_t_evict_radix, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_t_trigger_abort_on_waiting_timeout(self):
+        """ScriptedRuntime.trigger_abort_on_waiting_timeout runs without exception."""
         execute_scripted_runtime(
             _script_api_smoke_t_trigger_abort_on_waiting_timeout,
             **_COMMON_ENGINE_KWARGS,
         )
 
     def test_api_smoke_t_get_chunked_req_rid(self):
+        """ScriptedRuntime.get_chunked_req_rid returns None or a str."""
         execute_scripted_runtime(
             _script_api_smoke_t_get_chunked_req_rid, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_start_req_priority(self):
+        """start_req accepts a priority kwarg."""
         execute_scripted_runtime(
             _script_api_smoke_start_req_priority, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_start_req_lora_path(self):
+        """start_req accepts a lora_path kwarg."""
         execute_scripted_runtime(
             _script_api_smoke_start_req_lora_path, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_start_req_temperature(self):
+        """start_req accepts a temperature kwarg."""
         execute_scripted_runtime(
             _script_api_smoke_start_req_temperature, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_start_req_top_p_top_k(self):
+        """start_req accepts top_p and top_k kwargs."""
         execute_scripted_runtime(
             _script_api_smoke_start_req_top_p_top_k, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_start_req_stop(self):
+        """start_req accepts a stop string-list kwarg."""
         execute_scripted_runtime(
             _script_api_smoke_start_req_stop, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_start_req_stop_token_ids(self):
+        """start_req accepts a stop_token_ids kwarg."""
         execute_scripted_runtime(
             _script_api_smoke_start_req_stop_token_ids, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_start_req_ignore_eos(self):
+        """start_req accepts an ignore_eos kwarg."""
         execute_scripted_runtime(
             _script_api_smoke_start_req_ignore_eos, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_start_req_return_logprob(self):
+        """start_req accepts a return_logprob kwarg."""
         execute_scripted_runtime(
             _script_api_smoke_start_req_return_logprob, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_start_req_top_logprobs_num(self):
+        """start_req accepts a top_logprobs_num kwarg."""
         execute_scripted_runtime(
             _script_api_smoke_start_req_top_logprobs_num, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_start_req_min_new_tokens(self):
+        """start_req accepts a min_new_tokens kwarg."""
         execute_scripted_runtime(
             _script_api_smoke_start_req_min_new_tokens, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_start_req_penalties(self):
+        """start_req accepts repetition / frequency / presence penalty kwargs."""
         execute_scripted_runtime(
             _script_api_smoke_start_req_penalties, **_COMMON_ENGINE_KWARGS
         )
 
     def test_api_smoke_start_req_explicit_rid(self):
+        """start_req accepts an explicit rid kwarg and uses it."""
         execute_scripted_runtime(
             _script_api_smoke_start_req_explicit_rid, **_COMMON_ENGINE_KWARGS
         )

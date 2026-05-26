@@ -127,6 +127,7 @@ class ChunkedTestBase(CustomTestCase):
             kill_process_tree(cls.process.pid)
 
     def test_mixed_prefix_gsm8k_chunked(self):
+        """Mixed-prefix GSM8K accuracy stays above threshold under chunked prefill."""
         metrics = self._simple_tester.run_eval(
             self.base_url, self.model, type(self).__name__
         )
@@ -161,6 +162,7 @@ class ChunkedTestPDBase(PDDisaggregationServerBase):
         PDDisaggregationServerBase.tearDownClass()
 
     def test_mixed_prefix_gsm8k_chunked(self):
+        """Mixed-prefix GSM8K accuracy stays above threshold under chunked prefill."""
         metrics = self._simple_tester.run_eval(
             self.base_url, self.model, type(self).__name__
         )
