@@ -106,18 +106,29 @@ def make_verify_plan(
     slot_indices: list[int],
     positions: list[int],
     prev_slot_indices: list[int],
+    expected_input_ids: Optional[list[int]] = None,
     capacity: Optional[int] = None,
     device: torch.device,
 ) -> VerifyPlan:
     """Build a VerifyPlan whose active prefix matches the three input lists.
 
     Active prefix mirrors the input lists. Tail entries are left at the
-    allocate-time zero values; ``verify_num_valid = len(slot_indices)``.
+    allocate-time defaults; ``verify_num_valid = len(slot_indices)``.
+
+    ``expected_input_ids`` defaults to ``[-1] * n_active`` (the verify-kernel
+    "skip token check" sentinel) so existing tests that only exercise the
+    chain / position / real-kv-hash paths keep working unchanged.
     """
     n_active = len(slot_indices)
     if not (len(positions) == n_active and len(prev_slot_indices) == n_active):
         raise ValueError(
             "make_verify_plan: slot_indices, positions, and prev_slot_indices must all have the same length"
+        )
+    if expected_input_ids is None:
+        expected_input_ids = [-1] * n_active
+    if len(expected_input_ids) != n_active:
+        raise ValueError(
+            "make_verify_plan: expected_input_ids must match len(slot_indices)"
         )
     cap = capacity if capacity is not None else max(n_active, 1)
     plan = VerifyPlan.allocate(verify_capacity=cap, device=device)
@@ -127,6 +138,9 @@ def make_verify_plan(
         )
         plan.verify_expected_positions[:n_active] = torch.tensor(
             positions, dtype=torch.int64, device=device
+        )
+        plan.verify_expected_input_ids[:n_active] = torch.tensor(
+            expected_input_ids, dtype=torch.int64, device=device
         )
         plan.verify_prev_slot_indices[:n_active] = torch.tensor(
             prev_slot_indices, dtype=torch.int64, device=device
@@ -140,6 +154,7 @@ def make_verify_plan_pair(
     slot_indices: list[int],
     positions: list[int],
     prev_slot_indices: list[int],
+    expected_input_ids: Optional[list[int]] = None,
     capacity: Optional[int] = None,
     device: torch.device,
 ) -> tuple[VerifyPlan, VerifyPlan]:
@@ -148,6 +163,7 @@ def make_verify_plan_pair(
             slot_indices=slot_indices,
             positions=positions,
             prev_slot_indices=prev_slot_indices,
+            expected_input_ids=expected_input_ids,
             capacity=capacity,
             device=device,
         ),
@@ -155,6 +171,7 @@ def make_verify_plan_pair(
             slot_indices=slot_indices,
             positions=positions,
             prev_slot_indices=prev_slot_indices,
+            expected_input_ids=expected_input_ids,
             capacity=capacity,
             device=device,
         ),

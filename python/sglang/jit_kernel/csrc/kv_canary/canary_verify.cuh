@@ -26,6 +26,7 @@ struct VerifyKernelParams {
   // Plan tensors.
   const int64_t* verify_slot_indices;
   const int64_t* verify_expected_positions;
+  const int64_t* verify_expected_input_ids;
   const int64_t* verify_prev_slot_indices;
   const int32_t* verify_num_valid;
   const int32_t* verify_enable;
@@ -64,6 +65,7 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
 
     const int64_t slot_idx = p.verify_slot_indices[entry_idx];
     const int64_t expected_position = p.verify_expected_positions[entry_idx];
+    const int64_t expected_input_id = p.verify_expected_input_ids[entry_idx];
     const int64_t prev_slot_idx = p.verify_prev_slot_indices[entry_idx];
 
     if (slot_idx == kTokenToKvSlotPadding) {
@@ -95,6 +97,12 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
     if (stored_real_kv_hash != expected_real_kv_hash) {
       fail_reason_bits |= FailReason::kRealKvHash;
     }
+    // ``expected_input_id == -1`` is the plan-side sentinel for "no source-of-truth available for
+    // this entry" (out-of-range vs valid_lens, pool absent, or sweep over orphan slots). Skip the
+    // token-mismatch check in that case; otherwise compare against the canary slot's stored token.
+    if (expected_input_id != -1 && stored_token != expected_input_id) {
+      fail_reason_bits |= FailReason::kVerifyTokenMismatch;
+    }
 
     if (fail_reason_bits != FailReason{}) {
       record_violation(
@@ -103,7 +111,7 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
               /* slot_idx = */ slot_idx,
               /* position = */ stored_position,
               /* stored_token = */ stored_token,
-              /* expected_token = */ 0,
+              /* expected_token = */ expected_input_id,
               /* stored_chain_hash = */ stored_chain_hash,
               /* expected_aux = */ expected_chain_hash,
               /* fail_reason_bits = */ static_cast<int64_t>(fail_reason_bits),
@@ -136,6 +144,7 @@ inline void canary_verify_step_cuda(
     tvm::ffi::TensorView canary_buf,
     tvm::ffi::TensorView verify_slot_indices,
     tvm::ffi::TensorView verify_expected_positions,
+    tvm::ffi::TensorView verify_expected_input_ids,
     tvm::ffi::TensorView verify_prev_slot_indices,
     tvm::ffi::TensorView verify_num_valid,
     tvm::ffi::TensorView verify_enable,
@@ -166,6 +175,7 @@ inline void canary_verify_step_cuda(
       .with_device<kDLCUDA>(device_)
       .verify(verify_slot_indices)
       .verify(verify_expected_positions)
+      .verify(verify_expected_input_ids)
       .verify(verify_prev_slot_indices);
   TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(verify_num_valid);
   TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(verify_enable);
@@ -236,6 +246,7 @@ inline void canary_verify_step_cuda(
   p.slot_stride_bytes = slot_stride_bytes;
   p.verify_slot_indices = static_cast<const int64_t*>(verify_slot_indices.data_ptr());
   p.verify_expected_positions = static_cast<const int64_t*>(verify_expected_positions.data_ptr());
+  p.verify_expected_input_ids = static_cast<const int64_t*>(verify_expected_input_ids.data_ptr());
   p.verify_prev_slot_indices = static_cast<const int64_t*>(verify_prev_slot_indices.data_ptr());
   p.verify_num_valid = static_cast<const int32_t*>(verify_num_valid.data_ptr());
   p.verify_enable = static_cast<const int32_t*>(verify_enable.data_ptr());

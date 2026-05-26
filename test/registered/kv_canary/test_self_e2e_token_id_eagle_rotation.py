@@ -6,10 +6,12 @@ overrides the chunk-1 seg-end tail with the target model's predicted next
 token instead of the next prompt token. PR #26329 fixes this by reading
 ``req.origin_input_ids`` at the chunk boundary. The kv_canary token-id
 validator (``SGLANG_KV_CANARY_ENABLE_REQ_TOKEN_IDS_CHECK=1``) reads the same
-``origin_input_ids + output_ids`` per req and asserts the write kernel's
-``input_ids`` matches the source-of-truth at the chunk seg-end's logical
-position, so the buggy revert reliably fires a ``write_token`` violation
-without depending on any inter-request race.
+``origin_input_ids + output_ids`` per req, populates a static
+``req_to_expected_token_ids`` pool, and the verify kernel compares each
+canary slot's stored token against ``pool[rp, p + expected_token_ids_offset]``.
+For EAGLE draft pools ``expected_token_ids_offset = 1``, so the buggy
+revert reliably fires a ``verify_token`` violation without depending on any
+inter-request race.
 """
 
 from __future__ import annotations
@@ -66,9 +68,7 @@ class _EagleChunkedRotationBase(CanaryE2EBase):
         rng = random.Random(0)
         # ~3K tokens after BPE — long enough to span 2+ chunked-prefill chunks
         # at chunked_prefill_size=2048, short enough to stay under context_length.
-        body = "".join(
-            rng.choices(string.ascii_letters + string.digits + " ", k=8000)
-        )
+        body = "".join(rng.choices(string.ascii_letters + string.digits + " ", k=8000))
         return [body] * n
 
     def test_chunked_rotation_token_id_mismatch(self) -> None:
@@ -82,7 +82,7 @@ class _EagleChunkedRotationBase(CanaryE2EBase):
         if self.revert_pr:
             self.assert_violation_logged_any(
                 launch_tag_patterns=("*",),
-                fail_reason="write_token",
+                fail_reason="verify_token",
                 flush_wait_seconds=3.0,
             )
         else:
