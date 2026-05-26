@@ -15,9 +15,6 @@ import pybase64
 import torch
 from torchvision.io import decode_image
 
-from sglang.srt.configs.minimax_vl_processor import (
-    get_video_tensor,
-)
 from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
 from sglang.srt.models.minimax_m3_vl import (
     MiniMaxM3SparseForConditionalGeneration
@@ -28,6 +25,222 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.utils import ImageData
+
+
+import math
+import re
+from typing import List, Optional, Tuple, Union
+
+import torch
+import torchvision
+from torchvision.transforms import InterpolationMode
+from transformers import BatchFeature
+from transformers.image_processing_utils_fast import (
+    BaseImageProcessorFast,
+    group_images_by_shape,
+    reorder_images,
+)
+from transformers.image_utils import PILImageResampling, SizeDict
+from transformers.processing_utils import (
+    ImagesKwargs,
+    ProcessingKwargs,
+    ProcessorMixin,
+    Unpack,
+    VideosKwargs,
+)
+from transformers.utils import TensorType
+from transformers.video_processing_utils import BaseVideoProcessor
+from transformers.video_utils import group_videos_by_shape, reorder_videos
+
+
+def get_hw_multiple_of(
+    image_size: Tuple[int, int],
+    multiple: int,
+    max_size: Union[None, int, Tuple[int, int]] = None,
+) -> Tuple[int, int]:
+    """
+    Calculate target size that is multiple of given factor.
+    Behavior depends on the type of max_size.
+
+    Args:
+        image_size: Original (width, height)
+        multiple: Alignment factor (patch_size * spatial_merge_size)
+        max_size: None, frame_max_size, or (max_w, max_h)
+
+    Returns:
+        Tuple[int, int]: (new_width, new_height) both divisible by multiple
+    """
+    w, h = image_size
+
+    if isinstance(max_size, int):
+        ratio = 1.0
+        max_dim = max(w, h)
+        if max_dim > max_size:
+            ratio = max_size / max_dim
+        new_w = round(w * ratio)
+        new_h = round(h * ratio)
+        # ceil-align to multiple
+        new_w = (
+            new_w if new_w % multiple == 0 else new_w + (multiple - new_w % multiple)
+        )
+        new_h = (
+            new_h if new_h % multiple == 0 else new_h + (multiple - new_h % multiple)
+        )
+        return new_w, new_h
+
+    # Round up to nearest multiple
+    new_w = w if w % multiple == 0 else w + (multiple - w % multiple)
+    new_h = h if h % multiple == 0 else h + (multiple - h % multiple)
+
+    if max_size is not None:
+        assert isinstance(max_size, (list, tuple)) and len(max_size) == 2
+        max_w, max_h = max_size
+        assert max_w % multiple == 0 and max_h % multiple == 0
+
+        if new_w > max_w or new_h > max_h:
+            # Scale down to fit within max_size while maintaining aspect ratio
+            new_w_ = min((new_w * max_w) // new_w, (new_w * max_h) // new_h)
+            new_h_ = min((new_h * max_w) // new_w, (new_h * max_h) // new_h)
+            new_w = new_w_
+            new_h = new_h_
+
+            # Re-align to multiple
+            new_w = (
+                new_w
+                if new_w % multiple == 0
+                else new_w + (multiple - new_w % multiple)
+            )
+            new_h = (
+                new_h
+                if new_h % multiple == 0
+                else new_h + (multiple - new_h % multiple)
+            )
+
+        assert new_w % multiple == 0 and new_h % multiple == 0
+        assert new_w <= max_w and new_h <= max_h
+
+    return new_w, new_h
+
+
+def vllm_resize(
+    height: int,
+    width: int,
+    factor: int,
+    max_size: Tuple[int, int],
+) -> Tuple[int, int]:
+    """
+    Wrapper around get_hw_multiple_of.
+
+    Args:
+        height: Image height
+        width: Image width
+        factor: Alignment factor (patch_size * merge_size)
+        max_size: (max_width, max_height) constraint
+
+    Returns:
+        Tuple[int, int]: (new_height, new_width)
+    """
+    new_w, new_h = get_hw_multiple_of((width, height), factor, max_size)
+    return new_h, new_w
+
+def _compute_sampled_frame_indices(
+    total_frames: int, video_fps: float, fps: float
+) -> List[int]:
+    """
+    Pick frame indices that match the SFT extract_frame.py constant-mode
+    behavior: keep frames whose timestamp is at least read_time_interval
+    seconds (= 1/fps) apart from the previously kept frame, then always
+    append the last frame if it was not already kept.
+    """
+    if total_frames <= 0 or video_fps <= 0 or fps <= 0:
+        return [0] if total_frames > 0 else []
+
+    read_time_interval = 1.0 / fps
+    eps = 1e-4
+
+    indices: List[int] = []
+    prev_kept_ts = -float("inf")
+    while True:
+        if not indices:
+            target_frame = 0
+        else:
+            target_ts = prev_kept_ts + read_time_interval - eps
+            target_frame = math.ceil(target_ts * video_fps)
+            target_frame = max(target_frame, indices[-1] + 1)
+        if target_frame >= total_frames:
+            break
+        indices.append(target_frame)
+        prev_kept_ts = target_frame / video_fps
+
+    last_frame_idx = total_frames - 1
+    last_ts = last_frame_idx / video_fps
+    if indices and indices[-1] != last_frame_idx and last_ts - prev_kept_ts > eps:
+        indices.append(last_frame_idx)
+
+    if not indices:
+        indices = [0]
+    return indices
+
+
+async def get_video_tensor(
+    vr,
+    image_factor: int,
+    max_size: Tuple[int, int],
+    fps: Optional[float] = None,
+    frame_max_size: Optional[int] = None,
+) -> Tuple[torch.Tensor, dict]:
+    """Sample/resize one MiniMax video and return text-expansion metadata."""
+    if fps is None:
+        fps = 1.0
+    if frame_max_size is None:
+        frame_max_size = max_size[0]
+    if fps <= 0:
+        raise ValueError(f"video fps must be > 0, got {fps}")
+
+    if isinstance(vr, torch.Tensor):
+        # data:video/jpeg fallback: frames are already selected; no timestamps.
+        video_tchw = vr
+        _, _, height, width = video_tchw.shape
+        resized_width, resized_height = get_hw_multiple_of(
+            (width, height), image_factor, max_size
+        )
+        resized = torchvision.transforms.functional.resize(
+            video_tchw,
+            [resized_height, resized_width],
+            interpolation=InterpolationMode.BICUBIC,
+        )
+        return resized, {
+            "total_num_frames": resized.shape[0],
+            "fps": None,
+            "frames_indices": None,
+        }
+
+    total_frames = len(vr)
+    video_fps = vr.avg_fps
+    if video_fps <= 0 or total_frames <= 0:
+        raise ValueError(
+            f"Invalid video metadata: fps={video_fps}, frames={total_frames}"
+        )
+    indices = _compute_sampled_frame_indices(total_frames, video_fps, fps)
+    video_tchw = vr.get_frames_as_tensor(indices)
+    # NHWC uint8 -> NCHW float
+    video_tchw = video_tchw.permute(0, 3, 1, 2).float()
+
+    _, _, height, width = video_tchw.shape
+    resized_width, resized_height = get_hw_multiple_of(
+        (width, height), image_factor, frame_max_size
+    )
+    resized = torchvision.transforms.functional.resize(
+        video_tchw,
+        [resized_height, resized_width],
+        interpolation=InterpolationMode.BICUBIC,
+    )
+    return resized, {
+        "total_num_frames": total_frames,
+        "fps": video_fps,
+        "frames_indices": indices,
+    }
+
 
 # ==============================================================================
 # SGLang Multimodal Processor

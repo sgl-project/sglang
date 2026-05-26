@@ -6,11 +6,6 @@ from typing import Optional
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.auto import CONFIG_MAPPING
 
-from sglang.srt.configs.minimax_vl_processor import MiniMaxVLProcessor
-from sglang.srt.multimodal.customized_mm_processor_utils import (
-    register_customized_processor,
-)
-
 
 def _coerce_sub_config(
     sub_config: Optional[dict], default_model_type: str
@@ -69,7 +64,6 @@ class MiniMaxVLBaseConfig(PretrainedConfig):
 
         super().__init__(**kwargs)
 
-@register_customized_processor(processor_class=MiniMaxVLProcessor)
 class MiniMaxM3VLConfig(MiniMaxVLBaseConfig):
     """MiniMax M3 VL: vision tower + M3 (mixed sparse/dense MoE) text backbone."""
 
