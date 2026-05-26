@@ -1269,17 +1269,6 @@ class TestExpectedTokenPool:
 
 
 class TestExpectedTokenPoolValidLens:
-    """Cover the per-req ``req_to_verify_expected_tokens_valid_lens`` upper bound that the
-    plan_entries kernel uses to skip gathers past each req's snapshot length.
-
-    The kernel reads ``pool[rp, sot_pos]`` iff ``0 <= sot_pos < valid_lens[req_id]``,
-    where ``sot_pos = position + kv_token_id_vs_position_offset``; everything else
-    becomes the ``-1`` sentinel. The bound is per-req, applied AFTER the offset shift,
-    and overrides any stale pool content beyond it. The auto-synthesised
-    ``valid_lens = [pool.shape[1]] * bs`` default used by ``run_plan_diff`` is
-    irrelevant here — every case below builds an explicit lens tensor.
-    """
-
     @staticmethod
     def _make_pool(
         *,
