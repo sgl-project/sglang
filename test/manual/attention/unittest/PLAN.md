@@ -61,7 +61,9 @@ Implemented:
   SGLang kernel helpers.
 - Runner mechanics are isolated under `common/*_runner.py`. Attention-method
   helpers build modules, inputs, references, and metadata; runner files own CUDA
-  graph/PCG/BCG capture and replay orchestration.
+  graph/PCG/BCG capture and replay orchestration. `common/cuda_graph_runner.py`
+  now shares the dense/SWA and MLA projected-attention graph path through one
+  helper, with GDN kept separate for recurrent cache handling.
 - RoPE is intentionally omitted from the current unit-level runner x attention
   tests. These tests feed post-RoPE-equivalent Q/K tensors because rotary math is
   orthogonal to runner/backend metadata compatibility.
@@ -712,6 +714,8 @@ Initial implementation slice:
   Q/K/V/O projections and dispatches through `RadixAttention`.
 - `common/cuda_graph_runner.py` owns CUDA graph capture/replay helpers for dense/SWA,
   MLA, and GDN. Attention-method files only enumerate cases and call runner helpers.
+  Dense/SWA and MLA share one projected-attention graph helper; GDN uses a dedicated
+  graph helper because capture/replay mutates recurrent cache state.
 - `dense/test_torch_native.py`, `dense/test_triton.py`, and
   `dense/test_flashinfer.py` cover representative MHA, GQA, and MQA cases.
 - Dense tests exercise page size 1, exact-page extend, page-boundary decode
