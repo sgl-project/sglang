@@ -522,7 +522,6 @@ class TestScriptedRadix(CustomTestCase):
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 
-
     def test_chunked_req_re_chunked_after_resume_same_prefix(self):
         """Chunked req retracted mid-stream and resumed: chunks_done across the full lifetime matches the expected total chunk count."""
         execute_scripted_runtime(
@@ -549,9 +548,7 @@ class TestScriptedRadix(CustomTestCase):
 
         t.force_retract(r)
         yield
-        assert r.kv_pages == 0, (
-            f"retract must release KV; got {r.kv_pages}"
-        )
+        assert r.kv_pages == 0, f"retract must release KV; got {r.kv_pages}"
 
         # Resume: the scheduler re-admits the req and finishes it.
         yield from run_until_finished(r, max_steps=800)
