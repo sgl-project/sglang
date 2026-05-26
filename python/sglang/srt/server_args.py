@@ -3292,15 +3292,6 @@ class ServerArgs:
                     "--quantization per_token_nvfp4 is supported only on "
                     "NVIDIA Blackwell SM100/SM103 GPUs."
                 )
-            if (
-                self.tp_size % (self.ep_size * self.moe_dp_size) != 0
-                or self.tp_size // self.ep_size // self.moe_dp_size != 1
-            ):
-                raise ValueError(
-                    "--quantization per_token_nvfp4 currently supports MoE "
-                    "expert parallelism only. Use MoE TP size 1, e.g. "
-                    "--tp-size N --ep-size N."
-                )
             if self.moe_runner_backend == "auto":
                 self.moe_runner_backend = "flashinfer_trtllm"
             elif self.moe_runner_backend not in [

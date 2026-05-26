@@ -266,7 +266,7 @@ class FlashinferTrtllmGenMoeBackendOnlinePerTokenNVFP4Base:
                 "--tp-size",
                 "4",
                 "--ep-size",
-                "4",
+                "2",
                 "--quantization",
                 "per_token_nvfp4",
                 "--mem-fraction-static",

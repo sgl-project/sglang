@@ -1768,12 +1768,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     "--moe-runner-backend flashinfer_trtllm or "
                     "flashinfer_trtllm_routed."
                 )
-            if layer.moe_tp_size != 1:
-                raise ValueError(
-                    "--quantization per_token_nvfp4 currently supports MoE "
-                    "expert parallelism only. Use MoE TP size 1, e.g. "
-                    "--tp-size N --ep-size N."
-                )
 
         # TODO(ch-wan): check if this is needed
         layer.intermediate_size_per_partition = intermediate_size_per_partition
