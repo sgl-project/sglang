@@ -1547,6 +1547,9 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            # Pair with forward-entry wait_stream: cover WAR/RAW on SB.seq_lens.
+            self.schedule_stream.wait_stream(self.forward_stream)
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
