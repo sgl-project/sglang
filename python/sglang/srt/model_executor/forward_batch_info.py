@@ -387,7 +387,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     is_extend_in_batch: bool = False
     all_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
-    can_run_dp_piecewise_cuda_graph: bool = False
+    can_run_dp_breakable_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
 
     # Whether this batch is prefill-only (no token generation needed)
@@ -466,7 +466,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             is_extend_in_batch=batch.is_extend_in_batch,
             all_extend_in_batch=batch.all_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
-            can_run_dp_piecewise_cuda_graph=batch.can_run_dp_piecewise_cuda_graph,
+            can_run_dp_breakable_cuda_graph=batch.can_run_dp_breakable_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
             multi_item_delimiter_indices=batch.multi_item_delimiter_indices,

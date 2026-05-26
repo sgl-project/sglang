@@ -371,7 +371,7 @@ class BreakableCudaGraphRunner:
         if getattr(
             forward_batch, "global_num_tokens_cpu", None
         ) is not None and not getattr(
-            forward_batch, "can_run_dp_piecewise_cuda_graph", False
+            forward_batch, "can_run_dp_breakable_cuda_graph", False
         ):
             return False
         num_tokens = len(forward_batch.input_ids)
