@@ -31,6 +31,11 @@ Implemented:
   GQA, and MQA decode variants; the CUDA-graph tests capture against a fixed padded
   decode batch and replay distinct request metadata/input tensors, so capture data
   is not identical to forward data.
+- Phase 3 CUDA graph decode replay now also covers SWA for `triton` and
+  `flashinfer`, plus GDN for `triton`. The SWA graph cases currently use decode
+  lengths within the configured window; an above-window Triton SWA decode case
+  exposes a backend/reference semantic mismatch before graph replay and should be
+  investigated separately from runner coverage.
 - Dense input-config cases now cover page size 1, zero-prefix exact page,
   zero-prefix input lengths below/equal/above a page, prefix-length exact page,
   total-length exact page, total-length crossing a page boundary, ragged
@@ -59,9 +64,8 @@ Implemented:
   orthogonal to runner/backend metadata compatibility.
 
 In progress:
-- Phase 3 representative coverage needs one more pass before Phase 4: add CUDA
-  graph decode replay for SWA and GDN, and add representative PCG/BCG split-op
-  coverage for dense/SWA/GDN module paths.
+- Phase 3 representative coverage needs one more pass before Phase 4: add
+  representative PCG/BCG split-op coverage for dense/SWA/GDN module paths.
 
 Next implementation steps:
 - Finish the remaining Phase 3 graph coverage before implementing Phase 4.
@@ -76,6 +80,10 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
+- `python -m py_compile test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/gdn/test_triton.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/swa/test_flashinfer.py`
+- `python test/manual/attention/unittest/swa/test_triton.py -v`
+- `python test/manual/attention/unittest/swa/test_flashinfer.py -v`
+- `python test/manual/attention/unittest/gdn/test_triton.py -v`
 - `python -m py_compile test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/mla/test_triton.py`
 - `python test/manual/attention/unittest/mla/test_triton.py -v`
 - `python -m py_compile test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/dense/test_torch_native.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/swa/test_flashinfer.py`
@@ -431,7 +439,11 @@ Representative Phase 3 status:
   is the PyTorch baseline backend and does not exercise CUDA graph replay.
 - `triton` and `flashinfer` are covered in CUDA graph decode replay for MHA, GQA,
   and MQA, using distinct capture and replay batches.
-- Still required before Phase 4: CUDA graph decode replay for SWA and GDN.
+- SWA is covered in CUDA graph decode replay for `triton` and `flashinfer` with
+  decode lengths inside the configured window.
+- GDN is covered in CUDA graph decode replay for the representative `triton`
+  hybrid-linear backend path, including recurrent cache restore between capture and
+  replay.
 - Still required before Phase 4: representative PCG and BCG coverage. At unit-test
   scope this means exercising the PCG/BCG split-op path with active forward context
   and comparing against eager/reference output; full server-level PCG/BCG capture can

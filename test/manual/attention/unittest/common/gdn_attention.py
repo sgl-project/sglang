@@ -35,6 +35,7 @@ DEFAULT_DTYPE = torch.bfloat16
 DEFAULT_DEVICE = "cuda"
 GDN_ATOL = 3e-2
 GDN_RTOL = 3e-2
+DEFAULT_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 3
 
 
 @dataclass(frozen=True)
@@ -528,6 +529,8 @@ def build_gdn_attention_fixture(
     max_context_len: int = DEFAULT_MAX_CONTEXT_LEN,
     dtype: torch.dtype = DEFAULT_DTYPE,
     device: str = DEFAULT_DEVICE,
+    disable_cuda_graph: bool = True,
+    runner_batch_size: int | None = None,
 ) -> GDNAttentionFixture:
     seed = 4096 + len(case.name)
     torch.manual_seed(seed)
@@ -547,6 +550,8 @@ def build_gdn_attention_fixture(
         head_dim=head_k_dim,
         head_k_dim=head_k_dim,
         head_v_dim=head_v_dim,
+        disable_cuda_graph=disable_cuda_graph,
+        runner_batch_size=runner_batch_size,
     )
     try:
         full_backend = ATTENTION_BACKENDS[case.backend](runner)
@@ -612,6 +617,20 @@ def _copy_gdn_parameters(
 
 def _ssm_states(fixture: GDNAttentionFixture) -> torch.Tensor:
     return fixture.runner.req_to_token_pool.mamba2_layer_cache(0).temporal
+
+
+def _conv_states(fixture: GDNAttentionFixture) -> torch.Tensor:
+    return fixture.runner.req_to_token_pool.mamba2_layer_cache(0).conv[0]
+
+
+def _clone_gdn_cache(fixture: GDNAttentionFixture):
+    return _conv_states(fixture).clone(), _ssm_states(fixture).clone()
+
+
+def _restore_gdn_cache(fixture: GDNAttentionFixture, cache) -> None:
+    conv_states, ssm_states = cache
+    _conv_states(fixture).copy_(conv_states)
+    _ssm_states(fixture).copy_(ssm_states)
 
 
 def _cache_indices(fixture: GDNAttentionFixture) -> torch.Tensor:
@@ -733,3 +752,164 @@ def run_gdn_attention_case(
             atol=GDN_ATOL,
             rtol=GDN_RTOL,
         )
+
+
+def run_gdn_cuda_graph_decode_case(
+    testcase,
+    case: GDNAttentionCase,
+    *,
+    head_k_dim: int = DEFAULT_HEAD_K_DIM,
+    head_v_dim: int = DEFAULT_HEAD_V_DIM,
+    max_context_len: int = DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = DEFAULT_DTYPE,
+    device: str = DEFAULT_DEVICE,
+    cuda_graph_capture_batch_size: int = DEFAULT_CUDA_GRAPH_CAPTURE_BATCH_SIZE,
+):
+    if not case.forward_mode.is_decode():
+        raise ValueError(
+            "CUDA graph runner integration currently expects decode cases."
+        )
+    if case.batch_size != cuda_graph_capture_batch_size:
+        raise ValueError(
+            "GDN CUDA graph coverage currently uses an unpadded replay batch; "
+            "choose a case whose batch size matches the capture batch size."
+        )
+
+    eager_fixture = build_gdn_attention_fixture(
+        testcase,
+        case,
+        head_k_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+    )
+    eager_initial_cache = _clone_gdn_cache(eager_fixture)
+    eager_actual = run_gdn_fixture_eager(eager_fixture)
+    eager_expected = _pure_torch_gdn_reference(
+        eager_fixture,
+        eager_initial_cache[1],
+    )
+    torch.testing.assert_close(
+        eager_actual, eager_expected.output, atol=GDN_ATOL, rtol=GDN_RTOL
+    )
+
+    graph_fixture = build_gdn_attention_fixture(
+        testcase,
+        case,
+        head_k_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        disable_cuda_graph=False,
+        runner_batch_size=cuda_graph_capture_batch_size,
+    )
+    graph_initial_cache = _clone_gdn_cache(graph_fixture)
+    replay_mixed_qkv = graph_fixture.mixed_qkv
+    replay_a = graph_fixture.a
+    replay_b = graph_fixture.b
+    backend = graph_fixture.backend
+    capture_batch_size = cuda_graph_capture_batch_size
+    seq_len_fill_value = backend.get_cuda_graph_seq_len_fill_value()
+    capture_prefix_len = max(0, seq_len_fill_value - 1)
+    capture_case = GDNAttentionCase(
+        name=f"{case.name}_cuda_graph_capture",
+        backend=case.backend,
+        forward_mode=case.forward_mode,
+        num_k_heads=case.num_k_heads,
+        num_v_heads=case.num_v_heads,
+        page_size=case.page_size,
+        prefix_lens=(capture_prefix_len,) * capture_batch_size,
+    )
+    capture_batch = _make_forward_batch(
+        capture_case,
+        graph_fixture.runner,
+        max_context_len=max_context_len,
+        device=device,
+    )
+    capture_mixed_qkv = torch.randn(
+        capture_case.num_input_tokens,
+        graph_fixture.actual_module.mixed_qkv_dim,
+        dtype=dtype,
+        device=device,
+    )
+    capture_a = torch.randn(
+        capture_case.num_input_tokens,
+        capture_case.num_v_heads,
+        dtype=dtype,
+        device=device,
+    )
+    capture_b = torch.randn(
+        capture_case.num_input_tokens,
+        capture_case.num_v_heads,
+        dtype=dtype,
+        device=device,
+    )
+
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
+        backend.init_cuda_graph_state(
+            max_bs=capture_batch_size,
+            max_num_tokens=capture_case.num_input_tokens,
+        )
+        backend.init_forward_metadata_capture_cuda_graph(
+            bs=capture_batch_size,
+            num_tokens=capture_case.num_input_tokens,
+            req_pool_indices=capture_batch.req_pool_indices,
+            seq_lens=capture_batch.seq_lens,
+            encoder_lens=capture_batch.encoder_lens,
+            forward_mode=capture_batch.forward_mode,
+            spec_info=capture_batch.spec_info,
+        )
+        graph_fixture.case = capture_case
+        graph_fixture.forward_batch = capture_batch
+        graph_fixture.mixed_qkv = capture_mixed_qkv
+        graph_fixture.a = capture_a
+        graph_fixture.b = capture_b
+        capture_actual = graph_fixture.actual_module(
+            capture_batch,
+            capture_mixed_qkv,
+            capture_a,
+            capture_b,
+        )
+        backend.on_after_cuda_graph_warmup()
+        capture_expected = _pure_torch_gdn_reference(
+            graph_fixture,
+            graph_initial_cache[1],
+        )
+
+        _restore_gdn_cache(graph_fixture, graph_initial_cache)
+        graph_fixture.case = case
+        graph_fixture.mixed_qkv = replay_mixed_qkv
+        graph_fixture.a = replay_a
+        graph_fixture.b = replay_b
+        replay_batch = _make_forward_batch(
+            case,
+            graph_fixture.runner,
+            max_context_len=max_context_len,
+            device=device,
+        )
+        backend.init_forward_metadata_replay_cuda_graph(
+            bs=capture_batch_size,
+            req_pool_indices=replay_batch.req_pool_indices,
+            seq_lens=replay_batch.seq_lens,
+            seq_lens_sum=replay_batch.seq_lens_sum,
+            encoder_lens=replay_batch.encoder_lens,
+            forward_mode=replay_batch.forward_mode,
+            spec_info=replay_batch.spec_info,
+            seq_lens_cpu=replay_batch.seq_lens_cpu,
+        )
+        graph_fixture.forward_batch = replay_batch
+        replay_actual = graph_fixture.actual_module(
+            replay_batch,
+            graph_fixture.mixed_qkv,
+            graph_fixture.a,
+            graph_fixture.b,
+        )
+
+    torch.testing.assert_close(
+        capture_actual, capture_expected.output, atol=GDN_ATOL, rtol=GDN_RTOL
+    )
+    torch.testing.assert_close(
+        replay_actual, eager_actual, atol=GDN_ATOL, rtol=GDN_RTOL
+    )
