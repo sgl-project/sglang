@@ -104,6 +104,10 @@ def launch_canary_plan_kernels_torch_reference(
     swa_window_size: int,
     full_to_swa_index_mapping: Optional[torch.Tensor],
     verify_capacity: int,
+    expected_token_pool: Optional[torch.Tensor] = None,
+    expected_token_valid_lens: Optional[torch.Tensor] = None,
+    slot_token_offset: int = 0,
+    out_expected_input_tokens: Optional[torch.Tensor] = None,
 ) -> None:
     """Python reference for :func:`launch_canary_plan_kernels`. Same signature & byte-equal semantics."""
     bs = int(req_pool_indices.shape[0])
@@ -159,6 +163,17 @@ def launch_canary_plan_kernels_torch_reference(
         requested=total_verify,
         verify_capacity=verify_capacity,
     )
+
+    if out_expected_input_tokens is not None:
+        launch_plan_write_expected_tokens_kernel_torch_reference(
+            req_pool_indices=req_pool_indices,
+            prefix_lens=prefix_lens,
+            write_offsets=write_plan_out.write_offsets,
+            expected_token_pool=expected_token_pool,
+            expected_token_valid_lens=expected_token_valid_lens,
+            out_expected_input_tokens=out_expected_input_tokens,
+            slot_token_offset=int(slot_token_offset),
+        )
 
 
 def _write_num_valid_and_enable(
