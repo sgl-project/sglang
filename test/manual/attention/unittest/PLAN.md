@@ -9,9 +9,10 @@ Implemented:
   `test/manual/attention/unittest/common/dense_attention.py`.
 - Dense attention backend correctness files exist under
   `test/manual/attention/unittest/dense/` for `torch_native`, `triton`,
-  `flashinfer`, `fa3`, `fa4`, and `flex_attention`. Dense/SWA expected paths now
-  use separate HF-style reference modules with copied random projection weights
-  instead of calling projection helpers on the SGLang actual module.
+  `flashinfer`, `fa3`, `fa4`, `flex_attention`, and decode-only `trtllm_mha`.
+  Dense/SWA expected paths now use separate HF-style reference modules with
+  copied random projection weights instead of calling projection helpers on the
+  SGLang actual module.
 - SWA attention backend correctness files exist under
   `test/manual/attention/unittest/swa/` for `triton` and `flashinfer`.
 - MLA attention backend correctness exists under
@@ -110,6 +111,12 @@ Implemented:
 - FA3/FA4 decode CUDA-graph replay is intentionally not enabled yet. Dense eager
   and PCG/BCG split-op paths match the HF-style reference, but the shared decode
   CUDA-graph helper currently mismatches on replay for both FA backends.
+- `trtllm_mha` dense coverage is decode-only for now. Local SM90 probes show MHA,
+  GQA, MQA, and page-size-32 decode match the HF-style reference, while prefill
+  goes through FlashInfer TRT-LLM Gen FMHA and reports `Unsupported architecture`.
+  TRT-LLM MHA also rejects page size 1 (`16/32/64/128` only), and the shared
+  CUDA-graph decode helper currently mismatches on replay. Treat those as
+  backend-specific Phase 3 follow-ups.
 - Flex attention dense coverage required a small backend compatibility fix:
   PyTorch `create_block_mask` expects a plain mask function, so the Flex backend
   now exposes its causal/decode mask callbacks as static functions instead of
@@ -171,6 +178,12 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
+- `python -m py_compile test/manual/attention/unittest/dense/test_trtllm_mha.py`
+- `python test/manual/attention/unittest/dense/test_trtllm_mha.py -v`
+  - Ran 1 test in 0.534s after adding decode-only dense `trtllm_mha` coverage.
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+  - Ran 56 tests in 22.370s after adding decode-only dense `trtllm_mha`
+    coverage.
 - `python -m py_compile test/manual/attention/unittest/common/spec_runner.py test/manual/attention/unittest/mla/test_triton.py`
 - `python test/manual/attention/unittest/mla/test_triton.py -v`
   - Ran 6 tests in 1.012s after adding MLA Triton `DRAFT_EXTEND_V2`
