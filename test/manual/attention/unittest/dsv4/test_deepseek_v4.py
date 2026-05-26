@@ -38,6 +38,9 @@ from common.attention_methods.dsv4_attention import (  # noqa: E402
 from common.runner_modes.cuda_graph_decode_runner import (  # noqa: E402
     run_dsv4_cuda_graph_decode_case,
 )
+from common.runner_modes.speculative_draft_extend_runner import (  # noqa: E402
+    run_dsv4_eagle_draft_extend_cuda_graph_case,
+)
 from common.runner_modes.speculative_target_verify_runner import (  # noqa: E402
     run_dsv4_eagle_verify_cuda_graph_case,
 )
@@ -251,6 +254,30 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
         for case in self.DRAFT_EXTEND_CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_dsv4_draft_extend_attention_case(self, case)
+
+    # CUDA-graph capture/replay for EAGLE DRAFT_EXTEND — SWA only
+    # (init_forward_metadata_draft_extend uses need_compress=False; see
+    # `Production-Unsupported` in dsv4/README.md). Uniform `extend_lens`
+    # because DSV4 `forward(compress_ratio=0)` asserts
+    # `swa_page_indices.shape[0] == q.shape[0]` and the graph metadata
+    # builder uses uniform `num_tokens_per_bs = max_num_tokens // max_bs`
+    # (see `deepseek_v4_backend.py:646-647`).
+    EAGLE_DRAFT_EXTEND_CUDA_GRAPH_CASES = (
+        DSV4AttentionCase(
+            name="runner_cuda_graph_dsv4_swa_eagle_draft_extend",
+            backend="dsv4",
+            forward_mode=ForwardMode.DRAFT_EXTEND,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(64, 96),
+            extend_lens=(4, 4),
+        ),
+    )
+
+    def test_runner_mode_eagle_draft_extend_cuda_graph_cases(self):
+        for case in self.EAGLE_DRAFT_EXTEND_CUDA_GRAPH_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_dsv4_eagle_draft_extend_cuda_graph_case(self, case)
 
 
 if __name__ == "__main__":

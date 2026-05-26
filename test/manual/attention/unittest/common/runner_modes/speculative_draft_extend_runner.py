@@ -598,3 +598,93 @@ def run_mla_eagle_draft_extend_case(
         actual = run_mla_forward(fixture, fixture.forward_batch, inputs)
 
     torch.testing.assert_close(actual, expected, atol=MLA_ATOL, rtol=MLA_RTOL)
+
+
+def run_dsv4_eagle_draft_extend_cuda_graph_case(
+    testcase,
+    case,
+    *,
+    swa_size: int = 1024,
+    max_context_len: int = 256,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+    cuda_graph_capture_batch_size: int = 2,
+):
+    """DSV4 EAGLE DRAFT_EXTEND CUDA-graph capture/replay. SWA-only:
+    `init_forward_metadata_draft_extend` (`deepseek_v4_backend.py:636-663`)
+    hardcodes `need_compress=False`, so the C4/C128 metadata fields are
+    None and a `forward(compress_ratio=4 or 128)` would crash. The runner
+    asserts compress_ratio == 0 to make this explicit at the call site.
+    """
+    assert case.compress_ratio == 0, (
+        "DSV4 DRAFT_EXTEND is SWA-only — `init_forward_metadata_draft_extend` "
+        "uses `need_compress=False` so C4/C128 metadata is unpopulated. See "
+        "the 'Production-Unsupported' note in dsv4/README.md."
+    )
+    assert case.forward_mode.is_draft_extend(include_v2=True), (
+        f"run_dsv4_eagle_draft_extend_cuda_graph_case requires DRAFT_EXTEND; "
+        f"got {case.forward_mode}"
+    )
+    from ..attention_methods.dsv4_attention import (
+        DSV4_GRAPH_ATOL,
+        DSV4_GRAPH_RTOL,
+        build_dsv4_attention_fixture,
+        dsv4_fixture_inputs,
+        expected_dsv4_output_from_inputs,
+        make_dsv4_case_with_lens,
+        make_dsv4_padded_replay_inputs,
+        make_dsv4_random_inputs,
+        prepare_dsv4_runner_inputs,
+        run_dsv4_forward,
+    )
+    from ..attention_methods.dsv4_attention import (
+        _make_forward_batch as _make_dsv4_forward_batch,
+    )
+
+    # DSV4 graph contract requires uniform tokens per request: the graph-bound
+    # `init_forward_metadata_draft_extend` uses
+    # `num_tokens_per_bs = max_num_tokens // max_bs` and treats every request
+    # as having that many extend tokens. DSV4 forward then asserts that
+    # `swa_page_indices.shape[0] == q.shape[0]` via `_pad_tensor_to_size`,
+    # so q must also be the uniform per-request token count. Use a single
+    # `num_tokens_per_req = max(case.input_lens)` for both capture and replay
+    # (this differs from the MLA twin — MLA's forward tolerates ragged q vs
+    # padded metadata, DSV4 does not).
+    num_tokens_per_req = max(case.input_lens)
+    _run_draft_extend_cuda_graph_case(
+        testcase,
+        case,
+        build_fixture=build_dsv4_attention_fixture,
+        make_capture_case=lambda base, name, prefix_len, bs: make_dsv4_case_with_lens(
+            base, name, (prefix_len,) * bs, (num_tokens_per_req,) * bs
+        ),
+        make_replay_case=lambda base, name, pad_prefix_lens: make_dsv4_case_with_lens(
+            base,
+            name,
+            base.prefix_lens + pad_prefix_lens,
+            (num_tokens_per_req,) * (len(base.prefix_lens) + len(pad_prefix_lens)),
+        ),
+        make_forward_batch=_make_dsv4_forward_batch,
+        fixture_inputs=dsv4_fixture_inputs,
+        make_capture_inputs=make_dsv4_random_inputs,
+        make_replay_inputs=make_dsv4_padded_replay_inputs,
+        prepare_batch=lambda draft_case, batch: _prepare_eagle_draft_extend_batch(
+            draft_case, batch, device=device
+        ),
+        prepare_inputs=prepare_dsv4_runner_inputs,
+        run_forward=run_dsv4_forward,
+        expected_output=expected_dsv4_output_from_inputs,
+        build_kwargs=dict(
+            swa_size=swa_size,
+            max_context_len=max_context_len,
+            dtype=dtype,
+            device=device,
+        ),
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        capture_batch_size=cuda_graph_capture_batch_size,
+        atol=DSV4_GRAPH_ATOL,
+        rtol=DSV4_GRAPH_RTOL,
+        max_num_tokens=lambda _case, bs: bs * num_tokens_per_req,
+    )

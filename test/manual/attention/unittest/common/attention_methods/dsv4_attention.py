@@ -781,6 +781,28 @@ def make_dsv4_case_with_prefix_lens(
     )
 
 
+def make_dsv4_case_with_lens(
+    case: DSV4AttentionCase,
+    name: str,
+    prefix_lens: tuple[int, ...],
+    extend_lens: tuple[int, ...],
+) -> DSV4AttentionCase:
+    """Build a variant case with explicit prefix + extend lengths. Used by the
+    draft_extend graph runner where capture / replay both need to set both
+    fields independently (ragged accepted-token counts)."""
+    return DSV4AttentionCase(
+        name=name,
+        backend=case.backend,
+        forward_mode=case.forward_mode,
+        num_heads=case.num_heads,
+        page_size=case.page_size,
+        prefix_lens=prefix_lens,
+        extend_lens=extend_lens,
+        compress_ratio=case.compress_ratio,
+        attn_sink_value=case.attn_sink_value,
+    )
+
+
 def dsv4_fixture_inputs(fixture: DSV4AttentionFixture) -> dict[str, Any]:
     return {
         "prefix_hidden": fixture.prefix_hidden,
