@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025-2026 SGLang / AMD Contributors
-
 """FlyDSL sparse NSA prefill attention kernel for AMD gfx950 (MI350X).
 
 Online flash-attention over NSA sparse KV using MFMA 16x16x32 FP8 wave64.
