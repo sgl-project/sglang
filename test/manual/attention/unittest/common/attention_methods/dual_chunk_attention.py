@@ -4,6 +4,9 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
+from sglang.srt.layers.attention import (
+    dual_chunk_flashattention_backend as _dual_chunk_backend,
+)
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
@@ -35,6 +38,19 @@ DUAL_CHUNK_CONFIG = {
     "original_max_position_embeddings": 32768,
     "sparse_attention_enabled": False,
 }
+DUAL_CHUNK_SPARSE_ALL_COLUMN_CONFIG = {
+    **DUAL_CHUNK_CONFIG,
+    "sparse_attention_enabled": True,
+    "sparse_attention_threshold": 0,
+    "sparse_attention_last_q": 16,
+    "sparse_attention_config": {
+        0: {str(head_id): ("vertical_and_slash", 16, 16, None) for head_id in range(4)}
+    },
+}
+
+# Unit tests run without distributed initialization. Sparse dual-chunk config
+# lookup should see the single-rank default.
+_dual_chunk_backend.get_tensor_model_parallel_rank = lambda: 0
 
 
 @dataclass(frozen=True)
@@ -135,6 +151,21 @@ def make_dual_chunk_cases(backend: str) -> tuple[DualChunkAttentionCase, ...]:
     )
 
 
+def make_dual_chunk_sparse_cases(backend: str) -> tuple[DualChunkAttentionCase, ...]:
+    return (
+        DualChunkAttentionCase(
+            name="dual_chunk_sparse_prefill_all_columns",
+            backend=backend,
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(0,),
+            extend_lens=(16,),
+        ),
+    )
+
+
 class TinyDualChunkModelConfig:
     def __init__(
         self,
@@ -144,6 +175,7 @@ class TinyDualChunkModelConfig:
         head_dim: int,
         hidden_size: int,
         context_len: int,
+        dual_chunk_attention_config: dict | None = None,
     ):
         self.context_len = context_len
         self.hidden_size = hidden_size
@@ -163,7 +195,9 @@ class TinyDualChunkModelConfig:
             num_attention_heads=num_heads,
             num_key_value_heads=num_kv_heads,
             head_dim=head_dim,
-            dual_chunk_attention_config=DUAL_CHUNK_CONFIG,
+            dual_chunk_attention_config=(
+                dual_chunk_attention_config or DUAL_CHUNK_CONFIG
+            ),
         )
         self.hf_text_config = self.hf_config
 
@@ -460,6 +494,7 @@ def build_dual_chunk_attention_fixture(
     max_context_len: int = DEFAULT_MAX_CONTEXT_LEN,
     dtype: torch.dtype = DEFAULT_DTYPE,
     device: str = DEFAULT_DEVICE,
+    dual_chunk_attention_config: dict | None = None,
 ) -> DualChunkAttentionFixture:
     max_context_len = max(max_context_len, max(case.seq_lens))
     if max_context_len % case.page_size:
@@ -477,6 +512,7 @@ def build_dual_chunk_attention_fixture(
         head_dim=head_dim,
         hidden_size=hidden_size,
         context_len=max_context_len,
+        dual_chunk_attention_config=dual_chunk_attention_config,
     )
     runner = DualChunkMockModelRunner(
         case=case,
@@ -679,6 +715,30 @@ def run_dual_chunk_attention_case(
         max_context_len=max_context_len,
         dtype=dtype,
         device=device,
+    )
+    actual = run_dual_chunk_fixture_eager(fixture)
+    expected = expected_dual_chunk_fixture_output(fixture)
+    torch.testing.assert_close(actual, expected, atol=DENSE_ATOL, rtol=DENSE_RTOL)
+
+
+def run_dual_chunk_sparse_attention_case(
+    testcase,
+    case: DualChunkAttentionCase,
+    *,
+    max_context_len: int = DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = DEFAULT_DTYPE,
+    device: str = DEFAULT_DEVICE,
+) -> None:
+    fixture = build_dual_chunk_attention_fixture(
+        testcase,
+        case,
+        # The local sparse FlashAttention build only includes head_dim=128.
+        head_dim=128,
+        hidden_size=128,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        dual_chunk_attention_config=DUAL_CHUNK_SPARSE_ALL_COLUMN_CONFIG,
     )
     actual = run_dual_chunk_fixture_eager(fixture)
     expected = expected_dual_chunk_fixture_output(fixture)

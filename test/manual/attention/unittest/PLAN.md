@@ -35,7 +35,7 @@ Implemented:
   accumulation differences; chain verify and non-spec GDN paths keep `3e-2`.
 - Each attention-method folder now has a local `README.md` capability matrix and
   progress summary. Implemented folders are `dense/`, `swa/`, `mla/`, `gdn/`,
-  non-sparse `dual_chunk/`, plus DSA dense fallback and sparse top-k coverage. `dsv4/`
+  `dual_chunk/`, plus DSA dense fallback and sparse top-k coverage. `dsv4/`
   remains a deferred method fixture because it needs a DeepSeekV4-specific
   packed-cache reference.
 - Phase 3 dense runner integration is implemented for representative attention
@@ -142,8 +142,10 @@ Implemented:
   module and compares prefill/decode layouts against an independent PyTorch
   reference. The reference now covers non-sparse first-window, successor-chunk,
   and inter-chunk grouping with distinct `query`, `query_succ`, and
-  `query_inter` projection weights. Sparse-attention and critical-token
-  references remain future work.
+  `query_inter` projection weights, plus a sparse all-column prefill layout that
+  exercises the sparse vertical/slash kernel path with a dense-equivalent
+  reference. Sparse critical-token pruning beyond the all-column path remains
+  future work.
 - DSA has locally runnable Phase 2 fixtures in
   `common/attention_methods/dsa_attention.py`. It builds a DeepSeek-DSA-shaped
   runner with real `DSATokenToKVPool`, exercises the `dsa` backend's
@@ -242,20 +244,26 @@ In progress:
   to backend-specific blockers and hardware-gated paths documented in the
   implemented/deferred bullets.
 - Locally runnable Phase 2 expansion now covers the non-sparse, dense-fallback,
-  DSA sparse top-k, and torch-native SWA method fixtures identified in this pass.
-  Remaining Phase 2 work is compressed, hardware-gated, or sparse layouts beyond
-  the local DSA top-k slice.
+  DSA sparse top-k, dual-chunk sparse all-column, and torch-native SWA method
+  fixtures identified in this pass. Remaining Phase 2 work is compressed,
+  hardware-gated, or sparse pruning layouts beyond the local DSA/dual-chunk
+  slices.
 
 Next implementation steps:
 - Expand Phase 2 to additional attention methods/backends with method-specific
   fixtures rather than forcing them through the dense harness. Priority candidates:
   hardware-gated MLA kernels (`cutlass_mla`, `trtllm_mla`/`tokenspeed_mla` where
-  hardware and KV dtype support them), dual-chunk sparse layouts, additional DSA
-  index layouts, and DSV4-style methods.
+  hardware and KV dtype support them), dual-chunk sparse pruning layouts,
+  additional DSA index layouts, and DSV4-style methods.
 - Defer Phase 2 expansion for additional backends until representative Phase 3 and
   Phase 4 tests are passing.
 
 Latest verification:
+- Added dual-chunk sparse all-column Phase 2 coverage using the local
+  vertical/slash sparse FlashAttention kernel path.
+- `python -m py_compile test/manual/attention/unittest/common/attention_methods/dual_chunk_attention.py test/manual/attention/unittest/dual_chunk/test_dual_chunk_flash_attn.py`
+- `python test/manual/attention/unittest/dual_chunk/test_dual_chunk_flash_attn.py -v`
+  - Ran 2 tests in 0.658s after adding dual-chunk sparse all-column coverage.
 - Added DSA sparse top-k Phase 2 coverage for prefill (`flashmla_sparse`) and
   decode (`flashmla_kv`) with a production-shaped DSA projected-attention fixture.
 - `python -m py_compile test/manual/attention/unittest/common/attention_methods/dsa_attention.py test/manual/attention/unittest/dsa/test_dsa.py`
@@ -1160,6 +1168,9 @@ Initial implementation slice:
   decode, and GQA decode window boundaries using an explicit SDPA attention mask.
 - `dsa/test_dsa.py` covers DSA dense prefill fallback plus sparse top-k prefill
   and decode paths with a DSA-specific projected-attention fixture.
+- `dual_chunk/test_dual_chunk_flash_attn.py` covers non-sparse packed-query
+  layouts plus a sparse all-column prefill path that exercises the local
+  vertical/slash sparse kernel.
 - FlashInfer cases use `head_dim=64` to match FlashInfer kernel constraints.
 - `mla/test_triton.py` and `gdn/test_triton.py` cover the representative dense-style
   input edge cases for method-specific Triton paths.
