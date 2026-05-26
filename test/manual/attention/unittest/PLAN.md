@@ -149,6 +149,12 @@ Implemented:
   MHA_ONE_SHOT dense prefill fallback for no-prefix and prefix extend batches,
   and compares against the independent dense PyTorch reference. Sparse/indexer
   top-k prefill/decode remains future work.
+- DSV4 remains deferred from the default unit matrix because its CUDA backend is
+  not a compact backend swap: it hard-codes `head_dim=512`, `page_size=256`, and
+  the DeepSeekV4 packed FP8/BF16 KV-cache layout before routing through FlashMLA
+  and compression/indexer metadata. A correct unit fixture needs a DSV4-specific
+  reference that accounts for attention sinks, packed-cache quantization, and
+  compressed-index metadata rather than reusing the dense/MLA references.
 - FA3/FA4 CUDA-graph replay is intentionally not enabled yet. Dense eager and
   PCG/BCG split-op paths match the HF-style reference, but the shared decode
   CUDA-graph helper currently mismatches on replay for both FA backends. Local
@@ -245,6 +251,8 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
+- Documented the DSV4 unit-fixture blocker after checking the backend and memory
+  pool shape contracts.
 - Added DSA MHA_ONE_SHOT dense prefill fallback Phase 2 coverage with a real
   `DSATokenToKVPool` and independent dense PyTorch reference.
 - `python -m py_compile test/manual/attention/unittest/common/attention_methods/dsa_attention.py test/manual/attention/unittest/dsa/test_dsa.py`
