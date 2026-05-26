@@ -75,7 +75,11 @@ logger = logging.getLogger(__name__)
 
 
 class Fp8Config(QuantizationConfig):
-    """Config class for FP8."""
+    """Config class for FP8.
+
+    No-arg ``Fp8Config()`` selects online (post-load) weight quantization:
+    ``is_checkpoint_fp8_serialized=False`` with ``activation_scheme="dynamic"``.
+    """
 
     def __init__(
         self,
