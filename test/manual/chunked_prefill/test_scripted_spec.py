@@ -51,7 +51,6 @@ class TestScriptedSpec(CustomTestCase):
         assert r.finished
         assert r.chunks_done >= 2
 
-    @unittest.skip("requires real spec topology — wire up when fixture lands")
     def test_spec_chunked_handoff_first_verify(self):
         """First spec verify after chunked prefill must include all chunked tokens with right prefix length."""
         execute_scripted_runtime(
@@ -77,7 +76,6 @@ class TestScriptedSpec(CustomTestCase):
             f"{r.spec_verify_count}"
         )
 
-    @unittest.skip("requires real spec topology — wire up when fixture lands")
     def test_spec_acceptance_chunked_matches_baseline(self):
         """Chunked vs non-chunked spec acceptance rate must be approximately equal."""
         execute_scripted_runtime(
@@ -105,7 +103,6 @@ class TestScriptedSpec(CustomTestCase):
             f"baseline={r_baseline.spec_accept_rate:.3f})"
         )
 
-    @unittest.skip("requires real spec topology — wire up when fixture lands")
     def test_spec_abort_during_chunked_prepare(self):
         """Spec draft prepare + chunked abort must reset draft state cleanly."""
         execute_scripted_runtime(
@@ -128,7 +125,6 @@ class TestScriptedSpec(CustomTestCase):
             r.spec_draft_state_cleared
         ), "spec draft state must be cleared after abort during chunked prefill"
 
-    @unittest.skip("requires real EAGLE + disagg topology — wire up when fixture lands")
     def test_spec_eagle_disagg_chunked(self):
         """EAGLE + disagg + chunked last chunk must land topk_p, topk_index, hidden_states."""
         execute_scripted_runtime(
