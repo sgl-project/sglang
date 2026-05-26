@@ -773,9 +773,8 @@ class SchedulerDisaggregationPrefillMixin:
         # post-send value, the reset was skipped and the decode peer
         # would receive garbage slots. See commit 414efd4a27 for the
         # original bug.
-        if (
-            req.retraction_count > req._send_kv_chunk_last_retraction_count
-            and (req.start_send_idx > 0 or req.tmp_end_idx >= 0)
+        if req.retraction_count > req._send_kv_chunk_last_retraction_count and (
+            req.start_send_idx > 0 or req.tmp_end_idx >= 0
         ):
             req.disagg_send_state_leak_after_retract_count += 1
         req._send_kv_chunk_last_retraction_count = req.retraction_count
