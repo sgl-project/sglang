@@ -12,8 +12,9 @@ from sglang.test.kv_canary.e2e_base import CanaryE2EBase
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
 
 _SPEC_EAGLE_TOKEN_ORACLE_ENV = {
-    "SGLANG_KV_CANARY_INPUT_CHECK": "0",
+    "SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT": "0",
     "SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE": "1",
+    "SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT": "0",
 }
 _SPEC_EAGLE_REVERT_PR_ENV = {
     **_SPEC_EAGLE_TOKEN_ORACLE_ENV,
@@ -63,7 +64,7 @@ class _EaglePositionsBase(CanaryE2EBase):
         if self.revert_pr:
             self.assert_violation_logged_any(
                 launch_tag_patterns=("*",),
-                fail_reason="position",
+                fail_reason="verify_position",
                 flush_wait_seconds=0.0,
             )
         else:

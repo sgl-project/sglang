@@ -45,7 +45,7 @@ class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
         # while the orphan slots are still cached.
         self.send_parallel_requests(n=8)
         self.assert_sweep_violation_reported(
-            fail_reason="real_kv_hash",
+            fail_reason="verify_real_kv_hash",
             target_group=self.target_group,
             flush_wait_seconds=5.0,
         )

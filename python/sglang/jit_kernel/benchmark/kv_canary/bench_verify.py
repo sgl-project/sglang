@@ -113,9 +113,11 @@ def _build_verify_inputs(case: BenchCase, *, device: torch.device) -> Tuple[
 
     num_valid = torch.tensor([total_entries], dtype=torch.int32, device=device)
     enable = torch.ones(1, dtype=torch.int32, device=device)
+    expected_input_ids = torch.full((capacity,), -1, dtype=torch.int64, device=device)
     plan = VerifyPlan(
         verify_slot_indices=slot_indices,
-        verify_positions=positions,
+        verify_expected_tokens=expected_input_ids,
+        verify_expected_positions=positions,
         verify_prev_slot_indices=prev_slots,
         verify_num_valid=num_valid,
         enable=enable,
@@ -235,6 +237,7 @@ def benchmark(
             launch_canary_verify_kernel(
                 context=context,
                 plan=plan,
+                check_verify_expected_token=True,
             )
 
     else:
@@ -301,6 +304,7 @@ def benchmark_kernel_kind(
         launch_canary_verify_kernel(
             context=context,
             plan=plan,
+            check_verify_expected_token=True,
         )
 
     return run_benchmark(fn)

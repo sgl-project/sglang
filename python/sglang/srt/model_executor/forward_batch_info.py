@@ -434,6 +434,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
 
+    # kv-canary token-id validator snapshot
+    req_all_ids_flat: Optional[torch.Tensor] = None
+    req_all_ids_lens: Optional[torch.Tensor] = None
+
     @classmethod
     def init_new(
         cls,
@@ -558,6 +562,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             batch.sampling_info.bootstrap_room_ids_int = bootstrap_room_ids
             ret.rids_int = hashed
             ret.bootstrap_room_ids_int = bootstrap_room_ids
+
+        if envs.SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT.get():
+            from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
+                compute_req_all_ids_info,
+            )
+
+            ret.req_all_ids_flat, ret.req_all_ids_lens = compute_req_all_ids_info(
+                batch.reqs
+            )
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (

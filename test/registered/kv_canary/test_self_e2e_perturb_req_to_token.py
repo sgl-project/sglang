@@ -23,7 +23,7 @@ class _PerturbReqToTokenBase(CanaryE2EBase):
         """Verify req_to_token perturbation reports a chain hash violation."""
         for _ in range(self.workload_n_batches):
             self.send_parallel_requests()
-        self.assert_per_forward_violation_reported(fail_reason="chain_hash")
+        self.assert_per_forward_violation_reported(fail_reason="verify_chain_hash")
         self.maybe_assert_swa_divergence_observed()
 
 

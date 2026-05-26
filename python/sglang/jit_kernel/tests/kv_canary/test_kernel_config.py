@@ -251,7 +251,7 @@ def test_plan_byte_equal_across_repeated_launches_10x() -> None:
 
         n_verify = int(triton_v.verify_num_valid[0].item())
         snapshot_slots.append(triton_v.verify_slot_indices[:n_verify].clone())
-        snapshot_positions.append(triton_v.verify_positions[:n_verify].clone())
+        snapshot_positions.append(triton_v.verify_expected_positions[:n_verify].clone())
         snapshot_prevs.append(triton_v.verify_prev_slot_indices[:n_verify].clone())
         snapshot_write_offsets.append(triton_w.write_offsets.clone())
 
@@ -261,7 +261,7 @@ def test_plan_byte_equal_across_repeated_launches_10x() -> None:
         ), f"verify_slot_indices differs between launch 0 and {i}"
         assert torch.equal(
             snapshot_positions[0], snapshot_positions[i]
-        ), f"verify_positions differs between launch 0 and {i}"
+        ), f"verify_expected_positions differs between launch 0 and {i}"
         assert torch.equal(
             snapshot_prevs[0], snapshot_prevs[i]
         ), f"verify_prev_slot_indices differs between launch 0 and {i}"
@@ -298,6 +298,7 @@ def test_verify_multi_launch_100x_counter_linear() -> None:
                 real_kv_hash_mode=consts.RealKvHashMode.NONE,
             ),
             plan=plan_cuda,
+            check_verify_expected_token=True,
         )
 
     torch.cuda.synchronize()
@@ -308,6 +309,57 @@ def test_verify_multi_launch_100x_counter_linear() -> None:
     assert int(cuda_log.slot_run_counter[0].item()) == num_launches, (
         f"slot_run_counter expected {num_launches} (1 active entry x 100 launches), "
         f"got {cuda_log.slot_run_counter[0].item()}"
+    )
+
+
+def test_verify_check_disabled_byte_equal() -> None:
+    """check_verify_expected_token True vs False produce equivalent violation logs on a clean plan."""
+    plan_true_cuda, plan_true_ref = _build_verify_plan_5_entries(device=_DEVICE)
+    plan_false_cuda, plan_false_ref = _build_verify_plan_5_entries(device=_DEVICE)
+
+    cuda_buf_true, ref_buf_true = make_canary_buf_pair(
+        num_slots=16, slot_stride_bytes=32, device=_DEVICE
+    )
+    cuda_buf_false, ref_buf_false = make_canary_buf_pair(
+        num_slots=16, slot_stride_bytes=32, device=_DEVICE
+    )
+    cuda_log_true, ref_log_true = make_log_pair(capacity=64, device=_DEVICE)
+    cuda_log_false, ref_log_false = make_log_pair(capacity=64, device=_DEVICE)
+
+    _run_both_verify(
+        cuda_canary_buf=cuda_buf_true,
+        ref_canary_buf=ref_buf_true,
+        plan_cuda=plan_true_cuda,
+        plan_ref=plan_true_ref,
+        cuda_log=cuda_log_true,
+        ref_log=ref_log_true,
+        real_kv_sources_cuda=(),
+        real_kv_sources_ref=(),
+        real_kv_hash_mode=consts.RealKvHashMode.NONE,
+        kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+        check_verify_expected_token=True,
+    )
+    _run_both_verify(
+        cuda_canary_buf=cuda_buf_false,
+        ref_canary_buf=ref_buf_false,
+        plan_cuda=plan_false_cuda,
+        plan_ref=plan_false_ref,
+        cuda_log=cuda_log_false,
+        ref_log=ref_log_false,
+        real_kv_sources_cuda=(),
+        real_kv_sources_ref=(),
+        real_kv_hash_mode=consts.RealKvHashMode.NONE,
+        kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+        check_verify_expected_token=False,
+    )
+
+    assert int(cuda_log_true.write_index[0].item()) == 0
+    assert int(cuda_log_false.write_index[0].item()) == 0
+    assert torch.equal(cuda_log_true.ring, cuda_log_false.ring)
+    assert torch.equal(cuda_log_true.write_index, cuda_log_false.write_index)
+    assert torch.equal(cuda_log_true.slot_run_counter, cuda_log_false.slot_run_counter)
+    assert torch.equal(
+        cuda_log_true.kernel_run_counter, cuda_log_false.kernel_run_counter
     )
 
 

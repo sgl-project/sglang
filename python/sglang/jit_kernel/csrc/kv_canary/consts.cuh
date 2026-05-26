@@ -29,11 +29,12 @@ constexpr int kViolationFieldExpectedAux = 6;
 constexpr int kViolationFieldFailReasonBits = 7;
 
 enum class FailReason : int64_t {
-  kChainHash = 1LL << 0,
-  kPosition = 1LL << 1,
-  kRealKvHash = 1LL << 2,
+  kVerifyChainHashMismatch = 1LL << 0,
+  kVerifyPositionMismatch = 1LL << 1,
+  kVerifyRealKvHashMismatch = 1LL << 2,
   kWriteTokenMismatch = 1LL << 3,
   kWritePositionMismatch = 1LL << 4,
+  kVerifyTokenMismatch = 1LL << 5,
 };
 
 constexpr FailReason operator|(FailReason a, FailReason b) {

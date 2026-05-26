@@ -238,7 +238,7 @@ def benchmark(
                 input_ids=inputs["input_ids"],
                 positions=inputs["positions"],
                 out_cache_loc=inputs["out_cache_loc"],
-                enable_assert_inputs=False,
+                enable_write_input_assert=False,
                 expected_input_tokens=inputs["expected_input_tokens"],
                 expected_input_positions=inputs["expected_input_positions"],
             )
@@ -298,7 +298,7 @@ def benchmark_kernel_kind(
             input_ids=inputs["input_ids"],
             positions=inputs["positions"],
             out_cache_loc=inputs["out_cache_loc"],
-            enable_assert_inputs=enable_write_verify_inputs,
+            enable_write_input_assert=enable_write_verify_inputs,
             expected_input_tokens=inputs["expected_input_tokens"],
             expected_input_positions=inputs["expected_input_positions"],
         )

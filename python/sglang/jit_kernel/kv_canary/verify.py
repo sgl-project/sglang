@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Final
 import torch
 
 from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -172,7 +172,13 @@ class VerifyPlan:
     Fields:
         verify_slot_indices: Canary slot index per entry, shape [verify_capacity], int64. Already SWA-translated
             for the SWA group.
-        verify_positions: Expected sequence position per entry, shape [verify_capacity], int64.
+        verify_expected_tokens: Source-of-truth token id per entry, shape [verify_capacity], int64.
+            The plan-side entries kernel gathers from
+            ``CanaryDeviceState.req_to_verify_expected_tokens[rp, position + kv_token_id_vs_position_offset]``;
+            entries that fall outside the pool's row (e.g. EAGLE draft's last slot rotating in a bonus
+            token, or padding beyond the per-req length) get the ``-1`` sentinel. The verify kernel
+            compares against the stored canary token and skips when this is ``-1``.
+        verify_expected_positions: Expected sequence position per entry, shape [verify_capacity], int64.
         verify_prev_slot_indices: Chain predecessor slot per entry, shape [verify_capacity], int64. -1 = chain
             head (anchor on CANARY_CHAIN_ANCHOR). Explicit (not derived from verify_slot_indices[i-1])
             because chain heads, SWA window starts, cross-req boundaries, and radix-orphan extras break the
@@ -185,7 +191,8 @@ class VerifyPlan:
     """
 
     verify_slot_indices: torch.Tensor
-    verify_positions: torch.Tensor
+    verify_expected_tokens: torch.Tensor
+    verify_expected_positions: torch.Tensor
     verify_prev_slot_indices: torch.Tensor
     verify_num_valid: torch.Tensor
     enable: torch.Tensor
@@ -200,7 +207,10 @@ class VerifyPlan:
             verify_slot_indices=torch.empty(
                 verify_capacity, dtype=torch.int64, device=device
             ),
-            verify_positions=torch.empty(
+            verify_expected_tokens=torch.empty(
+                verify_capacity, dtype=torch.int64, device=device
+            ),
+            verify_expected_positions=torch.empty(
                 verify_capacity, dtype=torch.int64, device=device
             ),
             verify_prev_slot_indices=torch.empty(
@@ -217,7 +227,10 @@ class VerifyPlan:
         """WARN: ONLY use it when testing plan kernel. Do not use it when testing verify or
         write kernel to avoid hiding bugs."""
         self.verify_slot_indices.zero_()
-        self.verify_positions.zero_()
+        # Test helpers expect the "skip token check" sentinel after zero-out, matching
+        # the verify-kernel contract.
+        self.verify_expected_tokens.fill_(-1)
+        self.verify_expected_positions.zero_()
         self.verify_prev_slot_indices.zero_()
         self.verify_num_valid.zero_()
         self.enable.zero_()
@@ -228,6 +241,7 @@ def launch_canary_verify_kernel(
     *,
     context: VerifyOrWriteContext,
     plan: VerifyPlan,
+    check_verify_expected_token: bool,
 ) -> None:
     """Verify one canary buffer against a VerifyPlan.
 
@@ -299,7 +313,8 @@ def launch_canary_verify_kernel(
 
     _assert_contiguous(canary_buf, "canary_buf")
     _assert_contiguous(plan.verify_slot_indices, "plan.verify_slot_indices")
-    _assert_contiguous(plan.verify_positions, "plan.verify_positions")
+    _assert_contiguous(plan.verify_expected_tokens, "plan.verify_expected_tokens")
+    _assert_contiguous(plan.verify_expected_positions, "plan.verify_expected_positions")
     _assert_contiguous(plan.verify_prev_slot_indices, "plan.verify_prev_slot_indices")
     _assert_contiguous(plan.verify_num_valid, "plan.verify_num_valid")
     _assert_contiguous(plan.enable, "plan.enable")
@@ -312,11 +327,12 @@ def launch_canary_verify_kernel(
         real_kv_sources=real_kv_sources, device=canary_buf.device
     )
 
-    module = _jit_canary_verify_module()
+    module = _jit_canary_verify_module(check_verify_expected_token)
     module.canary_verify_step_cuda(
         canary_buf,
         plan.verify_slot_indices,
-        plan.verify_positions,
+        plan.verify_expected_tokens,
+        plan.verify_expected_positions,
         plan.verify_prev_slot_indices,
         plan.verify_num_valid,
         plan.enable,
@@ -336,12 +352,17 @@ def launch_canary_verify_kernel(
 
 
 @cache_once
-def _jit_canary_verify_module() -> "Module":
+def _jit_canary_verify_module(check_verify_expected_token: bool) -> "Module":
+    args = make_cpp_args(check_verify_expected_token)
     return load_jit(
         "kv_canary_verify",
+        *args,
         cuda_files=["kv_canary/canary_verify.cuh"],
         cuda_wrappers=[
-            ("canary_verify_step_cuda", "canary::canary_verify_step_cuda"),
+            (
+                "canary_verify_step_cuda",
+                f"canary::CanaryVerifyKernel<{args}>::run",
+            ),
         ],
     )
 

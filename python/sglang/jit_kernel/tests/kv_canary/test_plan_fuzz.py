@@ -41,6 +41,8 @@ class PlanFuzzInputs:
     full_to_swa_index_mapping: Optional[torch.Tensor]
     verify_capacity: int
     write_req_capacity: int
+    req_to_verify_expected_tokens: Optional[torch.Tensor]
+    kv_token_id_vs_position_offset: int
 
 
 def _draw_random_plan_inputs(rng: random.Random) -> PlanFuzzInputs:
@@ -117,6 +119,27 @@ def _draw_random_plan_inputs(rng: random.Random) -> PlanFuzzInputs:
     else:
         full_to_swa = None
 
+    expected_pool_present = rng.random() < 0.5
+    kv_token_id_vs_position_offset = rng.choice([0, 1])
+    expected_pool: Optional[torch.Tensor]
+    if expected_pool_present:
+        pool_max_context_len = rng.choice(
+            [
+                max(1, max_seq_len // 4),
+                max(1, max_seq_len // 2),
+                max_seq_len,
+            ]
+        )
+        expected_pool = torch.randint(
+            low=0,
+            high=50000,
+            size=(max_reqs, pool_max_context_len),
+            dtype=torch.int32,
+            device=_DEVICE,
+        )
+    else:
+        expected_pool = None
+
     return PlanFuzzInputs(
         req_pool_indices=req_pool_indices,
         prefix_lens=prefix_lens,
@@ -126,6 +149,8 @@ def _draw_random_plan_inputs(rng: random.Random) -> PlanFuzzInputs:
         full_to_swa_index_mapping=full_to_swa,
         verify_capacity=verify_capacity,
         write_req_capacity=write_req_capacity,
+        req_to_verify_expected_tokens=expected_pool,
+        kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
     )
 
 
@@ -151,6 +176,8 @@ def _run_one(inputs: PlanFuzzInputs) -> tuple:
         ),
         swa_window_size=inputs.swa_window_size,
         full_to_swa_index_mapping=inputs.full_to_swa_index_mapping,
+        req_to_verify_expected_tokens=inputs.req_to_verify_expected_tokens,
+        kv_token_id_vs_position_offset=inputs.kv_token_id_vs_position_offset,
     )
     PlanInvariants.assert_all(
         verify_plan=triton_v,
@@ -172,7 +199,9 @@ def _summarize(inputs: PlanFuzzInputs) -> str:
         f"bs={int(inputs.req_pool_indices.shape[0])} "
         f"swa={inputs.swa_window_size} "
         f"verify_cap={inputs.verify_capacity} write_cap={inputs.write_req_capacity} "
-        f"has_lut={inputs.full_to_swa_index_mapping is not None}"
+        f"has_lut={inputs.full_to_swa_index_mapping is not None} "
+        f"has_pool={inputs.req_to_verify_expected_tokens is not None} "
+        f"offset={inputs.kv_token_id_vs_position_offset}"
     )
 
 

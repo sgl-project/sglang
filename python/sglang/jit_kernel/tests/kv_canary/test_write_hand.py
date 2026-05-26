@@ -230,6 +230,7 @@ class TestSeedSlot:
                 real_kv_hash_mode=consts.RealKvHashMode.NONE,
             ),
             plan=verify_plan,
+            check_verify_expected_token=True,
         )
         torch.cuda.synchronize()
         assert int(verify_log.write_index[0].item()) == 0
@@ -623,6 +624,7 @@ class TestMockMode:
                 real_kv_hash_mode=consts.RealKvHashMode.NONE,
             ),
             plan=verify_plan,
+            check_verify_expected_token=True,
         )
         torch.cuda.synchronize()
         assert int(verify_log.write_index[0].item()) == 0
@@ -1008,7 +1010,7 @@ class TestRealKvHash:
                 input_ids=input_ids,
                 positions=positions,
                 out_cache_loc=out_cache_loc,
-                enable_assert_inputs=False,
+                enable_write_input_assert=False,
                 expected_input_tokens=None,
                 expected_input_positions=None,
             )
@@ -1186,7 +1188,7 @@ class TestRealKvHash:
                 input_ids=_int32_tensor([1]),
                 positions=_int32_tensor([0]),
                 out_cache_loc=_int32_tensor([2]),
-                enable_assert_inputs=False,
+                enable_write_input_assert=False,
                 expected_input_tokens=None,
                 expected_input_positions=None,
             )
@@ -1366,7 +1368,7 @@ class TestMisc:
                 input_ids=input_ids,
                 positions=positions,
                 out_cache_loc=out_cache_loc,
-                enable_assert_inputs=False,
+                enable_write_input_assert=False,
                 expected_input_tokens=None,
                 expected_input_positions=None,
             )

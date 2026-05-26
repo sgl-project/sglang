@@ -38,7 +38,10 @@ class TestAttachCanaryBuffers(PoolPatchHelper, CustomTestCase):
         """Verify MHA pools allocate only full canary buffers."""
         pool = make_mha_pool(self.device, num_slots=16, dim=8, layer_num=2)
         groups_tuple = attach_canary_buffers(
-            pool=pool, config=self.config, device=self.device
+            pool=pool,
+            config=self.config,
+            device=self.device,
+            kv_token_id_vs_position_offset=0,
         )
         groups = {g.kind: g for g in groups_tuple}
         self.assertEqual(set(groups.keys()), {PoolKind.FULL})
@@ -53,7 +56,10 @@ class TestAttachCanaryBuffers(PoolPatchHelper, CustomTestCase):
         """Verify SWA pools allocate full and SWA canary buffers."""
         pool = make_swa_pool(self.device, full_slots=16, swa_slots=8)
         groups_tuple = attach_canary_buffers(
-            pool=pool, config=self.config, device=self.device
+            pool=pool,
+            config=self.config,
+            device=self.device,
+            kv_token_id_vs_position_offset=0,
         )
         groups = {g.kind: g for g in groups_tuple}
         self.assertEqual(set(groups.keys()), {PoolKind.FULL, PoolKind.SWA})
@@ -100,6 +106,7 @@ class TestRealKvSources(PoolPatchHelper, CustomTestCase):
                     enable_chain_position_assert=enable_chain_position_assert,
                 ),
                 plan=plan,
+                check_verify_expected_token=True,
             )
 
 
@@ -114,7 +121,10 @@ class TestPoolPatchBufferInfos(PoolPatchHelper, CustomTestCase):
 
                 if patched:
                     attach_canary_buffers(
-                        pool=pool, config=self.config, device=self.device
+                        pool=pool,
+                        config=self.config,
+                        device=self.device,
+                        kv_token_id_vs_position_offset=0,
                     )
                     ptrs_after, _, _ = pool.get_contiguous_buf_infos()
                     self.assertEqual(len(ptrs_after), n_before + 4)
@@ -128,7 +138,12 @@ class TestPoolPatchBufferInfos(PoolPatchHelper, CustomTestCase):
         contiguous_before, _, _ = pool.get_contiguous_buf_infos()
         state_before, _, _ = pool.get_state_buf_infos()
 
-        attach_canary_buffers(pool=pool, config=self.config, device=self.device)
+        attach_canary_buffers(
+            pool=pool,
+            config=self.config,
+            device=self.device,
+            kv_token_id_vs_position_offset=0,
+        )
 
         contiguous_after, _, _ = pool.get_contiguous_buf_infos()
         state_after, _, _ = pool.get_state_buf_infos()
@@ -142,7 +157,10 @@ class TestPoolPatchBufferInfos(PoolPatchHelper, CustomTestCase):
         v_ptrs_orig = [b.data_ptr() for b in pool.v_buffer]
 
         groups_tuple = attach_canary_buffers(
-            pool=pool, config=self.config, device=self.device
+            pool=pool,
+            config=self.config,
+            device=self.device,
+            kv_token_id_vs_position_offset=0,
         )
         group = {g.kind: g for g in groups_tuple}[PoolKind.FULL]
         ptrs_after, _, _ = pool.get_contiguous_buf_infos()
@@ -164,7 +182,10 @@ class TestCanaryBufferBudget(PoolPatchHelper, CustomTestCase):
         """Verify canary per-token storage stays below the real KV budget."""
         pool = make_mha_pool(self.device, num_slots=16, dim=64, layer_num=2)
         groups_tuple = attach_canary_buffers(
-            pool=pool, config=self.config, device=self.device
+            pool=pool,
+            config=self.config,
+            device=self.device,
+            kv_token_id_vs_position_offset=0,
         )
         group = {g.kind: g for g in groups_tuple}[PoolKind.FULL]
 

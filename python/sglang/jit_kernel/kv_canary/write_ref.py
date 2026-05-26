@@ -22,7 +22,7 @@ def launch_canary_write_kernel_torch_reference(
     input_ids: torch.Tensor,
     positions: torch.Tensor,
     out_cache_loc: torch.Tensor,
-    enable_assert_inputs: bool,
+    enable_write_input_assert: bool,
     expected_input_tokens: torch.Tensor | None,
     expected_input_positions: torch.Tensor | None,
 ) -> None:
@@ -77,10 +77,10 @@ def launch_canary_write_kernel_torch_reference(
             f"kv-canary: canary_buf slot stride must hold at least 4 int64 fields, got {slot_stride_i64}"
         )
 
-    if enable_assert_inputs:
+    if enable_write_input_assert:
         if expected_input_tokens is None or expected_input_positions is None:
             raise ValueError(
-                "kv-canary: expected input tensors are required when enable_assert_inputs=True"
+                "kv-canary: expected input tensors are required when enable_write_input_assert=True"
             )
         expected_input_tokens_host = expected_input_tokens.detach().to(
             device=work_device, dtype=torch.int64
@@ -91,7 +91,7 @@ def launch_canary_write_kernel_torch_reference(
     else:
         if expected_input_tokens is not None or expected_input_positions is not None:
             raise ValueError(
-                "kv-canary: expected input tensors must be None when enable_assert_inputs=False"
+                "kv-canary: expected input tensors must be None when enable_write_input_assert=False"
             )
         expected_input_tokens_host = None
         expected_input_positions_host = None
@@ -134,7 +134,7 @@ def launch_canary_write_kernel_torch_reference(
                 work_device=work_device,
             )
 
-            if enable_assert_inputs:
+            if enable_write_input_assert:
                 assert expected_input_tokens_host is not None
                 assert expected_input_positions_host is not None
                 mismatch_bits = consts.FailReason(0)

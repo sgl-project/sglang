@@ -14,6 +14,7 @@ from sglang.srt.kv_canary.pool_patch.adapters.mha import attach_mha
 from sglang.srt.kv_canary.pool_patch.adapters.swa import attach_swa
 from sglang.srt.kv_canary.pool_patch.api import register_pool_attacher
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 DEFAULT_DEVICE: torch.device = torch.device("cuda")
 
@@ -137,7 +138,8 @@ def make_base_config() -> CanaryConfig:
         ring_capacity=1024,
         sweep_interval=0,
         real_kv_hash_mode=consts.RealKvHashMode.NONE,
-        input_check_mode=False,
+        enable_write_input_assert=False,
+        enable_verify_token_assert=True,
         stats_print_every_n_steps=100,
     )
 
@@ -149,7 +151,9 @@ def make_req_to_token_pool(
     max_seq_len: int = 32,
 ) -> SimpleNamespace:
     req_to_token = torch.zeros(max_reqs, max_seq_len, dtype=torch.int32, device=device)
-    return SimpleNamespace(req_to_token=req_to_token, size=max_reqs)
+    return SimpleNamespace(
+        req_to_token=req_to_token, size=max_reqs, max_context_len=max_seq_len
+    )
 
 
 def make_forward_batch(
@@ -190,20 +194,16 @@ def make_forward_batch(
     if out_cache_loc is None:
         out_cache_loc = torch.zeros(bs, dtype=torch.int32, device=device)
 
-    is_decode_or_idle = not (is_extend or is_target_verify or is_draft_extend_v2)
-    mode = SimpleNamespace(
-        is_extend=lambda include_draft_extend_v2=False: is_extend
-        or (include_draft_extend_v2 and is_draft_extend_v2),
-        is_extend_or_draft_extend_or_mixed=lambda include_draft_extend_v2=False: is_extend
-        or (include_draft_extend_v2 and is_draft_extend_v2),
-        is_mixed=lambda: False,
-        is_decode=lambda: is_decode_or_idle,
-        is_decode_or_idle=lambda: is_decode_or_idle,
-        is_target_verify=lambda: is_target_verify,
-        is_draft_extend_v2=lambda: is_draft_extend_v2,
-    )
+    if is_extend:
+        forward_mode = ForwardMode.EXTEND
+    elif is_target_verify:
+        forward_mode = ForwardMode.TARGET_VERIFY
+    elif is_draft_extend_v2:
+        forward_mode = ForwardMode.DRAFT_EXTEND_V2
+    else:
+        forward_mode = ForwardMode.DECODE
     return SimpleNamespace(
-        forward_mode=mode,
+        forward_mode=forward_mode,
         batch_size=bs,
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens,
@@ -217,6 +217,8 @@ def make_forward_batch(
         positions=positions,
         out_cache_loc=out_cache_loc,
         num_token_non_padded_cpu=num_token_non_padded_cpu,
+        req_all_ids_flat=None,
+        req_all_ids_lens=None,
     )
 
 
@@ -229,6 +231,7 @@ def make_buffer_group(
     real_kv_source: Optional[RealKvSource] = None,
     swa_index_lut: Optional[torch.Tensor] = None,
     num_slots: int = 4,
+    kv_token_id_vs_position_offset: int = 0,
 ) -> CanaryBufferGroup:
     def _zero() -> torch.Tensor:
         return torch.zeros(
@@ -255,6 +258,7 @@ def make_buffer_group(
         real_kv_sources_k=real_kv_sources,
         real_kv_sources_v=real_kv_sources if has_v else (),
         swa_index_lut=swa_index_lut,
+        kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
     )
 
 

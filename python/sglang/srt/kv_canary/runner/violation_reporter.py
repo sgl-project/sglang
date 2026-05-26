@@ -10,13 +10,11 @@ from sglang.srt.kv_canary.state import CanaryDeviceState
 logger = logging.getLogger(__name__)
 
 _WRITE_BITS = FailReason.WRITE_TOKEN_MISMATCH | FailReason.WRITE_POSITION_MISMATCH
-_REASON_LABELS: dict[FailReason, str] = {
-    FailReason.CHAIN_HASH: "chain_hash",
-    FailReason.POSITION: "position",
-    FailReason.REAL_KV_HASH: "real_kv_hash",
-    FailReason.WRITE_TOKEN_MISMATCH: "write_token",
-    FailReason.WRITE_POSITION_MISMATCH: "write_position",
-}
+_TOKEN_BITS = FailReason.WRITE_TOKEN_MISMATCH | FailReason.VERIFY_TOKEN_MISMATCH
+
+
+def _reason_label(bit: FailReason) -> str:
+    return bit.name.lower().removesuffix("_mismatch")
 
 
 class ViolationReporter:
@@ -105,7 +103,7 @@ def _format_violation(
         tag_label = f"unknown({int(kernel_kind)})"
         canary_kind = tag_label
     bits_int = int(fail_reason_bits)
-    reasons = [label for bit, label in _REASON_LABELS.items() if bits_int & int(bit)]
+    reasons = [_reason_label(bit) for bit in FailReason if bits_int & int(bit)]
     is_write = bool(bits_int & int(_WRITE_BITS))
     u64_mask = (1 << 64) - 1
 
@@ -136,6 +134,7 @@ def _format_violation(
         f"step_when_pumped={step_when_pumped}"
     )
 
+    has_token_check = bool(bits_int & int(_TOKEN_BITS))
     if is_write:
         running_prev_hash = int(stored_chain_hash) & u64_mask
         body = [
@@ -150,12 +149,15 @@ def _format_violation(
     else:
         stored_prev_hash = int(stored_chain_hash) & u64_mask
         expected_prev_hash = int(expected_aux) & u64_mask
-        body = [
-            (
-                f"  stored:   token_id={int(stored_token)}   position={int(position)} "
-                f"prev_hash={stored_prev_hash:#018x}"
-            ),
-            f"  expected: prev_hash={expected_prev_hash:#018x}",
-        ]
+        stored_body = (
+            f"  stored:   token_id={int(stored_token)}   position={int(position)} "
+            f"prev_hash={stored_prev_hash:#018x}"
+        )
+        expected_body = (
+            f"  expected: token_id={int(expected_token)} prev_hash={expected_prev_hash:#018x}"
+            if has_token_check
+            else f"  expected: prev_hash={expected_prev_hash:#018x}"
+        )
+        body = [stored_body, expected_body]
 
     return "\n".join([structured_line, header, kind_line, reasons_line, *body, footer])

@@ -18,6 +18,7 @@ def launch_canary_verify_kernel_torch_reference(
     *,
     context: VerifyOrWriteContext,
     plan: VerifyPlan,
+    check_verify_expected_token: bool,
 ) -> None:
     canary_buf = context.canary_buf
     kernel_kind = context.kernel_kind
@@ -47,7 +48,15 @@ def launch_canary_verify_kernel_torch_reference(
     slot_indices_host = plan.verify_slot_indices[:active].to(
         device=work_device, dtype=torch.int64
     )
-    expected_positions_host = plan.verify_positions[:active].to(
+    if check_verify_expected_token:
+        expected_input_ids_host = plan.verify_expected_tokens[:active].to(
+            device=work_device, dtype=torch.int64
+        )
+    else:
+        expected_input_ids_host = torch.full(
+            (active,), -1, dtype=torch.int64, device=work_device
+        )
+    expected_positions_host = plan.verify_expected_positions[:active].to(
         device=work_device, dtype=torch.int64
     )
     prev_slot_indices_host = plan.verify_prev_slot_indices[:active].to(
@@ -58,6 +67,7 @@ def launch_canary_verify_kernel_torch_reference(
 
     kept_slots: list[int] = []
     kept_expected_positions: list[int] = []
+    kept_expected_input_ids: list[int] = []
     kept_prev_slots: list[int] = []
     for k in range(active):
         s = int(slot_indices_host[k].item())
@@ -66,12 +76,14 @@ def launch_canary_verify_kernel_torch_reference(
         if s != consts.TOKEN_TO_KV_SLOT_PADDING:
             kept_slots.append(s)
             kept_expected_positions.append(int(expected_positions_host[k].item()))
+            kept_expected_input_ids.append(int(expected_input_ids_host[k].item()))
             kept_prev_slots.append(int(prev_slot_indices_host[k].item()))
     active = len(kept_slots)
     if active <= 0:
         return
     slot_indices_list: list[int] = kept_slots
     expected_positions_list: list[int] = kept_expected_positions
+    expected_input_ids_list: list[int] = kept_expected_input_ids
     prev_slot_indices_list: list[int] = kept_prev_slots
 
     buf_i64 = canary_buf.detach().to(device=work_device).contiguous().view(torch.int64)
@@ -86,6 +98,7 @@ def launch_canary_verify_kernel_torch_reference(
     for k in range(active):
         slot_idx = slot_indices_list[k]
         expected_position = expected_positions_list[k]
+        expected_input_id = expected_input_ids_list[k]
         prev_slot = prev_slot_indices_list[k]
 
         stored_token = int(buf_i64[slot_idx, consts.CANARY_FIELD_TOKEN].item())
@@ -107,11 +120,14 @@ def launch_canary_verify_kernel_torch_reference(
 
         fail_reason = consts.FailReason(0)
         if stored_chain_hash != expected_chain_hash:
-            fail_reason |= consts.FailReason.CHAIN_HASH
+            fail_reason |= consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH
+        if check_verify_expected_token:
+            if expected_input_id != -1 and stored_token != expected_input_id:
+                fail_reason |= consts.FailReason.VERIFY_TOKEN_MISMATCH
         if stored_position != expected_position:
-            fail_reason |= consts.FailReason.POSITION
+            fail_reason |= consts.FailReason.VERIFY_POSITION_MISMATCH
         if stored_real_kv_hash != expected_real_kv_hash:
-            fail_reason |= consts.FailReason.REAL_KV_HASH
+            fail_reason |= consts.FailReason.VERIFY_REAL_KV_HASH_MISMATCH
 
         if fail_reason != consts.FailReason(0):
             row = [0] * consts.VIOLATION_FIELDS
@@ -119,7 +135,7 @@ def launch_canary_verify_kernel_torch_reference(
             row[consts.VIOLATION_FIELD_SLOT_IDX] = slot_idx
             row[consts.VIOLATION_FIELD_POSITION] = stored_position
             row[consts.VIOLATION_FIELD_STORED_TOKEN] = stored_token
-            row[consts.VIOLATION_FIELD_EXPECTED_TOKEN] = 0
+            row[consts.VIOLATION_FIELD_EXPECTED_TOKEN] = expected_input_id
             row[consts.VIOLATION_FIELD_STORED_CHAIN_HASH] = stored_chain_hash
             row[consts.VIOLATION_FIELD_EXPECTED_AUX] = expected_chain_hash
             row[consts.VIOLATION_FIELD_FAIL_REASON_BITS] = int(fail_reason)

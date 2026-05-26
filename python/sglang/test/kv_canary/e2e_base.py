@@ -80,6 +80,7 @@ class CanaryE2EBase(CapturedServerE2EBase):
     def setUpClass(cls) -> None:
         cls._cfg = _MODE_CONFIGS[cls.model_mode]
         server_env = os.environ.copy()
+        server_env.setdefault("SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT", "1")
         server_env.update(cls.extra_env)
         if cls.model_mode == "swa":
             server_env.setdefault(
@@ -97,7 +98,12 @@ class CanaryE2EBase(CapturedServerE2EBase):
         server_args = build_canary_server_args(
             kv_canary_mode=cls.kv_canary_mode,
             mode_cfg=cls._cfg,
-            extra_server_args=("--max-total-tokens", "65536", *cls.extra_server_args),
+            extra_server_args=(
+                "--max-total-tokens",
+                "65536",
+                "--skip-server-warmup",
+                *cls.extra_server_args,
+            ),
         )
         cls.process = popen_launch_server(
             cls._cfg.model_path,

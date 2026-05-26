@@ -40,10 +40,10 @@ class TestSelfUnitSweepPlanBuilder(CustomTestCase):
         )
         self.assertEqual(int(out.verify_num_valid.item()), 3)
         self.assertEqual(out.verify_slot_indices.dtype, torch.int64)
-        self.assertEqual(out.verify_positions.dtype, torch.int64)
+        self.assertEqual(out.verify_expected_positions.dtype, torch.int64)
         self.assertEqual(out.verify_prev_slot_indices.dtype, torch.int64)
         self.assertEqual(out.verify_slot_indices[:3].tolist(), [100, 101, 102])
-        self.assertEqual(out.verify_positions[:3].tolist(), [0, 1, 2])
+        self.assertEqual(out.verify_expected_positions[:3].tolist(), [0, 1, 2])
         self.assertEqual(out.verify_prev_slot_indices[:3].tolist(), [-1, 100, 101])
 
     def test_radix_held_slot_still_swept(self) -> None:

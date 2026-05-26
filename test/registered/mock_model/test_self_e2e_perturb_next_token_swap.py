@@ -27,9 +27,9 @@ class TestPerturbNextTokenSwap(MockModelPerturbE2EBase):
         self.send_parallel_requests(n=4, timeout=30.0)
         self.assert_log_contains("mock_perturb next_token_swap: swapped")
         self.assert_any_launch_tag_violation_reported(fail_reason="write_token")
-        self.assert_any_launch_tag_violation_absent(fail_reason="real_kv_hash")
-        self.assert_any_launch_tag_violation_absent(fail_reason="position")
-        self.assert_any_launch_tag_violation_absent(fail_reason="chain_hash")
+        self.assert_any_launch_tag_violation_absent(fail_reason="verify_real_kv_hash")
+        self.assert_any_launch_tag_violation_absent(fail_reason="verify_position")
+        self.assert_any_launch_tag_violation_absent(fail_reason="verify_chain_hash")
 
 
 if __name__ == "__main__":

@@ -51,8 +51,20 @@ patches:
 """
 
 
+_PR_REVERT_YAML_26329 = """
+patches:
+  - target: sglang.srt.speculative.eagle_utils._eagle_prefill_tail_tokens
+    edits:
+      - match: |
+          tail_tokens = next_token_ids.to(batch.input_ids.dtype)
+        prepend: |
+          return next_token_ids.to(batch.input_ids.dtype)
+"""
+
+
 _PR_FIX_REVERT_YAML: Dict[int, str] = {
     25015: _PR_REVERT_YAML_25015,
+    26329: _PR_REVERT_YAML_26329,
 }
 
 

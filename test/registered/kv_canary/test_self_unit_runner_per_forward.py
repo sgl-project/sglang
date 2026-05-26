@@ -98,7 +98,8 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
             expected_inputs=ExpectedInputs.allocate(capacity=3, device=self.device),
             violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
             real_kv_hash_mode=RealKvHashMode.NONE,
-            input_check_mode=False,
+            enable_write_input_assert=False,
+            enable_verify_token_assert=False,
         )
 
         self.assertEqual(len(endpoint.calls), 1)
@@ -150,7 +151,8 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
             expected_inputs=ExpectedInputs.allocate(capacity=1, device=self.device),
             violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
             real_kv_hash_mode=RealKvHashMode.NONE,
-            input_check_mode=False,
+            enable_write_input_assert=False,
+            enable_verify_token_assert=False,
         )
 
         self.assertEqual(len(endpoint.calls), 1)
@@ -158,6 +160,42 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
         self.assertEqual(call["input_ids"].dtype, torch.int64)
         self.assertEqual(call["positions"].dtype, torch.int64)
         self.assertEqual(call["out_cache_loc"].dtype, torch.int64)
+
+    def test_launch_endpoints_per_forward_propagates_enable_verify_token_assert_true(
+        self,
+    ) -> None:
+        """Verify enable_verify_token_assert=True is plumbed through to the endpoint kwargs."""
+        group = make_buffer_group(device=self.device)
+        endpoint = RecordingEndpoint(kernel_kind=CanaryLaunchTag.HEAD_K_FULL)
+        forward_batch = make_forward_batch(self.device, bs=1, seq_lens_list=(1,))
+        forward_batch.input_ids = torch.tensor(
+            [101, 0, 0], dtype=torch.int64, device=self.device
+        )
+        forward_batch.positions = torch.tensor(
+            [10, 0, 0], dtype=torch.int64, device=self.device
+        )
+        forward_batch.out_cache_loc = torch.tensor(
+            [7, 0, 0], dtype=torch.int64, device=self.device
+        )
+        forward_batch.num_token_non_padded_cpu = 1
+
+        kernel_launch_module.launch_endpoints_per_forward(
+            endpoints=(endpoint,),
+            group=group,
+            tag_filter=lambda tag: True,
+            verify_plan=VerifyPlan.allocate(verify_capacity=1, device=self.device),
+            write_plan=WritePlan.allocate(write_req_capacity=1, device=self.device),
+            forward_batch=forward_batch,
+            expected_inputs=ExpectedInputs.allocate(capacity=3, device=self.device),
+            violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
+            real_kv_hash_mode=RealKvHashMode.NONE,
+            enable_write_input_assert=False,
+            enable_verify_token_assert=True,
+        )
+
+        self.assertEqual(len(endpoint.calls), 1)
+        call = endpoint.calls[0]
+        self.assertEqual(call["enable_verify_token_assert"], True)
 
     def test_launch_endpoints_per_forward_materializes_strided_boundary_tensors(
         self,
@@ -187,7 +225,8 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
             expected_inputs=ExpectedInputs.allocate(capacity=1, device=self.device),
             violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
             real_kv_hash_mode=RealKvHashMode.NONE,
-            input_check_mode=False,
+            enable_write_input_assert=False,
+            enable_verify_token_assert=False,
         )
 
         self.assertEqual(len(endpoint.calls), 1)

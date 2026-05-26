@@ -117,7 +117,7 @@ def _stamp_clean_kv_chain(
         device=_DEVICE,
     )
     log = FakeViolationLog.allocate(device=_DEVICE)
-    # enable_assert_inputs=False is hard-wired here, so the kernel API requires the
+    # enable_write_input_assert=False is hard-wired here, so the kernel API requires the
     # expected_* tensors be None (otherwise it raises ValueError).
     launch_canary_write_kernel_torch_reference(
         context=VerifyOrWriteContext(
@@ -135,7 +135,7 @@ def _stamp_clean_kv_chain(
         input_ids=input_ids,
         positions=positions,
         out_cache_loc=out_cache_loc,
-        enable_assert_inputs=False,
+        enable_write_input_assert=False,
         expected_input_tokens=None,
         expected_input_positions=None,
     )
@@ -301,7 +301,7 @@ class TestChain:
         cuda_log, _ = run_verify_diff(buf_pair=buf_pair, plan_pair=plan_pair)
         assert int(cuda_log.write_index[0].item()) == 1
         bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
-        assert bits & consts.FailReason.CHAIN_HASH
+        assert bits & consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH
 
     def test_chain_head_prev_hash_equals_splitmix64_anchor_random_50(self) -> None:
         random.seed(0)
@@ -378,7 +378,7 @@ class TestViolationField:
         fail_bits = int(
             cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
         )
-        assert_only_bits_set(fail_bits, consts.FailReason.CHAIN_HASH)
+        assert_only_bits_set(fail_bits, consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH)
 
     def test_violation_position_mismatch(self) -> None:
         """Stored position differs from what the slot's chain reconstruction would yield → POSITION bit."""
@@ -403,7 +403,7 @@ class TestViolationField:
         fail_bits = int(
             cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
         )
-        assert_only_bits_set(fail_bits, consts.FailReason.POSITION)
+        assert_only_bits_set(fail_bits, consts.FailReason.VERIFY_POSITION_MISMATCH)
 
     def test_violation_position_diverges_from_plan(self) -> None:
         """Plan-supplied position contradicts stored position → POSITION bit (verify trusts plan, not +1)."""
@@ -427,7 +427,7 @@ class TestViolationField:
         fail_bits = int(
             cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
         )
-        assert_only_bits_set(fail_bits, consts.FailReason.POSITION)
+        assert_only_bits_set(fail_bits, consts.FailReason.VERIFY_POSITION_MISMATCH)
 
     def test_violation_prev_hash_mismatch(self) -> None:
         """Stored prev_hash differs from predecessor-derived expectation → CHAIN_HASH bit."""
@@ -462,7 +462,7 @@ class TestViolationField:
         fail_bits = int(
             cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
         )
-        assert_only_bits_set(fail_bits, consts.FailReason.CHAIN_HASH)
+        assert_only_bits_set(fail_bits, consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH)
 
     def test_violation_real_kv_hash_mismatch(self) -> None:
         """Mutate one byte of a RealKvSource tensor after writing the chain → REAL_KV_HASH bit on verify."""
@@ -503,7 +503,7 @@ class TestViolationField:
         fail_bits = int(
             cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
         )
-        assert_only_bits_set(fail_bits, consts.FailReason.REAL_KV_HASH)
+        assert_only_bits_set(fail_bits, consts.FailReason.VERIFY_REAL_KV_HASH_MISMATCH)
 
     @pytest.mark.parametrize("bit_to_trigger", ["POSITION", "PREV_HASH", "REAL_KV"])
     @pytest.mark.parametrize("injection_position", ["head", "mid", "last"])
@@ -524,9 +524,9 @@ class TestViolationField:
         corrupt_slot = slot_indices[corruption_index]
 
         expected_bit = {
-            "POSITION": consts.FailReason.POSITION,
-            "PREV_HASH": consts.FailReason.CHAIN_HASH,
-            "REAL_KV": consts.FailReason.REAL_KV_HASH,
+            "POSITION": consts.FailReason.VERIFY_POSITION_MISMATCH,
+            "PREV_HASH": consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH,
+            "REAL_KV": consts.FailReason.VERIFY_REAL_KV_HASH_MISMATCH,
         }[bit_to_trigger]
 
         if bit_to_trigger == "REAL_KV":
@@ -691,10 +691,10 @@ class TestViolationField:
         assert int(cuda_log.write_index[0].item()) == 1
         bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
         assert (
-            bits & consts.FailReason.POSITION
+            bits & consts.FailReason.VERIFY_POSITION_MISMATCH
         ), f"expected POSITION bit, got {bits:#b}"
         assert (
-            bits & consts.FailReason.CHAIN_HASH
+            bits & consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH
         ) == 0, f"chain hash bit unexpectedly set: {bits:#b}"
 
 
@@ -905,7 +905,7 @@ class TestRealKvHash:
         fail_bits = int(
             cuda_log2.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
         )
-        assert_only_bits_set(fail_bits, consts.FailReason.REAL_KV_HASH)
+        assert_only_bits_set(fail_bits, consts.FailReason.VERIFY_REAL_KV_HASH_MISMATCH)
 
     def test_real_kv_hash_all_mode_with_multiple_sources(self) -> None:
         """ALL mode with count=2 page=16 bytes=128 sources: chain still verifies clean."""
@@ -1010,7 +1010,7 @@ class TestRealKvHash:
         assert int(cuda_log.write_index[0].item()) >= 1
         bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
         assert (
-            bits & consts.FailReason.REAL_KV_HASH
+            bits & consts.FailReason.VERIFY_REAL_KV_HASH_MISMATCH
         ), f"expected REAL_KV_HASH bit, got {bits:#b}"
 
     def test_real_kv_off_does_not_deref_real_kv_sources(self) -> None:
@@ -1107,6 +1107,7 @@ class TestRealKvSource:
                     real_kv_hash_mode=consts.RealKvHashMode.NONE,
                 ),
                 plan=plan,
+                check_verify_expected_token=True,
             )
 
     def test_real_kv_source_holey_dim1(self) -> None:
@@ -1273,6 +1274,7 @@ class TestLayoutAndScheduling:
                 real_kv_hash_mode=consts.RealKvHashMode.NONE,
             ),
             plan=plan,
+            check_verify_expected_token=True,
         )
         torch.cuda.synchronize()
 
@@ -1698,7 +1700,7 @@ class TestViolationRing:
         first_row_fail = int(
             cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
         )
-        assert first_row_fail & consts.FailReason.POSITION
+        assert first_row_fail & consts.FailReason.VERIFY_POSITION_MISMATCH
 
     def test_violation_ring_overflow_counter_still_increments(self) -> None:
         """Ring capacity exceeded → rows beyond are dropped but ``write_index`` still grows."""
@@ -1800,16 +1802,18 @@ class TestViolationRing:
         # splitmix64(consts.CANARY_CHAIN_ANCHOR) = 0xde7fae23a9a1b716; signed = -2414019407054260458.
         # Slot 5 was stamped with position=0 (stored); plan claims position=99 → POSITION mismatch.
         # stored_chain_hash == expected_chain_hash (both splitmix64(ANCHOR)) → no CHAIN_HASH bit.
-        # verify path has no token oracle → expected_token field is always 0.
+        # plan has no populated verify_expected_tokens → entries read -1 sentinel, the
+        # verify kernel skips the token check (no TOKEN_MISMATCH bit) but the row's
+        # expected_token field reflects the gathered sentinel value.
         # expected_aux = expected_chain_hash = splitmix64(ANCHOR) signed (same value as stored_chain_hash).
         kernel_kind_val = int(CanaryLaunchTag.HEAD_K_FULL)
         slot_idx_val = 5
         position_val = 0
         stored_token_val = 33
-        expected_token_val = 0
+        expected_token_val = -1
         stored_chain_hash_val = anchor_hash_signed
         expected_aux_val = anchor_hash_signed
-        fail_reason_bits_val = consts.FailReason.POSITION
+        fail_reason_bits_val = consts.FailReason.VERIFY_POSITION_MISMATCH
 
         expected_bytes = struct.pack(
             "<8q",
@@ -2001,3 +2005,129 @@ class TestBoundarySweep:
                 real_kv_hash_mode=consts.RealKvHashMode.PARTIAL,
             )
         )
+
+
+class TestVerifyExpectedInputIds:
+    """Cover the new verify-time token-id check via VerifyPlan.verify_expected_tokens."""
+
+    def _run(
+        self,
+        *,
+        stored_token: int,
+        expected_input_id: int,
+        check_verify_expected_token: bool = True,
+    ) -> FakeViolationLog:
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
+        stamp_pair(
+            buf_pair,
+            slot_idx=1,
+            token=stored_token,
+            position=0,
+            prev_hash=chain_anchor_signed(),
+        )
+        plan_pair = make_verify_plan_pair(
+            slot_indices=[1],
+            positions=[0],
+            prev_slot_indices=[-1],
+            expected_input_ids=[expected_input_id],
+            device=_DEVICE,
+        )
+        cuda_log, ref_log = run_verify_diff(
+            buf_pair=buf_pair,
+            plan_pair=plan_pair,
+            check_verify_expected_token=check_verify_expected_token,
+        )
+        return cuda_log
+
+    def test_sentinel_skips_token_check(self) -> None:
+        """``expected_input_id == -1`` must not fire even if stored token differs."""
+        log = self._run(stored_token=42, expected_input_id=-1)
+        assert int(log.write_index[0].item()) == 0
+
+    def test_match_records_no_violation(self) -> None:
+        """Matching stored vs expected token: zero violations."""
+        log = self._run(stored_token=42, expected_input_id=42)
+        assert int(log.write_index[0].item()) == 0
+
+    def test_mismatch_fires_verify_token_bit(self) -> None:
+        """Mismatch: kVerifyTokenMismatch bit set; expected_token field populated."""
+        log = self._run(stored_token=42, expected_input_id=99)
+        assert int(log.write_index[0].item()) == 1
+        row = log.ring[0].tolist()
+        fail_bits = int(row[consts.VIOLATION_FIELD_FAIL_REASON_BITS])
+        assert_only_bits_set(fail_bits, int(consts.FailReason.VERIFY_TOKEN_MISMATCH))
+        assert int(row[consts.VIOLATION_FIELD_STORED_TOKEN]) == 42
+        assert int(row[consts.VIOLATION_FIELD_EXPECTED_TOKEN]) == 99
+
+    def test_check_disabled_never_raises_token_mismatch(self) -> None:
+        """check_verify_expected_token=False: token mismatch is silently ignored byte-equal CUDA vs ref."""
+        log = self._run(
+            stored_token=42,
+            expected_input_id=99,
+            check_verify_expected_token=False,
+        )
+        assert int(log.write_index[0].item()) == 0
+
+    def test_check_disabled_does_not_read_expected_tokens_tensor(self) -> None:
+        """check_verify_expected_token=False with garbage expected_input_id: kernel must not deref the tensor."""
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
+        stamp_pair(
+            buf_pair,
+            slot_idx=1,
+            token=42,
+            position=0,
+            prev_hash=chain_anchor_signed(),
+        )
+        garbage_value = (1 << 63) - 1
+        plan_pair = make_verify_plan_pair(
+            slot_indices=[1],
+            positions=[0],
+            prev_slot_indices=[-1],
+            expected_input_ids=[garbage_value],
+            device=_DEVICE,
+        )
+        cuda_log, _ = run_verify_diff(
+            buf_pair=buf_pair,
+            plan_pair=plan_pair,
+            check_verify_expected_token=False,
+        )
+        assert int(cuda_log.write_index[0].item()) == 0
+
+    def test_token_and_position_both_mismatch_set_both_bits(self) -> None:
+        """token mismatch + position mismatch: both fail bits set; expected_token row carries the gathered id."""
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
+        slot_idx = 5
+        stamp_pair(
+            buf_pair,
+            slot_idx=slot_idx,
+            token=42,
+            position=10,
+            prev_hash=chain_anchor_signed(),
+        )
+        plan_pair = make_verify_plan_pair(
+            slot_indices=[slot_idx],
+            positions=[99],
+            prev_slot_indices=[-1],
+            expected_input_ids=[123],
+            device=_DEVICE,
+        )
+        cuda_log, _ = run_verify_diff(
+            buf_pair=buf_pair,
+            plan_pair=plan_pair,
+            check_verify_expected_token=True,
+        )
+        assert int(cuda_log.write_index[0].item()) == 1
+        row = cuda_log.ring[0].tolist()
+        fail_bits = int(row[consts.VIOLATION_FIELD_FAIL_REASON_BITS])
+        expected_bits = int(consts.FailReason.VERIFY_TOKEN_MISMATCH) | int(
+            consts.FailReason.VERIFY_POSITION_MISMATCH
+        )
+        assert_only_bits_set(fail_bits, expected_bits)
+        assert int(row[consts.VIOLATION_FIELD_STORED_TOKEN]) == 42
+        assert int(row[consts.VIOLATION_FIELD_EXPECTED_TOKEN]) == 123
