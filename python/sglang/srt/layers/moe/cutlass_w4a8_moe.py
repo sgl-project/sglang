@@ -33,8 +33,10 @@ if _is_cuda_alike:
         get_cutlass_w4a8_moe_mm_data,
         silu_and_mul,
     )
-    from sglang.jit_kernel.per_tensor_absmax_fp8 import per_tensor_absmax_fp8
-    from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
+    from sglang.jit_kernel.per_tensor_quant_fp8 import (
+        per_tensor_absmax_fp8,
+        per_tensor_quant_fp8,
+    )
 
 from sglang.srt.distributed import get_moe_expert_parallel_world_size
 from sglang.srt.layers.moe.ep_moe.kernels import (
