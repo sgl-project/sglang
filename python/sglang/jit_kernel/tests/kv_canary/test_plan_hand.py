@@ -1082,7 +1082,9 @@ class TestExpectedTokenPool:
         )
         self.pool = self._make_pool(fill_fn=lambda rp, pos: rp * 1000 + pos)
 
-    def _make_pool(self, *, fill_fn, pool_max_context_len: int | None = None) -> torch.Tensor:
+    def _make_pool(
+        self, *, fill_fn, pool_max_context_len: int | None = None
+    ) -> torch.Tensor:
         cols = self._POOL_COLS if pool_max_context_len is None else pool_max_context_len
         pool = torch.full(
             (self._MAX_REQS, cols), -999, dtype=torch.int32, device=_DEVICE
@@ -1145,7 +1147,11 @@ class TestExpectedTokenPool:
         assert torch.equal(
             got,
             self._expected(
-                [rp * 1000 + pos for rp, plen in [(1, 3), (2, 5)] for pos in range(plen)]
+                [
+                    rp * 1000 + pos
+                    for rp, plen in [(1, 3), (2, 5)]
+                    for pos in range(plen)
+                ]
             ),
         )
 
@@ -1159,7 +1165,11 @@ class TestExpectedTokenPool:
         assert torch.equal(
             got,
             self._expected(
-                [rp * 1000 + pos + 1 for rp, plen in [(1, 3), (2, 5)] for pos in range(plen)]
+                [
+                    rp * 1000 + pos + 1
+                    for rp, plen in [(1, 3), (2, 5)]
+                    for pos in range(plen)
+                ]
             ),
         )
 
@@ -1176,9 +1186,7 @@ class TestExpectedTokenPool:
         )
         assert torch.equal(
             got,
-            self._expected(
-                [1000 + pos if pos < pool_cols else -1 for pos in range(6)]
-            ),
+            self._expected([1000 + pos if pos < pool_cols else -1 for pos in range(6)]),
         )
 
     def test_pool_oob_offset_plus_1_byte_equal_triggers_sentinel(self) -> None:
