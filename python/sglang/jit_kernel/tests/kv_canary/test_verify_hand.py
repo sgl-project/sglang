@@ -1800,13 +1800,15 @@ class TestViolationRing:
         # splitmix64(consts.CANARY_CHAIN_ANCHOR) = 0xde7fae23a9a1b716; signed = -2414019407054260458.
         # Slot 5 was stamped with position=0 (stored); plan claims position=99 → POSITION mismatch.
         # stored_chain_hash == expected_chain_hash (both splitmix64(ANCHOR)) → no CHAIN_HASH bit.
-        # verify path has no token oracle → expected_token field is always 0.
+        # plan has no populated verify_expected_input_ids → entries read -1 sentinel, the
+        # verify kernel skips the token check (no TOKEN_MISMATCH bit) but the row's
+        # expected_token field reflects the gathered sentinel value.
         # expected_aux = expected_chain_hash = splitmix64(ANCHOR) signed (same value as stored_chain_hash).
         kernel_kind_val = int(CanaryLaunchTag.HEAD_K_FULL)
         slot_idx_val = 5
         position_val = 0
         stored_token_val = 33
-        expected_token_val = 0
+        expected_token_val = -1
         stored_chain_hash_val = anchor_hash_signed
         expected_aux_val = anchor_hash_signed
         fail_reason_bits_val = consts.FailReason.POSITION
