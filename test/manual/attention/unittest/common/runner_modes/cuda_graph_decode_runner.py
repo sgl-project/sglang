@@ -822,6 +822,7 @@ def run_dsa_sparse_cuda_graph_decode_case(
     device: str = DENSE_DEFAULT_DEVICE,
     cuda_graph_capture_batch_size: int | None = None,
     dsa_decode_backend: str = "flashmla_kv",
+    fp8_kv_cache: bool = False,
 ):
     """DSA sparse-topk CUDA-graph decode replay (`flashmla_kv` path).
     Sparse decode uses cached MLA latent KV (written by
@@ -842,6 +843,15 @@ def run_dsa_sparse_cuda_graph_decode_case(
             max_context_len = (
                 (max_context_len + case.page_size - 1) // case.page_size
             ) * case.page_size
+    from ..attention_methods.dsa_attention import (
+        DSA_SPARSE_FP8_ATOL,
+        DSA_SPARSE_FP8_RTOL,
+    )
+
+    if fp8_kv_cache:
+        atol, rtol = DSA_SPARSE_FP8_ATOL, DSA_SPARSE_FP8_RTOL
+    else:
+        atol, rtol = DSA_SPARSE_ATOL, DSA_SPARSE_RTOL
     adapter = CudaGraphDecodeAdapter(
         build_fixture=build_dsa_sparse_attention_fixture,
         make_case=make_dsa_sparse_case_with_prefix_lens,
@@ -856,8 +866,8 @@ def run_dsa_sparse_cuda_graph_decode_case(
         clone_state=_clone_dsa_sparse_cache,
         restore_state=_restore_dsa_sparse_cache,
         allow_padding=False,
-        atol=DSA_SPARSE_ATOL,
-        rtol=DSA_SPARSE_RTOL,
+        atol=atol,
+        rtol=rtol,
     )
     _run_cuda_graph_decode_case(
         testcase,
@@ -869,6 +879,7 @@ def run_dsa_sparse_cuda_graph_decode_case(
             dtype=dtype,
             device=device,
             dsa_decode_backend=dsa_decode_backend,
+            fp8_kv_cache=fp8_kv_cache,
         ),
         capture_batch_size=capture_batch_size,
         max_context_len=max_context_len,

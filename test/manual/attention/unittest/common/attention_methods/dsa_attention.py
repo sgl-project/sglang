@@ -42,6 +42,14 @@ DSA_SPARSE_QK_ROPE_HEAD_DIM = 64
 DSA_SPARSE_INDEX_TOPK = 128
 DSA_SPARSE_ATOL = 1.6e-1
 DSA_SPARSE_RTOL = 1.6e-1
+# Tolerance for FP8 KV cache. The actual path stores K as FP8 (with
+# per-128-channel scales) and the kernel reads from that quantized
+# cache; the reference compares against the original BF16 K (so a
+# silent pack/write bug can't self-cancel — same separation principle
+# as the DSV4 SWA reference). Empirically max_diff lands around
+# 0.05–0.1 vs the BF16 reference; 0.2 absorbs that headroom.
+DSA_SPARSE_FP8_ATOL = 2.0e-1
+DSA_SPARSE_FP8_RTOL = 2.0e-1
 
 
 @dataclass(frozen=True)
@@ -240,11 +248,16 @@ class DSAMockModelRunner(ModelRunner):
         runner_batch_size: int | None = None,
         dsa_prefill_backend: str = "flashmla_auto",
         dsa_decode_backend: str = "flashmla_kv",
+        fp8_kv_cache: bool = False,
     ):
         pool_batch_size = runner_batch_size or case.batch_size
         self.device = device
         self.dtype = dtype
-        self.kv_cache_dtype = dtype
+        # `kv_cache_dtype` is the dtype the *storage* uses. For FP8 KV
+        # cache the pool stores packed FP8 nope + scales + BF16 rope at
+        # 656 bytes/token while the model still projects K/V in BF16;
+        # `set_mla_kv_buffer` does the quantize on the way in.
+        self.kv_cache_dtype = torch.float8_e4m3fn if fp8_kv_cache else dtype
         self.gpu_id = 0
         self.page_size = case.page_size
         self.model_config = model_config
@@ -291,17 +304,36 @@ class DSAMockModelRunner(ModelRunner):
             enable_memory_saver=False,
         )
         max_token_loc = case.page_size + pool_batch_size * max_context_len
+        # FP8 KV cache: packed nope_fp8 (dim_nope) + scales (num_tiles*4) +
+        # rope_bf16_bytes (dim_rope*2) = 528 + 128 = 656 bytes/token for
+        # the production DSA shape (dim_nope=512, dim_rope=64). The pool
+        # flips `dsa_kv_cache_store_fp8=True` iff
+        # `dtype=torch.float8_e4m3fn AND override_kv_cache_dim is not None`
+        # (`DSATokenToKVPool.__init__`), so both must be passed in tandem.
+        if fp8_kv_cache:
+            pool_dtype = torch.float8_e4m3fn
+            dim_nope = model_config.kv_lora_rank
+            dim_rope = model_config.qk_rope_head_dim
+            num_tiles = dim_nope // DSATokenToKVPool.quant_block_size
+            # uint8 byte layout: [nope_fp8 (dim_nope B)] + [scales (num_tiles*4 B)] +
+            # [rope_bf16 (dim_rope*2 B)]
+            pool_kv_cache_dim = dim_nope + num_tiles * 4 + dim_rope * 2
+        else:
+            pool_dtype = dtype
+            pool_kv_cache_dim = (
+                model_config.kv_lora_rank + model_config.qk_rope_head_dim
+            )
         self.token_to_kv_pool = DSATokenToKVPool(
             size=max_token_loc + case.page_size,
             page_size=case.page_size,
             kv_lora_rank=model_config.kv_lora_rank,
-            dtype=dtype,
+            dtype=pool_dtype,
             qk_rope_head_dim=model_config.qk_rope_head_dim,
             layer_num=1,
             device=device,
             index_head_dim=DSA_INDEX_HEAD_DIM,
             enable_memory_saver=False,
-            kv_cache_dim=model_config.kv_lora_rank + model_config.qk_rope_head_dim,
+            kv_cache_dim=pool_kv_cache_dim,
         )
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
         self.attn_cp_size = 1
@@ -653,6 +685,7 @@ def build_dsa_sparse_attention_fixture(
     runner_batch_size: int | None = None,
     dsa_prefill_backend: str = "flashmla_auto",
     dsa_decode_backend: str = "flashmla_kv",
+    fp8_kv_cache: bool = False,
 ) -> DSASparseAttentionFixture:
     max_context_len = max(max_context_len, max(case.seq_lens))
     if max_context_len % case.page_size:
@@ -688,6 +721,7 @@ def build_dsa_sparse_attention_fixture(
         runner_batch_size=runner_batch_size,
         dsa_prefill_backend=dsa_prefill_backend,
         dsa_decode_backend=dsa_decode_backend,
+        fp8_kv_cache=fp8_kv_cache,
     )
     try:
         backend = ATTENTION_BACKENDS[case.backend](runner)
@@ -878,6 +912,7 @@ def run_dsa_sparse_attention_case(
     device: str = DEFAULT_DEVICE,
     dsa_prefill_backend: str = "flashmla_auto",
     dsa_decode_backend: str = "flashmla_kv",
+    fp8_kv_cache: bool = False,
 ) -> None:
     fixture = build_dsa_sparse_attention_fixture(
         testcase,
@@ -888,12 +923,13 @@ def run_dsa_sparse_attention_case(
         device=device,
         dsa_prefill_backend=dsa_prefill_backend,
         dsa_decode_backend=dsa_decode_backend,
+        fp8_kv_cache=fp8_kv_cache,
     )
     actual = run_dsa_sparse_fixture_eager(fixture, testcase)
     expected = expected_dsa_sparse_fixture_output(fixture)
-    torch.testing.assert_close(
-        actual, expected, atol=DSA_SPARSE_ATOL, rtol=DSA_SPARSE_RTOL
-    )
+    atol = DSA_SPARSE_FP8_ATOL if fp8_kv_cache else DSA_SPARSE_ATOL
+    rtol = DSA_SPARSE_FP8_RTOL if fp8_kv_cache else DSA_SPARSE_RTOL
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
 
 
 # ---------------------------------------------------------------------------
@@ -1017,6 +1053,18 @@ DSA_DECODE_IMPL_VARIANTS: tuple[str, ...] = (
     "aiter",
 )
 
+# Impls that accept an FP8-stored K cache. The flashmla *sparse* and FA3
+# kernels require BF16 K (`kv must have dtype torch::kBFloat16`), so they
+# fall back to the inline-quantize-of-bf16 path that production *doesn't*
+# take in FP8 deployments. The `flashmla_kv` decode kernel and *both*
+# flashmla prefill kernels are the production-relevant FP8 paths.
+DSA_FP8_COMPATIBLE_PREFILL_IMPLS: frozenset[str] = frozenset(
+    {"flashmla_sparse", "flashmla_kv", "flashmla_auto"}
+)
+DSA_FP8_COMPATIBLE_DECODE_IMPLS: frozenset[str] = frozenset(
+    {"flashmla_kv", "flashmla_auto"}
+)
+
 
 def run_dsa_sparse_prefill_impl_variant_case(
     testcase,
@@ -1091,6 +1139,65 @@ def run_dsa_sparse_decode_impl_variant_case(
         dtype=dtype,
         device=device,
         dsa_decode_backend=impl,
+    )
+
+
+def run_dsa_sparse_fp8_prefill_case(
+    testcase,
+    case: DSAAttentionCase,
+    *,
+    dsa_prefill_backend: str = "flashmla_auto",
+) -> None:
+    """FP8-KV-cache prefill. With `flashmla_sparse` + EXTEND + non-empty
+    prefix, `get_topk_transform_method` returns `RAGGED` (the only path
+    that exercises `dequantize_k_cache_paged` + the
+    `topk_indices_offset` shift). With `flashmla_kv` or `flashmla_auto`
+    it stays on `PAGED` topk; the auto resolver picks `flashmla_kv` for
+    FP8 KV cache (`set_dsa_prefill_impl`), so `flashmla_auto` and
+    `flashmla_kv` test the same code path."""
+    if dsa_prefill_backend not in DSA_FP8_COMPATIBLE_PREFILL_IMPLS:
+        testcase.skipTest(
+            f"DSA prefill impl `{dsa_prefill_backend}` does not support FP8 KV "
+            f"cache (only `flashmla_sparse`, `flashmla_kv`, and `flashmla_auto` "
+            f"read FP8 K directly; others require BF16 K)."
+        )
+    if not case.forward_mode.is_extend_without_speculative():
+        raise ValueError(
+            "run_dsa_sparse_fp8_prefill_case expects an EXTEND case."
+        )
+    run_dsa_sparse_attention_case(
+        testcase,
+        case,
+        dsa_prefill_backend=dsa_prefill_backend,
+        fp8_kv_cache=True,
+    )
+
+
+def run_dsa_sparse_fp8_decode_case(
+    testcase,
+    case: DSAAttentionCase,
+    *,
+    dsa_decode_backend: str = "flashmla_kv",
+) -> None:
+    """FP8-KV-cache decode. Only `flashmla_kv` (and `flashmla_auto`
+    which resolves to it for FP8) accepts an FP8-stored K cache;
+    `flashmla_sparse` and `fa3` decode kernels assert BF16 K and would
+    fall back to the inline-quantize-of-bf16 path that production
+    doesn't take in FP8 deployments."""
+    if dsa_decode_backend not in DSA_FP8_COMPATIBLE_DECODE_IMPLS:
+        testcase.skipTest(
+            f"DSA decode impl `{dsa_decode_backend}` does not support FP8 KV "
+            f"cache (only `flashmla_kv` / `flashmla_auto` read FP8 K directly)."
+        )
+    if not case.forward_mode.is_decode():
+        raise ValueError(
+            "run_dsa_sparse_fp8_decode_case expects a DECODE case."
+        )
+    run_dsa_sparse_attention_case(
+        testcase,
+        case,
+        dsa_decode_backend=dsa_decode_backend,
+        fp8_kv_cache=True,
     )
 
 

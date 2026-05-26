@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from common.attention_methods.dsa_attention import (
     DSA_DECODE_IMPL_VARIANTS,
+    DSA_FP8_COMPATIBLE_DECODE_IMPLS,
+    DSA_FP8_COMPATIBLE_PREFILL_IMPLS,
     DSA_PAGE_SIZE,
     DSA_PREFILL_IMPL_VARIANTS,
     DSAAttentionCase,
@@ -20,6 +22,8 @@ from common.attention_methods.dsa_attention import (
     run_dsa_sparse_attention_case,
     run_dsa_sparse_cuda_graph_decode_impl_variant_case,
     run_dsa_sparse_decode_impl_variant_case,
+    run_dsa_sparse_fp8_decode_case,
+    run_dsa_sparse_fp8_prefill_case,
     run_dsa_sparse_prefill_impl_variant_case,
     run_dsa_sparse_speculative_forward_mode_case,
 )
@@ -154,6 +158,91 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
         for case in self.SPECULATIVE_FORWARD_MODE_CASES:
             with self.subTest(case=case.name, mode=case.forward_mode.name):
                 run_dsa_sparse_speculative_forward_mode_case(self, case)
+
+    # FP8 KV cache (`dsa_kv_cache_store_fp8=True`) — the production
+    # deployment dtype. Switches `DSATokenToKVPool` to packed
+    # FP8-nope/BF16-rope storage at 656 bytes/token; `set_mla_kv_buffer`
+    # routes through `quantize_k_cache_separate` and the kernel reads
+    # FP8 directly. The reference stays on BF16 K (independent of the
+    # cache bytes), and `DSA_SPARSE_FP8_ATOL=0.2` absorbs FP8 quant
+    # noise — same separation principle as the DSV4 SWA fixture so a
+    # silent pack/write bug cannot corrupt both paths identically.
+    #
+    # FP8 + `flashmla_sparse` prefill + EXTEND + non-empty prefix is the
+    # only combo that hits `TopkTransformMethod.RAGGED`
+    # (`get_topk_transform_method`), which exercises
+    # `dequantize_k_cache_paged` and the `topk_indices_offset` shift —
+    # paths that the BF16 default suite never reaches.
+    FP8_PREFILL_RAGGED_CASE = DSAAttentionCase(
+        name="dsa_sparse_fp8_prefill_ragged_topk",
+        backend="dsa",
+        forward_mode=ForwardMode.EXTEND,
+        num_heads=4,
+        num_kv_heads=1,
+        page_size=DSA_PAGE_SIZE,
+        # Long prefix → above MHA threshold, RAGGED topk transform
+        prefix_lens=(2048,),
+        extend_lens=(1,),
+    )
+    FP8_PREFILL_PAGED_CASE = DSAAttentionCase(
+        name="dsa_sparse_fp8_prefill_paged_topk",
+        backend="dsa",
+        forward_mode=ForwardMode.EXTEND,
+        num_heads=4,
+        num_kv_heads=1,
+        page_size=DSA_PAGE_SIZE,
+        prefix_lens=(2048,),
+        extend_lens=(1,),
+    )
+    FP8_DECODE_CASE = DSAAttentionCase(
+        name="dsa_sparse_fp8_decode",
+        backend="dsa",
+        forward_mode=ForwardMode.DECODE,
+        num_heads=4,
+        num_kv_heads=1,
+        page_size=DSA_PAGE_SIZE,
+        prefix_lens=(128,),
+    )
+
+    def test_sparse_fp8_prefill_cases(self):
+        for impl in DSA_PREFILL_IMPL_VARIANTS:
+            with self.subTest(impl=impl):
+                # Each impl that isn't in `DSA_FP8_COMPATIBLE_PREFILL_IMPLS`
+                # emits skipTest from the helper with the reason. The
+                # `flashmla_sparse` impl hits the RAGGED-topk path; the
+                # others stay on PAGED.
+                case = (
+                    self.FP8_PREFILL_RAGGED_CASE
+                    if impl == "flashmla_sparse"
+                    else self.FP8_PREFILL_PAGED_CASE
+                )
+                run_dsa_sparse_fp8_prefill_case(
+                    self, case, dsa_prefill_backend=impl
+                )
+
+    def test_sparse_fp8_decode_cases(self):
+        for impl in DSA_DECODE_IMPL_VARIANTS:
+            with self.subTest(impl=impl):
+                run_dsa_sparse_fp8_decode_case(
+                    self, self.FP8_DECODE_CASE, dsa_decode_backend=impl
+                )
+
+    # CG decode replay with FP8 KV cache. Captures and replays through
+    # `flashmla_kv` (the only FP8-compatible decode kernel). The
+    # `_clone_dsa_sparse_cache` hook is reused as-is — it snapshots the
+    # raw uint8 K buffer bytes, which round-trip correctly across
+    # capture/replay regardless of bf16 vs FP8 packing.
+    def test_sparse_fp8_cuda_graph_decode_case(self):
+        from common.runner_modes.cuda_graph_decode_runner import (
+            run_dsa_sparse_cuda_graph_decode_case,
+        )
+
+        run_dsa_sparse_cuda_graph_decode_case(
+            self,
+            self.FP8_DECODE_CASE,
+            dsa_decode_backend="flashmla_kv",
+            fp8_kv_cache=True,
+        )
 
     # CG decode replay parametrized over `dsa_decode_backend` impl. The
     # `flashmla_kv` baseline is already covered by
