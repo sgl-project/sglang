@@ -538,6 +538,165 @@ class TestScriptedSampling(CustomTestCase):
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=1.0)
         yield from run_until_finished(r2)
 
+    def test_chunked_logprob_input_accumulates_across_chunks(self):
+        """Return_logprob + multi-chunk prompt: input logprobs accumulate across chunks to cover the whole prompt."""
+        execute_scripted_runtime(
+            self._script_chunked_logprob_input_accumulates_across_chunks,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    @staticmethod
+    def _script_chunked_logprob_input_accumulates_across_chunks(t: ScriptedRuntime):
+        # Source: [c-R3/R5] — guards _apply_chunked_prefill_logprobs in
+        # batch_result_processor.py (lines 274-285, 451-482). Each middle
+        # chunk should append its input logprobs incrementally so that, at
+        # finish time, the accumulated input_token_logprobs_val covers the
+        # whole prompt (minus the standard leading-token offset).
+        # NEW API NEEDED: start_req(..., return_logprob=True).
+        # NEW API NEEDED: r.logprobs.input_token_logprobs_val — list of
+        # input-token logprobs accumulated across chunks.
+        prompt_len = VERY_LONG_PROMPT_LEN
+        r = t.start_req(
+            prompt_len=prompt_len,
+            max_new_tokens=4,
+            return_logprob=True,
+        )
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done >= 2, (
+            f"prompt should span multiple chunks, got chunks_done={r.chunks_done}"
+        )
+        assert r.logprobs is not None
+        input_lp = r.logprobs.input_token_logprobs_val
+        # The first input token has no preceding context so it is not scored;
+        # everything after it should have a logprob entry accumulated across
+        # all chunks.
+        assert len(input_lp) == prompt_len - 1, (
+            f"expected {prompt_len - 1} input logprobs (one per token after "
+            f"the first), got {len(input_lp)}"
+        )
+
+    def test_logprob_start_len_inside_chunk_2(self):
+        """Logprob_start_len that falls inside the 2nd chunk: only tokens >= start_len have logprobs."""
+        execute_scripted_runtime(
+            self._script_logprob_start_len_inside_chunk_2,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    @staticmethod
+    def _script_logprob_start_len_inside_chunk_2(t: ScriptedRuntime):
+        # Source: [a-Sampling8] — logprob_start_len positioned inside the
+        # 2nd chunk (chunk_size + 50 with a 4*chunk_size prompt) exercises
+        # the chunked logprob-start alignment in
+        # _apply_chunked_prefill_logprobs: only tokens at index >=
+        # logprob_start_len should produce input logprobs.
+        # NEW API NEEDED: start_req(..., return_logprob=True,
+        # logprob_start_len=).
+        # NEW API NEEDED: r.logprobs.input_token_logprobs_val.
+        prompt_len = 4 * DEFAULT_CHUNK_SIZE
+        start_len = DEFAULT_CHUNK_SIZE + 50
+        r = t.start_req(
+            prompt_len=prompt_len,
+            max_new_tokens=4,
+            return_logprob=True,
+            logprob_start_len=start_len,
+        )
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done >= 3, (
+            f"prompt should span 3+ chunks, got chunks_done={r.chunks_done}"
+        )
+        assert r.logprobs is not None
+        input_lp = r.logprobs.input_token_logprobs_val
+        # Only tokens at positions >= start_len contribute input logprobs.
+        assert len(input_lp) == prompt_len - start_len, (
+            f"expected {prompt_len - start_len} input logprobs for tokens "
+            f">= logprob_start_len={start_len}, got {len(input_lp)}"
+        )
+
+    @unittest.skip(
+        "needs ScriptedRuntime stream-event capture: start_req(stream=True) "
+        "passthrough plus a ReqHandle.stream_events buffer that records "
+        "when each output token is delivered. Once available, drive a "
+        "VERY_LONG_PROMPT_LEN chunked req with stream=True, run_until "
+        "chunks_done reaches the final chunk index, assert "
+        "stream_events == [] (no mid-chunk emission), then run_until_finished "
+        "and assert stream_events has one event per output token."
+    )
+    def test_chunked_streaming_no_mid_chunk_output(self):
+        """Stream=True + chunked: no output events fire until the last chunk finishes."""
+        execute_scripted_runtime(
+            self._script_chunked_streaming_no_mid_chunk_output,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    @staticmethod
+    def _script_chunked_streaming_no_mid_chunk_output(t: ScriptedRuntime):
+        # Source: [c-R2] — guards the skip_stream_req branch in
+        # batch_result_processor.py: while a req is in the middle of
+        # chunked prefill, stream_output must suppress its emission until
+        # the final chunk lands.
+        # NEW API NEEDED: start_req(..., stream=True).
+        # NEW API NEEDED: ReqHandle.stream_events list capturing each
+        # delivered stream chunk so the test can observe ordering.
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN,
+            max_new_tokens=4,
+            stream=True,
+        )
+        yield from run_until(r, lambda h: h.chunks_done >= 1)
+        assert (
+            r.stream_events == []
+        ), f"stream output must be suppressed mid-chunk, got {r.stream_events!r}"
+        yield from run_until_finished(r)
+        assert r.finished
+        assert len(r.stream_events) >= 1, (
+            f"stream events expected after last chunk completes, "
+            f"got {r.stream_events!r}"
+        )
+
+    def test_seed_chunked_bit_identical_runs(self):
+        """Same seed + same prompt + chunked, run twice sequentially: identical output tokens."""
+        execute_scripted_runtime(
+            self._script_seed_chunked_bit_identical_runs,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    @staticmethod
+    def _script_seed_chunked_bit_identical_runs(t: ScriptedRuntime):
+        # Source: [a-Sampling9] — seeded sampling over a chunked prompt
+        # must be reproducible: running the same prompt + same seed twice
+        # within one engine should yield identical output tokens despite
+        # the chunked-prefill scheduling.
+        # NEW API NEEDED: start_req(..., seed=, temperature=).
+        seed = 12345
+        r1 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN,
+            max_new_tokens=32,
+            temperature=0.8,
+            seed=seed,
+        )
+        yield from run_until_finished(r1)
+        out1 = list(r1.output_tokens)
+
+        r2 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN,
+            max_new_tokens=32,
+            temperature=0.8,
+            seed=seed,
+        )
+        yield from run_until_finished(r2)
+        out2 = list(r2.output_tokens)
+
+        assert r1.chunks_done >= 2 and r2.chunks_done >= 2, (
+            f"both runs should be chunked, got chunks_done="
+            f"{r1.chunks_done}, {r2.chunks_done}"
+        )
+        assert out1 == out2, (
+            f"same seed + same prompt + chunked must be bit-identical: "
+            f"{out1} != {out2}"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
