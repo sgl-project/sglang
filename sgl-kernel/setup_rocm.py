@@ -64,31 +64,42 @@ libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
 
 default_target = "gfx942"
-amdgpu_target = os.environ.get("AMDGPU_TARGET", default_target)
+amdgpu_target_env = os.environ.get("AMDGPU_TARGET", default_target)
 
-if torch.cuda.is_available():
+# Support multi-arch: Parse semicolon-separated architectures
+# Examples: "gfx942" or "gfx942;gfx950"
+amdgpu_targets = amdgpu_target_env.split(";")
+
+# Auto-detect current GPU if not explicitly set and single-arch mode
+if amdgpu_target_env == default_target and torch.cuda.is_available():
     try:
-        amdgpu_target = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+        detected_arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+        print(f"Auto-detected GPU architecture: {detected_arch}")
+        amdgpu_targets = [detected_arch]
     except Exception as e:
         print(f"Warning: Failed to detect GPU properties: {e}")
-else:
-    print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
+        print(f"Using default target: {default_target}")
 
-if amdgpu_target not in ["gfx942", "gfx950"]:
-    print(
-        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942' or 'gfx950'."
-    )
-    sys.exit(1)
+# Validate all target architectures
+supported_archs = ["gfx942", "gfx950"]
+for arch in amdgpu_targets:
+    if arch not in supported_archs:
+        print(
+            f"Error: Unsupported GPU architecture '{arch}'. Expected one of: {supported_archs}"
+        )
+        sys.exit(1)
 
-fp8_macro = (
-    "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"
-)
+print(f"Building for architectures: {', '.join(amdgpu_targets)}")
 
-# Dynamic shared-memory budget for the TopK kernels.
-# - gfx942 (MI300/MI325): LDS is typically 64KB per workgroup -> keep dynamic smem <= ~48KB
-#   (leaves room for static shared allocations in the kernel).
-# - gfx95x (MI350): LDS is larger (e.g. 160KB per CU) -> allow the original 128KB dynamic smem.
-topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 32 * 1024 * 4
+# Multi-arch build: Define both FP8 types so compile-time selection can work
+# For single-arch builds, we still define both to keep code consistent
+fp8_macros = [
+    "-DHIP_FP8_TYPE_FNUZ=1",  # For gfx942
+    "-DHIP_FP8_TYPE_E4M3=1",  # For gfx950
+]
+
+# Note: SMEM sizing for topk kernel uses compile-time constant (48KB) that works on all archs.
+# Multi-arch builds must use the minimum value that is safe on all target architectures.
 
 hipcc_flags = [
     "-DNDEBUG",
@@ -97,12 +108,16 @@ hipcc_flags = [
     "-Xcompiler",
     "-fPIC",
     "-std=c++17",
-    f"--amdgpu-target={amdgpu_target}",
     "-DENABLE_BF16",
     "-DENABLE_FP8",
-    fp8_macro,
-    f"-DSGL_TOPK_DYNAMIC_SMEM_BYTES={topk_dynamic_smem_bytes}",
 ]
+
+# Add architecture targets (multi-arch support)
+for arch in amdgpu_targets:
+    hipcc_flags.append(f"--offload-arch={arch}")
+
+# Add FP8 macros
+hipcc_flags.extend(fp8_macros)
 
 ext_modules = [
     CUDAExtension(
