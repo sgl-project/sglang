@@ -56,6 +56,13 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     doweight_stage1: bool = False
     hidden_pad: int = 0
     intermediate_pad: int = 0
+    # PATCH 3a (gpt-oss-120b MXFP4 on aiter/gfx950):
+    # Aiter's fused_moe defaults gate_mode to "separated". Quant schemes
+    # that preshuffle weights into the gate/up-interleaved layout (e.g.
+    # the MXFP4 static path via shuffle_weight_a16w4(gate_up=True)) must
+    # opt-in to "interleave" so the dispatcher picks the matching kernel
+    # family. Leave as None to use aiter's default (separated).
+    gate_mode: Optional[str] = None
 
 
 @dataclass
@@ -128,6 +135,13 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
             extra["dtype"] = runner_input.output_dtype
+        # PATCH 3b (gpt-oss-120b MXFP4 on aiter/gfx950):
+        # Forward gate_mode only when a scheme has explicitly opted in.
+        # Schemes that produce gate/up-interleaved weights set this to
+        # "interleave" via AiterMoeQuantInfo; everyone else leaves it None
+        # so aiter keeps its default GateMode.SEPARATED behavior.
+        if quant_info.gate_mode is not None:
+            extra["gate_mode"] = quant_info.gate_mode
 
         output = fused_moe(
             hidden_states=runner_input.hidden_states,
