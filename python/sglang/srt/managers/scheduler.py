@@ -1211,8 +1211,8 @@ class Scheduler(
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
-        ):  # *2 for the headroom.
-            buffer_size = (self.req_to_token_pool.size) * 2
+        ):  # *8 for the headroom.
+            buffer_size = (self.req_to_token_pool.size) * 8
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
@@ -1805,8 +1805,14 @@ class Scheduler(
                 and has_shm_features(recv_reqs)
             ):
                 barrier(group=self.tp_cpu_group)
+            _t0 = time.perf_counter()
             for req in recv_reqs:
                 unwrap_shm_features(req)
+            _t1 = time.perf_counter()
+            if (_t1 - _t0) > 0.010:
+                logger.warning(
+                    f"Unwrapping shared memory features took {(_t1 - _t0) * 1e3:.2f}ms for {len(recv_reqs)} requests."
+                )
 
         return recv_reqs
 
