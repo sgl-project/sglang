@@ -2214,8 +2214,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
 
-        log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
-
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
         dtype = torch.float16
@@ -3103,11 +3101,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        # In DP Attention, IDLE batches are padded (batch_size > 0) for MLP sync.
-        # in this case, we need to reinit the forward metadata, otherwise the stale
-        # metadata causes batch_size mismatch in attention kernel(e.g. DSA Indexer).
+        # In DP Attention, IDLE batches may be padded (batch_size > 0) for MLP
+        # sync. Reinit metadata for the padded case so attention kernels see
+        # the right batch_size (e.g. DSA Indexer). For the unpadded case
+        # (batch_size == 0) explicitly drop any stale forward_metadata left
+        # over from the previous forward — without this, attention layers
+        # called from the idle path can re-read a prior batch's req_pool
+        # indices and trigger SWA mapping use-after-free.
         if forward_batch.batch_size > 0:
             self.attn_backend.init_forward_metadata(forward_batch)
+        else:
+            self.attn_backend.forward_metadata = None
 
         kwargs = {}
         if self.support_pp:
