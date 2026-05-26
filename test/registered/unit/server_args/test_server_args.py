@@ -662,6 +662,10 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
                 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
                 "--sampling-backend",
                 "token_oracle",
+                # Explicit device so ServerArgs.__post_init__ does not call
+                # get_device(), which fails on CPU-only CI runners.
+                "--device",
+                "cpu",
             ]
         )
         self.assertEqual(parsed.sampling_backend, "token_oracle")
