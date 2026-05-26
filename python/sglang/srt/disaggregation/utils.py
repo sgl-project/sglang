@@ -148,6 +148,7 @@ def poll_and_all_reduce_with_staging(
                 decode_req
             ):
                 raw_polls[i] = int(KVPoll.Transferring)
+    # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if metadata_buffers is not None and server_args is not None:
         _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers, server_args)
     poll_tensor = torch.tensor(raw_polls, dtype=torch.uint8, device="cpu")
