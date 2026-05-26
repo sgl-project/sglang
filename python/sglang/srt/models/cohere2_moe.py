@@ -56,9 +56,7 @@ class Cohere2MoeLayerNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
-        return _cohere_layer_norm(
-            hidden_states, self.weight, self.variance_epsilon
-        )
+        return _cohere_layer_norm(hidden_states, self.weight, self.variance_epsilon)
 
 
 def cohere2_sigmoid_topk(
@@ -174,8 +172,7 @@ class Cohere2MoeAttention(nn.Module):
 
         layer_types = getattr(config, "layer_types", None)
         self.is_sliding = (
-            layer_types is not None
-            and layer_types[layer_id] == "sliding_attention"
+            layer_types is not None and layer_types[layer_id] == "sliding_attention"
         )
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
         prefix_dense_sliding_window_pattern = getattr(
@@ -241,6 +238,7 @@ def _small_batch_moe(
     there). Result is TP-partial (no all-reduce); caller folds the reduce.
     """
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
+
     return fused_experts(
         x,
         experts.w13_weight,
@@ -355,8 +353,17 @@ class Cohere2MoeSparseMoeBlock(nn.Module):
     def _route_experts(self, hidden_states, topk_output):
         """Dispatch to Triton fused_experts for small batches, FusedMoE
         (flashinfer_cutlass) for big batches.
-        ``topk_output`` is a StandardTopKOutput(topk_weights, topk_ids, router_logits)."""
-        if hidden_states.shape[0] <= _NATIVE_MOE_BATCH_THRESHOLD:
+        ``topk_output`` is a StandardTopKOutput(topk_weights, topk_ids, router_logits).
+        """
+        # _small_batch_moe calls fused_experts with no quant args, so it only
+        # works for unquantized weights. For fp8/int8 it would feed a bf16
+        # activation into an fp8-weight tl.dot ("Unsupported rhs dtype fp8e4nv"
+        # on SM100); route those through the standard runner instead.
+        is_unquantized = self.experts.w13_weight.dtype not in (
+            torch.float8_e4m3fn,
+            torch.int8,
+        )
+        if hidden_states.shape[0] <= _NATIVE_MOE_BATCH_THRESHOLD and is_unquantized:
             return _small_batch_moe(self.experts, hidden_states, topk_output)
         return self.experts(hidden_states, topk_output)
 
@@ -663,6 +670,7 @@ class Cohere2MoeForCausalLM(nn.Module):
             loaded_params.add(name)
 
         import os
+
         if os.environ.get("SGLANG_COHERE_DEBUG_LOAD"):
             unloaded = sorted(set(params_dict.keys()) - loaded_params)
             print(
