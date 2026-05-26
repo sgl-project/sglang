@@ -1,36 +1,58 @@
 # DSV4 Attention Capability Matrix
 
 This folder tracks DeepSeek-V4 style attention tests. DSV4 has method-specific
-sparse/indexer metadata, so it should not be folded into the dense or MLA
-folders.
+sparse/indexer metadata and packed FP8/BF16 KV cache layout, so it is not
+folded into the dense, MLA, or DSA folders.
 
 ## Current Matrix
 
-| Backend family | Phase 2: method correctness | Phase 3: runner compatibility | Phase 4: speculative modes | Status |
+| Backend | Phase 2: method correctness | Phase 3: runner compatibility | Phase 4: speculative modes | Status |
 |---|---|---|---|---|
-| DSV4/DeepSeek-V4 attention backends | Not implemented | Not implemented | Not implemented | Needs a small DSV4-specific fixture and independent reference. |
+| `dsv4` (`compress_ratio=0`, SWA-only) | EXTEND with SWA window via the production packed FP8-nope/BF16-rope SWA cache | Not implemented | Not implemented | Drives the real `DeepseekV4AttnBackend` through `flash_mla` with `attn_sink=-1e30` and an independent PyTorch reference that dequantizes the same SWA cache. |
+
+## Input And Config Coverage
+
+- `num_heads=64` (flash_mla `sparse_decode_fwd` head count) with DeepSeek-V4
+  shape metadata: `qk_nope_head_dim=448`, `qk_rope_head_dim=64`,
+  `kv_lora_rank=448`.
+- Page size and packed FP8/BF16 SWA cache layout (584 bytes/token) come from
+  `DeepSeekV4TokenToKVPool`.
+- `max_seq_len <= SWA_WINDOW = 128` for the SWA-only slice.
+- Tolerance is held loose (`DSV4_ATOL = DSV4_RTOL = 5e-2`) to absorb flash_mla
+  FP8 GEMM accumulation variance against the dequantized reference.
 
 ## Current Progress
 
-- No default-discovery DSV4 unit test is enabled yet.
-- The folder exists to keep DeepSeek-V4 sparse/indexed metadata separate from
-  dense, MLA, and DSA assumptions.
-- The CUDA backend hard-codes `head_dim=512`, `page_size=256`, and the
-  DeepSeekV4 packed KV layout (`qk_nope_head_dim=448`,
-  `qk_rope_head_dim=64`, FP8 nope plus BF16 rope), so the compact dense/MLA
-  unit fixtures cannot be reused safely.
-- Hardware- and kernel-specific backend paths should be added with explicit skip
-  gates rather than silently widening the default suite.
+- Phase 2 EXTEND coverage with the SWA-only path is enabled and verified
+  against an independent PyTorch reference that unpacks bytes from the same
+  SWA cache buffer, dequantizes with the stored UE8M0 FP8 scales, and applies
+  causal + sliding-window MLA math with a virtual-key attention-sink
+  correction.
+- The SWA subset of `DSV4AttnMetadata` is populated manually
+  (`init_compression_metadata` is skipped since C4/C128 layers are empty for
+  `compress_ratios=[0]`).
+- Hardware-gated / kernel-specific backend paths beyond flash_mla SWA are not
+  enabled yet.
 
 ## Required Fixture Work
 
-- Model the DSV4 indexer/KV-cache layout directly instead of reusing dense Q/K/V helpers.
-- Add a PyTorch reference for the selected sparse/indexed attention behavior.
-- Identify local hardware gates for B200/GB300-specific paths before adding default-discovery tests.
-- Account for FlashMLA attention-sink semantics and packed FP8/BF16 cache
-  quantization in the reference instead of comparing against an unquantized dense
-  approximation.
+- Model the C4 (4x) and C128 (128x) compressed-attention layers and their
+  `Compressor` / `C4Indexer` metadata. Today only `compress_ratio=0` (SWA) is
+  exercised, so the compressed pipeline is not in the matrix.
+- Add a decode-mode fixture that uses `DSV4RawDecodeMetadata`. EXTEND is
+  covered but DECODE shares enough metadata setup to warrant a separate
+  fixture.
+- Add a speculative target-verify and draft-extend fixture using
+  `DSV4RawVerifyMetadata`.
+- Account for FlashMLA attention-sink semantics with non-zero `attn_sink`
+  values (today the reference applies `-1e30`).
+- Extend the reference to `seq_len > SWA_WINDOW=128` once the corresponding
+  backend semantics are scoped.
 
 ## Next Work
 
-- `dsv4/test_<backend_name>.py` for a locally runnable backend or a hardware-gated backend file with clear skips.
+- C4 (4x) and C128 (128x) compressed-attention coverage.
+- Decode-mode SWA coverage.
+- Speculative target-verify / draft-extend coverage.
+- Non-zero attention-sink coverage.
+- CUDA graph capture/replay for the DSV4 SWA path.
