@@ -9,15 +9,18 @@ structurally wrong for this method.
 
 | Backend | Phase 2: method correctness | Phase 3: runner compatibility | Phase 4: speculative modes | Status |
 |---|---|---|---|---|
-| `dual_chunk_flash_attn` | Not implemented | Not implemented | Not implemented | Needs a method-specific fixture and independent PyTorch reference. |
+| `dual_chunk_flash_attn` | Short-sequence eager prefill/decode coverage inside the first dual-chunk window | Not implemented | Not implemented | Uses a method-specific packed-query fixture and an independent dense causal PyTorch reference while succ/inter chunks are inactive. |
 
 ## Required Fixture Work
 
-- Build a tiny model-specific module that emits the packed dual-chunk query streams.
-- Implement an HF-style reference for the dual-chunk mask/layout semantics.
-- Populate real request/KV pools and `ForwardBatch` metadata instead of adapting the dense fixture.
+- Extend coverage beyond first-chunk semantics so succ/inter chunk query streams
+  and dual-chunk output merging are checked against a dedicated PyTorch reference.
+- Populate CUDA graph and PCG/BCG runner metadata after eager first-chunk coverage
+  is stable across more chunk layouts.
+- Add sparse-attention reference coverage once a compact sparse config is selected.
 
 ## First Test Target
 
-- `dual_chunk/test_dual_chunk_flash_attn.py` with Phase 2 eager correctness over page-boundary inputs.
-- Add Phase 3/4 only after the packed-query reference and eager path are stable.
+- Broaden `dual_chunk/test_dual_chunk_flash_attn.py` from first-chunk equivalence
+  to cross-chunk layouts that require `query_succ` and `query_inter`.
+- Add Phase 3/4 only after the full packed-query reference is stable.

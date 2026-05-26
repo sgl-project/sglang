@@ -34,9 +34,9 @@ Implemented:
   tests use a scoped `5e-2` absolute tolerance for bf16 recurrent-kernel
   accumulation differences; chain verify and non-spec GDN paths keep `3e-2`.
 - Each attention-method folder now has a local `README.md` capability matrix and
-  progress summary. Implemented folders are `dense/`, `swa/`, `mla/`, and `gdn/`.
-  Placeholder folders now exist for not-yet-implemented method fixtures:
-  `dual_chunk/`, `dsa/`, and `dsv4/`.
+  progress summary. Implemented folders are `dense/`, `swa/`, `mla/`, `gdn/`, and
+  first-chunk `dual_chunk/`. Placeholder folders remain for not-yet-implemented
+  method fixtures: `dsa/` and `dsv4/`.
 - Phase 3 dense runner integration is implemented for representative attention
   backends: eager mode for `torch_native`, and CUDA-graph metadata capture/replay
   decode mode for `triton` and `flashinfer`. Runner coverage now includes MHA,
@@ -134,11 +134,13 @@ Implemented:
 - Tokenspeed MLA is not enabled yet because it requires an FP8 KV-cache fixture
   (`kv_cache_dtype=fp8_e4m3`); the current MLA unit fixture intentionally uses
   fp16 KV cache for reference parity.
-- `dual_chunk_flash_attn` should be modeled as its own attention method fixture,
-  not as a dense backend swap. The backend expects a packed five-way query
-  projection (`query`, `succ`, `inter`, and critical variants), so the dense
-  Q/K/V module is structurally wrong for it even when short sequences would make
-  the mask mathematically close to ordinary causal attention.
+- `dual_chunk_flash_attn` is modeled as its own attention method fixture rather
+  than a dense backend swap. The backend expects a packed five-way query
+  projection (`query`, `succ`, `inter`, and critical variants), so
+  `common/attention_methods/dual_chunk_attention.py` constructs a packed-query
+  module and compares first-chunk prefill/decode layouts against an independent
+  dense causal PyTorch reference while succ/inter chunks are inactive. Cross-chunk
+  and sparse-attention references remain future work.
 - FA3/FA4 CUDA-graph replay is intentionally not enabled yet. Dense eager and
   PCG/BCG split-op paths match the HF-style reference, but the shared decode
   CUDA-graph helper currently mismatches on replay for both FA backends. Local
@@ -227,14 +229,22 @@ Next implementation steps:
 - Expand Phase 2 to additional attention methods/backends with method-specific
   fixtures rather than forcing them through the dense harness. Priority candidates:
   hardware-gated MLA kernels (`cutlass_mla`, `trtllm_mla`/`tokenspeed_mla` where
-  hardware and KV dtype support them), dual-chunk attention with a packed-query
-  fixture, and DSA/DSV4-style methods.
+  hardware and KV dtype support them), dual-chunk cross-chunk/sparse layouts, and
+  DSA/DSV4-style methods.
 - Keep `torch_native` SWA out of the matrix until the backend honors
   `RadixAttention.sliding_window_size`.
 - Defer Phase 2 expansion for additional backends until representative Phase 3 and
   Phase 4 tests are passing.
 
 Latest verification:
+- Added first-chunk `dual_chunk_flash_attn` Phase 2 coverage with a packed-query
+  fixture, real request/KV pools, and an independent dense causal PyTorch
+  reference for short layouts where succ/inter chunks are inactive.
+- `python -m py_compile test/manual/attention/unittest/common/attention_methods/dual_chunk_attention.py test/manual/attention/unittest/dual_chunk/test_dual_chunk_flash_attn.py`
+- `python test/manual/attention/unittest/dual_chunk/test_dual_chunk_flash_attn.py -v`
+  - Ran 1 test in 0.619s after adding first-chunk dual-chunk attention coverage.
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+  - Ran 72 tests in 27.559s after adding first-chunk dual-chunk attention coverage.
 - Added production draft-runner coverage for MLA EAGLE draft decode, EAGLE
   draft-extend graph runners, and dense Frozen-KV MTP draft decode. The graph
   runner helper now resets shared CUDA graph input buffers between independent
@@ -443,6 +453,7 @@ test/manual/attention/unittest/
   common/
     attention_methods/
       dense_attention.py
+      dual_chunk_attention.py
       gdn_attention.py
       mla_attention.py
     runner_modes/
@@ -458,6 +469,8 @@ test/manual/attention/unittest/
     test_torch_native.py
     test_triton.py
     test_flashinfer.py
+  dual_chunk/
+    test_dual_chunk_flash_attn.py
   swa/
     test_triton.py
     test_flashinfer.py
