@@ -186,7 +186,7 @@ def _script_abort_in_separate_yields(t: ScriptedRuntime):
         assert r.kv_pages == 0
 
 
-def _script_abort_finish_event_count_zero(t: ScriptedRuntime):
+def _script_abort_finish_event_count_at_most_one(t: ScriptedRuntime):
     # Aborted req should not emit a normal finish event.
     # NEW API NEEDED: r.finish_event_count — count of completion events.
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -289,9 +289,9 @@ class TestEdgeAbortTiming(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    def test_abort_finish_event_count_zero(self):
+    def test_abort_finish_event_count_at_most_one(self):
         execute_scripted_runtime(
-            _script_abort_finish_event_count_zero,
+            _script_abort_finish_event_count_at_most_one,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
