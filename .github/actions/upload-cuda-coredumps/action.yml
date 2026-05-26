@@ -58,10 +58,21 @@ runs:
         else
           ref_label="$EVENT_NAME"
         fi
-        run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
-        # Use curl + REST API instead of `gh` CLI; gh is not installed on
-        # the self-hosted GPU runners.
-        body_json=$(printf '{"body":"%s"}' "${ref_label} - ${run_url}")
+        # Resolve own job_id via REST API: match by runner_name + status
+        # in_progress (the current job is the only one in_progress on this
+        # runner). Robust across matrix expansions and artifact-suffix shapes.
+        job_id=$(curl -sS \
+          -H "Authorization: Bearer ${BOT_TOKEN}" \
+          -H "Accept: application/vnd.github+json" \
+          "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs?per_page=100" \
+          | python3 -c 'import json,sys,os; print(next((j["id"] for j in json.load(sys.stdin)["jobs"] if j.get("runner_name")==os.environ["RUNNER_NAME"] and j.get("status")=="in_progress"), ""))')
+        if [ -n "$job_id" ]; then
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/job/${job_id}"
+        else
+          # Fallback to run-attempt URL if job_id lookup failed
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
+        fi
+        body_json=$(printf '{"body":"@hnyls2002 %s - %s"}' "${ref_label}" "${run_url}")
         curl -sS -X POST \
           -H "Authorization: Bearer ${BOT_TOKEN}" \
           -H "Accept: application/vnd.github+json" \
