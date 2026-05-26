@@ -358,6 +358,34 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Investigated DSA runner-mode coverage and landed the fixture plumbing
+  + documented the structural block. `DSAMockModelRunner` and
+  `build_dsa_attention_fixture` now accept the standard
+  `disable_cuda_graph` / `disable_piecewise_cuda_graph` /
+  `runner_batch_size` kwargs, and `dsa_attention.py` exposes the
+  standard adapter callbacks (`make_dsa_case_with_prefix_lens`,
+  `dsa_fixture_inputs`, `make_dsa_random_inputs`,
+  `make_dsa_token_padded_inputs`, `prepare_dsa_runner_inputs`,
+  `run_dsa_forward`, `expected_dsa_output_from_inputs`,
+  `dsa_attention_layers`, `_clone_dsa_cache`, `_restore_dsa_cache`).
+  PCG/BCG split-op on the MHA_ONE_SHOT dense fallback path is
+  structurally blocked by `unified_attention_with_output`
+  (`radix_attention.py:170-208`) slicing K to
+  `num_token_non_padded_cpu` — DSA dense fallback passes
+  prefix+extend K inline (length `sum(seq_lens)`) so the slicer
+  drops the prefix and the piecewise actual diverges from eager by
+  ~50% mismatch. Documented in `dsa/README.md` with two unblocking
+  paths. The natural next target is sparse CG decode via the
+  `flashmla_kv` decode cases (uses cached K so the slicer is a
+  no-op).
+- Fixed FA `DRAFT_EXTEND_V2` cache-extent bug in
+  `flashattention_backend.py` (commit `7e8475592`). Both eager
+  `init_forward_metadata` (~L503) and replay
+  `init_forward_metadata_replay_cuda_graph` (~L2288) now use
+  `effective_cache_seqlens = seq_lens + extend_seq_lens` for V2
+  (where production sets `seq_lens = prefix_lens`); non-V2 EXTEND is
+  untouched. FA3/FA4 V2 test coverage added; full dense+swa+mla
+  regression suites green.
 - Unblocked FA3/FA4 CUDA-graph decode replay by aligning the unit-test
   CG runner contract with production: capture-time forward is now
   treated as a JIT warmup whose output is discarded (matching how
