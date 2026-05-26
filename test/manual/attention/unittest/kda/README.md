@@ -19,7 +19,7 @@ Columns are runner modes; rows are the linear-attention kernel backend
 
 | Linear-attn kernel | Eager Phase 2 | CG decode | PCG extend | BCG extend | Verify eager | Verify CG | DE eager | DE CG | DE-V2 CG | EAGLE-draft runner | EAGLE-DE runner | FKVMTP runner |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `triton` | ✓ 10 input layouts (page 1/16/32, prefix/decode edges) | ✓ decode page-boundary (uses `KDA_GRAPH_ATOL=1e-1` to absorb Triton recurrent-kernel CG-replay drift; eager `KDA_ATOL=3e-2` kept for non-graph cases) | deferred | deferred | ✓ EAGLE chain (topk=1) + EAGLE tree (topk=2) (`atol=1e-1` because the verify reference's pure-Python per-token recurrence drifts ~0.07 vs the Triton kernel even before CG capture/replay) | ✓ EAGLE chain CG + EAGLE tree CG (same `1e-1` tolerance) | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
+| `triton` | ✓ 10 input layouts (page 1/16/32, prefix/decode edges) | ✓ decode page-boundary (uses `KDA_GRAPH_ATOL=1e-1` to absorb Triton recurrent-kernel CG-replay drift; eager `KDA_ATOL=3e-2` kept for non-graph cases) | ✓ ragged page-boundary extend | ✓ ragged page-boundary extend | ✓ EAGLE chain (topk=1) + EAGLE tree (topk=2) (`atol=1e-1` because the verify reference's pure-Python per-token recurrence drifts ~0.07 vs the Triton kernel even before CG capture/replay) | ✓ EAGLE chain CG + EAGLE tree CG (same `1e-1` tolerance) | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
 
 ## Input And Config Coverage
 
@@ -40,9 +40,6 @@ Columns are runner modes; rows are the linear-attention kernel backend
 
 ## Next Work
 
-- Add PCG/BCG runner coverage modeled on GDN `runner_modes`. CG decode +
-  EAGLE chain/tree verify (eager + CG) already wired (see above);
-  `kda_fixture_inputs` + `make_kda_random_inputs` now expose both
-  `a/b` (post-transform, fed to the actual module) and `a_raw/b_raw`
-  (raw, fed to `_pure_torch_kda_gating` inside the verify reference).
-- Consider additional KDA kernel backend variants when available.
+- Consider additional KDA kernel backend variants when available. CG
+  decode, PCG/BCG split-op extend, and EAGLE chain/tree verify
+  (eager + CG) are all wired (see matrix above).

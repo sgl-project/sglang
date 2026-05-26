@@ -60,6 +60,59 @@ from ..attention_methods.gdn_attention import (
     run_gdn_fixture_eager,
     run_gdn_forward,
 )
+from ..attention_methods.kda_attention import DEFAULT_DEVICE as KDA_DEFAULT_DEVICE
+from ..attention_methods.kda_attention import DEFAULT_DTYPE as KDA_DEFAULT_DTYPE
+from ..attention_methods.kda_attention import (
+    DEFAULT_HEAD_K_DIM as KDA_DEFAULT_HEAD_K_DIM,
+)
+from ..attention_methods.kda_attention import (
+    DEFAULT_HEAD_V_DIM as KDA_DEFAULT_HEAD_V_DIM,
+)
+from ..attention_methods.kda_attention import (
+    DEFAULT_MAX_CONTEXT_LEN as KDA_DEFAULT_MAX_CONTEXT_LEN,
+)
+from ..attention_methods.kda_attention import (
+    KDA_ATOL,
+    KDA_RTOL,
+    KDAAttentionCase,
+    _clone_kda_cache,
+    _restore_kda_cache,
+    build_kda_attention_fixture,
+    expected_kda_output_from_inputs,
+    kda_attention_layers,
+    kda_fixture_inputs,
+    make_kda_token_padded_inputs,
+    prepare_kda_runner_inputs,
+    run_kda_fixture_eager,
+    run_kda_forward,
+)
+from ..attention_methods.lightning_attention import (
+    DEFAULT_DEVICE as LIGHTNING_DEFAULT_DEVICE,
+)
+from ..attention_methods.lightning_attention import (
+    DEFAULT_DTYPE as LIGHTNING_DEFAULT_DTYPE,
+)
+from ..attention_methods.lightning_attention import (
+    DEFAULT_HEAD_DIM as LIGHTNING_DEFAULT_HEAD_DIM,
+)
+from ..attention_methods.lightning_attention import (
+    DEFAULT_MAX_CONTEXT_LEN as LIGHTNING_DEFAULT_MAX_CONTEXT_LEN,
+)
+from ..attention_methods.lightning_attention import (
+    LIGHTNING_ATOL,
+    LIGHTNING_RTOL,
+    LightningAttentionCase,
+    _clone_lightning_cache,
+    _restore_lightning_cache,
+    build_lightning_attention_fixture,
+    expected_lightning_split_op_output_from_inputs,
+    lightning_attention_layers,
+    lightning_fixture_inputs,
+    make_lightning_token_padded_inputs,
+    prepare_lightning_runner_inputs,
+    run_lightning_fixture_eager,
+    run_lightning_forward,
+)
 from ..attention_methods.mla_attention import DEFAULT_DEVICE as MLA_DEFAULT_DEVICE
 from ..attention_methods.mla_attention import DEFAULT_DTYPE as MLA_DEFAULT_DTYPE
 from ..attention_methods.mla_attention import (
@@ -379,6 +432,97 @@ def run_gdn_split_op_extend_case(
         build_kwargs=dict(
             head_k_dim=head_k_dim,
             head_v_dim=head_v_dim,
+            max_context_len=max_context_len,
+            dtype=dtype,
+            device=device,
+        ),
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        breakable=breakable,
+        static_num_tokens=static_num_tokens,
+    )
+
+
+def run_kda_split_op_extend_case(
+    testcase,
+    case: KDAAttentionCase,
+    *,
+    breakable: bool,
+    static_num_tokens: int | None = None,
+    head_k_dim: int = KDA_DEFAULT_HEAD_K_DIM,
+    head_v_dim: int = KDA_DEFAULT_HEAD_V_DIM,
+    max_context_len: int = KDA_DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = KDA_DEFAULT_DTYPE,
+    device: str = KDA_DEFAULT_DEVICE,
+):
+    """KDA PCG/BCG split-op extend. Verifies the live-token slicing contract
+    with a larger static token buffer, mirroring GDN's split_op coverage."""
+    adapter = SplitOpAdapter(
+        build_fixture=build_kda_attention_fixture,
+        fixture_inputs=kda_fixture_inputs,
+        make_token_padded_inputs=make_kda_token_padded_inputs,
+        prepare_inputs=prepare_kda_runner_inputs,
+        run_eager=run_kda_fixture_eager,
+        run_forward=run_kda_forward,
+        expected_output=expected_kda_output_from_inputs,
+        attention_layers=kda_attention_layers,
+        clone_state=_clone_kda_cache,
+        restore_state=_restore_kda_cache,
+        atol=KDA_ATOL,
+        rtol=KDA_RTOL,
+    )
+    _run_split_op_extend_case(
+        testcase,
+        case,
+        adapter=adapter,
+        build_kwargs=dict(
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
+            max_context_len=max_context_len,
+            dtype=dtype,
+            device=device,
+        ),
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        breakable=breakable,
+        static_num_tokens=static_num_tokens,
+    )
+
+
+def run_lightning_split_op_extend_case(
+    testcase,
+    case: LightningAttentionCase,
+    *,
+    breakable: bool,
+    static_num_tokens: int | None = None,
+    head_dim: int = LIGHTNING_DEFAULT_HEAD_DIM,
+    max_context_len: int = LIGHTNING_DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = LIGHTNING_DEFAULT_DTYPE,
+    device: str = LIGHTNING_DEFAULT_DEVICE,
+):
+    """Lightning PCG/BCG split-op extend. Same pattern as KDA/GDN."""
+    adapter = SplitOpAdapter(
+        build_fixture=build_lightning_attention_fixture,
+        fixture_inputs=lightning_fixture_inputs,
+        make_token_padded_inputs=make_lightning_token_padded_inputs,
+        prepare_inputs=prepare_lightning_runner_inputs,
+        run_eager=run_lightning_fixture_eager,
+        run_forward=run_lightning_forward,
+        expected_output=expected_lightning_split_op_output_from_inputs,
+        attention_layers=lightning_attention_layers,
+        clone_state=_clone_lightning_cache,
+        restore_state=_restore_lightning_cache,
+        atol=LIGHTNING_ATOL,
+        rtol=LIGHTNING_RTOL,
+    )
+    _run_split_op_extend_case(
+        testcase,
+        case,
+        adapter=adapter,
+        build_kwargs=dict(
+            head_dim=head_dim,
             max_context_len=max_context_len,
             dtype=dtype,
             device=device,

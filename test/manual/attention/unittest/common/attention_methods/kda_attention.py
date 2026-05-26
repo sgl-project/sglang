@@ -920,50 +920,41 @@ def make_kda_token_padded_inputs(
     dtype: torch.dtype,
     device: str,
 ) -> dict[str, torch.Tensor]:
+    """Pad each input tensor along its token-axis to `static_num_tokens`.
+
+    `kda_fixture_inputs` carries both the shaped `a/b` (which may be 2D
+    `[T, HV*K]` for DECODE or 4D `[1, T, HV, K]` for non-DECODE) and the
+    raw `a_raw/b_raw` (always 2D). Pad along whichever axis corresponds to
+    `num_input_tokens` for each tensor.
+    """
     del fixture
     raw_num_tokens = base_inputs["mixed_qkv"].shape[0]
     if static_num_tokens < raw_num_tokens:
         raise ValueError("static_num_tokens must cover the live input token count.")
-
+    if static_num_tokens == raw_num_tokens:
+        return base_inputs
     pad_num_tokens = static_num_tokens - raw_num_tokens
-    return {
-        "mixed_qkv": torch.cat(
-            [
-                base_inputs["mixed_qkv"],
-                torch.randn(
-                    pad_num_tokens,
-                    base_inputs["mixed_qkv"].shape[1],
-                    dtype=dtype,
-                    device=device,
-                ),
-            ],
-            dim=0,
-        ),
-        "a": torch.cat(
-            [
-                base_inputs["a"],
-                torch.randn(
-                    pad_num_tokens,
-                    base_inputs["a"].shape[1],
-                    dtype=dtype,
-                    device=device,
-                ),
-            ],
-            dim=0,
-        ),
-        "b": torch.cat(
-            [
-                base_inputs["b"],
-                torch.randn(
-                    pad_num_tokens,
-                    base_inputs["b"].shape[1],
-                    dtype=dtype,
-                    device=device,
-                ),
-            ],
-            dim=0,
-        ),
-    }
+
+    def _pad_token_axis(t: torch.Tensor, token_axis: int) -> torch.Tensor:
+        pad_shape = list(t.shape)
+        pad_shape[token_axis] = pad_num_tokens
+        return torch.cat(
+            [t, torch.randn(*pad_shape, dtype=dtype, device=device)],
+            dim=token_axis,
+        )
+
+    padded: dict[str, torch.Tensor] = {}
+    for key, t in base_inputs.items():
+        if key in ("mixed_qkv", "a_raw", "b_raw"):
+            padded[key] = _pad_token_axis(t, token_axis=0)
+        elif key in ("a", "b"):
+            # DECODE shape `[T, HV*K]` / `[1, T, HV]`; non-DECODE
+            # `[1, T, HV, K]` / `[1, T, HV]`. Pad whichever axis has T.
+            token_axis = 0 if t.shape[0] == raw_num_tokens else 1
+            padded[key] = _pad_token_axis(t, token_axis=token_axis)
+        else:
+            padded[key] = t
+    return padded
 
 
 def prepare_kda_runner_inputs(

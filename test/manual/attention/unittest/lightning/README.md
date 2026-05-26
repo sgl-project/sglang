@@ -19,7 +19,7 @@ Columns are runner modes; rows are the linear-attention kernel backend
 
 | Linear-attn kernel | Eager Phase 2 | CG decode | PCG extend | BCG extend | Verify eager | Verify CG | DE eager | DE CG | DE-V2 CG | EAGLE-draft runner | EAGLE-DE runner | FKVMTP runner |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `triton` | ✓ 10 input layouts (page 1/16/32, prefix/decode edges) | ✓ decode page-boundary (uses `LIGHTNING_GRAPH_ATOL=1e-1` to absorb seg_la kernel CG-replay drift; eager `LIGHTNING_ATOL=3e-2` kept for non-graph cases) | deferred | deferred | ✓ EAGLE chain (topk=1) only — see "Production-Unsupported" below for why tree is omitted. Uses `atol=1e-1` because the verify reference's pure-Python per-token recurrence drifts ~0.07 vs the seg_la Triton kernel. | ✓ EAGLE chain CG (same `1e-1` tolerance) | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
+| `triton` | ✓ 10 input layouts (page 1/16/32, prefix/decode edges) | ✓ decode page-boundary (uses `LIGHTNING_GRAPH_ATOL=1e-1` to absorb seg_la kernel CG-replay drift; eager `LIGHTNING_ATOL=3e-2` kept for non-graph cases) | deferred: piecewise CG path returns per-head shape via `RadixAttention.forward`'s `empty_like(q)`, but Lightning backend's `forward_extend` flattens to `[T, num_heads * head_dim]`; eager vs piecewise actuals don't share a shape. See "Production-Unsupported" below. | deferred (same reason) | ✓ EAGLE chain (topk=1) only — see "Production-Unsupported" below for why tree is omitted. Uses `atol=1e-1` because the verify reference's pure-Python per-token recurrence drifts ~0.07 vs the seg_la Triton kernel. | ✓ EAGLE chain CG (same `1e-1` tolerance) | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
 
 ## Input And Config Coverage
 
@@ -49,13 +49,25 @@ Columns are runner modes; rows are the linear-attention kernel backend
   `intermediate_state_indices` / `intermediate_ssm` plumbing in
   `lightning_backend.py:307-329` is per-request, not per-token, so it
   cannot replay parent state forks. Only chain (topk=1) is covered.
+- **PCG / BCG split-op extend** — Lightning's `forward_extend` flattens
+  to `[T, num_heads * head_dim]` at `lightning_backend.py:335`, but
+  under piecewise CG `RadixAttention.forward`
+  (`radix_attention.py:124-137`) writes through `output =
+  torch.empty_like(q)` of per-head shape `[T, num_heads, head_dim]`,
+  ignoring the backend's intended flatten. The shared
+  `_run_split_op_extend_case` compares eager vs piecewise actuals,
+  which then trip a shape mismatch. KDA and GDN avoid this because
+  their backends keep the per-head shape on the return path. Fixing
+  needs either a Lightning-specific split-op runner that reshapes
+  actual to flat, or a Lightning backend change to keep per-head shape
+  under piecewise CG.
 
 ## Next Work
 
-- Add PCG/BCG runner coverage. CG decode + EAGLE chain verify already
-  wired (see above); the `_clone_lightning_cache` /
-  `_restore_lightning_cache` snapshot helpers reuse `_ssm_states(fixture)`
-  which points at the shared `Mamba2CacheParams.temporal` buffer.
+- PCG/BCG split-op extend needs either a Lightning-specific split-op
+  runner that reshapes piecewise actual to flat, or a backend-side
+  change to keep per-head shape under piecewise CG. See
+  "Production-Unsupported" above.
 - EAGLE tree verify is gated by the `seg_la` kernel itself (no
   parent-indices support); landing it requires a kernel-side change to
   thread parent indices through `intermediate_ssm` so each draft token

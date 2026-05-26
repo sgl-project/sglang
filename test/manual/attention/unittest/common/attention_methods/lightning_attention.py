@@ -965,3 +965,65 @@ def expected_lightning_verify_output_from_inputs(
         start += input_len
 
     return outputs.to(fixture.q.dtype).reshape(case.num_input_tokens, -1)
+
+
+def make_lightning_token_padded_inputs(
+    _case: LightningAttentionCase,
+    fixture: LightningAttentionFixture,
+    static_num_tokens: int,
+    base_inputs: dict[str, torch.Tensor],
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> dict[str, torch.Tensor]:
+    """Pad inputs to a fixed static token count for split-op runner tests.
+    The static count is the upper bound the backend's token-padding contract
+    must cover; live tokens come first, padding follows."""
+    del fixture
+    raw_num_tokens = base_inputs["q"].shape[0]
+    if static_num_tokens < raw_num_tokens:
+        raise ValueError("static_num_tokens must cover the live input token count.")
+    if static_num_tokens == raw_num_tokens:
+        return base_inputs
+    pad_num_tokens = static_num_tokens - raw_num_tokens
+
+    def _pad(t: torch.Tensor) -> torch.Tensor:
+        return torch.cat(
+            [
+                t,
+                torch.randn(
+                    pad_num_tokens,
+                    *t.shape[1:],
+                    dtype=dtype,
+                    device=device,
+                ),
+            ],
+            dim=0,
+        )
+
+    return {
+        "q": _pad(base_inputs["q"]),
+        "k": _pad(base_inputs["k"]),
+        "v": _pad(base_inputs["v"]),
+    }
+
+
+def lightning_attention_layers(fixture: LightningAttentionFixture) -> list:
+    """Return the RadixAttention layers the backend forwards through. The
+    split-op runner uses this list to install per-layer
+    `num_token_non_padded_cpu` metadata before forward."""
+    return [fixture.actual_module.attn]
+
+
+def expected_lightning_split_op_output_from_inputs(
+    fixture: LightningAttentionFixture,
+    case: LightningAttentionCase,
+    _inputs: dict[str, torch.Tensor],
+    state,
+) -> torch.Tensor:
+    """Per-head-shape reference for the split-op runner. In piecewise CG
+    context, `RadixAttention.forward` writes through `output =
+    torch.empty_like(q)` (shape `[T, num_heads, head_dim]`) instead of the
+    flat backend return — so the split-op `actual` is per-head and the
+    expected must match that shape."""
+    return _pure_torch_lightning_reference(fixture, state).output

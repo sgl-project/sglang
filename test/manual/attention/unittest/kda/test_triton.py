@@ -21,6 +21,9 @@ from common.runner_modes.speculative_target_verify_runner import (
     run_kda_eagle_verify_case,
     run_kda_eagle_verify_cuda_graph_case,
 )
+from common.runner_modes.split_op_runner import (
+    run_kda_split_op_extend_case,
+)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -115,6 +118,38 @@ class TestTritonKDABackendCorrectness(CustomTestCase):
         for case, topk in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:
             with self.subTest(case=case.name, backend=case.backend, topk=topk):
                 run_kda_eagle_verify_cuda_graph_case(self, case, topk=topk)
+
+    SPLIT_OP_CASES = (
+        (
+            KDAAttentionCase(
+                name="runner_split_op_kda_extend_ragged_page_boundary",
+                backend="triton",
+                forward_mode=ForwardMode.EXTEND,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(0, 8, 16),
+                extend_lens=(15, 8, 1),
+            ),
+            32,
+        ),
+    )
+
+    def test_runner_mode_split_op_extend_cases(self):
+        for case, static_num_tokens in self.SPLIT_OP_CASES:
+            for breakable in (False, True):
+                runner = "bcg" if breakable else "pcg"
+                with self.subTest(
+                    case=case.name,
+                    backend=case.backend,
+                    runner=runner,
+                ):
+                    run_kda_split_op_extend_case(
+                        self,
+                        case,
+                        breakable=breakable,
+                        static_num_tokens=static_num_tokens,
+                    )
 
 
 if __name__ == "__main__":

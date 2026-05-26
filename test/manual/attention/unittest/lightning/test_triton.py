@@ -94,6 +94,20 @@ class TestTritonLightningBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend, topk=topk):
                 run_lightning_eagle_verify_cuda_graph_case(self, case, topk=topk)
 
+    # PCG/BCG split-op extend is deliberately NOT covered. Lightning's
+    # backend `forward_extend` flattens the output via `o.view(-1,
+    # tp_q_head_num * v_head_dim)` (`lightning_backend.py:335`), so eager
+    # forward returns flat `[T, num_heads * head_dim]`. But under
+    # piecewise CG (the split-op path), `RadixAttention.forward` writes
+    # through `output = torch.empty_like(q)` of per-head shape
+    # `[T, num_heads, head_dim]`, ignoring the backend's intended
+    # flatten. The split-op runner compares eager_actual to the
+    # piecewise actual, which then trips a shape mismatch. KDA and GDN
+    # avoid this because their backends keep the per-head shape on the
+    # return path. Fixing requires either a Lightning-specific split-op
+    # runner that reshapes actual to flat, or a Lightning backend
+    # change to keep per-head shape under piecewise CG.
+
 
 if __name__ == "__main__":
     unittest.main()
