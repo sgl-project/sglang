@@ -35,9 +35,10 @@ Implemented:
   accumulation differences; chain verify and non-spec GDN paths keep `3e-2`.
 - Each attention-method folder now has a local `README.md` capability matrix and
   progress summary. Implemented folders are `dense/`, `swa/`, `mla/`, `gdn/`,
-  `dual_chunk/`, plus DSA dense fallback and sparse top-k coverage. `dsv4/`
-  remains a deferred method fixture because it needs a DeepSeekV4-specific
-  packed-cache reference.
+  `dual_chunk/`, plus DSA dense fallback and sparse top-k coverage, and an
+  initial KDA (Kimi Delta Attention) linear-attention fixture under `kda/` with
+  an eager EXTEND Triton case. `dsv4/` remains a deferred method fixture
+  because it needs a DeepSeekV4-specific packed-cache reference.
 - Phase 3 dense runner integration is implemented for representative attention
   backends: eager mode for `torch_native`, and CUDA-graph metadata capture/replay
   decode mode for `triton` and `flashinfer`. Runner coverage now includes MHA,
@@ -259,6 +260,16 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Added initial KDA (Kimi Delta Attention) linear-attention Phase 2 fixture with
+  a `ProjectedKDAAttention` actual module (wraps `RadixLinearAttention` via
+  `KDAAttnBackend` + `HybridLinearAttnBackend`) and an independent pure-PyTorch
+  sigmoid-gated delta-rule reference using `KimiLinearCacheParams` /
+  `KimiLinearStateShape` (per-head-channel `dt_bias`, `silu` activation on
+  conv1d output, per-channel gate broadcast).
+- `python -m py_compile test/manual/attention/unittest/common/attention_methods/kda_attention.py test/manual/attention/unittest/kda/test_triton.py`
+- `python test/manual/attention/unittest/kda/test_triton.py -v`
+  - Ran 1 test in 2.485s after adding eager KDA EXTEND Triton coverage
+    (`kda_extend_zero_prefix_exact_page`, page_size=16, prefix=(0,), extend=(16,)).
 - Added dual-chunk sparse all-column Phase 2 coverage using the local
   vertical/slash sparse FlashAttention kernel path.
 - `python -m py_compile test/manual/attention/unittest/common/attention_methods/dual_chunk_attention.py test/manual/attention/unittest/dual_chunk/test_dual_chunk_flash_attn.py`
@@ -511,6 +522,7 @@ test/manual/attention/unittest/
       dsa_attention.py
       dual_chunk_attention.py
       gdn_attention.py
+      kda_attention.py
       mla_attention.py
     runner_modes/
       cuda_graph_decode_runner.py
@@ -529,6 +541,8 @@ test/manual/attention/unittest/
     test_dual_chunk_flash_attn.py
   dsa/
     test_dsa.py
+  kda/
+    test_triton.py
   swa/
     test_triton.py
     test_flashinfer.py
