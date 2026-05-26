@@ -22,6 +22,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.hicache_host_index import HiCacheHostBlockIndex
 from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
@@ -402,6 +403,27 @@ class TestSharedHiCache(unittest.TestCase):
 
         cache.evict_host(2)
         self.assertEqual(cache.lookup_hicache_host_blocks({evicted_hash}), {})
+
+    def test_shared_hicache_device_insert_does_not_write_through(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        captured = []
+
+        def insert(params):
+            captured.append(params)
+            return SimpleNamespace(prefix_len=0)
+
+        cache.insert = insert
+        key = RadixKey(array("q", [1, 2]))
+        value = torch.tensor([10, 11], dtype=torch.int64)
+
+        result = cache.insert_shared_hicache_device_blocks(key=key, value=value)
+
+        self.assertEqual(result.prefix_len, 0)
+        self.assertEqual(len(captured), 1)
+        self.assertIsInstance(captured[0], InsertParams)
+        self.assertTrue(captured[0].chunked)
+        self.assertIs(captured[0].key, key)
+        self.assertTrue(torch.equal(captured[0].value, value))
 
     def test_manager_stages_direct_transfer_into_local_prefix(self):
         manager = _make_manager()

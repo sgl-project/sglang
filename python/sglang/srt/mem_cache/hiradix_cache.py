@@ -660,7 +660,7 @@ class HiRadixCache(RadixCache):
     def insert_shared_hicache_device_blocks(
         self, *, key: RadixKey, value: torch.Tensor
     ) -> InsertResult:
-        return self.insert(InsertParams(key=key, value=value))
+        return self.insert(InsertParams(key=key, value=value, chunked=True))
 
     def get_height(self, node: TreeNode):
         height = 0
