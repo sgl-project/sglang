@@ -1,4 +1,4 @@
-"""Duck-typed attention contract for the MLX backend."""
+"""Attention helpers based on duck typing for the MLX backend."""
 
 from __future__ import annotations
 
@@ -9,7 +9,14 @@ from typing import Any, Iterable
 # mistaken for softmax attention just because they expose projection layers.
 ATTENTION_API_ATTRS = ("q_proj", "k_proj", "v_proj", "o_proj", "rope", "scale")
 NUM_HEAD_ATTRS = ("n_heads", "num_heads", "num_attention_heads")
-NUM_KV_HEAD_ATTRS = ("n_kv_heads", "num_k_heads", "num_key_value_heads")
+NUM_KV_HEAD_ATTRS = ("n_kv_heads", "num_k_heads", "num_kv_heads", "num_key_value_heads")
+SLIDING_ATTENTION_ATTRS = (
+    "is_sliding",
+    "use_sliding",
+    "is_sliding_window",
+    "use_sliding_window",
+    "is_swa",
+)
 
 
 def first_present_attr(module: Any, names: Iterable[str]) -> Any | None:
@@ -48,4 +55,12 @@ def is_attention_module(module: Any) -> bool:
         all(hasattr(module, attr) for attr in ATTENTION_API_ATTRS)
         and get_num_heads(module) is not None
         and get_num_kv_heads(module) is not None
+    )
+
+
+def uses_sliding_window_attention(*modules: Any) -> bool:
+    return any(
+        bool(getattr(module, attr, False))
+        for module in modules
+        for attr in SLIDING_ATTENTION_ATTRS
     )

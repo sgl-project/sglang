@@ -45,6 +45,7 @@ from sglang.srt.hardware_backend.mlx.kv_cache import (
     get_num_kv_heads,
     patch_model_attention,
     set_context,
+    uses_sliding_window_attention,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.server_args import get_global_server_args
@@ -108,13 +109,6 @@ _MLX_QUANTIZATION_PRESETS: dict[str, tuple[int, int]] = {
     "mlx_q8": (8, 64),
 }
 _MLX_KV_FLOAT_DTYPES = {mx.float16, mx.bfloat16, mx.float32}
-_SLIDING_ATTENTION_MARKERS = (
-    "is_sliding",
-    "use_sliding",
-    "is_sliding_window",
-    "use_sliding_window",
-    "is_swa",
-)
 
 
 class MlxModelRunner:
@@ -476,20 +470,12 @@ class MlxModelRunner:
             return attn._inner
         return attn
 
-    @staticmethod
-    def _uses_sliding_window_attention(layer: Any, attn: Any) -> bool:
-        return any(
-            bool(getattr(obj, marker, False))
-            for obj in (layer, attn)
-            for marker in _SLIDING_ATTENTION_MARKERS
-        )
-
     def _attention_kv_config_for_layer(
         self, layer_idx: int
     ) -> tuple[int, int, mx.Dtype]:
         layer = self._cache_layout.layers[layer_idx]
         sample_attn = self._attention_module_for_layer(layer_idx)
-        if self._uses_sliding_window_attention(layer, sample_attn):
+        if uses_sliding_window_attention(layer, sample_attn):
             raise NotImplementedError(
                 "MLX radix attention KV pool does not support sliding-window "
                 f"attention yet at layer {layer_idx}. Sliding-window KV needs "

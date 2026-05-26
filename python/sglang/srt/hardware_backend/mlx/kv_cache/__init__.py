@@ -5,6 +5,7 @@ from sglang.srt.hardware_backend.mlx.kv_cache.attention_contract import (
     get_num_heads,
     get_num_kv_heads,
     is_attention_module,
+    uses_sliding_window_attention,
 )
 from sglang.srt.hardware_backend.mlx.kv_cache.attention_kv_cache import (
     AttentionOffsetCache,
@@ -54,4 +55,5 @@ __all__ = [
     "patch_model_attention",
     "PoolBackedAttentionKVCache",
     "set_context",
+    "uses_sliding_window_attention",
 ]
