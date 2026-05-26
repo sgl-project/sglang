@@ -71,7 +71,7 @@ class ChunkedRefactorTestBase(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k_mixed",
-            api="completion",
+            api="chat_completion",
             max_tokens=self.max_tokens,
             num_examples=self.num_examples,
             num_threads=self.num_threads,
