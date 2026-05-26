@@ -2,7 +2,8 @@
 
 import unittest
 
-from sglang.test.scripted_runtime import ScriptedRuntime, execute_scripted_runtime
+from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
+from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
 
