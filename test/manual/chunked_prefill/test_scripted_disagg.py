@@ -18,6 +18,7 @@ from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
+    DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     run_until,
@@ -95,6 +96,65 @@ class TestDisaggBasic(ScriptedRuntimeTestCase):
         ), f"tmp_end_idx must reset on retract, got {r.tmp_end_idx}"
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
+
+    def test_disagg_send_state_reset_on_retract_invariant(self):
+        """Invariant D3: ``reset_for_retract`` must clear ``start_send_idx`` to 0 and ``tmp_end_idx`` to -1 on a disagg-prefill chunked req.
+
+        Direct access to ``_scheduler`` internals is intentional; this is an
+        invariant-tier test (see direct-internals-access plan).
+        """
+        self.runtime.run(self._script_disagg_send_state_reset_on_retract_invariant)
+
+    # D3 — drive a disagg-prefill chunked req partway so its send-side
+    # state has been advanced by ``send_kv_chunk`` (``start_send_idx >
+    # 0``). Reach into ``t._scheduler`` to grab the raw ``Req``, then
+    # call ``req.reset_for_retract()`` directly — this is the
+    # canonical retract reset path; ``t.force_retract`` is a wishlist
+    # stub that wraps the same call inside scheduler bookkeeping but
+    # adds nothing to the invariant under test. After the reset the
+    # disagg-prefill send fields must be back at their init values.
+    # See commit 414efd4a27 ("Reset disagg send-side state on
+    # chunked-resume retract") for the original bug.
+    @staticmethod
+    def _script_disagg_send_state_reset_on_retract_invariant(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        # Drive past at least one chunk completion so the disagg
+        # prefill side has executed a ``send_kv_chunk`` and advanced
+        # ``start_send_idx`` away from its init value of 0.
+        yield from run_until(
+            r,
+            lambda h: h.is_chunking and h.chunks_done >= 1,
+            max_steps=DEFAULT_MAX_STEPS,
+        )
+        req = t._find_req_by_rid(r.rid)
+        assert req is not None, "req must still be live mid-chunk"
+        # Sanity: precondition. If neither field ever advanced the
+        # invariant assertion below is vacuously satisfied, so require
+        # one to be in a non-init state. In disagg-prefill mode the
+        # bootstrap or per-chunk send must have moved at least one.
+        assert req.start_send_idx > 0 or req.tmp_end_idx >= 0, (
+            f"setup expected disagg send-side state to have advanced "
+            f"mid-chunk, got start_send_idx={req.start_send_idx}, "
+            f"tmp_end_idx={req.tmp_end_idx}"
+        )
+
+        # Trigger the retract reset path directly. ``reset_for_retract``
+        # is the single documented routine that retract callers (both
+        # ``retract_decode`` and the disagg-prefill pause sweep) invoke
+        # to bring the req back to a re-admissible state.
+        req.reset_for_retract()
+
+        assert req.start_send_idx == 0, (
+            f"D3 invariant violation: reset_for_retract did not clear "
+            f"start_send_idx; got {req.start_send_idx}. Without this "
+            f"reset, the next send_kv_chunk on the re-admitted req would "
+            f"skip already-staged-but-not-yet-sent bytes."
+        )
+        assert req.tmp_end_idx == -1, (
+            f"D3 invariant violation: reset_for_retract did not clear "
+            f"tmp_end_idx; got {req.tmp_end_idx}. Stale tmp_end_idx "
+            f"would index the wrong slice on the next overlap send."
+        )
 
 
 class TestDisaggOverlap(ScriptedRuntimeTestCase):
