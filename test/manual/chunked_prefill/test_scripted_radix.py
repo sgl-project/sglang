@@ -340,7 +340,7 @@ class TestRadixBasic(ScriptedRuntimeTestCase):
     # remaining prompt — chunks_done across the full lifetime should
     # equal the expected total chunk count for the original prompt
     # (not 0, not doubled). The radix layer's lock_ref on the
-    # already-committed prefix means resume can re-use prior chunks'
+    # already-committed prefix means resume can reuse prior chunks'
     # KV, so chunks_done counts only the chunks the scheduler actually
     # admitted for this req.
     @staticmethod
