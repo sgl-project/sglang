@@ -983,7 +983,13 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
             _original_torch_bmm = torch.bmm
             torch.bmm = bmm_batch_invariant
     else:
-        _batch_invariant_LIB.impl("aten::mm", npu_mm_batch_invariant, "NPU")
+        _batch_invariant_LIB.impl("aten::mm", npu_mm_batch_invariant, dispatch_key)
+        _batch_invariant_LIB.impl(
+            "aten::matmul", npu_matmul_batch_invariant, dispatch_key
+        )
+        _batch_invariant_LIB.impl(
+            "aten::mean.dim", npu_mean_batch_invariant, dispatch_key
+        )
         _batch_invariant_LIB.impl(
             "aten::matmul",
             npu_matmul_batch_invariant,
