@@ -83,9 +83,6 @@ class PlanInput:
             bs=bs,
         )
 
-        # Mirror the snapshot lens already captured on the forward batch. Padding rows
-        # stay at zero from ``zero_()`` so the plan kernel reads ``valid_len == 0`` and
-        # emits the ``-1`` sentinel for them.
         req_all_ids_lens = forward_batch.req_all_ids_lens
         if req_all_ids_lens is not None:
             self.req_to_verify_expected_tokens_valid_lens[:bs].copy_(

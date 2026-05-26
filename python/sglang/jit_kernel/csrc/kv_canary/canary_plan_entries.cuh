@@ -227,9 +227,11 @@ struct PlanEntriesKernel {
     RuntimeCheck(
         req_to_verify_expected_tokens.has_value() == HAS_VERIFY_EXPECTED_TOKEN_POOL,
         "req_to_verify_expected_tokens presence does not match HAS_VERIFY_EXPECTED_TOKEN_POOL specialization");
-    RuntimeCheck(
-        req_to_verify_expected_tokens_valid_lens.has_value() == HAS_VERIFY_EXPECTED_TOKEN_POOL,
-        "req_to_verify_expected_tokens_valid_lens presence does not match HAS_VERIFY_EXPECTED_TOKEN_POOL specialization");
+    if constexpr (HAS_VERIFY_EXPECTED_TOKEN_POOL) {
+      RuntimeCheck(
+          req_to_verify_expected_tokens_valid_lens.has_value(),
+          "req_to_verify_expected_tokens_valid_lens must be set when req_to_verify_expected_tokens is set");
+    }
     if constexpr (HAS_SWA_LUT) {
       TensorMatcher({Nlut})  //
           .with_dtype<int64_t>()

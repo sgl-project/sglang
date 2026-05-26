@@ -49,14 +49,6 @@ def launch_plan_entries_kernel(
             "kv-canary: launch_plan_entries_kernel requires "
             "req_to_verify_expected_tokens_valid_lens when req_to_verify_expected_tokens is set"
         )
-    if (
-        not has_verify_expected_token_pool
-        and req_to_verify_expected_tokens_valid_lens is not None
-    ):
-        raise ValueError(
-            "kv-canary: launch_plan_entries_kernel cannot accept "
-            "req_to_verify_expected_tokens_valid_lens without req_to_verify_expected_tokens"
-        )
     module = _jit_plan_entries_module(has_swa_lut, has_verify_expected_token_pool)
     module.plan_entries(
         req_pool_indices,
