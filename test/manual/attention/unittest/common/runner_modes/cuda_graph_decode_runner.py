@@ -94,10 +94,28 @@ from ..attention_methods.mla_attention import (
     run_mla_fixture_eager,
     run_mla_forward,
 )
+from ..attention_methods.dsv4_attention import (
+    DSV4_ATOL,
+    DSV4_RTOL,
+    DSV4AttentionCase,
+    build_dsv4_attention_fixture,
+    dsv4_fixture_inputs,
+    expected_dsv4_output_from_inputs,
+    make_dsv4_case_with_prefix_lens,
+    make_dsv4_padded_replay_inputs,
+    make_dsv4_random_inputs,
+    prepare_dsv4_runner_inputs,
+    run_dsv4_fixture_eager,
+    run_dsv4_forward,
+)
+from ..attention_methods.dsv4_attention import (
+    _make_forward_batch as _make_dsv4_forward_batch,
+)
 
 DENSE_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 4
 MLA_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 4
 GDN_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 3
+DSV4_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 2
 
 
 @dataclass(frozen=True)
@@ -153,16 +171,24 @@ def _init_cuda_graph_capture_metadata(backend, capture_batch_size: int, batch):
 
 
 def _init_cuda_graph_replay_metadata(backend, capture_batch_size: int, batch):
-    backend.init_forward_metadata_replay_cuda_graph(
-        bs=capture_batch_size,
-        req_pool_indices=batch.req_pool_indices,
-        seq_lens=batch.seq_lens,
-        seq_lens_sum=batch.seq_lens_sum,
-        encoder_lens=batch.encoder_lens,
-        forward_mode=batch.forward_mode,
-        spec_info=batch.spec_info,
-        seq_lens_cpu=batch.seq_lens_cpu,
-    )
+    # Some backends (e.g., `DeepseekV4AttnBackend`) read out-of-band attributes
+    # off the backend during replay metadata init — production wires this in
+    # `sglang/srt/model_executor/cuda_graph_runner.py:1234`. Mirror that
+    # contract so backends that don't use it just store-and-clear the field.
+    backend._replay_forward_batch = batch
+    try:
+        backend.init_forward_metadata_replay_cuda_graph(
+            bs=capture_batch_size,
+            req_pool_indices=batch.req_pool_indices,
+            seq_lens=batch.seq_lens,
+            seq_lens_sum=batch.seq_lens_sum,
+            encoder_lens=batch.encoder_lens,
+            forward_mode=batch.forward_mode,
+            spec_info=batch.spec_info,
+            seq_lens_cpu=batch.seq_lens_cpu,
+        )
+    finally:
+        backend._replay_forward_batch = None
 
 
 def _run_cuda_graph_decode_case(
@@ -391,6 +417,47 @@ def run_mla_cuda_graph_decode_case(
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
             hidden_size=hidden_size,
+            max_context_len=max_context_len,
+            dtype=dtype,
+            device=device,
+        ),
+        capture_batch_size=cuda_graph_capture_batch_size,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+    )
+
+
+def run_dsv4_cuda_graph_decode_case(
+    testcase,
+    case: DSV4AttentionCase,
+    *,
+    swa_size: int = 1024,
+    max_context_len: int = 256,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+    cuda_graph_capture_batch_size: int = DSV4_CUDA_GRAPH_CAPTURE_BATCH_SIZE,
+):
+    adapter = CudaGraphDecodeAdapter(
+        build_fixture=build_dsv4_attention_fixture,
+        make_case=make_dsv4_case_with_prefix_lens,
+        make_forward_batch=_make_dsv4_forward_batch,
+        fixture_inputs=dsv4_fixture_inputs,
+        make_capture_inputs=make_dsv4_random_inputs,
+        make_replay_inputs=make_dsv4_padded_replay_inputs,
+        prepare_inputs=prepare_dsv4_runner_inputs,
+        run_eager=run_dsv4_fixture_eager,
+        run_forward=run_dsv4_forward,
+        expected_output=expected_dsv4_output_from_inputs,
+        atol=DSV4_ATOL,
+        rtol=DSV4_RTOL,
+    )
+    _run_cuda_graph_decode_case(
+        testcase,
+        case,
+        adapter=adapter,
+        build_kwargs=dict(
+            swa_size=swa_size,
             max_context_len=max_context_len,
             dtype=dtype,
             device=device,

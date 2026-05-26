@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any
 
 import torch
 from torch import nn
@@ -226,7 +227,11 @@ class MockDSV4ModelRunner:
         device: str,
         max_context_len: int,
         swa_size: int,
+        disable_cuda_graph: bool = True,
+        disable_piecewise_cuda_graph: bool = True,
+        runner_batch_size: int | None = None,
     ):
+        pool_batch_size = runner_batch_size or case.batch_size
         self.device = device
         self.dtype = dtype
         self.kv_cache_dtype = dtype
@@ -239,8 +244,8 @@ class MockDSV4ModelRunner:
         self.server_args = SimpleNamespace(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=True,
-            disable_piecewise_cuda_graph=True,
+            disable_cuda_graph=disable_cuda_graph,
+            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
             disable_radix_cache=False,
             disaggregation_mode=None,
             dp_size=1,
@@ -263,7 +268,7 @@ class MockDSV4ModelRunner:
         )
         set_global_server_args_for_scheduler(self.server_args)
         self.req_to_token_pool = ReqToTokenPool(
-            size=case.batch_size,
+            size=pool_batch_size,
             max_context_len=max_context_len,
             device=device,
             enable_memory_saver=False,
@@ -274,12 +279,12 @@ class MockDSV4ModelRunner:
         # DSV4 KV pool stores FP8 nope; pass fp8 dtype so store_dtype=uint8 (the
         # backing tensor is always raw bytes regardless of the nominal dtype).
         self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
-            max_num_reqs=case.batch_size,
+            max_num_reqs=pool_batch_size,
             swa_size=swa_size,
             c4_size=case.page_size,  # minimum: one page worth; unused for layer_num=0
             c128_size=case.page_size,
-            c4_state_pool_size=case.batch_size,
-            c128_state_pool_size=case.batch_size,
+            c4_state_pool_size=pool_batch_size,
+            c128_state_pool_size=pool_batch_size,
             page_size=case.page_size,
             swa_page_size=DSV4_SWA_WINDOW,
             dtype=torch.float8_e4m3fn,
@@ -569,6 +574,9 @@ def build_dsv4_attention_fixture(
     max_context_len: int = 256,
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    disable_cuda_graph: bool = True,
+    disable_piecewise_cuda_graph: bool = True,
+    runner_batch_size: int | None = None,
 ) -> DSV4AttentionFixture:
     max_seq = max(case.seq_lens)
     # SWA-only (compress_ratio=0) is the SGLang path that handles the
@@ -593,6 +601,9 @@ def build_dsv4_attention_fixture(
         device=device,
         max_context_len=max_context_len,
         swa_size=swa_size,
+        disable_cuda_graph=disable_cuda_graph,
+        disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+        runner_batch_size=runner_batch_size,
     )
     try:
         backend = ATTENTION_BACKENDS[case.backend](runner)
@@ -631,14 +642,20 @@ def _pure_torch_dsv4_swa_reference(
     fixture: DSV4AttentionFixture,
     q: torch.Tensor,
     full_kv_locs_per_req: list[torch.Tensor],
+    *,
+    case: DSV4AttentionCase | None = None,
 ) -> torch.Tensor:
     """Independent reference: unpack same-quantized K from the SWA cache, run
     standard softmax(q @ k.T) with sliding-window-causal mask + attention sink.
 
     `q` has shape `[num_q, num_heads, DSV4_HEAD_DIM]`. `full_kv_locs_per_req[r]`
     are the **full-pool** locs of all KV tokens for request r in causal order.
+    `case` overrides `fixture.case` — needed by runner-mode integrations where
+    the replay/capture case has a different batch shape than the fixture's
+    construction-time case.
     """
-    case = fixture.case
+    if case is None:
+        case = fixture.case
     scaling = DSV4_HEAD_DIM**-0.5
     attn_sink = fixture.actual_module.attn_sink.detach()
     outputs = []
@@ -738,3 +755,242 @@ def run_dsv4_attention_case(
     torch.testing.assert_close(
         actual.float(), expected.float(), atol=DSV4_ATOL, rtol=DSV4_RTOL
     )
+
+
+# ---------------------------------------------------------------------------
+# Runner-mode callbacks (used by common/runner_modes/cuda_graph_decode_runner)
+# ---------------------------------------------------------------------------
+
+
+def make_dsv4_case_with_prefix_lens(
+    case: DSV4AttentionCase,
+    name: str,
+    prefix_lens: tuple[int, ...],
+) -> DSV4AttentionCase:
+    """Build a variant case with new prefix lengths, preserving everything else
+    relevant to the SWA-only fixture (mode, head count, page size, attn sink).
+
+    For DECODE `extend_lens=()` (`input_lens` derives `(1,) * batch_size`); for
+    EXTEND we pad/clip the existing `extend_lens` to match the new batch shape.
+    """
+    if case.forward_mode.is_decode():
+        extend_lens: tuple[int, ...] = ()
+    else:
+        base = case.extend_lens or (1,)
+        if len(prefix_lens) <= len(base):
+            extend_lens = base[: len(prefix_lens)]
+        else:
+            extend_lens = base + (base[-1],) * (len(prefix_lens) - len(base))
+    return DSV4AttentionCase(
+        name=name,
+        backend=case.backend,
+        forward_mode=case.forward_mode,
+        num_heads=case.num_heads,
+        page_size=case.page_size,
+        prefix_lens=prefix_lens,
+        extend_lens=extend_lens,
+        compress_ratio=case.compress_ratio,
+        attn_sink_value=case.attn_sink_value,
+    )
+
+
+def dsv4_fixture_inputs(fixture: DSV4AttentionFixture) -> dict[str, Any]:
+    return {
+        "prefix_hidden": fixture.prefix_hidden,
+        "input_hidden": fixture.input_hidden,
+    }
+
+
+def _random_dsv4_hidden_by_lens(
+    lens: tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> list[torch.Tensor]:
+    return [
+        torch.randn(length, DSV4_HEAD_DIM, dtype=dtype, device=device) for length in lens
+    ]
+
+
+def make_dsv4_random_inputs(
+    case: DSV4AttentionCase,
+    fixture: DSV4AttentionFixture,
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> dict[str, Any]:
+    return {
+        "prefix_hidden": _random_dsv4_hidden_by_lens(
+            case.prefix_lens, dtype=dtype, device=device
+        ),
+        "input_hidden": torch.randn(
+            case.num_input_tokens, DSV4_HEAD_DIM, dtype=dtype, device=device
+        ),
+    }
+
+
+def make_dsv4_padded_replay_inputs(
+    case: DSV4AttentionCase,
+    fixture: DSV4AttentionFixture,
+    pad_prefix_lens: tuple[int, ...],
+    base_inputs: dict[str, Any],
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> dict[str, Any]:
+    pad_prefix_hidden = _random_dsv4_hidden_by_lens(
+        pad_prefix_lens, dtype=dtype, device=device
+    )
+    pad_token_count = case.num_input_tokens - base_inputs["input_hidden"].shape[0]
+    if pad_token_count < 0:
+        raise ValueError(
+            f"replay input shrink not supported: {pad_token_count=}; "
+            f"case={case.name}"
+        )
+    if pad_token_count == 0:
+        padded_input_hidden = base_inputs["input_hidden"]
+    else:
+        pad_input_hidden = torch.randn(
+            pad_token_count, DSV4_HEAD_DIM, dtype=dtype, device=device
+        )
+        padded_input_hidden = torch.cat(
+            [base_inputs["input_hidden"], pad_input_hidden], dim=0
+        )
+    return {
+        "prefix_hidden": base_inputs["prefix_hidden"] + pad_prefix_hidden,
+        "input_hidden": padded_input_hidden,
+    }
+
+
+def _full_kv_locs_per_req(
+    case: DSV4AttentionCase, *, max_context_len: int, device: str
+) -> list[torch.Tensor]:
+    out: list[torch.Tensor] = []
+    for req_idx, seq_len in enumerate(case.seq_lens):
+        out.append(
+            torch.tensor(
+                [
+                    _token_loc(req_idx, p, max_context_len=max_context_len)
+                    for p in range(seq_len)
+                ],
+                dtype=torch.int64,
+                device=device,
+            )
+        )
+    return out
+
+
+def prepare_dsv4_runner_inputs(
+    fixture: DSV4AttentionFixture,
+    case: DSV4AttentionCase,
+    batch: ForwardBatch,
+    inputs: dict[str, Any],
+    *,
+    max_context_len: int,
+) -> None:
+    """Project K for prefix + input hidden in `inputs` and write the packed
+    FP8 nope + BF16 rope representation into the SWA cache so the backend's
+    SWA read path sees the matching values."""
+    del batch
+    all_k_parts: list[torch.Tensor] = []
+    all_locs_parts: list[torch.Tensor] = []
+    input_hidden = inputs["input_hidden"]
+    for req_idx, prefix in enumerate(inputs["prefix_hidden"]):
+        input_part = input_hidden[
+            sum(case.input_lens[:req_idx]) : sum(case.input_lens[: req_idx + 1])
+        ]
+        req_hidden = torch.cat([prefix, input_part], dim=0)
+        _, k_req = fixture.actual_module.project(req_hidden)
+        all_k_parts.append(k_req.view(-1, DSV4_HEAD_DIM))
+        seq_len = case.seq_lens[req_idx]
+        all_locs_parts.append(
+            torch.tensor(
+                [
+                    _token_loc(req_idx, p, max_context_len=max_context_len)
+                    for p in range(seq_len)
+                ],
+                dtype=torch.int64,
+                device=fixture.runner.device,
+            )
+        )
+    _write_swa_cache(
+        fixture.runner,
+        layer_id=0,
+        loc=torch.cat(all_locs_parts, dim=0),
+        k_bf16=torch.cat(all_k_parts, dim=0),
+    )
+
+
+def run_dsv4_fixture_eager(fixture: DSV4AttentionFixture) -> torch.Tensor:
+    """Eager forward that also re-initializes the forward metadata. Used as
+    the eager baseline before graph capture/replay; the existing
+    `run_dsv4_attention_case` already exercises this end-to-end including
+    the reference comparison.
+    """
+    case = fixture.case
+    runner = fixture.runner
+    max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
+    full_kv_locs_per_req = _populate_swa_kv_cache(
+        fixture, max_context_len=max_context_len, device=runner.device
+    )
+    q_input, _ = fixture.actual_module.project(fixture.input_hidden)
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+        fixture.backend.init_forward_metadata(fixture.forward_batch)
+        actual = fixture.backend.forward(
+            q=q_input,
+            k=q_input,
+            v=q_input,
+            layer=fixture.actual_module.attn,
+            forward_batch=fixture.forward_batch,
+            compress_ratio=case.compress_ratio,
+            save_kv_cache=False,
+            attn_sink=fixture.actual_module.attn_sink,
+        )
+    fixture._eager_full_kv_locs_per_req = full_kv_locs_per_req  # type: ignore[attr-defined]
+    return actual.float()
+
+
+def run_dsv4_forward(
+    fixture: DSV4AttentionFixture,
+    batch: ForwardBatch,
+    inputs: dict[str, Any],
+) -> torch.Tensor:
+    """Forward call used after the runner harness has already invoked
+    `init_forward_metadata_capture_cuda_graph` / `_replay_cuda_graph` on the
+    backend. Projects Q from `inputs['input_hidden']` and calls `forward`.
+    """
+    case = fixture.case
+    q_input, _ = fixture.actual_module.project(inputs["input_hidden"])
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+        out = fixture.backend.forward(
+            q=q_input,
+            k=q_input,
+            v=q_input,
+            layer=fixture.actual_module.attn,
+            forward_batch=batch,
+            compress_ratio=case.compress_ratio,
+            save_kv_cache=False,
+            attn_sink=fixture.actual_module.attn_sink,
+        )
+    return out.float()
+
+
+def expected_dsv4_output_from_inputs(
+    fixture: DSV4AttentionFixture,
+    case: DSV4AttentionCase,
+    inputs: dict[str, Any],
+    _state: Any,
+) -> torch.Tensor:
+    """Pure PyTorch SWA reference built from `inputs`. The actual path is
+    expected to have already written the corresponding K into the SWA cache
+    via `prepare_dsv4_runner_inputs`; the reference unpacks back from the
+    cache to absorb FP8 quant noise consistently."""
+    runner = fixture.runner
+    max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
+    q_input, _ = fixture.actual_module.project(inputs["input_hidden"])
+    full_kv_locs_per_req = _full_kv_locs_per_req(
+        case, max_context_len=max_context_len, device=runner.device
+    )
+    return _pure_torch_dsv4_swa_reference(
+        fixture, q_input, full_kv_locs_per_req, case=case
+    ).float()
