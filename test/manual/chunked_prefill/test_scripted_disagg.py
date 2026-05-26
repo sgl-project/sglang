@@ -139,5 +139,6 @@ class TestScriptedDisagg(CustomTestCase):
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
 
+
 if __name__ == "__main__":
     unittest.main()
