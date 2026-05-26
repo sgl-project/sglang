@@ -6,11 +6,10 @@ catches "piecewise graph capture trips on a chunked extend".
 
 In addition to the baseline smoke, this file pins:
 
-* chunk_size that misses every captured bucket (a-Piecewise1)
-* tail chunk of size 1 — tiniest possible extend (a-Piecewise2)
+* chunk_size that misses every captured bucket
+* tail chunk of size 1 — tiniest possible extend
 * retract + resume that lands the resumed chunk in a different bucket
-  (a-Piecewise3)
-* dynamic chunking walking the bucket table iter by iter (c-T3e)
+* dynamic chunking walking the bucket table iter by iter
 
 All four tests force ``disable_cuda_graph=False`` so the piecewise
 capture machinery is actually exercised.

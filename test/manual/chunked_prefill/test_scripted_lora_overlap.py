@@ -10,9 +10,9 @@ chunked LoRA request with overlap loading enabled.
 
 In addition to the baseline smoke, this file pins:
 
-* H2D copy in progress at chunk-admission boundary (a-LoRA-OL1)
-* abort hitting the LoRA H2D + chunked sync window (a-LoRA-OL2 / #25413)
-* back-to-back distinct adapters all chunking (a-LoRA-OL3)
+* H2D copy in progress at chunk-admission boundary
+* abort hitting the LoRA H2D + chunked sync window (#25413)
+* back-to-back distinct adapters all chunking
 """
 
 import unittest

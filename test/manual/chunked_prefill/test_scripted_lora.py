@@ -7,11 +7,11 @@ deadlock that previously kept it stuck in waiting_queue.
 
 In addition to the baseline smoke, this file pins:
 
-* drainer bypass on chunked-resume (c-L6+L7 / b-5ed4faf0ab)
-* multi-adapter / mid-chunk adapter switching (a-LoRA1, a-LoRA2)
-* adapter eviction interleaved with chunked-resume (a-LoRA3)
-* abort during adapter eviction (a-LoRA4)
-* return_logprob + chunked + LoRA lm-head pass index (c-L3)
+* drainer bypass on chunked-resume
+* multi-adapter / mid-chunk adapter switching
+* adapter eviction interleaved with chunked-resume
+* abort during adapter eviction
+* return_logprob + chunked + LoRA lm-head pass index
 
 Many tests reference forward-pointing harness APIs (``t.abort``,
 ``r.lora_path``, ``r.is_chunking``, etc.); they will start exercising
