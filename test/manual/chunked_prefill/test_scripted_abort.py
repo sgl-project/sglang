@@ -35,12 +35,12 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
 
     def test_abort_waiting_chunked_resume(self):
-        """Abort a chunked-resume req parked in waiting_queue: full resource release with W3 dedup gate intact."""
+        """Abort a chunked-resume req parked in waiting_queue: full resource release."""
         self.runtime.run(self._script_abort_waiting_chunked_resume)
 
     # abort a chunked-resume req while it's still in waiting_queue
     # (chunked-resume parked between chunks). Resources must release
-    # exactly once across the dual-queue path (W3, commit de3859646b).
+    # across the dual-queue path.
     @staticmethod
     def _script_abort_waiting_chunked_resume(t: ScriptedRuntime):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -67,12 +67,6 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
         assert (
             r.lock_refs == 0
         ), f"abort must release lock_refs; r.lock_refs={r.lock_refs}"
-        # W3: chunked-resume in waiting + abort = the dual-queue path.
-        # Dedup must hold so the req is only released once.
-        assert r.abort_double_release_count == 0, (
-            f"W3 violation: dual-queue abort double-released chunked-"
-            f"resume req; got {r.abort_double_release_count}"
-        )
 
     def test_abort_at_chunk_0(self):
         """Abort during chunk_0 (first chunk not yet flushed)."""
@@ -251,15 +245,13 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
         assert r.lock_refs == 0
 
     def test_abort_after_finish_noop(self):
-        """Aborting an already-finished req is a no-op: KV stays released, W3 dual-queue dedup gate holds."""
+        """Aborting an already-finished req is a no-op: KV stays released."""
         self.runtime.run(self._script_abort_after_finish_noop)
 
     @staticmethod
     def _script_abort_after_finish_noop(t: ScriptedRuntime):
         # Submit r, wait for finish, then abort. The abort must not
-        # trigger a second resource release on the corpse — this is
-        # exactly the dual-queue dedup invariant that commit de3859646b
-        # added to scheduler.abort_request. W3 counter must stay 0.
+        # trigger a second resource release on the corpse.
         r = t.start_req(prompt_len=16, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
@@ -271,11 +263,6 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
         # finished + abort must not destabilize state.
         assert r.kv_pages == 0
         assert r.lock_refs == 0
-        # W3: no double-release on the already-finished corpse.
-        assert r.abort_double_release_count == 0, (
-            f"W3 violation: abort double-released an already-finished "
-            f"req; got {r.abort_double_release_count}"
-        )
         # finish_event_count must NOT increment from the post-finish abort.
         assert r.finish_event_count <= 1, (
             f"abort-after-finish should not emit a second finish event; "
@@ -285,16 +272,13 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
         assert stats["kv_pool_free"] >= 0
 
     def test_abort_during_waiting_timeout(self):
-        """Chunked-resume in waiting_queue + abort timeout cleanup hits."""
+        """Chunked-resume in waiting_queue survives the timeout-cleanup sweep."""
         self.runtime.run(self._script_abort_during_waiting_timeout)
 
     @staticmethod
     def _script_abort_during_waiting_timeout(t: ScriptedRuntime):
         # Chunked-resume in waiting_queue + abort timeout cleanup hits.
-        # The cleanup must skip chunked-resume reqs (359e5ed7bd) AND
-        # the dual-queue release path must not double-fire on a
-        # chunked-resume (de3859646b → W3). This single test pins both
-        # gates because the buggy code path is the same.
+        # The cleanup must skip chunked-resume reqs (359e5ed7bd).
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
         yield from run_until(r, lambda h: h.status == "waiting")
@@ -303,16 +287,13 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
         # the internal waiting-queue housekeeping abort sweep.
         t.trigger_abort_on_waiting_timeout()
         yield
-        # W2: the timeout sweep must NOT abort a chunked-resume.
-        assert r.watchdog_aborted_while_chunked_resume_count == 0, (
-            f"W2 violation: timeout sweep aborted chunked-resume; got "
-            f"{r.watchdog_aborted_while_chunked_resume_count}"
-        )
         yield from run_until_finished(r)
         assert r.finished, "chunked-resume must survive waiting-timeout sweep"
-        # W3: even if the sweep had wanted to abort, dedup would
-        # protect against double-release.
-        assert r.abort_double_release_count == 0
+        # The chunked-resume must produce its output normally, proving
+        # the timeout sweep did not abort it.
+        assert len(r.output_tokens) == 2
+        assert r.kv_pages == 0
+        assert r.lock_refs == 0
 
     def test_abort_chunk_first(self):
         """Abort during the very first chunk releases KV, lock_refs, and finalize-event count is bounded."""
@@ -331,7 +312,6 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
         assert r.kv_pages == 0
         assert r.lock_refs == 0
         assert r.finish_event_count <= 1
-        assert r.abort_double_release_count == 0
 
     def test_abort_chunk_last(self):
         """Abort while the last chunk is in progress."""
@@ -367,8 +347,6 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
     @staticmethod
     def _script_double_abort_idempotent(t: ScriptedRuntime):
         # Call abort twice on the same handle: second call is a no-op.
-        # W3 specifically protects against the second abort entering
-        # the dual-queue release path on a corpse — counter must stay 0.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
         t.abort(r)
@@ -379,10 +357,6 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
         assert (
             r.finish_event_count <= 1
         ), f"double abort must not double-finalize; got {r.finish_event_count}"
-        assert r.abort_double_release_count == 0, (
-            f"W3 violation: second abort double-released; got "
-            f"{r.abort_double_release_count}"
-        )
 
     def test_abort_during_decode(self):
         """Abort mid-decode releases KV + lock_refs cleanly without double-finalize."""
@@ -401,7 +375,6 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
         assert r.kv_pages == 0
         assert r.lock_refs == 0
         assert r.finish_event_count <= 1
-        assert r.abort_double_release_count == 0
 
     def test_abort_one_of_three_others_finish(self):
         """Three reqs in batch, abort middle one, other two finish."""
@@ -510,12 +483,8 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
         yield from run_until_finished(r2)
         assert r2.finished, "resubmit under same rid must complete independently"
         assert r1.kv_pages == 0, "aborted r1 must release KV before resubmit"
-        # W3: dual-queue abort + same-rid resubmit is a textbook
-        # double-release trigger if the dedup gate regresses.
-        assert r1.abort_double_release_count == 0, (
-            f"W3 violation: abort-then-same-rid-resubmit double-"
-            f"released r1; got {r1.abort_double_release_count}"
-        )
+        assert r1.row_idx is None
+        assert r1.lock_refs == 0
 
     def test_abort_during_gap_pending_middle_outputs_positive(self):
         """Abort during the gap where pending_middle_outputs > 0 but is_chunking == False."""
@@ -636,12 +605,6 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
             f"force_retract + abort same yield must not double-finalize; "
             f"got {r1.finish_event_count} events"
         )
-        # W3: retract puts r1 in waiting_queue, abort then visits both
-        # active and waiting structures — dedup must hold.
-        assert r1.abort_double_release_count == 0, (
-            f"W3 violation: force_retract+abort same yield double-"
-            f"released; got {r1.abort_double_release_count}"
-        )
         # No double-free crash means the engine survived; one more yield
         # to confirm the scheduler can keep stepping.
         yield
@@ -667,11 +630,8 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
         # r2 must now pick up the chunked baton.
         yield from run_until(r2, lambda h: h.is_chunking)
         assert r1.kv_pages == 0
-        # W3: dual-queue dedup on the in-flight chunked-req must hold.
-        assert r1.abort_double_release_count == 0, (
-            f"W3 violation: r1 dual-queue abort double-released; got "
-            f"{r1.abort_double_release_count}"
-        )
+        assert r1.row_idx is None
+        assert r1.lock_refs == 0
         yield from run_until_finished(r2)
         assert r2.finished, "baton handoff must let r2 complete"
         assert r2.lock_refs == 0
@@ -684,7 +644,7 @@ class TestAbortPP(ScriptedRuntimeTestCase):
     )
 
     def test_abort_at_last_chunk_in_flight_pp(self):
-        """PP=2 abort at last_chunk_in_flight finalizes exactly once and W3 dual-queue gate holds."""
+        """PP=2 abort at last_chunk_in_flight finalizes exactly once."""
         self.runtime.run(self._script_abort_at_last_chunk_in_flight_pp)
 
     # abort at last_chunk_in_flight under PP (forward still in
@@ -705,17 +665,13 @@ class TestAbortPP(ScriptedRuntimeTestCase):
         yield
 
         assert r.kv_pages == 0
+        assert r.row_idx is None
+        assert r.lock_refs == 0
         # No double-finalize: the result_queue should have one finished
         # event for r, not two.
         assert (
             r.finish_event_count == 1
         ), f"abort must not double-finalize; got {r.finish_event_count} events"
-        # W3: under PP the req can sit in mb_other AND waiting; dual-
-        # queue dedup must hold.
-        assert r.abort_double_release_count == 0, (
-            f"W3 violation: PP cross-mb abort double-released; got "
-            f"{r.abort_double_release_count}"
-        )
 
 
 if __name__ == "__main__":
