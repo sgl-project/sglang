@@ -21,6 +21,7 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     make_verify_plan,
     make_verify_plan_pair,
     make_write_plan_pair,
+    stamp_clean_chain,
 )
 from sglang.jit_kernel.tests.kv_canary._differential import (
     _assert_plans_byte_equal,
@@ -317,11 +318,29 @@ def test_verify_check_disabled_byte_equal() -> None:
     plan_true_cuda, plan_true_ref = _build_verify_plan_5_entries(device=_DEVICE)
     plan_false_cuda, plan_false_ref = _build_verify_plan_5_entries(device=_DEVICE)
 
+    chain_slot_indices = [0, 1, 2, 3, 4]
+    chain_tokens = [10, 20, 30, 40, 50]
+    chain_positions = [0, 1, 2, 3, 4]
+
     cuda_buf_true, ref_buf_true = make_canary_buf_pair(
         num_slots=16, slot_stride_bytes=32, device=_DEVICE
     )
+    stamp_clean_chain(
+        cuda_buf=cuda_buf_true,
+        ref_buf=ref_buf_true,
+        slot_indices=chain_slot_indices,
+        tokens=chain_tokens,
+        positions=chain_positions,
+    )
     cuda_buf_false, ref_buf_false = make_canary_buf_pair(
         num_slots=16, slot_stride_bytes=32, device=_DEVICE
+    )
+    stamp_clean_chain(
+        cuda_buf=cuda_buf_false,
+        ref_buf=ref_buf_false,
+        slot_indices=chain_slot_indices,
+        tokens=chain_tokens,
+        positions=chain_positions,
     )
     cuda_log_true, ref_log_true = make_log_pair(capacity=64, device=_DEVICE)
     cuda_log_false, ref_log_false = make_log_pair(capacity=64, device=_DEVICE)
