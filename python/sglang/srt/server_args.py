@@ -1364,6 +1364,16 @@ class ServerArgs:
         if self.enable_dsa_prefill_context_parallel:
             self.disable_piecewise_cuda_graph = True
 
+        if (
+            self.disaggregation_mode == "prefill"
+            and self.disable_piecewise_cuda_graph
+            and not self.disable_cuda_graph
+        ):
+            self.disable_cuda_graph = True
+            logger.warning(
+                "Cuda graph is disabled for prefill server when piecewise cuda graph is not enabled."
+            )
+
     def _handle_multi_item_scoring(self):
         """Setup and validate multi-item scoring constraints.
 
@@ -3799,8 +3809,6 @@ class ServerArgs:
             assert (
                 self.disaggregation_transfer_backend != "fake"
             ), "Prefill server does not support 'fake' as the transfer backend"
-
-            self.disable_cuda_graph = True
 
         if self.disaggregation_mode in ("prefill", "decode"):
             if (
