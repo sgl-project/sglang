@@ -1,5 +1,5 @@
 name: Upload CUDA Coredumps
-description: Upload CUDA coredump files as artifacts and clean up the directory.
+description: Upload CUDA coredump files as artifacts, optionally signal to a tracker issue, and clean up.
 
 inputs:
   artifact-suffix:
@@ -10,17 +10,58 @@ inputs:
     description: Number of days to retain the artifact
     required: false
     default: "7"
+  tracker-issue:
+    description: |
+      If set, post a one-line comment to sgl-project/sglang-ci-stats issue
+      #<tracker-issue> when at least one coredump is detected. Requires
+      `bot-token` with issues:write on that repo.
+    required: false
+    default: ""
+  bot-token:
+    description: Token with issues:write on sgl-project/sglang-ci-stats. Required when tracker-issue is set.
+    required: false
+    default: ""
 
 runs:
   using: composite
   steps:
+    - name: Check for coredumps
+      id: check
+      shell: bash
+      run: |
+        dir="${SGLANG_CUDA_COREDUMP_DIR:-/tmp/sglang_cuda_coredumps}"
+        if [ -d "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
+          echo "has_dumps=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "has_dumps=false" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Upload CUDA coredumps
+      if: steps.check.outputs.has_dumps == 'true'
       uses: actions/upload-artifact@v4
       with:
         name: cuda-coredumps-${{ github.job }}${{ inputs.artifact-suffix && format('-{0}', inputs.artifact-suffix) }}
         path: ${{ env.SGLANG_CUDA_COREDUMP_DIR || '/tmp/sglang_cuda_coredumps' }}/
         retention-days: ${{ inputs.retention-days }}
-        if-no-files-found: ignore
+
+    - name: Signal coredump to tracker issue
+      if: steps.check.outputs.has_dumps == 'true' && inputs.tracker-issue != '' && inputs.bot-token != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.bot-token }}
+        PR_NUM: ${{ github.event.pull_request.number }}
+        EVENT_NAME: ${{ github.event_name }}
+        TRACKER_ISSUE: ${{ inputs.tracker-issue }}
+      run: |
+        if [ -n "$PR_NUM" ]; then
+          ref_label="PR #${PR_NUM}"
+        else
+          ref_label="$EVENT_NAME"
+        fi
+        run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
+        gh issue comment "$TRACKER_ISSUE" \
+          --repo sgl-project/sglang-ci-stats \
+          --body "${ref_label} - ${run_url}"
 
     - name: Cleanup CUDA coredumps
       shell: bash
