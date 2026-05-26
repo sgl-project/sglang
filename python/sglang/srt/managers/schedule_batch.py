@@ -837,6 +837,12 @@ class Req(ReqDllmMixin):
         # history.
         self.radix_chunked_hit_inflation_count: int = 0
 
+        # Regression instrumentation for invariant B5: HiCache breakdown
+        # fields (cached_tokens_{device,host,storage}) must be written
+        # exactly once per req lifetime — on the first chunk only. Counts
+        # actual writes; ScriptedRuntime tests assert <= 1.
+        self.hicache_cached_tokens_write_count: int = 0
+
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
         # processed.
@@ -1939,9 +1945,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     host_portion = host_total - storage_portion
                     device_portion = max(0, len(req.prefix_indices) - host_total)
 
+                    # Invariant B5: HiCache breakdown fields must be written
+                    # exactly once per req lifetime (first chunk only). The
+                    # _cache_breakdown_computed gate above enforces this;
+                    # the counter records every actual write so tests can
+                    # assert <= 1 even if the gate is ever weakened.
                     req.cached_tokens_device = device_portion
                     req.cached_tokens_host = host_portion
                     req.cached_tokens_storage = storage_portion
+                    req.hicache_cached_tokens_write_count += 1
                     req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len
