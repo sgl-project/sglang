@@ -14,8 +14,8 @@ true, no resource leak).
 
 import unittest
 
-from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
+from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
@@ -23,7 +23,6 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until,
     run_until_finished,
 )
-from sglang.test.test_utils import CustomTestCase
 
 
 def _expected_chunks(prompt_len: int, chunk_size: int) -> int:
@@ -39,13 +38,12 @@ def _expected_chunks(prompt_len: int, chunk_size: int) -> int:
     return (prompt_len + chunk_size - 1) // chunk_size
 
 
-class TestScriptedChunkSize(CustomTestCase):
+class TestChunkSizeDefault(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
+
     def test_exact_chunk_size(self):
         """Prompt_len == chunk_size → no chunking, single-shot prefill."""
-        execute_scripted_runtime(
-            self._script_exact_chunk_size,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_exact_chunk_size)
 
     # prompt_len == chunk_size → no chunking, single-shot prefill.
     @staticmethod
@@ -60,10 +58,7 @@ class TestScriptedChunkSize(CustomTestCase):
 
     def test_one_token_over(self):
         """Prompt_len == chunk_size + 1 → exactly two chunks, second is 1 token."""
-        execute_scripted_runtime(
-            self._script_one_token_over,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_one_token_over)
 
     # prompt_len == chunk_size + 1 → exactly two chunks, second is 1 token.
     @staticmethod
@@ -78,10 +73,7 @@ class TestScriptedChunkSize(CustomTestCase):
 
     def test_two_chunks_exact(self):
         """Prompt_len == 2 * chunk_size → exactly 2 chunks."""
-        execute_scripted_runtime(
-            self._script_two_chunks_exact,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_two_chunks_exact)
 
     # prompt_len == 2 * chunk_size → exactly 2 chunks.
     @staticmethod
@@ -93,10 +85,7 @@ class TestScriptedChunkSize(CustomTestCase):
 
     def test_three_chunks_one_decode(self):
         """Prompt_len == 3 * chunk_size, max_new_tokens=1 → 3 chunks + 1 decode."""
-        execute_scripted_runtime(
-            self._script_three_chunks_one_decode,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_three_chunks_one_decode)
 
     # prompt_len == 3 * chunk_size, max_new_tokens=1 → 3 chunks + 1 decode.
     @staticmethod
@@ -108,10 +97,7 @@ class TestScriptedChunkSize(CustomTestCase):
 
     def test_tiny_prompt(self):
         """Prompt_len == 1 → no chunking; req runs straight through decode."""
-        execute_scripted_runtime(
-            self._script_tiny_prompt,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_tiny_prompt)
 
     # prompt_len == 1 → no chunking; req runs straight through decode.
     @staticmethod
@@ -123,146 +109,9 @@ class TestScriptedChunkSize(CustomTestCase):
             r.chunks_done == 0
         ), f"single-token prompt should not chunk, got chunks_done={r.chunks_done}"
 
-    def test_radix_hit_minus_one(self):
-        """Radix hit leaving 1 fresh token does not engage chunked path."""
-        # Radix cache is on by default; pass explicitly to make the
-        # dependency obvious — if someone flips the default later, the
-        # test still pins what it needs.
-        execute_scripted_runtime(
-            self._script_radix_hit_minus_one,
-            **base_engine_kwargs(
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-                disable_radix_cache=False,
-            ),
-        )
-
-    # long prefix already in radix; req that follows shares prefix
-    # such that only 1 token is uncached → no chunking required for the
-    # tail. Verifies the chunked-resume path is not taken when the radix
-    # match already covers everything but a sliver.
-    @staticmethod
-    def _script_radix_hit_minus_one(t: ScriptedRuntime):
-        # Warm radix with chunk_size-1 tokens. start_req builds input_ids
-        # = [1] * prompt_len, so r_warm and r below share the exact same
-        # prefix bytes — the radix cache will key off them.
-        r_warm = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE - 1, max_new_tokens=1)
-        yield from run_until_finished(r_warm)
-        assert r_warm.finished
-
-        # Give the cache one extra iteration to commit r_warm's KV into the
-        # radix tree before the follow-up submission. Without this yield
-        # the prefix may not yet be visible to r.
-        yield
-
-        # Same prefix + 1 extra token = total chunk_size. Even though the
-        # *total* prompt equals chunk_size, only 1 token is fresh.
-        r = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE, max_new_tokens=1)
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.chunks_done == 0, (
-            f"radix hit should leave only 1 fresh token; chunked path should "
-            f"not engage. Got chunks_done={r.chunks_done}"
-        )
-
-    def test_chunk_size_one_token(self):
-        """Chunk_size = 1: every token is its own chunk."""
-        execute_scripted_runtime(
-            self._script_chunk_size_one_token,
-            **base_engine_kwargs(chunked_prefill_size=1),
-        )
-
-    @staticmethod
-    def _script_chunk_size_one_token(t: ScriptedRuntime):
-        # chunk_size = 1: every token is its own chunk.
-        r = t.start_req(prompt_len=8, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.chunks_done == 8, f"expected 8 chunks, got {r.chunks_done}"
-
-    def test_chunk_size_two_prompt_two(self):
-        """Chunk_size = 2, prompt_len = 2: equal, single-shot."""
-        execute_scripted_runtime(
-            self._script_chunk_size_two_prompt_two,
-            **base_engine_kwargs(chunked_prefill_size=2),
-        )
-
-    @staticmethod
-    def _script_chunk_size_two_prompt_two(t: ScriptedRuntime):
-        # chunk_size = 2, prompt_len = 2: equal, single-shot.
-        r = t.start_req(prompt_len=2, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.chunks_done <= 1
-
-    def test_chunk_size_two_prompt_five(self):
-        """Chunk_size = 2, prompt_len = 5: chunks_done == 3 (2 + 2 + 1)."""
-        execute_scripted_runtime(
-            self._script_chunk_size_two_prompt_five,
-            **base_engine_kwargs(chunked_prefill_size=2),
-        )
-
-    @staticmethod
-    def _script_chunk_size_two_prompt_five(t: ScriptedRuntime):
-        # chunk_size = 2, prompt_len = 5: chunks_done == 3 (2 + 2 + 1).
-        r = t.start_req(prompt_len=5, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.chunks_done == 3, f"expected 3 chunks, got {r.chunks_done}"
-
-    def test_chunk_size_equals_max_prefill_tokens(self):
-        """Chunk_size == max_prefill_tokens: prompt fits in one shot."""
-        execute_scripted_runtime(
-            self._script_chunk_size_equals_max_prefill_tokens,
-            **base_engine_kwargs(chunked_prefill_size=1024, max_prefill_tokens=1024),
-        )
-
-    @staticmethod
-    def _script_chunk_size_equals_max_prefill_tokens(t: ScriptedRuntime):
-        # chunk_size == max_prefill_tokens: prompt fits in one shot.
-        r = t.start_req(prompt_len=1024, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.chunks_done <= 1
-
-    def test_chunk_size_exceeds_max_prefill_tokens(self):
-        """Chunk_size > max_prefill_tokens: engine should reject or cap."""
-        execute_scripted_runtime(
-            self._script_chunk_size_exceeds_max_prefill_tokens,
-            **base_engine_kwargs(chunked_prefill_size=2048, max_prefill_tokens=1024),
-        )
-
-    @staticmethod
-    def _script_chunk_size_exceeds_max_prefill_tokens(t: ScriptedRuntime):
-        # chunk_size > max_prefill_tokens: engine should reject or cap.
-        # Test verifies submission still completes (engine internally
-        # capped chunk_size to max_prefill_tokens).
-        # NEW API NEEDED: engine_args validation — server_args should
-        # reject chunked_prefill_size > max_prefill_tokens cleanly.
-        r = t.start_req(prompt_len=512, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
-
-    def test_chunk_size_4096_prompt_4097(self):
-        """Chunk_size = 4096, prompt_len = 4097: 2 chunks (4096 + 1)."""
-        execute_scripted_runtime(
-            self._script_chunk_size_4096_prompt_4097,
-            **base_engine_kwargs(chunked_prefill_size=4096),
-        )
-
-    @staticmethod
-    def _script_chunk_size_4096_prompt_4097(t: ScriptedRuntime):
-        # chunk_size = 4096, prompt_len = 4097: 2 chunks (4096 + 1).
-        r = t.start_req(prompt_len=4097, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.chunks_done == 2
-
     def test_chunk_size_256_prompt_100x(self):
         """Chunk_size = 256, prompt_len = 100 * 256 = 25600: long-prompt stability test."""
-        execute_scripted_runtime(
-            self._script_chunk_size_256_prompt_100x,
-            **base_engine_kwargs(chunked_prefill_size=256),
-        )
+        self.runtime.run(self._script_chunk_size_256_prompt_100x)
 
     @staticmethod
     def _script_chunk_size_256_prompt_100x(t: ScriptedRuntime):
@@ -275,192 +124,9 @@ class TestScriptedChunkSize(CustomTestCase):
         assert r.finished
         assert r.chunks_done == 100
 
-    def test_chunk_size_16_prompt_1024(self):
-        """High fragmentation: chunk_size = 16, prompt_len = 1024 = 64 chunks."""
-        execute_scripted_runtime(
-            self._script_chunk_size_16_prompt_1024,
-            **base_engine_kwargs(chunked_prefill_size=16),
-        )
-
-    @staticmethod
-    def _script_chunk_size_16_prompt_1024(t: ScriptedRuntime):
-        # High fragmentation: chunk_size = 16, prompt_len = 1024 = 64 chunks.
-        r = t.start_req(prompt_len=1024, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.finished, max_steps=1000)
-        assert r.finished
-        assert r.chunks_done == 64
-
-    def test_chunk_size_4_prompt_4(self):
-        """Chunk_size = 4, prompt_len = 4: single-shot, no chunking."""
-        execute_scripted_runtime(
-            self._script_chunk_size_4_prompt_4,
-            **base_engine_kwargs(chunked_prefill_size=4),
-        )
-
-    @staticmethod
-    def _script_chunk_size_4_prompt_4(t: ScriptedRuntime):
-        # chunk_size = 4, prompt_len = 4: single-shot, no chunking.
-        r = t.start_req(prompt_len=4, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.chunks_done == 0
-
-    def test_chunk_size_4_prompt_5(self):
-        """Chunk_size = 4, prompt_len = 5: chunks_done == 2 (4 + 1)."""
-        execute_scripted_runtime(
-            self._script_chunk_size_4_prompt_5,
-            **base_engine_kwargs(chunked_prefill_size=4),
-        )
-
-    @staticmethod
-    def _script_chunk_size_4_prompt_5(t: ScriptedRuntime):
-        # chunk_size = 4, prompt_len = 5: chunks_done == 2 (4 + 1).
-        r = t.start_req(prompt_len=5, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.chunks_done == 2
-
-    def test_chunk_size_32_prompt_33(self):
-        """Chunk_size = 32, prompt_len = 33: 2 chunks, second is 1 token."""
-        execute_scripted_runtime(
-            self._script_chunk_size_32_prompt_33,
-            **base_engine_kwargs(chunked_prefill_size=32),
-        )
-
-    @staticmethod
-    def _script_chunk_size_32_prompt_33(t: ScriptedRuntime):
-        # chunk_size = 32, prompt_len = 33: 2 chunks, second is 1 token.
-        r = t.start_req(prompt_len=33, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.chunks_done == 2
-
-    def test_chunk_size_64_prompt_129(self):
-        """Chunk_size = 64, prompt_len = 129: 3 chunks (64 + 64 + 1)."""
-        execute_scripted_runtime(
-            self._script_chunk_size_64_prompt_129,
-            **base_engine_kwargs(chunked_prefill_size=64),
-        )
-
-    @staticmethod
-    def _script_chunk_size_64_prompt_129(t: ScriptedRuntime):
-        # chunk_size = 64, prompt_len = 129: 3 chunks (64 + 64 + 1).
-        r = t.start_req(prompt_len=129, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.chunks_done == 3
-
-    def test_chunk_size_128_prompt_512(self):
-        """Chunk_size = 128, prompt_len = 512: 4 chunks."""
-        execute_scripted_runtime(
-            self._script_chunk_size_128_prompt_512,
-            **base_engine_kwargs(chunked_prefill_size=128),
-        )
-
-    @staticmethod
-    def _script_chunk_size_128_prompt_512(t: ScriptedRuntime):
-        # chunk_size = 128, prompt_len = 512: 4 chunks.
-        r = t.start_req(prompt_len=512, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.chunks_done == 4
-
-    def test_chunk_size_1024_prompt_4096(self):
-        """Chunk_size = 1024, prompt_len = 4096: 4 chunks."""
-        execute_scripted_runtime(
-            self._script_chunk_size_1024_prompt_4096,
-            **base_engine_kwargs(chunked_prefill_size=1024),
-        )
-
-    @staticmethod
-    def _script_chunk_size_1024_prompt_4096(t: ScriptedRuntime):
-        # chunk_size = 1024, prompt_len = 4096: 4 chunks.
-        r = t.start_req(prompt_len=4096, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.finished, max_steps=1000)
-        assert r.finished
-        assert r.chunks_done == 4
-
-    def test_chunks_done_monotone_under_chunk_size_1(self):
-        """Invariant: chunks_done is monotone non-decreasing across yields."""
-        execute_scripted_runtime(
-            self._script_chunks_done_monotone_under_chunk_size_1,
-            **base_engine_kwargs(chunked_prefill_size=1),
-        )
-
-    @staticmethod
-    def _script_chunks_done_monotone_under_chunk_size_1(t: ScriptedRuntime):
-        # Invariant: chunks_done is monotone non-decreasing across yields.
-        r = t.start_req(prompt_len=16, max_new_tokens=2)
-        prev = 0
-        for _ in range(DEFAULT_MAX_STEPS):
-            cur = r.chunks_done
-            assert cur >= prev, f"chunks_done regressed: prev={prev}, cur={cur}"
-            prev = cur
-            if r.finished:
-                return
-            yield
-        raise AssertionError("req never finished")
-
-    def test_chunk_size_one_long_prompt(self):
-        """Chunk_size = 1, prompt_len = 64: stress fragmentation."""
-        execute_scripted_runtime(
-            self._script_chunk_size_one_long_prompt,
-            **base_engine_kwargs(chunked_prefill_size=1),
-        )
-
-    @staticmethod
-    def _script_chunk_size_one_long_prompt(t: ScriptedRuntime):
-        # chunk_size = 1, prompt_len = 64: stress fragmentation.
-        r = t.start_req(prompt_len=64, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.finished, max_steps=500)
-        assert r.finished
-        assert r.chunks_done == 64
-
-    def test_chunk_size_equals_page_size(self):
-        """chunk_size == page_size: each chunk allocates one page; final kv_pages reflects chunks_done."""
-        execute_scripted_runtime(
-            self._script_chunk_size_equals_page_size,
-            **base_engine_kwargs(chunked_prefill_size=16, page_size=16),
-        )
-
-    # chunk_size == page_size — every chunk is exactly one
-    # page; the chunked path must not double-allocate or leak.
-    @staticmethod
-    def _script_chunk_size_equals_page_size(t: ScriptedRuntime):
-        # prompt_len = 8 * page_size → 8 chunks expected.
-        r = t.start_req(prompt_len=8 * 16, max_new_tokens=2)
-        yield from run_until_finished(r, max_steps=400)
-        assert r.finished
-        assert r.chunks_done == 8
-        # After finish, KV must be fully released.
-        assert r.kv_pages == 0
-
-    def test_chunk_size_misaligned_page_size_plus_minus_1(self):
-        """chunk_size = page_size ± 1: chunked completes and page accounting stays consistent."""
-        execute_scripted_runtime(
-            self._script_chunk_size_misaligned_page_size_plus_minus_1,
-            **base_engine_kwargs(chunked_prefill_size=15, page_size=16),
-        )
-
-    # chunk_size = page_size - 1 — misaligned boundaries
-    # exercise the partial-page tail; finishing without leaks is the
-    # property under test.
-    @staticmethod
-    def _script_chunk_size_misaligned_page_size_plus_minus_1(t: ScriptedRuntime):
-        # chunk_size = page_size - 1 = 15; prompt = 60 → 4 chunks
-        # (15 + 15 + 15 + 15) but each chunk straddles page boundaries.
-        r = t.start_req(prompt_len=60, max_new_tokens=2)
-        yield from run_until_finished(r, max_steps=400)
-        assert r.finished
-        assert r.chunks_done == 4
-        assert r.kv_pages == 0
-
     def test_prompt_n_chunks_plus_minus_1(self):
         """Sweep prompt_len = N*chunk_size ± 1 for N in {1..5}; chunks_done matches ceil-div."""
-        execute_scripted_runtime(
-            self._script_prompt_n_chunks_plus_minus_1,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_prompt_n_chunks_plus_minus_1)
 
     # N*chunk_size ± 1 sweep — verifies that the
     # ceil-div arithmetic in the chunked admission path is correct at
@@ -491,6 +157,326 @@ class TestScriptedChunkSize(CustomTestCase):
                 f"N={n} prompt_len={prompt_plus}: "
                 f"expected chunks_done={expected_plus}, got {r_plus.chunks_done}"
             )
+
+
+class TestChunkSizeDefaultRadixExplicit(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(
+        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        disable_radix_cache=False,
+    )
+
+    def test_radix_hit_minus_one(self):
+        """Radix hit leaving 1 fresh token does not engage chunked path."""
+        # Radix cache is on by default; pass explicitly to make the
+        # dependency obvious — if someone flips the default later, the
+        # test still pins what it needs.
+        self.runtime.run(self._script_radix_hit_minus_one)
+
+    # long prefix already in radix; req that follows shares prefix
+    # such that only 1 token is uncached → no chunking required for the
+    # tail. Verifies the chunked-resume path is not taken when the radix
+    # match already covers everything but a sliver.
+    @staticmethod
+    def _script_radix_hit_minus_one(t: ScriptedRuntime):
+        # Warm radix with chunk_size-1 tokens. start_req builds input_ids
+        # = [1] * prompt_len, so r_warm and r below share the exact same
+        # prefix bytes — the radix cache will key off them.
+        r_warm = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE - 1, max_new_tokens=1)
+        yield from run_until_finished(r_warm)
+        assert r_warm.finished
+
+        # Give the cache one extra iteration to commit r_warm's KV into the
+        # radix tree before the follow-up submission. Without this yield
+        # the prefix may not yet be visible to r.
+        yield
+
+        # Same prefix + 1 extra token = total chunk_size. Even though the
+        # *total* prompt equals chunk_size, only 1 token is fresh.
+        r = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE, max_new_tokens=1)
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done == 0, (
+            f"radix hit should leave only 1 fresh token; chunked path should "
+            f"not engage. Got chunks_done={r.chunks_done}"
+        )
+
+
+class TestChunkSize1(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=1)
+
+    def test_chunk_size_one_token(self):
+        """Chunk_size = 1: every token is its own chunk."""
+        self.runtime.run(self._script_chunk_size_one_token)
+
+    @staticmethod
+    def _script_chunk_size_one_token(t: ScriptedRuntime):
+        # chunk_size = 1: every token is its own chunk.
+        r = t.start_req(prompt_len=8, max_new_tokens=2)
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done == 8, f"expected 8 chunks, got {r.chunks_done}"
+
+    def test_chunks_done_monotone_under_chunk_size_1(self):
+        """Invariant: chunks_done is monotone non-decreasing across yields."""
+        self.runtime.run(self._script_chunks_done_monotone_under_chunk_size_1)
+
+    @staticmethod
+    def _script_chunks_done_monotone_under_chunk_size_1(t: ScriptedRuntime):
+        # Invariant: chunks_done is monotone non-decreasing across yields.
+        r = t.start_req(prompt_len=16, max_new_tokens=2)
+        prev = 0
+        for _ in range(DEFAULT_MAX_STEPS):
+            cur = r.chunks_done
+            assert cur >= prev, f"chunks_done regressed: prev={prev}, cur={cur}"
+            prev = cur
+            if r.finished:
+                return
+            yield
+        raise AssertionError("req never finished")
+
+    def test_chunk_size_one_long_prompt(self):
+        """Chunk_size = 1, prompt_len = 64: stress fragmentation."""
+        self.runtime.run(self._script_chunk_size_one_long_prompt)
+
+    @staticmethod
+    def _script_chunk_size_one_long_prompt(t: ScriptedRuntime):
+        # chunk_size = 1, prompt_len = 64: stress fragmentation.
+        r = t.start_req(prompt_len=64, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.finished, max_steps=500)
+        assert r.finished
+        assert r.chunks_done == 64
+
+
+class TestChunkSize2(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=2)
+
+    def test_chunk_size_two_prompt_two(self):
+        """Chunk_size = 2, prompt_len = 2: equal, single-shot."""
+        self.runtime.run(self._script_chunk_size_two_prompt_two)
+
+    @staticmethod
+    def _script_chunk_size_two_prompt_two(t: ScriptedRuntime):
+        # chunk_size = 2, prompt_len = 2: equal, single-shot.
+        r = t.start_req(prompt_len=2, max_new_tokens=2)
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done <= 1
+
+    def test_chunk_size_two_prompt_five(self):
+        """Chunk_size = 2, prompt_len = 5: chunks_done == 3 (2 + 2 + 1)."""
+        self.runtime.run(self._script_chunk_size_two_prompt_five)
+
+    @staticmethod
+    def _script_chunk_size_two_prompt_five(t: ScriptedRuntime):
+        # chunk_size = 2, prompt_len = 5: chunks_done == 3 (2 + 2 + 1).
+        r = t.start_req(prompt_len=5, max_new_tokens=2)
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done == 3, f"expected 3 chunks, got {r.chunks_done}"
+
+
+class TestChunkSize4(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=4)
+
+    def test_chunk_size_4_prompt_4(self):
+        """Chunk_size = 4, prompt_len = 4: single-shot, no chunking."""
+        self.runtime.run(self._script_chunk_size_4_prompt_4)
+
+    @staticmethod
+    def _script_chunk_size_4_prompt_4(t: ScriptedRuntime):
+        # chunk_size = 4, prompt_len = 4: single-shot, no chunking.
+        r = t.start_req(prompt_len=4, max_new_tokens=2)
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done == 0
+
+    def test_chunk_size_4_prompt_5(self):
+        """Chunk_size = 4, prompt_len = 5: chunks_done == 2 (4 + 1)."""
+        self.runtime.run(self._script_chunk_size_4_prompt_5)
+
+    @staticmethod
+    def _script_chunk_size_4_prompt_5(t: ScriptedRuntime):
+        # chunk_size = 4, prompt_len = 5: chunks_done == 2 (4 + 1).
+        r = t.start_req(prompt_len=5, max_new_tokens=2)
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done == 2
+
+
+class TestChunkSize16(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=16)
+
+    def test_chunk_size_16_prompt_1024(self):
+        """High fragmentation: chunk_size = 16, prompt_len = 1024 = 64 chunks."""
+        self.runtime.run(self._script_chunk_size_16_prompt_1024)
+
+    @staticmethod
+    def _script_chunk_size_16_prompt_1024(t: ScriptedRuntime):
+        # High fragmentation: chunk_size = 16, prompt_len = 1024 = 64 chunks.
+        r = t.start_req(prompt_len=1024, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.finished, max_steps=1000)
+        assert r.finished
+        assert r.chunks_done == 64
+
+
+class TestChunkSize32(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=32)
+
+    def test_chunk_size_32_prompt_33(self):
+        """Chunk_size = 32, prompt_len = 33: 2 chunks, second is 1 token."""
+        self.runtime.run(self._script_chunk_size_32_prompt_33)
+
+    @staticmethod
+    def _script_chunk_size_32_prompt_33(t: ScriptedRuntime):
+        # chunk_size = 32, prompt_len = 33: 2 chunks, second is 1 token.
+        r = t.start_req(prompt_len=33, max_new_tokens=2)
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done == 2
+
+
+class TestChunkSize64(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=64)
+
+    def test_chunk_size_64_prompt_129(self):
+        """Chunk_size = 64, prompt_len = 129: 3 chunks (64 + 64 + 1)."""
+        self.runtime.run(self._script_chunk_size_64_prompt_129)
+
+    @staticmethod
+    def _script_chunk_size_64_prompt_129(t: ScriptedRuntime):
+        # chunk_size = 64, prompt_len = 129: 3 chunks (64 + 64 + 1).
+        r = t.start_req(prompt_len=129, max_new_tokens=2)
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done == 3
+
+
+class TestChunkSize128(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=128)
+
+    def test_chunk_size_128_prompt_512(self):
+        """Chunk_size = 128, prompt_len = 512: 4 chunks."""
+        self.runtime.run(self._script_chunk_size_128_prompt_512)
+
+    @staticmethod
+    def _script_chunk_size_128_prompt_512(t: ScriptedRuntime):
+        # chunk_size = 128, prompt_len = 512: 4 chunks.
+        r = t.start_req(prompt_len=512, max_new_tokens=2)
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done == 4
+
+
+class TestChunkSize1024(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=1024)
+
+    def test_chunk_size_1024_prompt_4096(self):
+        """Chunk_size = 1024, prompt_len = 4096: 4 chunks."""
+        self.runtime.run(self._script_chunk_size_1024_prompt_4096)
+
+    @staticmethod
+    def _script_chunk_size_1024_prompt_4096(t: ScriptedRuntime):
+        # chunk_size = 1024, prompt_len = 4096: 4 chunks.
+        r = t.start_req(prompt_len=4096, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.finished, max_steps=1000)
+        assert r.finished
+        assert r.chunks_done == 4
+
+
+class TestChunkSize4096(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=4096)
+
+    def test_chunk_size_4096_prompt_4097(self):
+        """Chunk_size = 4096, prompt_len = 4097: 2 chunks (4096 + 1)."""
+        self.runtime.run(self._script_chunk_size_4096_prompt_4097)
+
+    @staticmethod
+    def _script_chunk_size_4096_prompt_4097(t: ScriptedRuntime):
+        # chunk_size = 4096, prompt_len = 4097: 2 chunks (4096 + 1).
+        r = t.start_req(prompt_len=4097, max_new_tokens=2)
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done == 2
+
+
+class TestChunkSize1024MaxPrefill1024(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(
+        chunked_prefill_size=1024, max_prefill_tokens=1024
+    )
+
+    def test_chunk_size_equals_max_prefill_tokens(self):
+        """Chunk_size == max_prefill_tokens: prompt fits in one shot."""
+        self.runtime.run(self._script_chunk_size_equals_max_prefill_tokens)
+
+    @staticmethod
+    def _script_chunk_size_equals_max_prefill_tokens(t: ScriptedRuntime):
+        # chunk_size == max_prefill_tokens: prompt fits in one shot.
+        r = t.start_req(prompt_len=1024, max_new_tokens=2)
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done <= 1
+
+
+class TestChunkSize2048MaxPrefill1024(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(
+        chunked_prefill_size=2048, max_prefill_tokens=1024
+    )
+
+    def test_chunk_size_exceeds_max_prefill_tokens(self):
+        """Chunk_size > max_prefill_tokens: engine should reject or cap."""
+        self.runtime.run(self._script_chunk_size_exceeds_max_prefill_tokens)
+
+    @staticmethod
+    def _script_chunk_size_exceeds_max_prefill_tokens(t: ScriptedRuntime):
+        # chunk_size > max_prefill_tokens: engine should reject or cap.
+        # Test verifies submission still completes (engine internally
+        # capped chunk_size to max_prefill_tokens).
+        # NEW API NEEDED: engine_args validation — server_args should
+        # reject chunked_prefill_size > max_prefill_tokens cleanly.
+        r = t.start_req(prompt_len=512, max_new_tokens=2)
+        yield from run_until_finished(r)
+        assert r.finished
+
+
+class TestChunkSize16Page16(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=16, page_size=16)
+
+    def test_chunk_size_equals_page_size(self):
+        """chunk_size == page_size: each chunk allocates one page; final kv_pages reflects chunks_done."""
+        self.runtime.run(self._script_chunk_size_equals_page_size)
+
+    # chunk_size == page_size — every chunk is exactly one
+    # page; the chunked path must not double-allocate or leak.
+    @staticmethod
+    def _script_chunk_size_equals_page_size(t: ScriptedRuntime):
+        # prompt_len = 8 * page_size → 8 chunks expected.
+        r = t.start_req(prompt_len=8 * 16, max_new_tokens=2)
+        yield from run_until_finished(r, max_steps=400)
+        assert r.finished
+        assert r.chunks_done == 8
+        # After finish, KV must be fully released.
+        assert r.kv_pages == 0
+
+
+class TestChunkSize15Page16(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=15, page_size=16)
+
+    def test_chunk_size_misaligned_page_size_plus_minus_1(self):
+        """chunk_size = page_size ± 1: chunked completes and page accounting stays consistent."""
+        self.runtime.run(self._script_chunk_size_misaligned_page_size_plus_minus_1)
+
+    # chunk_size = page_size - 1 — misaligned boundaries
+    # exercise the partial-page tail; finishing without leaks is the
+    # property under test.
+    @staticmethod
+    def _script_chunk_size_misaligned_page_size_plus_minus_1(t: ScriptedRuntime):
+        # chunk_size = page_size - 1 = 15; prompt = 60 → 4 chunks
+        # (15 + 15 + 15 + 15) but each chunk straddles page boundaries.
+        r = t.start_req(prompt_len=60, max_new_tokens=2)
+        yield from run_until_finished(r, max_steps=400)
+        assert r.finished
+        assert r.chunks_done == 4
+        assert r.kv_pages == 0
 
 
 if __name__ == "__main__":
