@@ -42,7 +42,6 @@ class TestScriptedDPAttention(CustomTestCase):
         assert r.finished
         assert r.chunks_done >= 2
 
-    @unittest.skip("requires real dp-attention topology — wire up when fixture lands")
     def test_dp_chunked_on_one_rank_other_idle(self):
         """DP rank 0 chunked, rank 1 fully idle — rank 1 must not block rank 0."""
         execute_scripted_runtime(
@@ -70,7 +69,6 @@ class TestScriptedDPAttention(CustomTestCase):
             f"{t.dp_rank_max_pending(1)}"
         )
 
-    @unittest.skip("requires real dp-attention topology — wire up when fixture lands")
     def test_dp_two_chunked_one_per_rank(self):
         """DP one chunked req per rank with different chunk sizes — chunks_done tracked per rank."""
         execute_scripted_runtime(
@@ -99,7 +97,6 @@ class TestScriptedDPAttention(CustomTestCase):
             f"r0.chunks_done={r0.chunks_done}, r1.chunks_done={r1.chunks_done}"
         )
 
-    @unittest.skip("requires real dp-attention topology — wire up when fixture lands")
     def test_dp_chunked_completion_skew(self):
         """DP rank 0 finishes while rank 1 still chunking — broadcast stays consistent."""
         execute_scripted_runtime(
