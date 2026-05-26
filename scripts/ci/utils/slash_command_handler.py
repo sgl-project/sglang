@@ -486,6 +486,72 @@ def resolve_test_group_specs(group_name):
     return [os.path.relpath(path, "test") for path in test_files], None
 
 
+# A spec is treated as a wildcard pattern (expanding to many files) when its
+# file part contains a glob metacharacter. Plain specs keep the existing
+# single-file resolution, which requires a unique match.
+_GLOB_METACHARS = ("*", "?", "[")
+
+
+def _is_glob_pattern(file_part):
+    return any(ch in file_part for ch in _GLOB_METACHARS)
+
+
+def expand_glob_spec(file_part):
+    """
+    Expand a wildcard file_part into matching test files (repo-relative paths).
+
+    Globs are matched against the same locations resolve_test_file() searches
+    — test/registered/ and the multimodal_gen test dir — so e.g.
+    `test_*backend*.py` reruns every backend test without hand-enumerating
+    each file. Two constraints keep a broad pattern from pulling in non-tests:
+    a match must live under a known test root and be named `test_*.py`.
+
+    glob's `*` matches path separators only via `**`, so a bare pattern is
+    searched recursively under each root; a path-ful pattern is anchored.
+
+    Returns (sorted_repo_relative_paths, error). On success error is None.
+    """
+    pat = file_part
+    if pat.startswith("test/"):
+        pat = pat[len("test/") :]
+
+    matches = set()
+    if "/" in pat:
+        # Path-ful pattern. Glob from the repo root (handles fully qualified
+        # multimodal paths like python/sglang/multimodal_gen/test/**/test_*.py)
+        # and under test/ (handles test/-relative patterns like
+        # registered/attention/test_*.py).
+        for base in (".", "test"):
+            matches.update(glob.glob(os.path.join(base, pat), recursive=True))
+    else:
+        # Bare pattern: search recursively under each known test root.
+        for root in ("test/registered", MULTIMODAL_TEST_DIR):
+            matches.update(glob.glob(os.path.join(root, "**", pat), recursive=True))
+
+    def _under_test_root(path):
+        return path.startswith("test/registered/") or path.startswith(
+            MULTIMODAL_TEST_DIR + "/"
+        )
+
+    files = sorted(
+        {
+            os.path.normpath(p)
+            for p in matches
+            if os.path.isfile(p)
+            and os.path.basename(p).startswith("test_")
+            and p.endswith(".py")
+            and _under_test_root(os.path.normpath(p))
+        }
+    )
+    if not files:
+        return [], (
+            f"No test files matched wildcard `{file_part}` under "
+            f"`test/registered/` or `{MULTIMODAL_TEST_DIR}/` "
+            f"(patterns only match files named `test_*.py`)."
+        )
+    return files, None
+
+
 def resolve_test_file(file_part):
     """
     Resolve a user-provided file path to a path relative to test/ or full path for multimodal.
@@ -907,7 +973,8 @@ def handle_rerun_test(
             "- `/rerun-test test/registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`\n"
             "- `/rerun-test registered/core/test_srt_endpoint.py::TestSRTEndpoint`\n"
             "- `/rerun-test test_srt_endpoint.py`\n"
-            "- `/rerun-test test_a.py test_b.py test_c.py` (multiple tests)"
+            "- `/rerun-test test_a.py test_b.py test_c.py` (multiple tests)\n"
+            "- `/rerun-test test_*backend*.py` (wildcard — reruns every matching file)"
         )
         return False
 
@@ -917,10 +984,46 @@ def handle_rerun_test(
         pr.create_issue_comment(gate_msg)
         return False
 
+    # Phase 0: Expand wildcard specs into concrete test files. A spec whose
+    # file part contains a glob metacharacter (* ? [) expands to every
+    # matching file; plain specs pass through to single-file resolution.
+    # De-dupe so an explicit file and a glob that also matches it (or two
+    # overlapping globs) don't dispatch the same file twice.
+    resolve_failures = []
+    expanded_specs = []
+    seen_specs = set()
+    for spec in test_specs:
+        # Quotes are never meaningful here (the command isn't shell-parsed),
+        # so strip them — it lets a habitually quoted `'test_*.py'` still match.
+        file_part = spec.split("::", 1)[0].strip().strip("'\"")
+        if not _is_glob_pattern(file_part):
+            if spec not in seen_specs:
+                seen_specs.add(spec)
+                expanded_specs.append(spec)
+            continue
+        if "::" in spec:
+            resolve_failures.append(
+                {
+                    "spec": spec,
+                    "error": (
+                        "Wildcard patterns can't be combined with a `::test` "
+                        "selector — drop the `::...` to rerun whole files."
+                    ),
+                }
+            )
+            continue
+        matched, err = expand_glob_spec(file_part)
+        if err:
+            resolve_failures.append({"spec": spec, "error": err})
+            continue
+        for m in matched:
+            if m not in seen_specs:
+                seen_specs.add(m)
+                expanded_specs.append(m)
+
     # Phase 1: Resolve all specs
     resolved = []
-    resolve_failures = []
-    for spec in test_specs:
+    for spec in expanded_specs:
         r = _resolve_test_spec(spec)
         if r.get("error"):
             resolve_failures.append(r)
