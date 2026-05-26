@@ -11,8 +11,8 @@ again, wait, …" patterns without state leaks between reqs.
 
 import unittest
 
-from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
+from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
@@ -21,16 +21,14 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until,
     run_until_finished,
 )
-from sglang.test.test_utils import CustomTestCase
 
 
-class TestScriptedLifecycle(CustomTestCase):
+class TestLifecycleBasic(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
+
     def test_small_prompt_short_decode(self):
         """Tiny prompt + tiny decode."""
-        execute_scripted_runtime(
-            self._script_small_prompt_short_decode,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_small_prompt_short_decode)
 
     @staticmethod
     def _script_small_prompt_short_decode(t: ScriptedRuntime):
@@ -42,10 +40,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_medium_prompt_medium_decode(self):
         """Prompt <= chunk_size + medium decode."""
-        execute_scripted_runtime(
-            self._script_medium_prompt_medium_decode,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_medium_prompt_medium_decode)
 
     @staticmethod
     def _script_medium_prompt_medium_decode(t: ScriptedRuntime):
@@ -57,10 +52,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_long_prompt_short_decode(self):
         """Multi-chunk prefill + short decode."""
-        execute_scripted_runtime(
-            self._script_long_prompt_short_decode,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_long_prompt_short_decode)
 
     @staticmethod
     def _script_long_prompt_short_decode(t: ScriptedRuntime):
@@ -72,10 +64,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_long_prompt_long_decode(self):
         """Multi-chunk prefill + long decode."""
-        execute_scripted_runtime(
-            self._script_long_prompt_long_decode,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_long_prompt_long_decode)
 
     @staticmethod
     def _script_long_prompt_long_decode(t: ScriptedRuntime):
@@ -87,10 +76,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_tiny_prompt_long_decode(self):
         """1-token prompt, long decode."""
-        execute_scripted_runtime(
-            self._script_tiny_prompt_long_decode,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_tiny_prompt_long_decode)
 
     @staticmethod
     def _script_tiny_prompt_long_decode(t: ScriptedRuntime):
@@ -102,10 +88,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_chunk_size_minus_one_prompt(self):
         """Prompt_len = chunk_size - 1 + short decode."""
-        execute_scripted_runtime(
-            self._script_chunk_size_minus_one_prompt,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_chunk_size_minus_one_prompt)
 
     @staticmethod
     def _script_chunk_size_minus_one_prompt(t: ScriptedRuntime):
@@ -117,10 +100,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_chunk_size_plus_two_prompt(self):
         """Prompt_len = chunk_size + 2."""
-        execute_scripted_runtime(
-            self._script_chunk_size_plus_two_prompt,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_chunk_size_plus_two_prompt)
 
     @staticmethod
     def _script_chunk_size_plus_two_prompt(t: ScriptedRuntime):
@@ -132,10 +112,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_just_over_2x_chunk_size(self):
         """Prompt_len = 2 * chunk_size + 1."""
-        execute_scripted_runtime(
-            self._script_just_over_2x_chunk_size,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_just_over_2x_chunk_size)
 
     @staticmethod
     def _script_just_over_2x_chunk_size(t: ScriptedRuntime):
@@ -147,10 +124,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_five_x_chunk_size(self):
         """5 chunks exactly."""
-        execute_scripted_runtime(
-            self._script_five_x_chunk_size,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_five_x_chunk_size)
 
     @staticmethod
     def _script_five_x_chunk_size(t: ScriptedRuntime):
@@ -162,10 +136,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_ten_x_chunk_size(self):
         """10 chunks exactly."""
-        execute_scripted_runtime(
-            self._script_ten_x_chunk_size,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_ten_x_chunk_size)
 
     @staticmethod
     def _script_ten_x_chunk_size(t: ScriptedRuntime):
@@ -177,10 +148,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_status_progression_happy_path(self):
         """Verify status progresses unknown → waiting → running → finished."""
-        execute_scripted_runtime(
-            self._script_status_progression_happy_path,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_status_progression_happy_path)
 
     @staticmethod
     def _script_status_progression_happy_path(t: ScriptedRuntime):
@@ -196,10 +164,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_long_prompt_only_one_decode(self):
         """Max_new_tokens = 1: minimum decode."""
-        execute_scripted_runtime(
-            self._script_long_prompt_only_one_decode,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_long_prompt_only_one_decode)
 
     @staticmethod
     def _script_long_prompt_only_one_decode(t: ScriptedRuntime):
@@ -210,10 +175,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_kv_pages_consistent_during_run(self):
         """Kv_pages > 0 during running, == 0 after finish."""
-        execute_scripted_runtime(
-            self._script_kv_pages_consistent_during_run,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_kv_pages_consistent_during_run)
 
     @staticmethod
     def _script_kv_pages_consistent_during_run(t: ScriptedRuntime):
@@ -231,10 +193,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_row_idx_recycled_after_finish(self):
         """After finish, row_idx becomes None."""
-        execute_scripted_runtime(
-            self._script_row_idx_recycled_after_finish,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_row_idx_recycled_after_finish)
 
     @staticmethod
     def _script_row_idx_recycled_after_finish(t: ScriptedRuntime):
@@ -245,10 +204,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_two_seq_clean_handoff(self):
         """Two sequential reqs complete cleanly one after the other."""
-        execute_scripted_runtime(
-            self._script_two_seq_clean_handoff,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_two_seq_clean_handoff)
 
     @staticmethod
     def _script_two_seq_clean_handoff(t: ScriptedRuntime):
@@ -260,10 +216,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_five_seq_clean(self):
         """Five sequential reqs each complete cleanly."""
-        execute_scripted_runtime(
-            self._script_five_seq_clean,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_five_seq_clean)
 
     @staticmethod
     def _script_five_seq_clean(t: ScriptedRuntime):
@@ -273,10 +226,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_radix_partial_seq(self):
         """R1 prompt becomes radix prefix; r2 = r1.prompt + extra."""
-        execute_scripted_runtime(
-            self._script_radix_partial_seq,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_radix_partial_seq)
 
     @staticmethod
     def _script_radix_partial_seq(t: ScriptedRuntime):
@@ -290,10 +240,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_alternating_short_long_seq(self):
         """Alternate short / long across 6 reqs."""
-        execute_scripted_runtime(
-            self._script_alternating_short_long_seq,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_alternating_short_long_seq)
 
     @staticmethod
     def _script_alternating_short_long_seq(t: ScriptedRuntime):
@@ -305,10 +252,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_seq_with_growing_prompt(self):
         """Prompt_len grows: each new req longer than the previous."""
-        execute_scripted_runtime(
-            self._script_seq_with_growing_prompt,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_seq_with_growing_prompt)
 
     @staticmethod
     def _script_seq_with_growing_prompt(t: ScriptedRuntime):
@@ -319,10 +263,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_seq_with_shrinking_prompt(self):
         """Sequential reqs with shrinking prompt lengths all finish."""
-        execute_scripted_runtime(
-            self._script_seq_with_shrinking_prompt,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_seq_with_shrinking_prompt)
 
     @staticmethod
     def _script_seq_with_shrinking_prompt(t: ScriptedRuntime):
@@ -332,10 +273,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_seq_with_idle_yields_between(self):
         """Insert idle yields between completion and next submission."""
-        execute_scripted_runtime(
-            self._script_seq_with_idle_yields_between,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_seq_with_idle_yields_between)
 
     @staticmethod
     def _script_seq_with_idle_yields_between(t: ScriptedRuntime):
@@ -348,10 +286,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_chunked_then_short_seq(self):
         """Long chunked, then short, then long, then short."""
-        execute_scripted_runtime(
-            self._script_chunked_then_short_seq,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_chunked_then_short_seq)
 
     @staticmethod
     def _script_chunked_then_short_seq(t: ScriptedRuntime):
@@ -363,10 +298,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_seq_finish_events_one_each(self):
         """Each sequential req emits exactly one finish event."""
-        execute_scripted_runtime(
-            self._script_seq_finish_events_one_each,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_seq_finish_events_one_each)
 
     @staticmethod
     def _script_seq_finish_events_one_each(t: ScriptedRuntime):
@@ -380,10 +312,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_seq_engine_stats_stable(self):
         """Engine KV pool stays at baseline across a sequence of reqs."""
-        execute_scripted_runtime(
-            self._script_seq_engine_stats_stable,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_seq_engine_stats_stable)
 
     @staticmethod
     def _script_seq_engine_stats_stable(t: ScriptedRuntime):
@@ -398,10 +327,7 @@ class TestScriptedLifecycle(CustomTestCase):
 
     def test_engine_shutdown_during_chunked(self):
         """Engine shutdown mid-chunk: chunked req receives a final error and no subprocess is orphaned."""
-        execute_scripted_runtime(
-            self._script_engine_shutdown_during_chunked,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_engine_shutdown_during_chunked)
 
     # engine shutdown mid-chunked — the chunked req must
     # surface a clean terminal error (not a hang) and no scheduler
