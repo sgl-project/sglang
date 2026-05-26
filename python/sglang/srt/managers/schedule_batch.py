@@ -958,6 +958,9 @@ class Req(ReqDllmMixin):
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
+        self.optimistic_prefill: bool = False
+        self.optimistic_prefill_remaining: int = 0
+        self.optimistic_stop: bool = False
 
         # For Matryoshka embeddings
         self.dimensions = dimensions

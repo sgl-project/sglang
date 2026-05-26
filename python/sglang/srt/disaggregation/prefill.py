@@ -20,6 +20,7 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import logging
+from array import array
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
@@ -219,9 +220,11 @@ class PrefillBootstrapQueue:
                 )
         return kv_manager
 
-    def add(self, req: Req, num_kv_heads: int) -> None:
+    def create_sender(self, req: Req, num_kv_heads: int) -> bool:
+        """Create a KV sender for the request without enqueuing it.
+        Returns False if the request exceeds KV capacity."""
         if self._check_if_req_exceed_kv_capacity(req):
-            return
+            return False
 
         backend = (
             TransferBackend.FAKE
@@ -240,6 +243,32 @@ class PrefillBootstrapQueue:
             pp_rank=self.pp_rank,
         )
         self._process_req(req)
+        return True
+
+    def finalize_bootstrap(self, req: Req) -> bool:
+        """Initialize the sender after bootstrap completes.
+        Returns False if no metadata buffer is available (non-terminal)."""
+        if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
+            return False
+
+        req.time_stats.set_bootstrap_done_time()
+        num_kv_indices = len(req.origin_input_ids)
+
+        req.metadata_buffer_index = self.req_to_metadata_buffer_idx_allocator.alloc()
+        assert req.metadata_buffer_index is not None
+
+        decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
+        req.start_send_idx = decode_prefix_len
+        num_kv_indices_to_send = num_kv_indices - decode_prefix_len
+        num_pages = kv_to_page_num(
+            num_kv_indices_to_send, self.token_to_kv_pool.page_size
+        )
+        req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+        return True
+
+    def add(self, req: Req, num_kv_heads: int) -> None:
+        if not self.create_sender(req, num_kv_heads):
+            return
         self.queue.append(req)
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
@@ -320,26 +349,8 @@ class PrefillBootstrapQueue:
                 continue
 
             # KV.WaitingForInput - decode is ready to receive. initialize the kv sender
-            req.time_stats.set_bootstrap_done_time()
-            num_kv_indices = len(req.origin_input_ids)
-            if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
+            if not self.finalize_bootstrap(req):
                 break
-
-            req.metadata_buffer_index = (
-                self.req_to_metadata_buffer_idx_allocator.alloc()
-            )
-            assert req.metadata_buffer_index is not None
-
-            # Cal number of pages to send
-            # if decode has a cached prefix, we need to send the delta indices
-            # otherwise, send the entire request
-            decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
-            req.start_send_idx = decode_prefix_len
-            num_kv_indices_to_send = num_kv_indices - decode_prefix_len
-            num_pages = kv_to_page_num(
-                num_kv_indices_to_send, self.token_to_kv_pool.page_size
-            )
-            req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
 
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
@@ -528,7 +539,36 @@ class SchedulerDisaggregationPrefillMixin:
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
-                # There is no output_ids for prefill
+                # For optimistic requests, check bootstrap before irreversible side effects
+                if req.optimistic_prefill and req.metadata_buffer_index < 0:
+                    poll = req.disagg_kv_sender.poll()
+                    if poll == KVPoll.WaitingForInput:
+                        if not self.disagg_prefill_bootstrap_queue.finalize_bootstrap(
+                            req
+                        ):
+                            self.optimistic_release_and_requeue(req)
+                            continue
+                    elif poll == KVPoll.Failed:
+                        error_message = (
+                            f"Optimistic prefill bootstrap failed for request {req.rid}"
+                        )
+                        try:
+                            req.disagg_kv_sender.failure_exception()
+                        except Exception as e:
+                            error_message += f" with exception {e}"
+                        logger.warning(error_message)
+                        release_kv_cache(req, self.tree_cache)
+                        prepare_abort(
+                            req,
+                            error_message,
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
+                        self.output_streamer.stream_output([req], req.return_logprob)
+                        continue
+                    else:
+                        self.optimistic_release_and_requeue(req)
+                        continue
+
                 req.output_ids.append(next_token_id)
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
@@ -559,12 +599,9 @@ class SchedulerDisaggregationPrefillMixin:
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
                 if req.grammar is not None:
-                    # FIXME: this try-except block is for handling unexpected xgrammar issue.
                     try:
                         req.grammar.accept_token(next_token_id)
                     except ValueError as e:
-                        # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                        # This can happen if the grammar is not set correctly or the token is invalid.
                         error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                         release_kv_cache(req, self.tree_cache)
                         prepare_abort(
@@ -577,11 +614,16 @@ class SchedulerDisaggregationPrefillMixin:
                 # being chunked reqs' prefill is not finished
                 req.inflight_middle_chunks -= 1
 
+                # Overlap deferred release for optimistic requests stopped in process_prefill_chunk
+                if req.optimistic_stop:
+                    self.optimistic_release_and_requeue(req)
+                    req.time_stats.set_last_chunked_prefill_finish_time()
+                    continue
+
                 if req.return_logprob:
                     extend_logprob_start_len = extend_logprob_start_len_per_req[i]
                     extend_input_len = extend_input_len_per_req[i]
                     if extend_logprob_start_len < extend_input_len:
-                        # Update input logprobs.
                         num_input_logprobs = extend_input_len - extend_logprob_start_len
                         self.batch_result_processor.logprob_result_processor.add_input_logprob_return_values(
                             i,
@@ -593,7 +635,7 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                         logprob_pt += num_input_logprobs
 
-                if self.enable_overlap:
+                if self.enable_overlap and req.metadata_buffer_index >= 0:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
@@ -735,20 +777,64 @@ class SchedulerDisaggregationPrefillMixin:
 
         return transferred_rids
 
+    def _optimistic_bootstrap_check(self: Scheduler, req: Req) -> bool:
+        """Check bootstrap status for an optimistic request.
+        Returns True if the request should continue normal chunked flow,
+        False if it was stopped/aborted (chunked_req should be set to None)."""
+        poll = req.disagg_kv_sender.poll()
+        if poll == KVPoll.WaitingForInput:
+            if self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req):
+                return True
+            # No metadata buffer available; retry next iteration
+            return True
+        elif poll == KVPoll.Failed:
+            error_message = f"Optimistic prefill bootstrap failed for request {req.rid}"
+            try:
+                req.disagg_kv_sender.failure_exception()
+            except Exception as e:
+                error_message += f" with exception {e}"
+            logger.warning(error_message)
+            release_kv_cache(req, self.tree_cache)
+            prepare_abort(
+                req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+            self.output_streamer.stream_output([req], req.return_logprob)
+            return False
+        else:
+            # Still bootstrapping — stop chunking
+            if self.enable_overlap:
+                req.optimistic_stop = True
+            else:
+                self.optimistic_release_and_requeue(req)
+            return False
+
     def process_prefill_chunk(self: Scheduler) -> None:
         chunked_req_to_exclude = set()
         if self.chunked_req:
             chunked_req_to_exclude.add(self.chunked_req)
             maybe_cache_unfinished_req(self.chunked_req, self.tree_cache, chunked=True)
-            if self.enable_overlap:
-                # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
-                self.chunked_req.tmp_end_idx = min(
-                    len(self.chunked_req.fill_ids),
-                    len(self.chunked_req.origin_input_ids),
-                )
-            else:
-                self.send_kv_chunk(self.chunked_req)
-            self.running_batch.batch_is_full = False
+
+            if (
+                self.chunked_req.optimistic_prefill
+                and self.chunked_req.metadata_buffer_index < 0
+            ):
+                if not self._optimistic_bootstrap_check(self.chunked_req):
+                    self.chunked_req = None
+
+            if (
+                self.chunked_req is not None
+                and self.chunked_req.metadata_buffer_index >= 0
+            ):
+                if self.enable_overlap:
+                    self.chunked_req.tmp_end_idx = min(
+                        len(self.chunked_req.fill_ids),
+                        len(self.chunked_req.origin_input_ids),
+                    )
+                else:
+                    self.send_kv_chunk(self.chunked_req)
+
+            if self.chunked_req is not None:
+                self.running_batch.batch_is_full = False
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             if self.last_batch.chunked_req:
@@ -854,3 +940,22 @@ class SchedulerDisaggregationPrefillMixin:
             return
         req.disagg_kv_sender.send(page_indices, state_indices)
         req.start_send_idx = end_idx
+
+    def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
+        """Release KV cache and requeue an optimistic prefill request.
+        Uses reset_for_retract() as the base reset, then clears disagg-specific fields.
+        """
+        maybe_cache_unfinished_req(req, self.tree_cache)
+        release_kv_cache(req, self.tree_cache)
+        req.reset_for_retract()
+        req.output_ids = array("q")
+        req.start_send_idx = 0
+        req.metadata_buffer_index = -1
+        req.tmp_end_idx = -1
+        req.hidden_states_tensor = None
+        req.optimistic_stop = False
+        req.optimistic_prefill_remaining -= 1
+        if req.optimistic_prefill_remaining <= 0:
+            self.disagg_prefill_bootstrap_queue.queue.append(req)
+        else:
+            self.waiting_queue.insert(0, req)

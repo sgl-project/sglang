@@ -793,6 +793,7 @@ class ServerArgs:
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
+    optimistic_prefill_retries: int = 0
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -3793,6 +3794,19 @@ class ServerArgs:
 
             self.disable_cuda_graph = True
 
+        if self.optimistic_prefill_retries > 0:
+            if self.disaggregation_mode != "prefill":
+                raise ValueError(
+                    "--optimistic-prefill-retries requires "
+                    "--disaggregation-mode prefill, "
+                    f"got '{self.disaggregation_mode}'"
+                )
+            if self.pp_size > 1:
+                raise ValueError(
+                    "--optimistic-prefill-retries is not supported "
+                    "with pipeline parallelism (pp_size > 1)"
+                )
+
         if self.disaggregation_mode in ("prefill", "decode"):
             if (
                 envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -6696,6 +6710,14 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_decode_polling_interval,
             help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
+        )
+
+        parser.add_argument(
+            "--optimistic-prefill-retries",
+            type=int,
+            default=ServerArgs.optimistic_prefill_retries,
+            help="Number of optimistic prefill retries before falling back to bootstrap-wait. "
+            "0 disables optimistic prefill (default). Only valid with --disaggregation-mode prefill.",
         )
 
         # Encode prefill disaggregation
