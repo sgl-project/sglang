@@ -91,6 +91,7 @@ class MockModelRunner:
             device=self.device,
             enable_memory_saver=False,
         )
+        self.hisparse_coordinator = None
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
