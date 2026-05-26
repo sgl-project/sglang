@@ -77,9 +77,10 @@ def _demo_script(t: ScriptedRuntime):
 
     # After one yield, the scheduler has pulled r1 from the queue and
     # placed it in its waiting or running structures.
-    assert r1.status in ("waiting", "running"), (
-        f"after one yield the scheduler should know about r1; got {r1.status!r}"
-    )
+    assert r1.status in (
+        "waiting",
+        "running",
+    ), f"after one yield the scheduler should know about r1; got {r1.status!r}"
 
     # ----------------------------------------------------------------
     # Part 3 — Multiple concurrent requests.
