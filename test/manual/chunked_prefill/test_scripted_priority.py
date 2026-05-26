@@ -457,5 +457,61 @@ class TestScriptedPriority(CustomTestCase):
         assert r.finished
 
 
+    def test_priority_preempt_with_chunked_admission_same_yield(self):
+        """Same yield: high-priority R1 + new long chunked R2 land while low-priority R3 runs; R3 preempted, R2 chunks_done starts; both finish."""
+        execute_scripted_runtime(
+            self._script_priority_preempt_with_chunked_admission_same_yield,
+            **base_engine_kwargs(
+                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+                enable_priority_scheduling=True,
+            ),
+        )
+
+    # [a-NEW] same-yield priority preempt + chunked admission combo.
+    # Low-priority R3 is mid-flight; on the same yield we submit a
+    # high-priority short R1 and a long chunked R2. R3 must be preempted
+    # (kv_pages goes to 0), R2 must begin chunking (chunks_done starts
+    # advancing), and ultimately every req completes.
+    @staticmethod
+    def _script_priority_preempt_with_chunked_admission_same_yield(
+        t: ScriptedRuntime,
+    ):
+        # Low-priority running req to be preempted.
+        r3 = t.start_req(
+            prompt_len=16,
+            max_new_tokens=32,
+            priority="low",
+        )
+        yield from run_until(r3, lambda h: h.status == "running")
+        assert r3.kv_pages > 0
+
+        # Same yield: submit high-priority R1 + long chunked R2, plus
+        # an explicit preempt to force R3 out of the running batch.
+        r1 = t.start_req(prompt_len=8, max_new_tokens=2, priority="high")
+        r2 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN,
+            max_new_tokens=2,
+            priority="high",
+        )
+        t.force_preempt(victim_rid=r3.rid, by_rid=r1.rid)
+        yield
+
+        # R3 retracted: kv_pages released.
+        assert r3.kv_pages == 0, (
+            f"preempted low-priority r3 must release KV; got {r3.kv_pages}"
+        )
+
+        # R2 must enter chunked admission.
+        yield from run_until(r2, lambda h: h.is_chunking)
+        assert r2.chunks_done >= 1, (
+            f"long chunked r2 should start advancing chunks_done; got "
+            f"{r2.chunks_done}"
+        )
+
+        # All reqs eventually finish.
+        yield from run_until_all_finished([r1, r2, r3], max_steps=800)
+        assert r1.finished and r2.finished and r3.finished
+
+
 if __name__ == "__main__":
     unittest.main()
