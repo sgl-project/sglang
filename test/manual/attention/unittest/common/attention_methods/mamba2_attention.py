@@ -201,6 +201,14 @@ class MockMamba2ModelRunner(ModelRunner):
             dllm_algorithm_config=None,
             enable_deterministic_inference=False,
             enable_mis=False,
+            # `RowParallelLinear.forward` (called by the production
+            # `MambaMixer2.out_proj`) consults
+            # `get_global_server_args().enable_symm_mem` to decide whether
+            # to wrap allocations in a symmetric-memory context. With
+            # `world_size=1` the wrapper short-circuits, but the
+            # attribute read still happens, so it must exist on the mock
+            # server_args.
+            enable_symm_mem=False,
             kv_cache_dtype="auto",
             linear_attn_backend="triton",
             linear_attn_decode_backend=None,
@@ -216,6 +224,16 @@ class MockMamba2ModelRunner(ModelRunner):
             triton_attention_num_kv_splits=8,
             triton_attention_split_tile_size=None,
         )
+        # Install this fixture's `server_args` as the global so that
+        # `is_symmetric_memory_enabled()` (called from
+        # `RowParallelLinear.forward`) reads our `enable_symm_mem=False`
+        # value. Without this, a previous test in the discover sweep
+        # whose fixture *did* call `set_global_server_args_for_scheduler`
+        # would leave a SimpleNamespace without `enable_symm_mem` as the
+        # global, and the mamba2 forward would AttributeError.
+        from sglang.srt.server_args import set_global_server_args_for_scheduler
+
+        set_global_server_args_for_scheduler(self.server_args)
         cache_shape = Mamba2StateShape.create(
             tp_world_size=1,
             intermediate_size=case.intermediate_size,

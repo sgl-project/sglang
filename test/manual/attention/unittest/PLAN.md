@@ -1450,3 +1450,48 @@ Use tiers instead of trying to fit the full matrix into one fast job.
   in medium/nightly depending on cost.
 - AMD/NPU/CPU/XPU tiers: register with the appropriate backend-specific CI helpers and
   skip CUDA-only runner modes.
+
+## Intentionally Untested Mutation-Surfaces
+
+A 2026-05 mutation-testing campaign (see `MUTATION_FIXES.md`) identified
+production code paths whose mutations are *structurally* invisible to the
+output-diff style assertions the rest of the suite relies on:
+
+- **`TritonMultiStepDraftBackend.init_forward_metadata_replay_cuda_graph`
+  (`triton_backend.py:1395`, journal entry M23)**: dropping the
+  `get_num_kv_splits(...)` call leaves `cuda_graph_num_kv_splits` at its
+  `max_kv_splits` init value. `max_kv_splits >= 1` is always a valid
+  split-count for the decode kernel, and the combine_kv kernel handles any
+  split layout, so the math output is unchanged regardless of whether the
+  call runs. The same `MultiStepDraftBackend` surface is already exercised
+  end-to-end by the production EAGLE draft cuda-graph runner tests
+  (`dense/test_triton.py::test_runner_mode_eagle_draft_cuda_graph_runner_cases`)
+  for shape and lifecycle, so this gap is recorded here rather than papered
+  over with a synthetic assertion on an implementation-detail buffer that
+  would couple the test to internal kv-splitting heuristics. Worker-level
+  draft integration tests (see Phase 4b deferred follow-up) are the
+  appropriate place to catch any future regression that *does* make this
+  buffer load-bearing.
+
+- **Triton SWA target_verify `sliding_window_size + 1` in
+  `init_forward_metadata_replay_cuda_graph` (`triton_backend.py:832`,
+  journal entry M6)**: the verify-path SWA buffer is later re-clipped by
+  the extend kernel's own `kv_id >= q_id - layer.sliding_window_size`
+  mask, AND the kernel's custom-mask row stride is computed as
+  `cur_seq_len + window_kv_offset = window_kv_lens + draft + (seq_lens -
+  window_kv_lens) = seq_lens + draft`, which is invariant under a `+1`
+  shift between `window_kv_lens` and `window_kv_offset`. The mutation
+  therefore changes neither the masked KV positions nor the custom-mask
+  layout, so it is unobservable through any forward output. An
+  above-window verify case is still added to `swa/test_triton.py` for
+  general above-window safety coverage even though it does not catch M6
+  specifically.
+
+- **`flashinfer_mla_backend.py:318` eager target_verify
+  `prefix_lens=None` (journal entry M12)**: `prefix_lens` flows into
+  `FlashInferMLAIndicesUpdaterPrefill.call_begin_forward`, which only
+  consumes it inside the `spec_info is None` branch. The eager
+  target_verify branch always supplies a non-None `spec_info`, so the
+  argument is dead in this code path and the mutation is a true no-op.
+  See the `@unittest.skip`-documented `test_eager_target_verify_prefix_lens_is_noop`
+  in `mla/test_flashinfer.py`.

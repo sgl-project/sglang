@@ -28,6 +28,13 @@ DEFAULT_DEVICE = "cuda"
 DENSE_ATOL = 3e-2
 DENSE_RTOL = 3e-2
 
+# Backends that apply `min(seq_lens, sliding_window_size)` SWA clipping during
+# decode metadata construction (see `update_sliding_window_buffer*` in
+# `python/sglang/srt/layers/attention/triton_backend.py`). For these backends
+# the reference must use the tighter window rule so that above-window decode
+# cases catch off-by-one mutations like `sliding_window_size + 1`.
+_SWA_AWARE_DECODE_BACKENDS = frozenset({"triton", "flashinfer"})
+
 
 @dataclass(frozen=True)
 class DenseAttentionCase:
@@ -626,9 +633,32 @@ def _dense_attention_reference(
             query_pos = case.prefix_lens[req_idx] + offset
             key_start = 0
             if case.sliding_window_size is not None:
-                # SGLang stores model sliding-window sizes as the number of tokens
-                # to the left of the current query, so the current token is extra.
-                key_start = max(0, query_pos - case.sliding_window_size)
+                # The SGLang triton/flashinfer SWA paths use two different
+                # masks depending on the forward mode:
+                #   - The extend kernel applies a per-token window mask
+                #     `kv_id >= q_id - sliding_window_size`, i.e. keys at
+                #     `[query_pos - window, query_pos]` are allowed
+                #     (`window + 1` keys for above-window queries).
+                #   - The decode metadata builder uses
+                #     `window_kv_lens = min(seq_lens, sliding_window_size)`
+                #     with `window_kv_start_idx = seq_lens - window_kv_lens`,
+                #     i.e. exactly `min(seq_lens, window)` keys: the current
+                #     token plus up to `window - 1` left-context tokens.
+                # `torch_native` does not implement SWA, so it reads all
+                # `seq_lens` keys regardless; we keep the looser extend-style
+                # rule for it so the existing within-window smoke coverage
+                # (where the two rules coincide) still passes. For SWA-aware
+                # decode backends we apply the tighter `min(seq_lens, window)`
+                # rule, which is what allows above-window decode cases to
+                # exercise the `sliding_window_size + 1` mutation in the
+                # graph-replay metadata builder (M5/M6).
+                if (
+                    case.forward_mode.is_decode()
+                    and case.backend in _SWA_AWARE_DECODE_BACKENDS
+                ):
+                    key_start = max(0, query_pos + 1 - case.sliding_window_size)
+                else:
+                    key_start = max(0, query_pos - case.sliding_window_size)
             keys = _expand_gqa(
                 req_k[key_start : query_pos + 1].movedim(0, 1), case.num_heads
             )
@@ -678,6 +708,10 @@ def dense_attention_reference_with_custom_mask(
             allowed = req_mask[offset, : req_k.shape[0]]
             if case.sliding_window_size is not None:
                 query_pos = case.prefix_lens[req_idx] + offset
+                # Target-verify draft tokens are appended through the extend
+                # kernel, which applies `kv_id >= q_id - sliding_window_size`
+                # (see `dense_attention_reference` note). The custom-mask
+                # reference must use the same rule.
                 window_allowed = torch.arange(
                     req_k.shape[0], device=req_k.device
                 ) >= max(0, query_pos - case.sliding_window_size)

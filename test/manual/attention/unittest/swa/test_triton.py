@@ -41,6 +41,26 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
             prefix_lens=(1, 2, 3),
             sliding_window_size=4,
         ),
+        # `seq_lens > sliding_window_size` so the metadata builder's
+        # `window_kv_lens = min(seq_lens, sliding_window_size)` and
+        # `window_kv_start_idx = seq_lens - window_kv_lens` actually clip.
+        # A `sliding_window_size + 1` mutation in
+        # `init_forward_metadata_replay_cuda_graph` (and its capture
+        # twin) shifts every per-request window by one token; the
+        # within-window case above cannot see that drift, but this case
+        # does. The dense SWA reference also uses the matching
+        # `min(seq_lens, window)` rule for decode-only triton/flashinfer
+        # paths, so the assertion compares apples to apples.
+        DenseAttentionCase(
+            name="runner_cuda_graph_swa_decode_above_window",
+            backend="triton",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(7, 8, 9),
+            sliding_window_size=4,
+        ),
     )
     SPLIT_OP_CASES = (
         (
@@ -116,6 +136,28 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
                 sliding_window_size=4,
             ),
             2,
+        ),
+        # `seq_lens (= prefix) > sliding_window_size` so the verify-path
+        # SWA metadata builder's
+        # `window_kv_lens = min(seq_lens, sliding_window_size)` clips.
+        # An `sliding_window_size + 1` mutation in
+        # `init_forward_metadata_replay_cuda_graph` for target_verify
+        # changes the SWA prefix-only window length, which propagates
+        # through the extend kernel's per-token mask. The within-window
+        # case above never triggers the clip and so cannot detect M6.
+        (
+            DenseAttentionCase(
+                name="runner_cuda_graph_eagle_verify_swa_above_window",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(6, 8),
+                extend_lens=(3, 3),
+                sliding_window_size=4,
+            ),
+            1,
         ),
     )
 
