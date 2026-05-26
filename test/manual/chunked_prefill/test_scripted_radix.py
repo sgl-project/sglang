@@ -363,6 +363,143 @@ class TestRadixBasic(ScriptedRuntimeTestCase):
         )
 
 
+class TestRadixHitCountInvariant(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
+
+    def test_chunked_stash_no_hit_count_inflation_invariant(self):
+        """Invariant C1: chunked stash via ``_inc_hit_count(chunked=True)`` must not inflate any pre-existing node's ``hit_count``.
+
+        Direct access to ``_scheduler`` internals is intentional; this is an
+        invariant-tier test (see direct-internals-access plan).
+        """
+        self.runtime.run(self._script_chunked_stash_no_hit_count_inflation_invariant)
+
+    # C1 — _inc_hit_count(chunked=True) short-circuits before incrementing.
+    # Drive a long chunked req across 4+ chunks. After every chunk
+    # admission, snapshot {node_id: hit_count} across the radix tree and
+    # assert no pre-existing node's hit_count has grown.
+    @staticmethod
+    def _script_chunked_stash_no_hit_count_inflation_invariant(t: ScriptedRuntime):
+        def _snapshot_hit_counts(root) -> dict:
+            # BFS the radix tree, collecting (id, hit_count) for every node.
+            snapshot: dict = {}
+            stack = [root]
+            while stack:
+                node = stack.pop()
+                snapshot[node.id] = node.hit_count
+                stack.extend(node.children.values())
+            return snapshot
+
+        s = t._scheduler
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        # Wait for the first chunk to commit so the radix tree has at least
+        # one chunked-stash node to track.
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+        baseline = _snapshot_hit_counts(s.tree_cache.root_node)
+
+        prev_chunks: int = r.chunks_done
+        observed_chunk_admissions: int = 0
+        for _ in range(800):
+            cur_chunks: int = r.chunks_done
+            if cur_chunks > prev_chunks:
+                observed_chunk_admissions += 1
+                cur = _snapshot_hit_counts(s.tree_cache.root_node)
+                for node_id, base_count in baseline.items():
+                    if node_id in cur:
+                        assert cur[node_id] == base_count, (
+                            f"_inc_hit_count(chunked=True) inflated existing "
+                            f"node id={node_id} hit_count: baseline={base_count}, "
+                            f"now={cur[node_id]}"
+                        )
+                prev_chunks = cur_chunks
+            if r.finished:
+                break
+            yield
+        assert r.finished
+        # We need to have observed at least 2 more chunk admissions after
+        # the baseline snapshot to make the invariant meaningful (otherwise
+        # we never re-stashed and the invariant trivially holds).
+        assert observed_chunk_admissions >= 2, (
+            f"test must exercise at least 2 chunk admissions after baseline; "
+            f"observed {observed_chunk_admissions}"
+        )
+
+
+class TestRadixPartialPage(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(
+        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        page_size=4,
+    )
+
+    def test_partial_page_tail_no_double_free_invariant(self):
+        """Invariant C2: with page_size > 1, the partial-page tail beyond ``cache_protected_len`` must be freed exactly once across the chunked lifetime.
+
+        Direct access to ``_scheduler`` internals is intentional; this is an
+        invariant-tier test (see direct-internals-access plan).
+        """
+        self.runtime.run(self._script_partial_page_tail_no_double_free_invariant)
+
+    # C2 — partial-page tail double-free guard (radix_cache.py:533-536).
+    # With page_size=4 and a prompt length producing a non-page-aligned
+    # tail, ``req.prefix_indices`` carries the partial tail beyond
+    # ``req.cache_protected_len``. Across multi-chunk stash and the final
+    # cache step, the tail bytes must only release once. Sample the KV
+    # pool free count across iters to verify single-release math, and
+    # verify ``len(prefix_indices) >= cache_protected_len`` throughout
+    # the chunked life (it must never drop the partial tail prematurely).
+    @staticmethod
+    def _script_partial_page_tail_no_double_free_invariant(t: ScriptedRuntime):
+        s = t._scheduler
+        allocator = s.token_to_kv_pool_allocator
+        free_before: int = allocator.available_size()
+        # Non-page-aligned prompt: 4 * chunk_size + 7 bytes — the 7-byte
+        # tail straddles the partial-page window once chunked.
+        prompt_len: int = 4 * DEFAULT_CHUNK_SIZE + 7
+        r = t.start_req(prompt_len=prompt_len, max_new_tokens=2)
+        # Wait for the chunked req to be observed and at least one chunk
+        # committed so cache_protected_len has been written at least once.
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+
+        observed_partial_tail: bool = False
+        for _ in range(800):
+            req = s.chunked_req
+            # While the req is the active chunked_req, prefix_indices must
+            # be at least cache_protected_len — the tail beyond is the
+            # partial page that must stay live for the next stash.
+            if req is not None and req.rid == r.rid:
+                prefix_len: int = len(req.prefix_indices)
+                protected_len: int = req.cache_protected_len
+                assert prefix_len >= protected_len, (
+                    f"len(prefix_indices)={prefix_len} dropped below "
+                    f"cache_protected_len={protected_len}: tail was freed "
+                    f"prematurely"
+                )
+                if prefix_len > protected_len:
+                    observed_partial_tail = True
+            if r.finished:
+                break
+            yield
+        assert r.finished
+        # After finish, every KV byte the chunked req touched must be
+        # released exactly once. Double-free would push available_size
+        # above its pre-test baseline (extra phantom pages); leak would
+        # leave it below. Equality proves single-release.
+        free_after: int = allocator.available_size()
+        assert free_after == free_before, (
+            f"KV pool free count delta on chunked req lifecycle must be 0; "
+            f"got free_before={free_before}, free_after={free_after} "
+            f"(double-free or leak of partial-page tail)"
+        )
+        # Sanity: the partial-tail window must have been observed at least
+        # once — otherwise we never exercised the page_size > 1 branch
+        # this test is designed to protect.
+        assert observed_partial_tail, (
+            "test must observe len(prefix_indices) > cache_protected_len at "
+            "least once (partial-page tail window); the page_size > 1 "
+            "branch was never exercised"
+        )
+
+
 class TestRadixFcfs(ScriptedRuntimeTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
