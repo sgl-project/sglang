@@ -46,6 +46,15 @@ class TestHiSparseBasic(ScriptedRuntimeTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
+        # Staging buffers must release at finish — leaks would inflate
+        # GPU memory across long-running serving.
+        assert r.hisparse_staging_buffers_held == 0, (
+            f"hisparse + chunked left staging buffers held; got "
+            f"{r.hisparse_staging_buffers_held}"
+        )
+        assert r.kv_pages == 0
+        assert r.lock_refs == 0
+        assert len(r.output_tokens) == 4
 
     def test_hisparse_staging_dma_during_chunk_admit(self):
         """HiSparse staging DMA in flight + chunk admission must not deadlock."""
@@ -65,6 +74,21 @@ class TestHiSparseBasic(ScriptedRuntimeTestCase):
         yield from run_until_finished(r, max_steps=2000)
         yield from run_until_finished(r2, max_steps=2000)
         assert r.finished and r2.finished
+        # Both reqs must release their staging + KV state — the race
+        # window must not have leaked a buffer.
+        assert r.hisparse_staging_buffers_held == 0, (
+            f"r still holding staging buffers after finish; got "
+            f"{r.hisparse_staging_buffers_held}"
+        )
+        assert r2.hisparse_staging_buffers_held == 0, (
+            f"r2 still holding staging buffers after finish; got "
+            f"{r2.hisparse_staging_buffers_held}"
+        )
+        assert r.kv_pages == 0 and r2.kv_pages == 0
+        assert r.lock_refs == 0 and r2.lock_refs == 0
+        # r must have actually chunked (long prompt) to make this test
+        # meaningful — otherwise no DMA-during-chunk race was exercised.
+        assert r.chunks_done >= 2
 
     def test_hisparse_abort_during_chunk_with_dma(self):
         """HiSparse DMA + chunk + abort three-way race must cancel cleanly."""
