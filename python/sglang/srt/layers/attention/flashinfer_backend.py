@@ -1060,6 +1060,8 @@ class FlashInferIndicesUpdaterDecode:
                 spec_info,
                 seq_lens_cpu=seq_lens_cpu_tmp,
                 use_sliding_window_kv_pool=use_sliding_window_kv_pool,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=disable_split_kv,
             )
 
     def update_cross_attention(
@@ -1097,6 +1099,8 @@ class FlashInferIndicesUpdaterDecode:
                 kv_start_idx,
                 spec_info,
                 seq_lens_cpu=kv_lens_cpu,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=disable_split_kv,
             )
 
     def call_begin_forward(
@@ -1341,6 +1345,7 @@ class FlashInferIndicesUpdaterPrefill:
                 use_ragged,
                 spec_info,
                 use_sliding_window_kv_pool=use_sliding_window_kv_pool,
+                fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
             )
 
@@ -1384,6 +1389,7 @@ class FlashInferIndicesUpdaterPrefill:
                 self.qo_indptr[wrapper_id],
                 use_ragged,
                 spec_info,
+                fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=(
                     cross_attention_custom_mask if wrapper_id == 1 else None
