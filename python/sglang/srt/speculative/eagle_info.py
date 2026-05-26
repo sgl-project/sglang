@@ -42,6 +42,7 @@ from sglang.srt.speculative.spec_utils import (
     generate_simulated_accept_index,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
+    maybe_detect_oob,
 )
 from sglang.srt.utils import is_cuda, is_musa, next_power_of_2
 
@@ -125,6 +126,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             return
 
         batch.input_ids = self.draft_token
+        maybe_detect_oob(
+            batch.input_ids,
+            0,
+            batch.model_config.vocab_size,
+            "eagle prepare_for_verify input_ids",
+        )
 
         if page_size == 1:
             batch.out_cache_loc = alloc_token_slots(
@@ -418,6 +425,15 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 spec_steps=self.spec_steps,
             )
 
+        # accept_index values index batch.out_cache_loc (size = bs * draft_token_num);
+        # -1 is the reject sentinel.
+        maybe_detect_oob(
+            accept_index,
+            -1,
+            bs * self.draft_token_num,
+            "eagle verify accept_index post-sampling",
+        )
+
         unfinished_index = []
         unfinished_accept_index = []
         accept_index_cpu = accept_index.tolist()
@@ -475,6 +491,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # TODO: fuse them
         accept_index = accept_index[accept_index != -1]
         accept_tokens = predict[accept_index]
+        maybe_detect_oob(
+            accept_tokens,
+            0,
+            batch.model_config.vocab_size,
+            "eagle verify accept_tokens",
+        )
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
         evict_mask[accept_index] = False
         num_correct_drafts_cpu = num_correct_drafts.cpu()

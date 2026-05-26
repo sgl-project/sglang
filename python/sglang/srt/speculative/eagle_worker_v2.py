@@ -1218,6 +1218,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
         bs = len(batch.seq_lens)
         size = bs * self.speculative_num_draft_tokens
 
+        # fill_accepted_out_cache_loc reads out_cache_loc[accept_index]; -1 sentinel ok.
+        maybe_detect_oob(
+            accept_index,
+            -1,
+            batch.out_cache_loc.size(0),
+            "eagle v2 move_accepted_tokens accept_index",
+        )
+
         tgt_cache_loc = torch.zeros(
             size,
             dtype=torch.int64,
