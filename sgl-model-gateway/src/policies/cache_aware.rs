@@ -3,53 +3,46 @@
 
     This router combines two strategies to optimize both cache utilization and request distribution:
 
-    1. Cache-Aware Routing (Approximate Tree)
-    2. Load Balancing (Shortest Queue with Balance Thresholds)
+    1. Terminal-prefix affinity (Approximate Tree)
+    2. Round-robin first placement
 
-    The router dynamically switches between these strategies based on load conditions:
-    - Uses load balancing when the system is imbalanced
-    - Uses cache-aware routing when the system is balanced
-
-    A system is considered imbalanced if both conditions are met:
-    1. (max - min) > abs_threshold
-    2. max > rel_threshold * min
+    Established conversations are routed back to the worker that owns a complete
+    request-boundary prefix. New conversations are placed round-robin so common
+    shared system/tool prefixes do not collapse first placement onto one worker.
 
     Strategy Details:
 
-    1. Cache-Aware Routing (Approximate Tree)
-    -------------------------------------------
+    1. Terminal-prefix affinity (Approximate Tree)
+    ----------------------------------------------
     This strategy maintains an approximate radix tree for each worker based on request history,
     eliminating the need for direct cache state queries. The tree stores raw text characters
     instead of token IDs to avoid tokenization overhead.
 
     Process:
     a. For each request, find the worker with the highest prefix match
-    b. If match rate > cache_threshold:
-    Route to the worker with highest match (likely has relevant data cached)
-    c. If match rate ≤ cache_threshold:
-    Route to the worker with smallest tree size (most available cache capacity)
+    b. If the match lands on a terminal request-boundary node:
+    Route to the worker that owns that terminal prefix
+    c. Otherwise:
+    Route to the next healthy worker by round-robin and insert that owner
     d. Background maintenance:
     Periodically evict least recently used leaf nodes to prevent memory overflow
 
-    2. Load Balancing (Shortest Queue)
-    -------------------------------------------
-    This strategy tracks pending request counts per worker and routes new requests
-    to the least busy worker when the system is detected to be imbalanced.
+    2. Round-robin first placement
+    ------------------------------
+    This strategy spreads new cache entries fairly across healthy workers. Later
+    terminal-prefix hits preserve the owner chosen for that initial placement.
 
     Configuration Parameters:
     ------------------------
     1. cache_threshold: (float, 0.0 to 1.0)
-    Minimum prefix match ratio to use highest-match routing.
-    Below this threshold, routes to worker with most available cache space.
+    Retained for config compatibility; terminal-only affinity ignores
+    non-terminal match rate when selecting an owner.
 
     2. balance_abs_threshold: (integer)
-    Absolute difference threshold for load imbalance detection.
-    System is potentially imbalanced if (max_load - min_load) > abs_threshold
+    Retained for config compatibility.
 
     3. balance_rel_threshold: (float)
-    Relative ratio threshold for load imbalance detection.
-    System is potentially imbalanced if max_load > min_load * rel_threshold
-    Used in conjunction with abs_threshold to determine final imbalance state.
+    Retained for config compatibility.
 
     4. eviction_interval_secs: (integer)
     Interval between LRU eviction cycles for the approximate trees.
@@ -411,11 +404,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         });
         let min_load = if min_load == usize::MAX { 0 } else { min_load };
 
-        // Check if load is imbalanced. A terminal prefix hit is evaluated before this
-        // redirects the request, so established request-boundary affinity stays stable.
-        let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
-            && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
-
         let text = request_text.unwrap_or("");
 
         // Get the tree reference without locking the entire HashMap
@@ -431,17 +419,14 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
         if let Some(tree) = tree {
             // Now we work with the tree without holding the HashMap lock
-            // Use prefix_match_with_counts to avoid redundant chars().count() calls
             let result = tree.prefix_match_with_counts(text);
-            let match_rate = if result.input_char_count == 0 {
-                0.0
-            } else {
-                result.matched_char_count as f32 / result.input_char_count as f32
-            };
             let terminal_prefix_hit =
                 !result.ended_on_partial_match && result.matched_node_is_terminal;
-            let cache_hit = match_rate > self.config.cache_threshold;
-            let should_try_cache_owner = terminal_prefix_hit || (!is_imbalanced && cache_hit);
+            // Only a complete request-boundary prefix should carry affinity. A
+            // non-terminal shared-prefix hit can be a common system/tool prompt
+            // across unrelated conversations; using its owner here makes first
+            // placement collapse onto whichever DP rank inserted that prefix.
+            let should_try_cache_owner = terminal_prefix_hit;
 
             // Select worker without String allocation
             let selected_idx = if should_try_cache_owner {
@@ -647,6 +632,55 @@ mod tests {
             let idx = policy.select_worker(&workers, &info).await.unwrap();
             assert_eq!(idx, expected_idx);
         }
+    }
+
+    #[tokio::test]
+    async fn test_cache_aware_shared_prefix_miss_uses_round_robin() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.1,
+            balance_abs_threshold: 1000,
+            balance_rel_threshold: 1000.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 10000,
+        });
+
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+        ];
+        policy.init_workers(&workers);
+
+        let first = SelectWorkerInfo {
+            request_text: Some("shared-prefix conversation-a turn 1"),
+            ..Default::default()
+        };
+        let first_owner = policy.select_worker(&workers, &first).await.unwrap();
+        assert_eq!(first_owner, 0);
+
+        let second = SelectWorkerInfo {
+            request_text: Some("shared-prefix conversation-b turn 1"),
+            ..Default::default()
+        };
+        let second_owner = policy.select_worker(&workers, &second).await.unwrap();
+        assert_eq!(second_owner, 1);
+
+        let first_continuation = SelectWorkerInfo {
+            request_text: Some("shared-prefix conversation-a turn 1 plus more history"),
+            ..Default::default()
+        };
+        let selected = policy
+            .select_worker(&workers, &first_continuation)
+            .await
+            .unwrap();
+        assert_eq!(selected, first_owner);
     }
 
     #[tokio::test]
