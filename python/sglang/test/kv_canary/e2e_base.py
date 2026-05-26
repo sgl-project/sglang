@@ -98,7 +98,16 @@ class CanaryE2EBase(CapturedServerE2EBase):
         server_args = build_canary_server_args(
             kv_canary_mode=cls.kv_canary_mode,
             mode_cfg=cls._cfg,
-            extra_server_args=("--max-total-tokens", "65536", *cls.extra_server_args),
+            # ``--skip-server-warmup`` avoids the built-in VLM image warmup
+            # request whose multimodal-placeholder token IDs get rewritten
+            # before the model forward — the real-model token-id validator
+            # would otherwise fire false positives on these synthetic tokens.
+            extra_server_args=(
+                "--max-total-tokens",
+                "65536",
+                "--skip-server-warmup",
+                *cls.extra_server_args,
+            ),
         )
         cls.process = popen_launch_server(
             cls._cfg.model_path,
