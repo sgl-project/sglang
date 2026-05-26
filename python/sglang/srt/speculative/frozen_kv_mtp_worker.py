@@ -398,8 +398,9 @@ class FrozenKVMTPWorker(TpModelWorker):
                 forward_batch.mm_input_embeds = mm_input_embeds
             self._set_positions(forward_batch)
             self._init_frozen_kv_metadata(forward_batch)
-            with self._target_kv_pool_view(forward_batch), forward_context(
-                ForwardContext(attn_backend=self.draft_attn_backend)
+            with (
+                self._target_kv_pool_view(forward_batch),
+                forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
             ):
                 logits_output = self.draft_model_runner.forward(
                     forward_batch, skip_attn_backend_init=True
@@ -682,8 +683,9 @@ class FrozenKVMTPWorker(TpModelWorker):
             forward_batch.spec_info.hidden_states = hidden_states
             self._set_positions(forward_batch)
 
-            with self._target_kv_pool_view(forward_batch), forward_context(
-                ForwardContext(attn_backend=self.draft_attn_backend)
+            with (
+                self._target_kv_pool_view(forward_batch),
+                forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
             ):
                 logits_output = self.draft_model_runner.forward(
                     forward_batch, skip_attn_backend_init=True
