@@ -131,32 +131,32 @@ def _scatter_req_token_ids_kernel(
     BATCH_BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    tids = pid * TOKEN_BLOCK + tl.arange(0, TOKEN_BLOCK)
-    tid_mask = tids < num_tokens
+    tids = pid * TOKEN_BLOCK + tl.arange(0, TOKEN_BLOCK)  # [TOKEN_BLOCK] int32
+    tid_mask = tids < num_tokens  # [TOKEN_BLOCK] bool
 
-    bs_offs = tl.arange(0, BATCH_BLOCK)
-    bs_mask = bs_offs < (num_batch + 1)
-    offs_vals = tl.load(
+    bs_offs = tl.arange(0, BATCH_BLOCK)  # [BATCH_BLOCK] int32
+    bs_mask = bs_offs < (num_batch + 1)  # [BATCH_BLOCK] bool
+    offs_vals = tl.load(  # [BATCH_BLOCK] int64
         offsets_ptr + bs_offs,
         mask=bs_mask,
         other=(1 << 62),
     )
 
     # find owning req for each tid via reduce-sum: req_idx = (count of offsets <= tid) - 1
-    le = offs_vals[None, :] <= tids[:, None]
-    req_idx = tl.sum(le.to(tl.int32), axis=1) - 1
+    le = offs_vals[None, :] <= tids[:, None]  # [TOKEN_BLOCK, BATCH_BLOCK] bool
+    req_idx = tl.sum(le.to(tl.int32), axis=1) - 1  # [TOKEN_BLOCK] int32
 
-    safe_req_idx = tl.where(tid_mask, req_idx, 0)
-    starts = tl.load(offsets_ptr + safe_req_idx, mask=tid_mask, other=0)
-    pos = tids - starts
-    rp = tl.load(req_pool_indices_ptr + safe_req_idx, mask=tid_mask, other=0)
+    safe_req_idx = tl.where(tid_mask, req_idx, 0)  # [TOKEN_BLOCK] int32
+    starts = tl.load(offsets_ptr + safe_req_idx, mask=tid_mask, other=0)  # [TOKEN_BLOCK] int64
+    pos = tids - starts  # [TOKEN_BLOCK] int64
+    rp = tl.load(req_pool_indices_ptr + safe_req_idx, mask=tid_mask, other=0)  # [TOKEN_BLOCK] int64
 
     # Bound writes by the pool's max_context_len so a token sequence longer than the
     # ReqToTokenPool row never spills into an adjacent row.
-    in_row = pos < pool_max_context_len
-    write_mask = tid_mask & in_row
+    in_row = pos < pool_max_context_len  # [TOKEN_BLOCK] bool
+    write_mask = tid_mask & in_row  # [TOKEN_BLOCK] bool
 
-    val = tl.load(flat_in_ptr + tids, mask=tid_mask, other=0).to(tl.int32)
+    val = tl.load(flat_in_ptr + tids, mask=tid_mask, other=0).to(tl.int32)  # [TOKEN_BLOCK] int32
     tl.store(pool_out_ptr + rp * pool_stride0 + pos, val, mask=write_mask)
 
 
