@@ -52,17 +52,9 @@ def apply_eagle_prefill_input_rotation(
 ) -> None:
     """EAGLE input rotation for draft prefill.
 
-    Each req's slice [t_0..t_{n-1}] -> [t_1..t_{n-1}, t_n] with
-    t_n = next_token_ids[i]. Aligns draft's position-i hidden with
-    target's label at i+1 — the basis of EAGLE chain prediction.
-    Vectorized: one whole-tensor left shift + scatter at segment tails.
-
-    Non-final-chunk override: when a req is mid-chunked-prefill (more prompt
-    tokens remain after this chunk), the seg-end's t_n is the next *prompt*
-    token, not the target's next_token_id. Without this override, the DRAFT
-    pool's stored token at the chunk-1 seg end differs from a single-chunk
-    prefill of the same prompt, which breaks the canary chain invariant after
-    radix-fold merges per-req slot tables across writers.
+    Each req's slice [t_0..t_{n-1}] -> [t_1..t_{n-1}, t_n]. t_n is target's
+    predicted next_token, except for non-final chunks of a chunked req where it
+    is the next prompt token (see `_eagle_prefill_tail_tokens`).
     """
     if batch.forward_mode.is_idle():
         return
@@ -82,15 +74,10 @@ def apply_eagle_prefill_input_rotation(
 def _eagle_prefill_tail_tokens(
     batch: ScheduleBatch, next_token_ids: torch.Tensor
 ) -> torch.Tensor:
-    """Resolve the per-seq tail token that the EAGLE prefill rotation writes
-    at each segment's last position.
-
-    The default is the target model's predicted next_token_id. For a req that
-    is mid-chunked-prefill (more prompt tokens remain after this chunk's last
-    seq position), use the next prompt token instead. This keeps the DRAFT
-    pool's stored token at the chunk boundary byte-identical to a single-chunk
-    prefill of the same prompt, so the canary chain invariant survives the
-    radix-fold step that merges per-req slot tables across writers.
+    """Per-seq tail token for the EAGLE prefill rotation. Default is the target's
+    predicted `next_token_ids[i]`; for a non-final chunk of a chunked req the
+    next prompt token is used instead, so the chunk-boundary DRAFT KV matches a
+    single-chunk prefill of the same prompt.
     """
     tail_tokens = next_token_ids.to(batch.input_ids.dtype)
     next_prompt_token = batch.chunked_req_next_prompt_token

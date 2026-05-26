@@ -553,10 +553,6 @@ class EagleDraftWorker(BaseDraftWorker):
         """
         # Construct input_ids
         if not batch.forward_mode.is_idle():
-            # Chunked-prefill-aware tail tokens: non-final chunks of a chunked req
-            # must put the next prompt token at the seg end (not the target's
-            # next_token_id) so the DRAFT canary chain stays consistent across
-            # writers post-radix-fold.
             tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
             pt = 0
             for i, extend_len in enumerate(batch.extend_lens):
