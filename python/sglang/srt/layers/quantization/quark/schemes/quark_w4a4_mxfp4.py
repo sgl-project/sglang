@@ -8,6 +8,7 @@ import torch
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.common import mxfp_supported
 
 _is_hip = is_hip()
 if _is_hip:
@@ -40,9 +41,10 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
 
         if not self.is_checkpoint_mxfp4_serialized:
-            if not _is_hip:
+            if not mxfp_supported():
                 raise NotImplementedError(
-                    "Online MXFP4 quantization is currently only supported on AMD ROCm devices."
+                    "Online MXFP4 quantization requires an AMD ROCm device with "
+                    "FP4 hardware support (gfx95x, e.g. MI355x)."
                 )
             logger.info_once(
                 "Using online MXFP4 quantization from a higher precision checkpoint. Beware that this optimization may degrade prediction quality - please validate your model accuracy. More details at https://docs.sglang.io/advanced_features/quantization.html#online-quantization."

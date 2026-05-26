@@ -5,14 +5,14 @@ import unittest
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=103, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=106, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=106, suite="stage-b-test-1-gpu-small-amd-mi35x")
 import time
 from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import is_hip, kill_process_tree
-from sglang.srt.utils.common import is_cuda_alike
+from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.common import is_cuda_alike, mxfp_supported
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -27,9 +27,10 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not is_hip():
+        if not mxfp_supported():
             raise unittest.SkipTest(
-                "online MXFP4 quantization is only supported on AMD ROCm devices"
+                "online MXFP4 quantization requires an AMD ROCm device with "
+                "FP4 hardware support (gfx95x, e.g. MI355x)"
             )
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.stdout = io.StringIO()

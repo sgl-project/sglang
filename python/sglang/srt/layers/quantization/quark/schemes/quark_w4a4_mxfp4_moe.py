@@ -16,6 +16,7 @@ from sglang.srt.utils import (
     is_hip,
     set_weight_attrs,
 )
+from sglang.srt.utils.common import mxfp_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -68,6 +69,11 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         self.with_bias = False
 
         if not self.is_checkpoint_mxfp4_serialized:
+            if not mxfp_supported():
+                raise NotImplementedError(
+                    "Online MXFP4 quantization for MoE layers requires an AMD ROCm "
+                    "device with FP4 hardware support (gfx95x, e.g. MI355x)."
+                )
             logger.info_once(
                 "Using online MXFP4 quantization for MoE layers from a higher precision checkpoint. "
                 "Beware that this optimization may degrade prediction quality - please validate your model accuracy. "
