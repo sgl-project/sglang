@@ -35,7 +35,10 @@ logger = init_logger(__name__)
 
 SGL_TEST_FILES_CI_DATA_REVISION = "b7455318873fc5af399c8447b3bb0d9471a5084c"
 SGL_TEST_FILES_CONSISTENCY_GT_CASE_REVISIONS = {
-    "wan2_2_t2v_a14b_lora_2gpu": "646754015786500f53b16da9064130318a7b1c23",
+    "zimage_image_t2i_multi_lora": "969596096a74c1f0a7320928fa7798e759fd2573",
+    "wan2_1_t2v_1_3b_lora_1gpu": "969596096a74c1f0a7320928fa7798e759fd2573",
+    "wan2_1_i2v_14b_lora_2gpu": "969596096a74c1f0a7320928fa7798e759fd2573",
+    "wan2_2_t2v_a14b_lora_2gpu": "969596096a74c1f0a7320928fa7798e759fd2573",
 }
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
