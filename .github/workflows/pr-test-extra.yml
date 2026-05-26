@@ -33,6 +33,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_all_tests:
+        description: "Run all tests — bypasses paths-filter (needed when dispatching against long-lived branches whose diff against main can't resolve a merge-base in a shallow clone)"
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       git_ref:
