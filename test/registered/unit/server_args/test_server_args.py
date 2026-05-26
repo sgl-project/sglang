@@ -663,9 +663,11 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
                 "--sampling-backend",
                 "token_oracle",
                 # Explicit device so ServerArgs.__post_init__ does not call
-                # get_device(), which fails on CPU-only CI runners.
+                # get_device() (fails on CPU-only CI runners) and does not run
+                # _handle_cpu_backends (which would override sampling_backend
+                # to "pytorch", masking what we want to verify).
                 "--device",
-                "cpu",
+                "cuda",
             ]
         )
         self.assertEqual(parsed.sampling_backend, "token_oracle")

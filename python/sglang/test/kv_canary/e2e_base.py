@@ -4,7 +4,6 @@ import io
 import os
 import string
 import time
-import unittest
 from typing import ClassVar, Literal, Optional
 
 from sglang.srt.kv_canary.config import CanaryMode
@@ -79,11 +78,6 @@ class CanaryE2EBase(CapturedServerE2EBase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        # Abstract intermediate test classes declare `__test__ = False` (pytest
-        # convention). unittest does not honor `__test__`, so skip here to keep
-        # the convention working under `python3 file.py -f` discovery.
-        if not getattr(cls, "__test__", True):
-            raise unittest.SkipTest(f"{cls.__name__}: __test__ = False")
         cls._cfg = _MODE_CONFIGS[cls.model_mode]
         server_env = os.environ.copy()
         server_env.setdefault("SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT", "1")
