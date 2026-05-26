@@ -83,8 +83,8 @@ def poll_and_all_reduce(
     pollers,
     gloo_group: dist.ProcessGroup,
     decode_reqs=None,
-    metadata_buffers: Optional["MetadataBuffers"] = None,
-    server_args=None,
+    metadata_buffers: Optional[MetadataBuffers] = None,
+    server_args: Optional[ServerArgs] = None,
 ):
     # at a certain prob, the poll is failed to simulate failure
     if FAILURE_PROB > 0:
@@ -131,8 +131,8 @@ def poll_and_all_reduce_with_staging(
     decode_reqs,
     staging_handler,
     gloo_group: dist.ProcessGroup,
-    metadata_buffers: Optional["MetadataBuffers"] = None,
-    server_args=None,
+    metadata_buffers: Optional[MetadataBuffers] = None,
+    server_args: Optional[ServerArgs] = None,
 ):
     """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
     for decode_req in decode_reqs:
