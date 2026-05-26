@@ -330,6 +330,11 @@ class _DeepEPDispatcherImplBase:
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
 
+        self.handle = None
+        self.quant_config: Optional[dict] = None
+        self.overlap_args: Optional[CombineOverlapArgs] = None
+        self.meta_overlap_args: Optional[dict] = None
+
         self.set_deepep_dispatcher_dtype()
         # Set params_bytes based on the actual dispatch dtype so buffer size
         # calculations are correct. FP8/INT8/NVFP4 use 1 byte, BF16 uses 2.
@@ -347,13 +352,6 @@ class _DeepEPDispatcherImplBase:
         # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
         # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
         assert self.num_max_dispatch_tokens_per_rank <= 1024
-
-        self.handle = None
-
-        self.quant_config: Optional[dict] = None
-
-        self.overlap_args: Optional[CombineOverlapArgs] = None
-        self.meta_overlap_args: Optional[dict] = None
 
     def dispatch_a(
         self,
