@@ -1064,9 +1064,7 @@ class TestExpectedTokenPool:
         max_seq_len: int,
         filled: dict[int, list[int]],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        pool = torch.zeros(
-            max_reqs, max_seq_len, dtype=torch.int32, device=_DEVICE
-        )
+        pool = torch.zeros(max_reqs, max_seq_len, dtype=torch.int32, device=_DEVICE)
         valid_lens = torch.zeros(max_reqs, dtype=torch.int32, device=_DEVICE)
         for rpi, tokens in filled.items():
             seq_len = len(tokens)

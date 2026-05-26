@@ -535,9 +535,7 @@ class TestViolationField:
         )
         assert_only_bits_set(fail_bits, consts.FailReason.VERIFY_TOKEN_MISMATCH)
         # The violation row carries both stored and expected token columns.
-        stored_token = int(
-            cuda_log.ring[0, consts.VIOLATION_FIELD_STORED_TOKEN].item()
-        )
+        stored_token = int(cuda_log.ring[0, consts.VIOLATION_FIELD_STORED_TOKEN].item())
         expected_token = int(
             cuda_log.ring[0, consts.VIOLATION_FIELD_EXPECTED_TOKEN].item()
         )
