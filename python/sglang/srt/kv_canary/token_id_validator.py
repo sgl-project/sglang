@@ -128,8 +128,16 @@ def fill_expected_inputs_from_reqs(
 
 
 def _logical_pos_offset(*, forward_batch: "ForwardBatch") -> int:
+    from sglang.srt.speculative.eagle_info import EagleDraftInput
+
     forward_mode = forward_batch.forward_mode
     if forward_mode.is_draft_extend(include_v2=True):
+        return 1
+    # EAGLE draft prefill keeps forward_mode == EXTEND but rotates input_ids in place
+    # so slot p stores K/V for token p+1 (see eagle_worker_v2._draft_extend_for_prefill).
+    if forward_mode.is_extend() and isinstance(
+        forward_batch.spec_info, EagleDraftInput
+    ):
         return 1
     return 0
 
