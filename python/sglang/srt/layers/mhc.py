@@ -8,7 +8,7 @@ import torch
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_round_robin_split
+from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
 from sglang.srt.layers.utils.common import strict_contiguous
 
 tilelang.set_log_level("WARNING")
@@ -450,6 +450,24 @@ def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
     return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
 
 
+def get_mhc_pre_token_count_representatives(
+    max_num_tokens: int, hc_hidden_size: int
+) -> Tuple[int, ...]:
+    """Return one token-count representative for each MHC pre split bucket."""
+    if max_num_tokens <= 0:
+        return tuple()
+
+    representatives_by_split: dict[int, int] = {}
+    for num_tokens in range(1, max_num_tokens + 1):
+        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+        representatives_by_split[n_splits] = num_tokens
+
+    return tuple(
+        representatives_by_split[n_splits]
+        for n_splits in sorted(representatives_by_split)
+    )
+
+
 @tilelang.jit(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
@@ -880,7 +898,7 @@ def mhc_post(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
-    if is_nsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_round_robin_split():
         x = strict_contiguous(x)
         residual = strict_contiguous(residual)
         post_layer_mix = strict_contiguous(post_layer_mix)
