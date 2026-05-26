@@ -18,13 +18,6 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 from sglang.test.test_utils import CustomTestCase
 
 
-def _script_naive_piecewise_cg_chunked(t: ScriptedRuntime):
-    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=8)
-    yield from run_until_finished(r)
-    assert r.finished
-    assert r.chunks_done >= 2
-
-
 class TestScriptedPiecewiseCG(CustomTestCase):
     def test_naive_piecewise_cg_chunked(self):
         """Piecewise CUDA graph capture runs alongside chunked prefill."""
@@ -32,12 +25,19 @@ class TestScriptedPiecewiseCG(CustomTestCase):
         # piecewise capture runs; ``base_engine_kwargs`` defaults it off
         # for compatibility with all the other tests, so override here.
         execute_scripted_runtime(
-            _script_naive_piecewise_cg_chunked,
+            self._script_naive_piecewise_cg_chunked,
             **base_engine_kwargs(
                 chunked_prefill_size=DEFAULT_CHUNK_SIZE,
                 disable_cuda_graph=False,
             ),
         )
+
+    @staticmethod
+    def _script_naive_piecewise_cg_chunked(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=8)
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done >= 2
 
 
 if __name__ == "__main__":

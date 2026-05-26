@@ -25,19 +25,11 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 
 
-def _script_naive_pp_chunked(t: ScriptedRuntime):
-    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
-    yield from run_until_finished(r)
-    assert r.finished
-    # VERY_LONG_PROMPT_LEN / DEFAULT_CHUNK_SIZE chunks expected.
-    assert r.chunks_done >= 2, f"expected ≥2 chunks, got {r.chunks_done}"
-
-
 class TestScriptedPP(CustomTestCase):
     def test_naive_pp_chunked(self):
         """PP × chunked: naive ScriptedRuntime smoke."""
         execute_scripted_runtime(
-            _script_naive_pp_chunked,
+            self._script_naive_pp_chunked,
             **base_engine_kwargs(
                 model_path=DEFAULT_MODEL_NAME_FOR_TEST,
                 tp_size=2,
@@ -46,6 +38,14 @@ class TestScriptedPP(CustomTestCase):
                 enable_dynamic_chunking=True,
             ),
         )
+
+    @staticmethod
+    def _script_naive_pp_chunked(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
+        yield from run_until_finished(r)
+        assert r.finished
+        # VERY_LONG_PROMPT_LEN / DEFAULT_CHUNK_SIZE chunks expected.
+        assert r.chunks_done >= 2, f"expected ≥2 chunks, got {r.chunks_done}"
 
 
 if __name__ == "__main__":

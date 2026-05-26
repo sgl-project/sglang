@@ -22,18 +22,11 @@ _SPEC_MODEL = "Qwen/Qwen3-8B"
 _SPEC_DRAFT = "Qwen/Qwen3-8B-EAGLE"
 
 
-def _script_naive_spec_chunked(t: ScriptedRuntime):
-    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=16)
-    yield from run_until_finished(r)
-    assert r.finished
-    assert r.chunks_done >= 2
-
-
 class TestScriptedSpec(CustomTestCase):
     def test_naive_spec_chunked(self):
         """Speculative decoding × chunked: naive ScriptedRuntime smoke."""
         execute_scripted_runtime(
-            _script_naive_spec_chunked,
+            self._script_naive_spec_chunked,
             **base_engine_kwargs(
                 model_path=_SPEC_MODEL,
                 chunked_prefill_size=DEFAULT_CHUNK_SIZE,
@@ -44,6 +37,13 @@ class TestScriptedSpec(CustomTestCase):
                 speculative_num_draft_tokens=8,
             ),
         )
+
+    @staticmethod
+    def _script_naive_spec_chunked(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=16)
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done >= 2
 
 
 if __name__ == "__main__":

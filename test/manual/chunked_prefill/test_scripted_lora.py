@@ -26,26 +26,11 @@ _LORA_BASE_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 _LORA_ADAPTER = "philschmid/llama-3-2-1b-instruct-finetuning-lora-cookbook-test"
 
 
-def _script_naive_lora_chunked(t: ScriptedRuntime):
-    # When ``start_req`` learns ``lora_path=`` (wishlist §4 P2 (10)
-    # adjacent — same kwarg-routing pattern as ``priority``), this
-    # script will route to the adapter; until then it exercises the
-    # chunked path with LoRA enabled at engine level.
-    r = t.start_req(
-        prompt_len=VERY_LONG_PROMPT_LEN,
-        max_new_tokens=4,
-        lora_path=_LORA_ADAPTER,
-    )
-    yield from run_until_finished(r)
-    assert r.finished
-    assert r.chunks_done >= 2
-
-
 class TestScriptedLoRA(CustomTestCase):
     def test_naive_lora_chunked(self):
         """Chunked prefill path runs with LoRA enabled at engine level."""
         execute_scripted_runtime(
-            _script_naive_lora_chunked,
+            self._script_naive_lora_chunked,
             **base_engine_kwargs(
                 model_path=_LORA_BASE_MODEL,
                 chunked_prefill_size=DEFAULT_CHUNK_SIZE,
@@ -53,6 +38,21 @@ class TestScriptedLoRA(CustomTestCase):
                 lora_paths=[_LORA_ADAPTER],
             ),
         )
+
+    @staticmethod
+    def _script_naive_lora_chunked(t: ScriptedRuntime):
+        # When ``start_req`` learns ``lora_path=`` (wishlist §4 P2 (10)
+        # adjacent — same kwarg-routing pattern as ``priority``), this
+        # script will route to the adapter; until then it exercises the
+        # chunked path with LoRA enabled at engine level.
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN,
+            max_new_tokens=4,
+            lora_path=_LORA_ADAPTER,
+        )
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done >= 2
 
 
 if __name__ == "__main__":
