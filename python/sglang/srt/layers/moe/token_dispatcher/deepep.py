@@ -437,11 +437,8 @@ class _DeepEPDispatcherImplBase:
             # NVFP4 is supported on GPU, no adjustment needed
 
     def _update_int8_quant_env(self) -> None:
-        """Update the DEEP_NORMAL_MODE_USE_INT8_QUANT environment variable."""
-        if self.use_fp8:
-            os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
-        else:
-            os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
+        """TODO adapt different quantization schemes for base model and draft model"""
+        pass
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
