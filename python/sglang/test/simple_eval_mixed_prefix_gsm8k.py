@@ -37,17 +37,17 @@ class MixedPrefixGSM8KEval(GSM8KEval):
         )
 
     def _setup_prefix_pool(self, all_lines: list, num_shots: int) -> int:
-        pool_size = num_shots + self._secondary_pool_size
-        if len(all_lines) < pool_size + 1:
+        overall_pool_size = num_shots + self._secondary_pool_size
+        if len(all_lines) < overall_pool_size + 1:
             raise ValueError(
                 f"GSM8K dataset has {len(all_lines)} examples but mixed-prefix "
-                f"eval needs at least {pool_size + 1} "
+                f"eval needs at least {overall_pool_size + 1} "
                 f"(num_shots {num_shots} + secondary "
                 f"{self._secondary_pool_size} + 1 test)."
             )
         self._primary_shots = all_lines[:num_shots]
-        self._secondary_pool = all_lines[num_shots:pool_size]
-        return pool_size
+        self._secondary_pool = all_lines[num_shots:overall_pool_size]
+        return overall_pool_size
 
     def _build_prefix(self, idx: int) -> str:
         rng = random.Random(self._seed + idx)
