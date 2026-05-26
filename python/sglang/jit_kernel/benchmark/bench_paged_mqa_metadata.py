@@ -13,7 +13,7 @@ Shape axes:
     makes the (small, expected) seq_lens-value variance empirically visible.
 
 Constants:
-  - ``num_sm = 132`` (H200; matches the kernel's tuned per-shape grid)
+  - ``num_sm``: queried from the active GPU.
   - ``page_size = 64`` (fixed by sglang public API)
 
 Local run:
@@ -33,7 +33,11 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=15, suite="base-b-kernel-benchmark-1-gpu-large")
 
 
-NUM_SM = 132
+NUM_SM = (
+    torch.cuda.get_device_properties(0).multi_processor_count
+    if torch.cuda.is_available()
+    else 132
+)
 PAGE_SIZE = 64
 DEVICE = "cuda"
 
