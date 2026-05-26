@@ -13,6 +13,8 @@
 # ==============================================================================
 """Pydantic models for OpenAI API protocol"""
 
+from __future__ import annotations
+
 import logging
 import time
 import uuid
@@ -23,10 +25,12 @@ from typing import (
     List,
     NamedTuple,
     Optional,
+    Protocol,
     Tuple,
     TypeAlias,
     Union,
     get_args,
+    runtime_checkable,
 )
 
 from openai.types.responses import (
@@ -86,6 +90,42 @@ class ErrorResponse(BaseModel):
     type: str
     param: Optional[str] = None
     code: int
+
+
+@runtime_checkable
+class ParsedResponseFields(Protocol):
+    """Protocol for parsed response fields from custom renderers."""
+
+    content: Optional[str]
+    tool_calls: Optional[List[Dict]]
+    reasoning_content: Optional[str]
+
+
+class ResponseParserProtocol(Protocol):
+    """Protocol for custom response parsers.
+
+    Implementations parse model output tokens into structured OpenAI response fields.
+    """
+
+    def parse_response(
+        self, output_ids: List[int]
+    ) -> Union[ParsedResponseFields, ErrorResponse]:
+        """Parse complete response from output token IDs."""
+        ...
+
+    def build_streaming_sse_chunks(
+        self,
+        output_ids: List[int],
+        index: int,
+        chunk_id: str,
+        model: str,
+        usage: Optional[Dict],
+    ) -> Tuple[List[str], bool, Optional[str]]:
+        """Parse streaming tokens and build SSE chunks.
+
+        Returns: (sse_chunks, has_tool_calls, error_message)
+        """
+        ...
 
 
 class LogProbs(BaseModel):
@@ -285,6 +325,7 @@ class CompletionRequest(BaseModel):
     user: Optional[str] = None
     return_hidden_states: bool = False
     return_routed_experts: bool = False
+    routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
@@ -632,6 +673,7 @@ class ChatCompletionRequest(BaseModel):
     parallel_tool_calls: bool = True
     return_hidden_states: bool = False
     return_routed_experts: bool = False
+    routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
     reasoning_effort: Optional[Literal["none", "low", "medium", "high", "max"]] = Field(
         default=None,

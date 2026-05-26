@@ -36,6 +36,9 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
 | `sla_attn` | `SLA_ATTN` | Sparse Linear Attention. Requires `SpargeAttn`. Install with `pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation`. |
 | `sage_sla_attn` | `SAGE_SLA_ATTN` | SageAttention + Sparse Linear Attention. Requires `SpargeAttn` (same install as SLA). |
 | `sparse_video_gen_2_attn` | `SPARSE_VIDEO_GEN_2_ATTN` | Requires `svg`. See installation instructions at https://github.com/svg-project/Sparse-VideoGen. |
+| `laser_attn` | `LASER_ATTN` | Requires `attentions` which can be installed with `sgl_kernel_npu`; available only for NPU. |
+| `block_sparse_attn` | `BLOCK_SPARSE_ATTN` | Requires `attentions` which can be installed with `sgl_kernel_npu`; available only for NPU. |
+| `rain_fusion_attn` | `RAIN_FUSION_ATTN` | Requires `attentions` which can be installed with `sgl_kernel_npu`; available only for NPU. |
 
 ## Selection priority
 
@@ -88,6 +91,12 @@ Some backends require additional configuration. You can pass these parameters vi
 | `spatial_layer` | `int` | Number of spatial layers. | `1` |
 | `st_layer` | `int` | Number of spatiotemporal layers. | `1` |
 
+**Block Sparse attention ( `block_sparse_attn` ) and  Rain Fusion attention ( `rain_fusion_attn` )**
+| Parameter | Type | Description | Default |
+| :--- | :--- | :--- | :--- |
+| `skip_first_steps` | `int` | Number of steps to use laser attention before switching to sparse attention. | `10` |
+| `sparsity` | `float` | The sparsity coefficient must be in the range (0, 1). | `0.2` |
+
 ## Platform support matrix
 
 | Backend | CUDA | ROCm | XPU | MUSA | MPS | NPU | Notes |
@@ -104,6 +113,9 @@ Some backends require additional configuration. You can pass these parameters vi
 | `aiter` | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | Requires `aiter`. |
 | `aiter_sage` | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | Requires `aiter`. |
 | `sparse_video_gen_2_attn` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | CUDA-only. Requires `svg`. |
+| `laser_attn` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | NPU-only. Requires `attentions` from `sgl_kernel_npu`. Uses SDPA if seqlen is less than 2048. |
+| `block_sparse_attn` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | NPU-only. Requires `attentions` from `sgl_kernel_npu`.  Configure via `--attention-backend-config`. |
+| `rain_fusion_attn` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | NPU-only. Requires `attentions` from `sgl_kernel_npu`. Configure via `--attention-backend-config`. |
 
 ## Usage
 
