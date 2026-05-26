@@ -37,11 +37,11 @@ def attach_canary_buffers(
     pool: KVCache,
     config: CanaryConfig,
     device: torch.device,
-    slot_token_offset: int = 0,
+    expected_token_ids_offset: int = 0,
 ) -> tuple[CanaryBufferGroup, ...]:
     """Install canary buffers on a KV pool and return the resulting CanaryBufferGroup tuple.
 
-    ``slot_token_offset`` is propagated into every produced :class:`CanaryBufferGroup` (0 for target
+    ``expected_token_ids_offset`` is propagated into every produced :class:`CanaryBufferGroup` (0 for target
     pools; 1 for EAGLE draft pools where the rotation shifts the slot-to-token mapping by one).
     """
     attacher = _POOL_ATTACHERS.get(type(pool))
@@ -56,16 +56,16 @@ def attach_canary_buffers(
         pool=pool,
         device=device,
         read_bytes=read_bytes,
-        slot_token_offset=slot_token_offset,
+        expected_token_ids_offset=expected_token_ids_offset,
     )
     logger.info(
         "attach_canary_buffers: pool=%s attacher=%s read_bytes=%d n_groups=%d kinds=%s "
-        "slot_token_offset=%d",
+        "expected_token_ids_offset=%d",
         type(pool).__name__,
         attacher.__name__,
         read_bytes,
         len(groups),
         [g.kind.name for g in groups],
-        slot_token_offset,
+        expected_token_ids_offset,
     )
     return groups
