@@ -17,8 +17,12 @@ from sglang.multimodal_gen.runtime.pipelines.sana_wm_pipeline import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_refiner import (
+    OfficialDiffusersLTX2RefinerModule,
+    OfficialGemma3TextEncoderModule,
     SanaWMLTX2RefinerStage,
     SanaWMRefinerDecodingStage,
+    _refiner_config_value,
+    _uses_diffusers_ltx2_refiner,
     sana_wm_skip_refiner_enabled,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
@@ -333,32 +337,16 @@ class TestSanaWMTwoStagePipeline(unittest.TestCase):
         self.assertEqual(refiner_root, "/custom/refiner")
         self.assertEqual(refiner_gemma_root, "/custom/refiner/text_encoder")
 
-    def test_refiner_text_encoder_config_is_scoped_to_manual_load(self) -> None:
-        config = SanaWMPipelineConfig()
-        server_args = SimpleNamespace(pipeline_config=config)
-        original_configs = config.text_encoder_configs
-        original_precisions = config.text_encoder_precisions
-
-        saved = SanaWMTwoStagePipeline._ensure_refiner_text_encoder_config(server_args)
-        try:
-            self.assertEqual(len(config.text_encoder_configs), 2)
-            self.assertEqual(len(config.text_encoder_precisions), 2)
-            self.assertEqual(config.text_encoder_precisions[1], "bf16")
-            refiner_config = config.text_encoder_configs[1]
-            refiner_config.update_model_arch(
-                {
-                    "architectures": ["Gemma3ForConditionalGeneration"],
-                    "text_config": {"vocab_size": 10},
-                    "vision_config": {"hidden_size": 20},
-                }
-            )
-            self.assertEqual(refiner_config.text_config.vocab_size, 10)
-            self.assertEqual(refiner_config.vision_config.hidden_size, 20)
-        finally:
-            config.text_encoder_configs, config.text_encoder_precisions = saved
-
-        self.assertIs(config.text_encoder_configs, original_configs)
-        self.assertIs(config.text_encoder_precisions, original_precisions)
+    def test_refiner_modules_are_loaded_from_official_subtrees(self) -> None:
+        self.assertEqual(
+            SanaWMTwoStagePipeline._REFINER_SUB_MODULES,
+            (
+                ("transformer_2", "refiner/transformer"),
+                ("connectors", "refiner/connectors"),
+                ("text_encoder_2", "refiner/text_encoder"),
+                ("tokenizer_2", "refiner/text_encoder"),
+            ),
+        )
 
 
 class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
@@ -498,6 +486,35 @@ class TestSanaWMTextEncodingStage(unittest.TestCase):
 
 
 class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
+    def test_diffusers_refiner_detection_uses_official_class_name(self) -> None:
+        class LTX2VideoTransformer3DModel(torch.nn.Module):
+            pass
+
+        self.assertTrue(_uses_diffusers_ltx2_refiner(LTX2VideoTransformer3DModel()))
+        self.assertTrue(
+            _uses_diffusers_ltx2_refiner(
+                OfficialDiffusersLTX2RefinerModule(LTX2VideoTransformer3DModel())
+            )
+        )
+
+    def test_refiner_config_value_prefers_diffusers_config(self) -> None:
+        module = SimpleNamespace(
+            patch_size=999,
+            config=SimpleNamespace(patch_size=1),
+        )
+
+        self.assertEqual(_refiner_config_value(module, "patch_size"), 1)
+
+    def test_official_refiner_wrappers_expose_layerwise_blocks(self) -> None:
+        self.assertEqual(
+            OfficialDiffusersLTX2RefinerModule.layer_names,
+            ["module.transformer_blocks"],
+        )
+        self.assertIn(
+            "module.model.language_model.layers",
+            OfficialGemma3TextEncoderModule.layer_names,
+        )
+
     def test_skip_refiner_flag_accepts_request_extra(self) -> None:
         batch = SimpleNamespace(extra={"diffusers_kwargs": {"skip_refiner": True}})
         self.assertTrue(sana_wm_skip_refiner_enabled(batch))
@@ -511,6 +528,57 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
         batch = Req(prompt=["left", "right"])
         prompts = SanaWMLTX2RefinerStage._prompts_for_batch(batch, batch_size=2)
         self.assertEqual(prompts, ["left", "right"])
+
+    def test_refiner_prompt_encoding_uses_hf_gemma_backbone(self) -> None:
+        class DummyTokenizer:
+            padding_side = "right"
+            pad_token = None
+            eos_token = "<eos>"
+
+            def __call__(self, *args, **kwargs):
+                return SimpleNamespace(
+                    input_ids=torch.tensor([[1, 2, 0, 0]]),
+                    attention_mask=torch.tensor([[1, 1, 0, 0]]),
+                )
+
+        class DummyBackbone:
+            def __init__(self):
+                self.called = False
+
+            def __call__(self, **kwargs):
+                self.called = True
+                hidden0 = torch.arange(8, dtype=torch.float32).reshape(1, 4, 2)
+                hidden1 = hidden0 + 10
+                return SimpleNamespace(hidden_states=(hidden0, hidden1))
+
+        class DummyTextEncoder:
+            def __init__(self):
+                self.called = False
+                self.model = DummyBackbone()
+
+            def __call__(self, **kwargs):
+                self.called = True
+                raise AssertionError("Gemma3ForConditionalGeneration.model was not used")
+
+        class DummyConnectors:
+            def __call__(self, prompt_embeds, attention_mask):
+                return prompt_embeds, None, attention_mask
+
+        stage = object.__new__(SanaWMLTX2RefinerStage)
+        stage.tokenizer = DummyTokenizer()
+        stage.text_encoder = DummyTextEncoder()
+        stage.connectors = DummyConnectors()
+        stage.dtype = torch.float32
+        stage.text_max_sequence_length = 4
+
+        prompt_embeds, attention_mask = stage._encode_prompt(
+            "drive forward", torch.device("cpu")
+        )
+
+        self.assertTrue(stage.text_encoder.model.called)
+        self.assertFalse(stage.text_encoder.called)
+        self.assertEqual(prompt_embeds.shape, (1, 4, 4))
+        self.assertTrue(torch.equal(attention_mask, torch.tensor([[1, 1, 0, 0]])))
 
     def test_refiner_decoding_drops_clean_sink_frame_after_decode(self) -> None:
         stage = SanaWMRefinerDecodingStage(vae=None)
