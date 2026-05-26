@@ -41,8 +41,13 @@ Implemented:
   segmented linear attention) fixture under `lightning/` with an eager EXTEND
   Triton case, plus an initial Mamba2 state-space-model fixture under `mamba/`
   with an eager EXTEND case that drives `Mamba2AttnBackend` end-to-end through
-  a real `MambaMixer2`. `dsv4/` remains a deferred method fixture because it
-  needs a DeepSeekV4-specific packed-cache reference.
+  a real `MambaMixer2`. `dsv4/` now has an initial SWA-only (`compress_ratio=0`)
+  Phase 2 fixture under `dsv4/` that drives the real `DeepseekV4AttnBackend`
+  through `flash_mla` with the production packed FP8-nope/BF16-rope SWA cache
+  and an independent PyTorch reference that dequantizes the same cache and
+  applies sliding-window MLA math with a virtual-key attention-sink correction.
+  C4/C128 compressed-attention paths, decode mode, speculative paths, and
+  graph runners remain explicit DSV4 follow-ups.
 - Phase 3 dense runner integration is implemented for representative attention
   backends: eager mode for `torch_native`, and CUDA-graph metadata capture/replay
   decode mode for `triton` and `flashinfer`. Runner coverage now includes MHA,
@@ -159,12 +164,15 @@ Implemented:
   `flashmla_kv` path. Dense fallback cases compare against an independent dense
   PyTorch reference; sparse cases compare against an independent top-k PyTorch
   reference.
-- DSV4 remains deferred from the default unit matrix because its CUDA backend is
-  not a compact backend swap: it hard-codes `head_dim=512`, `page_size=256`, and
-  the DeepSeekV4 packed FP8/BF16 KV-cache layout before routing through FlashMLA
-  and compression/indexer metadata. A correct unit fixture needs a DSV4-specific
-  reference that accounts for attention sinks, packed-cache quantization, and
-  compressed-index metadata rather than reusing the dense/MLA references.
+- DSV4 has an initial SWA-only (`compress_ratio=0`) Phase 2 fixture using the
+  real `DeepseekV4AttnBackend` and `DeepSeekV4TokenToKVPool` with the production
+  packed FP8-nope/BF16-rope SWA cache, plus an independent PyTorch reference
+  that dequantizes the same cache. Remaining DSV4 work is explicitly deferred
+  as follow-ups: C4 (4×) and C128 (128×) compressed-attention paths and their
+  `Compressor`/`C4Indexer` metadata, decode mode SWA, speculative target-verify
+  and draft-extend paths (`DSV4RawVerifyMetadata`, `DSV4RawDecodeMetadata`),
+  `seq_len > SWA_WINDOW` cases, non-zero attention sinks, and CUDA-graph
+  capture/replay coverage.
 - FA3/FA4 CUDA-graph replay is intentionally not enabled yet. Dense eager and
   PCG/BCG split-op paths match the HF-style reference, but the shared decode
   CUDA-graph helper currently mismatches on replay for both FA backends. Local
@@ -264,6 +272,27 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Added initial DSV4 (DeepSeek V4) Phase 2 fixture scoped to the SWA-only
+  (`compress_ratio=0`) path. The actual path constructs a real
+  `DeepSeekV4TokenToKVPool` with the production packed FP8-nope/BF16-rope SWA
+  cache (584 bytes/token), writes K via `quant_to_nope_fp8_rope_bf16_pack_triton`
+  + `set_swa_key_buffer_radix`, manually populates the SWA subset of
+  `DSV4AttnMetadata` (skipping `init_compression_metadata` since C4/C128 layers
+  are empty for `compress_ratios=[0]`), and calls
+  `DeepseekV4AttnBackend.forward(..., compress_ratio=0, attn_sink=-1e30)`. The
+  reference unpacks bytes from the same SWA cache buffer, dequantizes with the
+  stored UE8M0 FP8 scales, builds a causal+sliding-window mask over the SWA
+  window, and reproduces the flash_mla attention-sink correction by appending a
+  virtual key with score `attn_sink` to each per-head softmax row.
+- Uses `num_heads=64` (flash_mla `sparse_decode_fwd` requires specific h_q
+  values; production DSV4 uses 64) and enforces `max_seq_len <= SWA_WINDOW=128`
+  for the SWA-only slice.
+- `python -m py_compile test/manual/attention/unittest/common/attention_methods/dsv4_attention.py test/manual/attention/unittest/dsv4/test_deepseek_v4.py`
+- `python test/manual/attention/unittest/dsv4/test_deepseek_v4.py -v`
+  - Ran 1 test in 1.722s after adding DSV4 SWA-only EXTEND coverage. Observed
+    max abs diff ~0.008 against actual std ~0.21 (well under the documented
+    `DSV4_ATOL=DSV4_RTOL=5e-2` tolerance, kept loose to absorb flash_mla FP8
+    GEMM accumulation variance).
 - Added initial Mamba2 SSM Phase 2 fixture that constructs a real
   `MambaMixer2` and drives it through `Mamba2AttnBackend` via `ForwardContext`,
   with a pure-PyTorch per-token SSM scan reference (`state_t = exp(A*dt_t) * state_{t-1} + dt_t * B_t * x_t`,
