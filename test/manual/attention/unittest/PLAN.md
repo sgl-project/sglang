@@ -93,6 +93,18 @@ Implemented:
 - FlashInfer MLA EAGLE tree verify (`topk=2`) is intentionally not enabled yet.
   Chain verify (`topk=1`) passes, but the tree custom-mask path currently
   mismatches the HF-style PyTorch reference on realistic MLA shapes.
+- Cutlass MLA and TRT-LLM MLA are hardware-gated in this environment. Cutlass MLA
+  decode reports support only for compute capability 10.0, while the TRT-LLM MLA
+  XQA path reports an SM120a/SM121a requirement. Keep their tests hardware-gated
+  rather than enabling them in the default SM90 sweep.
+- Tokenspeed MLA is not enabled yet because it requires an FP8 KV-cache fixture
+  (`kv_cache_dtype=fp8_e4m3`); the current MLA unit fixture intentionally uses
+  fp16 KV cache for reference parity.
+- `dual_chunk_flash_attn` should be modeled as its own attention method fixture,
+  not as a dense backend swap. The backend expects a packed five-way query
+  projection (`query`, `succ`, `inter`, and critical variants), so the dense
+  Q/K/V module is structurally wrong for it even when short sequences would make
+  the mask mathematically close to ordinary causal attention.
 - FA3/FA4 decode CUDA-graph replay is intentionally not enabled yet. Dense eager
   and PCG/BCG split-op paths match the HF-style reference, but the shared decode
   CUDA-graph helper currently mismatches on replay for both FA backends.
@@ -148,15 +160,20 @@ Next implementation steps:
   representative valid backends before broadening the speculative matrix.
 - Expand Phase 2 to additional attention methods/backends with method-specific
   fixtures rather than forcing them through the dense harness. Priority candidates:
-  supported-shape MLA kernels (`flashinfer` MLA, `flashmla`, `cutlass_mla`,
-  `trtllm_mla`/`tokenspeed_mla` where hardware supports them), dual-chunk
-  attention, and DSA/DSV4-style methods.
+  hardware-gated MLA kernels (`cutlass_mla`, `trtllm_mla`/`tokenspeed_mla` where
+  hardware and KV dtype support them), dual-chunk attention with a packed-query
+  fixture, and DSA/DSV4-style methods.
 - Keep `torch_native` SWA out of the matrix until the backend honors
   `RadixAttention.sliding_window_size`.
 - Defer Phase 2 expansion for additional backends until representative Phase 3 and
   Phase 4 tests are passing.
 
 Latest verification:
+- Probed additional backend candidates after FlashMLA: `cutlass_mla` decode is
+  unavailable on local SM90 because it requires compute capability 10.0;
+  `trtllm_mla` decode is unavailable because FlashInfer's XQA MLA path requires
+  SM120a/SM121a; `tokenspeed_mla` construction requires FP8 KV cache; and
+  `dual_chunk_flash_attn` requires a method-specific packed-query fixture.
 - `python -m py_compile test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/mla/test_flashmla.py`
 - `python test/manual/attention/unittest/mla/test_triton.py -v`
 - `python test/manual/attention/unittest/mla/test_flashinfer.py -v`
