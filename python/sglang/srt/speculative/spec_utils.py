@@ -464,7 +464,12 @@ def get_src_tgt_cache_loc(
     page_size: int,
 ):
     src_cache_loc = out_cache_loc[accept_index]
-    tgt_cache_loc = torch.empty_like(src_cache_loc)
+    # zeros_like (not empty_like): if get_target_cache_loc fails to fully
+    # cover tgt_cache_loc on any edge case, the tail stays at slot 0 (the
+    # reserved padding slot) instead of caching-allocator garbage. Prevents
+    # downstream move_kv_cache from writing KV into a random slot, which has
+    # been seen to surface as either illegal-address or NaN target logits.
+    tgt_cache_loc = torch.zeros_like(src_cache_loc)
     extended_len = seq_lens + draft_token_num
     keep_len = torch.minimum(
         (seq_lens + num_correct_drafts + 1 + page_size - 1) // page_size * page_size,
