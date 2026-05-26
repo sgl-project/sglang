@@ -2001,3 +2001,56 @@ class TestBoundarySweep:
                 real_kv_hash_mode=consts.RealKvHashMode.PARTIAL,
             )
         )
+
+
+class TestVerifyExpectedInputIds:
+    """Cover the new verify-time token-id check via VerifyPlan.verify_expected_input_ids."""
+
+    def _run(
+        self,
+        *,
+        stored_token: int,
+        expected_input_id: int,
+    ) -> FakeViolationLog:
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
+        stamp_pair(
+            buf_pair,
+            slot_idx=1,
+            token=stored_token,
+            position=0,
+            prev_hash=chain_anchor_signed(),
+        )
+        plan_pair = make_verify_plan_pair(
+            slot_indices=[1],
+            positions=[0],
+            prev_slot_indices=[-1],
+            expected_input_ids=[expected_input_id],
+            device=_DEVICE,
+        )
+        cuda_log, ref_log = run_verify_diff(
+            buf_pair=buf_pair,
+            plan_pair=plan_pair,
+        )
+        return cuda_log
+
+    def test_sentinel_skips_token_check(self) -> None:
+        """``expected_input_id == -1`` must not fire even if stored token differs."""
+        log = self._run(stored_token=42, expected_input_id=-1)
+        assert int(log.write_index[0].item()) == 0
+
+    def test_match_records_no_violation(self) -> None:
+        """Matching stored vs expected token: zero violations."""
+        log = self._run(stored_token=42, expected_input_id=42)
+        assert int(log.write_index[0].item()) == 0
+
+    def test_mismatch_fires_verify_token_bit(self) -> None:
+        """Mismatch: kVerifyTokenMismatch bit set; expected_token field populated."""
+        log = self._run(stored_token=42, expected_input_id=99)
+        assert int(log.write_index[0].item()) == 1
+        row = log.ring[0].tolist()
+        fail_bits = int(row[consts.VIOLATION_FIELD_FAIL_REASON_BITS])
+        assert_only_bits_set(fail_bits, int(consts.FailReason.VERIFY_TOKEN_MISMATCH))
+        assert int(row[consts.VIOLATION_FIELD_STORED_TOKEN]) == 42
+        assert int(row[consts.VIOLATION_FIELD_EXPECTED_TOKEN]) == 99
