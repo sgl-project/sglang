@@ -48,7 +48,6 @@ class TestScriptedDisagg(CustomTestCase):
         assert r.finished
         assert r.chunks_done >= 2
 
-    @unittest.skip("requires real disagg topology — wire up when fixture lands")
     def test_disagg_prefill_per_chunk_kv_send(self):
         """Disagg-prefill multi-chunk: each middle chunk sends KV with last_chunk=False."""
         execute_scripted_runtime(
@@ -79,7 +78,6 @@ class TestScriptedDisagg(CustomTestCase):
             r.kv_send_last_chunk_events == 1
         ), f"expected exactly one last_chunk=True send, got {r.kv_send_last_chunk_events}"
 
-    @unittest.skip("requires real disagg topology — wire up when fixture lands")
     def test_disagg_overlap_mid_chunk_tmp_end_idx(self):
         """Disagg overlap mode: tmp_end_idx updates per chunk per the documented formula."""
         execute_scripted_runtime(
@@ -110,7 +108,6 @@ class TestScriptedDisagg(CustomTestCase):
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
 
-    @unittest.skip("requires real disagg topology — wire up when fixture lands")
     def test_disagg_retract_resets_send_state(self):
         """Disagg-prefill chunked retract resets start_send_idx and tmp_end_idx."""
         execute_scripted_runtime(
