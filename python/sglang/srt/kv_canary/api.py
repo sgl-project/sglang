@@ -40,10 +40,14 @@ def install_canary(
 
     perturb_config = PerturbConfig.from_env()
     device = torch.device(model_runner.device)
+    # EAGLE draft worker pools rotate input_ids so slot ``p`` stores K/V for the token at position ``p+1``;
+    # target pools have no such shift. Threaded into the plan-side expected-token gather kernel.
+    slot_token_offset = 1 if model_runner.is_draft_worker else 0
     buffer_groups = attach_canary_buffers(
         pool=model_runner.token_to_kv_pool,
         config=config,
         device=device,
+        slot_token_offset=slot_token_offset,
     )
     allocator = model_runner.token_to_kv_pool_allocator
     swa_allocator = (
