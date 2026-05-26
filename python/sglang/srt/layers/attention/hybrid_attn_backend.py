@@ -3,7 +3,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
+from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -23,6 +23,8 @@ class HybridAttnBackend(AttentionBackend):
         self.prefill_backend = prefill_backend
         self.decode_backend = decode_backend
         self.data_type = model_runner.kv_cache_dtype
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.req_to_token_pool = model_runner.req_to_token_pool
 
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
         """

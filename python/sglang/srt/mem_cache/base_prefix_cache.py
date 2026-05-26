@@ -17,7 +17,11 @@ import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
+from sglang.srt.observability.metrics_collector import (
+    STAT_LOGGER_ROLE_RADIX_CACHE,
+    RadixCacheMetricsCollector,
+    resolve_collector_class,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -134,9 +138,9 @@ class DecLockRefResult:
 
 @dataclasses.dataclass
 class InitLoadBackParams:
-    """Unified parameters for init_load_back across different cache types"""
+    """Unified parameters for init_load_back across different cache types."""
 
-    last_host_node: Any
+    best_match_node: Any
     host_hit_length: int
     mem_quota: Optional[int] = None
     req: Optional[Req] = None
@@ -151,6 +155,13 @@ class MatchResult(NamedTuple):
         last_host_node  :   The last TreeNode on the host that was matched.
                             Note that if HiCache is not enabled,
                             this **must** be the same as `last_device_node`.
+                            Reserved for L3 storage prefetch anchoring; L2 load_back
+                            uses `best_match_node` instead.
+        best_match_node :   Deepest node accepted by all component validators
+                            during match_prefix. Anchor for every L2 host->device
+                            load_back walk (FULL / SWA / ...). For legacy caches
+                            that don't run multi-component validation, set this
+                            equal to `last_host_node`.
         host_hit_length :   Length of the host cache hit. For pure-KV caches this is the
                             number of evicted KV tokens on CPU. For hybrid Mamba models this
                             is max(kv_host_tokens, 1-if-mamba-on-host) so that a mamba-only
@@ -164,6 +175,7 @@ class MatchResult(NamedTuple):
     device_indices: torch.Tensor
     last_device_node: Any
     last_host_node: Any
+    best_match_node: Any
     host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
@@ -180,6 +192,7 @@ def zero_match_result(tree_cache, match_result: "MatchResult") -> "MatchResult":
         device_indices=match_result.device_indices[:0],
         last_device_node=root,
         last_host_node=root,
+        best_match_node=root,
         host_hit_length=0,
     )
 
@@ -198,7 +211,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         labels = {"cache_type": self.__class__.__name__}
         if server_args.extra_metric_labels:
             labels.update(server_args.extra_metric_labels)
-        self.metrics_collector = RadixCacheMetricsCollector(labels=labels)
+        radix_cache_cls = resolve_collector_class(
+            server_args,
+            STAT_LOGGER_ROLE_RADIX_CACHE,
+            RadixCacheMetricsCollector,
+        )
+        self.metrics_collector = radix_cache_cls(labels=labels)
 
     def update_eviction_metrics(self, num_evicted: int, start_time: float):
         if self.metrics_collector is not None and num_evicted > 0:
