@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, Literal, Optional
 
 from sglang.srt.entrypoints.engine import Engine
 from sglang.test.scripted_runtime.runtime import _resolve_fn
@@ -26,6 +26,12 @@ def execute_scripted_runtime(
     script_fn: Callable,
     *,
     model_path: str,
+    # === Wishlist kwargs (disagg sidecar mode, see
+    # 2026-05-26-round-5-de-skip-and-api-wishlist.md §4.2) ===
+    disagg_role: Literal["none", "prefill", "decode"] = "none",
+    disagg_sidecar_decode_args: Optional[Dict[str, Any]] = None,
+    disagg_sidecar_prefill_args: Optional[Dict[str, Any]] = None,
+    disagg_router_args: Optional[Dict[str, Any]] = None,
     **engine_overrides,
 ) -> None:
     """Run ``script_fn`` as a ScriptedRuntime generator inside a sglang Engine.
@@ -38,7 +44,24 @@ def execute_scripted_runtime(
     generator returning or raising triggers shutdown). On script-side
     exceptions, re-raises an ``AssertionError`` containing the captured
     traceback on the caller side.
+
+    Disagg sidecar mode (``disagg_role != "none"``) is wishlist — see
+    ``2026-05-26-round-5-de-skip-and-api-wishlist.md`` §4.2. In that
+    mode this entry point will fork the ScriptedRuntime-controlled
+    engine, the opposite-side engine, and the router; today any
+    non-default disagg kwarg raises ``NotImplementedError``.
+
+    Consumed by: test_disagg_prefill_per_chunk_kv_send (disagg),
+                 test_disagg_overlap_mid_chunk_tmp_end_idx (disagg),
+                 test_disagg_retract_resets_send_state (disagg),
+                 test_spec_eagle_disagg_chunked (spec).
     """
+    _check_disagg_wishlist_kwargs(
+        disagg_role=disagg_role,
+        disagg_sidecar_decode_args=disagg_sidecar_decode_args,
+        disagg_sidecar_prefill_args=disagg_sidecar_prefill_args,
+        disagg_router_args=disagg_router_args,
+    )
     script_fn_path = f"{script_fn.__module__}:{script_fn.__qualname__}"
     resolved = _resolve_fn(script_fn_path)
     if resolved is not script_fn:
@@ -86,6 +109,31 @@ def execute_scripted_runtime(
                 engine.shutdown()
             except Exception:  # noqa: BLE001 — best-effort shutdown
                 pass
+
+
+def _check_disagg_wishlist_kwargs(
+    *,
+    disagg_role: Literal["none", "prefill", "decode"],
+    disagg_sidecar_decode_args: Optional[Dict[str, Any]],
+    disagg_sidecar_prefill_args: Optional[Dict[str, Any]],
+    disagg_router_args: Optional[Dict[str, Any]],
+) -> None:
+    """Raise NotImplementedError if any disagg sidecar kwarg is non-default.
+
+    Centralised so the wishlist mode surfaces with a clear error at the
+    call site once any disagg sidecar field is set.
+    """
+    any_set = (
+        disagg_role != "none"
+        or disagg_sidecar_decode_args is not None
+        or disagg_sidecar_prefill_args is not None
+        or disagg_router_args is not None
+    )
+    if any_set:
+        raise NotImplementedError(
+            "scripted_runtime: disagg sidecar mode is wishlist — see "
+            "2026-05-26-round-5-de-skip-and-api-wishlist.md"
+        )
 
 
 def _module_directory(module_name: str) -> Optional[str]:
