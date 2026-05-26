@@ -28,11 +28,10 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 )
 from sglang.test.test_utils import CustomTestCase
 
+# r2 must be a distinct request lifecycle, not a resurrection of r1.
 
-    # r2 must be a distinct request lifecycle, not a resurrection of r1.
 
-
-    # Decode-only batch: chunked_in_flight should never have been > 0.
+# Decode-only batch: chunked_in_flight should never have been > 0.
 
 
 class TestScriptedMultiReq(CustomTestCase):
@@ -201,7 +200,8 @@ class TestScriptedMultiReq(CustomTestCase):
         yield from run_until_finished(r1)
 
         others = [
-            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2) for _ in range(4)
+            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+            for _ in range(4)
         ]
         yield from run_until_all_finished(others)
         for r in others:
@@ -304,7 +304,8 @@ class TestScriptedMultiReq(CustomTestCase):
     def _script_three_long_back_to_back(t: ScriptedRuntime):
         # Three long chunked reqs submitted back-to-back.
         reqs = [
-            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2) for _ in range(3)
+            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+            for _ in range(3)
         ]
         yield from run_until_all_finished(reqs, max_steps=1500)
         for r in reqs:
@@ -418,7 +419,8 @@ class TestScriptedMultiReq(CustomTestCase):
     def _script_eight_concurrent_chunked(t: ScriptedRuntime):
         # 8 chunked reqs submitted together. Single-in-flight invariant holds.
         reqs = [
-            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2) for _ in range(8)
+            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+            for _ in range(8)
         ]
         for _ in range(DEFAULT_MAX_STEPS * 5):
             assert t.chunked_in_flight_count() <= 1
@@ -532,7 +534,8 @@ class TestScriptedMultiReq(CustomTestCase):
         # 3 normal + 2 high-priority reqs.
         normal = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(3)]
         high = [
-            t.start_req(prompt_len=16, max_new_tokens=2, priority="high") for _ in range(2)
+            t.start_req(prompt_len=16, max_new_tokens=2, priority="high")
+            for _ in range(2)
         ]
         yield from run_until_all_finished(normal + high)
 
