@@ -21,7 +21,7 @@ def launch_canary_plan_kernels_torch_reference(
     full_to_swa_index_mapping: Optional[torch.Tensor],
     verify_capacity: int,
     req_to_expected_token_ids: Optional[torch.Tensor],
-    expected_token_ids_offset: int,
+    kv_token_id_vs_position_offset: int,
 ) -> None:
     """Python reference for :func:`launch_canary_plan_kernels`. Same signature & byte-equal semantics."""
     bs = int(req_pool_indices.shape[0])
@@ -65,7 +65,7 @@ def launch_canary_plan_kernels_torch_reference(
         work_device=work_device,
         bs=bs,
         expected_token_pool_host=expected_token_pool_host,
-        expected_token_ids_offset=int(expected_token_ids_offset),
+        kv_token_id_vs_position_offset=int(kv_token_id_vs_position_offset),
     )
 
     _materialize_write_metadata(
@@ -123,7 +123,7 @@ def _materialize_verify_entries(
     work_device: torch.device,
     bs: int,
     expected_token_pool_host: Optional[torch.Tensor],
-    expected_token_ids_offset: int,
+    kv_token_id_vs_position_offset: int,
 ) -> int:
     out_slots: list[int] = []
     out_positions: list[int] = []
@@ -170,7 +170,7 @@ def _materialize_verify_entries(
 
             expected_input_id = -1
             if expected_token_pool_host is not None:
-                sot_pos = position + expected_token_ids_offset
+                sot_pos = position + kv_token_id_vs_position_offset
                 if 0 <= sot_pos < pool_max_context_len:
                     expected_input_id = int(
                         expected_token_pool_host[rpi, sot_pos].item()

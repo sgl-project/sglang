@@ -41,7 +41,7 @@ class TestAttachCanaryBuffers(PoolPatchHelper, CustomTestCase):
             pool=pool,
             config=self.config,
             device=self.device,
-            expected_token_ids_offset=0,
+            kv_token_id_vs_position_offset=0,
         )
         groups = {g.kind: g for g in groups_tuple}
         self.assertEqual(set(groups.keys()), {PoolKind.FULL})
@@ -59,7 +59,7 @@ class TestAttachCanaryBuffers(PoolPatchHelper, CustomTestCase):
             pool=pool,
             config=self.config,
             device=self.device,
-            expected_token_ids_offset=0,
+            kv_token_id_vs_position_offset=0,
         )
         groups = {g.kind: g for g in groups_tuple}
         self.assertEqual(set(groups.keys()), {PoolKind.FULL, PoolKind.SWA})
@@ -123,7 +123,7 @@ class TestPoolPatchBufferInfos(PoolPatchHelper, CustomTestCase):
                         pool=pool,
                         config=self.config,
                         device=self.device,
-                        expected_token_ids_offset=0,
+                        kv_token_id_vs_position_offset=0,
                     )
                     ptrs_after, _, _ = pool.get_contiguous_buf_infos()
                     self.assertEqual(len(ptrs_after), n_before + 4)
@@ -154,7 +154,7 @@ class TestPoolPatchBufferInfos(PoolPatchHelper, CustomTestCase):
             pool=pool,
             config=self.config,
             device=self.device,
-            expected_token_ids_offset=0,
+            kv_token_id_vs_position_offset=0,
         )
         group = {g.kind: g for g in groups_tuple}[PoolKind.FULL]
         ptrs_after, _, _ = pool.get_contiguous_buf_infos()
@@ -179,7 +179,7 @@ class TestCanaryBufferBudget(PoolPatchHelper, CustomTestCase):
             pool=pool,
             config=self.config,
             device=self.device,
-            expected_token_ids_offset=0,
+            kv_token_id_vs_position_offset=0,
         )
         group = {g.kind: g for g in groups_tuple}[PoolKind.FULL]
 

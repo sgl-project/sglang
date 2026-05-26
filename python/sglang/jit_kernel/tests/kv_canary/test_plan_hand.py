@@ -104,7 +104,7 @@ def _run_label(
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=verify_capacity,
         req_to_expected_token_ids=None,
-        expected_token_ids_offset=0,
+        kv_token_id_vs_position_offset=0,
     )
     torch.cuda.synchronize()
     return verify_plan, write_plan
@@ -824,7 +824,7 @@ class TestMisc:
                 full_to_swa_index_mapping=None,
                 verify_capacity=verify_capacity,
                 req_to_expected_token_ids=None,
-                expected_token_ids_offset=0,
+                kv_token_id_vs_position_offset=0,
             )
             torch.cuda.synchronize()
             runner(
@@ -838,7 +838,7 @@ class TestMisc:
                 full_to_swa_index_mapping=None,
                 verify_capacity=verify_capacity,
                 req_to_expected_token_ids=None,
-                expected_token_ids_offset=0,
+                kv_token_id_vs_position_offset=0,
             )
             torch.cuda.synchronize()
             n_active = int(write_plan.write_num_valid_reqs[0].item())

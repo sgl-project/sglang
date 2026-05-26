@@ -34,7 +34,7 @@ struct PlanEntriesParams {
   int64_t req_to_token_stride0;
   int64_t req_to_expected_token_ids_stride0;
   int64_t req_to_expected_token_ids_size0;
-  int32_t expected_token_ids_offset;  // 0 for target pools; +1 for EAGLE draft.
+  int32_t kv_token_id_vs_position_offset;  // 0 for target pools; +1 for EAGLE draft.
   int32_t swa_window_size;
 };
 
@@ -141,7 +141,7 @@ __global__ void plan_entries_persistent_kernel(
 
     int64_t out_expected_input_id = -1;
     if constexpr (HAS_EXPECTED_TOKEN_POOL) {
-      const int64_t sot_pos = out_position + static_cast<int64_t>(params.expected_token_ids_offset);
+      const int64_t sot_pos = out_position + static_cast<int64_t>(params.kv_token_id_vs_position_offset);
       if (sot_pos >= 0 && sot_pos < params.req_to_expected_token_ids_size0) {
         const int32_t token = params.req_to_expected_token_ids[rp * params.req_to_expected_token_ids_stride0 + sot_pos];
         out_expected_input_id = static_cast<int64_t>(token);
@@ -178,7 +178,7 @@ struct PlanEntriesKernel {
       const tvm::ffi::TensorView out_verify_expected_input_ids,
       const tvm::ffi::TensorView out_verify_expected_positions,
       const tvm::ffi::TensorView out_verify_prev_slot_indices,
-      int32_t expected_token_ids_offset,
+      int32_t kv_token_id_vs_position_offset,
       int32_t swa_window_size) {
     using namespace host;
 
@@ -275,7 +275,7 @@ struct PlanEntriesKernel {
         .req_to_token_stride0 = static_cast<int64_t>(Nmax_seq_len.unwrap()),
         .req_to_expected_token_ids_stride0 = expected_token_ids_stride0,
         .req_to_expected_token_ids_size0 = expected_token_ids_max_context_len,
-        .expected_token_ids_offset = expected_token_ids_offset,
+        .kv_token_id_vs_position_offset = kv_token_id_vs_position_offset,
         .swa_window_size = swa_window_size,
     };
 

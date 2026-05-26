@@ -15,7 +15,7 @@ def attach_mha(
     pool: object,
     device: torch.device,
     read_bytes: int,
-    expected_token_ids_offset: int,
+    kv_token_id_vs_position_offset: int,
 ) -> tuple[CanaryBufferGroup, ...]:
     num_slots = int(pool.k_buffer[0].shape[0])
     k_head = alloc_canary_buf(num_slots=num_slots, device=device)
@@ -36,7 +36,7 @@ def attach_mha(
             layer_buffer=pool.v_buffer[0], read_bytes=read_bytes
         ),
         swa_index_lut=None,
-        expected_token_ids_offset=expected_token_ids_offset,
+        kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
     )
     patch_buf_info_method(
         pool,

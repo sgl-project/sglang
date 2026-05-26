@@ -87,7 +87,7 @@ class CanaryDeviceState:
             ``pool[req_idx, p]`` = source-of-truth token at logical position ``p`` for the
             req in slot ``req_idx``. Allocated only when
             ``CanaryConfig.enable_req_token_ids_check`` is True. The plan-side entries
-            kernel gathers from this pool (via ``expected_token_ids_offset`` per buffer
+            kernel gathers from this pool (via ``kv_token_id_vs_position_offset`` per buffer
             group) into ``VerifyPlan.verify_expected_input_ids``; the verify kernel then
             compares against each canary slot's stored token.
     """

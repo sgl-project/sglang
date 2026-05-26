@@ -38,7 +38,7 @@ def launch_plan_entries_kernel(
     out_verify_expected_input_ids: torch.Tensor,
     out_verify_expected_positions: torch.Tensor,
     out_verify_prev_slot_indices: torch.Tensor,
-    expected_token_ids_offset: int,
+    kv_token_id_vs_position_offset: int,
     swa_window_size: int,
 ) -> None:
     has_swa_lut = full_to_swa_index_mapping is not None
@@ -56,6 +56,6 @@ def launch_plan_entries_kernel(
         out_verify_expected_input_ids,
         out_verify_expected_positions,
         out_verify_prev_slot_indices,
-        int(expected_token_ids_offset),
+        int(kv_token_id_vs_position_offset),
         int(swa_window_size),
     )

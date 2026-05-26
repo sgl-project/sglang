@@ -91,7 +91,7 @@ def _run_pipeline(
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=verify_capacity,
         req_to_expected_token_ids=None,
-        expected_token_ids_offset=0,
+        kv_token_id_vs_position_offset=0,
     )
 
     if real:
@@ -701,7 +701,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
         full_to_swa_index_mapping=None,
         verify_capacity=int(plan_v_real.verify_slot_indices.shape[0]),
         req_to_expected_token_ids=None,
-        expected_token_ids_offset=0,
+        kv_token_id_vs_position_offset=0,
     )
     launch_canary_plan_kernels_torch_reference(
         verify_plan_out=plan_v_ref,
@@ -714,7 +714,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
         full_to_swa_index_mapping=None,
         verify_capacity=int(plan_v_ref.verify_slot_indices.shape[0]),
         req_to_expected_token_ids=None,
-        expected_token_ids_offset=0,
+        kv_token_id_vs_position_offset=0,
     )
 
     launch_canary_verify_kernel(

@@ -52,7 +52,7 @@ def invoke_plan(
         full_to_swa_index_mapping=group.swa_index_lut,
         verify_capacity=int(verify_plan.verify_slot_indices.shape[0]),
         req_to_expected_token_ids=req_to_expected_token_ids,
-        expected_token_ids_offset=group.expected_token_ids_offset,
+        kv_token_id_vs_position_offset=group.kv_token_id_vs_position_offset,
     )
 
 

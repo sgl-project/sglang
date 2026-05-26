@@ -8,8 +8,8 @@ token instead of the next prompt token. PR #26329 fixes this by reading
 validator (``SGLANG_KV_CANARY_ENABLE_REQ_TOKEN_IDS_CHECK=1``) reads the same
 ``origin_input_ids + output_ids`` per req, populates a static
 ``req_to_expected_token_ids`` pool, and the verify kernel compares each
-canary slot's stored token against ``pool[rp, p + expected_token_ids_offset]``.
-For EAGLE draft pools ``expected_token_ids_offset = 1``, so the buggy
+canary slot's stored token against ``pool[rp, p + kv_token_id_vs_position_offset]``.
+For EAGLE draft pools ``kv_token_id_vs_position_offset = 1``, so the buggy
 revert reliably fires a ``verify_token`` violation without depending on any
 inter-request race.
 """

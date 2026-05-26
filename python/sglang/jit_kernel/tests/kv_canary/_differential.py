@@ -64,7 +64,7 @@ def _run_both_plan(
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=verify_capacity,
         req_to_expected_token_ids=None,
-        expected_token_ids_offset=0,
+        kv_token_id_vs_position_offset=0,
     )
     launch_canary_plan_kernels_torch_reference(
         verify_plan_out=ref_verify,
@@ -77,7 +77,7 @@ def _run_both_plan(
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=int(ref_verify.verify_slot_indices.shape[0]),
         req_to_expected_token_ids=None,
-        expected_token_ids_offset=0,
+        kv_token_id_vs_position_offset=0,
     )
     torch.cuda.synchronize()
 

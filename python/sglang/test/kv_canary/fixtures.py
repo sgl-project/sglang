@@ -235,7 +235,7 @@ def make_buffer_group(
     real_kv_source: Optional[RealKvSource] = None,
     swa_index_lut: Optional[torch.Tensor] = None,
     num_slots: int = 4,
-    expected_token_ids_offset: int = 0,
+    kv_token_id_vs_position_offset: int = 0,
 ) -> CanaryBufferGroup:
     def _zero() -> torch.Tensor:
         return torch.zeros(
@@ -262,7 +262,7 @@ def make_buffer_group(
         real_kv_sources_k=real_kv_sources,
         real_kv_sources_v=real_kv_sources if has_v else (),
         swa_index_lut=swa_index_lut,
-        expected_token_ids_offset=expected_token_ids_offset,
+        kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
     )
 
 

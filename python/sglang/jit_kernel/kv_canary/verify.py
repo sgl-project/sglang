@@ -174,7 +174,7 @@ class VerifyPlan:
             for the SWA group.
         verify_expected_input_ids: Source-of-truth token id per entry, shape [verify_capacity], int64.
             The plan-side entries kernel gathers from
-            ``CanaryDeviceState.req_to_expected_token_ids[rp, position + expected_token_ids_offset]``;
+            ``CanaryDeviceState.req_to_expected_token_ids[rp, position + kv_token_id_vs_position_offset]``;
             entries that fall outside the pool's row (e.g. EAGLE draft's last slot rotating in a bonus
             token, or padding beyond the per-req length) get the ``-1`` sentinel. The verify kernel
             compares against the stored canary token and skips when this is ``-1``.
