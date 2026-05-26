@@ -180,6 +180,13 @@ Implemented:
   The folder is intentionally named `runner_modes`, not `graph_runners`, because
   it also hosts eager-style and split-op runner coverage rather than only CUDA
   graph execution.
+- Runner-mode helpers must use a shared adapter/lifecycle framework whenever the
+  same runner contract can apply to more than one attention method or backend.
+  Do not add one-off `run_*_case` implementations inside attention-method files or
+  backend-specific wrappers when a generic runner-mode helper can own capture,
+  replay, eager comparison, and lifecycle setup. Attention-method files should
+  provide only method-specific callbacks such as fixture construction, input
+  creation, state preparation, forward-batch construction, and output comparison.
   `common/runner_modes/cuda_graph_decode_runner.py` now uses one CUDA graph
   decode lifecycle for dense/SWA, MLA, and GDN through attention-family adapters.
   Reusable family-specific callbacks such as case cloning, random capture inputs,
@@ -230,6 +237,10 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
+- Documented the runner-mode requirement that reusable runner contracts must be
+  implemented through shared adapter/lifecycle helpers under `common/runner_modes/`
+  instead of local one-off capture/replay wrappers.
+- `git diff --check`
 - Refactored production `EAGLEDraftCudaGraphRunner` coverage into the
   adapter-based lifecycle in `common/runner_modes/eagle_draft_runner.py`. Dense
   `triton` and `flashinfer` wrappers now only provide method-specific callbacks
@@ -443,6 +454,10 @@ attention backend across supported runner modes, forward modes, and input config
 Runner implementations such as CUDA graph capture/replay live in isolated
 `common/*_runner.py` files and are imported by the attention-method tests; do not
 duplicate runner orchestration inside each attention method helper.
+When adding a new runner mode or production runner integration, first factor the
+runner lifecycle into `common/runner_modes/` with an adapter contract. Backend or
+attention-method tests should call that helper and pass callbacks, not reimplement
+capture/replay or eager-vs-graph comparison logic locally.
 Speculative decoding is not an attention-method folder; it is represented as
 `ForwardMode`, runner mode, and synthetic spec metadata cases inside the affected
 attention-method folder.
