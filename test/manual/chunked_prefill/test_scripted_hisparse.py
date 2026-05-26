@@ -49,7 +49,6 @@ class TestScriptedHiSparse(CustomTestCase):
         assert r.finished
         assert r.chunks_done >= 2
 
-    @unittest.skip("requires real hisparse topology — wire up when fixture lands")
     def test_hisparse_staging_dma_during_chunk_admit(self):
         """HiSparse staging DMA in flight + chunk admission must not deadlock."""
         execute_scripted_runtime(
@@ -79,7 +78,6 @@ class TestScriptedHiSparse(CustomTestCase):
         yield from run_until_finished(r2, max_steps=2000)
         assert r.finished and r2.finished
 
-    @unittest.skip("requires real hisparse topology — wire up when fixture lands")
     def test_hisparse_abort_during_chunk_with_dma(self):
         """HiSparse DMA + chunk + abort three-way race must cancel cleanly."""
         execute_scripted_runtime(
