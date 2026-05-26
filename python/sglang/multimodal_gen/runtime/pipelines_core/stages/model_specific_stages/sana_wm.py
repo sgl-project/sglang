@@ -989,14 +989,15 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             intrinsics = intrinsics.unsqueeze(0)
         elif intrinsics.dim() == 3 and intrinsics.shape[-2:] == (3, 3):
             vec4 = SanaWMBeforeDenoisingStage._intrinsics_matrix_to_vec4(intrinsics)
-            if intrinsics.shape[0] == num_frames:
+            if intrinsics.shape[0] >= num_frames:
                 intrinsics = vec4.unsqueeze(0)
             elif intrinsics.shape[0] == batch_size:
                 intrinsics = vec4.unsqueeze(1)
             else:
                 raise ValueError(
-                    "intrinsics with shape (N,3,3) must use N=num_frames or "
-                    f"N=batch_size, got N={intrinsics.shape[0]}"
+                    "intrinsics with shape (N,3,3) must use N>=num_frames "
+                    f"or N=batch_size, got N={intrinsics.shape[0]}, "
+                    f"num_frames={num_frames}, batch_size={batch_size}"
                 )
         elif intrinsics.dim() == 3 and intrinsics.shape[-1] == 4:
             pass

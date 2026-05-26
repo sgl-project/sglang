@@ -28,15 +28,35 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     _align_sana_wm_cfg_text_conditions,
     configure_sana_wm_ltx2_vae_for_long_video,
 )
+from sglang.multimodal_gen.runtime import server_args as server_args_module
 from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
     _RMSNorm,
     _downscale_to_reference_rms,
     compute_chunk_plucker,
 )
+from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 from sglang.multimodal_gen.runtime.utils.model_overlay import (
     resolve_model_overlay_target,
 )
 from sglang.multimodal_gen.test.test_utils import DEFAULT_SANA_WM_MODEL_NAME_FOR_TEST
+
+
+class _GlobalStageArgsMixin:
+    def setUp(self) -> None:
+        super().setUp()
+        self._prev_global_server_args = server_args_module._global_server_args
+        set_global_server_args(
+            SimpleNamespace(
+                comfyui_mode=False,
+                enable_cfg_parallel=False,
+                enable_torch_compile=False,
+                attention_backend=None,
+            )
+        )
+
+    def tearDown(self) -> None:
+        set_global_server_args(self._prev_global_server_args)
+        super().tearDown()
 
 
 class TestSanaWMPipelineConfig(unittest.TestCase):
@@ -341,7 +361,7 @@ class TestSanaWMTwoStagePipeline(unittest.TestCase):
         self.assertIs(config.text_encoder_precisions, original_precisions)
 
 
-class TestSanaWMBeforeDenoisingStage(unittest.TestCase):
+class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
     def test_vae_encode_image_extracts_latent_dist_and_normalizes_ltx2(self) -> None:
         class DummyLatentDist:
             def mode(self):
@@ -409,6 +429,20 @@ class TestSanaWMBeforeDenoisingStage(unittest.TestCase):
 
         self.assertTrue(SanaWMBeforeDenoisingStage._has_explicit_camera_request(batch))
 
+    def test_intrinsics_3x3_sequence_can_exceed_requested_frame_count(self) -> None:
+        intrinsics = torch.eye(3).unsqueeze(0).repeat(321, 1, 1)
+
+        coerced = SanaWMBeforeDenoisingStage._coerce_intrinsics_vec4(
+            intrinsics,
+            batch_size=1,
+            num_frames=49,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+        self.assertEqual(coerced.shape, (1, 49, 4))
+        self.assertTrue(torch.equal(coerced[0, 0], torch.tensor([1.0, 1.0, 0.0, 0.0])))
+
     def test_latent_frame_camera_conditions_samples_stride_indices(self) -> None:
         original = torch.arange(1 * 17 * 20, dtype=torch.float32).reshape(1, 17, 20)
 
@@ -463,7 +497,7 @@ class TestSanaWMTextEncodingStage(unittest.TestCase):
         self.assertTrue(torch.equal(selected.squeeze(-1), torch.tensor([[0, 3, 4]])))
 
 
-class TestSanaWMRefinerStage(unittest.TestCase):
+class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
     def test_skip_refiner_flag_accepts_request_extra(self) -> None:
         batch = SimpleNamespace(extra={"diffusers_kwargs": {"skip_refiner": True}})
         self.assertTrue(sana_wm_skip_refiner_enabled(batch))
@@ -485,7 +519,7 @@ class TestSanaWMRefinerStage(unittest.TestCase):
         with patch.object(DecodingStage, "decode", return_value=decoded):
             frames = stage.decode(
                 torch.empty(1, 128, 4, 2, 2),
-                SimpleNamespace(),
+                SimpleNamespace(pipeline_config=SanaWMPipelineConfig()),
                 vae_dtype=torch.bfloat16,
             )
 
@@ -499,7 +533,7 @@ class TestSanaWMRefinerStage(unittest.TestCase):
         with patch.object(DecodingStage, "decode", return_value=decoded):
             frames = stage.decode(
                 torch.empty(1, 128, 4, 2, 2),
-                SimpleNamespace(),
+                SimpleNamespace(pipeline_config=SanaWMPipelineConfig()),
                 vae_dtype=torch.bfloat16,
             )
 
