@@ -1036,6 +1036,70 @@ class LTX2DenoisingStage(DenoisingStage):
         return tensor.repeat(repeat_factor, *([1] * (tensor.ndim - 1)))
 
     @staticmethod
+    def _expand_ltx2_condition_batch(
+        tensor: torch.Tensor | None,
+        target_batch_size: int,
+        *,
+        name: str,
+    ) -> torch.Tensor | None:
+        if tensor is None:
+            return None
+        target_batch_size = int(target_batch_size)
+        source_batch_size = int(tensor.shape[0])
+        if source_batch_size == target_batch_size:
+            return tensor
+        if (
+            source_batch_size <= 0
+            or target_batch_size <= 0
+            or target_batch_size % source_batch_size != 0
+        ):
+            raise ValueError(
+                f"{name} batch dimension mismatch: got {source_batch_size}, "
+                f"expected a divisor of {target_batch_size}"
+            )
+        repeat_factor = target_batch_size // source_batch_size
+        return tensor.repeat_interleave(repeat_factor, dim=0)
+
+    @classmethod
+    def _cat_ltx2_cfg_condition_batch(
+        cls,
+        negative: torch.Tensor,
+        positive: torch.Tensor,
+        target_batch_size: int,
+        *,
+        name: str,
+    ) -> torch.Tensor:
+        negative = cls._expand_ltx2_condition_batch(
+            negative,
+            target_batch_size,
+            name=f"negative_{name}",
+        )
+        positive = cls._expand_ltx2_condition_batch(
+            positive,
+            target_batch_size,
+            name=f"positive_{name}",
+        )
+        return torch.cat([negative, positive], dim=0)
+
+    @classmethod
+    def _cat_ltx2_optional_cfg_condition_batch(
+        cls,
+        negative: torch.Tensor | None,
+        positive: torch.Tensor | None,
+        target_batch_size: int,
+        *,
+        name: str,
+    ) -> torch.Tensor | None:
+        if negative is None or positive is None:
+            return None
+        return cls._cat_ltx2_cfg_condition_batch(
+            negative,
+            positive,
+            target_batch_size,
+            name=name,
+        )
+
+    @staticmethod
     def _build_ltx2_sp_padding_mask(
         batch: Req,
         *,
@@ -1671,23 +1735,60 @@ class LTX2DenoisingStage(DenoisingStage):
 
             if cfg_parallel:
                 if cfg_rank == 0:
-                    encoder_hidden_states = batch.prompt_embeds[0]
-                    audio_encoder_hidden_states = batch.audio_prompt_embeds[0]
-                    encoder_attention_mask = prompt_attention_mask
+                    encoder_hidden_states = self._expand_ltx2_condition_batch(
+                        batch.prompt_embeds[0],
+                        batch_size,
+                        name="encoder_hidden_states",
+                    )
+                    audio_encoder_hidden_states = self._expand_ltx2_condition_batch(
+                        batch.audio_prompt_embeds[0],
+                        batch_size,
+                        name="audio_encoder_hidden_states",
+                    )
+                    encoder_attention_mask = self._expand_ltx2_condition_batch(
+                        prompt_attention_mask,
+                        batch_size,
+                        name="encoder_attention_mask",
+                    )
                 elif cfg_rank == 1:
-                    encoder_hidden_states = batch.negative_prompt_embeds[0]
-                    audio_encoder_hidden_states = batch.negative_audio_prompt_embeds[0]
-                    encoder_attention_mask = self._get_ltx_prompt_attention_mask(
-                        batch,
-                        is_ltx23_variant=(
-                            ctx.is_ltx23_variant and not ctx.use_ltx23_legacy_one_stage
+                    encoder_hidden_states = self._expand_ltx2_condition_batch(
+                        batch.negative_prompt_embeds[0],
+                        batch_size,
+                        name="negative_encoder_hidden_states",
+                    )
+                    audio_encoder_hidden_states = self._expand_ltx2_condition_batch(
+                        batch.negative_audio_prompt_embeds[0],
+                        batch_size,
+                        name="negative_audio_encoder_hidden_states",
+                    )
+                    encoder_attention_mask = self._expand_ltx2_condition_batch(
+                        self._get_ltx_prompt_attention_mask(
+                            batch,
+                            is_ltx23_variant=(
+                                ctx.is_ltx23_variant
+                                and not ctx.use_ltx23_legacy_one_stage
+                            ),
+                            negative=True,
                         ),
-                        negative=True,
+                        batch_size,
+                        name="negative_encoder_attention_mask",
                     )
                 else:
-                    encoder_hidden_states = batch.prompt_embeds[0]
-                    audio_encoder_hidden_states = batch.audio_prompt_embeds[0]
-                    encoder_attention_mask = prompt_attention_mask
+                    encoder_hidden_states = self._expand_ltx2_condition_batch(
+                        batch.prompt_embeds[0],
+                        batch_size,
+                        name="encoder_hidden_states",
+                    )
+                    audio_encoder_hidden_states = self._expand_ltx2_condition_batch(
+                        batch.audio_prompt_embeds[0],
+                        batch_size,
+                        name="audio_encoder_hidden_states",
+                    )
+                    encoder_attention_mask = self._expand_ltx2_condition_batch(
+                        prompt_attention_mask,
+                        batch_size,
+                        name="encoder_attention_mask",
+                    )
                 model_kwargs = self._build_ltx2_model_kwargs(
                     ctx,
                     base_model_kwargs,
@@ -1708,20 +1809,25 @@ class LTX2DenoisingStage(DenoisingStage):
                     model_kwargs = self._repeat_ltx2_model_kwargs_batch(
                         model_kwargs, cfg_batch_size
                     )
-                    model_kwargs["encoder_hidden_states"] = torch.cat(
-                        [batch.negative_prompt_embeds[0], batch.prompt_embeds[0]],
-                        dim=0,
+                    model_kwargs["encoder_hidden_states"] = (
+                        self._cat_ltx2_cfg_condition_batch(
+                            batch.negative_prompt_embeds[0],
+                            batch.prompt_embeds[0],
+                            batch_size,
+                            name="encoder_hidden_states",
+                        )
                     )
-                    model_kwargs["audio_encoder_hidden_states"] = torch.cat(
-                        [
+                    model_kwargs["audio_encoder_hidden_states"] = (
+                        self._cat_ltx2_cfg_condition_batch(
                             batch.negative_audio_prompt_embeds[0],
                             batch.audio_prompt_embeds[0],
-                        ],
-                        dim=0,
+                            batch_size,
+                            name="audio_encoder_hidden_states",
+                        )
                     )
                     if self._should_pass_ltx2_text_attention_mask(ctx):
-                        repeated_attention_mask = self._cat_or_none(
-                            [
+                        repeated_attention_mask = (
+                            self._cat_ltx2_optional_cfg_condition_batch(
                                 self._get_ltx_prompt_attention_mask(
                                     batch,
                                     is_ltx23_variant=(
@@ -1731,7 +1837,9 @@ class LTX2DenoisingStage(DenoisingStage):
                                     negative=True,
                                 ),
                                 prompt_attention_mask,
-                            ]
+                                batch_size,
+                                name="encoder_attention_mask",
+                            )
                         )
                         model_kwargs["encoder_attention_mask"] = repeated_attention_mask
                         model_kwargs["audio_encoder_attention_mask"] = (
@@ -1797,25 +1905,25 @@ class LTX2DenoisingStage(DenoisingStage):
                             model_kwargs_local = self._repeat_ltx2_model_kwargs_batch(
                                 model_kwargs_local, cfg_batch_size
                             )
-                            model_kwargs_local["encoder_hidden_states"] = torch.cat(
-                                [
+                            model_kwargs_local["encoder_hidden_states"] = (
+                                self._cat_ltx2_cfg_condition_batch(
                                     batch.negative_prompt_embeds[0],
                                     batch.prompt_embeds[0],
-                                ],
-                                dim=0,
+                                    batch_size_local,
+                                    name="encoder_hidden_states",
+                                )
                             )
                             model_kwargs_local["audio_encoder_hidden_states"] = (
-                                torch.cat(
-                                    [
-                                        batch.negative_audio_prompt_embeds[0],
-                                        batch.audio_prompt_embeds[0],
-                                    ],
-                                    dim=0,
+                                self._cat_ltx2_cfg_condition_batch(
+                                    batch.negative_audio_prompt_embeds[0],
+                                    batch.audio_prompt_embeds[0],
+                                    batch_size_local,
+                                    name="audio_encoder_hidden_states",
                                 )
                             )
                             if self._should_pass_ltx2_text_attention_mask(ctx):
-                                repeated_attention_mask = self._cat_or_none(
-                                    [
+                                repeated_attention_mask = (
+                                    self._cat_ltx2_optional_cfg_condition_batch(
                                         self._get_ltx_prompt_attention_mask(
                                             batch,
                                             is_ltx23_variant=(
@@ -1825,7 +1933,9 @@ class LTX2DenoisingStage(DenoisingStage):
                                             negative=True,
                                         ),
                                         prompt_attention_mask,
-                                    ]
+                                        batch_size_local,
+                                        name="encoder_attention_mask",
+                                    )
                                 )
                                 model_kwargs_local["encoder_attention_mask"] = (
                                     repeated_attention_mask
@@ -1966,6 +2076,42 @@ class LTX2DenoisingStage(DenoisingStage):
                 base_model_kwargs_local = self._build_ltx2_base_model_kwargs(
                     ctx, batch, model_inputs_local
                 )
+                encoder_hidden_states_local = self._expand_ltx2_condition_batch(
+                    encoder_hidden_states,
+                    batch_size_local,
+                    name="encoder_hidden_states",
+                )
+                audio_encoder_hidden_states_local = self._expand_ltx2_condition_batch(
+                    audio_encoder_hidden_states,
+                    batch_size_local,
+                    name="audio_encoder_hidden_states",
+                )
+                encoder_attention_mask_local = self._expand_ltx2_condition_batch(
+                    encoder_attention_mask,
+                    batch_size_local,
+                    name="encoder_attention_mask",
+                )
+                negative_encoder_hidden_states_local = (
+                    self._expand_ltx2_condition_batch(
+                        negative_encoder_hidden_states,
+                        batch_size_local,
+                        name="negative_encoder_hidden_states",
+                    )
+                )
+                negative_audio_encoder_hidden_states_local = (
+                    self._expand_ltx2_condition_batch(
+                        negative_audio_encoder_hidden_states,
+                        batch_size_local,
+                        name="negative_audio_encoder_hidden_states",
+                    )
+                )
+                negative_encoder_attention_mask_local = (
+                    self._expand_ltx2_condition_batch(
+                        negative_encoder_attention_mask,
+                        batch_size_local,
+                        name="negative_encoder_attention_mask",
+                    )
+                )
 
                 if ctx.use_ltx23_legacy_one_stage:
                     with self._ltx2_model_forward_context(ctx, step):
@@ -1973,9 +2119,9 @@ class LTX2DenoisingStage(DenoisingStage):
                             **self._build_ltx2_model_kwargs(
                                 ctx,
                                 base_model_kwargs_local,
-                                encoder_hidden_states=encoder_hidden_states,
-                                audio_encoder_hidden_states=audio_encoder_hidden_states,
-                                encoder_attention_mask=encoder_attention_mask,
+                                encoder_hidden_states=encoder_hidden_states_local,
+                                audio_encoder_hidden_states=audio_encoder_hidden_states_local,
+                                encoder_attention_mask=encoder_attention_mask_local,
                                 disable_v2a_cross_attn=(
                                     skip_v2a_cross_attn_for_video_gt
                                 ),
@@ -1985,9 +2131,11 @@ class LTX2DenoisingStage(DenoisingStage):
                             **self._build_ltx2_model_kwargs(
                                 ctx,
                                 base_model_kwargs_local,
-                                encoder_hidden_states=negative_encoder_hidden_states,
-                                audio_encoder_hidden_states=negative_audio_encoder_hidden_states,
-                                encoder_attention_mask=negative_encoder_attention_mask,
+                                encoder_hidden_states=negative_encoder_hidden_states_local,
+                                audio_encoder_hidden_states=(
+                                    negative_audio_encoder_hidden_states_local
+                                ),
+                                encoder_attention_mask=negative_encoder_attention_mask_local,
                                 disable_v2a_cross_attn=(
                                     skip_v2a_cross_attn_for_video_gt
                                 ),
@@ -2007,9 +2155,9 @@ class LTX2DenoisingStage(DenoisingStage):
                                 **self._build_ltx2_model_kwargs(
                                     ctx,
                                     base_model_kwargs_local,
-                                    encoder_hidden_states=encoder_hidden_states,
-                                    audio_encoder_hidden_states=audio_encoder_hidden_states,
-                                    encoder_attention_mask=encoder_attention_mask,
+                                    encoder_hidden_states=encoder_hidden_states_local,
+                                    audio_encoder_hidden_states=audio_encoder_hidden_states_local,
+                                    encoder_attention_mask=encoder_attention_mask_local,
                                     skip_video_self_attn_blocks=tuple(
                                         stage1_guider_params["video_stg_blocks"]
                                     ),
@@ -2032,9 +2180,9 @@ class LTX2DenoisingStage(DenoisingStage):
                                 **self._build_ltx2_model_kwargs(
                                     ctx,
                                     base_model_kwargs_local,
-                                    encoder_hidden_states=encoder_hidden_states,
-                                    audio_encoder_hidden_states=audio_encoder_hidden_states,
-                                    encoder_attention_mask=encoder_attention_mask,
+                                    encoder_hidden_states=encoder_hidden_states_local,
+                                    audio_encoder_hidden_states=audio_encoder_hidden_states_local,
+                                    encoder_attention_mask=encoder_attention_mask_local,
                                     disable_a2v_cross_attn=True,
                                     disable_v2a_cross_attn=True,
                                 )
@@ -2045,16 +2193,16 @@ class LTX2DenoisingStage(DenoisingStage):
                     pass_specs: list[LTX2GuidancePassSpec] = [
                         LTX2GuidancePassSpec(
                             name="cond",
-                            encoder_hidden_states=encoder_hidden_states,
-                            audio_encoder_hidden_states=audio_encoder_hidden_states,
-                            encoder_attention_mask=encoder_attention_mask,
+                            encoder_hidden_states=encoder_hidden_states_local,
+                            audio_encoder_hidden_states=audio_encoder_hidden_states_local,
+                            encoder_attention_mask=encoder_attention_mask_local,
                             disable_v2a_cross_attn=skip_v2a_cross_attn_for_video_gt,
                         ),
                         LTX2GuidancePassSpec(
                             name="neg",
-                            encoder_hidden_states=negative_encoder_hidden_states,
-                            audio_encoder_hidden_states=negative_audio_encoder_hidden_states,
-                            encoder_attention_mask=negative_encoder_attention_mask,
+                            encoder_hidden_states=negative_encoder_hidden_states_local,
+                            audio_encoder_hidden_states=negative_audio_encoder_hidden_states_local,
+                            encoder_attention_mask=negative_encoder_attention_mask_local,
                             disable_v2a_cross_attn=skip_v2a_cross_attn_for_video_gt,
                         ),
                     ]
@@ -2062,9 +2210,9 @@ class LTX2DenoisingStage(DenoisingStage):
                         pass_specs.append(
                             LTX2GuidancePassSpec(
                                 name="perturbed",
-                                encoder_hidden_states=encoder_hidden_states,
-                                audio_encoder_hidden_states=audio_encoder_hidden_states,
-                                encoder_attention_mask=encoder_attention_mask,
+                                encoder_hidden_states=encoder_hidden_states_local,
+                                audio_encoder_hidden_states=audio_encoder_hidden_states_local,
+                                encoder_attention_mask=encoder_attention_mask_local,
                                 skip_video_self_attn_blocks=tuple(
                                     stage1_guider_params["video_stg_blocks"]
                                 ),
@@ -2078,9 +2226,9 @@ class LTX2DenoisingStage(DenoisingStage):
                         pass_specs.append(
                             LTX2GuidancePassSpec(
                                 name="modality",
-                                encoder_hidden_states=encoder_hidden_states,
-                                audio_encoder_hidden_states=audio_encoder_hidden_states,
-                                encoder_attention_mask=encoder_attention_mask,
+                                encoder_hidden_states=encoder_hidden_states_local,
+                                audio_encoder_hidden_states=audio_encoder_hidden_states_local,
+                                encoder_attention_mask=encoder_attention_mask_local,
                                 disable_a2v_cross_attn=True,
                                 disable_v2a_cross_attn=True,
                             )
