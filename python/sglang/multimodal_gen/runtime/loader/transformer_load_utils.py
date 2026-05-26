@@ -43,6 +43,74 @@ _PRECISION_VARIANT_SUFFIX_RE = re.compile(
 _MIXED_SAFETENSORS_RE = re.compile(r".*-mixed(?:-\d+-of-\d+)?\.safetensors$")
 
 
+def _get_quant_config_name(config: Optional[QuantizationConfig]) -> Optional[str]:
+    if config is None:
+        return None
+    quant_name_getter = getattr(type(config), "get_name", None)
+    return quant_name_getter() if callable(quant_name_getter) else None
+
+
+def _merge_modelopt_fp4_configs(
+    existing_config: Optional[QuantizationConfig],
+    inferred_config: Optional[QuantizationConfig],
+) -> Optional[QuantizationConfig]:
+    """Prefer safetensors-inferred NVFP4 layout over stale config.json ignores.
+
+    Some ModelOpt NVFP4 transformer repos ship a flat `quantization_config` in
+    `config.json`, but its `ignore` list can lag behind the actual checkpoint
+    contents. The safetensors shards are the source of truth for which modules
+    remain BF16 fallbacks, so when we can infer an NVFP4 config from the shards
+    we should use its exclude list while preserving explicit repo-level knobs
+    such as `swap_weight_nibbles`.
+    """
+    if inferred_config is None:
+        return existing_config
+
+    if _get_quant_config_name(inferred_config) != "modelopt_fp4":
+        return existing_config or inferred_config
+
+    if existing_config is None:
+        return inferred_config
+
+    if _get_quant_config_name(existing_config) != "modelopt_fp4":
+        return existing_config
+
+    existing_excludes = getattr(existing_config, "exclude_modules", []) or []
+    inferred_excludes = getattr(inferred_config, "exclude_modules", []) or []
+    if inferred_excludes != existing_excludes:
+        logger.warning(
+            "Overriding ModelOpt NVFP4 exclude_modules from config.json with "
+            "safetensors-inferred layout (%d -> %d entries).",
+            len(existing_excludes),
+            len(inferred_excludes),
+        )
+
+    inferred_config.packed_modules_mapping = getattr(
+        existing_config, "packed_modules_mapping", {}
+    )
+    inferred_config.checkpoint_uses_packed_qkv = getattr(
+        inferred_config, "checkpoint_uses_packed_qkv", False
+    ) or getattr(existing_config, "checkpoint_uses_packed_qkv", False)
+    inferred_config.swap_weight_nibbles = getattr(
+        inferred_config, "swap_weight_nibbles", False
+    ) or getattr(existing_config, "swap_weight_nibbles", False)
+    existing_scale_layout = getattr(
+        existing_config, "checkpoint_weight_scale_layout", "linear"
+    )
+    inferred_scale_layout = getattr(
+        inferred_config, "checkpoint_weight_scale_layout", "linear"
+    )
+    inferred_config.checkpoint_weight_scale_layout = (
+        existing_scale_layout
+        if inferred_scale_layout == "linear" and existing_scale_layout != "linear"
+        else inferred_scale_layout
+    )
+    if getattr(inferred_config, "group_size", None) is None:
+        inferred_config.group_size = getattr(existing_config, "group_size", None)
+
+    return inferred_config
+
+
 @dataclass
 class TransformerQuantLoadSpec:
     """Resolved loading plan for a transformer checkpoint."""
@@ -311,6 +379,12 @@ def resolve_transformer_quant_load_spec(
         safetensors_list=safetensors_list,
         component_model_path=component_model_path,
     )
+
+    if quant_config is not None:
+        packed = getattr(model_cls, "packed_modules_mapping", None)
+        if packed and hasattr(quant_config, "packed_modules_mapping"):
+            quant_config.packed_modules_mapping = packed
+
     nunchaku_config = server_args.nunchaku_config
 
     # resolve target param dtype
@@ -420,15 +494,59 @@ def _resolve_quant_config(
 ) -> Optional[QuantizationConfig]:
     """
     resolve quant config from checkpoints' metadata
-    priority: model config.json -> safetensors metadata -> format-specific fallback
+    priority: explicit --quantization flag -> model config.json -> safetensors metadata -> format-specific fallback
     """
+    # priority: explicit --quantization flag (e.g. mxfp8, mxfp4_npu, modelslim)
+    if server_args.quantization is not None:
+        from sglang.multimodal_gen.runtime.layers.quantization import (
+            get_quantization_config,
+        )
+
+        # modelslim requires a per-layer quant description file; load it from
+        # the component directory rather than returning an empty config.
+        if server_args.quantization == "modelslim":
+            return get_quant_config(hf_config, component_model_path)
+
+        quant_cls = get_quantization_config(server_args.quantization)
+        return quant_cls.from_config({})
+
     quant_config = get_quant_config(hf_config, component_model_path)
+    if quant_config is None and server_args.transformer_weights_path:
+        for safetensors_file in safetensors_list:
+            quant_config = get_quant_config_from_safetensors_metadata(safetensors_file)
+            if quant_config is not None:
+                return quant_config
+
+    arch_config = server_args.pipeline_config.dit_config.arch_config
+    param_names_mapping_dict = arch_config.param_names_mapping
+    reverse_param_names_mapping_dict = getattr(
+        arch_config, "reverse_param_names_mapping", None
+    )
+    quant_config = get_quant_config(
+        hf_config,
+        component_model_path,
+        reverse_param_names_mapping=reverse_param_names_mapping_dict,
+    )
+    quant_config_name = _get_quant_config_name(quant_config)
+    inferred_nvfp4_config = None
+    if quant_config is None or quant_config_name == "modelopt_fp4":
+        fallback_group_size = None
+        if quant_config_name == "modelopt_fp4":
+            fallback_group_size = getattr(quant_config, "group_size", None)
+        inferred_nvfp4_config = build_nvfp4_config_from_safetensors_list(
+            safetensors_list,
+            param_names_mapping_dict,
+            reverse_param_names_mapping_dict,
+            fallback_group_size,
+        )
+    quant_config = _merge_modelopt_fp4_configs(quant_config, inferred_nvfp4_config)
     if quant_config is not None or not server_args.transformer_weights_path:
         return quant_config
 
     quant_config = _resolve_quant_config_from_transformer_override(
         server_args.transformer_weights_path
     )
+    quant_config = _merge_modelopt_fp4_configs(quant_config, inferred_nvfp4_config)
     if quant_config is not None:
         return quant_config
 
@@ -437,16 +555,7 @@ def _resolve_quant_config(
         if quant_config is not None:
             return quant_config
 
-    param_names_mapping_dict = (
-        server_args.pipeline_config.dit_config.arch_config.param_names_mapping
-    )
-    quant_config = build_nvfp4_config_from_safetensors_list(
-        safetensors_list, param_names_mapping_dict
-    )
-    if quant_config is not None:
-        return quant_config
-
-    return quant_config
+    return inferred_nvfp4_config
 
 
 def _resolve_target_param_dtype(

@@ -27,6 +27,10 @@ limitations under the License.
 
 #include "scalar_type.hpp"
 
+#ifdef USE_MUSA
+#include "sgl_kernel_musa_ops.h"
+#endif
+
 #define _CONCAT(A, B) A##B
 #define CONCAT(A, B) _CONCAT(A, B)
 
@@ -127,6 +131,8 @@ int64_t cutlass_mla_get_workspace_size(
 void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
 void sgl_fused_add_rmsnorm(
     torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps, bool enable_pdl);
+void musa_fused_add_rms_norm(
+    torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double epsilon, bool enable_pdl);
 void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
 void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, bool enable_pdl);
 void silu_and_mul(at::Tensor& out, at::Tensor& input);
@@ -166,7 +172,44 @@ void fast_topk_transform_ragged_interface(
 
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
+
+void deepseek_v4_topk_transform_512(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    const at::Tensor& page_table,
+    at::Tensor& page_indices,
+    int64_t page_size,
+    std::optional<at::Tensor> raw_indices_opt = std::nullopt);
 #endif
+
+/*
+ * From csrc/elementwise (DeepSeek-V4 norm + rope)
+ */
+void dsv4_fused_q_norm_rope(
+    const at::Tensor& q_input,
+    at::Tensor& q_output,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions,
+    double eps);
+
+void dsv4_fused_k_norm_rope_flashmla(
+    const at::Tensor& kv,
+    const at::Tensor& kv_weight,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions,
+    const at::Tensor& out_loc,
+    at::Tensor& kvcache,
+    double eps,
+    int64_t page_size);
+
+void dsv4_fused_q_indexer_rope_hadamard_quant(
+    const at::Tensor& q_input,
+    at::Tensor& q_fp8,
+    const at::Tensor& weight,
+    at::Tensor& weights_out,
+    double weight_scale,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions);
 
 /*
  * From csrc/gemm
@@ -324,6 +367,35 @@ void apply_shuffle_mul_sum(
     torch::Tensor& output,
     const torch::Tensor& permutation,
     const std::optional<torch::Tensor>& factors);
+
+/*
+ * From csrc/elementwise (DeepSeek-V4 norm + rope)
+ */
+void dsv4_fused_q_norm_rope(
+    const at::Tensor& q_input,
+    at::Tensor& q_output,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions,
+    double eps);
+
+void dsv4_fused_k_norm_rope_flashmla(
+    const at::Tensor& kv,
+    const at::Tensor& kv_weight,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions,
+    const at::Tensor& out_loc,
+    at::Tensor& kvcache,
+    double eps,
+    int64_t page_size);
+
+void dsv4_fused_q_indexer_rope_hadamard_quant(
+    const at::Tensor& q_input,
+    at::Tensor& q_fp8,
+    const at::Tensor& weight,
+    at::Tensor& weights_out,
+    double weight_scale,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions);
 
 void fused_qk_norm_rope(
     torch::Tensor& qkv,

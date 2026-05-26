@@ -3,40 +3,49 @@ name: Bot Cherry Pick to Release Branch
 on:
   workflow_dispatch:
     inputs:
+      pr_number:
+        description: 'PR number to cherry-pick (preferred). Provide either pr_number OR commit_sha, not both.'
+        required: false
+        type: string
       commit_sha:
-        description: 'Commit SHA to cherry-pick (full or short hash)'
-        required: true
+        description: 'Commit SHA to cherry-pick (alternative to pr_number; full or short hash).'
+        required: false
         type: string
       target_branch:
         description: 'Target release branch (e.g., release/v0.5.7)'
         required: true
         type: string
-      create_pr:
-        description: 'Create a PR instead of pushing directly'
-        required: false
-        type: boolean
-        default: true
 
 permissions:
   contents: write
   pull-requests: write
 
-concurrency:
-  group: cherry-pick-${{ github.event.inputs.target_branch }}
-  cancel-in-progress: false
-
 jobs:
   cherry-pick:
     if: github.repository == 'sgl-project/sglang'
     runs-on: ubuntu-latest
-    environment: 'prod'
     steps:
       - name: Validate inputs
         env:
           TARGET_BRANCH: ${{ github.event.inputs.target_branch }}
+          PR_NUMBER: ${{ github.event.inputs.pr_number }}
+          COMMIT_SHA_INPUT: ${{ github.event.inputs.commit_sha }}
         run: |
           if [[ ! "$TARGET_BRANCH" =~ ^release/v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
             echo "::error::Target branch must match pattern 'release/vX.Y' or 'release/vX.Y.Z' (e.g., release/v0.5.7)"
+            exit 1
+          fi
+
+          if [[ -z "$PR_NUMBER" && -z "$COMMIT_SHA_INPUT" ]]; then
+            echo "::error::Provide either 'pr_number' or 'commit_sha'."
+            exit 1
+          fi
+          if [[ -n "$PR_NUMBER" && -n "$COMMIT_SHA_INPUT" ]]; then
+            echo "::error::Provide exactly one of 'pr_number' or 'commit_sha', not both."
+            exit 1
+          fi
+          if [[ -n "$PR_NUMBER" && ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::pr_number must be a positive integer."
             exit 1
           fi
 
@@ -44,7 +53,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure Git
         run: |
@@ -61,122 +70,204 @@ jobs:
             exit 1
           fi
 
-      - name: Get commit info
-        id: commit_info
+      - name: Resolve PR / commit
+        id: resolve
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.inputs.pr_number }}
           COMMIT_SHA_INPUT: ${{ github.event.inputs.commit_sha }}
         run: |
-          # Verify commit exists
-          if ! git cat-file -t "$COMMIT_SHA_INPUT" > /dev/null 2>&1; then
-            echo "::error::Commit SHA '$COMMIT_SHA_INPUT' does not exist"
-            exit 1
+          set -eo pipefail
+          shopt -s inherit_errexit
+
+          SOURCE_PR=""
+          PR_URL=""
+
+          if [[ -n "$PR_NUMBER" ]]; then
+            if ! PR_JSON=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json state,mergeCommit,title,number,url); then
+              echo "::error::Failed to fetch PR #$PR_NUMBER from $GITHUB_REPOSITORY (see gh output above)."
+              exit 1
+            fi
+            STATE=$(jq -r '.state' <<<"$PR_JSON")
+            if [[ "$STATE" != "MERGED" ]]; then
+              echo "::error::PR #$PR_NUMBER is not merged (state=$STATE). Only merged PRs can be cherry-picked."
+              exit 1
+            fi
+            FULL_SHA=$(jq -r '.mergeCommit.oid // empty' <<<"$PR_JSON")
+            if [[ -z "$FULL_SHA" ]]; then
+              echo "::error::PR #$PR_NUMBER is marked merged but has no associated merge commit."
+              exit 1
+            fi
+            PR_TITLE=$(jq -r '.title // empty' <<<"$PR_JSON")
+            PR_URL=$(jq -r '.url // empty' <<<"$PR_JSON")
+            SOURCE_PR="#$PR_NUMBER"
+          else
+            if ! git cat-file -t "$COMMIT_SHA_INPUT" > /dev/null 2>&1; then
+              echo "::error::Commit SHA '$COMMIT_SHA_INPUT' does not exist in the fetched history"
+              exit 1
+            fi
+            FULL_SHA=$(git rev-parse --verify "${COMMIT_SHA_INPUT}^{commit}")
+            PR_TITLE=$(git log -1 --format="%s" "$FULL_SHA")
+
+            # Look up the merged PR associated with this commit. Distinguish "API call
+            # failed" (abort — could mask an unmerged commit) from "API returned no
+            # merged PR" (fall through to ancestry check).
+            if ! PR_LOOKUP_RAW=$(gh api -X GET "repos/${GITHUB_REPOSITORY}/commits/${FULL_SHA}/pulls"); then
+              echo "::error::Failed to query PRs associated with commit ${FULL_SHA}. Aborting to avoid cherry-picking unverified commits."
+              exit 1
+            fi
+            PR_LOOKUP=$(jq '[.[] | select(.merged_at != null)][0] // empty' <<<"$PR_LOOKUP_RAW")
+            if [[ -n "$PR_LOOKUP" ]]; then
+              ASSOC_PR_NUM=$(jq -r '.number' <<<"$PR_LOOKUP")
+              PR_URL=$(jq -r '.html_url // empty' <<<"$PR_LOOKUP")
+              PR_TITLE=$(jq -r '.title // empty' <<<"$PR_LOOKUP")
+              SOURCE_PR="#$ASSOC_PR_NUM"
+            else
+              # No merged PR found for this commit. Require it to at least be reachable
+              # from the default branch so we don't cherry-pick unmerged work.
+              if ! DEFAULT_BRANCH=$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef --jq '.defaultBranchRef.name'); then
+                echo "::error::Could not determine default branch for ${GITHUB_REPOSITORY}."
+                exit 1
+              fi
+              if [[ -z "$DEFAULT_BRANCH" ]]; then
+                echo "::error::GitHub API returned an empty default branch for ${GITHUB_REPOSITORY}."
+                exit 1
+              fi
+              if ! git rev-parse --verify "origin/${DEFAULT_BRANCH}" >/dev/null 2>&1; then
+                echo "::error::origin/${DEFAULT_BRANCH} is not fetched locally; cannot verify whether ${FULL_SHA} is merged."
+                exit 1
+              fi
+              if ! git merge-base --is-ancestor "$FULL_SHA" "origin/${DEFAULT_BRANCH}"; then
+                echo "::error::Commit '$FULL_SHA' has no associated merged PR and is not reachable from origin/${DEFAULT_BRANCH}. Refusing to cherry-pick unmerged commits."
+                exit 1
+              fi
+            fi
           fi
 
-          # Get full SHA if short hash provided
-          FULL_SHA=$(git rev-parse "$COMMIT_SHA_INPUT")
-          COMMIT_TITLE=$(git log -1 --format="%s" "$FULL_SHA")
           SHORT_SHA=$(git rev-parse --short "$FULL_SHA")
+
+          # Detect merge commit by counting parents. `git show -s --format=%P` prints
+          # parent SHAs separated by spaces; >1 means it's a merge commit.
+          PARENTS_LINE=$(git show -s --format=%P "$FULL_SHA")
+          PARENT_COUNT=$(wc -w <<<"$PARENTS_LINE" | tr -d ' ')
+          IS_MERGE_COMMIT="false"
+          if [[ "$PARENT_COUNT" -gt 1 ]]; then
+            IS_MERGE_COMMIT="true"
+          fi
+
           echo "full_sha=$FULL_SHA" >> $GITHUB_OUTPUT
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
-          # Use delimiter for multiline-safe output
+          echo "is_merge_commit=$IS_MERGE_COMMIT" >> $GITHUB_OUTPUT
+          echo "source_pr=$SOURCE_PR" >> $GITHUB_OUTPUT
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
           {
-            echo "commit_title<<EOF"
-            echo "$COMMIT_TITLE"
+            echo "pr_title<<EOF"
+            echo "$PR_TITLE"
             echo "EOF"
           } >> $GITHUB_OUTPUT
-          echo "Cherry-picking commit: $SHORT_SHA - $COMMIT_TITLE"
+
+          echo "Cherry-picking ${SHORT_SHA} (${SOURCE_PR:-no associated PR}) - ${PR_TITLE}"
 
       - name: Cherry-pick commit
         id: cherry_pick
         env:
           TARGET_BRANCH: ${{ github.event.inputs.target_branch }}
-          FULL_SHA: ${{ steps.commit_info.outputs.full_sha }}
-          SHORT_SHA: ${{ steps.commit_info.outputs.short_sha }}
-          CREATE_PR: ${{ github.event.inputs.create_pr }}
+          FULL_SHA: ${{ steps.resolve.outputs.full_sha }}
+          SHORT_SHA: ${{ steps.resolve.outputs.short_sha }}
+          IS_MERGE_COMMIT: ${{ steps.resolve.outputs.is_merge_commit }}
         run: |
-          if [[ "$CREATE_PR" == "true" ]]; then
-            # Create a new branch for the PR
-            RANDOM_SUFFIX=$(head -c 4 /dev/urandom | xxd -p)
-            NEW_BRANCH="cherry-pick/${SHORT_SHA}-to-${TARGET_BRANCH#release/}-${RANDOM_SUFFIX}"
-            git checkout -b "$NEW_BRANCH" "origin/$TARGET_BRANCH"
-            echo "new_branch=$NEW_BRANCH" >> $GITHUB_OUTPUT
-          else
-            # Checkout target branch directly
-            git checkout "$TARGET_BRANCH"
-          fi
+          RANDOM_SUFFIX=$(head -c 4 /dev/urandom | xxd -p)
+          NEW_BRANCH="cherry-pick/${SHORT_SHA}-to-${TARGET_BRANCH#release/}-${RANDOM_SUFFIX}"
+          git checkout -b "$NEW_BRANCH" "origin/$TARGET_BRANCH"
+          echo "new_branch=$NEW_BRANCH" >> $GITHUB_OUTPUT
 
-          # Attempt cherry-pick
-          if git cherry-pick "$FULL_SHA"; then
+          CP_ARGS=()
+          if [[ "$IS_MERGE_COMMIT" == "true" ]]; then
+            CP_ARGS+=(-m 1)
+          fi
+          if git cherry-pick "${CP_ARGS[@]}" "$FULL_SHA"; then
             echo "cherry_pick_success=true" >> $GITHUB_OUTPUT
           else
-            echo "::error::Cherry-pick failed due to conflicts. Please resolve manually."
-            git cherry-pick --abort || true
+            echo "::error::Cherry-pick of ${FULL_SHA} onto ${TARGET_BRANCH} failed due to conflicts. Resolve locally: 'git checkout ${TARGET_BRANCH} && git cherry-pick ${FULL_SHA}', fix conflicts, push a branch, and open the PR by hand."
+            git cherry-pick --abort || echo "::warning::git cherry-pick --abort returned non-zero; ignoring since the job is exiting."
             echo "cherry_pick_success=false" >> $GITHUB_OUTPUT
             exit 1
           fi
 
-      - name: Push changes
+      - name: Push branch
         if: steps.cherry_pick.outputs.cherry_pick_success == 'true'
         env:
-          CREATE_PR: ${{ github.event.inputs.create_pr }}
-          TARGET_BRANCH: ${{ github.event.inputs.target_branch }}
           NEW_BRANCH: ${{ steps.cherry_pick.outputs.new_branch }}
         run: |
-          if [[ "$CREATE_PR" == "true" ]]; then
-            git push origin "$NEW_BRANCH"
-          else
-            git push origin "$TARGET_BRANCH"
-          fi
+          git push origin "$NEW_BRANCH"
 
       - name: Create Pull Request
-        if: steps.cherry_pick.outputs.cherry_pick_success == 'true' && github.event.inputs.create_pr == 'true'
+        id: create_pr
+        if: steps.cherry_pick.outputs.cherry_pick_success == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_CHERRY_PICK }}
           TARGET_BRANCH: ${{ github.event.inputs.target_branch }}
-          SHORT_SHA: ${{ steps.commit_info.outputs.short_sha }}
-          COMMIT_TITLE: ${{ steps.commit_info.outputs.commit_title }}
-          FULL_SHA: ${{ steps.commit_info.outputs.full_sha }}
+          SHORT_SHA: ${{ steps.resolve.outputs.short_sha }}
+          FULL_SHA: ${{ steps.resolve.outputs.full_sha }}
+          PR_TITLE: ${{ steps.resolve.outputs.pr_title }}
+          SOURCE_PR: ${{ steps.resolve.outputs.source_pr }}
+          PR_URL: ${{ steps.resolve.outputs.pr_url }}
           NEW_BRANCH: ${{ steps.cherry_pick.outputs.new_branch }}
         run: |
-          PR_TITLE="[Cherry-pick] ${COMMIT_TITLE} to ${TARGET_BRANCH}"
+          if [[ -n "$SOURCE_PR" ]]; then
+            CHERRY_PICK_TITLE="[Cherry-pick to ${TARGET_BRANCH}] ${PR_TITLE} (${SOURCE_PR})"
+          else
+            CHERRY_PICK_TITLE="[Cherry-pick to ${TARGET_BRANCH}] ${PR_TITLE} (${SHORT_SHA})"
+          fi
 
-          gh pr create \
-            --title "$PR_TITLE" \
+          BODY="Cherry-pick of commit \`${FULL_SHA}\` to \`${TARGET_BRANCH}\`."$'\n\n'
+          if [[ -n "$SOURCE_PR" ]]; then
+            BODY+="**Source PR:** ${SOURCE_PR} (${PR_URL})"$'\n'
+          fi
+          BODY+="**Source commit:** \`${FULL_SHA}\`"$'\n'
+          BODY+="**Original title:** ${PR_TITLE}"$'\n\n'
+          BODY+="---"$'\n'
+          BODY+="*This PR was automatically created by the cherry-pick workflow.*"
+
+          CREATED_PR_URL=$(printf '%s' "$BODY" | gh pr create \
+            --title "$CHERRY_PICK_TITLE" \
             --base "$TARGET_BRANCH" \
             --head "$NEW_BRANCH" \
             --label "cherry-pick" \
-            --body-file - <<EOF
-          Cherry-pick of commit ${FULL_SHA} to \`${TARGET_BRANCH}\`
-
-          **Original commit:** ${FULL_SHA}
-          **Original title:** ${COMMIT_TITLE}
-
-          ---
-          *This PR was automatically created by the cherry-pick workflow.*
-          EOF
+            --body-file -)
+          CREATED_PR_NUMBER="${CREATED_PR_URL##*/}"
+          echo "created_pr_url=$CREATED_PR_URL" >> $GITHUB_OUTPUT
+          echo "created_pr_number=$CREATED_PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "Created cherry-pick PR #${CREATED_PR_NUMBER}: ${CREATED_PR_URL}"
 
       - name: Summary
         if: always()
         env:
-          FULL_SHA: ${{ steps.commit_info.outputs.full_sha }}
-          COMMIT_TITLE: ${{ steps.commit_info.outputs.commit_title }}
+          FULL_SHA: ${{ steps.resolve.outputs.full_sha }}
+          PR_TITLE: ${{ steps.resolve.outputs.pr_title }}
+          SOURCE_PR: ${{ steps.resolve.outputs.source_pr }}
           TARGET_BRANCH: ${{ github.event.inputs.target_branch }}
           CHERRY_PICK_SUCCESS: ${{ steps.cherry_pick.outputs.cherry_pick_success }}
-          CREATE_PR: ${{ github.event.inputs.create_pr }}
           NEW_BRANCH: ${{ steps.cherry_pick.outputs.new_branch }}
+          CREATED_PR_NUMBER: ${{ steps.create_pr.outputs.created_pr_number }}
+          CREATED_PR_URL: ${{ steps.create_pr.outputs.created_pr_url }}
           ACTOR: ${{ github.actor }}
         run: |
           echo "## Cherry-Pick Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- **Triggered by:** @${ACTOR}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Commit:** ${FULL_SHA}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Title:** ${COMMIT_TITLE}" >> $GITHUB_STEP_SUMMARY
+          if [[ -n "$SOURCE_PR" ]]; then
+            echo "- **Source PR:** ${SOURCE_PR}" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "- **Source commit:** ${FULL_SHA}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Title:** ${PR_TITLE}" >> $GITHUB_STEP_SUMMARY
           echo "- **Target Branch:** ${TARGET_BRANCH}" >> $GITHUB_STEP_SUMMARY
           if [[ "$CHERRY_PICK_SUCCESS" == "true" ]]; then
-            echo "- **Status:** ✅ Success" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- **Status:** ❌ Failed" >> $GITHUB_STEP_SUMMARY
-          fi
-          if [[ "$CREATE_PR" == "true" && "$CHERRY_PICK_SUCCESS" == "true" ]]; then
+            echo "- **Status:** Success" >> $GITHUB_STEP_SUMMARY
             echo "- **PR Branch:** ${NEW_BRANCH}" >> $GITHUB_STEP_SUMMARY
+            if [[ -n "$CREATED_PR_NUMBER" ]]; then
+              echo "- **Cherry-pick PR:** [#${CREATED_PR_NUMBER}](${CREATED_PR_URL})" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "- **Status:** Failed" >> $GITHUB_STEP_SUMMARY
           fi

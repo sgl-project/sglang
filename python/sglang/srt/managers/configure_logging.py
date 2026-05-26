@@ -33,15 +33,30 @@ if __name__ == "__main__":
         "--dump-requests-folder", type=str, default="/tmp/sglang_request_dump"
     )
     parser.add_argument("--dump-requests-threshold", type=int, default=1000)
+    parser.add_argument(
+        "--dump-requests-exclude-meta-keys",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated meta_info keys to strip from each dumped request "
+            "(e.g. 'routed_experts,hidden_states'). Pass an empty string to "
+            "keep all keys. If not set, the server default is used."
+        ),
+    )
     args = parser.parse_args()
 
-    response = requests.post(
-        args.url + "/configure_logging",
-        json={
-            "log_requests": args.log_requests,
-            "log_requests_level": args.log_requests_level,  # Log full requests
-            "dump_requests_folder": args.dump_requests_folder,
-            "dump_requests_threshold": args.dump_requests_threshold,
-        },
-    )
+    payload = {
+        "log_requests": args.log_requests,
+        "log_requests_level": args.log_requests_level,  # Log full requests
+        "dump_requests_folder": args.dump_requests_folder,
+        "dump_requests_threshold": args.dump_requests_threshold,
+    }
+    if args.dump_requests_exclude_meta_keys is not None:
+        payload["dump_requests_exclude_meta_keys"] = [
+            k.strip()
+            for k in args.dump_requests_exclude_meta_keys.split(",")
+            if k.strip()
+        ]
+
+    response = requests.post(args.url + "/configure_logging", json=payload)
     assert response.status_code == 200
