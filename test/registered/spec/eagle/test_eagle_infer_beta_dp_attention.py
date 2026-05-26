@@ -65,7 +65,7 @@ class TestEagleDPAttnServerSmall(CustomTestCase):
             "--speculative-num-draft-tokens",
             "4",
         ]
-        with (envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True),):
+        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

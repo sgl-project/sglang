@@ -60,7 +60,7 @@ class TestEAGLE3EngineDPAttention(CustomTestCase):
             "--cuda-graph-max-bs",
             "64",
         ]
-        with (envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True),):
+        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

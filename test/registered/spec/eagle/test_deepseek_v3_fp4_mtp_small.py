@@ -49,7 +49,7 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true,"num_threads": 64}',
         ]
-        with (envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True),):
+        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
