@@ -267,6 +267,12 @@ class SchedulerBatchResultProcessor:
 
                 else:
                     # being chunked reqs' prefill is not finished
+                    # Invariant R1: decrement only legal while still chunking
+                    # (inflight_middle_chunks > 0). The if/else above is the
+                    # gate; counter records any future bypass that would
+                    # drive the value negative.
+                    if req.inflight_middle_chunks <= 0:
+                        req.inflight_middle_chunks_premature_decrement_count += 1
                     req.inflight_middle_chunks -= 1
                     # There is only at most one request being currently chunked.
                     # Because this request does not finish prefill,
@@ -320,6 +326,11 @@ class SchedulerBatchResultProcessor:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                 else:
                     # being chunked reqs' prefill is not finished
+                    # Invariant R1: same self-check as the generation branch
+                    # above; decrement only legal while inflight_middle_chunks
+                    # > 0. Embedding/reward model variant.
+                    if req.inflight_middle_chunks <= 0:
+                        req.inflight_middle_chunks_premature_decrement_count += 1
                     req.inflight_middle_chunks -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 

@@ -564,6 +564,11 @@ class SchedulerDisaggregationPrefillMixin:
                     req.grammar.finished = req.finished()
             else:
                 # being chunked reqs' prefill is not finished
+                # Invariant R1: decrement only legal while still chunking
+                # (inflight_middle_chunks > 0). Disagg-prefill variant of
+                # the same self-check as batch_result_processor.
+                if req.inflight_middle_chunks <= 0:
+                    req.inflight_middle_chunks_premature_decrement_count += 1
                 req.inflight_middle_chunks -= 1
 
                 if req.return_logprob:

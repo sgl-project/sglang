@@ -849,6 +849,13 @@ class Req(ReqDllmMixin):
         # smaller than the previous one outside the reset path.
         self.extend_batch_idx_regression_count: int = 0
 
+        # Regression instrumentation for invariant R1: inflight_middle_chunks
+        # may only be decremented while the req still has chunks in flight
+        # (the > 0 precondition gated by the if/else in
+        # batch_result_processor); see decrement sites there for full
+        # context.
+        self.inflight_middle_chunks_premature_decrement_count: int = 0
+
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
         # processed.
