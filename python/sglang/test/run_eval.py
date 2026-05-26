@@ -184,11 +184,11 @@ def run_eval(args):
         eval_obj = MixedPrefixGSM8KEval(
             num_examples=args.num_examples,
             num_threads=args.num_threads,
-            num_shots=getattr(args, "num_shots", 10),
-            num_clusters=getattr(args, "mixed_prefix_gsm8k_num_clusters", 5),
-            random_pool_size=getattr(args, "mixed_prefix_gsm8k_random_pool_size", 50),
-            data_path=getattr(args, "gsm8k_data_path", None),
-            seed=getattr(args, "mixed_prefix_gsm8k_seed", 42),
+            num_shots=args.num_shots,
+            num_clusters=args.mixed_prefix_gsm8k_num_clusters,
+            random_pool_size=args.mixed_prefix_gsm8k_random_pool_size,
+            data_path=args.gsm8k_data_path,
+            seed=args.mixed_prefix_gsm8k_seed,
         )
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
