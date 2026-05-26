@@ -278,6 +278,5 @@ sgl-kernel/csrc/**/*_musa/
 artifacts/
 .claude/scheduled_tasks.lock
 
-# Plan and humanize files
-optimistic_prefill_plan.md
+# Humanize working files
 .humanize/
