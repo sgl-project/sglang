@@ -15,6 +15,10 @@ from common.attention_methods.mla_attention import (
     run_mla_attention_case,
 )
 from common.runner_modes.cuda_graph_decode_runner import run_mla_cuda_graph_decode_case
+from common.runner_modes.eagle_draft_runner import (
+    run_mla_eagle_draft_cuda_graph_runner_case,
+    run_mla_eagle_draft_extend_v2_cuda_graph_runner_case,
+)
 from common.runner_modes.speculative_draft_extend_runner import (
     run_mla_draft_extend_v2_cuda_graph_case,
 )
@@ -91,6 +95,43 @@ class TestTritonMLAAttentionBackendCorrectness(CustomTestCase):
             extend_lens=(3, 3),
         ),
     )
+    EAGLE_DRAFT_EXTEND_V2_RUNNER_CASES = (
+        MLAAttentionCase(
+            name="runner_eagle_draft_extend_v2_mla_cuda_graph_runner_fixed_tokens",
+            backend="triton",
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            num_heads=4,
+            page_size=16,
+            prefix_lens=(4, 7),
+            extend_lens=(3, 3),
+        ),
+    )
+    EAGLE_DRAFT_RUNNER_CASES = (
+        (
+            MLAAttentionCase(
+                name="runner_eagle_draft_decode_mla_cuda_graph_chain",
+                backend="triton",
+                forward_mode=ForwardMode.DECODE,
+                num_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+            ),
+            1,
+            3,
+        ),
+        (
+            MLAAttentionCase(
+                name="runner_eagle_draft_decode_mla_cuda_graph_tree",
+                backend="triton",
+                forward_mode=ForwardMode.DECODE,
+                num_heads=4,
+                page_size=1,
+                prefix_lens=(4, 7),
+            ),
+            2,
+            4,
+        ),
+    )
 
     def test_tiny_deepseek_mla_attention_cases(self):
         for case in self.CASES:
@@ -132,6 +173,21 @@ class TestTritonMLAAttentionBackendCorrectness(CustomTestCase):
         for case in self.DRAFT_EXTEND_V2_CUDA_GRAPH_CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_mla_draft_extend_v2_cuda_graph_case(self, case)
+
+    def test_runner_mode_eagle_draft_extend_v2_cuda_graph_runner_cases(self):
+        for case in self.EAGLE_DRAFT_EXTEND_V2_RUNNER_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_mla_eagle_draft_extend_v2_cuda_graph_runner_case(self, case)
+
+    def test_runner_mode_eagle_draft_cuda_graph_runner_cases(self):
+        for case, topk, num_draft_tokens in self.EAGLE_DRAFT_RUNNER_CASES:
+            with self.subTest(case=case.name, backend=case.backend, topk=topk):
+                run_mla_eagle_draft_cuda_graph_runner_case(
+                    self,
+                    case,
+                    topk=topk,
+                    speculative_num_draft_tokens=num_draft_tokens,
+                )
 
 
 if __name__ == "__main__":

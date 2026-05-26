@@ -89,17 +89,23 @@ Implemented:
   draft token count is carried separately by the graph/spec buffers. The MLA case
   exercises the absorb-MLA cached-KV path with distinct capture/replay metadata
   and input tensors.
-- Phase 4 production `EAGLEDraftCudaGraphRunner` integration now uses the same
-  adapter-based runner lifecycle as draft-extend and target-verify graph replay.
-  The shared `common/runner_modes/eagle_draft_runner.py` helper owns production
-  graph-runner capture/replay through `run_eagle_draft_cuda_graph_runner_case`,
-  while attention-method wrappers provide fixture/input/state callbacks. Dense
-  `triton` and `flashinfer` cover decode draft for chain (`topk=1`) and tree
-  (`topk=2`) draft layouts by capturing a fixed padded batch, replaying distinct
-  draft metadata/input tensors, and comparing graph replay against the eager
-  draft-worker path. This comparison intentionally targets runner buffer/metadata
-  compatibility; dense attention math remains covered by the independent HF-style
-  Phase 2/3 references.
+- Phase 4 production draft-runner integration now uses the same adapter-based
+  runner lifecycle as draft-extend and target-verify graph replay. The shared
+  `common/runner_modes/eagle_draft_runner.py` helper owns production
+  `EAGLEDraftCudaGraphRunner`, `EAGLEDraftExtendCudaGraphRunner`, and
+  `FrozenKVMTPCudaGraphRunner` capture/replay, while attention-method wrappers
+  provide fixture/input/state callbacks. Dense `triton` and `flashinfer` cover
+  EAGLE draft decode for chain (`topk=1`) and tree (`topk=2`) layouts. MLA
+  `triton`, `flashinfer`, and `flashmla` cover EAGLE draft decode on absorb-MLA
+  fixtures. Dense `flashinfer` covers production EAGLE `DRAFT_EXTEND` and
+  Frozen-KV MTP draft decode; dense `triton` covers production EAGLE
+  `DRAFT_EXTEND_V2`; MLA `flashinfer` covers production EAGLE `DRAFT_EXTEND`;
+  and MLA `triton` covers production EAGLE `DRAFT_EXTEND_V2`. These tests capture
+  fixed padded batches, replay distinct metadata/input tensors, reset shared graph
+  input buffers between independent runner instances, and compare graph replay
+  against the eager worker path. The comparison intentionally targets runner
+  buffer/metadata compatibility; attention math remains covered by independent
+  HF-style Phase 2/3 references.
 - The synthetic EAGLE verify helper uses realistic target-verify semantics:
   `ForwardBatch.seq_lens` represents prefix KV lengths, while `spec_info`
   supplies the draft tokens, positions, retrieve indices, and custom tree mask.
@@ -212,20 +218,12 @@ Implemented:
   orthogonal to runner/backend metadata compatibility.
 
 In progress:
-- Phase 4 multi-step draft-runner coverage remains open beyond the dense
-  `EAGLEDraftCudaGraphRunner` slice. `DRAFT_EXTEND` replay now has a
-  fixed-capture-batch unit helper for FlashInfer, `DRAFT_EXTEND_V2` has
-  representative dense/MLA Triton CUDA graph replay cases, and dense
-  `EAGLEDraftCudaGraphRunner` decode replay covers chain/tree draft metadata.
-  Remaining draft-runner work should model multi-layer EAGLE, multi-step
-  draft-extend, Frozen-KV MTP, and MLA draft-model contracts.
+- Locally runnable Phase 4 production draft-runner coverage is complete for the
+  representative valid backends listed above. Remaining Phase 4 work is limited
+  to backend-specific blockers and hardware-gated paths documented in the
+  implemented/deferred bullets.
 
 Next implementation steps:
-- Extend production draft-runner integration beyond dense
-  `EAGLEDraftCudaGraphRunner`: MLA draft decode, multi-layer EAGLE draft-extend,
-  multi-step draft-extend, and Frozen-KV MTP runner coverage.
-- Finish Phase 4 `DRAFT_EXTEND_V2` / multi-layer draft-runner coverage for
-  representative valid backends before broadening the speculative matrix.
 - Expand Phase 2 to additional attention methods/backends with method-specific
   fixtures rather than forcing them through the dense harness. Priority candidates:
   hardware-gated MLA kernels (`cutlass_mla`, `trtllm_mla`/`tokenspeed_mla` where
@@ -237,6 +235,31 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
+- Added production draft-runner coverage for MLA EAGLE draft decode, EAGLE
+  draft-extend graph runners, and dense Frozen-KV MTP draft decode. The graph
+  runner helper now resets shared CUDA graph input buffers between independent
+  unit-runner captures so stale larger buffers from one runner contract cannot
+  leak into the next.
+- `python -m py_compile test/manual/attention/unittest/common/runner_modes/eagle_draft_runner.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/mla/test_flashinfer.py test/manual/attention/unittest/mla/test_flashmla.py test/manual/attention/unittest/mla/test_triton.py`
+- `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
+  - Ran 10 tests in 4.469s after adding dense FlashInfer production
+    draft-extend and Frozen-KV MTP graph-runner coverage.
+- `python test/manual/attention/unittest/dense/test_triton.py -v`
+  - Ran 8 tests in 3.727s after adding dense Triton production
+    `DRAFT_EXTEND_V2` graph-runner coverage.
+- `python test/manual/attention/unittest/mla/test_flashinfer.py -v`
+  - Ran 9 tests in 2.761s after adding MLA FlashInfer production EAGLE draft
+    decode and draft-extend graph-runner coverage.
+- `python test/manual/attention/unittest/mla/test_flashmla.py -v`
+  - Ran 7 tests in 2.491s after adding MLA FlashMLA production EAGLE draft
+    decode graph-runner coverage.
+- `python test/manual/attention/unittest/mla/test_triton.py -v`
+  - Ran 8 tests in 3.705s after adding MLA Triton production EAGLE draft decode
+    and `DRAFT_EXTEND_V2` graph-runner coverage.
+- `python -m unittest discover -s test/manual/attention/unittest/dense -p 'test_*.py' -v`
+  - Ran 27 tests in 24.701s after isolating graph-runner shared buffer state.
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+  - Ran 71 tests in 27.382s after the production draft-runner expansion.
 - Documented the runner-mode requirement that reusable runner contracts must be
   implemented through shared adapter/lifecycle helpers under `common/runner_modes/`
   instead of local one-off capture/replay wrappers.

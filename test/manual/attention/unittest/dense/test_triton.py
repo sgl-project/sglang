@@ -19,6 +19,7 @@ from common.runner_modes.cuda_graph_decode_runner import (
 )
 from common.runner_modes.eagle_draft_runner import (
     run_dense_eagle_draft_cuda_graph_runner_case,
+    run_dense_eagle_draft_extend_v2_cuda_graph_runner_case,
 )
 from common.runner_modes.speculative_draft_extend_runner import (
     run_dense_draft_extend_v2_cuda_graph_case,
@@ -218,6 +219,18 @@ class TestTritonDenseAttentionBackendCorrectness(CustomTestCase):
             extend_lens=(3, 3),
         ),
     )
+    EAGLE_DRAFT_EXTEND_V2_RUNNER_CASES = (
+        DenseAttentionCase(
+            name="runner_eagle_draft_extend_v2_cuda_graph_runner_fixed_tokens",
+            backend="triton",
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(4, 7),
+            extend_lens=(3, 3),
+        ),
+    )
     EAGLE_DRAFT_RUNNER_CASES = (
         (
             DenseAttentionCase(
@@ -307,6 +320,11 @@ class TestTritonDenseAttentionBackendCorrectness(CustomTestCase):
         for case in self.DRAFT_EXTEND_V2_CUDA_GRAPH_CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_dense_draft_extend_v2_cuda_graph_case(self, case)
+
+    def test_runner_mode_eagle_draft_extend_v2_cuda_graph_runner_cases(self):
+        for case in self.EAGLE_DRAFT_EXTEND_V2_RUNNER_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_dense_eagle_draft_extend_v2_cuda_graph_runner_case(self, case)
 
     def test_runner_mode_eagle_draft_cuda_graph_runner_cases(self):
         for case, topk, num_draft_tokens in self.EAGLE_DRAFT_RUNNER_CASES:

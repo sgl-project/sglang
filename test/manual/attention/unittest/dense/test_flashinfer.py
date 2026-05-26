@@ -20,6 +20,8 @@ from common.runner_modes.cuda_graph_decode_runner import (
 )
 from common.runner_modes.eagle_draft_runner import (
     run_dense_eagle_draft_cuda_graph_runner_case,
+    run_dense_eagle_draft_extend_cuda_graph_runner_case,
+    run_dense_frozen_kv_mtp_cuda_graph_runner_case,
 )
 from common.runner_modes.speculative_draft_extend_runner import (
     run_dense_draft_extend_cuda_graph_case,
@@ -271,6 +273,18 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
             "frozen_kv_mtp",
         ),
     )
+    EAGLE_DRAFT_EXTEND_RUNNER_CASES = (
+        DenseAttentionCase(
+            name="runner_eagle_draft_extend_cuda_graph_runner_ragged_accept",
+            backend="flashinfer",
+            forward_mode=ForwardMode.DRAFT_EXTEND,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(2, 5),
+            extend_lens=(2, 4),
+        ),
+    )
     EAGLE_DRAFT_RUNNER_CASES = (
         (
             DenseAttentionCase(
@@ -297,6 +311,17 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
             ),
             2,
             4,
+        ),
+    )
+    FROZEN_KV_MTP_RUNNER_CASES = (
+        DenseAttentionCase(
+            name="runner_frozen_kv_mtp_decode_cuda_graph_chain",
+            backend="flashinfer",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(4, 7),
         ),
     )
 
@@ -402,6 +427,16 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
                     spec_kind=spec_kind,
                 )
 
+    def test_runner_mode_eagle_draft_extend_cuda_graph_runner_cases(self):
+        for case in self.EAGLE_DRAFT_EXTEND_RUNNER_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_dense_eagle_draft_extend_cuda_graph_runner_case(
+                    self,
+                    case,
+                    head_dim=self.HEAD_DIM,
+                    hidden_size=self.HIDDEN_SIZE,
+                )
+
     def test_runner_mode_eagle_draft_cuda_graph_runner_cases(self):
         for case, topk, num_draft_tokens in self.EAGLE_DRAFT_RUNNER_CASES:
             with self.subTest(case=case.name, backend=case.backend, topk=topk):
@@ -410,6 +445,16 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
                     case,
                     topk=topk,
                     speculative_num_draft_tokens=num_draft_tokens,
+                    head_dim=self.HEAD_DIM,
+                    hidden_size=self.HIDDEN_SIZE,
+                )
+
+    def test_runner_mode_frozen_kv_mtp_cuda_graph_runner_cases(self):
+        for case in self.FROZEN_KV_MTP_RUNNER_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_dense_frozen_kv_mtp_cuda_graph_runner_case(
+                    self,
+                    case,
                     head_dim=self.HEAD_DIM,
                     hidden_size=self.HIDDEN_SIZE,
                 )
