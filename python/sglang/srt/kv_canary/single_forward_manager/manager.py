@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.jit_kernel.kv_canary.scatter_req_token_ids import (
+    launch_scatter_req_token_ids_kernel,
+)
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag, VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
@@ -140,6 +143,65 @@ class SingleForwardManager:
                 f"CanaryLaunchCapacities.from_args"
             )
 
+        self._populate_expected_token_pool(forward_batch=maybe_inaccurate_forward_batch)
+
+    def _populate_expected_token_pool(self, *, forward_batch: "ForwardBatch") -> None:
+        """H2D the per-req source-of-truth token snapshot then scatter into the static pool.
+
+        Runs outside cuda-graph capture. The pool is a device-resident static tensor (allocated
+        by :class:`CanaryDeviceState`); rows not addressed by this batch keep stale content from
+        the prior step, but the verify kernel only reads rows pointed by ``req_pool_indices``
+        in this forward, all of which are freshly populated below.
+
+        ``forward_batch.req_all_ids_flat is None`` happens during cuda-graph capture's synchronous-
+        batch dry run; bail out then. The verify kernel will see whatever was previously scattered
+        and the ``-1`` plan-kernel sentinel where the row hasn't been touched.
+        """
+        if not self._config.enable_req_token_ids_check:
+            return
+        flat_cpu = forward_batch.req_all_ids_flat
+        lens_cpu = forward_batch.req_all_ids_lens
+        if flat_cpu is None or lens_cpu is None:
+            return
+        pool = self._device_state.req_to_expected_token_ids
+        if pool is None:
+            return
+
+        bs = int(forward_batch.req_pool_indices.shape[0])
+        if bs == 0:
+            return
+        if int(lens_cpu.shape[0]) != bs:
+            raise RuntimeError(
+                f"kv-canary: req_all_ids_lens length {int(lens_cpu.shape[0])} != batch_size {bs}; "
+                f"ForwardBatch snapshot diverged"
+            )
+
+        # Host cumsum (small bs); produces ``[bs + 1]`` int64 offsets.
+        offsets_cpu = torch.zeros(bs + 1, dtype=torch.int64, pin_memory=True)
+        offsets_cpu[1:] = torch.cumsum(lens_cpu, dim=0)
+        total_tokens = int(offsets_cpu[bs].item())
+        if total_tokens != int(flat_cpu.shape[0]):
+            raise RuntimeError(
+                f"kv-canary: cumsum(req_all_ids_lens)={total_tokens} != "
+                f"req_all_ids_flat.numel()={int(flat_cpu.shape[0])}; snapshot inconsistent"
+            )
+        if total_tokens == 0:
+            return
+
+        device = pool.device
+        flat_dev = flat_cpu.to(device, non_blocking=True)
+        offsets_dev = offsets_cpu.to(device, non_blocking=True)
+        req_pool_indices_dev = forward_batch.req_pool_indices.to(
+            device=device, dtype=torch.int64
+        )
+
+        launch_scatter_req_token_ids_kernel(
+            flat_in=flat_dev,
+            offsets=offsets_dev,
+            req_pool_indices=req_pool_indices_dev,
+            pool_out=pool,
+        )
+
     def pre_ops_maybe_inside_graph(
         self, forward_batch: "ForwardBatch"
     ) -> "_PreOpsMaybeInsideGraphOutput":
@@ -181,6 +243,11 @@ class SingleForwardManager:
         num_tokens = int(forward_batch.positions.shape[0])
         expected_inputs_slice = expected_inputs.slice(num_tokens)
 
+        # The plan kernel reads the static expected-token pool inside cuda graph capture; its
+        # device address is stable across replays. When the validator is off the field is
+        # None and the plan kernel writes the ``-1`` "skip" sentinel into every entry.
+        req_to_expected_token_ids = self._device_state.req_to_expected_token_ids
+
         for group_idx, group in enumerate(self._buffer_groups):
             verify_plan = verify_plans[group_idx]
             write_plan = write_plans[group_idx]
@@ -191,6 +258,7 @@ class SingleForwardManager:
                 group=group,
                 req_to_token=self._req_to_token_pool.req_to_token,
                 swa_window_size=self._swa_window_size,
+                req_to_expected_token_ids=req_to_expected_token_ids,
             )
             if self._swa_divergence_report is not None:
                 self._swa_divergence_report.observe_after_invoke_plan(

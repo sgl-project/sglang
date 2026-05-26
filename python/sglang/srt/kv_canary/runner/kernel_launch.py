@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
@@ -38,6 +38,7 @@ def invoke_plan(
     group: CanaryBufferGroup,
     req_to_token: torch.Tensor,
     swa_window_size: int,
+    req_to_expected_token_ids: Optional[torch.Tensor] = None,
 ) -> None:
     window = swa_window_size if group.kind is PoolKind.SWA else 0
     launch_canary_plan_kernels(
@@ -50,6 +51,8 @@ def invoke_plan(
         swa_window_size=window,
         full_to_swa_index_mapping=group.swa_index_lut,
         verify_capacity=int(verify_plan.verify_slot_indices.shape[0]),
+        req_to_expected_token_ids=req_to_expected_token_ids,
+        expected_token_ids_offset=group.expected_token_ids_offset,
     )
 
 
