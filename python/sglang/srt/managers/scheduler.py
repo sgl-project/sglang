@@ -3003,7 +3003,7 @@ class Scheduler(
             batch_result.logits_output.next_token_logits = None
 
     def run_batch_pipelined(
-        self, batch: ScheduleBatch, group_size: int = 10
+        self, batch: ScheduleBatch, group_size: int
     ) -> GenerationBatchResult:
         """Run a batch with layer-pipelined KV transfer.
 
@@ -3032,7 +3032,7 @@ class Scheduler(
             page_indices = kv_to_page_indices(kv_indices, page_size)
             req_page_indices_list.append(page_indices)
 
-        # Pre-compute state indices for hybrid models (Mamba/SWA/NSA).
+        # Pre-compute state indices for hybrid models (Mamba/SWA/DSA).
         # Attached to req so the last send_layer call can pass them through.
         self._prepare_pipelined_state_indices(batch)
 

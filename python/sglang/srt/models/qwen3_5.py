@@ -1316,6 +1316,8 @@ class Qwen3_5ForCausalLM(nn.Module):
                 )
             forward_batch.hidden_states = hidden_states
 
+        # Returns None: this is the inner language model; the outer
+        # ConditionalGeneration wrapper handles logits_processor.
         return None
 
 
