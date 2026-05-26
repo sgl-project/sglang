@@ -64,7 +64,7 @@ class CapturedServerE2EBase(CanaryViolationAssertMixin, CustomTestCase):
 
 
 class CanaryE2EBase(CapturedServerE2EBase):
-    model_mode: ClassVar[Literal["mha", "swa"]]
+    model_mode: ClassVar[Literal["mha", "swa", "dsv4"]]
     kv_canary_mode: ClassVar[CanaryMode]
     extra_env: ClassVar[dict[str, str]] = {}
     extra_server_args: ClassVar[tuple[str, ...]] = ()
