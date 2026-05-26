@@ -308,6 +308,14 @@ class EmbeddingCacheController:
         # Select candidates to evict
         candidates = self._select_eviction_candidates(size_bytes)
         if not candidates:
+            n_protected = sum(1 for v in self.ref_counts.values() if v > 0)
+            logger.warning(
+                f"[Rank {self.tp_rank}] Cannot allocate {size_bytes / 1024**2:.2f} MB: "
+                f"pool full ({self.allocator.get_allocated_size() / 1024**2:.1f}/"
+                f"{self.total_pool_size_bytes / 1024**2:.1f} MB used), "
+                f"no evictable candidates "
+                f"({len(self.hash_to_metadata)} entries, {n_protected} protected)"
+            )
             self.stats["allocation_failures"] += 1
             return None
 
