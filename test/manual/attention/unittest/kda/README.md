@@ -19,7 +19,7 @@ Columns are runner modes; rows are the linear-attention kernel backend
 
 | Linear-attn kernel | Eager Phase 2 | CG decode | PCG extend | BCG extend | Verify eager | Verify CG | DE eager | DE CG | DE-V2 CG | EAGLE-draft runner | EAGLE-DE runner | FKVMTP runner |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `triton` | ✓ 10 input layouts (page 1/16/32, prefix/decode edges) | ✓ decode page-boundary (uses `KDA_GRAPH_ATOL=1e-1` to absorb Triton recurrent-kernel CG-replay drift; eager `KDA_ATOL=3e-2` kept for non-graph cases) | deferred | deferred | deferred: `expected_kda_verify_output_from_inputs` reads `inputs["a"]/["b"]` as raw `[T, HV*K]` / `[T, HV]` shapes (matching `fixture.a_raw`/`b_raw`), but `kda_fixture_inputs` and `make_kda_random_inputs` return the *shaped* (`[1, T, HV, K]`) / per-head-scalar (`[T, HV]`) versions used by `run_kda_forward`. Verify wiring needs `make_kda_random_inputs` + `kda_fixture_inputs` to expose raw a/b alongside the shaped versions, then `expected_kda_verify_output_from_inputs` adjusted to consume the raw key. | deferred | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
+| `triton` | ✓ 10 input layouts (page 1/16/32, prefix/decode edges) | ✓ decode page-boundary (uses `KDA_GRAPH_ATOL=1e-1` to absorb Triton recurrent-kernel CG-replay drift; eager `KDA_ATOL=3e-2` kept for non-graph cases) | deferred | deferred | ✓ EAGLE chain (topk=1) + EAGLE tree (topk=2) (`atol=1e-1` because the verify reference's pure-Python per-token recurrence drifts ~0.07 vs the Triton kernel even before CG capture/replay) | ✓ EAGLE chain CG + EAGLE tree CG (same `1e-1` tolerance) | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
 
 ## Input And Config Coverage
 
@@ -40,15 +40,9 @@ Columns are runner modes; rows are the linear-attention kernel backend
 
 ## Next Work
 
-- Add PCG/BCG runner coverage modeled on GDN `runner_modes`. CG decode
-  already wired via `run_kda_cuda_graph_decode_case` (see above).
-- Add EAGLE chain/tree speculative target-verify coverage. Blocked by
-  the `expected_kda_verify_output_from_inputs` ↔ `make_kda_random_inputs`
-  shape mismatch documented in the matrix above; the existing verify
-  reference path is correct for `fixture.a_raw / b_raw`, but the inputs
-  dict surfaced by `kda_fixture_inputs` carries the *shaped* tensors
-  that `run_kda_forward` passes to the actual module. Fix needs
-  `make_kda_random_inputs` to expose both shapes so capture inputs can
-  feed both the forward and the reference, then the verify
-  expected-output wrapper consumes the raw key.
+- Add PCG/BCG runner coverage modeled on GDN `runner_modes`. CG decode +
+  EAGLE chain/tree verify (eager + CG) already wired (see above);
+  `kda_fixture_inputs` + `make_kda_random_inputs` now expose both
+  `a/b` (post-transform, fed to the actual module) and `a_raw/b_raw`
+  (raw, fed to `_pure_torch_kda_gating` inside the verify reference).
 - Consider additional KDA kernel backend variants when available.

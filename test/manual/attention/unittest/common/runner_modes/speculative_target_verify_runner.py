@@ -65,6 +65,35 @@ from ..attention_methods.gdn_attention import (
     prepare_gdn_runner_inputs,
     run_gdn_forward,
 )
+from ..attention_methods.kda_attention import DEFAULT_DEVICE as KDA_DEFAULT_DEVICE
+from ..attention_methods.kda_attention import DEFAULT_DTYPE as KDA_DEFAULT_DTYPE
+from ..attention_methods.kda_attention import (
+    DEFAULT_HEAD_K_DIM as KDA_DEFAULT_HEAD_K_DIM,
+)
+from ..attention_methods.kda_attention import (
+    DEFAULT_HEAD_V_DIM as KDA_DEFAULT_HEAD_V_DIM,
+)
+from ..attention_methods.kda_attention import (
+    DEFAULT_MAX_CONTEXT_LEN as KDA_DEFAULT_MAX_CONTEXT_LEN,
+)
+from ..attention_methods.kda_attention import (
+    KDA_ATOL,
+    KDA_RTOL,
+    KDA_TREE_ATOL,
+    KDAAttentionCase,
+    _clone_kda_cache,
+    _restore_kda_cache,
+    build_kda_attention_fixture,
+    expected_kda_verify_output_from_inputs,
+    kda_fixture_inputs,
+    make_kda_case_with_prefix_lens,
+    make_kda_random_inputs,
+    prepare_kda_runner_inputs,
+    run_kda_forward,
+)
+from ..attention_methods.kda_attention import (
+    _make_forward_batch as _make_kda_forward_batch,
+)
 from ..attention_methods.mla_attention import DEFAULT_DEVICE as MLA_DEFAULT_DEVICE
 from ..attention_methods.mla_attention import DEFAULT_DTYPE as MLA_DEFAULT_DTYPE
 from ..attention_methods.mla_attention import (
@@ -812,6 +841,144 @@ def run_dsv4_eagle_verify_cuda_graph_case(
         adapter=adapter,
         build_kwargs=dict(
             swa_size=swa_size,
+            max_context_len=max_context_len,
+            dtype=dtype,
+            device=device,
+        ),
+        capture_batch_size=cuda_graph_capture_batch_size,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+    )
+
+
+def run_kda_eagle_verify_case(
+    testcase,
+    case: KDAAttentionCase,
+    *,
+    topk: int,
+    head_k_dim: int = KDA_DEFAULT_HEAD_K_DIM,
+    head_v_dim: int = KDA_DEFAULT_HEAD_V_DIM,
+    max_context_len: int = KDA_DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = KDA_DEFAULT_DTYPE,
+    device: str = KDA_DEFAULT_DEVICE,
+    # KDA's recurrent kernel accumulates precision drift through the prefix
+    # state seeding + per-draft-token recurrence; the verify reference's pure
+    # python recurrence drifts by up to ~0.1 against the Triton kernel even
+    # before CG capture/replay enters the picture. Use a loose tolerance for
+    # verify coverage where the goal is metadata/contract validation, not
+    # exact numerical reproduction.
+    atol: float = 1e-1,
+    rtol: float = 1e-1,
+):
+    """KDA EAGLE chain/tree verify (eager). Mirrors `run_gdn_eagle_verify_case`.
+    `expected_kda_verify_output_from_inputs` consumes the raw `a_raw / b_raw`
+    keys surfaced by `kda_fixture_inputs`."""
+    fixture = build_kda_attention_fixture(
+        testcase,
+        case,
+        head_k_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+    )
+    _prepare_target_verify_batch(fixture.forward_batch, case, device)
+    fixture.forward_batch.spec_info = _make_eagle_verify_input(
+        case,
+        fixture.forward_batch,
+        topk=topk,
+        device=device,
+    )
+    inputs = kda_fixture_inputs(fixture)
+    initial_state = _clone_kda_cache(fixture)
+    expected = expected_kda_verify_output_from_inputs(
+        fixture,
+        case,
+        inputs,
+        initial_state,
+        topk=topk,
+    )
+
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+        fixture.backend.init_forward_metadata(fixture.forward_batch)
+        actual = run_kda_forward(fixture, fixture.forward_batch, inputs)
+
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+
+
+def _prepare_kda_verify_batch(case, batch, *, topk: int, device: str) -> None:
+    _prepare_target_verify_batch(batch, case, device)
+    batch.spec_info = _make_eagle_verify_input(
+        case,
+        batch,
+        topk=topk,
+        device=device,
+    )
+
+
+def run_kda_eagle_verify_cuda_graph_case(
+    testcase,
+    case: KDAAttentionCase,
+    *,
+    topk: int,
+    head_k_dim: int = KDA_DEFAULT_HEAD_K_DIM,
+    head_v_dim: int = KDA_DEFAULT_HEAD_V_DIM,
+    max_context_len: int = KDA_DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = KDA_DEFAULT_DTYPE,
+    device: str = KDA_DEFAULT_DEVICE,
+    cuda_graph_capture_batch_size: int | None = None,
+    # Same loose tolerance reasoning as `run_kda_eagle_verify_case`.
+    atol: float = 1e-1,
+    rtol: float = 1e-1,
+):
+    cuda_graph_capture_batch_size = cuda_graph_capture_batch_size or case.batch_size
+    adapter = SpeculativeCudaGraphAdapter(
+        build_fixture=build_kda_attention_fixture,
+        make_capture_case=lambda base, name, capture_prefix_len, bs: (
+            make_kda_case_with_prefix_lens(base, name, (capture_prefix_len,) * bs)
+        ),
+        make_replay_case=lambda base, name, _pad_prefix_lens: (
+            make_kda_case_with_prefix_lens(base, name, base.prefix_lens)
+        ),
+        make_forward_batch=_make_kda_forward_batch,
+        fixture_inputs=kda_fixture_inputs,
+        make_capture_inputs=make_kda_random_inputs,
+        make_replay_inputs=lambda _case, fixture, *_args, **_kwargs: (
+            kda_fixture_inputs(fixture)
+        ),
+        prepare_batch=lambda spec_case, batch: _prepare_kda_verify_batch(
+            spec_case,
+            batch,
+            topk=topk,
+            device=device,
+        ),
+        prepare_inputs=prepare_kda_runner_inputs,
+        run_forward=run_kda_forward,
+        expected_output=lambda fixture, spec_case, inputs, state: (
+            expected_kda_verify_output_from_inputs(
+                fixture,
+                spec_case,
+                inputs,
+                state,
+                topk=topk,
+            )
+        ),
+        clone_state=_clone_kda_cache,
+        restore_state=_restore_kda_cache,
+        allow_padding=False,
+        run_graph_eager=False,
+        compare_replay_to_graph_eager=False,
+        atol=atol,
+        rtol=rtol,
+    )
+    run_speculative_cuda_graph_case(
+        testcase,
+        case,
+        adapter=adapter,
+        build_kwargs=dict(
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
             max_context_len=max_context_len,
             dtype=dtype,
             device=device,

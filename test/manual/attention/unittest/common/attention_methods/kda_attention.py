@@ -841,10 +841,20 @@ def make_kda_case_with_prefix_lens(
 
 
 def kda_fixture_inputs(fixture: KDAAttentionFixture) -> dict[str, torch.Tensor]:
+    # `a, b` are the per-forward-mode shaped tensors the actual module
+    # consumes (see `build_kda_attention_fixture`: for DECODE
+    # `a = a_raw [T, HV*K]` and `b = b_raw.unsqueeze(0) [1, T, HV]`; for
+    # non-DECODE `a = a_raw.unflatten(-1, (HV, K)).unsqueeze(0)` and
+    # `b = b_raw.sigmoid().unsqueeze(0)`). The verify reference
+    # (`expected_kda_verify_output_from_inputs` →
+    # `_pure_torch_kda_gating`) expects raw `[T, HV*K]` / `[T, HV]`
+    # instead, so we expose both shapes through the inputs dict.
     return {
         "mixed_qkv": fixture.mixed_qkv,
         "a": fixture.a,
         "b": fixture.b,
+        "a_raw": fixture.a_raw,
+        "b_raw": fixture.b_raw,
     }
 
 
@@ -855,6 +865,25 @@ def make_kda_random_inputs(
     dtype: torch.dtype,
     device: str,
 ) -> dict[str, torch.Tensor]:
+    head_k_dim = fixture.reference_module.head_k_dim
+    a_raw = torch.randn(
+        case.num_input_tokens,
+        case.num_v_heads * head_k_dim,
+        dtype=dtype,
+        device=device,
+    )
+    b_raw = torch.randn(
+        case.num_input_tokens,
+        case.num_v_heads,
+        dtype=dtype,
+        device=device,
+    )
+    if case.forward_mode.is_decode():
+        a = a_raw
+        b = b_raw.unsqueeze(0)
+    else:
+        a = a_raw.unflatten(-1, (case.num_v_heads, head_k_dim)).unsqueeze(0)
+        b = b_raw.float().sigmoid().unsqueeze(0).to(dtype)
     return {
         "mixed_qkv": torch.randn(
             case.num_input_tokens,
@@ -862,18 +891,10 @@ def make_kda_random_inputs(
             dtype=dtype,
             device=device,
         ),
-        "a": torch.randn(
-            case.num_input_tokens,
-            case.num_v_heads,
-            dtype=dtype,
-            device=device,
-        ),
-        "b": torch.randn(
-            case.num_input_tokens,
-            case.num_v_heads,
-            dtype=dtype,
-            device=device,
-        ),
+        "a": a,
+        "b": b,
+        "a_raw": a_raw,
+        "b_raw": b_raw,
     }
 
 
@@ -959,6 +980,12 @@ def prepare_kda_runner_inputs(
     fixture.mixed_qkv = inputs["mixed_qkv"]
     fixture.a = inputs["a"]
     fixture.b = inputs["b"]
+    # Keep `a_raw, b_raw` in sync so the verify reference (which reads them
+    # off the fixture in non-runner tests) stays consistent with `a, b`.
+    if "a_raw" in inputs:
+        fixture.a_raw = inputs["a_raw"]
+    if "b_raw" in inputs:
+        fixture.b_raw = inputs["b_raw"]
 
 
 def run_kda_forward(
@@ -1006,7 +1033,15 @@ def expected_kda_verify_output_from_inputs(
     module = fixture.reference_module
     q, k, v = module.split_qkv(inputs["mixed_qkv"])
     cache_indices = _cache_indices(fixture)
-    g, beta = _pure_torch_kda_gating(module, inputs["a"], inputs["b"])
+    # `_pure_torch_kda_gating` expects raw `[T, HV*K]` / `[T, HV]` shapes
+    # (matching `fixture.a_raw / b_raw`). `inputs["a_raw"]` / `inputs["b_raw"]`
+    # are surfaced by `kda_fixture_inputs` and `make_kda_random_inputs` for
+    # this purpose. Falling back to `inputs["a"] / inputs["b"]` keeps
+    # backwards compatibility for callers that haven't been updated to pass
+    # the raw keys.
+    a_for_gating = inputs.get("a_raw", inputs["a"])
+    b_for_gating = inputs.get("b_raw", inputs["b"])
+    g, beta = _pure_torch_kda_gating(module, a_for_gating, b_for_gating)
     q = q.float()
     k = k.float()
     v = v.float()
