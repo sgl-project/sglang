@@ -100,6 +100,7 @@ _is_gfx95_supported = is_gfx95_supported()
 
 if _use_aiter:
     from aiter import rope_rotate_activation
+    from aiter.tuned_gemm import tgemm as _tgemm
 
     if is_gfx95_supported():
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
@@ -1121,7 +1122,10 @@ class Compressor(nn.Module):
 
         self.forward_mode = forward_batch.forward_mode
 
-        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+        if _use_aiter:
+            kv_score = _tgemm.mm(x, self.wkv_gate.weight, otype=x.dtype)
+        else:
+            kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
         return self.compress_dispatch(kv_score, forward_batch)
 
     def compress_extend_old(
