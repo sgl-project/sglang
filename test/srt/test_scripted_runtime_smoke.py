@@ -9,12 +9,14 @@ Verifies the basic generator-driven mechanism end-to-end:
 4. When the generator returns, all ranks exit cleanly and the test
    process unblocks without an exception.
 
-The script function is intentionally underscore-prefixed so pytest
-does not collect it as a test directly.
+The script function is intentionally underscore-prefixed so unittest
+discovery does not mistake it for a test method.
 """
 
+import unittest
+
 from sglang.test.scripted_runtime import ScriptedRuntime, execute_scripted_runtime
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
 
 def _smoke_script(t: ScriptedRuntime):
@@ -28,17 +30,18 @@ def _smoke_script(t: ScriptedRuntime):
     ), f"unexpected status: {r1.status!r}"
 
 
-def test_smoke_scripted_runtime():
-    execute_scripted_runtime(
-        _smoke_script,
-        model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-        tp_size=1,
-        dp_size=1,
-        pp_size=1,
-        disable_overlap_schedule=True,
-        disable_cuda_graph=True,
-    )
+class TestScriptedRuntimeSmoke(CustomTestCase):
+    def test_smoke(self):
+        execute_scripted_runtime(
+            _smoke_script,
+            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            tp_size=1,
+            dp_size=1,
+            pp_size=1,
+            disable_overlap_schedule=True,
+            disable_cuda_graph=True,
+        )
 
 
 if __name__ == "__main__":
-    test_smoke_scripted_runtime()
+    unittest.main()
