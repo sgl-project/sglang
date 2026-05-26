@@ -1,4 +1,4 @@
-"""Feature c — Hybrid SWA × chunked: naive ScriptedRuntime smoke.
+"""Hybrid SWA × chunked: naive ScriptedRuntime smoke.
 
 Hybrid sliding-window-attention models exercise an ``add_chunked_req``
 early-return branch under SWA pressure (see audit doc § "Hybrid SWA").
@@ -10,18 +10,16 @@ Uses gpt-oss-20b — the same SWA model the existing
 """
 
 import unittest
-
-from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.test_utils import CustomTestCase
-
-from test.manual.scripted_runtime.common import (
+from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     run_until_finished,
 )
 
+from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
+from sglang.test.scripted_runtime.runtime import ScriptedRuntime
+from sglang.test.test_utils import CustomTestCase
 
 _SWA_MODEL = "openai/gpt-oss-20b"
 
@@ -36,7 +34,7 @@ def _script_naive_swa_chunked(t: ScriptedRuntime):
     assert r.chunks_done >= 2
 
 
-class TestFeatureCHybridSWAChunked(CustomTestCase):
+class TestFeatureHybridSWAChunked(CustomTestCase):
     def test_naive_swa_chunked(self):
         execute_scripted_runtime(
             _script_naive_swa_chunked,

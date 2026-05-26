@@ -1,4 +1,4 @@
-"""Feature d — HiSparse × chunked: naive ScriptedRuntime smoke.
+"""HiSparse × chunked: naive ScriptedRuntime smoke.
 
 HiSparse staging DMA can race with chunked admission (audit doc
 § "HiSparse"). A naive smoke just verifies "engine starts with both
@@ -10,18 +10,16 @@ Uses the same GLM-5-FP8 model and 8×H200 layout as
 """
 
 import unittest
-
-from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.test_utils import CustomTestCase
-
-from test.manual.scripted_runtime.common import (
+from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     run_until_finished,
 )
 
+from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
+from sglang.test.scripted_runtime.runtime import ScriptedRuntime
+from sglang.test.test_utils import CustomTestCase
 
 _HISPARSE_MODEL = "zai-org/GLM-5-FP8"
 
@@ -35,7 +33,7 @@ def _script_naive_hisparse_chunked(t: ScriptedRuntime):
     assert r.chunks_done >= 2
 
 
-class TestFeatureDHiSparseChunked(CustomTestCase):
+class TestFeatureHiSparseChunked(CustomTestCase):
     def test_naive_hisparse_chunked(self):
         execute_scripted_runtime(
             _script_naive_hisparse_chunked,

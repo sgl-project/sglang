@@ -1,4 +1,4 @@
-"""Feature i — LoRA × chunked: naive ScriptedRuntime smoke.
+"""LoRA × chunked: naive ScriptedRuntime smoke.
 
 Reproduces the path that 5ed4faf0ab "Bypass LoRA scheduling gate for
 chunked-resume reqs" had to fix: a LoRA request must be able to
@@ -7,22 +7,20 @@ deadlock that previously kept it stuck in waiting_queue.
 
 This is a *smoke* — it doesn't deliberately trigger the drainer. The
 deliberate drainer-deadlock regression lives in
-``test_regression_309b6dc.py`` (B-60).
+``test_regression_309b6dc.py``.
 """
 
 import unittest
-
-from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.test_utils import CustomTestCase
-
-from test.manual.scripted_runtime.common import (
+from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     run_until_finished,
 )
 
+from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
+from sglang.test.scripted_runtime.runtime import ScriptedRuntime
+from sglang.test.test_utils import CustomTestCase
 
 _LORA_BASE_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 _LORA_ADAPTER = "philschmid/llama-3-2-1b-instruct-finetuning-lora-cookbook-test"
@@ -43,7 +41,7 @@ def _script_naive_lora_chunked(t: ScriptedRuntime):
     assert r.chunks_done >= 2
 
 
-class TestFeatureILoRAChunked(CustomTestCase):
+class TestFeatureLoRAChunked(CustomTestCase):
     def test_naive_lora_chunked(self):
         execute_scripted_runtime(
             _script_naive_lora_chunked,

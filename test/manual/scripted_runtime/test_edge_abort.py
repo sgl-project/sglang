@@ -1,6 +1,6 @@
 """Edge cases — abort × chunked.
 
-B-20 ~ B-25 from the plan. Verifies that aborting a chunked-resume
+Verifies that aborting a chunked-resume
 request (1) releases all owned resources (row, KV, lock_ref), (2)
 does not double-finalize, and (3) does not poison other reqs in
 flight.
@@ -12,12 +12,7 @@ out as deliberate whitebox API.
 """
 
 import unittest
-
-from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.test_utils import CustomTestCase
-
-from test.manual.scripted_runtime.common import (
+from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
@@ -25,10 +20,14 @@ from test.manual.scripted_runtime.common import (
     run_until_finished,
 )
 
+from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
+from sglang.test.scripted_runtime.runtime import ScriptedRuntime
+from sglang.test.test_utils import CustomTestCase
 
-# B-20: abort a chunked-resume req while it's still in waiting_queue
+
+# abort a chunked-resume req while it's still in waiting_queue
 # (chunked-resume parked between chunks). Resources must release.
-def _script_b20_abort_waiting_chunked_resume(t: ScriptedRuntime):
+def _script_abort_waiting_chunked_resume(t: ScriptedRuntime):
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     # Push it into chunked-resume parked-in-waiting state.
     yield from run_until(r, lambda h: h.is_chunking)
@@ -40,22 +39,21 @@ def _script_b20_abort_waiting_chunked_resume(t: ScriptedRuntime):
     t.abort(r)
     yield  # let scheduler process the abort
 
-    assert r.status in ("finished", "unknown"), (
-        f"after abort r should be finished/unknown, got {r.status}"
-    )
-    assert r.kv_pages == 0, (
-        f"abort must release KV; r.kv_pages={r.kv_pages} after abort"
-    )
-    assert r.row_idx is None, (
-        f"abort must release row; r.row_idx={r.row_idx} after abort"
-    )
-    assert r.lock_refs == 0, (
-        f"abort must release lock_refs; r.lock_refs={r.lock_refs}"
-    )
+    assert r.status in (
+        "finished",
+        "unknown",
+    ), f"after abort r should be finished/unknown, got {r.status}"
+    assert (
+        r.kv_pages == 0
+    ), f"abort must release KV; r.kv_pages={r.kv_pages} after abort"
+    assert (
+        r.row_idx is None
+    ), f"abort must release row; r.row_idx={r.row_idx} after abort"
+    assert r.lock_refs == 0, f"abort must release lock_refs; r.lock_refs={r.lock_refs}"
 
 
-# B-21: abort during chunk_0 (first chunk not yet flushed).
-def _script_b21_abort_at_chunk_0(t: ScriptedRuntime):
+# abort during chunk_0 (first chunk not yet flushed).
+def _script_abort_at_chunk_0(t: ScriptedRuntime):
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     yield  # request observed by scheduler; first chunk starts
     yield from run_until(r, lambda h: h.is_chunking)
@@ -67,8 +65,8 @@ def _script_b21_abort_at_chunk_0(t: ScriptedRuntime):
     assert r.row_idx is None
 
 
-# B-22: abort at chunk_mid (some chunks done, some pending).
-def _script_b22_abort_at_chunk_mid(t: ScriptedRuntime):
+# abort at chunk_mid (some chunks done, some pending).
+def _script_abort_at_chunk_mid(t: ScriptedRuntime):
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     yield from run_until(r, lambda h: h.chunks_done >= 2 and h.is_chunking)
 
@@ -78,10 +76,10 @@ def _script_b22_abort_at_chunk_mid(t: ScriptedRuntime):
     assert r.kv_pages == 0
 
 
-# B-23: abort at last_chunk (pending_middle_outputs has been ++ for
+# abort at last_chunk (pending_middle_outputs has been ++ for
 # the last admission; abort must zero it so Stage A doesn't revive
 # the released row). Tied to scheduler.py:3567-3569 defensive cleanup.
-def _script_b23_abort_at_last_chunk(t: ScriptedRuntime):
+def _script_abort_at_last_chunk(t: ScriptedRuntime):
     # Use a prompt that's exactly 2 chunks so the second chunk is the
     # last one.
     r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4)
@@ -101,12 +99,12 @@ def _script_b23_abort_at_last_chunk(t: ScriptedRuntime):
     )
 
 
-# B-24: abort at last_chunk_in_flight under PP (forward still in
+# abort at last_chunk_in_flight under PP (forward still in
 # flight when the abort hits). Verifies the PP cross-microbatch
 # dedup (b823c16e60) and double-finalize guard (02b1785f0a).
 #
 # Requires multi-rank ScriptedRuntime + PP=2 (wishlist §4 P3 (15)).
-def _script_b24_abort_at_last_chunk_in_flight_pp(t: ScriptedRuntime):
+def _script_abort_at_last_chunk_in_flight_pp(t: ScriptedRuntime):
     r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4)
     # Drive to last_chunk_in_flight via batch_composition introspection
     # — when ``mb='b'`` has the chunked extend and ``mb='a'`` has the
@@ -122,13 +120,13 @@ def _script_b24_abort_at_last_chunk_in_flight_pp(t: ScriptedRuntime):
     assert r.kv_pages == 0
     # No double-finalize: the result_queue should have one finished
     # event for r, not two.
-    assert r.finish_event_count == 1, (
-        f"abort must not double-finalize; got {r.finish_event_count} events"
-    )
+    assert (
+        r.finish_event_count == 1
+    ), f"abort must not double-finalize; got {r.finish_event_count} events"
 
 
-# B-25: abort one chunked req does not disturb another in flight.
-def _script_b25_abort_one_does_not_disturb_other(t: ScriptedRuntime):
+# abort one chunked req does not disturb another in flight.
+def _script_abort_one_does_not_disturb_other(t: ScriptedRuntime):
     r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     yield from run_until(r1, lambda h: h.is_chunking)
@@ -143,33 +141,33 @@ def _script_b25_abort_one_does_not_disturb_other(t: ScriptedRuntime):
 
 
 class TestEdgeAbort(CustomTestCase):
-    def test_b20_abort_waiting_chunked_resume(self):
+    def test_abort_waiting_chunked_resume(self):
         execute_scripted_runtime(
-            _script_b20_abort_waiting_chunked_resume,
+            _script_abort_waiting_chunked_resume,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    def test_b21_abort_at_chunk_0(self):
+    def test_abort_at_chunk_0(self):
         execute_scripted_runtime(
-            _script_b21_abort_at_chunk_0,
+            _script_abort_at_chunk_0,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    def test_b22_abort_at_chunk_mid(self):
+    def test_abort_at_chunk_mid(self):
         execute_scripted_runtime(
-            _script_b22_abort_at_chunk_mid,
+            _script_abort_at_chunk_mid,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    def test_b23_abort_at_last_chunk(self):
+    def test_abort_at_last_chunk(self):
         execute_scripted_runtime(
-            _script_b23_abort_at_last_chunk,
+            _script_abort_at_last_chunk,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    def test_b24_abort_at_last_chunk_in_flight_pp(self):
+    def test_abort_at_last_chunk_in_flight_pp(self):
         execute_scripted_runtime(
-            _script_b24_abort_at_last_chunk_in_flight_pp,
+            _script_abort_at_last_chunk_in_flight_pp,
             **base_engine_kwargs(
                 chunked_prefill_size=DEFAULT_CHUNK_SIZE,
                 tp_size=2,
@@ -177,9 +175,9 @@ class TestEdgeAbort(CustomTestCase):
             ),
         )
 
-    def test_b25_abort_one_does_not_disturb_other(self):
+    def test_abort_one_does_not_disturb_other(self):
         execute_scripted_runtime(
-            _script_b25_abort_one_does_not_disturb_other,
+            _script_abort_one_does_not_disturb_other,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 

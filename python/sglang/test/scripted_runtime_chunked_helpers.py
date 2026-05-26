@@ -106,14 +106,11 @@ def run_until_finished(handle, *, max_steps: int = DEFAULT_MAX_STEPS):
     )
 
 
-def run_until_all_finished(
-    handles: List[Any], *, max_steps: int = DEFAULT_MAX_STEPS
-):
+def run_until_all_finished(handles: List[Any], *, max_steps: int = DEFAULT_MAX_STEPS):
     """Generator helper: ``yield`` until every handle reports finished."""
     for _ in range(max_steps):
         if all(
-            getattr(h, "finished", False) or h.status == "finished"
-            for h in handles
+            getattr(h, "finished", False) or h.status == "finished" for h in handles
         ):
             return
         yield

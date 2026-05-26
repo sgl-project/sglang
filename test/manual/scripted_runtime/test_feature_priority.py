@@ -1,4 +1,4 @@
-"""Feature g — Priority scheduling × chunked: naive ScriptedRuntime smoke.
+"""Priority scheduling × chunked: naive ScriptedRuntime smoke.
 
 Submit a low-priority long-prompt request that must be chunked, then
 a high-priority short request. With priority preemption enabled the
@@ -11,23 +11,20 @@ will surface as a clear AttributeError at script time.
 """
 
 import unittest
-
-from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.test_utils import CustomTestCase
-
-from test.manual.scripted_runtime.common import (
+from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     run_until_all_finished,
 )
 
+from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
+from sglang.test.scripted_runtime.runtime import ScriptedRuntime
+from sglang.test.test_utils import CustomTestCase
+
 
 def _script_naive_priority_chunked(t: ScriptedRuntime):
-    low = t.start_req(
-        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, priority="low"
-    )
+    low = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, priority="low")
     yield  # let scheduler pull `low` and begin its chunk loop
 
     high = t.start_req(prompt_len=8, max_new_tokens=2, priority="high")
@@ -36,7 +33,7 @@ def _script_naive_priority_chunked(t: ScriptedRuntime):
     assert low.finished and high.finished
 
 
-class TestFeatureGPriorityChunked(CustomTestCase):
+class TestFeaturePriorityChunked(CustomTestCase):
     def test_naive_priority_chunked(self):
         execute_scripted_runtime(
             _script_naive_priority_chunked,

@@ -1,4 +1,4 @@
-"""Feature k — DP attention × chunked: naive ScriptedRuntime smoke.
+"""DP attention × chunked: naive ScriptedRuntime smoke.
 
 DP attention shards attention across DP ranks; the chunked path runs
 independently on each DP rank. The naive smoke just verifies a
@@ -9,17 +9,16 @@ P2 (12)).
 """
 
 import unittest
-
-from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.test_utils import CustomTestCase
-
-from test.manual.scripted_runtime.common import (
+from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     run_until_finished,
 )
+
+from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
+from sglang.test.scripted_runtime.runtime import ScriptedRuntime
+from sglang.test.test_utils import CustomTestCase
 
 
 def _script_naive_dp_attention_chunked(t: ScriptedRuntime):
@@ -29,7 +28,7 @@ def _script_naive_dp_attention_chunked(t: ScriptedRuntime):
     assert r.chunks_done >= 2
 
 
-class TestFeatureKDPAttentionChunked(CustomTestCase):
+class TestFeatureDPAttentionChunked(CustomTestCase):
     def test_naive_dp_attention_chunked(self):
         execute_scripted_runtime(
             _script_naive_dp_attention_chunked,
