@@ -1238,6 +1238,7 @@ class TestLayoutAndScheduling:
                 real_kv_hash_mode=consts.RealKvHashMode.NONE,
             ),
             plan=plan,
+            check_verify_expected_token=True,
         )
         if runner is launch_canary_verify_kernel:
             torch.cuda.synchronize()
