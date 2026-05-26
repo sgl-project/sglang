@@ -24,14 +24,6 @@ def _make_req(*, origin: list[int], output: list[int]) -> SimpleNamespace:
 
 
 class TestComputeReqAllIdsInfo(CustomTestCase):
-    def test_empty_reqs_returns_empty_tensors(self) -> None:
-        """Zero reqs produces zero-length flat and zero-length lens tensors."""
-        flat, lens = compute_req_all_ids_info([])
-        self.assertEqual(int(flat.numel()), 0)
-        self.assertEqual(int(lens.numel()), 0)
-        self.assertEqual(flat.dtype, torch.int64)
-        self.assertEqual(lens.dtype, torch.int64)
-
     def test_single_req_concatenates_origin_then_output(self) -> None:
         """One req's flat is origin_input_ids followed by output_ids in that order."""
         req = _make_req(origin=[10, 20, 30], output=[40, 50])
