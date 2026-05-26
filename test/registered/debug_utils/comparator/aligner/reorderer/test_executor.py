@@ -19,7 +19,11 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
     CpThdConcatParams,
     UnsharderPlan,
 )
-from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis
+from sglang.srt.debug_utils.comparator.dims_spec import (
+    ParallelAxis,
+    apply_dim_names,
+    without_dim_names,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
@@ -214,9 +218,10 @@ class TestThdCpZigzagE2E:
         for rank in range(cp_size):
             used: int = seq_a_ranks[rank].shape[0] + seq_b_ranks[rank].shape[0]
             pad_len: int = total_per_rank - used
-            rank_tensor: torch.Tensor = torch.cat(
-                [seq_a_ranks[rank], seq_b_ranks[rank], torch.zeros(pad_len)]
-            ).refine_names("t")
+            rank_tensor: torch.Tensor = apply_dim_names(
+                torch.cat([seq_a_ranks[rank], seq_b_ranks[rank], torch.zeros(pad_len)]),
+                ["t"],
+            )
             rank_tensors.append(rank_tensor)
 
         # Step 1: THD unshard
@@ -240,7 +245,7 @@ class TestThdCpZigzagE2E:
         reordered: list[torch.Tensor] = execute_reorderer_plan(reorder_plan, unsharded)
         assert len(reordered) == 1
 
-        result: torch.Tensor = reordered[0].rename(None)
+        result: torch.Tensor = without_dim_names(reordered[0])
         assert torch.equal(result[:100], seq_a_natural)
         assert torch.equal(result[100:164], seq_b_padded)
 
@@ -252,7 +257,9 @@ class TestThdCpZigzagE2E:
 
         seq_ranks: list[torch.Tensor] = _zigzag_split_seq(seq_natural, cp_size=cp_size)
 
-        rank_tensors: list[torch.Tensor] = [t.refine_names("t") for t in seq_ranks]
+        rank_tensors: list[torch.Tensor] = [
+            apply_dim_names(t, ["t"]) for t in seq_ranks
+        ]
 
         # Step 1: THD unshard
         seq_len_per_rank: int = 120 // cp_size  # 40
@@ -276,7 +283,7 @@ class TestThdCpZigzagE2E:
         reordered: list[torch.Tensor] = execute_reorderer_plan(reorder_plan, unsharded)
         assert len(reordered) == 1
 
-        result: torch.Tensor = reordered[0].rename(None)
+        result: torch.Tensor = without_dim_names(reordered[0])
         assert torch.equal(result, seq_natural)
 
 
