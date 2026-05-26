@@ -1848,7 +1848,14 @@ def initialize_model_parallel(
 
     from sglang.srt.server_args import get_global_server_args
 
-    if get_global_server_args().enable_longcat_double_stream:
+    try:
+        enable_longcat_double_stream = (
+            get_global_server_args().enable_longcat_double_stream
+        )
+    except ValueError:
+        enable_longcat_double_stream = False
+
+    if enable_longcat_double_stream:
         global _DOUBLE_STREAM_EP
         assert (
             _DOUBLE_STREAM_EP is None
@@ -2273,6 +2280,11 @@ def destroy_model_parallel():
     if _MOE_EP:
         _MOE_EP.destroy()
     _MOE_EP = None
+
+    global _DOUBLE_STREAM_EP
+    if _DOUBLE_STREAM_EP:
+        _DOUBLE_STREAM_EP.destroy()
+    _DOUBLE_STREAM_EP = None
 
     global _MOE_TP
     if _MOE_TP:

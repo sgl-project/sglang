@@ -1,0 +1,478 @@
+[1mdiff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py[m
+[1mindex c42760ce5..405520c24 100644[m
+[1m--- a/python/sglang/srt/distributed/parallel_state.py[m
+[1m+++ b/python/sglang/srt/distributed/parallel_state.py[m
+[36m@@ -8,80 +8,81 @@[m
+ It takes over the control of the distributed environment from PyTorch.[m
+ The typical workflow is:[m
+ [m
+ - call `init_distributed_environment` to initialize the distributed environment.[m
+ - call `initialize_model_parallel` or `ensure_model_parallel_initialized` to[m
+  initialize the model parallel groups.[m
+ [m
+ - any code dealing with the distributed stuff[m
+ [m
+ - call `destroy_model_parallel` to destroy the model parallel groups.[m
+ - call `destroy_distributed_environment` to destroy the distributed environment.[m
+ [m
+ If you only need to use the distributed environment without model/pipeline[m
+  parallelism, you can skip the model parallel initialization and destruction[m
+  steps.[m
+ """[m
+ [m
+ import contextlib[m
+ import gc[m
+ import logging[m
+ import os[m
+ import pickle[m
+ import weakref[m
+ from collections import namedtuple[m
+ from contextlib import contextmanager, nullcontext[m
+ from dataclasses import dataclass[m
+ from datetime import timedelta[m
+ from multiprocessing import shared_memory[m
+ from typing import Any, Callable, Dict, List, Optional, Tuple, Union[m
+ from unittest.mock import patch[m
+ [m
+ import torch[m
+ import torch.distributed[m
+ from torch.distributed import Backend, ProcessGroup[m
+ [m
+ from sglang.srt.compilation.compilation_config import register_split_op[m
+ from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph[m
+ from sglang.srt.distributed.utils import set_global_tcp_store[m
+ from sglang.srt.environ import envs[m
+ from sglang.srt.utils import ([m
+[32m+[m[32m    get_bool_env_var,[m
+     get_current_device_stream_fast,[m
+     get_int_env_var,[m
+     is_cpu,[m
+     is_cuda_alike,[m
+     is_hip,[m
+     is_musa,[m
+     is_npu,[m
+     is_shm_available,[m
+     is_xpu,[m
+ )[m
+ from sglang.srt.utils.custom_op import register_custom_op[m
+ from sglang.srt.utils.network import get_local_ip_auto[m
+ [m
+ _is_npu = is_npu()[m
+ _is_cpu = is_cpu()[m
+ _is_xpu = is_xpu()[m
+ _is_musa = is_musa()[m
+ [m
+ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])[m
+ [m
+ # use int value instead of ReduceOp.SUM to support torch compile[m
+ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)[m
+ [m
+ # Reuse the user-provided distributed timeout for model-parallel subgroup[m
+ # creation so runtime collectives do not silently fall back to backend defaults.[m
+ _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None[m
+ [m
+ [m
+ def get_torch_distributed_pg_options(group_name=None):[m
+     if not _is_npu:[m
+         return None[m
+ [m
+     # Only create HCCL options for default group or MoE-related groups[m
+     if group_name is not None and "moe" not in group_name:[m
+         return None[m
+ [m
+     import torch_npu[m
+ [m
+     options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()[m
+     hccl_buffer_size = int([m
+[36m@@ -1463,96 +1464,100 @@[m [m_ATTN_TP: Optional[GroupCoordinator] = None[m
+ _ATTN_CP: Optional[GroupCoordinator] = None[m
+ [m
+ # duplicate GroupCoordinator for prefill in PD-Multiplexing[m
+ _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None[m
+ [m
+ _ENABLE_PDMUX_P_TP: bool = False[m
+ [m
+ [m
+ def set_pdmux_status(enable_prefill_multiplexing: bool):[m
+     global _ENABLE_PDMUX_P_TP[m
+     _ENABLE_PDMUX_P_TP = enable_prefill_multiplexing[m
+ [m
+ [m
+ def get_tp_group() -> GroupCoordinator:[m
+     if _ENABLE_PDMUX_P_TP:[m
+         assert ([m
+             _PDMUX_PREFILL_TP_GROUP is not None[m
+         ), "tensor model parallel group for PD-Multiplexing Prefill is not initialized"[m
+         return _PDMUX_PREFILL_TP_GROUP[m
+     assert _TP is not None, "tensor model parallel group is not initialized"[m
+     return _TP[m
+ [m
+ [m
+ def get_attn_tp_group() -> GroupCoordinator:[m
+     assert ([m
+         _ATTN_TP is not None[m
+     ), "attention tensor model parallel group is not initialized"[m
+     return _ATTN_TP[m
+ [m
+ [m
+ def get_attn_cp_group() -> GroupCoordinator:[m
+     assert ([m
+         _ATTN_CP is not None[m
+     ), "attention context model parallel group is not initialized"[m
+     return _ATTN_CP[m
+ [m
+ [m
+ _MOE_DP: Optional[GroupCoordinator] = None[m
+ _MOE_EP: Optional[GroupCoordinator] = None[m
+ _MOE_TP: Optional[GroupCoordinator] = None[m
+[32m+[m[32m_DOUBLE_STREAM_EP: Optional[GroupCoordinator] = None[m
+ [m
+ [m
+ def get_moe_dp_group() -> GroupCoordinator:[m
+     assert _MOE_DP is not None, "moe data parallel group is not initialized"[m
+     return _MOE_DP[m
+ [m
+ [m
+ def get_moe_ep_group() -> GroupCoordinator:[m
+     assert _MOE_EP is not None, "expert model parallel group is not initialized"[m
+     return _MOE_EP[m
+ [m
+ [m
+ def get_moe_tp_group() -> GroupCoordinator:[m
+     assert _MOE_TP is not None, "expert model parallel group is not initialized"[m
+     return _MOE_TP[m
+ [m
+[32m+[m[32mdef get_double_stream_ep_group() -> GroupCoordinator:[m
+[32m+[m[32m    assert _DOUBLE_STREAM_EP is not None, "double stream parallel group is not initialized"[m
+[32m+[m[32m    return _DOUBLE_STREAM_EP[m
+ [m
+ # kept for backward compatibility[m
+ get_tensor_model_parallel_group = get_tp_group[m
+ [m
+ _PP: Optional[GroupCoordinator] = None[m
+ [m
+ [m
+ def get_pp_group() -> GroupCoordinator:[m
+     assert _PP is not None, "pipeline model parallel group is not initialized"[m
+     return _PP[m
+ [m
+ [m
+ # kept for backward compatibility[m
+ get_pipeline_model_parallel_group = get_pp_group[m
+ [m
+ [m
+ def get_mooncake_transfer_engine():[m
+     """[m
+     Return the shared MooncakeTransferEngine if initialized in device_communicators,[m
+     else None. Used by disaggregation mooncake backend and mem_cache mooncake_store.[m
+     """[m
+     from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import ([m
+         get_mooncake_transfer_engine as _get_engine,[m
+     )[m
+ [m
+     return _get_engine()[m
+ [m
+ [m
+ @contextmanager[m
+ def graph_capture(stream: Optional[torch.cuda.Stream] = None):[m
+     """[m
+     `graph_capture` is a context manager which should surround the code that[m
+     is capturing the CUDA graph. Its main purpose is to ensure that the[m
+     some operations will be run after the graph is captured, before the graph[m
+     is replayed. It returns a `GraphCaptureContext` object which contains the[m
+     necessary data for the graph capture. Currently, it only contains the[m
+     stream that the graph capture is running on. This stream is set to the[m
+     current CUDA stream when the context manager is entered and reset to the[m
+     default stream when the context manager is exited. This is to ensure that[m
+     the graph capture is running on a separate stream from the default stream,[m
+[36m@@ -1804,80 +1809,95 @@[m [mdef initialize_model_parallel([m
+     are on the same DGX box. For example if we are using 2 DGX-1 boxes[m
+     with a total of 16 GPUs, rank 0 to 7 belong to the first box and[m
+     ranks 8 to 15 belong to the second box.[m
+     """[m
+     # Get world size and rank. Ensure some consistencies.[m
+     assert torch.distributed.is_initialized()[m
+     world_size: int = torch.distributed.get_world_size()[m
+     backend = backend or torch.distributed.get_backend(get_world_group().device_group)[m
+ [m
+     if world_size != tensor_model_parallel_size * pipeline_model_parallel_size:[m
+         raise RuntimeError([m
+             f"world_size ({world_size}) is not equal to "[m
+             f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "[m
+             f"pipeline_model_parallel_size ({pipeline_model_parallel_size})"[m
+         )[m
+ [m
+     # Build the tensor model-parallel groups.[m
+     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size[m
+     global _TP[m
+     assert _TP is None, "tensor model parallel group is already initialized"[m
+     group_ranks = [][m
+     for tp_group_idx in range(num_tensor_model_parallel_groups):[m
+         ranks = list([m
+             range([m
+                 tp_group_idx * tensor_model_parallel_size,[m
+                 (tp_group_idx + 1) * tensor_model_parallel_size,[m
+             )[m
+         )[m
+         group_ranks.append(ranks)[m
+ [m
+     # message queue broadcaster is only used in tensor model parallel group[m
+     _TP = init_model_parallel_group([m
+         group_ranks,[m
+         get_world_group().local_rank,[m
+         backend,[m
+         use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),[m
+         group_name="tp",[m
+         recovered_rank=recovered_rank,[m
+     )[m
+ [m
+[32m+[m[32m    from sglang.srt.server_args import get_global_server_args[m
+[32m+[m
+[32m+[m[32m    if get_global_server_args().enable_longcat_double_stream:[m
+[32m+[m[32m        global _DOUBLE_STREAM_EP[m
+[32m+[m[32m        assert ([m
+[32m+[m[32m            _DOUBLE_STREAM_EP is None[m
+[32m+[m[32m        ), "double stream expert parallel group is already initialized"[m
+[32m+[m[32m        _DOUBLE_STREAM_EP = init_model_parallel_group([m
+[32m+[m[32m            group_ranks,[m
+[32m+[m[32m            get_world_group().local_rank,[m
+[32m+[m[32m            backend,[m
+[32m+[m[32m            group_name="double_stream_ep",[m
+[32m+[m[32m            recovered_rank=recovered_rank,[m
+[32m+[m[32m        )[m
+[32m+[m
+     if duplicate_tp_group:[m
+         global _PDMUX_PREFILL_TP_GROUP[m
+         assert ([m
+             _PDMUX_PREFILL_TP_GROUP is None[m
+         ), "tensor model parallel group for PD-Multiplexing Prefill is already initialized"[m
+         _PDMUX_PREFILL_TP_GROUP = init_model_parallel_group([m
+             group_ranks,[m
+             get_world_group().local_rank,[m
+             backend,[m
+             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),[m
+             group_name="pdmux_prefill_tp",[m
+             recovered_rank=recovered_rank,[m
+         )[m
+         if _TP.pynccl_comm:[m
+             _TP.pynccl_comm.disabled = False[m
+             _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False[m
+ [m
+     attn_dp_size = attention_data_parallel_size[m
+     attn_cp_size = attention_context_model_parallel_size[m
+     attn_tp_size = tensor_model_parallel_size // attn_cp_size // attn_dp_size[m
+ [m
+     global _ATTN_CP[m
+     assert ([m
+         _ATTN_CP is None[m
+     ), "attention context model parallel group is already initialized"[m
+     if attn_cp_size == tensor_model_parallel_size:[m
+         _ATTN_CP = _TP[m
+     else:[m
+         group_ranks = [][m
+         for tp_group_idx in range(num_tensor_model_parallel_groups):[m
+             for dp_idx in range(attn_dp_size):[m
+                 for attn_tp_idx in range(attn_tp_size):[m
+                     st = ([m
+                         tp_group_idx * tensor_model_parallel_size[m
+                         + dp_idx * attn_tp_size * attn_cp_size[m
+                         + attn_tp_idx[m
+                     )[m
+                     en = ([m
+                         tp_group_idx * tensor_model_parallel_size[m
+                         + (dp_idx + 1) * attn_tp_size * attn_cp_size[m
+[1mdiff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py[m
+[1mindex 97e8040e8..829e23f5e 100644[m
+[1m--- a/python/sglang/srt/environ.py[m
+[1m+++ b/python/sglang/srt/environ.py[m
+[36m@@ -292,81 +292,80 @@[m [mclass Envs:[m
+     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)[m
+     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)[m
+     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)[m
+     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)[m
+     # Staging buffer for heterogeneous TP KV transfer[m
+     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)[m
+     SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB = EnvInt(64)[m
+     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)[m
+     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in[m
+     # staging_buffer.py once Triton kernels are fully validated in production.[m
+     SGLANG_STAGING_USE_TORCH = EnvBool(False)[m
+     # Mooncake KV Transfer[m
+     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)[m
+     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)[m
+     ASCEND_NPU_PHY_ID = EnvInt(-1)[m
+     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)[m
+ [m
+     # Mooncake Store[m
+     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)[m
+     SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)[m
+     MOONCAKE_MASTER = EnvStr(None)[m
+     MOONCAKE_CLIENT = EnvStr(None)[m
+     MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")[m
+     MOONCAKE_TE_META_DATA_SERVER = EnvStr("P2PHANDSHAKE")[m
+     MOONCAKE_GLOBAL_SEGMENT_SIZE = EnvStr("4gb")[m
+     MOONCAKE_PROTOCOL = EnvStr("tcp")[m
+     MOONCAKE_DEVICE = EnvStr("")[m
+     MOONCAKE_MASTER_METRICS_PORT = EnvInt(9003)[m
+     MOONCAKE_CHECK_SERVER = EnvBool(False)[m
+     MOONCAKE_STANDALONE_STORAGE = EnvBool(False)[m
+ [m
+     # AMD & ROCm[m
+     SGLANG_USE_AITER = EnvBool(False)[m
+     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)[m
+     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)[m
+     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)[m
+     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)[m
+     # Enable dual-stream MoE (shared experts vs routed experts) on the[m
+     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.[m
+     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)[m
+[31m-[m
+     # MPS (Apple Silicon)[m
+     SGLANG_USE_MLX = EnvBool(False)[m
+ [m
+     # NPU[m
+     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)[m
+     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)[m
+     SGLANG_NPU_USE_MLAPO = EnvBool(False)[m
+     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2[m
+     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)[m
+     # Forward native implementation for gemma rms norm for model Skywork-Reward-Gemma-2-27B-v0.2[m
+     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)[m
+     # Delay all-gather after qlora for better performance for Deepseek v3.2[m
+     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)[m
+     # Quantize x to int8 in the dispatch operator[m
+     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)[m
+     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)[m
+ [m
+     # MTHREADS & MUSA[m
+     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)[m
+ [m
+     # Quantization[m
+     SGLANG_INT4_WEIGHT = EnvBool(False)[m
+     SGLANG_CPU_QUANTIZATION = EnvBool(False)[m
+     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)[m
+     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)[m
+     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)[m
+     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)[m
+     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)[m
+     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)[m
+     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")[m
+ [m
+     # Flashinfer[m
+     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)[m
+     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)[m
+     # Default to the pick from flashinfer[m
+     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)[m
+     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).[m
+     # None = standard attention. See https://arxiv.org/abs/2512.12087[m
+     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)[m
+     SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR = EnvFloat(None)[m
+[1mdiff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py[m
+[1mindex 82543626a..4b1b89f0a 100644[m
+[1m--- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py[m
+[1m+++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py[m
+[36m@@ -1,136 +1,145 @@[m
+ # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py[m
+ [m
+ import logging[m
+ from enum import Enum[m
+ from functools import cached_property[m
+ from typing import List, Optional, Tuple[m
+ [m
+ import torch[m
+ from torch.nn.parameter import UninitializedParameter[m
+ [m
+ from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs[m
+ from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher[m
+ from sglang.srt.compilation.piecewise_context_manager import ([m
+     get_forward_context,[m
+     is_in_piecewise_cuda_graph,[m
+ )[m
+ from sglang.srt.distributed import ([m
+[32m+[m[32m    get_double_stream_ep_group,[m
+     get_moe_expert_parallel_rank,[m
+     get_moe_expert_parallel_world_size,[m
+     get_moe_tensor_parallel_rank,[m
+     get_moe_tensor_parallel_world_size,[m
+     get_tp_group,[m
+     tensor_model_parallel_all_reduce,[m
+ )[m
+ from sglang.srt.distributed.device_communicators.pynccl_allocator import ([m
+     use_symmetric_memory,[m
+ )[m
+[32m+[m[32mfrom sglang.srt.environ import envs[m
+ from sglang.srt.eplb.expert_location import get_global_expert_location_metadata[m
+ from sglang.srt.layers.dp_attention import is_allocation_symmetric[m
+ from sglang.srt.layers.moe import ([m
+     MoeRunnerConfig,[m
+     get_deepep_mode,[m
+     get_moe_a2a_backend,[m
+     get_moe_runner_backend,[m
+ )[m
+ from sglang.srt.layers.moe.kt_ep_wrapper import ([m
+     KTEPWrapperMethod,[m
+     create_kt_config_from_server_args,[m
+ )[m
+[32m+[m[32mfrom sglang.srt.server_args import get_global_server_args[m
+ from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput[m
+ from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher[m
+ from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher[m
+ from sglang.srt.layers.moe.token_dispatcher.standard import ([m
+     StandardDispatcher,[m
+ )[m
+ from sglang.srt.layers.moe.topk import ([m
+     BypassedTopKOutput,[m
+     StandardTopKOutput,[m
+     TopKConfig,[m
+     TopKOutput,[m
+     TopKOutputChecker,[m
+ )[m
+ from sglang.srt.layers.moe.utils import RoutingMethodType, is_deepep_class_backend[m
+ from sglang.srt.layers.quantization.base_config import ([m
+     FusedMoEMethodBase,[m
+     QuantizationConfig,[m
+ )[m
+ from sglang.srt.layers.quantization.compressed_tensors.schemes import ([m
+     CompressedTensorsMxInt4MoE,[m
+ )[m
+ from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod[m
+ from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod[m
+ from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod[m
+ from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight[m
+ from sglang.srt.server_args import get_global_server_args[m
+ from sglang.srt.utils import ([m
+     cpu_has_amx_support,[m
+     get_bool_env_var,[m
+     is_cpu,[m
+     is_hip,[m
+     round_up,[m
+ )[m
+ from sglang.srt.utils.custom_op import register_custom_op[m
+ [m
+ _is_hip = is_hip()[m
+ _is_cpu_amx_available = cpu_has_amx_support()[m
+ _is_cpu = is_cpu()[m
+ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip[m
+ [m
+ [m
+ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:[m
+     a2a_backend = get_moe_a2a_backend()[m
+     if a2a_backend.is_none():[m
+         return StandardDispatcher(moe_runner_config)[m
+     elif ([m
+         a2a_backend.is_deepep()[m
+         or a2a_backend.is_mooncake()[m
+         or a2a_backend.is_mori()[m
+         or a2a_backend.is_nixl()[m
+     ):[m
+[32m+[m[32m        if a2a_backend.is_mori():[m
+[32m+[m[32m            group = get_tp_group()[m
+[32m+[m[32m        elif ([m
+[32m+[m[32m            a2a_backend.is_deepep()[m
+[32m+[m[32m            and get_global_server_args().enable_longcat_double_stream[m
+[32m+[m[32m        ):[m
+[32m+[m[32m            group = get_double_stream_ep_group().device_group[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            group = get_tp_group().device_group[m
+[32m+[m
+      
