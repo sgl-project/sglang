@@ -1,0 +1,399 @@
+"""Edge cases — sampling parameter × chunked interactions.
+
+Covers the A.2 series from the expansion plan plus parametrised
+combinations of greedy / stochastic / EOS-handling / stop-str /
+return-logprob with chunked prefill.
+
+Many cases here invoke ``start_req`` with sampling kwargs that the
+v0 ``ScriptedRuntime`` API does not yet accept (temperature, top_p,
+top_k, ignore_eos, stop, return_logprob, rid). Those are listed in
+expansion plan §6 as P0/P1 wishlist items.
+"""
+
+import unittest
+
+from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
+from sglang.test.scripted_runtime.req_handle import ReqHandle
+from sglang.test.scripted_runtime.runtime import ScriptedRuntime
+from sglang.test.scripted_runtime_chunked_helpers import (
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_MAX_STEPS,
+    VERY_LONG_PROMPT_LEN,
+    base_engine_kwargs,
+    run_until,
+    run_until_all_finished,
+    run_until_finished,
+)
+from sglang.test.test_utils import CustomTestCase
+
+
+def _script_max_new_tokens_zero_rejected(t: ScriptedRuntime):
+    # max_new_tokens = 0: engine should reject or never enter decode.
+    # NEW API NEEDED: start_req should propagate sampling validation
+    # errors back to the caller as ReqHandle.error_message.
+    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=0)
+    for _ in range(DEFAULT_MAX_STEPS):
+        if r.finished or r.status == "unknown":
+            return
+        yield
+    raise AssertionError("max_new_tokens=0 should fast-fail or no-op")
+
+
+def _script_max_new_tokens_one_long_chunked(t: ScriptedRuntime):
+    # max_new_tokens = 1 with a long chunked prompt: completes after 1 decode.
+    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=1)
+    yield from run_until_finished(r)
+    assert r.finished
+    assert r.chunks_done >= 2
+
+
+def _script_max_new_tokens_1000_long_chunked(t: ScriptedRuntime):
+    # max_new_tokens = 1000: long decode after chunked prefill.
+    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=1000)
+    yield from run_until(r, lambda h: h.finished, max_steps=2000)
+    assert r.finished
+
+
+def _script_greedy_chunked_deterministic(t: ScriptedRuntime):
+    # temperature = 0 (greedy) + chunked: same prompt gives same output.
+    # NEW API NEEDED: start_req(..., temperature=) — sampling kwarg passthrough.
+    # NEW API NEEDED: r.output_tokens — list[int] of generated tokens.
+    r1 = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=8, temperature=0.0
+    )
+    yield from run_until_finished(r1)
+    r2 = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=8, temperature=0.0
+    )
+    yield from run_until_finished(r2)
+    assert r1.output_tokens == r2.output_tokens, (
+        f"greedy non-determinism: {r1.output_tokens} != {r2.output_tokens}"
+    )
+
+
+def _script_return_logprob_chunked(t: ScriptedRuntime):
+    # return_logprob = True + chunked: logprob array length matches output.
+    # NEW API NEEDED: start_req(..., return_logprob=True).
+    # NEW API NEEDED: r.logprobs — list (or None when not requested).
+    r = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, return_logprob=True
+    )
+    yield from run_until_finished(r)
+    assert r.finished
+    assert r.logprobs is not None
+    assert len(r.logprobs) == 4
+
+
+def _script_ignore_eos_chunked(t: ScriptedRuntime):
+    # ignore_eos = True + early EOS production + chunked: still runs to
+    # max_new_tokens; doesn't shortcut on EOS.
+    # NEW API NEEDED: start_req(..., ignore_eos=True).
+    r = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=16, ignore_eos=True
+    )
+    yield from run_until_finished(r)
+    assert r.finished
+    assert len(r.output_tokens) == 16
+
+
+def _script_stop_str_chunked(t: ScriptedRuntime):
+    # stop=["xyz"] + chunked: stops at stop_str, doesn't reach max_new_tokens.
+    # NEW API NEEDED: start_req(..., stop=["..."]).
+    r = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=512, stop=["xyz"]
+    )
+    yield from run_until(r, lambda h: h.finished, max_steps=2000)
+    assert r.finished
+    assert len(r.output_tokens) < 512
+
+
+def _script_top_p_chunked(t: ScriptedRuntime):
+    # top_p sampling + chunked: doesn't hang or crash.
+    # NEW API NEEDED: start_req(..., top_p=).
+    r = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, top_p=0.9
+    )
+    yield from run_until_finished(r)
+    assert r.finished
+
+
+def _script_top_k_chunked(t: ScriptedRuntime):
+    # top_k sampling + chunked.
+    # NEW API NEEDED: start_req(..., top_k=).
+    r = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, top_k=50
+    )
+    yield from run_until_finished(r)
+    assert r.finished
+
+
+def _script_top_p_top_k_combined_chunked(t: ScriptedRuntime):
+    # top_p AND top_k together + chunked.
+    r = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN,
+        max_new_tokens=4,
+        top_p=0.95,
+        top_k=40,
+    )
+    yield from run_until_finished(r)
+    assert r.finished
+
+
+def _script_high_temperature_chunked(t: ScriptedRuntime):
+    # High temperature + chunked: stable output, no crash.
+    r = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=2.0
+    )
+    yield from run_until_finished(r)
+    assert r.finished
+
+
+def _script_greedy_two_sequential_reqs(t: ScriptedRuntime):
+    # Greedy + chunked, 2 sequential reqs — verify second matches first.
+    r1 = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0
+    )
+    yield from run_until_finished(r1)
+    out_a = list(r1.output_tokens)
+
+    r2 = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0
+    )
+    yield from run_until_finished(r2)
+    assert list(r2.output_tokens) == out_a
+
+
+def _script_greedy_chunked_with_radix_hit(t: ScriptedRuntime):
+    # greedy + chunked + radix prefix hit. Output for r2 == r1.
+    r1 = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0
+    )
+    yield from run_until_finished(r1)
+    r2 = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0
+    )
+    yield from run_until_finished(r2)
+    assert list(r1.output_tokens) == list(r2.output_tokens)
+
+
+def _script_return_logprob_top_logprobs_chunked(t: ScriptedRuntime):
+    # return_logprob + top_logprobs_num + chunked.
+    # NEW API NEEDED: start_req(..., top_logprobs_num=).
+    r = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN,
+        max_new_tokens=4,
+        return_logprob=True,
+        top_logprobs_num=5,
+    )
+    yield from run_until_finished(r)
+    assert r.finished
+    assert r.logprobs is not None
+
+
+def _script_multiple_stop_strs_chunked(t: ScriptedRuntime):
+    # Multiple stop strings + chunked.
+    r = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN,
+        max_new_tokens=64,
+        stop=["a", "b", "c"],
+    )
+    yield from run_until_finished(r)
+    assert r.finished
+
+
+def _script_stop_token_ids_chunked(t: ScriptedRuntime):
+    # stop_token_ids + chunked.
+    # NEW API NEEDED: start_req(..., stop_token_ids=).
+    r = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN,
+        max_new_tokens=64,
+        stop_token_ids=[2, 3],
+    )
+    yield from run_until_finished(r)
+    assert r.finished
+
+
+def _script_min_new_tokens_chunked(t: ScriptedRuntime):
+    # min_new_tokens > 0 + chunked + ignore_eos forced by minimum.
+    # NEW API NEEDED: start_req(..., min_new_tokens=).
+    r = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=16, min_new_tokens=4
+    )
+    yield from run_until_finished(r)
+    assert r.finished
+    assert len(r.output_tokens) >= 4
+
+
+def _script_repetition_penalty_chunked(t: ScriptedRuntime):
+    # repetition_penalty + chunked.
+    # NEW API NEEDED: start_req(..., repetition_penalty=).
+    r = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN,
+        max_new_tokens=4,
+        repetition_penalty=1.2,
+    )
+    yield from run_until_finished(r)
+    assert r.finished
+
+
+def _script_frequency_penalty_chunked(t: ScriptedRuntime):
+    # frequency_penalty + chunked.
+    # NEW API NEEDED: start_req(..., frequency_penalty=).
+    r = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, frequency_penalty=0.5
+    )
+    yield from run_until_finished(r)
+    assert r.finished
+
+
+def _script_presence_penalty_chunked(t: ScriptedRuntime):
+    # presence_penalty + chunked.
+    # NEW API NEEDED: start_req(..., presence_penalty=).
+    r = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, presence_penalty=0.5
+    )
+    yield from run_until_finished(r)
+    assert r.finished
+
+
+def _script_explicit_rid_chunked(t: ScriptedRuntime):
+    # Explicit rid + chunked: handle uses given rid.
+    # NEW API NEEDED: start_req(..., rid="custom-rid").
+    r = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, rid="custom-rid-1"
+    )
+    yield from run_until_finished(r)
+    assert r.rid == "custom-rid-1"
+    assert r.finished
+
+
+class TestEdgeSamplingParams(CustomTestCase):
+    def test_max_new_tokens_zero_rejected(self):
+        execute_scripted_runtime(
+            _script_max_new_tokens_zero_rejected,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_max_new_tokens_one_long_chunked(self):
+        execute_scripted_runtime(
+            _script_max_new_tokens_one_long_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_max_new_tokens_1000_long_chunked(self):
+        execute_scripted_runtime(
+            _script_max_new_tokens_1000_long_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_greedy_chunked_deterministic(self):
+        execute_scripted_runtime(
+            _script_greedy_chunked_deterministic,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_return_logprob_chunked(self):
+        execute_scripted_runtime(
+            _script_return_logprob_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_ignore_eos_chunked(self):
+        execute_scripted_runtime(
+            _script_ignore_eos_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_stop_str_chunked(self):
+        execute_scripted_runtime(
+            _script_stop_str_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_top_p_chunked(self):
+        execute_scripted_runtime(
+            _script_top_p_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_top_k_chunked(self):
+        execute_scripted_runtime(
+            _script_top_k_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_top_p_top_k_combined_chunked(self):
+        execute_scripted_runtime(
+            _script_top_p_top_k_combined_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_high_temperature_chunked(self):
+        execute_scripted_runtime(
+            _script_high_temperature_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_greedy_two_sequential_reqs(self):
+        execute_scripted_runtime(
+            _script_greedy_two_sequential_reqs,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_greedy_chunked_with_radix_hit(self):
+        execute_scripted_runtime(
+            _script_greedy_chunked_with_radix_hit,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_return_logprob_top_logprobs_chunked(self):
+        execute_scripted_runtime(
+            _script_return_logprob_top_logprobs_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_multiple_stop_strs_chunked(self):
+        execute_scripted_runtime(
+            _script_multiple_stop_strs_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_stop_token_ids_chunked(self):
+        execute_scripted_runtime(
+            _script_stop_token_ids_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_min_new_tokens_chunked(self):
+        execute_scripted_runtime(
+            _script_min_new_tokens_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_repetition_penalty_chunked(self):
+        execute_scripted_runtime(
+            _script_repetition_penalty_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_frequency_penalty_chunked(self):
+        execute_scripted_runtime(
+            _script_frequency_penalty_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_presence_penalty_chunked(self):
+        execute_scripted_runtime(
+            _script_presence_penalty_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    def test_explicit_rid_chunked(self):
+        execute_scripted_runtime(
+            _script_explicit_rid_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
