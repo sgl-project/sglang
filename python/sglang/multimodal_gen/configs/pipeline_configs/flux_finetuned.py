@@ -36,6 +36,11 @@ class Flux2FinetunedPipelineConfig(Flux2PipelineConfig):
     - 5D latents support for both single-frame and multi-frame generation
     """
 
+    def preprocess_vae_encode(self, image: torch.Tensor, vae) -> torch.Tensor:
+        if image.ndim == 5 and image.shape[2] == 1 and not self._check_vae_has_bn(vae):
+            return image.squeeze(2)
+        return image
+
     def preprocess_decoding(
         self, latents: torch.Tensor, server_args=None, vae=None
     ) -> torch.Tensor:

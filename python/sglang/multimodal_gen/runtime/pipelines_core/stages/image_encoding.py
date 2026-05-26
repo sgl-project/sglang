@@ -904,6 +904,9 @@ class ImageVAEEncodingStage(PipelineStage):
                     #     self.vae.enable_parallel()
                     if not vae_autocast_enabled:
                         video_condition = video_condition.to(vae_dtype)
+                    video_condition = server_args.pipeline_config.preprocess_vae_encode(
+                        video_condition, self.vae
+                    )
                     latent_dist: DiagonalGaussianDistribution = self.vae.encode(
                         video_condition
                     )

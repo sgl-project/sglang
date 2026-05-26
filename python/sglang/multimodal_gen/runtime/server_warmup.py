@@ -131,7 +131,7 @@ def should_include_warmup_image(
     if task_type.requires_image_input():
         return True
     if server_based_warmup:
-        return task_type == ModelTaskType.TI2V
+        return task_type in (ModelTaskType.TI2I, ModelTaskType.TI2V)
     return True
 
 
