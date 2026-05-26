@@ -52,6 +52,19 @@ from sglang.srt.utils.network import NetworkAddress
 logger = logging.getLogger(__name__)
 
 
+# Raised by KVSender/KVReceiver.failure_exception() to surface the transfer
+# failure reason recorded by the manager. Defined locally to keep this backend
+# decoupled from mooncake's runtime (which depends on RDMA-capable libs).
+class KVTransferError(Exception):
+    def __init__(self, bootstrap_room: int, failure_reason: str):
+        super().__init__(failure_reason)
+        self.bootstrap_room = bootstrap_room
+        self.failure_reason = failure_reason
+
+    def __str__(self) -> str:
+        return f"KVTransferError(bootstrap_room={self.bootstrap_room}): {self.failure_reason}"
+
+
 # ---- CUDA runtime bridge -----------------------------------------------------
 
 # Use libcudart via the handle torch already loaded, so we don't add a dep.
@@ -338,16 +351,29 @@ class TcpKVManager(CommonKVManager):
     # -- prefill worker --------------------------------------------------------
 
     def _get_client_sock(self, endpoint: str, data_port: int) -> tuple:
+        # Double-checked lock: a slow connect() must not block other workers
+        # looking up an already-connected socket.
         key = f"{endpoint}:{data_port}"
         with self._client_pool_lock:
             sock = self._client_socks.get(key)
-            if sock is None:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                sock.connect((endpoint, data_port))
-                self._client_socks[key] = sock
-                self._client_locks[key] = threading.Lock()
-            return sock, self._client_locks[key]
+            if sock is not None:
+                return sock, self._client_locks[key]
+        # Establish outside the global lock.
+        new_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        new_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        new_sock.connect((endpoint, data_port))
+        with self._client_pool_lock:
+            existing = self._client_socks.get(key)
+            if existing is not None:
+                # Another thread won the race; drop ours.
+                try:
+                    new_sock.close()
+                except Exception:
+                    pass
+                return existing, self._client_locks[key]
+            self._client_socks[key] = new_sock
+            self._client_locks[key] = threading.Lock()
+            return new_sock, self._client_locks[key]
 
     def _drop_client_sock(self, endpoint: str, data_port: int) -> None:
         key = f"{endpoint}:{data_port}"
@@ -367,24 +393,36 @@ class TcpKVManager(CommonKVManager):
         reg: TcpKVArgsRegisterInfo,
         prefill_unique_rank: int,
     ) -> bytes:
-        """Stage all buffers GPU->pinned host then build the wire frame."""
+        """Stage all buffers GPU->pinned host then build the wire frame.
+
+        Each staged entry keeps a strong reference to its host_buf tensor
+        until after the stream is synchronised — otherwise PyTorch's caching
+        allocator can reclaim the pinned memory while cudaMemcpyAsync is
+        still writing to it.
+        """
         # Slice dst KV indices to the same chunk window as prefill indices.
         dst_kv_chunk = req.dst_kv_indices[kv_chunk.index_slice]
         if len(dst_kv_chunk) > len(kv_chunk.prefill_kv_indices):
             dst_kv_chunk = dst_kv_chunk[: len(kv_chunk.prefill_kv_indices)]
         src_kv_chunk = kv_chunk.prefill_kv_indices[: len(dst_kv_chunk)]
 
-        buffers: List[tuple] = (
-            []
-        )  # (kind, comp_idx, layer, dst_indices_np, payload_bytes)
+        # (kind, comp_idx, layer, dst_indices_np, host_buf_or_None, item_len)
+        staged: List[tuple] = []
 
         if len(src_kv_chunk) > 0:
             for layer_idx, (src_ptr, item_len) in enumerate(
                 zip(self.kv_args.kv_data_ptrs, self.kv_args.kv_item_lens)
             ):
-                payload = self._stage_d2h(src_ptr, item_len, src_kv_chunk)
-                buffers.append(
-                    (_KIND_MAIN, 0, layer_idx, dst_kv_chunk.astype(np.int32), payload)
+                host_buf = self._stage_d2h(src_ptr, item_len, src_kv_chunk)
+                staged.append(
+                    (
+                        _KIND_MAIN,
+                        0,
+                        layer_idx,
+                        dst_kv_chunk.astype(np.int32),
+                        host_buf,
+                        item_len,
+                    )
                 )
 
             # SWA / DSA / extra state, indexed by component then by layer.
@@ -410,9 +448,16 @@ class TcpKVManager(CommonKVManager):
                 for layer_idx, (src_ptr, item_len) in enumerate(
                     zip(comp_src_ptrs, state_item_lens)
                 ):
-                    payload = self._stage_d2h(src_ptr, item_len, src_state_chunk_np)
-                    buffers.append(
-                        (_KIND_STATE, comp_idx, layer_idx, dst_state_chunk_np, payload)
+                    host_buf = self._stage_d2h(src_ptr, item_len, src_state_chunk_np)
+                    staged.append(
+                        (
+                            _KIND_STATE,
+                            comp_idx,
+                            layer_idx,
+                            dst_state_chunk_np,
+                            host_buf,
+                            item_len,
+                        )
                     )
 
         # Aux data goes only with the last chunk.
@@ -422,30 +467,46 @@ class TcpKVManager(CommonKVManager):
             for layer_idx, (src_ptr, item_len) in enumerate(
                 zip(self.kv_args.aux_data_ptrs, self.kv_args.aux_item_lens)
             ):
-                payload = self._stage_d2h(src_ptr, item_len, src_aux_idx)
-                buffers.append((_KIND_AUX, 0, layer_idx, dst_aux_idx, payload))
+                host_buf = self._stage_d2h(src_ptr, item_len, src_aux_idx)
+                staged.append(
+                    (_KIND_AUX, 0, layer_idx, dst_aux_idx, host_buf, item_len)
+                )
 
-        # Wait for all D2H copies before serialising.
+        # All D2H copies are now enqueued; wait for them before serialising.
         self._d2h_stream.synchronize()
 
+        # Convert host tensors to bytes only after sync — host_bufs stay alive
+        # via the `staged` list reference throughout.
+        buffers: List[tuple] = [
+            (
+                kind,
+                comp_idx,
+                layer,
+                dst_indices_np,
+                bytes(host_buf.numpy()) if host_buf is not None else b"",
+                item_len,
+            )
+            for kind, comp_idx, layer, dst_indices_np, host_buf, item_len in staged
+        ]
         return self._frame(
             kv_chunk.room, prefill_unique_rank, kv_chunk.is_last_chunk, buffers
         )
 
     def _stage_d2h(
         self, src_base_ptr: int, item_len: int, indices: npt.NDArray[np.int32]
-    ) -> bytes:
-        """GPU pages at src_base_ptr[indices*item_len] -> pinned host bytes."""
+    ) -> Optional[torch.Tensor]:
+        """Enqueue per-item D2H copies; return the pinned host tensor.
+
+        Caller MUST keep the tensor alive and synchronise the stream before
+        reading from it — cudaMemcpyAsync is non-blocking.
+        """
         n = len(indices)
         if n == 0:
-            return b""
+            return None
         nbytes = n * item_len
         host_buf = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
         host_ptr = host_buf.data_ptr()
         stream_ptr = self._d2h_stream.cuda_stream
-        # Each index is one item; copy sequentially. Sequential issue is OK
-        # since they're on the same stream and overlap with the socket I/O
-        # of the previous chunk.
         for i, idx in enumerate(indices.tolist()):
             ret = _cuda_memcpy_async(
                 host_ptr + i * item_len,
@@ -456,7 +517,7 @@ class TcpKVManager(CommonKVManager):
             )
             if ret != 0:
                 raise RuntimeError(f"cudaMemcpyAsync D2H failed: {ret}")
-        return bytes(memoryview(host_buf.numpy()))
+        return host_buf
 
     def _frame(
         self,
@@ -470,8 +531,7 @@ class TcpKVManager(CommonKVManager):
                 _HDR_FMT, room, prefill_unique_rank, int(is_last_chunk), len(buffers)
             )
         ]
-        for kind, comp_idx, layer, dst_indices_np, payload in buffers:
-            n = max(len(dst_indices_np), 1)
+        for kind, comp_idx, layer, dst_indices_np, payload, item_len in buffers:
             parts.append(
                 struct.pack(
                     _BUF_FMT,
@@ -479,7 +539,7 @@ class TcpKVManager(CommonKVManager):
                     comp_idx,
                     layer,
                     len(dst_indices_np),
-                    len(payload) // n,
+                    item_len,
                 )
             )
             parts.append(dst_indices_np.tobytes())
@@ -488,6 +548,9 @@ class TcpKVManager(CommonKVManager):
         return struct.pack("<I", len(body)) + body
 
     def _prefill_transfer_worker(self, queue: FastQueue) -> None:
+        # cuda current device is per-thread; new threads default to device 0.
+        # Pin to our rank's device so cudaMemcpyAsync uses the right context.
+        torch.cuda.set_device(self.kv_args.gpu_id)
         prefill_unique_rank = self._prefill_unique_rank()
         while True:
             kv_chunk: TransferKVChunk = queue.get()
@@ -595,6 +658,8 @@ class TcpKVManager(CommonKVManager):
         )
 
     def _decode_recv_loop(self, conn: socket.socket, addr) -> None:
+        # cuda current device is per-thread; pin H2D copies to our rank.
+        torch.cuda.set_device(self.kv_args.gpu_id)
         try:
             while True:
                 hdr = _recv_exact(conn, 4)
@@ -613,6 +678,11 @@ class TcpKVManager(CommonKVManager):
         room, prefill_rank, is_last, num_buffers = struct.unpack_from(_HDR_FMT, body, 0)
         off = _HDR_SIZE
         stream_ptr = self._h2d_stream.cuda_stream
+        # Keep all pinned host buffers alive until the stream is synchronised.
+        # PyTorch's caching allocator will reclaim a pinned tensor as soon as
+        # its refcount hits zero — without these references the cudaMemcpyAsync
+        # H2D copies would read freed memory once a later iteration reallocates.
+        live_host_bufs: List[torch.Tensor] = []
         for _ in range(num_buffers):
             kind, comp_idx, layer, n_idx, item_len = struct.unpack_from(
                 _BUF_FMT, body, off
@@ -627,12 +697,10 @@ class TcpKVManager(CommonKVManager):
             dst_base_ptr = self._dst_base_ptr(kind, comp_idx, layer)
             if dst_base_ptr == 0:
                 continue
-            # Pin the slice and issue per-page H2D.
-            # We allocate a pinned staging buffer per frame; copy_ ensures the
-            # bytes are page-locked before the async cudaMemcpy is enqueued.
             host_buf = torch.empty(payload_len, dtype=torch.uint8, pin_memory=True)
             host_arr = host_buf.numpy()
             host_arr[:] = np.frombuffer(payload_view, dtype=np.uint8)
+            live_host_bufs.append(host_buf)
             host_ptr = host_buf.data_ptr()
             for i, idx in enumerate(dst_indices.tolist()):
                 ret = _cuda_memcpy_async(
@@ -645,6 +713,7 @@ class TcpKVManager(CommonKVManager):
                 if ret != 0:
                     raise RuntimeError(f"cudaMemcpyAsync H2D failed: {ret}")
         self._h2d_stream.synchronize()
+        # `live_host_bufs` goes out of scope here; safe to free now.
 
     def _dst_base_ptr(self, kind: int, comp_idx: int, layer: int) -> int:
         if kind == _KIND_MAIN:
@@ -752,7 +821,6 @@ class TcpKVSender(CommonKVSender):
         return status
 
     def failure_exception(self):
-        from sglang.srt.disaggregation.mooncake.conn import KVTransferError
 
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
@@ -875,7 +943,6 @@ class TcpKVReceiver(CommonKVReceiver):
         return status
 
     def failure_exception(self):
-        from sglang.srt.disaggregation.mooncake.conn import KVTransferError
 
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
