@@ -3,12 +3,20 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Dict, Mapping, Optional, Union
 
 from sglang.srt.mem_cache.shared_hicache.plan import normalize_endpoint
 
 
-SHARED_HICACHE_TRANSFER_BACKEND_CHOICES = ["auto", "nixl"]
+class SharedHiCacheTransferBackendType(str, Enum):
+    AUTO = "auto"
+    NIXL = "nixl"
+
+
+SHARED_HICACHE_TRANSFER_BACKEND_CHOICES = [
+    backend.value for backend in SharedHiCacheTransferBackendType
+]
 
 
 @dataclass(frozen=True)
@@ -16,39 +24,34 @@ class SharedHiCacheConfig:
     worker_id: int
     control_endpoint: Optional[str]
     timeout_secs: float
-    transfer_backend: str
+    transfer_backend: SharedHiCacheTransferBackendType
+
+    def __post_init__(self) -> None:
+        backend = self.transfer_backend
+        if not isinstance(backend, SharedHiCacheTransferBackendType):
+            backend = SharedHiCacheTransferBackendType(str(backend).lower())
+        object.__setattr__(self, "transfer_backend", backend)
 
 
 SharedHiCacheConfigInput = Union[str, Dict[str, Any], SharedHiCacheConfig]
-SharedHiCacheConfigView = Union[SharedHiCacheConfig, Mapping[str, Any]]
-
-
-def shared_hicache_config(server_args) -> Optional[SharedHiCacheConfigView]:
-    config = getattr(server_args, "shared_hicache_config", None)
-    if isinstance(config, SharedHiCacheConfig):
-        return config
-    if isinstance(config, Mapping):
-        return config
-    return None
-
-
-def shared_hicache_config_value(server_args, key: str, default=None):
-    config = shared_hicache_config(server_args)
-    if config is None:
-        return default
-    if isinstance(config, SharedHiCacheConfig):
-        return getattr(config, key, default)
-    return config.get(key, default)
 
 
 def shared_hicache_transfer_backend_name(server_args, default: str = "auto") -> str:
-    return str(
-        shared_hicache_config_value(server_args, "transfer_backend", default)
-    ).lower()
+    config = getattr(server_args, "shared_hicache_config", None)
+    if isinstance(config, SharedHiCacheConfig):
+        return config.transfer_backend.value
+    if isinstance(config, Mapping):
+        return str(config.get("transfer_backend", default)).lower()
+    return default
 
 
 def shared_hicache_timeout_secs(server_args, default: float = 1.0) -> float:
-    return float(shared_hicache_config_value(server_args, "timeout_secs", default))
+    config = getattr(server_args, "shared_hicache_config", None)
+    if isinstance(config, SharedHiCacheConfig):
+        return float(config.timeout_secs)
+    if isinstance(config, Mapping):
+        return float(config.get("timeout_secs", default))
+    return float(default)
 
 
 def _load_json_object_config(
@@ -167,14 +170,15 @@ def normalize_shared_hicache_server_config(
             "SharedHiCache plans carry the source endpoint directly"
         )
 
-    transfer_backend = str(
+    transfer_backend_name = str(
         config.get("transfer_backend", transfer_config.get("backend", "auto"))
     ).lower()
-    if transfer_backend not in SHARED_HICACHE_TRANSFER_BACKEND_CHOICES:
+    if transfer_backend_name not in SHARED_HICACHE_TRANSFER_BACKEND_CHOICES:
         raise ValueError(
             "shared_hicache_config.transfer_backend must be one of "
-            f"{SHARED_HICACHE_TRANSFER_BACKEND_CHOICES}, got {transfer_backend!r}"
+            f"{SHARED_HICACHE_TRANSFER_BACKEND_CHOICES}, got {transfer_backend_name!r}"
         )
+    transfer_backend = SharedHiCacheTransferBackendType(transfer_backend_name)
 
     timeout_secs = config.get(
         "timeout_secs",

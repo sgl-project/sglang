@@ -12,10 +12,6 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.shared_hicache.control import (
     is_indeterminate_direct_transfer_reason,
 )
-from sglang.srt.mem_cache.shared_hicache.metrics import (
-    normalize_metric_label,
-    observe_quarantine,
-)
 from sglang.srt.mem_cache.shared_hicache.source import ResolvedHostPage
 
 
@@ -28,6 +24,23 @@ class SharedHiCacheTarget:
         self.metrics_collector = metrics_collector
         self.quarantined_device_indices: list[torch.Tensor] = []
         self.quarantined_tokens_by_backend: dict[str, int] = {}
+
+    def _observe_quarantine(
+        self,
+        *,
+        backend: str,
+        reason: str,
+        tokens: int,
+        current_tokens: int,
+    ) -> None:
+        if self.metrics_collector is None:
+            return
+        self.metrics_collector.observe_shared_hicache_quarantine(
+            backend=backend,
+            reason=reason,
+            tokens=tokens,
+            current_tokens=current_tokens,
+        )
 
     def alloc_device_indices(self, token_count: int) -> Optional[torch.Tensor]:
         allocator = self.tree_cache.cache_controller.mem_pool_device_allocator
@@ -71,14 +84,13 @@ class SharedHiCacheTarget:
         self, device_indices: torch.Tensor, reason: str, *, backend: str
     ) -> None:
         self.quarantined_device_indices.append(device_indices)
-        backend_label = normalize_metric_label(backend)
+        backend_label = str(backend or "unknown")
         token_count = int(device_indices.numel())
         current_tokens = (
             int(self.quarantined_tokens_by_backend.get(backend_label, 0)) + token_count
         )
         self.quarantined_tokens_by_backend[backend_label] = current_tokens
-        observe_quarantine(
-            self.metrics_collector,
+        self._observe_quarantine(
             backend=backend_label,
             reason=reason,
             tokens=token_count,
@@ -100,8 +112,7 @@ class SharedHiCacheTarget:
         for device_indices in quarantined:
             self.free_device_indices(device_indices)
         for backend in tokens_by_backend:
-            observe_quarantine(
-                self.metrics_collector,
+            self._observe_quarantine(
                 backend=backend,
                 reason="released",
                 tokens=0,

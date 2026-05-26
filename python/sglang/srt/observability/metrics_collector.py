@@ -1116,6 +1116,7 @@ class SchedulerMetricsCollector:
         if requests_total is None:
             return
 
+        tokens = max(0, int(tokens))
         labels = {
             **self.labels,
             "backend": backend,
@@ -1154,6 +1155,8 @@ class SchedulerMetricsCollector:
         if events_total is None or current_gauge is None:
             return
 
+        tokens = max(0, int(tokens))
+        current_tokens = max(0, int(current_tokens))
         event_labels = {
             **self.labels,
             "backend": backend,
@@ -1168,7 +1171,7 @@ class SchedulerMetricsCollector:
             self.shared_hicache_quarantined_tokens_total.labels(
                 **event_labels
             ).inc(tokens)
-        current_gauge.labels(**gauge_labels).set(max(0, int(current_tokens)))
+        current_gauge.labels(**gauge_labels).set(current_tokens)
 
     def observe_per_stage_req_latency(self, stage: str, latency: float) -> None:
         labels_with_stage = {**self.labels, "stage": stage}

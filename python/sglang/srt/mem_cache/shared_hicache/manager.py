@@ -13,15 +13,13 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.radix_cache import TreeNode
 from sglang.srt.mem_cache.shared_hicache.config import (
-    shared_hicache_config,
-    shared_hicache_config_value,
+    SharedHiCacheConfig,
     shared_hicache_timeout_secs,
 )
 from sglang.srt.mem_cache.shared_hicache.control import (
     is_indeterminate_direct_transfer_reason,
     request_source_transfer,
 )
-from sglang.srt.mem_cache.shared_hicache.metrics import observe_reuse
 from sglang.srt.mem_cache.shared_hicache.pending import (
     SharedHiCachePendingFetch,
     format_optional_ms,
@@ -68,8 +66,10 @@ class SharedHiCacheResult:
 
 
 def _shared_hicache_enabled(server_args: "ServerArgs") -> bool:
-    config = shared_hicache_config(server_args)
-    return bool(getattr(server_args, "enable_shared_hicache", False) or config)
+    return bool(
+        getattr(server_args, "enable_shared_hicache", False)
+        or getattr(server_args, "shared_hicache_config", None)
+    )
 
 
 class SharedHiCacheManager:
@@ -100,10 +100,9 @@ class SharedHiCacheManager:
                 "SharedHiCache is enabled but no direct transfer backend is available; "
                 "SharedHiCache plans will be treated as cache misses."
             )
-        endpoint_spec = shared_hicache_config_value(
-            server_args,
-            "control_endpoint",
-            None,
+        config = getattr(server_args, "shared_hicache_config", None)
+        endpoint_spec = (
+            config.control_endpoint if isinstance(config, SharedHiCacheConfig) else None
         )
         self.endpoint = self._format_local_control_endpoint(endpoint_spec)
         self.source_service: Optional[SharedHiCacheSourceService] = None
@@ -213,7 +212,9 @@ class SharedHiCacheManager:
             return None
         worker_id = getattr(server_args, "shared_hicache_worker_id", None)
         if worker_id is None:
-            worker_id = shared_hicache_config_value(server_args, "worker_id", None)
+            config = getattr(server_args, "shared_hicache_config", None)
+            if isinstance(config, SharedHiCacheConfig):
+                worker_id = config.worker_id
         if worker_id is None:
             logger.warning(
                 "SharedHiCache disabled because worker_id is not set; "
@@ -240,6 +241,29 @@ class SharedHiCacheManager:
             direct_transfer = getattr(self, "direct_transfer", None)
             return str(getattr(direct_transfer, "name", "direct"))
         return "none"
+
+    def _observe_reuse(
+        self,
+        *,
+        backend: str,
+        outcome: str,
+        reason: str,
+        tokens: int = 0,
+        wait_ms: Optional[float] = None,
+        insert_ms: Optional[float] = None,
+        transfer_bytes: Optional[int] = None,
+    ) -> None:
+        if self.metrics_collector is None:
+            return
+        self.metrics_collector.observe_shared_hicache(
+            backend=backend,
+            outcome=outcome,
+            reason=reason,
+            tokens=max(0, int(tokens)),
+            wait_ms=wait_ms,
+            insert_ms=insert_ms,
+            transfer_bytes=transfer_bytes,
+        )
 
     def _direct_transfer_enabled(self) -> bool:
         direct_transfer = getattr(self, "direct_transfer", None)
@@ -596,8 +620,7 @@ class SharedHiCacheManager:
                 req.rid,
                 type(plan).__name__,
             )
-            observe_reuse(
-                self.metrics_collector,
+            self._observe_reuse(
                 backend=self._current_backend_label(),
                 outcome="skip",
                 reason="invalid_plan",
@@ -612,8 +635,7 @@ class SharedHiCacheManager:
                 plan.plan_id,
                 rejection,
             )
-            observe_reuse(
-                self.metrics_collector,
+            self._observe_reuse(
                 backend=self._current_backend_label(),
                 outcome="skip",
                 reason=rejection,
@@ -636,8 +658,7 @@ class SharedHiCacheManager:
                 matched_tokens,
                 page_size,
             )
-            observe_reuse(
-                self.metrics_collector,
+            self._observe_reuse(
                 backend=self._current_backend_label(),
                 outcome="skip",
                 reason="unaligned_matched_tokens",
@@ -652,8 +673,7 @@ class SharedHiCacheManager:
                 computed_blocks,
                 plan.start_block_index,
             )
-            observe_reuse(
-                self.metrics_collector,
+            self._observe_reuse(
                 backend=self._current_backend_label(),
                 outcome="skip",
                 reason="before_plan_start",
@@ -674,8 +694,7 @@ class SharedHiCacheManager:
                 plan_offset,
                 max_plan_blocks,
             )
-            observe_reuse(
-                self.metrics_collector,
+            self._observe_reuse(
                 backend=self._current_backend_label(),
                 outcome="skip",
                 reason="no_remaining_planned_blocks",
@@ -702,8 +721,7 @@ class SharedHiCacheManager:
                     self._pending_fetches.pop(str(req.rid), None)
                     self._release_pending_fetch(pending)
                     self._finished_plan_keys.add(self._plan_key(req, pending.plan))
-                    observe_reuse(
-                        self.metrics_collector,
+                    self._observe_reuse(
                         backend=pending.backend,
                         outcome="miss",
                         reason=reason,
@@ -736,8 +754,7 @@ class SharedHiCacheManager:
                 plan.plan_id,
             )
             self._finished_plan_keys.add(plan_key)
-            observe_reuse(
-                self.metrics_collector,
+            self._observe_reuse(
                 backend="none",
                 outcome="miss",
                 reason="direct_transfer_unavailable",
@@ -745,8 +762,7 @@ class SharedHiCacheManager:
             return SharedHiCacheResult()
         if direct_transfer_enabled and req.host_hit_length > 0:
             self._finished_plan_keys.add(plan_key)
-            observe_reuse(
-                self.metrics_collector,
+            self._observe_reuse(
                 backend=self._current_backend_label(),
                 outcome="skip",
                 reason="local_host_hit",
@@ -771,8 +787,7 @@ class SharedHiCacheManager:
                 if locked_node is not None:
                     self.tree_cache.dec_lock_ref(locked_node)
                 self._finished_plan_keys.add(plan_key)
-                observe_reuse(
-                    self.metrics_collector,
+                self._observe_reuse(
                     backend=self._current_backend_label(),
                     outcome="miss",
                     reason="direct_submit_unavailable",
@@ -828,8 +843,7 @@ class SharedHiCacheManager:
             if pending.device_indices is not None:
                 self.target_cache.free_device_indices(pending.device_indices)
             self._finished_plan_keys.add(self._plan_key(req, plan))
-            observe_reuse(
-                self.metrics_collector,
+            self._observe_reuse(
                 backend=pending.backend,
                 outcome="error",
                 reason="fetch_exception",
@@ -858,8 +872,7 @@ class SharedHiCacheManager:
                 else:
                     self.target_cache.free_device_indices(pending.device_indices)
             self._finished_plan_keys.add(self._plan_key(req, plan))
-            observe_reuse(
-                self.metrics_collector,
+            self._observe_reuse(
                 backend=pending.backend,
                 outcome="error" if indeterminate_transfer else "miss",
                 reason=reason,
@@ -879,8 +892,7 @@ class SharedHiCacheManager:
             if pending.device_indices is not None:
                 self.target_cache.free_device_indices(pending.device_indices)
             self._finished_plan_keys.add(self._plan_key(req, plan))
-            observe_reuse(
-                self.metrics_collector,
+            self._observe_reuse(
                 backend=pending.backend,
                 outcome="error",
                 reason="too_many_pages",
@@ -900,8 +912,7 @@ class SharedHiCacheManager:
             if pending.device_indices is not None:
                 self.target_cache.free_device_indices(pending.device_indices)
             self._finished_plan_keys.add(self._plan_key(req, plan))
-            observe_reuse(
-                self.metrics_collector,
+            self._observe_reuse(
                 backend=pending.backend,
                 outcome="error",
                 reason="non_contiguous_pages",
@@ -917,8 +928,7 @@ class SharedHiCacheManager:
                     "Shared HiCache direct transfer completed without target device indices"
                 )
                 self._finished_plan_keys.add(self._plan_key(req, plan))
-                observe_reuse(
-                    self.metrics_collector,
+                self._observe_reuse(
                     backend=pending.backend,
                     outcome="error",
                     reason="missing_target_device_indices",
@@ -939,8 +949,7 @@ class SharedHiCacheManager:
                 plan.plan_id,
             )
             self._finished_plan_keys.add(self._plan_key(req, plan))
-            observe_reuse(
-                self.metrics_collector,
+            self._observe_reuse(
                 backend=pending.backend,
                 outcome="error",
                 reason="insert_exception",
@@ -979,8 +988,7 @@ class SharedHiCacheManager:
         if staged_tokens > 0:
             self._finished_plan_prefix_lens[self._plan_key(req, plan)] = prefix_len
         outcome = "hit" if staged_tokens > 0 else "miss"
-        observe_reuse(
-            self.metrics_collector,
+        self._observe_reuse(
             backend=pending.backend,
             outcome=outcome,
             reason=reason if staged_tokens > 0 else "insert_returned_zero",
