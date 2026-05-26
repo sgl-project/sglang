@@ -130,15 +130,7 @@ class DeepseekV2WeightLoaderMixin:
             weights, NVFP4_CKPT_FP8_ATTN_QUANT_MODULES, nextn_conf
         )
 
-        # Persist across calls: chunked weight updates can split q_a_proj and
-        # kv_a_proj_with_mqa for the same layer into different chunks, and
-        # the fusion only fires once both halves have been seen.
-        if self.fuse_qkv_a_proj:
-            if not hasattr(self, "_persistent_cached_a_proj"):
-                self._persistent_cached_a_proj = {}
-            cached_a_proj = self._persistent_cached_a_proj
-        else:
-            cached_a_proj = None
+        cached_a_proj = {} if self.fuse_qkv_a_proj else None
 
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
@@ -269,10 +261,9 @@ class DeepseekV2WeightLoaderMixin:
                         if self.fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
-                            # Clone: `loaded_weight` may be a view into an IPC
-                            # bucket that gets reused by the next chunk, and
-                            # the RunAI streamer also relies on cloning.
-                            cached_a_proj[name] = loaded_weight.detach().clone()
+                            cached_a_proj[name] = _clone_if_runai_streamed_tensor(
+                                loaded_weight
+                            )
                             q_a_proj_name = (
                                 name
                                 if "q_a_proj" in name
