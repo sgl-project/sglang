@@ -568,7 +568,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.rids_int = hashed
             ret.bootstrap_room_ids_int = bootstrap_room_ids
 
-        if envs.SGLANG_KV_CANARY_ENABLE_REQ_TOKEN_IDS_CHECK.get():
+        if envs.SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT.get():
             # Snapshot req sequences as pinned CPU int64 tensors so the canary
             # outside-graph pre-op can H2D into a device staging buffer without
             # racing the overlap-schedule sampler thread mutating Req.output_ids.

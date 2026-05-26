@@ -47,7 +47,7 @@ def launch_canary_verify_kernel_torch_reference(
     slot_indices_host = plan.verify_slot_indices[:active].to(
         device=work_device, dtype=torch.int64
     )
-    expected_input_ids_host = plan.verify_expected_input_ids[:active].to(
+    expected_input_ids_host = plan.verify_expected_tokens[:active].to(
         device=work_device, dtype=torch.int64
     )
     expected_positions_host = plan.verify_expected_positions[:active].to(

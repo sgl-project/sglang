@@ -20,7 +20,7 @@ def launch_canary_plan_kernels_torch_reference(
     swa_window_size: int,
     full_to_swa_index_mapping: Optional[torch.Tensor],
     verify_capacity: int,
-    req_to_expected_token_ids: Optional[torch.Tensor],
+    req_to_verify_expected_tokens: Optional[torch.Tensor],
     kv_token_id_vs_position_offset: int,
 ) -> None:
     """Python reference for :func:`launch_canary_plan_kernels`. Same signature & byte-equal semantics."""
@@ -49,8 +49,8 @@ def launch_canary_plan_kernels_torch_reference(
         lut = full_to_swa_index_mapping.detach().to(device=work_device)
 
     expected_token_pool_host: Optional[torch.Tensor] = None
-    if req_to_expected_token_ids is not None:
-        expected_token_pool_host = req_to_expected_token_ids.detach().to(
+    if req_to_verify_expected_tokens is not None:
+        expected_token_pool_host = req_to_verify_expected_tokens.detach().to(
             device=work_device, dtype=torch.int64
         )
 
@@ -201,9 +201,9 @@ def _materialize_verify_entries(
             verify_plan_out.verify_slot_indices.device
         )
     )
-    verify_plan_out.verify_expected_input_ids[:total_verify].copy_(
-        expected_input_ids_t.to(verify_plan_out.verify_expected_input_ids.dtype).to(
-            verify_plan_out.verify_expected_input_ids.device
+    verify_plan_out.verify_expected_tokens[:total_verify].copy_(
+        expected_input_ids_t.to(verify_plan_out.verify_expected_tokens.dtype).to(
+            verify_plan_out.verify_expected_tokens.device
         )
     )
     verify_plan_out.verify_expected_positions[:total_verify].copy_(

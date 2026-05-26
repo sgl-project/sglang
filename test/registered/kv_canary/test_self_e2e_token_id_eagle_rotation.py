@@ -5,9 +5,9 @@ The bug: when a req is mid-chunked-prefill, the EAGLE draft prefill rotation
 overrides the chunk-1 seg-end tail with the target model's predicted next
 token instead of the next prompt token. PR #26329 fixes this by reading
 ``req.origin_input_ids`` at the chunk boundary. The kv_canary token-id
-validator (``SGLANG_KV_CANARY_ENABLE_REQ_TOKEN_IDS_CHECK=1``) reads the same
+validator (``SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT=1``) reads the same
 ``origin_input_ids + output_ids`` per req, populates a static
-``req_to_expected_token_ids`` pool, and the verify kernel compares each
+``req_to_verify_expected_tokens`` pool, and the verify kernel compares each
 canary slot's stored token against ``pool[rp, p + kv_token_id_vs_position_offset]``.
 For EAGLE draft pools ``kv_token_id_vs_position_offset = 1``, so the buggy
 revert reliably fires a ``verify_token`` violation without depending on any

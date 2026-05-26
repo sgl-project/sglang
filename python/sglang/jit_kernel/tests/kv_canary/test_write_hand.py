@@ -1008,7 +1008,7 @@ class TestRealKvHash:
                 input_ids=input_ids,
                 positions=positions,
                 out_cache_loc=out_cache_loc,
-                enable_assert_inputs=False,
+                enable_write_input_assert=False,
                 expected_input_tokens=None,
                 expected_input_positions=None,
             )
@@ -1186,7 +1186,7 @@ class TestRealKvHash:
                 input_ids=_int32_tensor([1]),
                 positions=_int32_tensor([0]),
                 out_cache_loc=_int32_tensor([2]),
-                enable_assert_inputs=False,
+                enable_write_input_assert=False,
                 expected_input_tokens=None,
                 expected_input_positions=None,
             )
@@ -1366,7 +1366,7 @@ class TestMisc:
                 input_ids=input_ids,
                 positions=positions,
                 out_cache_loc=out_cache_loc,
-                enable_assert_inputs=False,
+                enable_write_input_assert=False,
                 expected_input_tokens=None,
                 expected_input_positions=None,
             )

@@ -136,7 +136,7 @@ def make_verify_plan(
         plan.verify_slot_indices[:n_active] = torch.tensor(
             slot_indices, dtype=torch.int64, device=device
         )
-        plan.verify_expected_input_ids[:n_active] = torch.tensor(
+        plan.verify_expected_tokens[:n_active] = torch.tensor(
             expected_input_ids, dtype=torch.int64, device=device
         )
         plan.verify_expected_positions[:n_active] = torch.tensor(

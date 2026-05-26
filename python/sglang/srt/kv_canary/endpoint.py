@@ -45,7 +45,7 @@ class CanaryEndpoint:
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
-        input_check_mode: bool,
+        enable_write_input_assert: bool,
         expected_inputs: ExpectedInputs,
         violation_log: ViolationLog,
         real_kv_hash_mode: RealKvHashMode,
@@ -69,7 +69,7 @@ class CanaryEndpoint:
             out_cache_loc_for_canary = self.full_to_swa_index_mapping[out_cache_loc]
         else:
             out_cache_loc_for_canary = out_cache_loc
-        if input_check_mode:
+        if enable_write_input_assert:
             expected_input_tokens = expected_inputs.tokens
             expected_input_positions = expected_inputs.positions
         else:
@@ -82,7 +82,7 @@ class CanaryEndpoint:
             input_ids=input_ids,
             positions=positions,
             out_cache_loc=out_cache_loc_for_canary,
-            enable_assert_inputs=input_check_mode,
+            enable_write_input_assert=enable_write_input_assert,
             expected_input_tokens=expected_input_tokens,
             expected_input_positions=expected_input_positions,
         )

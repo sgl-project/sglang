@@ -90,7 +90,7 @@ def _run_pipeline(
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=verify_capacity,
-        req_to_expected_token_ids=None,
+        req_to_verify_expected_tokens=None,
         kv_token_id_vs_position_offset=0,
     )
 
@@ -112,7 +112,7 @@ def _run_pipeline(
             input_ids=input_ids,
             positions=positions,
             out_cache_loc=out_cache_loc,
-            enable_assert_inputs=enable_write_verify_inputs,
+            enable_write_input_assert=enable_write_verify_inputs,
             expected_input_tokens=expected_input_tokens,
             expected_input_positions=expected_input_positions,
         )
@@ -135,7 +135,7 @@ def _run_pipeline(
             input_ids=input_ids,
             positions=positions,
             out_cache_loc=out_cache_loc,
-            enable_assert_inputs=enable_write_verify_inputs,
+            enable_write_input_assert=enable_write_verify_inputs,
             expected_input_tokens=expected_input_tokens,
             expected_input_positions=expected_input_positions,
         )
@@ -700,7 +700,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
         swa_window_size=0,
         full_to_swa_index_mapping=None,
         verify_capacity=int(plan_v_real.verify_slot_indices.shape[0]),
-        req_to_expected_token_ids=None,
+        req_to_verify_expected_tokens=None,
         kv_token_id_vs_position_offset=0,
     )
     launch_canary_plan_kernels_torch_reference(
@@ -713,7 +713,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
         swa_window_size=0,
         full_to_swa_index_mapping=None,
         verify_capacity=int(plan_v_ref.verify_slot_indices.shape[0]),
-        req_to_expected_token_ids=None,
+        req_to_verify_expected_tokens=None,
         kv_token_id_vs_position_offset=0,
     )
 

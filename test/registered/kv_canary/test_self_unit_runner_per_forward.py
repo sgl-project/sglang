@@ -98,7 +98,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
             expected_inputs=ExpectedInputs.allocate(capacity=3, device=self.device),
             violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
             real_kv_hash_mode=RealKvHashMode.NONE,
-            input_check_mode=False,
+            enable_write_input_assert=False,
         )
 
         self.assertEqual(len(endpoint.calls), 1)
@@ -150,7 +150,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
             expected_inputs=ExpectedInputs.allocate(capacity=1, device=self.device),
             violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
             real_kv_hash_mode=RealKvHashMode.NONE,
-            input_check_mode=False,
+            enable_write_input_assert=False,
         )
 
         self.assertEqual(len(endpoint.calls), 1)
@@ -187,7 +187,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
             expected_inputs=ExpectedInputs.allocate(capacity=1, device=self.device),
             violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
             real_kv_hash_mode=RealKvHashMode.NONE,
-            input_check_mode=False,
+            enable_write_input_assert=False,
         )
 
         self.assertEqual(len(endpoint.calls), 1)

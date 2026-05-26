@@ -16,24 +16,24 @@ namespace {
 
 struct PlanEntriesParams {
   // Inputs.
-  const int64_t* __restrict__ req_pool_indices;           // [bs_padded] int64
-  const int64_t* __restrict__ prefix_lens;                // [bs_padded] int64
-  const int32_t* __restrict__ req_to_token;               // [max_reqs, max_seq_len] int32
-  const int64_t* __restrict__ full_to_swa_lut;            // [lut_len] int64, may be nullptr when !HAS_SWA_LUT
-  const int64_t* __restrict__ verify_offsets_scratch;     // [bs_padded + 1] int64 (cumulative prefix sum)
-  const int32_t* __restrict__ verify_enable;              // [1] int32 — 0 ⇒ skip scatter entirely
-  const int32_t* __restrict__ req_to_expected_token_ids;  // [max_reqs, max_context_len] int32, may be nullptr
+  const int64_t* __restrict__ req_pool_indices;               // [bs_padded] int64
+  const int64_t* __restrict__ prefix_lens;                    // [bs_padded] int64
+  const int32_t* __restrict__ req_to_token;                   // [max_reqs, max_seq_len] int32
+  const int64_t* __restrict__ full_to_swa_lut;                // [lut_len] int64, may be nullptr when !HAS_SWA_LUT
+  const int64_t* __restrict__ verify_offsets_scratch;         // [bs_padded + 1] int64 (cumulative prefix sum)
+  const int32_t* __restrict__ verify_enable;                  // [1] int32 — 0 ⇒ skip scatter entirely
+  const int32_t* __restrict__ req_to_verify_expected_tokens;  // [max_reqs, max_context_len] int32, may be nullptr
   // Outputs.
   int64_t* __restrict__ out_verify_slot_indices;        // [verify_capacity] int64
-  int64_t* __restrict__ out_verify_expected_input_ids;  // [verify_capacity] int64
+  int64_t* __restrict__ out_verify_expected_tokens;     // [verify_capacity] int64
   int64_t* __restrict__ out_verify_expected_positions;  // [verify_capacity] int64
   int64_t* __restrict__ out_verify_prev_slot_indices;   // [verify_capacity] int64
   // Sizes / strides.
   int32_t bs_padded;
   int64_t verify_capacity;  // out_verify_*[verify_capacity]; scatter is clamped to this length.
   int64_t req_to_token_stride0;
-  int64_t req_to_expected_token_ids_stride0;
-  int64_t req_to_expected_token_ids_size0;
+  int64_t req_to_verify_expected_tokens_stride0;
+  int64_t req_to_verify_expected_tokens_size0;
   int32_t kv_token_id_vs_position_offset;  // 0 for target pools; +1 for EAGLE draft.
   int32_t swa_window_size;
 };
@@ -69,9 +69,9 @@ SGL_DEVICE int64_t swa_translate(const int64_t* __restrict__ lut, int64_t lut_le
 
 // Persistent grid; one thread = one verify entry (with stride). Template parameter HAS_SWA_LUT switches
 // the SWA-translate path off entirely in the FULL pool variant.
-// HAS_EXPECTED_TOKEN_POOL toggles the source-of-truth token gather; when off, every active entry
+// HAS_VERIFY_EXPECTED_TOKEN_POOL toggles the source-of-truth token gather; when off, every active entry
 // writes the ``-1`` sentinel so the verify kernel skips the token-mismatch check.
-template <bool HAS_SWA_LUT, bool HAS_EXPECTED_TOKEN_POOL>
+template <bool HAS_SWA_LUT, bool HAS_VERIFY_EXPECTED_TOKEN_POOL>
 __global__ void plan_entries_persistent_kernel(
     const PlanEntriesParams __grid_constant__ params,
     int64_t lut_len  // only meaningful when HAS_SWA_LUT
@@ -140,23 +140,24 @@ __global__ void plan_entries_persistent_kernel(
     }
 
     int64_t out_expected_input_id = -1;
-    if constexpr (HAS_EXPECTED_TOKEN_POOL) {
+    if constexpr (HAS_VERIFY_EXPECTED_TOKEN_POOL) {
       const int64_t sot_pos = out_position + static_cast<int64_t>(params.kv_token_id_vs_position_offset);
-      if (sot_pos >= 0 && sot_pos < params.req_to_expected_token_ids_size0) {
-        const int32_t token = params.req_to_expected_token_ids[rp * params.req_to_expected_token_ids_stride0 + sot_pos];
+      if (sot_pos >= 0 && sot_pos < params.req_to_verify_expected_tokens_size0) {
+        const int32_t token =
+            params.req_to_verify_expected_tokens[rp * params.req_to_verify_expected_tokens_stride0 + sot_pos];
         out_expected_input_id = static_cast<int64_t>(token);
       }
     }
 
     // 4) Scatter. out_idx == tid since verify_offsets[req_id] + entry_idx == tid by construction.
     params.out_verify_slot_indices[tid] = out_slot;
-    params.out_verify_expected_input_ids[tid] = out_expected_input_id;
+    params.out_verify_expected_tokens[tid] = out_expected_input_id;
     params.out_verify_expected_positions[tid] = out_position;
     params.out_verify_prev_slot_indices[tid] = out_prev_slot;
   }
 }
 
-template <bool HAS_SWA_LUT, bool HAS_EXPECTED_TOKEN_POOL>
+template <bool HAS_SWA_LUT, bool HAS_VERIFY_EXPECTED_TOKEN_POOL>
 struct PlanEntriesKernel {
   static constexpr int kBlockSize = 128;
   static constexpr int kBlocksPerSm = 8;
@@ -173,9 +174,9 @@ struct PlanEntriesKernel {
       const tvm::ffi::Optional<tvm::ffi::TensorView> full_to_swa_index_mapping,
       const tvm::ffi::TensorView verify_offsets_scratch,
       const tvm::ffi::TensorView verify_enable,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> req_to_expected_token_ids,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> req_to_verify_expected_tokens,
       const tvm::ffi::TensorView out_verify_slot_indices,
-      const tvm::ffi::TensorView out_verify_expected_input_ids,
+      const tvm::ffi::TensorView out_verify_expected_tokens,
       const tvm::ffi::TensorView out_verify_expected_positions,
       const tvm::ffi::TensorView out_verify_prev_slot_indices,
       int32_t kv_token_id_vs_position_offset,
@@ -188,8 +189,8 @@ struct PlanEntriesKernel {
     SymbolicSize Nmax_reqs = {"max_reqs"};
     SymbolicSize Nmax_seq_len = {"max_seq_len"};
     SymbolicSize Nlut = {"lut_len"};
-    SymbolicSize Npool_rows = {"req_to_expected_token_ids_rows"};
-    SymbolicSize Npool_cols = {"req_to_expected_token_ids_cols"};
+    SymbolicSize Npool_rows = {"req_to_verify_expected_tokens_rows"};
+    SymbolicSize Npool_cols = {"req_to_verify_expected_tokens_cols"};
     SymbolicDevice device_;
     device_.set_options<kDLCUDA>();
 
@@ -210,7 +211,7 @@ struct PlanEntriesKernel {
         .with_dtype<int64_t>()
         .with_device<kDLCUDA>(device_)
         .verify(out_verify_slot_indices)
-        .verify(out_verify_expected_input_ids)
+        .verify(out_verify_expected_tokens)
         .verify(out_verify_expected_positions)
         .verify(out_verify_prev_slot_indices);
     TensorMatcher({Nmax_reqs, Nmax_seq_len})  //
@@ -221,19 +222,19 @@ struct PlanEntriesKernel {
         full_to_swa_index_mapping.has_value() == HAS_SWA_LUT,
         "full_to_swa_index_mapping presence does not match HAS_SWA_LUT specialization");
     RuntimeCheck(
-        req_to_expected_token_ids.has_value() == HAS_EXPECTED_TOKEN_POOL,
-        "req_to_expected_token_ids presence does not match HAS_EXPECTED_TOKEN_POOL specialization");
+        req_to_verify_expected_tokens.has_value() == HAS_VERIFY_EXPECTED_TOKEN_POOL,
+        "req_to_verify_expected_tokens presence does not match HAS_VERIFY_EXPECTED_TOKEN_POOL specialization");
     if constexpr (HAS_SWA_LUT) {
       TensorMatcher({Nlut})  //
           .with_dtype<int64_t>()
           .with_device<kDLCUDA>(device_)
           .verify(full_to_swa_index_mapping.value());
     }
-    if constexpr (HAS_EXPECTED_TOKEN_POOL) {
+    if constexpr (HAS_VERIFY_EXPECTED_TOKEN_POOL) {
       TensorMatcher({Npool_rows, Npool_cols})  //
           .with_dtype<int32_t>()
           .with_device<kDLCUDA>(device_)
-          .verify(req_to_expected_token_ids.value());
+          .verify(req_to_verify_expected_tokens.value());
     }
     RuntimeCheck(Nscratch.unwrap() >= Nbs.unwrap() + 1, "verify_offsets_scratch length must be >= bs_padded + 1");
 
@@ -252,8 +253,8 @@ struct PlanEntriesKernel {
     const int32_t* expected_token_ids_ptr = nullptr;
     int64_t expected_token_ids_stride0 = 0;
     int64_t expected_token_ids_max_context_len = 0;
-    if constexpr (HAS_EXPECTED_TOKEN_POOL) {
-      expected_token_ids_ptr = static_cast<const int32_t*>(req_to_expected_token_ids.value().data_ptr());
+    if constexpr (HAS_VERIFY_EXPECTED_TOKEN_POOL) {
+      expected_token_ids_ptr = static_cast<const int32_t*>(req_to_verify_expected_tokens.value().data_ptr());
       expected_token_ids_stride0 = static_cast<int64_t>(Npool_cols.unwrap());
       expected_token_ids_max_context_len = static_cast<int64_t>(Npool_cols.unwrap());
     }
@@ -265,16 +266,16 @@ struct PlanEntriesKernel {
         .full_to_swa_lut = lut_ptr,
         .verify_offsets_scratch = static_cast<const int64_t*>(verify_offsets_scratch.data_ptr()),
         .verify_enable = static_cast<const int32_t*>(verify_enable.data_ptr()),
-        .req_to_expected_token_ids = expected_token_ids_ptr,
+        .req_to_verify_expected_tokens = expected_token_ids_ptr,
         .out_verify_slot_indices = static_cast<int64_t*>(out_verify_slot_indices.data_ptr()),
-        .out_verify_expected_input_ids = static_cast<int64_t*>(out_verify_expected_input_ids.data_ptr()),
+        .out_verify_expected_tokens = static_cast<int64_t*>(out_verify_expected_tokens.data_ptr()),
         .out_verify_expected_positions = static_cast<int64_t*>(out_verify_expected_positions.data_ptr()),
         .out_verify_prev_slot_indices = static_cast<int64_t*>(out_verify_prev_slot_indices.data_ptr()),
         .bs_padded = static_cast<int32_t>(bs_padded),
         .verify_capacity = static_cast<int64_t>(Ncap.unwrap()),
         .req_to_token_stride0 = static_cast<int64_t>(Nmax_seq_len.unwrap()),
-        .req_to_expected_token_ids_stride0 = expected_token_ids_stride0,
-        .req_to_expected_token_ids_size0 = expected_token_ids_max_context_len,
+        .req_to_verify_expected_tokens_stride0 = expected_token_ids_stride0,
+        .req_to_verify_expected_tokens_size0 = expected_token_ids_max_context_len,
         .kv_token_id_vs_position_offset = kv_token_id_vs_position_offset,
         .swa_window_size = swa_window_size,
     };
@@ -287,7 +288,7 @@ struct PlanEntriesKernel {
     const dim3 block(kBlockSize);
 
     LaunchKernel(grid, block, device)(
-        plan_entries_persistent_kernel<HAS_SWA_LUT, HAS_EXPECTED_TOKEN_POOL>, params, lut_len);
+        plan_entries_persistent_kernel<HAS_SWA_LUT, HAS_VERIFY_EXPECTED_TOKEN_POOL>, params, lut_len);
   }
 };
 

@@ -12,13 +12,13 @@ from sglang.test.kv_canary.e2e_base import CanaryE2EBase
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
 
 _SPEC_EAGLE_TOKEN_ORACLE_ENV = {
-    "SGLANG_KV_CANARY_INPUT_CHECK": "0",
+    "SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT": "0",
     "SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE": "1",
     # Real-model token-id validator is mutually exclusive with mock TokenOracle:
     # it uses req.origin_input_ids/output_ids as SOT, but mock-model output_ids
     # come from TokenOracle synthetic generation and do not match what the kernel
     # actually writes at each slot.
-    "SGLANG_KV_CANARY_ENABLE_REQ_TOKEN_IDS_CHECK": "0",
+    "SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT": "0",
 }
 _SPEC_EAGLE_REVERT_PR_ENV = {
     **_SPEC_EAGLE_TOKEN_ORACLE_ENV,

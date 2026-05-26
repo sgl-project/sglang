@@ -143,17 +143,17 @@ class SingleForwardManager:
                 f"CanaryLaunchCapacities.from_args"
             )
 
-        self._populate_expected_token_pool(forward_batch=maybe_inaccurate_forward_batch)
+        self._populate_verify_token_pool(forward_batch=maybe_inaccurate_forward_batch)
 
-    def _populate_expected_token_pool(self, *, forward_batch: "ForwardBatch") -> None:
-        if not self._config.enable_req_token_ids_check:
+    def _populate_verify_token_pool(self, *, forward_batch: "ForwardBatch") -> None:
+        if not self._config.enable_verify_token_assert:
             return
         req_all_ids_flat_cpu = forward_batch.req_all_ids_flat
         req_all_ids_lens_cpu = forward_batch.req_all_ids_lens
         if req_all_ids_flat_cpu is None or req_all_ids_lens_cpu is None:
             return
-        req_to_expected_token_ids = self._device_state.req_to_expected_token_ids
-        if req_to_expected_token_ids is None:
+        req_to_verify_expected_tokens = self._device_state.req_to_verify_expected_tokens
+        if req_to_verify_expected_tokens is None:
             return
 
         bs = int(forward_batch.req_pool_indices.shape[0])
@@ -178,7 +178,7 @@ class SingleForwardManager:
         if total_tokens == 0:
             return
 
-        device = req_to_expected_token_ids.device
+        device = req_to_verify_expected_tokens.device
         # ForwardBatch.init_new already allocates ``req_all_ids_flat`` / ``req_all_ids_lens``
         # as pinned-CPU tensors, so non_blocking H2D here is safe (and actually async).
         req_all_ids_flat_dev = req_all_ids_flat_cpu.to(device, non_blocking=True)
@@ -191,7 +191,7 @@ class SingleForwardManager:
             flat_in=req_all_ids_flat_dev,
             offsets=offsets_dev,
             req_pool_indices=req_pool_indices_dev,
-            pool_out=req_to_expected_token_ids,
+            pool_out=req_to_verify_expected_tokens,
         )
 
     def pre_ops_maybe_inside_graph(
@@ -222,12 +222,14 @@ class SingleForwardManager:
             bs_capacity=self._write_req_capacity, device=self._device
         )
 
-        input_check_mode = self._should_enable_input_check_for_launch(forward_batch)
-        if input_check_mode:
+        enable_write_input_assert = self._should_enable_write_input_assert_for_launch(
+            forward_batch
+        )
+        if enable_write_input_assert:
             manager = self._token_oracle_manager
             if manager is None:
                 raise RuntimeError(
-                    "kv-canary: input_check_mode=True requires a TokenOracleManager; pass "
+                    "kv-canary: enable_write_input_assert=True requires a TokenOracleManager; pass "
                     "token_oracle_manager=install_oracle_sampler(oracle=...) into "
                     "install_canary(...)"
                 )
@@ -252,7 +254,7 @@ class SingleForwardManager:
                 group=group,
                 req_to_token=self._req_to_token_pool.req_to_token,
                 swa_window_size=self._swa_window_size,
-                req_to_expected_token_ids=self._device_state.req_to_expected_token_ids,
+                req_to_verify_expected_tokens=self._device_state.req_to_verify_expected_tokens,
             )
             if self._swa_divergence_report is not None:
                 self._swa_divergence_report.observe_after_invoke_plan(
@@ -269,7 +271,7 @@ class SingleForwardManager:
                 expected_inputs=expected_inputs_slice,
                 violation_log=violation_log,
                 real_kv_hash_mode=self._config.real_kv_hash_mode,
-                input_check_mode=input_check_mode,
+                enable_write_input_assert=enable_write_input_assert,
             )
 
         return _PreOpsMaybeInsideGraphOutput(
@@ -292,7 +294,9 @@ class SingleForwardManager:
         violation_log = self._device_state.violation_log
         num_tokens = int(forward_batch.positions.shape[0])
         expected_inputs_slice = pre_ops_output.expected_inputs.slice(num_tokens)
-        input_check_mode = self._should_enable_input_check_for_launch(forward_batch)
+        enable_write_input_assert = self._should_enable_write_input_assert_for_launch(
+            forward_batch
+        )
         for group_idx, group in enumerate(self._buffer_groups):
             launch_endpoints_per_forward(
                 endpoints=self._endpoints,
@@ -304,7 +308,7 @@ class SingleForwardManager:
                 expected_inputs=expected_inputs_slice,
                 violation_log=violation_log,
                 real_kv_hash_mode=self._config.real_kv_hash_mode,
-                input_check_mode=input_check_mode,
+                enable_write_input_assert=enable_write_input_assert,
             )
 
         verify_plan_enable_combined = _torch_reduce_minimum(
@@ -331,10 +335,10 @@ class SingleForwardManager:
 
         self._enable_warner.tick(self._output_buffer.verify_plan_enable)
 
-    def _should_enable_input_check_for_launch(
+    def _should_enable_write_input_assert_for_launch(
         self, forward_batch: "ForwardBatch"
     ) -> bool:
-        if not self._config.input_check_mode:
+        if not self._config.enable_write_input_assert:
             return False
         forward_mode = forward_batch.forward_mode
         if (

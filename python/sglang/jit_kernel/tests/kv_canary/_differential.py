@@ -63,7 +63,7 @@ def _run_both_plan(
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=verify_capacity,
-        req_to_expected_token_ids=None,
+        req_to_verify_expected_tokens=None,
         kv_token_id_vs_position_offset=0,
     )
     launch_canary_plan_kernels_torch_reference(
@@ -76,7 +76,7 @@ def _run_both_plan(
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=int(ref_verify.verify_slot_indices.shape[0]),
-        req_to_expected_token_ids=None,
+        req_to_verify_expected_tokens=None,
         kv_token_id_vs_position_offset=0,
     )
     torch.cuda.synchronize()
@@ -130,8 +130,8 @@ def _assert_plans_byte_equal(
             ref_verify.verify_slot_indices[:n_verify],
         )
         assert torch.equal(
-            triton_verify.verify_expected_input_ids[:n_verify],
-            ref_verify.verify_expected_input_ids[:n_verify],
+            triton_verify.verify_expected_tokens[:n_verify],
+            ref_verify.verify_expected_tokens[:n_verify],
         )
         assert torch.equal(
             triton_verify.verify_expected_positions[:n_verify],
@@ -252,7 +252,7 @@ def _run_both_write(
         input_ids=input_ids,
         positions=positions,
         out_cache_loc=out_cache_loc,
-        enable_assert_inputs=enable_write_verify_inputs,
+        enable_write_input_assert=enable_write_verify_inputs,
         expected_input_tokens=expected_tokens_for_launch,
         expected_input_positions=expected_positions_for_launch,
     )
@@ -272,7 +272,7 @@ def _run_both_write(
         input_ids=input_ids,
         positions=positions,
         out_cache_loc=out_cache_loc,
-        enable_assert_inputs=enable_write_verify_inputs,
+        enable_write_input_assert=enable_write_verify_inputs,
         expected_input_tokens=expected_tokens_for_launch,
         expected_input_positions=expected_positions_for_launch,
     )

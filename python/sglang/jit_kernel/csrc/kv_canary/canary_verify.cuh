@@ -25,7 +25,7 @@ struct VerifyKernelParams {
 
   // Plan tensors.
   const int64_t* verify_slot_indices;
-  const int64_t* verify_expected_input_ids;
+  const int64_t* verify_expected_tokens;
   const int64_t* verify_expected_positions;
   const int64_t* verify_prev_slot_indices;
   const int32_t* verify_num_valid;
@@ -64,7 +64,7 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
     ++local_active_count;
 
     const int64_t slot_idx = p.verify_slot_indices[entry_idx];
-    const int64_t expected_input_id = p.verify_expected_input_ids[entry_idx];
+    const int64_t expected_input_id = p.verify_expected_tokens[entry_idx];
     const int64_t expected_position = p.verify_expected_positions[entry_idx];
     const int64_t prev_slot_idx = p.verify_prev_slot_indices[entry_idx];
 
@@ -140,7 +140,7 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
 inline void canary_verify_step_cuda(
     tvm::ffi::TensorView canary_buf,
     tvm::ffi::TensorView verify_slot_indices,
-    tvm::ffi::TensorView verify_expected_input_ids,
+    tvm::ffi::TensorView verify_expected_tokens,
     tvm::ffi::TensorView verify_expected_positions,
     tvm::ffi::TensorView verify_prev_slot_indices,
     tvm::ffi::TensorView verify_num_valid,
@@ -171,7 +171,7 @@ inline void canary_verify_step_cuda(
       .with_dtype<int64_t>()
       .with_device<kDLCUDA>(device_)
       .verify(verify_slot_indices)
-      .verify(verify_expected_input_ids)
+      .verify(verify_expected_tokens)
       .verify(verify_expected_positions)
       .verify(verify_prev_slot_indices);
   TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(verify_num_valid);
@@ -242,7 +242,7 @@ inline void canary_verify_step_cuda(
   p.canary_buf = static_cast<const uint8_t*>(canary_buf.data_ptr());
   p.slot_stride_bytes = slot_stride_bytes;
   p.verify_slot_indices = static_cast<const int64_t*>(verify_slot_indices.data_ptr());
-  p.verify_expected_input_ids = static_cast<const int64_t*>(verify_expected_input_ids.data_ptr());
+  p.verify_expected_tokens = static_cast<const int64_t*>(verify_expected_tokens.data_ptr());
   p.verify_expected_positions = static_cast<const int64_t*>(verify_expected_positions.data_ptr());
   p.verify_prev_slot_indices = static_cast<const int64_t*>(verify_prev_slot_indices.data_ptr());
   p.verify_num_valid = static_cast<const int32_t*>(verify_num_valid.data_ptr());

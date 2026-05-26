@@ -223,14 +223,14 @@ class TestMockModelServerLaunchHelpers(CustomTestCase):
         """Verify mock model launch env enables canary input checking by default."""
         env = mock_model_server_env()
 
-        self.assertEqual(env["SGLANG_KV_CANARY_INPUT_CHECK"], "1")
+        self.assertEqual(env["SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT"], "1")
         self.assertEqual(env["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"], "1")
 
     def test_mock_model_server_env_can_disable_input_check(self) -> None:
         """Verify mock model launch env can disable canary input checking."""
         env = mock_model_server_env(input_check_enabled=False)
 
-        self.assertEqual(env["SGLANG_KV_CANARY_INPUT_CHECK"], "0")
+        self.assertEqual(env["SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT"], "0")
         self.assertEqual(env["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"], "1")
 
 

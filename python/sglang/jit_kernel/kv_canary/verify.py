@@ -172,9 +172,9 @@ class VerifyPlan:
     Fields:
         verify_slot_indices: Canary slot index per entry, shape [verify_capacity], int64. Already SWA-translated
             for the SWA group.
-        verify_expected_input_ids: Source-of-truth token id per entry, shape [verify_capacity], int64.
+        verify_expected_tokens: Source-of-truth token id per entry, shape [verify_capacity], int64.
             The plan-side entries kernel gathers from
-            ``CanaryDeviceState.req_to_expected_token_ids[rp, position + kv_token_id_vs_position_offset]``;
+            ``CanaryDeviceState.req_to_verify_expected_tokens[rp, position + kv_token_id_vs_position_offset]``;
             entries that fall outside the pool's row (e.g. EAGLE draft's last slot rotating in a bonus
             token, or padding beyond the per-req length) get the ``-1`` sentinel. The verify kernel
             compares against the stored canary token and skips when this is ``-1``.
@@ -191,7 +191,7 @@ class VerifyPlan:
     """
 
     verify_slot_indices: torch.Tensor
-    verify_expected_input_ids: torch.Tensor
+    verify_expected_tokens: torch.Tensor
     verify_expected_positions: torch.Tensor
     verify_prev_slot_indices: torch.Tensor
     verify_num_valid: torch.Tensor
@@ -207,7 +207,7 @@ class VerifyPlan:
             verify_slot_indices=torch.empty(
                 verify_capacity, dtype=torch.int64, device=device
             ),
-            verify_expected_input_ids=torch.empty(
+            verify_expected_tokens=torch.empty(
                 verify_capacity, dtype=torch.int64, device=device
             ),
             verify_expected_positions=torch.empty(
@@ -229,7 +229,7 @@ class VerifyPlan:
         self.verify_slot_indices.zero_()
         # Test helpers expect the "skip token check" sentinel after zero-out, matching
         # the verify-kernel contract.
-        self.verify_expected_input_ids.fill_(-1)
+        self.verify_expected_tokens.fill_(-1)
         self.verify_expected_positions.zero_()
         self.verify_prev_slot_indices.zero_()
         self.verify_num_valid.zero_()
@@ -312,7 +312,7 @@ def launch_canary_verify_kernel(
 
     _assert_contiguous(canary_buf, "canary_buf")
     _assert_contiguous(plan.verify_slot_indices, "plan.verify_slot_indices")
-    _assert_contiguous(plan.verify_expected_input_ids, "plan.verify_expected_input_ids")
+    _assert_contiguous(plan.verify_expected_tokens, "plan.verify_expected_tokens")
     _assert_contiguous(plan.verify_expected_positions, "plan.verify_expected_positions")
     _assert_contiguous(plan.verify_prev_slot_indices, "plan.verify_prev_slot_indices")
     _assert_contiguous(plan.verify_num_valid, "plan.verify_num_valid")
@@ -330,7 +330,7 @@ def launch_canary_verify_kernel(
     module.canary_verify_step_cuda(
         canary_buf,
         plan.verify_slot_indices,
-        plan.verify_expected_input_ids,
+        plan.verify_expected_tokens,
         plan.verify_expected_positions,
         plan.verify_prev_slot_indices,
         plan.verify_num_valid,

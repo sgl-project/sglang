@@ -117,7 +117,7 @@ def _stamp_clean_kv_chain(
         device=_DEVICE,
     )
     log = FakeViolationLog.allocate(device=_DEVICE)
-    # enable_assert_inputs=False is hard-wired here, so the kernel API requires the
+    # enable_write_input_assert=False is hard-wired here, so the kernel API requires the
     # expected_* tensors be None (otherwise it raises ValueError).
     launch_canary_write_kernel_torch_reference(
         context=VerifyOrWriteContext(
@@ -135,7 +135,7 @@ def _stamp_clean_kv_chain(
         input_ids=input_ids,
         positions=positions,
         out_cache_loc=out_cache_loc,
-        enable_assert_inputs=False,
+        enable_write_input_assert=False,
         expected_input_tokens=None,
         expected_input_positions=None,
     )
@@ -1800,7 +1800,7 @@ class TestViolationRing:
         # splitmix64(consts.CANARY_CHAIN_ANCHOR) = 0xde7fae23a9a1b716; signed = -2414019407054260458.
         # Slot 5 was stamped with position=0 (stored); plan claims position=99 → POSITION mismatch.
         # stored_chain_hash == expected_chain_hash (both splitmix64(ANCHOR)) → no CHAIN_HASH bit.
-        # plan has no populated verify_expected_input_ids → entries read -1 sentinel, the
+        # plan has no populated verify_expected_tokens → entries read -1 sentinel, the
         # verify kernel skips the token check (no TOKEN_MISMATCH bit) but the row's
         # expected_token field reflects the gathered sentinel value.
         # expected_aux = expected_chain_hash = splitmix64(ANCHOR) signed (same value as stored_chain_hash).
@@ -2006,7 +2006,7 @@ class TestBoundarySweep:
 
 
 class TestVerifyExpectedInputIds:
-    """Cover the new verify-time token-id check via VerifyPlan.verify_expected_input_ids."""
+    """Cover the new verify-time token-id check via VerifyPlan.verify_expected_tokens."""
 
     def _run(
         self,

@@ -28,8 +28,8 @@ def make_config(
     ring_capacity: int = 1024,
     sweep_interval: int = 0,
     real_kv_hash_mode: RealKvHashMode = RealKvHashMode.NONE,
-    input_check_mode: bool = False,
-    enable_req_token_ids_check: bool = True,
+    enable_write_input_assert: bool = False,
+    enable_verify_token_assert: bool = True,
     stats_print_every_n_steps: int = 100,
 ) -> CanaryConfig:
     return CanaryConfig(
@@ -37,8 +37,8 @@ def make_config(
         ring_capacity=ring_capacity,
         sweep_interval=sweep_interval,
         real_kv_hash_mode=real_kv_hash_mode,
-        input_check_mode=input_check_mode,
-        enable_req_token_ids_check=enable_req_token_ids_check,
+        enable_write_input_assert=enable_write_input_assert,
+        enable_verify_token_assert=enable_verify_token_assert,
         stats_print_every_n_steps=stats_print_every_n_steps,
     )
 

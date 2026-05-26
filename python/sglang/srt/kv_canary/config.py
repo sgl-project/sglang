@@ -37,15 +37,15 @@ class CanaryConfig:
             redundancy) and verifies them.
         real_kv_hash_mode: RealKvHashMode (NONE / PARTIAL / ALL). Uniform across head/tail/sweep launches;
             PARTIAL (first 16B, hard cap) is cheap enough for production defaults.
-        input_check_mode: bool. True = launch_canary_write_kernel additionally compares
+        enable_write_input_assert: bool. True = launch_canary_write_kernel additionally compares
             forward_batch.input_ids[i] / positions[i] against caller-supplied expected_input_tokens[i] /
             expected_input_positions[i]; mismatch records a violation. Only useful when something else
             (e.g. token_oracle.oracle_manager.fill_expected_inputs) is feeding the expected_* placeholders
             per forward — canary itself knows no oracle.
-        enable_req_token_ids_check: bool. True = real-model token-id validator: build
+        enable_verify_token_assert: bool. True = real-model token-id validator: build
             expected_tokens from each req's ``origin_input_ids + output_ids`` (snapshotted at
             ForwardBatch.init_new) and compare against the canary's stored tokens at verify time.
-            Independent of ``input_check_mode``.
+            Independent of ``enable_write_input_assert``.
         stats_print_every_n_steps: 0 disables periodic stats logging; positive N prints
             "canary protected N tokens, ran M sweep passes, K violations so far" every N forward steps.
     """
@@ -54,8 +54,8 @@ class CanaryConfig:
     ring_capacity: int
     sweep_interval: int
     real_kv_hash_mode: RealKvHashMode
-    input_check_mode: bool
-    enable_req_token_ids_check: bool
+    enable_write_input_assert: bool
+    enable_verify_token_assert: bool
     stats_print_every_n_steps: int
 
     @classmethod
@@ -73,7 +73,7 @@ class CanaryConfig:
             ring_capacity=envs.SGLANG_KV_CANARY_RING_CAPACITY.get(),
             sweep_interval=server_args.kv_canary_sweep_interval,
             real_kv_hash_mode=RealKvHashMode[real_kv_raw],
-            input_check_mode=envs.SGLANG_KV_CANARY_INPUT_CHECK.get(),
-            enable_req_token_ids_check=envs.SGLANG_KV_CANARY_ENABLE_REQ_TOKEN_IDS_CHECK.get(),
+            enable_write_input_assert=envs.SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT.get(),
+            enable_verify_token_assert=envs.SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT.get(),
             stats_print_every_n_steps=envs.SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS.get(),
         )

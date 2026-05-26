@@ -103,7 +103,7 @@ def _run_label(
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=verify_capacity,
-        req_to_expected_token_ids=None,
+        req_to_verify_expected_tokens=None,
         kv_token_id_vs_position_offset=0,
     )
     torch.cuda.synchronize()
@@ -823,7 +823,7 @@ class TestMisc:
                 swa_window_size=0,
                 full_to_swa_index_mapping=None,
                 verify_capacity=verify_capacity,
-                req_to_expected_token_ids=None,
+                req_to_verify_expected_tokens=None,
                 kv_token_id_vs_position_offset=0,
             )
             torch.cuda.synchronize()
@@ -837,7 +837,7 @@ class TestMisc:
                 swa_window_size=0,
                 full_to_swa_index_mapping=None,
                 verify_capacity=verify_capacity,
-                req_to_expected_token_ids=None,
+                req_to_verify_expected_tokens=None,
                 kv_token_id_vs_position_offset=0,
             )
             torch.cuda.synchronize()

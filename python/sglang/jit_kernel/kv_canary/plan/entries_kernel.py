@@ -12,9 +12,9 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_plan_entries_module(
-    has_swa_lut: bool, has_expected_token_pool: bool
+    has_swa_lut: bool, has_verify_expected_token_pool: bool
 ) -> "Module":
-    args = make_cpp_args(has_swa_lut, has_expected_token_pool)
+    args = make_cpp_args(has_swa_lut, has_verify_expected_token_pool)
     return load_jit(
         "kv_canary_plan_entries",
         *args,
@@ -33,17 +33,17 @@ def launch_plan_entries_kernel(
     full_to_swa_index_mapping: Optional[torch.Tensor],
     verify_offsets_scratch: torch.Tensor,
     verify_enable: torch.Tensor,
-    req_to_expected_token_ids: Optional[torch.Tensor],
+    req_to_verify_expected_tokens: Optional[torch.Tensor],
     out_verify_slot_indices: torch.Tensor,
-    out_verify_expected_input_ids: torch.Tensor,
+    out_verify_expected_tokens: torch.Tensor,
     out_verify_expected_positions: torch.Tensor,
     out_verify_prev_slot_indices: torch.Tensor,
     kv_token_id_vs_position_offset: int,
     swa_window_size: int,
 ) -> None:
     has_swa_lut = full_to_swa_index_mapping is not None
-    has_expected_token_pool = req_to_expected_token_ids is not None
-    module = _jit_plan_entries_module(has_swa_lut, has_expected_token_pool)
+    has_verify_expected_token_pool = req_to_verify_expected_tokens is not None
+    module = _jit_plan_entries_module(has_swa_lut, has_verify_expected_token_pool)
     module.plan_entries(
         req_pool_indices,
         prefix_lens,
@@ -51,9 +51,9 @@ def launch_plan_entries_kernel(
         full_to_swa_index_mapping,
         verify_offsets_scratch,
         verify_enable,
-        req_to_expected_token_ids,
+        req_to_verify_expected_tokens,
         out_verify_slot_indices,
-        out_verify_expected_input_ids,
+        out_verify_expected_tokens,
         out_verify_expected_positions,
         out_verify_prev_slot_indices,
         int(kv_token_id_vs_position_offset),

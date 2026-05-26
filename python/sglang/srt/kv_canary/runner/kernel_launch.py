@@ -38,7 +38,7 @@ def invoke_plan(
     group: CanaryBufferGroup,
     req_to_token: torch.Tensor,
     swa_window_size: int,
-    req_to_expected_token_ids: Optional[torch.Tensor],
+    req_to_verify_expected_tokens: Optional[torch.Tensor],
 ) -> None:
     window = swa_window_size if group.kind is PoolKind.SWA else 0
     launch_canary_plan_kernels(
@@ -51,7 +51,7 @@ def invoke_plan(
         swa_window_size=window,
         full_to_swa_index_mapping=group.swa_index_lut,
         verify_capacity=int(verify_plan.verify_slot_indices.shape[0]),
-        req_to_expected_token_ids=req_to_expected_token_ids,
+        req_to_verify_expected_tokens=req_to_verify_expected_tokens,
         kv_token_id_vs_position_offset=group.kv_token_id_vs_position_offset,
     )
 
@@ -67,7 +67,7 @@ def launch_endpoints_per_forward(
     expected_inputs: ExpectedInputs,
     violation_log: ViolationLog,
     real_kv_hash_mode: RealKvHashMode,
-    input_check_mode: bool,
+    enable_write_input_assert: bool,
 ) -> None:
     positions = _canonicalize_boundary_int64(forward_batch.positions, _POSITIONS)
     out_cache_loc = _canonicalize_boundary_int64(forward_batch.out_cache_loc, _OUT_LOC)
@@ -102,7 +102,7 @@ def launch_endpoints_per_forward(
             input_ids=input_ids,
             positions=positions,
             out_cache_loc=out_cache_loc,
-            input_check_mode=input_check_mode,
+            enable_write_input_assert=enable_write_input_assert,
             expected_inputs=expected_inputs,
             violation_log=violation_log,
             real_kv_hash_mode=real_kv_hash_mode,
