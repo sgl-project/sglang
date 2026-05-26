@@ -94,7 +94,7 @@ class TestMambaRadixTrackSlots(CustomTestCase):
             spec_algorithm=FakeSpecAlgorithm(is_none=not spec),
         )
 
-    def test_spare_track_slot_keeps_pending_as_backup(self):
+    def test_spare_track_slot_preserves_pending_checkpoint(self):
         pool = FakeMambaPool([1007])
         req = FakeReq()
         batch = self._schedule_batch(pool)

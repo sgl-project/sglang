@@ -283,7 +283,7 @@ class MambaComponent(TreeComponent):
                 # succeed under mamba pool pressure). Returning 0 causes
                 # cache_finished_req to free kv beyond cache_protected_len
                 # and issue an empty-key insert, which _insert_helper
-                # short-circuits — no tree nodes created.
+                # short-circuits; no tree nodes created.
                 return 0
             mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
             insert_params.mamba_value = mamba_value

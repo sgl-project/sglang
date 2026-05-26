@@ -632,8 +632,6 @@ class TestMamba(unittest.TestCase):
         # Working slot still alive
         self.assertIsNotNone(req1.mamba_pool_idx)
 
-        tree.pretty_print()
-
         # Note: cannot call tree.sanity_check() here because req1 holds a lock on its last_node.
         # We verify the tree state via match_prefix instead.
 
@@ -709,7 +707,6 @@ class TestMamba(unittest.TestCase):
         self.assertIsNone(req2.mamba_pool_idx)
         self.assertIsNone(req2.pending_radix_mamba_slot)
 
-        tree.pretty_print()
         tree.sanity_check()
 
         # Verify the new node has the correct mamba value (99.0)
@@ -783,8 +780,6 @@ class TestMamba(unittest.TestCase):
 
         req_to_token_pool.free(req4)
         tree.sanity_check()
-        print(tree.available_and_evictable_str())
-        print(available_and_evictable_str(tree))
 
     def test_extra_buffer_eviction_frees_mamba_slots(self):
         """Test that evicting radix tree nodes correctly frees mamba slots
@@ -797,9 +792,8 @@ class TestMamba(unittest.TestCase):
         # Insert two separate prefixes via the pending slot path
         for token_ids in [[1, 2, 3], [10, 11, 12]]:
             req = make_dummy_req()
-            pending = mamba_pool.alloc(1)
+            pending = req.pending_radix_mamba_slot
             self.assertIsNotNone(pending)
-            req.pending_radix_mamba_slot = pending
             req.fill_ids = token_ids
             req.origin_input_ids = token_ids
             req.mamba_last_track_seqlen = len(token_ids)
@@ -880,9 +874,8 @@ class TestMamba(unittest.TestCase):
         req = make_dummy_req()
 
         # Chunk 1: tokens [1,2,3]
-        pending1 = mamba_pool.alloc(1)
+        pending1 = req.pending_radix_mamba_slot
         self.assertIsNotNone(pending1)
-        req.pending_radix_mamba_slot = pending1
         mamba_pool.mamba_cache.conv[0][:, pending1[0]] = 10.0
 
         req.fill_ids = [1, 2, 3]
@@ -913,6 +906,7 @@ class TestMamba(unittest.TestCase):
         # Chunk 2: tokens [1,2,3,4,5,6]
         # Use the pre-allocated pending slot from cache_unfinished_req
         pending2 = req.pending_radix_mamba_slot
+        self.assertIsNotNone(pending2)
         mamba_pool.mamba_cache.conv[0][:, pending2[0]] = 20.0
 
         req.fill_ids = [1, 2, 3, 4, 5, 6]
@@ -937,8 +931,6 @@ class TestMamba(unittest.TestCase):
                 == 20.0
             )
         )
-
-        tree.pretty_print()
 
         # Clean up: unlock, free mamba cache and req pool, then sanity check
         tree.dec_lock_ref(req.last_node)

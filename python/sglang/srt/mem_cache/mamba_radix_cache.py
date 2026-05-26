@@ -660,7 +660,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             if req.pending_radix_mamba_slot is None:
                 return _skip_cache_unfinished_req(req)
             # Data is already in the pending radix slot (written by track kernel).
-            # Transfer ownership directly to the radix tree — no fork needed.
+            # Transfer ownership directly to the radix tree; no fork needed.
             mamba_value = req.pending_radix_mamba_slot.clone()
             req.pending_radix_mamba_slot = None
         else:
