@@ -1266,3 +1266,336 @@ class TestExpectedTokenPool:
                 expected.append(-1)
         expected_t = torch.tensor(expected, dtype=torch.int64, device=_DEVICE)
         assert torch.equal(triton_v.verify_expected_tokens[:n_valid], expected_t)
+
+
+class TestExpectedTokenPoolValidLens:
+    """Cover the per-req ``req_to_verify_expected_tokens_valid_lens`` upper bound that the
+    plan_entries kernel uses to skip gathers past each req's snapshot length.
+
+    The kernel reads ``pool[rp, sot_pos]`` iff ``0 <= sot_pos < valid_lens[req_id]``,
+    where ``sot_pos = position + kv_token_id_vs_position_offset``; everything else
+    becomes the ``-1`` sentinel. The bound is per-req, applied AFTER the offset shift,
+    and overrides any stale pool content beyond it. The auto-synthesised
+    ``valid_lens = [pool.shape[1]] * bs`` default used by ``run_plan_diff`` is
+    irrelevant here — every case below builds an explicit lens tensor.
+    """
+
+    @staticmethod
+    def _make_pool(
+        *,
+        max_reqs: int,
+        pool_max_context_len: int,
+        fill_fn,
+    ) -> torch.Tensor:
+        pool = torch.full(
+            (max_reqs, pool_max_context_len),
+            -999,
+            dtype=torch.int32,
+            device=_DEVICE,
+        )
+        for rp in range(max_reqs):
+            for pos in range(pool_max_context_len):
+                pool[rp, pos] = fill_fn(rp, pos)
+        return pool
+
+    def test_valid_lens_boundary_emits_sentinel_at_limit(self) -> None:
+        """sot_pos == valid_lens[r] is OUT of range; the kernel must emit -1 even though the pool has a real value at that slot."""
+        max_seq_len = 16
+        max_reqs = 4
+        pool_max_context_len = 16
+        req_to_token = make_req_to_token(
+            kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE
+        )
+        pool = self._make_pool(
+            max_reqs=max_reqs,
+            pool_max_context_len=pool_max_context_len,
+            fill_fn=lambda rp, pos: rp * 1000 + pos,
+        )
+        valid_lens = _tensor([2])
+        plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
+        run_plan_diff(
+            plan_pair=plans,
+            req_pool_indices=_tensor([1]),
+            prefix_lens=_tensor([3]),
+            extend_seq_lens=_tensor([1]),
+            req_to_token=req_to_token,
+            extras=empty_extras(),
+            req_to_verify_expected_tokens=pool,
+            req_to_verify_expected_tokens_valid_lens=valid_lens,
+            kv_token_id_vs_position_offset=0,
+        )
+
+        triton_v = plans[0][0]
+        n_valid = int(triton_v.verify_num_valid[0].item())
+        assert n_valid == 3
+        expected_t = torch.tensor(
+            [1 * 1000 + 0, 1 * 1000 + 1, -1], dtype=torch.int64, device=_DEVICE
+        )
+        assert torch.equal(triton_v.verify_expected_tokens[:n_valid], expected_t)
+
+    def test_valid_lens_within_limit_reads_pool(self) -> None:
+        """sot_pos == valid_lens[r] - 1 is IN range; the kernel must gather the pool value, not -1."""
+        max_seq_len = 16
+        max_reqs = 4
+        pool_max_context_len = 16
+        req_to_token = make_req_to_token(
+            kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE
+        )
+        pool = self._make_pool(
+            max_reqs=max_reqs,
+            pool_max_context_len=pool_max_context_len,
+            fill_fn=lambda rp, pos: rp * 1000 + pos,
+        )
+        valid_lens = _tensor([3])
+        plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
+        run_plan_diff(
+            plan_pair=plans,
+            req_pool_indices=_tensor([1]),
+            prefix_lens=_tensor([3]),
+            extend_seq_lens=_tensor([1]),
+            req_to_token=req_to_token,
+            extras=empty_extras(),
+            req_to_verify_expected_tokens=pool,
+            req_to_verify_expected_tokens_valid_lens=valid_lens,
+            kv_token_id_vs_position_offset=0,
+        )
+
+        triton_v = plans[0][0]
+        n_valid = int(triton_v.verify_num_valid[0].item())
+        assert n_valid == 3
+        expected_t = torch.tensor(
+            [1 * 1000 + 0, 1 * 1000 + 1, 1 * 1000 + 2],
+            dtype=torch.int64,
+            device=_DEVICE,
+        )
+        assert torch.equal(triton_v.verify_expected_tokens[:n_valid], expected_t)
+
+    def test_valid_lens_mixed_across_reqs(self) -> None:
+        """Per-req different valid_lens in one batch: each req's gather is bounded by its own lens, not the batch max."""
+        max_seq_len = 16
+        max_reqs = 4
+        pool_max_context_len = 16
+        req_to_token = make_req_to_token(
+            kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE
+        )
+        pool = self._make_pool(
+            max_reqs=max_reqs,
+            pool_max_context_len=pool_max_context_len,
+            fill_fn=lambda rp, pos: rp * 1000 + pos,
+        )
+        valid_lens = _tensor([2, 4])
+        plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
+        run_plan_diff(
+            plan_pair=plans,
+            req_pool_indices=_tensor([1, 2]),
+            prefix_lens=_tensor([3, 3]),
+            extend_seq_lens=_tensor([1, 1]),
+            req_to_token=req_to_token,
+            extras=empty_extras(),
+            req_to_verify_expected_tokens=pool,
+            req_to_verify_expected_tokens_valid_lens=valid_lens,
+            kv_token_id_vs_position_offset=0,
+        )
+
+        triton_v = plans[0][0]
+        n_valid = int(triton_v.verify_num_valid[0].item())
+        assert n_valid == 6
+        # Req0 (rp=1, valid_lens=2): positions 0,1 in-range; position 2 → -1.
+        # Req1 (rp=2, valid_lens=4): positions 0,1,2 in-range.
+        expected_t = torch.tensor(
+            [
+                1 * 1000 + 0,
+                1 * 1000 + 1,
+                -1,
+                2 * 1000 + 0,
+                2 * 1000 + 1,
+                2 * 1000 + 2,
+            ],
+            dtype=torch.int64,
+            device=_DEVICE,
+        )
+        assert torch.equal(triton_v.verify_expected_tokens[:n_valid], expected_t)
+
+    def test_valid_lens_zero_emits_all_sentinel_for_that_req(self) -> None:
+        """valid_lens[r] == 0 disables every gather for req r regardless of pool content."""
+        max_seq_len = 16
+        max_reqs = 4
+        pool_max_context_len = 16
+        req_to_token = make_req_to_token(
+            kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE
+        )
+        pool = self._make_pool(
+            max_reqs=max_reqs,
+            pool_max_context_len=pool_max_context_len,
+            fill_fn=lambda rp, pos: rp * 1000 + pos,
+        )
+        valid_lens = _tensor([0])
+        plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
+        run_plan_diff(
+            plan_pair=plans,
+            req_pool_indices=_tensor([1]),
+            prefix_lens=_tensor([3]),
+            extend_seq_lens=_tensor([1]),
+            req_to_token=req_to_token,
+            extras=empty_extras(),
+            req_to_verify_expected_tokens=pool,
+            req_to_verify_expected_tokens_valid_lens=valid_lens,
+            kv_token_id_vs_position_offset=0,
+        )
+
+        triton_v = plans[0][0]
+        n_valid = int(triton_v.verify_num_valid[0].item())
+        assert n_valid == 3
+        sentinel = torch.full((n_valid,), -1, dtype=torch.int64, device=_DEVICE)
+        assert torch.equal(triton_v.verify_expected_tokens[:n_valid], sentinel)
+
+    def test_valid_lens_masks_stale_pool_data_above_bound(self) -> None:
+        """Pool has realistic-looking values past valid_lens (the recycled-slot motivation): kernel still emits -1 for them."""
+        max_seq_len = 16
+        max_reqs = 4
+        pool_max_context_len = 16
+        req_to_token = make_req_to_token(
+            kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE
+        )
+        # Stale tokens at positions 2..15 mimic a longer previous owner's leftovers.
+        pool = self._make_pool(
+            max_reqs=max_reqs,
+            pool_max_context_len=pool_max_context_len,
+            fill_fn=lambda rp, pos: 7777 if pos >= 2 else (rp * 1000 + pos),
+        )
+        valid_lens = _tensor([2])
+        plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
+        run_plan_diff(
+            plan_pair=plans,
+            req_pool_indices=_tensor([1]),
+            prefix_lens=_tensor([5]),
+            extend_seq_lens=_tensor([1]),
+            req_to_token=req_to_token,
+            extras=empty_extras(),
+            req_to_verify_expected_tokens=pool,
+            req_to_verify_expected_tokens_valid_lens=valid_lens,
+            kv_token_id_vs_position_offset=0,
+        )
+
+        triton_v = plans[0][0]
+        n_valid = int(triton_v.verify_num_valid[0].item())
+        assert n_valid == 5
+        # Positions 0,1 read the genuine pool entries; 2..4 must NOT pick up the 7777 stale tail.
+        expected_t = torch.tensor(
+            [1 * 1000 + 0, 1 * 1000 + 1, -1, -1, -1],
+            dtype=torch.int64,
+            device=_DEVICE,
+        )
+        assert torch.equal(triton_v.verify_expected_tokens[:n_valid], expected_t)
+
+    def test_valid_lens_with_offset_plus_1_bounds_after_shift(self) -> None:
+        """``sot_pos = position + offset`` is compared against valid_lens; the offset shifts before the bound check."""
+        max_seq_len = 16
+        max_reqs = 4
+        pool_max_context_len = 16
+        req_to_token = make_req_to_token(
+            kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE
+        )
+        pool = self._make_pool(
+            max_reqs=max_reqs,
+            pool_max_context_len=pool_max_context_len,
+            fill_fn=lambda rp, pos: rp * 1000 + pos,
+        )
+        valid_lens = _tensor([2])
+        plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
+        run_plan_diff(
+            plan_pair=plans,
+            req_pool_indices=_tensor([1]),
+            prefix_lens=_tensor([3]),
+            extend_seq_lens=_tensor([1]),
+            req_to_token=req_to_token,
+            extras=empty_extras(),
+            req_to_verify_expected_tokens=pool,
+            req_to_verify_expected_tokens_valid_lens=valid_lens,
+            kv_token_id_vs_position_offset=1,
+        )
+
+        triton_v = plans[0][0]
+        n_valid = int(triton_v.verify_num_valid[0].item())
+        assert n_valid == 3
+        # sot_pos for positions 0,1,2 is 1,2,3. valid_lens=2 → only sot_pos=1 reads pool.
+        expected_t = torch.tensor(
+            [1 * 1000 + 1, -1, -1], dtype=torch.int64, device=_DEVICE
+        )
+        assert torch.equal(triton_v.verify_expected_tokens[:n_valid], expected_t)
+
+    def test_valid_lens_applies_under_swa_window(self) -> None:
+        """SWA-windowed verify entries are subject to the same valid_lens bound as the FULL pool path."""
+        max_seq_len = 16
+        max_reqs = 4
+        pool_max_context_len = 16
+        req_to_token = make_req_to_token(
+            kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE
+        )
+        pool = self._make_pool(
+            max_reqs=max_reqs,
+            pool_max_context_len=pool_max_context_len,
+            fill_fn=lambda rp, pos: rp * 1000 + pos,
+        )
+        full_to_swa = make_lut(
+            max_seq_len=max_seq_len,
+            max_reqs=max_reqs,
+            kind="identity",
+            device=_DEVICE,
+        )
+        # prefix=5, swa_window=3 → entries cover positions 2,3,4. valid_lens=4 admits pos 2,3 only.
+        valid_lens = _tensor([4])
+        plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
+        run_plan_diff(
+            plan_pair=plans,
+            req_pool_indices=_tensor([1]),
+            prefix_lens=_tensor([5]),
+            extend_seq_lens=_tensor([1]),
+            req_to_token=req_to_token,
+            extras=empty_extras(),
+            swa_window_size=3,
+            full_to_swa_index_mapping=full_to_swa,
+            req_to_verify_expected_tokens=pool,
+            req_to_verify_expected_tokens_valid_lens=valid_lens,
+            kv_token_id_vs_position_offset=0,
+        )
+
+        triton_v = plans[0][0]
+        n_valid = int(triton_v.verify_num_valid[0].item())
+        assert n_valid == 3
+        expected_t = torch.tensor(
+            [1 * 1000 + 2, 1 * 1000 + 3, -1], dtype=torch.int64, device=_DEVICE
+        )
+        assert torch.equal(triton_v.verify_expected_tokens[:n_valid], expected_t)
+
+    def test_pool_set_but_valid_lens_missing_raises(self) -> None:
+        """One-way contract: passing the pool without per-req valid_lens is rejected at the Python wrapper."""
+        max_seq_len = 16
+        max_reqs = 4
+        pool_max_context_len = 16
+        req_to_token = make_req_to_token(
+            kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE
+        )
+        pool = self._make_pool(
+            max_reqs=max_reqs,
+            pool_max_context_len=pool_max_context_len,
+            fill_fn=lambda rp, pos: rp * 1000 + pos,
+        )
+        triton_v, triton_w = _plan_pair(verify_capacity=64, write_req_capacity=4)[0]
+        with pytest.raises(
+            ValueError, match="req_to_verify_expected_tokens_valid_lens"
+        ):
+            launch_canary_plan_kernels(
+                verify_plan_out=triton_v,
+                write_plan_out=triton_w,
+                req_pool_indices=_tensor([1]),
+                prefix_lens=_tensor([3]),
+                extend_seq_lens=_tensor([1]),
+                req_to_token=req_to_token,
+                swa_window_size=0,
+                full_to_swa_index_mapping=None,
+                verify_capacity=int(triton_v.verify_slot_indices.shape[0]),
+                req_to_verify_expected_tokens=pool,
+                req_to_verify_expected_tokens_valid_lens=None,
+                kv_token_id_vs_position_offset=0,
+            )
