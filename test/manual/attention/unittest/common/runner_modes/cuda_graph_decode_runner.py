@@ -200,6 +200,27 @@ from ..attention_methods.mamba2_attention import (
 from ..attention_methods.mamba2_attention import (
     _make_forward_batch as _make_mamba2_forward_batch,
 )
+from ..attention_methods.dsa_attention import (
+    DSA_SPARSE_ATOL,
+    DSA_SPARSE_RTOL,
+    DSAAttentionCase,
+    _clone_dsa_sparse_cache,
+    _restore_dsa_sparse_cache,
+    build_dsa_sparse_attention_fixture,
+    dsa_sparse_fixture_inputs,
+    expected_dsa_sparse_output_from_inputs,
+    make_dsa_sparse_case_with_prefix_lens,
+    make_dsa_sparse_random_inputs,
+    make_dsa_sparse_replay_inputs,
+    prepare_dsa_sparse_runner_inputs,
+    run_dsa_sparse_forward,
+)
+from ..attention_methods.dsa_attention import (
+    _make_forward_batch as _make_dsa_forward_batch,
+)
+from ..attention_methods.dsa_attention import (
+    run_dsa_sparse_fixture_eager as _run_dsa_sparse_fixture_eager_with_testcase,
+)
 
 DENSE_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 4
 MLA_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 4
@@ -757,6 +778,83 @@ def run_mamba2_cuda_graph_decode_case(
             device=device,
         ),
         capture_batch_size=cuda_graph_capture_batch_size,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+    )
+
+
+def _run_dsa_sparse_eager_for_cg(fixture):
+    """Eager wrapper for the DSA sparse CG decode adapter — wraps a
+    `forward_context` around `run_dsa_sparse_forward` so `module.attn`
+    sees the active backend (the existing
+    `run_dsa_sparse_fixture_eager` has its own context but takes an
+    extra `testcase` arg for `skipTest`, which doesn't fit the
+    adapter's `run_eager(fixture)` signature)."""
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+        fixture.backend.init_forward_metadata(fixture.forward_batch)
+        return run_dsa_sparse_forward(
+            fixture, fixture.forward_batch, dsa_sparse_fixture_inputs(fixture)
+        )
+
+
+def run_dsa_sparse_cuda_graph_decode_case(
+    testcase,
+    case: DSAAttentionCase,
+    *,
+    hidden_size: int = DEFAULT_HIDDEN_SIZE,
+    max_context_len: int | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = DENSE_DEFAULT_DEVICE,
+    cuda_graph_capture_batch_size: int | None = None,
+):
+    """DSA sparse-topk CUDA-graph decode replay (`flashmla_kv` path).
+    Sparse decode uses cached MLA latent KV (written by
+    `_populate_dsa_sparse_prefix_kv` at fixture build), so the
+    capture/replay K-cache boundary is compatible with piecewise CG —
+    unlike the dense-fallback MHA_ONE_SHOT path which passes prefix+
+    extend K inline."""
+    if not case.forward_mode.is_decode():
+        raise ValueError(
+            "run_dsa_sparse_cuda_graph_decode_case expects a DECODE case "
+            "(the sparse `flashmla_kv` path is the natural CG decode target)."
+        )
+    capture_batch_size = cuda_graph_capture_batch_size or case.batch_size
+    if max_context_len is None:
+        max_context_len = max(case.seq_lens) if case.seq_lens else DSA_PAGE_SIZE
+        # Round up to page_size multiple.
+        if max_context_len % case.page_size:
+            max_context_len = (
+                (max_context_len + case.page_size - 1) // case.page_size
+            ) * case.page_size
+    adapter = CudaGraphDecodeAdapter(
+        build_fixture=build_dsa_sparse_attention_fixture,
+        make_case=make_dsa_sparse_case_with_prefix_lens,
+        make_forward_batch=_make_dsa_forward_batch,
+        fixture_inputs=dsa_sparse_fixture_inputs,
+        make_capture_inputs=make_dsa_sparse_random_inputs,
+        make_replay_inputs=make_dsa_sparse_replay_inputs,
+        prepare_inputs=prepare_dsa_sparse_runner_inputs,
+        run_eager=_run_dsa_sparse_eager_for_cg,
+        run_forward=run_dsa_sparse_forward,
+        expected_output=expected_dsa_sparse_output_from_inputs,
+        clone_state=_clone_dsa_sparse_cache,
+        restore_state=_restore_dsa_sparse_cache,
+        allow_padding=False,
+        atol=DSA_SPARSE_ATOL,
+        rtol=DSA_SPARSE_RTOL,
+    )
+    _run_cuda_graph_decode_case(
+        testcase,
+        case,
+        adapter=adapter,
+        build_kwargs=dict(
+            hidden_size=hidden_size,
+            max_context_len=max_context_len,
+            dtype=dtype,
+            device=device,
+        ),
+        capture_batch_size=capture_batch_size,
         max_context_len=max_context_len,
         dtype=dtype,
         device=device,

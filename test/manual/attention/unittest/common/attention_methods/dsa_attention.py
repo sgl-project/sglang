@@ -642,6 +642,9 @@ def build_dsa_sparse_attention_fixture(
     max_context_len: int = DSA_PAGE_SIZE,
     dtype: torch.dtype = torch.bfloat16,
     device: str = DEFAULT_DEVICE,
+    disable_cuda_graph: bool = True,
+    disable_piecewise_cuda_graph: bool = True,
+    runner_batch_size: int | None = None,
 ) -> DSASparseAttentionFixture:
     max_context_len = max(max_context_len, max(case.seq_lens))
     if max_context_len % case.page_size:
@@ -672,6 +675,9 @@ def build_dsa_sparse_attention_fixture(
         device=device,
         max_context_len=max_context_len,
         head_dim=head_dim,
+        disable_cuda_graph=disable_cuda_graph,
+        disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+        runner_batch_size=runner_batch_size,
     )
     try:
         backend = ATTENTION_BACKENDS[case.backend](runner)
@@ -1051,3 +1057,169 @@ def _clone_dsa_cache(fixture: DSAAttentionFixture):
 
 def _restore_dsa_cache(fixture: DSAAttentionFixture, state) -> None:
     del fixture, state
+
+
+# ---------------------------------------------------------------------------
+# Runner-mode helpers for DSA SPARSE attention (DECODE / EXTEND via flashmla)
+# ---------------------------------------------------------------------------
+# These mirror the dense-fallback helpers above but consume the sparse
+# fixture (`DSASparseAttentionFixture`) which carries `topk_indices` /
+# `topk_rows` and uses a different `module.attn(...)` signature with
+# `q_rope=`, `k_rope=`, `topk_indices=` kwargs.
+
+
+def make_dsa_sparse_case_with_prefix_lens(
+    case: DSAAttentionCase,
+    name: str,
+    prefix_lens: tuple[int, ...],
+) -> DSAAttentionCase:
+    """Build a sparse-case variant with new `prefix_lens`. Mirrors the
+    dense-fallback shape but uses `num_kv_heads=1` (sparse always uses
+    MLA-style latent KV)."""
+    if case.forward_mode.is_decode():
+        extend_lens: tuple[int, ...] = ()
+    else:
+        base = case.extend_lens or (1,)
+        if len(prefix_lens) <= len(base):
+            extend_lens = base[: len(prefix_lens)]
+        else:
+            extend_lens = base + (base[-1],) * (len(prefix_lens) - len(base))
+    return DSAAttentionCase(
+        name=name,
+        backend=case.backend,
+        forward_mode=case.forward_mode,
+        num_heads=case.num_heads,
+        num_kv_heads=case.num_kv_heads,
+        page_size=case.page_size,
+        prefix_lens=prefix_lens,
+        extend_lens=extend_lens,
+    )
+
+
+def dsa_sparse_fixture_inputs(
+    fixture: DSASparseAttentionFixture,
+) -> dict[str, Any]:
+    return {
+        "input_hidden": fixture.input_hidden,
+        "topk_indices": fixture.topk_indices,
+        "topk_rows": fixture.topk_rows,
+    }
+
+
+def make_dsa_sparse_random_inputs(
+    case: DSAAttentionCase,
+    fixture: DSASparseAttentionFixture,
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> dict[str, Any]:
+    hidden_size = fixture.actual_module.hidden_size
+    input_hidden = torch.randn(
+        case.num_input_tokens, hidden_size, dtype=dtype, device=device
+    )
+    topk_rows = _make_dsa_sparse_topk_rows(case)
+    topk_indices = torch.tensor(topk_rows, dtype=torch.int32, device=device)
+    return {
+        "input_hidden": input_hidden,
+        "topk_indices": topk_indices,
+        "topk_rows": topk_rows,
+    }
+
+
+def make_dsa_sparse_replay_inputs(
+    _case: DSAAttentionCase,
+    fixture: DSASparseAttentionFixture,
+    _pad_prefix_lens: tuple[int, ...],
+    base_inputs: dict[str, Any],
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> dict[str, Any]:
+    del fixture, dtype, device
+    return base_inputs
+
+
+def prepare_dsa_sparse_runner_inputs(
+    fixture: DSASparseAttentionFixture,
+    case: DSAAttentionCase,
+    batch: ForwardBatch,
+    inputs: dict[str, Any],
+    *,
+    max_context_len: int,
+) -> None:
+    """Rebind sparse inputs onto the fixture and re-populate prefix KV
+    cache for the (possibly re-shaped) case so the kernel reads the
+    expected MLA latent values."""
+    fixture.case = case
+    fixture.forward_batch = batch
+    fixture.input_hidden = inputs["input_hidden"]
+    fixture.topk_indices = inputs["topk_indices"]
+    if "topk_rows" in inputs:
+        fixture.topk_rows = inputs["topk_rows"]
+    _populate_dsa_sparse_prefix_kv(
+        fixture.actual_module,
+        case,
+        fixture.runner,
+        fixture.prefix_hidden,
+        max_context_len=max_context_len,
+    )
+
+
+def run_dsa_sparse_forward(
+    fixture: DSASparseAttentionFixture,
+    batch: ForwardBatch,
+    inputs: dict[str, Any],
+) -> torch.Tensor:
+    """DSA sparse forward — mirrors `run_dsa_sparse_fixture_eager` but
+    takes `(fixture, batch, inputs)` and re-passes `topk_indices` from
+    the inputs dict so capture and replay see consistent values."""
+    module = fixture.actual_module
+    input_hidden = inputs["input_hidden"]
+    q_nope, q_rope = module.project_q(input_hidden)
+    k_nope, k_rope = module.project_k(input_hidden)
+    attn_output = module.attn(
+        q_nope,
+        k_nope,
+        k_nope,
+        batch,
+        k_rope=k_rope,
+        q_rope=q_rope,
+        topk_indices=inputs["topk_indices"],
+    )
+    attn_output = attn_output.reshape(
+        -1, fixture.case.num_heads * module.qk_nope_head_dim
+    )
+    return module.o_proj(attn_output)
+
+
+def expected_dsa_sparse_output_from_inputs(
+    fixture: DSASparseAttentionFixture,
+    case: DSAAttentionCase,
+    inputs: dict[str, Any],
+    state,
+) -> torch.Tensor:
+    """Pure-PyTorch sparse-topk reference. The reference reads
+    `fixture.topk_rows` (already updated by `prepare_dsa_sparse_runner_inputs`),
+    so `inputs` and `state` are unused."""
+    del case, inputs, state
+    return expected_dsa_sparse_fixture_output(fixture)
+
+
+def dsa_sparse_attention_layers(fixture: DSASparseAttentionFixture) -> list:
+    return [fixture.actual_module.attn]
+
+
+def _clone_dsa_sparse_cache(fixture: DSASparseAttentionFixture):
+    """Snapshot the MLA KV cache so capture's per-decode-token write
+    doesn't bleed into replay state. Returns a clone of the layer's
+    K buffer."""
+    layer_id = fixture.actual_module.attn.layer_id
+    kv_buf = fixture.runner.token_to_kv_pool.get_key_buffer(layer_id)
+    return kv_buf.clone()
+
+
+def _restore_dsa_sparse_cache(
+    fixture: DSASparseAttentionFixture, state
+) -> None:
+    layer_id = fixture.actual_module.attn.layer_id
+    fixture.runner.token_to_kv_pool.get_key_buffer(layer_id).copy_(state)

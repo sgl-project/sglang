@@ -4,15 +4,21 @@ from pathlib import Path
 
 import torch
 
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from common.attention_methods.dsa_attention import (
+    DSA_PAGE_SIZE,
+    DSAAttentionCase,
     make_dsa_dense_fallback_cases,
     make_dsa_sparse_cases,
     run_dsa_attention_case,
     run_dsa_sparse_attention_case,
+)
+from common.runner_modes.cuda_graph_decode_runner import (
+    run_dsa_sparse_cuda_graph_decode_case,
 )
 
 
@@ -39,6 +45,28 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
         for case in self.SPARSE_CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_dsa_sparse_attention_case(self, case)
+
+    # CG decode replay via the sparse `flashmla_kv` path (cached MLA latent
+    # KV, written by `_populate_dsa_sparse_prefix_kv` at fixture build).
+    # Unlike the MHA_ONE_SHOT dense fallback (where K is passed inline as
+    # prefix+extend and `unified_attention_with_output` slicing breaks
+    # piecewise CG), sparse decode reads cached K and is CG-compatible.
+    CUDA_GRAPH_DECODE_CASES = (
+        DSAAttentionCase(
+            name="runner_cuda_graph_dsa_sparse_decode_flashmla_kv",
+            backend="dsa",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=1,
+            page_size=DSA_PAGE_SIZE,
+            prefix_lens=(127, 128),
+        ),
+    )
+
+    def test_runner_mode_cuda_graph_decode_cases(self):
+        for case in self.CUDA_GRAPH_DECODE_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_dsa_sparse_cuda_graph_decode_case(self, case)
 
 
 if __name__ == "__main__":
