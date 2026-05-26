@@ -18,6 +18,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.server_args import set_global_server_args_for_scheduler
 
 _dp_attention.get_attention_tp_size = lambda: 1
 
@@ -149,15 +150,21 @@ class TinyMLAModelConfig:
         *,
         num_heads: int,
         kv_lora_rank: int,
+        hidden_size: int,
         context_len: int,
     ):
         self.attention_arch = AttentionArch.MLA
         self.context_len = context_len
+        self.hidden_size = hidden_size
         self.num_attention_heads = num_heads
         self.num_key_value_heads = 1
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_nope_head_dim = kv_lora_rank
+        self.qk_rope_head_dim = 0
         self.head_dim = kv_lora_rank
         self.v_head_dim = kv_lora_rank
         self.swa_v_head_dim = kv_lora_rank
+        self.scaling = kv_lora_rank**-0.5
         self.is_encoder_decoder = False
         self.is_multimodal = False
         self.is_generation = True
@@ -165,8 +172,21 @@ class TinyMLAModelConfig:
         self.is_local_attention_model = False
         self.attention_chunk_size = None
         self.sliding_window_size = None
-        self.hf_config = SimpleNamespace(architectures=["TinyMLAForCausalLM"])
+        self.hf_config = SimpleNamespace(
+            architectures=["TinyMLAForCausalLM"],
+            hidden_size=hidden_size,
+            num_attention_heads=num_heads,
+            num_key_value_heads=1,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=kv_lora_rank,
+            qk_rope_head_dim=0,
+            v_head_dim=kv_lora_rank,
+        )
         self.hf_text_config = self.hf_config
+
+    def get_num_attention_heads(self, tp_size: int) -> int:
+        assert self.num_attention_heads % tp_size == 0
+        return self.num_attention_heads // tp_size
 
     def get_num_kv_heads(self, tp_size: int) -> int:
         return 1
@@ -193,6 +213,9 @@ class MockMLAModelRunner(ModelRunner):
         self.gpu_id = 0
         self.page_size = case.page_size
         self.model_config = model_config
+        self.tp_size = 1
+        self.dp_size = 1
+        self.pp_size = 1
         speculative_num_draft_tokens = (
             case.input_lens[0]
             if case.forward_mode.is_target_verify()
@@ -203,20 +226,32 @@ class MockMLAModelRunner(ModelRunner):
             attention_backend=case.backend,
             chunked_prefill_size=-1,
             disable_cuda_graph=disable_cuda_graph,
+            disable_chunked_prefix_cache=True,
             disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            disable_radix_cache=False,
+            disaggregation_mode=None,
             dllm_algorithm=None,
             dllm_algorithm_config=None,
+            dp_size=1,
+            enable_dp_attention=False,
             enable_deterministic_inference=False,
             enable_mis=False,
+            flashinfer_mla_disable_ragged=True,
+            is_embedding=False,
+            kv_cache_dtype="auto",
             max_running_requests=None,
             model_path=None,
+            pp_size=1,
             revision=None,
             speculative_algorithm=None,
+            speculative_eagle_topk=0,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_num_steps=max(0, speculative_num_draft_tokens - 1),
+            tp_size=1,
             triton_attention_num_kv_splits=8,
             triton_attention_split_tile_size=None,
         )
+        set_global_server_args_for_scheduler(self.server_args)
         self.req_to_token_pool = ReqToTokenPool(
             size=pool_batch_size,
             max_context_len=max_context_len,
@@ -709,6 +744,7 @@ def build_mla_attention_fixture(
     model_config = TinyMLAModelConfig(
         num_heads=case.num_heads,
         kv_lora_rank=kv_lora_rank,
+        hidden_size=hidden_size,
         context_len=max_context_len,
     )
     runner = MockMLAModelRunner(

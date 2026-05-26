@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.server_args import set_global_server_args_for_scheduler
 
 # Unit tests run without distributed initialization. Backends that size buffers by
 # attention tensor-parallel degree should see the single-rank default.
@@ -220,11 +221,13 @@ class TinyModelConfig:
         num_heads: int,
         num_kv_heads: int,
         head_dim: int,
+        hidden_size: int,
         context_len: int,
         sliding_window_size: int | None = None,
     ):
         self.attention_arch = AttentionArch.MHA
         self.context_len = context_len
+        self.hidden_size = hidden_size
         self.num_attention_heads = num_heads
         self.num_key_value_heads = num_kv_heads
         self.head_dim = head_dim
@@ -237,8 +240,18 @@ class TinyModelConfig:
         self.is_local_attention_model = sliding_window_size is not None
         self.attention_chunk_size = None
         self.sliding_window_size = sliding_window_size
-        self.hf_config = SimpleNamespace(architectures=["TinyForCausalLM"])
+        self.hf_config = SimpleNamespace(
+            architectures=["TinyForCausalLM"],
+            hidden_size=hidden_size,
+            num_attention_heads=num_heads,
+            num_key_value_heads=num_kv_heads,
+            head_dim=head_dim,
+        )
         self.hf_text_config = self.hf_config
+
+    def get_num_attention_heads(self, tp_size: int) -> int:
+        assert self.num_attention_heads % tp_size == 0
+        return self.num_attention_heads // tp_size
 
     def get_num_kv_heads(self, tp_size: int) -> int:
         assert self.num_key_value_heads % tp_size == 0
@@ -266,6 +279,9 @@ class MockModelRunner(ModelRunner):
         self.gpu_id = 0
         self.page_size = case.page_size
         self.model_config = model_config
+        self.tp_size = 1
+        self.dp_size = 1
+        self.pp_size = 1
         speculative_num_draft_tokens = (
             case.input_lens[0]
             if case.forward_mode.is_target_verify()
@@ -277,19 +293,28 @@ class MockModelRunner(ModelRunner):
             chunked_prefill_size=-1,
             disable_cuda_graph=disable_cuda_graph,
             disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            disable_radix_cache=False,
             dllm_algorithm=None,
             dllm_algorithm_config=None,
+            dp_size=1,
+            enable_dp_attention=False,
             enable_deterministic_inference=False,
             enable_mis=False,
+            is_embedding=False,
+            kv_cache_dtype="auto",
             max_running_requests=None,
             model_path=None,
+            pp_size=1,
             revision=None,
             speculative_algorithm=None,
+            speculative_eagle_topk=0,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_num_steps=max(0, speculative_num_draft_tokens - 1),
+            tp_size=1,
             triton_attention_num_kv_splits=8,
             triton_attention_split_tile_size=None,
         )
+        set_global_server_args_for_scheduler(self.server_args)
         self.req_to_token_pool = ReqToTokenPool(
             size=pool_batch_size,
             max_context_len=max_context_len,
@@ -741,6 +766,7 @@ def build_dense_attention_fixture(
         num_heads=case.num_heads,
         num_kv_heads=case.num_kv_heads,
         head_dim=head_dim,
+        hidden_size=hidden_size,
         context_len=max_context_len,
         sliding_window_size=case.sliding_window_size,
     )

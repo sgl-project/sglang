@@ -8,8 +8,8 @@ Implemented:
 - Shared dense MHA/GQA correctness helpers exist in
   `test/manual/attention/unittest/common/dense_attention.py`.
 - Dense attention backend correctness files exist under
-  `test/manual/attention/unittest/dense/` for `torch_native`, `triton`, and
-  `flashinfer`. Dense/SWA expected paths now use separate HF-style reference
+  `test/manual/attention/unittest/dense/` for `torch_native`, `triton`,
+  `flashinfer`, `fa3`, and `fa4`. Dense/SWA expected paths now use separate HF-style reference
   modules with copied random projection weights instead of calling projection
   helpers on the SGLang actual module.
 - SWA attention backend correctness files exist under
@@ -37,9 +37,10 @@ Implemented:
   exposes a backend/reference semantic mismatch before graph replay and should be
   investigated separately from runner coverage.
 - Phase 3 PCG/BCG split-op replay now covers representative dense MHA/GQA
-  extend, SWA extend, MLA extend, and GDN extend paths. These tests use live
-  backend metadata with a larger static token buffer to verify
-  `num_token_non_padded_cpu` slicing, not just exact-shape eager behavior.
+  extend for `triton`, `flashinfer`, `fa3`, and `fa4`, plus SWA extend, MLA
+  extend, and GDN extend paths. These tests use live backend metadata with a
+  larger static token buffer to verify `num_token_non_padded_cpu` slicing, not
+  just exact-shape eager behavior.
 - MLA split-op coverage exercises the absorb-MLA cached-KV path where
   `RadixAttention` receives `k/v=None`; the split-op wrapper now preserves that
   contract instead of assuming materialized K/V tensors.
@@ -70,6 +71,9 @@ Implemented:
   FlashInfer sliding-window metadata updater expects prefix lengths that are not
   supplied by the target-verify path (`prefix_lens=None`), so the Triton SWA spec
   tests cover the interaction for now.
+- FA3/FA4 decode CUDA-graph replay is intentionally not enabled yet. Dense eager
+  and PCG/BCG split-op paths match the HF-style reference, but the shared decode
+  CUDA-graph helper currently mismatches on replay for both FA backends.
 - Dense input-config cases now cover page size 1, zero-prefix exact page,
   zero-prefix input lengths below/equal/above a page, prefix-length exact page,
   total-length exact page, total-length crossing a page boundary, ragged
@@ -124,6 +128,9 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
+- `python -m py_compile test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/dense/test_fa3.py test/manual/attention/unittest/dense/test_fa4.py`
+- `python test/manual/attention/unittest/dense/test_fa3.py -v`
+- `python test/manual/attention/unittest/dense/test_fa4.py -v`
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
 - `python -m py_compile test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/common/spec_runner.py`
 - `python test/manual/attention/unittest/swa/test_triton.py -v`
@@ -171,6 +178,8 @@ test/manual/attention/unittest/
     split_op_runner.py
     spec_runner.py
   dense/
+    test_fa3.py
+    test_fa4.py
     test_torch_native.py
     test_triton.py
     test_flashinfer.py
@@ -453,7 +462,8 @@ Execute the matrix in two passes:
    paths already in scope such as Triton MLA and Triton GDN.
 2. **Backend-expansion pass**: after Phase 2/3/4 are stable for the representative
    set, add more backend files such as `flashmla`, `cutlass_mla`, `trtllm_mha`,
-   `trtllm_mla`, `fa3`, `fa4`, `dual_chunk_flash_attn`, and `flex_attention`.
+   `trtllm_mla`, `dual_chunk_flash_attn`, and `flex_attention`. `fa3` and `fa4`
+   dense backend files are now implemented.
 
 | Dimension | Values |
 |---|---|
@@ -512,8 +522,9 @@ Representative Phase 3 status:
   hybrid-linear backend path, including recurrent cache restore between capture and
   replay.
 - PCG and BCG are covered at unit-test scope through split-op replay paths with
-  active forward context and reference/eager comparison. Full server-level PCG/BCG
-  capture can remain in registered integration tests.
+  active forward context and reference/eager comparison. This now includes dense
+  `fa3` and `fa4`; full server-level PCG/BCG capture can remain in registered
+  integration tests.
 - `hybrid_attn` and TBO composition should be added as focused Phase 3 cases after
   the base backend graph paths are stable.
 
