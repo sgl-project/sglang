@@ -36,7 +36,6 @@ def endpoint_format_fields(endpoint_spec: object) -> set[str]:
 
 def format_control_endpoint(
     endpoint_spec: object,
-    attn_dp_rank: int,
     values: Optional[Mapping[str, Any]] = None,
     **extra_values,
 ) -> Optional[str]:
@@ -51,7 +50,6 @@ def format_control_endpoint(
     if values is not None:
         format_values.update({key: int(value) for key, value in values.items()})
     format_values.update({key: int(value) for key, value in extra_values.items()})
-    format_values["attn_dp_rank"] = int(attn_dp_rank)
     if "{" in spec:
         spec = spec.format(**format_values)
     return normalize_endpoint(spec)
@@ -63,7 +61,6 @@ class SharedHiCacheSourceService:
         *,
         endpoint: str,
         worker_id: Optional[int],
-        attn_dp_rank: int,
         worker_limit: int,
         max_body_bytes: Callable[[], int],
         direct_transfer_enabled: Callable[[], bool],
@@ -71,7 +68,6 @@ class SharedHiCacheSourceService:
     ):
         self.endpoint = endpoint
         self.worker_id = worker_id
-        self.attn_dp_rank = attn_dp_rank
         self.max_body_bytes = max_body_bytes
         self.direct_transfer_enabled = direct_transfer_enabled
         self.handle_source_transfer = handle_source_transfer
@@ -88,7 +84,6 @@ class SharedHiCacheSourceService:
             port=port,
             endpoint=self.endpoint,
             worker_id=self.worker_id,
-            attn_dp_rank=self.attn_dp_rank,
             max_body_bytes=self.max_body_bytes,
             try_enter=self.try_enter,
             exit_resolver=self.exit,

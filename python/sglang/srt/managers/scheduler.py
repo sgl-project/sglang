@@ -2104,14 +2104,8 @@ class Scheduler(
         return True
 
     def _sync_shared_hicache_bool(self, value: bool) -> tuple[bool, bool]:
-        group_size = 1
-        group = None
-        if self.server_args.enable_dp_attention:
-            group_size = self.ps.attn_tp_size
-            group = self.attn_tp_cpu_group
-        else:
-            group_size = self.ps.tp_size
-            group = self.tp_cpu_group
+        group_size = self.ps.tp_size
+        group = self.tp_cpu_group
         if group_size <= 1:
             return value, value
 
@@ -2125,14 +2119,8 @@ class Scheduler(
         return count > 0, count == group_size
 
     def _sync_shared_hicache_int_min(self, value: int) -> int:
-        group_size = 1
-        group = None
-        if self.server_args.enable_dp_attention:
-            group_size = self.ps.attn_tp_size
-            group = self.attn_tp_cpu_group
-        else:
-            group_size = self.ps.tp_size
-            group = self.tp_cpu_group
+        group_size = self.ps.tp_size
+        group = self.tp_cpu_group
         if group_size <= 1:
             return int(value)
 
@@ -2147,8 +2135,6 @@ class Scheduler(
     def _shared_hicache_tp_sync_enabled(self) -> bool:
         if getattr(self, "shared_hicache_manager", None) is None:
             return False
-        if self.server_args.enable_dp_attention:
-            return self.ps.attn_tp_size > 1
         return self.ps.tp_size > 1
 
     def _init_next_round_input_with_shared_hicache_tp_sync(self, req: Req) -> None:

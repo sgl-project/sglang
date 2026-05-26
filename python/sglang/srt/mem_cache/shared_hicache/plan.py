@@ -92,9 +92,7 @@ class SharedHiCachePlan:
     plan_id: str
     request_id: str
     target_worker_id: int
-    target_attn_dp_rank: int
     source_worker_id: int
-    source_attn_dp_rank: int
     source_endpoint: Optional[str]
     source_medium: str
     block_hashes: tuple[int, ...]
@@ -105,10 +103,10 @@ class SharedHiCachePlan:
     start_block_index: int = 0
     plan_version: int = SHARED_HICACHE_PLAN_VERSION
     kv_block_hashes: tuple[int, ...] = ()
-    source_attn_tp_rank: Optional[int] = None
-    source_attn_tp_size: int = 1
-    target_attn_tp_rank: Optional[int] = None
-    target_attn_tp_size: int = 1
+    source_tp_rank: Optional[int] = None
+    source_tp_size: int = 1
+    target_tp_rank: Optional[int] = None
+    target_tp_size: int = 1
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "SharedHiCachePlan":
@@ -173,16 +171,8 @@ class SharedHiCachePlan:
                 target_worker_id=_coerce_int(
                     data["target_worker_id"], "target_worker_id"
                 ),
-                target_attn_dp_rank=_coerce_int(
-                    _first_present(data, "target_attn_dp_rank", default=0),
-                    "target_attn_dp_rank",
-                ),
                 source_worker_id=_coerce_int(
                     data["source_worker_id"], "source_worker_id"
-                ),
-                source_attn_dp_rank=_coerce_int(
-                    _first_present(data, "source_attn_dp_rank", default=0),
-                    "source_attn_dp_rank",
                 ),
                 source_endpoint=source_endpoint,
                 source_medium=_canonical_source_medium(
@@ -206,33 +196,33 @@ class SharedHiCachePlan:
                     "plan_version",
                 ),
                 kv_block_hashes=kv_block_hashes,
-                source_attn_tp_rank=_coerce_optional_int(
-                    _first_present(data, "source_attn_tp_rank", default=None),
-                    "source_attn_tp_rank",
+                source_tp_rank=_coerce_optional_int(
+                    _first_present(data, "source_tp_rank", default=None),
+                    "source_tp_rank",
                 ),
-                source_attn_tp_size=_coerce_positive_int(
-                    _first_present(data, "source_attn_tp_size", default=1),
-                    "source_attn_tp_size",
+                source_tp_size=_coerce_positive_int(
+                    _first_present(data, "source_tp_size", default=1),
+                    "source_tp_size",
                 ),
-                target_attn_tp_rank=_coerce_optional_int(
-                    _first_present(data, "target_attn_tp_rank", default=None),
-                    "target_attn_tp_rank",
+                target_tp_rank=_coerce_optional_int(
+                    _first_present(data, "target_tp_rank", default=None),
+                    "target_tp_rank",
                 ),
-                target_attn_tp_size=_coerce_positive_int(
-                    _first_present(data, "target_attn_tp_size", default=1),
-                    "target_attn_tp_size",
+                target_tp_size=_coerce_positive_int(
+                    _first_present(data, "target_tp_size", default=1),
+                    "target_tp_size",
                 ),
             )
             for rank, size, name in (
                 (
-                    plan.source_attn_tp_rank,
-                    plan.source_attn_tp_size,
-                    "source_attn_tp_rank",
+                    plan.source_tp_rank,
+                    plan.source_tp_size,
+                    "source_tp_rank",
                 ),
                 (
-                    plan.target_attn_tp_rank,
-                    plan.target_attn_tp_size,
-                    "target_attn_tp_rank",
+                    plan.target_tp_rank,
+                    plan.target_tp_size,
+                    "target_tp_rank",
                 ),
             ):
                 if rank is not None and (rank < 0 or rank >= size):

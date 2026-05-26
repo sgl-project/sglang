@@ -54,9 +54,7 @@ def _make_plan(block_hashes, **overrides):
         "plan_id": "plan-1",
         "request_id": "request-1",
         "target_worker_id": 42,
-        "target_attn_dp_rank": 0,
         "source_worker_id": 7,
-        "source_attn_dp_rank": 0,
         "source_endpoint": "127.0.0.1:39007",
         "source_medium": StorageMedium.CPU.value,
         "block_hashes": block_hashes,
@@ -225,20 +223,13 @@ def _make_manager(tree=None):
     manager.worker_id = 42
     manager._set_parallel_metadata(
         {
-            "attn_dp_rank": 0,
-            "attn_dp_size": 1,
-            "attn_tp_rank": 0,
-            "attn_tp_size": 1,
-            "attn_cp_rank": 0,
-            "attn_cp_size": 1,
             "tp_rank": 0,
             "tp_size": 1,
             "pp_rank": 0,
             "pp_size": 1,
-            "moe_ep_rank": 0,
-            "moe_ep_size": 1,
+            "attn_cp_rank": 0,
+            "attn_cp_size": 1,
         },
-        attn_dp_rank=0,
     )
     manager.timeout_secs = 1.0
     manager.prefetch_stop_policy = "timeout"
@@ -250,6 +241,7 @@ def _make_manager(tree=None):
     manager._pending_fetches = {}
     manager._detached_fetches = set()
     manager._finished_plan_keys = set()
+    manager._finished_plan_prefix_lens = {}
     manager.target_cache = SharedHiCacheTarget(tree_cache=tree, metrics_collector=None)
     manager.source_service = None
     return manager
@@ -293,38 +285,36 @@ class TestSharedHiCache(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "target_worker_id must be an integer"):
             SharedHiCachePlan.from_dict(not_int)
 
-    def test_plan_accepts_attention_tp_rank_metadata(self):
+    def test_plan_accepts_tp_rank_metadata(self):
         plan = SharedHiCachePlan.from_dict(
             _make_plan(
                 [11],
-                source_attn_tp_rank=1,
-                source_attn_tp_size=2,
-                target_attn_tp_rank=1,
-                target_attn_tp_size=2,
+                source_tp_rank=1,
+                source_tp_size=2,
+                target_tp_rank=1,
+                target_tp_size=2,
             )
         )
 
-        self.assertEqual(plan.source_attn_tp_rank, 1)
-        self.assertEqual(plan.source_attn_tp_size, 2)
-        self.assertEqual(plan.target_attn_tp_rank, 1)
-        self.assertEqual(plan.target_attn_tp_size, 2)
+        self.assertEqual(plan.source_tp_rank, 1)
+        self.assertEqual(plan.source_tp_size, 2)
+        self.assertEqual(plan.target_tp_rank, 1)
+        self.assertEqual(plan.target_tp_size, 2)
 
-        with self.assertRaisesRegex(ValueError, "source_attn_tp_rank"):
+        with self.assertRaisesRegex(ValueError, "source_tp_rank"):
             SharedHiCachePlan.from_dict(
-                _make_plan([11], source_attn_tp_rank=2, source_attn_tp_size=2)
+                _make_plan([11], source_tp_rank=2, source_tp_size=2)
             )
 
-    def test_control_endpoint_formats_attention_rank_fields(self):
+    def test_control_endpoint_formats_tp_rank_fields(self):
         endpoint = format_control_endpoint(
-            "127.0.0.1:391{attn_dp_rank}{attn_tp_rank}",
-            2,
+            "127.0.0.1:391{tp_rank}",
             {
-                "attn_dp_rank": 2,
-                "attn_tp_rank": 1,
+                "tp_rank": 1,
             },
         )
 
-        self.assertEqual(endpoint, "http://127.0.0.1:39121")
+        self.assertEqual(endpoint, "http://127.0.0.1:3911")
 
     def test_source_resolves_protected_hicache_host_pages(self):
         kv_hash = hash_str_to_int64("aa" * 32)
@@ -355,7 +345,6 @@ class TestSharedHiCache(unittest.TestCase):
             start_block=0,
             max_blocks=1,
             worker_id=7,
-            attn_dp_rank=0,
         )
 
         self.assertEqual(reason, "ok")
@@ -442,11 +431,16 @@ class TestSharedHiCache(unittest.TestCase):
         finally:
             manager._fetch_executor.shutdown(wait=False, cancel_futures=True)
 
-    def test_manager_quarantines_indeterminate_target_pages(self):
-        for reason in (
-            SHARED_HICACHE_DIRECT_TIMEOUT_REASON,
-            "direct_transfer_failed:Mooncake direct KV transfer failed with ret=-1",
-        ):
+    def test_manager_releases_unusable_direct_transfer_target_pages(self):
+        cases = (
+            (SHARED_HICACHE_DIRECT_TIMEOUT_REASON, [], True),
+            (
+                "direct_transfer_failed:Mooncake direct KV transfer failed with ret=-1",
+                [200, 201, 202, 203],
+                False,
+            ),
+        )
+        for reason, expected_freed, expect_quarantine in cases:
             with self.subTest(reason=reason):
                 tree = FakeTree()
                 manager = _make_manager(tree)
@@ -468,9 +462,10 @@ class TestSharedHiCache(unittest.TestCase):
                 result = manager.prepare_reuse(req)
 
                 self.assertEqual(result.staged_tokens, 0)
-                self.assertEqual(tree.device_allocator.freed, [])
+                self.assertEqual(tree.device_allocator.freed, expected_freed)
                 self.assertEqual(
-                    manager.target_cache.quarantined_device_indices, [device_indices]
+                    manager.target_cache.quarantined_device_indices,
+                    [device_indices] if expect_quarantine else [],
                 )
 
     def test_mooncake_backend_registers_source_and_transfers_pages(self):
@@ -650,7 +645,7 @@ class TestSharedHiCache(unittest.TestCase):
         self.assertIsNone(backend)
         self.assertEqual(engine.registered, [(1, 128), (2, 128)])
 
-    def test_mooncake_from_scheduler_supports_tp_and_ep_rank_layout(self):
+    def test_mooncake_from_scheduler_supports_tp_rank_layout(self):
         page_size = 2
         source_k = torch.zeros((20, 4), dtype=torch.uint8)
         source_v = torch.zeros((20, 4), dtype=torch.uint8)
@@ -667,14 +662,8 @@ class TestSharedHiCache(unittest.TestCase):
                 tp_size=2,
                 pp_rank=0,
                 pp_size=1,
-                attn_dp_rank=0,
-                attn_dp_size=1,
-                attn_tp_rank=1,
-                attn_tp_size=2,
                 attn_cp_rank=0,
                 attn_cp_size=1,
-                moe_ep_rank=1,
-                moe_ep_size=4,
                 gpu_id=1,
             ),
             gpu_id=1,
@@ -707,10 +696,9 @@ class TestSharedHiCache(unittest.TestCase):
             backend = MooncakeSharedHiCacheTransferBackend.from_scheduler(scheduler)
 
         self.assertIsNotNone(backend)
-        self.assertEqual(backend.parallel_metadata["attn_tp_rank"], 1)
-        self.assertEqual(backend.parallel_metadata["attn_tp_size"], 2)
-        self.assertEqual(backend.parallel_metadata["moe_ep_size"], 4)
-        self.assertEqual(backend.target_descriptor()["attn_tp_rank"], 1)
+        self.assertEqual(backend.parallel_metadata["tp_rank"], 1)
+        self.assertEqual(backend.parallel_metadata["tp_size"], 2)
+        self.assertEqual(backend.target_descriptor()["tp_rank"], 1)
 
     def test_mooncake_engine_init_uses_scheduler_parallel_state_gpu_id(self):
         calls = []
@@ -763,8 +751,8 @@ class TestSharedHiCache(unittest.TestCase):
         plan = SharedHiCachePlan.from_dict(
             _make_plan(
                 [11],
-                source_attn_tp_size=2,
-                target_attn_tp_size=2,
+                source_tp_size=2,
+                target_tp_size=2,
             )
         )
         response = handle_source_transfer(
@@ -777,9 +765,8 @@ class TestSharedHiCache(unittest.TestCase):
                 "target_metadata": {
                     "backend": "mooncake",
                     "session_id": "target-session",
-                    "attn_dp_rank": 0,
-                    "attn_tp_rank": 1,
-                    "attn_tp_size": 2,
+                    "tp_rank": 1,
+                    "tp_size": 2,
                 },
                 "target_kv_ptrs": [1],
                 "target_kv_item_lens": [64],
@@ -788,32 +775,27 @@ class TestSharedHiCache(unittest.TestCase):
             transfer_backend=FakeDirectTransfer(),
             tree_cache=FakeTree(),
             worker_id=7,
-            attn_dp_rank=0,
-            attn_tp_rank=0,
-            attn_tp_size=2,
+            tp_rank=0,
+            tp_size=2,
         )
 
         self.assertFalse(response["ok"])
-        self.assertIn("wrong_source_attn_tp_rank_for_target", response["reason"])
+        self.assertIn("wrong_source_tp_rank_for_target", response["reason"])
 
-    def test_manager_formats_plan_endpoint_by_current_attention_tp_rank(self):
+    def test_manager_formats_plan_endpoint_by_current_tp_rank(self):
         manager = _make_manager()
         manager._set_parallel_metadata(
             {
-                "attn_dp_rank": 0,
-                "attn_tp_rank": 1,
-                "attn_tp_size": 2,
                 "tp_rank": 1,
                 "tp_size": 2,
             },
-            attn_dp_rank=0,
         )
         plan = SharedHiCachePlan.from_dict(
             _make_plan(
                 [11],
-                source_endpoint="127.0.0.1:3900{source_attn_tp_rank}",
-                source_attn_tp_size=2,
-                target_attn_tp_size=2,
+                source_endpoint="127.0.0.1:3900{source_tp_rank}",
+                source_tp_size=2,
+                target_tp_size=2,
             )
         )
 
@@ -906,18 +888,12 @@ class TestSharedHiCache(unittest.TestCase):
                 prefetch_timeout_config=None,
             ),
             ps=SimpleNamespace(
-                attn_dp_rank=0,
-                attn_dp_size=1,
-                attn_tp_rank=1,
-                attn_tp_size=2,
                 tp_rank=1,
                 tp_size=2,
                 pp_rank=0,
                 pp_size=1,
                 attn_cp_rank=0,
                 attn_cp_size=1,
-                moe_ep_rank=0,
-                moe_ep_size=1,
             ),
             enable_metrics=False,
         )
@@ -931,8 +907,8 @@ class TestSharedHiCache(unittest.TestCase):
         self.assertIsNotNone(manager)
         try:
             self.assertEqual(manager.worker_id, 99)
-            self.assertEqual(manager.attn_tp_rank, 1)
-            self.assertEqual(manager.attn_tp_size, 2)
+            self.assertEqual(manager.tp_rank, 1)
+            self.assertEqual(manager.tp_size, 2)
         finally:
             manager.shutdown()
 

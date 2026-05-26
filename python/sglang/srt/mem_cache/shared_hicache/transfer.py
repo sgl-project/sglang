@@ -69,17 +69,9 @@ def _parallel_value(scheduler, name: str, default: int) -> int:
 
 
 def scheduler_parallel_metadata(scheduler) -> dict[str, int]:
-    """Return the same parallel-rank vocabulary used by disagg and HiCache."""
+    """Return the TP/PP/CP rank metadata needed for same-shape direct reuse."""
 
     return {
-        "attn_dp_rank": _parallel_value(scheduler, "attn_dp_rank", 0),
-        "attn_dp_size": _parallel_value(
-            scheduler, "attn_dp_size", _server_arg(scheduler, "dp_size", 1)
-        ),
-        "attn_tp_rank": _parallel_value(scheduler, "attn_tp_rank", 0),
-        "attn_tp_size": _parallel_value(
-            scheduler, "attn_tp_size", _server_arg(scheduler, "tp_size", 1)
-        ),
         "tp_rank": _parallel_value(scheduler, "tp_rank", 0),
         "tp_size": _parallel_value(
             scheduler, "tp_size", _server_arg(scheduler, "tp_size", 1)
@@ -91,10 +83,6 @@ def scheduler_parallel_metadata(scheduler) -> dict[str, int]:
         "attn_cp_rank": _parallel_value(scheduler, "attn_cp_rank", 0),
         "attn_cp_size": _parallel_value(
             scheduler, "attn_cp_size", _server_arg(scheduler, "attn_cp_size", 1)
-        ),
-        "moe_ep_rank": _parallel_value(scheduler, "moe_ep_rank", 0),
-        "moe_ep_size": _parallel_value(
-            scheduler, "moe_ep_size", _server_arg(scheduler, "ep_size", 1)
         ),
     }
 
@@ -109,8 +97,8 @@ def shared_hicache_parallel_rejection(
         unsupported.append(f"attn_cp_size={attn_cp_size}")
     if unsupported:
         return (
-            "SharedHiCache direct transfer supports TP, DP-attn, and EP, but "
-            f"PP/CP are deferred; got {', '.join(unsupported)}"
+            "SharedHiCache direct transfer supports same-shape TP, but PP/CP "
+            f"are deferred; got {', '.join(unsupported)}"
         )
     return None
 
