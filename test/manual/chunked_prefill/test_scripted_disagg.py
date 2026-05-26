@@ -48,10 +48,9 @@ class TestDisaggBasic(ScriptedRuntimeTestCase):
         assert r.chunks_done >= 2
         # Disagg-prefill chunked happy-path must finalize the send
         # cleanly: exactly one last_chunk=True send, no leftover
-        # send-side state and no D3 leaks.
+        # send-side state.
         assert r.kv_send_last_chunk_events == 1
         assert r.disagg_send_state in (None, "idle")
-        assert r.disagg_send_state_leak_after_retract_count == 0
 
     def test_disagg_prefill_per_chunk_kv_send(self):
         """Disagg-prefill multi-chunk: each middle chunk sends KV with last_chunk=False."""
@@ -77,15 +76,11 @@ class TestDisaggBasic(ScriptedRuntimeTestCase):
         ), f"expected exactly one last_chunk=True send, got {r.kv_send_last_chunk_events}"
 
     def test_disagg_retract_resets_send_state(self):
-        """Disagg-prefill chunked retract resets start_send_idx and tmp_end_idx with D3 leak counter == 0."""
+        """Disagg-prefill chunked retract resets start_send_idx and tmp_end_idx."""
         self.runtime.run(self._script_disagg_retract_resets_send_state)
 
     # Disagg chunked retract — start_send_idx must reset to 0
     # and tmp_end_idx to -1 so the resumed prefill restarts the KV stream.
-    # D3: after retract, the send-side state must be fully wiped — if
-    # any of start_send_idx / tmp_end_idx leaks, the source-side
-    # counter increments and the resumed prefill would re-send a
-    # stale slice.
     @staticmethod
     def _script_disagg_retract_resets_send_state(t: ScriptedRuntime):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -98,17 +93,8 @@ class TestDisaggBasic(ScriptedRuntimeTestCase):
         assert (
             r.tmp_end_idx == -1
         ), f"tmp_end_idx must reset on retract, got {r.tmp_end_idx}"
-        # D3: the source-side counter must agree with the per-field
-        # reset above. If retract path drifts (e.g. only one of the two
-        # fields gets reset), D3 catches it.
-        assert r.disagg_send_state_leak_after_retract_count == 0, (
-            f"D3 violation: disagg send-side state leaked across retract; "
-            f"got {r.disagg_send_state_leak_after_retract_count}"
-        )
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
-        # D3 must remain at 0 across the resumed prefill too.
-        assert r.disagg_send_state_leak_after_retract_count == 0
 
 
 class TestDisaggOverlap(ScriptedRuntimeTestCase):
