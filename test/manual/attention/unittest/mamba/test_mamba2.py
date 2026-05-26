@@ -79,6 +79,20 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_mamba2_cuda_graph_decode_case(self, case)
 
+    # PCG/BCG split-op extend is deliberately NOT covered. The
+    # `MambaMixer2.forward` asserts `num_actual_tokens ==
+    # projected_states.shape[0]` (`mamba.py:467`) — the projection step
+    # requires `hidden_states.shape[0]` to equal the LIVE token count
+    # exactly, with no padding tolerance. The shared split-op runner
+    # pads `hidden_states` to a fixed `static_num_tokens` upper bound
+    # and then relies on the backend's per-layer slicing contract via
+    # `num_token_non_padded_cpu`. Mamba2 doesn't support this padding
+    # because its mixer projects BEFORE the attention dispatch sees
+    # `num_token_non_padded_cpu`. Landing this needs either a Mamba2
+    # mixer change to accept padded `hidden_states`, or a split-op
+    # runner variant that passes unpadded `hidden_states` while still
+    # padding the `forward_batch.input_ids` / `out_cache_loc`.
+
     def test_mamba2_replay_metadata_padding_indices(self):
         # Drive `init_forward_metadata_replay_cuda_graph` directly with
         # `seq_lens_cpu=[5, 1, 1]` (two trailing rows at the cuda-graph

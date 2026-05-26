@@ -21,7 +21,7 @@ Columns are runner modes; rows are the SSM kernel backend
 
 | SSM kernel | Eager Phase 2 | CG decode | PCG extend | BCG extend | Verify eager | Verify CG | DE eager | DE CG | DE-V2 CG | EAGLE-draft runner | EAGLE-DE runner | FKVMTP runner |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `triton` (`Mamba2AttnBackend`) | ✓ EXTEND zero-prefix exact-page / below-page / above-page, with-prefix, multi-request zero-prefix / ragged, page_size=1 (7 variants) + DECODE page-boundary + DECODE bsz=1 nonzero-prefix (9 variants total) | ✓ decode page-boundary (full forward replay with SSM+conv state snapshot/restore via `_clone_mamba2_cache`/`_restore_mamba2_cache`; uses `MAMBA2_GRAPH_ATOL=1e-1` to absorb chunked-scan kernel CG-replay drift; eager `MAMBA2_ATOL=5e-2` kept for non-graph cases). Plus the M21 metadata-only padding test (`seq_lens_cpu=[5,1,1]`). | deferred | deferred | deferred | deferred | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
+| `triton` (`Mamba2AttnBackend`) | ✓ EXTEND zero-prefix exact-page / below-page / above-page, with-prefix, multi-request zero-prefix / ragged, page_size=1 (7 variants) + DECODE page-boundary + DECODE bsz=1 nonzero-prefix (9 variants total) | ✓ decode page-boundary (full forward replay with SSM+conv state snapshot/restore via `_clone_mamba2_cache`/`_restore_mamba2_cache`; uses `MAMBA2_GRAPH_ATOL=1e-1` to absorb chunked-scan kernel CG-replay drift; eager `MAMBA2_ATOL=5e-2` kept for non-graph cases). Plus the M21 metadata-only padding test (`seq_lens_cpu=[5,1,1]`). | blocked: `MambaMixer2.forward` asserts `num_actual_tokens == projected_states.shape[0]` (`mamba.py:467`) — the in-mixer projection requires `hidden_states.shape[0]` to equal the LIVE token count exactly, no padding tolerance. The shared split-op runner pads `hidden_states` to a fixed static upper bound, so Mamba2 trips this assert. See "Production-Unsupported". | blocked: same | deferred | deferred | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
 
 ## Hybrid dispatch fan-out tests (MagicMock-based)
 
@@ -70,6 +70,18 @@ call.
 - **CUDA-graph capture/replay outside `DECODE_OR_IDLE` / `TARGET_VERIFY`** —
   the underlying `MambaAttnBackendBase` capture/replay rejects all other
   modes (`hybrid_linear_attn_backend.py:509, 572`).
+- **PCG / BCG split-op extend** — `MambaMixer2.forward` asserts
+  `num_actual_tokens == projected_states.shape[0]`
+  (`mamba.py:467`) at the projection step, BEFORE the
+  `num_token_non_padded_cpu` slicing kicks in at the attention
+  dispatch. The shared `_run_split_op_extend_case` pads
+  `hidden_states` to a fixed `static_num_tokens` upper bound to
+  exercise the per-layer slicing contract, but Mamba2 trips this
+  assert because its mixer projects all the padded rows. Landing
+  Mamba2 split-op needs either a mixer-side change to accept padded
+  `hidden_states` (project only `num_actual_tokens` rows), or a
+  split-op runner variant that passes unpadded `hidden_states` while
+  still padding `forward_batch.input_ids` / `out_cache_loc`.
 - **Per-mixer head_dim / chunk constraints** — `MambaMixer2.__init__` asserts
   weight dim sums (`mamba.py:92`), TP head divisibility (`mamba.py:217, 221,
   226`), and ssd kernels reject mismatched group / chunk shapes
@@ -97,8 +109,8 @@ call.
 
 ## Next Work
 
-- Add PCG/BCG split-op extend runner coverage (modeled on KDA/GDN).
-  The Mamba2 forward uses `hidden_states` rather than separate q/k/v,
-  so the per-head-vs-flat shape mismatch that blocks Lightning split-op
-  doesn't apply here — but the static-token padding helper still needs
-  authoring (`make_mamba2_token_padded_inputs`).
+- PCG/BCG split-op extend is gated by the `MambaMixer2.forward`
+  projection-step assert; see "Production-Unsupported" above. Landing
+  this needs a mixer-side change to project only `num_actual_tokens`
+  rows from a padded `hidden_states`, or a split-op runner variant
+  that decouples token-count padding from `hidden_states` padding.

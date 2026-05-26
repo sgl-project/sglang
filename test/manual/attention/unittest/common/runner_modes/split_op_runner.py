@@ -113,6 +113,30 @@ from ..attention_methods.lightning_attention import (
     run_lightning_fixture_eager,
     run_lightning_forward,
 )
+from ..attention_methods.mamba2_attention import (
+    DEFAULT_DEVICE as MAMBA2_DEFAULT_DEVICE,
+)
+from ..attention_methods.mamba2_attention import (
+    DEFAULT_DTYPE as MAMBA2_DEFAULT_DTYPE,
+)
+from ..attention_methods.mamba2_attention import (
+    DEFAULT_MAX_CONTEXT_LEN as MAMBA2_DEFAULT_MAX_CONTEXT_LEN,
+)
+from ..attention_methods.mamba2_attention import (
+    MAMBA2_ATOL,
+    MAMBA2_RTOL,
+    Mamba2AttentionCase,
+    _clone_mamba2_cache,
+    _restore_mamba2_cache,
+    build_mamba2_attention_fixture,
+    expected_mamba2_output_from_inputs,
+    make_mamba2_token_padded_inputs,
+    mamba2_attention_layers,
+    mamba2_fixture_inputs,
+    prepare_mamba2_runner_inputs,
+    run_mamba2_fixture_eager,
+    run_mamba2_forward,
+)
 from ..attention_methods.mla_attention import DEFAULT_DEVICE as MLA_DEFAULT_DEVICE
 from ..attention_methods.mla_attention import DEFAULT_DTYPE as MLA_DEFAULT_DTYPE
 from ..attention_methods.mla_attention import (
@@ -523,6 +547,51 @@ def run_lightning_split_op_extend_case(
         adapter=adapter,
         build_kwargs=dict(
             head_dim=head_dim,
+            max_context_len=max_context_len,
+            dtype=dtype,
+            device=device,
+        ),
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        breakable=breakable,
+        static_num_tokens=static_num_tokens,
+    )
+
+
+def run_mamba2_split_op_extend_case(
+    testcase,
+    case: Mamba2AttentionCase,
+    *,
+    breakable: bool,
+    static_num_tokens: int | None = None,
+    max_context_len: int = MAMBA2_DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = MAMBA2_DEFAULT_DTYPE,
+    device: str = MAMBA2_DEFAULT_DEVICE,
+):
+    """Mamba2 PCG/BCG split-op extend. Same pattern as KDA. Mamba2's
+    forward writes through an `empty_like(hidden_states)` buffer that
+    short-circuits the RadixAttention dispatch path, so the per-head-vs-flat
+    shape mismatch that blocks Lightning split-op doesn't apply."""
+    adapter = SplitOpAdapter(
+        build_fixture=build_mamba2_attention_fixture,
+        fixture_inputs=mamba2_fixture_inputs,
+        make_token_padded_inputs=make_mamba2_token_padded_inputs,
+        prepare_inputs=prepare_mamba2_runner_inputs,
+        run_eager=run_mamba2_fixture_eager,
+        run_forward=run_mamba2_forward,
+        expected_output=expected_mamba2_output_from_inputs,
+        attention_layers=mamba2_attention_layers,
+        clone_state=_clone_mamba2_cache,
+        restore_state=_restore_mamba2_cache,
+        atol=MAMBA2_ATOL,
+        rtol=MAMBA2_RTOL,
+    )
+    _run_split_op_extend_case(
+        testcase,
+        case,
+        adapter=adapter,
+        build_kwargs=dict(
             max_context_len=max_context_len,
             dtype=dtype,
             device=device,

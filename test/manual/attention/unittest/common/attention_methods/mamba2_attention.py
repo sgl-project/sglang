@@ -897,3 +897,48 @@ def expected_mamba2_output_from_inputs(
         initial_conv_states=initial_conv,
         initial_ssm_states=initial_ssm,
     ).output
+
+
+def make_mamba2_token_padded_inputs(
+    _case: Mamba2AttentionCase,
+    fixture: Mamba2AttentionFixture,
+    static_num_tokens: int,
+    base_inputs: dict[str, torch.Tensor],
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> dict[str, torch.Tensor]:
+    """Pad `hidden_states` to a fixed static token count for split-op
+    runner tests. Live tokens come first, padding follows."""
+    del fixture
+    raw_num_tokens = base_inputs["hidden_states"].shape[0]
+    if static_num_tokens < raw_num_tokens:
+        raise ValueError("static_num_tokens must cover the live input token count.")
+    if static_num_tokens == raw_num_tokens:
+        return base_inputs
+    pad_num_tokens = static_num_tokens - raw_num_tokens
+    return {
+        "hidden_states": torch.cat(
+            [
+                base_inputs["hidden_states"],
+                torch.randn(
+                    pad_num_tokens,
+                    base_inputs["hidden_states"].shape[1],
+                    dtype=dtype,
+                    device=device,
+                ),
+            ],
+            dim=0,
+        ),
+    }
+
+
+def mamba2_attention_layers(fixture: Mamba2AttentionFixture) -> list:
+    """Return the layer list the backend forwards through. For Mamba2 the
+    "layer" is the MambaMixer2 itself; there is no separate RadixAttention
+    wrapper. Returns an empty list because `piecewise_forward_context`
+    doesn't need to install per-layer hooks — Mamba2's forward writes
+    output directly to an `empty_like(hidden_states)` buffer, bypassing
+    the RadixAttention dispatch path that other backends use."""
+    del fixture
+    return []
