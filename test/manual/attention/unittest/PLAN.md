@@ -138,13 +138,22 @@ Implemented:
   The eager path passes, but capture currently raises
   `AttributeError: 'FlashMLABackend' object has no attribute 'cuda_graph_qo_indptr'`
   from the inherited FlashInfer MLA capture metadata path.
-- Cutlass MLA and TRT-LLM MLA are hardware-gated in this environment. Cutlass MLA
-  decode reports support only for compute capability 10.0, while the TRT-LLM MLA
-  XQA path reports an SM120a/SM121a requirement. Keep their tests hardware-gated
-  rather than enabling them in the default SM90 sweep.
-- Tokenspeed MLA is not enabled yet because it requires an FP8 KV-cache fixture
-  (`kv_cache_dtype=fp8_e4m3`); the current MLA unit fixture intentionally uses
-  fp16 KV cache for reference parity.
+- Cutlass MLA, TRT-LLM MLA, and Tokenspeed MLA now each have a
+  capability-gated test file under `mla/` (`test_cutlass_mla.py`,
+  `test_trtllm_mla.py`, `test_tokenspeed_mla.py`). Each gate is one
+  `_supported()` helper at module import. On this environment (H200, SM 9.0)
+  all three skip cleanly with explicit reasons:
+  - `cutlass_mla`: skips on `SM < 100`; cutlass MLA decode requires Blackwell
+    (compute capability 10.0). Uses `page_size=128` to match the backend's
+    hard-coded PAGE_SIZE.
+  - `trtllm_mla`: skips on `major != 12`; the FlashInfer XQA MLA path requires
+    SM 12.0a / 12.1a. Mirrors `is_sm120_supported`'s major check.
+  - `tokenspeed_mla`: skips combining `find_spec("tokenspeed_mla") is None`,
+    `SM < 100`, and an explicit "FP8 KV-cache fixture not in scope" final skip.
+    The current `MockMLAModelRunner` forces `kv_cache_dtype=model_dtype` so the
+    fp8_e4m3 variant needs a fixture extension before the final skip can be
+    removed. Enabling requires only flipping one constant per file once the
+    matching hardware/fixture is available.
 - `dual_chunk_flash_attn` is modeled as its own attention method fixture rather
   than a dense backend swap. The backend expects a packed five-way query
   projection (`query`, `succ`, `inter`, and critical variants), so
@@ -623,6 +632,8 @@ test/manual/attention/unittest/
     test_triton.py
     test_flashinfer.py
     test_flashmla.py
+    test_cutlass_mla.py
+    test_tokenspeed_mla.py
     test_trtllm_mla.py
   gdn/
     test_torch_native.py
