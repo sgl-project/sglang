@@ -1211,7 +1211,6 @@ def _prune_splitk_configs(configs, named_args, **kwargs):
         # BLOCK_H=32: critical for cc=32 with h_q=128 (gives 256 blocks with split_k=2)
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-
     ],
     key=["total_tokens_bucket", "h_q", "topk_per_split"],
     prune_configs_by={"early_config_prune": _prune_splitk_configs},

@@ -171,7 +171,9 @@ def _triton_sparse_attn_decode_dsv4(
     if _should_use_fused_nosplitk(total_tokens, h_q, total_topk):
         q_reshaped = q.reshape(total_tokens, h_q, d_qk).contiguous()
 
-        indices_main = kv_scope.indices_in_kvcache.reshape(total_tokens, topk_main).contiguous()
+        indices_main = kv_scope.indices_in_kvcache.reshape(
+            total_tokens, topk_main
+        ).contiguous()
 
         block_size_extra = extra_kv_scope.blocked_k.shape[1]
         indices_extra = extra_kv_scope.indices_in_kvcache.reshape(
@@ -208,7 +210,9 @@ def _triton_sparse_attn_decode_dsv4(
     if _should_use_fused_dual_scope(total_tokens, h_q, total_topk):
         q_reshaped = q.reshape(total_tokens, h_q, d_qk).contiguous()
 
-        indices_main = kv_scope.indices_in_kvcache.reshape(total_tokens, topk_main).contiguous()
+        indices_main = kv_scope.indices_in_kvcache.reshape(
+            total_tokens, topk_main
+        ).contiguous()
 
         block_size_extra = extra_kv_scope.blocked_k.shape[1]
         indices_extra = extra_kv_scope.indices_in_kvcache.reshape(
