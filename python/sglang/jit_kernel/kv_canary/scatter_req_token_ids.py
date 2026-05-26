@@ -12,49 +12,6 @@ _SCATTER_TOKEN_BLOCK: int = 256
 _SCATTER_BATCH_BLOCK: int = 512
 
 
-@triton.jit
-def _scatter_req_token_ids_kernel(
-    flat_in_ptr,
-    offsets_ptr,
-    req_pool_indices_ptr,
-    pool_out_ptr,
-    num_tokens,
-    num_batch,
-    pool_stride0,
-    pool_max_context_len,
-    TOKEN_BLOCK: tl.constexpr,
-    BATCH_BLOCK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    tids = pid * TOKEN_BLOCK + tl.arange(0, TOKEN_BLOCK)
-    tid_mask = tids < num_tokens
-
-    bs_offs = tl.arange(0, BATCH_BLOCK)
-    bs_mask = bs_offs < (num_batch + 1)
-    offs_vals = tl.load(
-        offsets_ptr + bs_offs,
-        mask=bs_mask,
-        other=(1 << 62),
-    )
-
-    # find owning req for each tid via reduce-sum: req_idx = (count of offsets <= tid) - 1
-    le = offs_vals[None, :] <= tids[:, None]
-    req_idx = tl.sum(le.to(tl.int32), axis=1) - 1
-
-    safe_req_idx = tl.where(tid_mask, req_idx, 0)
-    starts = tl.load(offsets_ptr + safe_req_idx, mask=tid_mask, other=0)
-    pos = tids - starts
-    rp = tl.load(req_pool_indices_ptr + safe_req_idx, mask=tid_mask, other=0)
-
-    # Bound writes by the pool's max_context_len so a token sequence longer than the
-    # ReqToTokenPool row never spills into an adjacent row.
-    in_row = pos < pool_max_context_len
-    write_mask = tid_mask & in_row
-
-    val = tl.load(flat_in_ptr + tids, mask=tid_mask, other=0).to(tl.int32)
-    tl.store(pool_out_ptr + rp * pool_stride0 + pos, val, mask=write_mask)
-
-
 def launch_scatter_req_token_ids_kernel(
     *,
     flat_in: torch.Tensor,
@@ -62,9 +19,9 @@ def launch_scatter_req_token_ids_kernel(
     req_pool_indices: torch.Tensor,
     pool_out: torch.Tensor,
 ) -> None:
-    """Scatter a flat per-req int64 token sequence into a 2-D int32 pool.
+    """Scatter a flat per-req int64 object sequence into a 2-D int32 pool.
 
-    For each global token index ``t`` in ``[0, total_tokens)``:
+    For each global object index ``t`` in ``[0, total_tokens)``:
 
     - find ``r`` = largest req index s.t. ``offsets[r] <= t``
     - ``pos = t - offsets[r]``
@@ -73,18 +30,15 @@ def launch_scatter_req_token_ids_kernel(
       ``pool_out[rp, pos] = flat_in[t].to(int32)``
 
     Args:
-        flat_in: ``[total_tokens]`` int64 device tensor of flattened
-            ``cat(r.origin_input_ids, r.output_ids)`` over reqs.
+        flat_in: ``[total_tokens]`` int64 device tensor of objects, flattened
+            per-req in req order.
         offsets: ``[bs + 1]`` int64 device tensor (host-computed cumsum of per-req
             lengths). ``offsets[bs] == total_tokens``.
-        req_pool_indices: ``[bs]`` int64 device tensor of ReqToTokenPool row indices.
-        pool_out: ``[max_reqs, max_context_len]`` int32 device tensor (the static pool
-            owned by :class:`CanaryDeviceState`). Mutated in-place; rows not addressed
-            by ``req_pool_indices`` are untouched.
+        req_pool_indices: ``[bs]`` int64 device tensor of pool row indices.
+        pool_out: ``[max_reqs, max_context_len]`` int32 device tensor of objects.
+            Mutated in-place; rows not addressed by ``req_pool_indices`` are untouched.
 
     Implementation notes:
-        - Outside cuda-graph capture; the upstream pool is static so addresses are
-          stable across replays.
         - Linear scan over ``offsets`` (``BATCH_BLOCK >= bs + 1``); fits easily in
           registers for the workloads kv-canary handles (``bs <= a few thousand``).
     """
@@ -161,6 +115,49 @@ def launch_scatter_req_token_ids_kernel(
         TOKEN_BLOCK=_SCATTER_TOKEN_BLOCK,
         BATCH_BLOCK=_SCATTER_BATCH_BLOCK,
     )
+
+
+@triton.jit
+def _scatter_req_token_ids_kernel(
+    flat_in_ptr,
+    offsets_ptr,
+    req_pool_indices_ptr,
+    pool_out_ptr,
+    num_tokens,
+    num_batch,
+    pool_stride0,
+    pool_max_context_len,
+    TOKEN_BLOCK: tl.constexpr,
+    BATCH_BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    tids = pid * TOKEN_BLOCK + tl.arange(0, TOKEN_BLOCK)
+    tid_mask = tids < num_tokens
+
+    bs_offs = tl.arange(0, BATCH_BLOCK)
+    bs_mask = bs_offs < (num_batch + 1)
+    offs_vals = tl.load(
+        offsets_ptr + bs_offs,
+        mask=bs_mask,
+        other=(1 << 62),
+    )
+
+    # find owning req for each tid via reduce-sum: req_idx = (count of offsets <= tid) - 1
+    le = offs_vals[None, :] <= tids[:, None]
+    req_idx = tl.sum(le.to(tl.int32), axis=1) - 1
+
+    safe_req_idx = tl.where(tid_mask, req_idx, 0)
+    starts = tl.load(offsets_ptr + safe_req_idx, mask=tid_mask, other=0)
+    pos = tids - starts
+    rp = tl.load(req_pool_indices_ptr + safe_req_idx, mask=tid_mask, other=0)
+
+    # Bound writes by the pool's max_context_len so a token sequence longer than the
+    # ReqToTokenPool row never spills into an adjacent row.
+    in_row = pos < pool_max_context_len
+    write_mask = tid_mask & in_row
+
+    val = tl.load(flat_in_ptr + tids, mask=tid_mask, other=0).to(tl.int32)
+    tl.store(pool_out_ptr + rp * pool_stride0 + pos, val, mask=write_mask)
 
 
 def scatter_req_token_ids_torch_reference(
