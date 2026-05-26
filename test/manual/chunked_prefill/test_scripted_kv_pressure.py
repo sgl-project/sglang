@@ -155,7 +155,9 @@ class TestScriptedKVPressure(CustomTestCase):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
 
-        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="high")
+        r2 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="high"
+        )
         yield from run_until_all_finished([r1, r2])
 
     def test_kv_at_one_page_chunked_completes(self):
@@ -401,7 +403,9 @@ class TestScriptedKVPressure(CustomTestCase):
         t.force_retract(r)
         # Resume back into chunking.
         yield from run_until(
-            r, lambda h: h.is_chunking and h.chunks_done >= chunks_at_first, max_steps=800
+            r,
+            lambda h: h.is_chunking and h.chunks_done >= chunks_at_first,
+            max_steps=800,
         )
         chunks_after_first_resume = r.chunks_done
         assert chunks_after_first_resume >= chunks_at_first, (
