@@ -2185,6 +2185,7 @@ if __name__ == "__main__":
         help="Profiler activities to capture: CPU, GPU, XPU, CUDA_PROFILER, MEM "
         "(MEM dumps a torch.cuda.memory snapshot, viewable at https://pytorch.org/memory_viz).",
     )
+    parser.add_argument("--merge-profiles", action="store_true", default=False)
     parser.add_argument(
         "--profile-start-step",
         type=int,
