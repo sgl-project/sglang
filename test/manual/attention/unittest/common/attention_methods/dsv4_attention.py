@@ -1083,3 +1083,178 @@ def run_dsv4_compress_smoke_case(
         f"compress_ratio={case.compress_ratio} forward must return finite values "
         f"(no NaN/Inf); mean abs = {out.abs().mean().item()}",
     )
+
+
+def run_dsv4_compress_cuda_graph_decode_smoke_case(
+    testcase,
+    case: DSV4AttentionCase,
+    *,
+    capture_batch_size: int = 2,
+    extra_entries: int = 32,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+) -> None:
+    """CUDA-graph capture/replay smoke for compress_ratio in {4, 128}.
+
+    Exercises the `init_forward_metadata_capture_cuda_graph` ->
+    `init_forward_metadata_replay_cuda_graph` -> `forward(compress_ratio=N)`
+    flow with C4 / C128 sub-pool allocated. Asserts capture and replay each
+    produce finite, shape-correct output; does not check math correctness
+    against an independent Compressor reference (deferred follow-up).
+    """
+    assert case.compress_ratio in (4, 128), (
+        f"smoke graph runner requires compress_ratio in (4, 128); "
+        f"got {case.compress_ratio}"
+    )
+    assert case.forward_mode.is_decode(), (
+        "compress cuda-graph smoke only covers DECODE for now"
+    )
+    if case.batch_size > capture_batch_size:
+        raise ValueError(
+            "capture_batch_size must be at least the case batch size; "
+            f"got case.batch_size={case.batch_size}, "
+            f"capture_batch_size={capture_batch_size}"
+        )
+
+    fixture = build_dsv4_attention_fixture(
+        testcase,
+        case,
+        dtype=dtype,
+        device=device,
+        compression_ratios=[case.compress_ratio],
+        disable_cuda_graph=False,
+        runner_batch_size=capture_batch_size,
+    )
+    runner = fixture.runner
+    backend = fixture.backend
+    max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
+
+    capture_prefix_len = max(0, backend.get_cuda_graph_seq_len_fill_value() - 1)
+    pad_prefix_lens = (capture_prefix_len,) * (capture_batch_size - case.batch_size)
+    padded_case = make_dsv4_case_with_prefix_lens(
+        case,
+        f"{case.name}_padded",
+        case.prefix_lens + pad_prefix_lens,
+    )
+
+    # Build padded prefix/input hidden so the SWA cache covers every padded
+    # request, then write packed K into both SWA and the extra (C4/C128) cache.
+    padded_prefix_hidden = list(fixture.prefix_hidden) + [
+        torch.randn(length, DSV4_HEAD_DIM, dtype=dtype, device=device)
+        for length in pad_prefix_lens
+    ]
+    pad_token_count = padded_case.num_input_tokens - fixture.input_hidden.shape[0]
+    padded_input_hidden = (
+        fixture.input_hidden
+        if pad_token_count == 0
+        else torch.cat(
+            [
+                fixture.input_hidden,
+                torch.randn(
+                    pad_token_count, DSV4_HEAD_DIM, dtype=dtype, device=device
+                ),
+            ],
+            dim=0,
+        )
+    )
+
+    # Build the padded forward batch + populate per-padded-request KV.
+    padded_batch = _make_forward_batch(
+        padded_case, runner, max_context_len=max_context_len, device=device
+    )
+    prepare_dsv4_runner_inputs(
+        fixture,
+        padded_case,
+        padded_batch,
+        {"prefix_hidden": padded_prefix_hidden, "input_hidden": padded_input_hidden},
+        max_context_len=max_context_len,
+    )
+    _populate_extra_kv_cache(fixture, layer_id=0, num_entries=extra_entries)
+
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
+        backend.init_cuda_graph_state(
+            max_bs=capture_batch_size,
+            max_num_tokens=capture_batch_size,
+        )
+        # Capture with a synthetic batch at the capture shape.
+        capture_seq_lens = torch.full(
+            (capture_batch_size,),
+            capture_prefix_len + 1,
+            dtype=torch.int32,
+            device=device,
+        )
+        capture_req_pool = torch.arange(
+            capture_batch_size, dtype=torch.int32, device=device
+        )
+        backend.init_forward_metadata_capture_cuda_graph(
+            bs=capture_batch_size,
+            num_tokens=capture_batch_size,
+            req_pool_indices=capture_req_pool,
+            seq_lens=capture_seq_lens,
+            encoder_lens=None,
+            forward_mode=ForwardMode.DECODE,
+            spec_info=None,
+        )
+        capture_q = torch.randn(
+            capture_batch_size,
+            case.num_heads,
+            DSV4_HEAD_DIM,
+            dtype=dtype,
+            device=device,
+        )
+        capture_out = backend.forward(
+            q=capture_q,
+            k=capture_q,
+            v=capture_q,
+            layer=fixture.actual_module.attn,
+            forward_batch=padded_batch,
+            compress_ratio=case.compress_ratio,
+            save_kv_cache=False,
+            attn_sink=fixture.actual_module.attn_sink,
+        )
+        backend.on_after_cuda_graph_warmup()
+
+        # Replay with the case's actual metadata (one decode token per padded request).
+        backend._replay_forward_batch = padded_batch
+        try:
+            backend.init_forward_metadata_replay_cuda_graph(
+                bs=capture_batch_size,
+                req_pool_indices=padded_batch.req_pool_indices,
+                seq_lens=padded_batch.seq_lens,
+                seq_lens_sum=padded_batch.seq_lens_sum,
+                encoder_lens=None,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=None,
+                seq_lens_cpu=padded_batch.seq_lens_cpu,
+            )
+        finally:
+            backend._replay_forward_batch = None
+        replay_q, _ = fixture.actual_module.project(padded_input_hidden)
+        replay_out = backend.forward(
+            q=replay_q,
+            k=replay_q,
+            v=replay_q,
+            layer=fixture.actual_module.attn,
+            forward_batch=padded_batch,
+            compress_ratio=case.compress_ratio,
+            save_kv_cache=False,
+            attn_sink=fixture.actual_module.attn_sink,
+        )
+
+    expected_shape = (
+        capture_batch_size,
+        case.num_heads,
+        DSV4_V_HEAD_DIM,
+    )
+    for label, out in (("capture", capture_out), ("replay", replay_out)):
+        testcase.assertEqual(
+            tuple(out.shape),
+            expected_shape,
+            f"compress_ratio={case.compress_ratio} {label} forward must return "
+            f"shape [capture_batch_size, num_heads, v_head_dim]",
+        )
+        testcase.assertTrue(
+            torch.isfinite(out).all().item(),
+            f"compress_ratio={case.compress_ratio} {label} forward must return "
+            f"finite values; mean abs = {out.abs().mean().item()}",
+        )

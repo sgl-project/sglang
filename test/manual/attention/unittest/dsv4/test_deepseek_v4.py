@@ -31,6 +31,7 @@ from common.attention_methods.dsv4_attention import (  # noqa: E402
     DSV4AttentionCase,
     make_dsv4_cases,
     run_dsv4_attention_case,
+    run_dsv4_compress_cuda_graph_decode_smoke_case,
     run_dsv4_compress_smoke_case,
 )
 from common.runner_modes.cuda_graph_decode_runner import (  # noqa: E402
@@ -123,6 +124,36 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
                 compress_ratio=case.compress_ratio,
             ):
                 run_dsv4_compress_smoke_case(self, case)
+
+    COMPRESS_CUDA_GRAPH_DECODE_CASES = (
+        DSV4AttentionCase(
+            name="runner_cuda_graph_dsv4_c4_decode_smoke",
+            backend="dsv4",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(64,),
+            compress_ratio=4,
+        ),
+        DSV4AttentionCase(
+            name="runner_cuda_graph_dsv4_c128_decode_smoke",
+            backend="dsv4",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(64,),
+            compress_ratio=128,
+        ),
+    )
+
+    def test_compress_cuda_graph_decode_smoke_cases(self):
+        for case in self.COMPRESS_CUDA_GRAPH_DECODE_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                compress_ratio=case.compress_ratio,
+            ):
+                run_dsv4_compress_cuda_graph_decode_smoke_case(self, case)
 
 
 if __name__ == "__main__":
