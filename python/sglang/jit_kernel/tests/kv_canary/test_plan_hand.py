@@ -1337,9 +1337,8 @@ class TestExpectedTokenPoolValidLens:
             valid_lens=_tensor([4]),
             swa_window_size=3,
             full_to_swa_index_mapping=make_lut(
-                max_seq_len=self._MAX_SEQ_LEN,
-                max_reqs=self._MAX_REQS,
                 kind="identity",
+                pool_size=self._MAX_REQS * self._MAX_SEQ_LEN,
                 device=_DEVICE,
             ),
         )
