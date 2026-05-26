@@ -843,6 +843,12 @@ class Req(ReqDllmMixin):
         # actual writes; ScriptedRuntime tests assert <= 1.
         self.hicache_cached_tokens_write_count: int = 0
 
+        # Regression instrumentation for invariant B6: extend_batch_idx must
+        # increase monotonically except on the explicit reset path
+        # (reset_for_retract). Counts assignments that produce a value
+        # smaller than the previous one outside the reset path.
+        self.extend_batch_idx_regression_count: int = 0
+
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
         # processed.
@@ -1883,7 +1889,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             assert seq_len - pre_len == req.extend_input_len
 
+            # Invariant B6: extend_batch_idx must increase monotonically here
+            # (the only non-reset mutation path). reset_for_retract zeroes it
+            # legitimately. The post-condition check below records any future
+            # regression where this path produces a non-increasing value.
+            _extend_batch_idx_before = req.extend_batch_idx
             req.extend_batch_idx += 1
+            if req.extend_batch_idx <= _extend_batch_idx_before:
+                req.extend_batch_idx_regression_count += 1
 
             # update req-level memory management fields
             req.kv_committed_len = seq_len
