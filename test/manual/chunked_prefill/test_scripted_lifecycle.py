@@ -394,6 +394,33 @@ class TestScriptedLifecycle(CustomTestCase):
         final = t.engine_stats()["kv_pool_free"]
         assert final >= baseline - 1, f"KV pool drift: baseline={baseline}, final={final}"
 
+    @unittest.skip("needs ScriptedRuntime.shutdown — wire up when harness adds the API")
+    def test_engine_shutdown_during_chunked(self):
+        """Engine shutdown mid-chunk: chunked req receives a final error and no subprocess is orphaned."""
+        execute_scripted_runtime(
+            self._script_engine_shutdown_during_chunked,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-Cross12] engine shutdown mid-chunked — the chunked req must
+    # surface a clean terminal error (not a hang) and no scheduler
+    # subprocess should be left orphaned after the engine tears down.
+    @staticmethod
+    def _script_engine_shutdown_during_chunked(t: ScriptedRuntime):
+        # NEW API NEEDED: t.shutdown() — request a graceful engine
+        # shutdown from inside a scripted run. Currently the harness
+        # only tears down when the generator returns; an explicit
+        # shutdown signal during a chunked req is required to test the
+        # cross-boundary cleanup path.
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+        t.shutdown()
+        yield
+        # After shutdown the chunked req should surface either a clean
+        # terminal error or finish with no orphaned KV.
+        assert r.finished or r.error_message is not None
+        assert r.kv_pages == 0
+
 
 if __name__ == "__main__":
     unittest.main()
