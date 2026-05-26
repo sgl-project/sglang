@@ -59,6 +59,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        kernel_page_size: Optional[int] = None,
     ):
         super().__init__(
             size,
@@ -72,6 +73,14 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
+        # Kernel-view page size for the NPU bf16 buffer. npu_sparse_attn_sharedkv
+        # requires cmp_kv.shape[1] == ori_kv's global page_size, so the c4/c128
+        # pools (whose token-level page_size is page_size // ratio) pass the
+        # global page_size here. Defaults to page_size (swa pool / CUDA path:
+        # no change).
+        self.kernel_page_size = (
+            kernel_page_size if kernel_page_size is not None else page_size
+        )
 
         self.scale_pad = 1
         self.quantize_block_size = 64
@@ -112,9 +121,20 @@ class DeepSeekV4SingleKVPool(KVCache):
         if is_npu_bf16:
             kv_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
             self.kv_cache_total_dim = kv_dim
+            # Use the GLOBAL kernel_page_size (not the pool's per-ratio
+            # page_size) so cmp_kv.shape[1] == ori_kv.shape[1], which
+            # npu_sparse_attn_sharedkv requires. For the swa pool
+            # kernel_page_size == page_size (no change); for c4/c128 this
+            # widens the native 32/1-slot pages to the global page_size and
+            # removes the reshape workaround in _forward_compressed. Writes are
+            # flat-indexed (set_compress_buffer uses buf.flatten(0,1)[loc]), so
+            # the page granularity only affects shape, not write locations.
+            npu_num_pages = (
+                self.size + self.kernel_page_size + 1
+            ) // self.kernel_page_size
             return torch.zeros(
-                num_pages,
-                self.page_size,
+                npu_num_pages,
+                self.kernel_page_size,
                 1,
                 kv_dim,
                 dtype=torch.bfloat16,
@@ -193,6 +213,7 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         enable_memory_saver: bool,
         start_layer: int | None = None,
         end_layer: int | None = None,
+        kernel_page_size: int | None = None,
     ):
         super().__init__(
             size,
@@ -205,6 +226,7 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
             enable_memory_saver,
             start_layer,
             end_layer,
+            kernel_page_size=kernel_page_size,
         )
 
         self.data_ptrs = torch.tensor(
@@ -514,6 +536,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             c4_layer_num,
             device,
             enable_memory_saver,
+            kernel_page_size=page_size,
         )
 
         self.c128_kv_pool = DeepSeekV4SingleKVPool(
@@ -525,6 +548,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             c128_layer_num,
             device,
             enable_memory_saver,
+            kernel_page_size=page_size,
         )
 
         self.c4_indexer_kv_pool = DeepSeekV4IndexerPool(

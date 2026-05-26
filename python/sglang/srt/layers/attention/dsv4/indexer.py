@@ -501,7 +501,7 @@ class C4Indexer(nn.Module):
         self.n_local_heads = self.n_heads
         # V4 c4 indexer hardcodes top-512 elsewhere; mirror that on the module
         # so forward_npu has access without piping a server arg through.
-        self.index_topk = getattr(config, "index_topk", 512)
+        self.index_topk = config.index_topk
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,

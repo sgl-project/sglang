@@ -134,16 +134,12 @@ class DeepseekV4AscendAttnBackend(
         # null in the HF config); pass head_dim verbatim to the metadata kernel.
         self._dsv4_head_dim = cfg.head_dim
         hf = getattr(cfg, "hf_config", cfg)
-        self._dsv4_index_topk = getattr(hf, "index_topk", 512)
-        self._dsv4_index_n_heads = getattr(hf, "index_n_heads", 64)
-        self._dsv4_index_head_dim = getattr(hf, "index_head_dim", 128)
-        self._dsv4_compress_ratios = getattr(hf, "compress_ratios", None)
-        self._dsv4_has_c4 = (
-            self._dsv4_compress_ratios is not None and 4 in self._dsv4_compress_ratios
-        )
-        self._dsv4_has_c128 = (
-            self._dsv4_compress_ratios is not None and 128 in self._dsv4_compress_ratios
-        )
+        self._dsv4_index_topk = hf.index_topk
+        self._dsv4_index_n_heads = hf.index_n_heads
+        self._dsv4_index_head_dim = hf.index_head_dim
+        self._dsv4_compress_ratios = hf.compress_ratios
+        self._dsv4_has_c4 = 4 in self._dsv4_compress_ratios
+        self._dsv4_has_c128 = 128 in self._dsv4_compress_ratios
         self._dsv4_sliding_window_size = (
             cfg.sliding_window_size if cfg.sliding_window_size is not None else 128
         )
@@ -1152,35 +1148,18 @@ class DeepseekV4AscendAttnBackend(
 
         ori_kv = pool.get_swa_buffer(layer.layer_id)
 
-        # Reshape cmp_kv to share page_size with ori_kv before the kernel call.
-        # main's V4 pool layout: c{N}_kv_pool buffer is (num_pages, page_size//
-        # ratio, 1, dim) so each native page holds page_size//ratio compressed
-        # tokens. The aclnn kernel expects cmp_kv to share its page_size with
-        # ori_kv (=global page_size). We slice the buffer to a ratio-aligned
-        # native-page count and view it as (N_kernel, global_page_size, 1, dim).
-        #
-        # cmp_block_table values: step 5c slab (`req_to_token_c{N}_pages`)
-        # already gives kernel-view page indices in [0, N_kernel), so no
-        # further `// page_ratio` divide is needed — the divide was a leftover
-        # from step 5b when block_table came from raw kv pool page indices.
         ori_page_size = ori_kv.shape[1]
         cmp_native_page_size = cmp_kv.shape[1]
-        cmp_block_table = getattr(
-            fm, f"c{compress_ratio}_page_table", fm.swa_page_table
+        cmp_block_table = getattr(fm, f"c{compress_ratio}_page_table")
+        # The c{4,128} kv pools are allocated with the global page_size (via
+        # DeepSeekV4SingleKVPool.kernel_page_size), so cmp_kv already shares
+        # ori_kv's page_size and the kernel consumes it directly — no reshape.
+        # Assert the invariant rather than papering over a page-size mismatch.
+        assert cmp_native_page_size == ori_page_size, (
+            f"cmp page_size={cmp_native_page_size} != ori page_size={ori_page_size}; "
+            "c{N}_kv_pool must be allocated with the global page_size on NPU "
+            "(see DeepSeekV4SingleKVPool.kernel_page_size)"
         )
-        if cmp_native_page_size != ori_page_size:
-            page_ratio = ori_page_size // cmp_native_page_size
-            assert page_ratio == compress_ratio, (
-                f"page_ratio={page_ratio} != compress_ratio={compress_ratio}; "
-                "main's V4 pool keeps c{N}_native_page_size = global_page_size//ratio"
-            )
-            n_native = cmp_kv.shape[0]
-            n_kernel = n_native // page_ratio
-            cmp_kv = cmp_kv[: n_kernel * page_ratio].reshape(
-                n_kernel, ori_page_size, *cmp_kv.shape[2:]
-            )
-            # Slab already in kernel-view page space — no divide.
-            cmp_block_table = cmp_block_table.to(torch.int32)
 
         attn_kwargs = dict(
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
@@ -1205,10 +1184,11 @@ class DeepseekV4AscendAttnBackend(
         # lightning indexer; c128 uses cmp_sparse_indices=None and lets the
         # kernel read the full populated c128 history.
         if compress_ratio == 4:
+            # The c4 lightning indexer (Indexer.forward_npu) populates
+            # c4_topk_indices on every non-idle c4 layer before this attention
+            # call, and idle ranks short-circuit in forward() before reaching
+            # here — so a None topk is a real bug to surface, not seed around.
             topk = fm.c4_topk_indices
-            if topk is None:
-                topk = self._seed_c4_topk_indices(forward_batch)
-                fm.c4_topk_indices = topk
             attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
         else:
             attn_kwargs["cmp_sparse_indices"] = None
