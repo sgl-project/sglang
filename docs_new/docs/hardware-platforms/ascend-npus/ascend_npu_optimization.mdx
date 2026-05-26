@@ -395,10 +395,10 @@ The following environment variables are used in other best practice configuratio
 The table shows feature-by-feature compatibility of SGLang capabilities on Ascend NPU. Features that have performance impact on Ascend are included. Each cell at the intersection of two features indicates whether they can be used together.
 
 The symbols used are defined as follows:
-🟢 = Full compatibility
-🟠 = Partial compatibility
-❌ = No compatibility
-❔ = Unknown or TBD
+- 🟢 = Full compatibility
+- 🟠 = Partial compatibility
+- ❌ = No compatibility
+- ❔ = Unknown or TBD
 
 <table>
   <thead>
@@ -738,7 +738,7 @@ Splits model weights across multiple NPU devices so that large models can be loa
 
 ### Data Parallelism (`--dp-size`, `--enable-dp-attention`)
 
-With --enable-dp-attention, the attention layers are replicated across DP ranks while the FFN/MoE layers remain tensor-parallel/expert-parallel. This reduces the communication overhead of attention layers in TP (which is significant during small-batch decode) while keeping the heavy compute and memory demands of MoE layers distributed.
+Replicates the model across independent device groups to increase throughput by processing multiple requests in parallel. With --enable-dp-attention, the attention layers are replicated across DP ranks while the FFN/MoE layers remain tensor-parallel/expert-parallel. This reduces the communication overhead of attention layers in TP (which is significant during small-batch decode) while keeping the heavy compute and memory demands of MoE layers distributed.
 
 ### Expert Parallelism (`--ep-size`)
 
@@ -754,7 +754,7 @@ Separates the prefill (P) and decode (D) phases onto different device groups, al
 
 ### Quantization (`--quantization`)
 
-Reduces model weight and activation precision (e.g., W8A8, W4A8, W4A16) to decrease memory usage and increase throughput. Ascend supports ModelSlim quantization (W4A4, W8A8, W4A8 dynamic/static), AWQ, GPTQ, Auto-round, Compressed-tensors, and GGUF formats. See [quantization](/hardware-platforms/ascend-npus/ascend_npu_quantization) for details.
+Reduces model weight and activation precision (e.g., W8A8, W4A8, W4A16) to decrease memory usage and increase throughput. On Ascend, the natively supported and highly optimized quantization method is ModelSlim (supporting W4A4, W8A8, W4A8 dynamic/static). Support for other community formats (such as AWQ, GPTQ, Auto-round, and Compressed-tensors) depends on the availability of specific Ascend custom kernels in your environment; see quantization for details and compatibility matrices.
 
 ### Chunked Prefill (`--chunked-prefill-size`)
 
