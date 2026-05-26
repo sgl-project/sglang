@@ -32,6 +32,11 @@ class GenerationBatchResult:
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
     can_run_cuda_graph: bool = False
 
+    # PP skip output comm: True when output send/recv was skipped and
+    # next_token_ids are placeholder zeros. Used by process_batch_result_prefill
+    # to validate that skipped output is never consumed.
+    skipped_output_comm: bool = False
+
     # For output processing
     extend_input_len_per_req: Optional[List[int]] = None
     extend_logprob_start_len_per_req: Optional[List[int]] = None
