@@ -33,6 +33,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
@@ -338,7 +339,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             )
             attention_hidden_states = attention_hidden_states * self.attn_out_multiplier
 
-            attn_backend = forward_batch.attn_backend
+            attn_backend = get_attn_backend()
             assert isinstance(attn_backend, HybridLinearAttnBackend)
             assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
             # Mamba block

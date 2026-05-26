@@ -230,6 +230,7 @@ class PipelineConfig:
     # Image encoder configuration
     image_encoder_config: EncoderConfig = field(default_factory=EncoderConfig)
     image_encoder_precision: str = "fp32"
+    image_encoder_extra_args: dict = field(default_factory=lambda: {})
 
     # Text encoder configuration
     DEFAULT_TEXT_ENCODER_PRECISIONS = ("fp32",)
@@ -239,9 +240,6 @@ class PipelineConfig:
     # See PRECISION_TO_TYPE for detailed mapping
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("fp32",))
     text_encoder_extra_args: list[dict] = field(default_factory=lambda: [{}])
-
-    # image encoding
-    image_encoder_extra_args: dict = field(default_factory=lambda: {})
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig()
@@ -265,6 +263,10 @@ class PipelineConfig:
 
     # DMD parameters
     dmd_denoising_steps: list[int] | None = field(default=None)
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # return the model-specific config for optimal deployment setting
+        return ModelDeploymentConfig()
 
     # Wan2.2 TI2V parameters
     boundary_ratio: float | None = None
