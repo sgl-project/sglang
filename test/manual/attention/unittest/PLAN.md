@@ -89,13 +89,17 @@ Implemented:
   draft token count is carried separately by the graph/spec buffers. The MLA case
   exercises the absorb-MLA cached-KV path with distinct capture/replay metadata
   and input tensors.
-- Phase 4 production `EAGLEDraftCudaGraphRunner` integration now covers dense
-  `triton` and `flashinfer` decode draft for chain (`topk=1`) and tree
-  (`topk=2`) draft layouts. These tests instantiate the production graph runner,
-  capture a fixed padded batch, replay distinct draft metadata/input tensors,
-  and compare graph replay against the eager draft-worker path. This comparison
-  intentionally targets runner buffer/metadata compatibility; dense attention
-  math remains covered by the independent HF-style Phase 2/3 references.
+- Phase 4 production `EAGLEDraftCudaGraphRunner` integration now uses the same
+  adapter-based runner lifecycle as draft-extend and target-verify graph replay.
+  The shared `common/runner_modes/eagle_draft_runner.py` helper owns production
+  graph-runner capture/replay through `run_eagle_draft_cuda_graph_runner_case`,
+  while attention-method wrappers provide fixture/input/state callbacks. Dense
+  `triton` and `flashinfer` cover decode draft for chain (`topk=1`) and tree
+  (`topk=2`) draft layouts by capturing a fixed padded batch, replaying distinct
+  draft metadata/input tensors, and comparing graph replay against the eager
+  draft-worker path. This comparison intentionally targets runner buffer/metadata
+  compatibility; dense attention math remains covered by the independent HF-style
+  Phase 2/3 references.
 - The synthetic EAGLE verify helper uses realistic target-verify semantics:
   `ForwardBatch.seq_lens` represents prefix KV lengths, while `spec_info`
   supplies the draft tokens, positions, retrieve indices, and custom tree mask.
@@ -191,6 +195,11 @@ Implemented:
   `common/runner_modes/speculative_cuda_graph_runner.py`, following the
   adapter-based shape of `cuda_graph_decode_runner.py`. There is no root-level
   speculative runner shim; in-tree tests import the runner-mode modules directly.
+- Production EAGLE draft graph-runner coverage follows the same adapter pattern:
+  `common/runner_modes/eagle_draft_runner.py` owns the fixed-capture-batch
+  `EAGLEDraftCudaGraphRunner` lifecycle, and attention-method callbacks provide
+  module construction, draft inputs, replay-state setup, forward-batch
+  construction, and output comparison.
 - RoPE is intentionally omitted from the current unit-level runner x attention
   tests. These tests feed post-RoPE-equivalent Q/K tensors because rotary math is
   orthogonal to runner/backend metadata compatibility.
@@ -221,18 +230,22 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
-- Added production `EAGLEDraftCudaGraphRunner` coverage through
-  `common/runner_modes/eagle_draft_runner.py`. Dense `triton` and `flashinfer`
-  now capture with a fixed padded batch and replay distinct chain (`topk=1`) and
-  tree (`topk=2`) draft metadata/input tensors.
+- Refactored production `EAGLEDraftCudaGraphRunner` coverage into the
+  adapter-based lifecycle in `common/runner_modes/eagle_draft_runner.py`. Dense
+  `triton` and `flashinfer` wrappers now only provide method-specific callbacks
+  for fixture creation, draft-input construction, replay-state setup,
+  forward-batch creation, and layout validation.
 - `python -m py_compile test/manual/attention/unittest/common/runner_modes/eagle_draft_runner.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py`
 - `python test/manual/attention/unittest/dense/test_triton.py -v`
-  - Ran 7 tests in 3.693s after adding production EAGLE draft-runner coverage.
+  - Ran 7 tests in 3.558s after refactoring production EAGLE draft-runner
+    coverage.
 - `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
-  - Ran 8 tests in 4.121s after adding production EAGLE draft-runner coverage.
+  - Ran 8 tests in 3.881s after refactoring production EAGLE draft-runner
+    coverage.
 - `python -m py_compile $(find test/manual/attention/unittest/common test/manual/attention/unittest/dense test/manual/attention/unittest/swa test/manual/attention/unittest/mla test/manual/attention/unittest/gdn -name '*.py' -not -path '*/__pycache__/*')`
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
-  - Ran 63 tests in 24.986s after adding production EAGLE draft-runner coverage.
+  - Ran 63 tests in 25.042s after refactoring production EAGLE draft-runner
+    coverage.
 - Renamed runner orchestration helpers from `common/graph_runners/` to
   `common/runner_modes/` because the folder includes eager-style, PCG/BCG
   split-op, speculative, and CUDA graph runner modes.
