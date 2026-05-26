@@ -14,6 +14,8 @@ without depending on any inter-request race.
 
 from __future__ import annotations
 
+import random
+import string
 import unittest
 from typing import ClassVar
 
@@ -53,6 +55,19 @@ class _EagleChunkedRotationBase(CanaryE2EBase):
     def setUpClass(cls) -> None:
         cls.extra_env = {"SGLANG_DEBUG_REVERT_PR": "26329"} if cls.revert_pr else {}
         super().setUpClass()
+
+    def make_prompts(self, n: int) -> list[str]:
+        # Override the default repetitive English body. The chunked-prefill bug
+        # only manifests as a TOKEN mismatch when target's predicted bonus token
+        # differs from the next prompt token; with predictable text the model
+        # often guesses right and the validator never fires. Seeded random ASCII
+        # is unpredictable enough to make ``next_token_ids[0] != prompt[K1]``
+        # at every chunk boundary.
+        rng = random.Random(0)
+        body = "".join(
+            rng.choices(string.ascii_letters + string.digits + " ", k=40000)
+        )
+        return [body] * n
 
     def test_chunked_rotation_token_id_mismatch(self) -> None:
         self.send_parallel_requests(
