@@ -26,15 +26,20 @@ from sglang.test.test_utils import CustomTestCase
 
 
 def _script_max_new_tokens_zero_rejected(t: ScriptedRuntime):
-    # max_new_tokens = 0: engine should reject or never enter decode.
+    # max_new_tokens = 0: engine should reject the req with a sampling
+    # validation error.
     # NEW API NEEDED: start_req should propagate sampling validation
     # errors back to the caller as ReqHandle.error_message.
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=0)
     for _ in range(DEFAULT_MAX_STEPS):
-        if r.finished or r.status == "unknown":
+        if r.error_message is not None:
+            return
+        if r.finished:
             return
         yield
-    raise AssertionError("max_new_tokens=0 should fast-fail or no-op")
+    raise AssertionError(
+        "max_new_tokens=0 should fast-fail with an error_message"
+    )
 
 
 def _script_max_new_tokens_one_long_chunked(t: ScriptedRuntime):
