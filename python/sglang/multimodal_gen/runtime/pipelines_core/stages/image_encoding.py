@@ -997,12 +997,16 @@ class ImageVAEEncodingStage(PipelineStage):
         if sample_mode == "sample":
             if hasattr(encoder_output, "latent_dist"):
                 return encoder_output.latent_dist.sample(generator)
+            if hasattr(encoder_output, "latent"):
+                return encoder_output.latent
             if hasattr(encoder_output, "latents"):
                 return encoder_output.latents
             return encoder_output.sample(generator)
         elif sample_mode == "argmax":
             if hasattr(encoder_output, "latent_dist"):
                 return encoder_output.latent_dist.mode()
+            if hasattr(encoder_output, "latent"):
+                return encoder_output.latent
             if hasattr(encoder_output, "latents"):
                 return encoder_output.latents
             return encoder_output.mode()

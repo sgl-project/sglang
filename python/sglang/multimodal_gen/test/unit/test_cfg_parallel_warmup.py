@@ -319,6 +319,20 @@ class TestFlux2FinetunedVaeEncodePreprocess(unittest.TestCase):
 
 
 class TestImageVaeEncodingLatentRetrieval(unittest.TestCase):
+    def test_retrieve_latents_accepts_encoder_output_latent(self):
+        stage = object.__new__(ImageVAEEncodingStage)
+        latents = torch.zeros(1, 32, 8, 8)
+        encoder_output = SimpleNamespace(latent=latents)
+
+        self.assertIs(
+            stage.retrieve_latents(encoder_output, sample_mode="argmax"),
+            latents,
+        )
+        self.assertIs(
+            stage.retrieve_latents(encoder_output, sample_mode="sample"),
+            latents,
+        )
+
     def test_retrieve_latents_accepts_encoder_output_latents(self):
         stage = object.__new__(ImageVAEEncodingStage)
         latents = torch.zeros(1, 32, 8, 8)
