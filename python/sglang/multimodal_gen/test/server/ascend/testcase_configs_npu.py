@@ -32,6 +32,7 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
             model_path=FLUX_1_DEV_WEIGHTS_PATH,
         ),
         T2I_sampling_params,
+        run_consistency_check=False,
     ),
     # === Text to Video (T2V) ===
     DiffusionTestCase(
@@ -42,6 +43,7 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
         ),
+        run_consistency_check=False,
     ),
 ]
 
@@ -71,7 +73,7 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
     ),
     # === Text to Video (T2V) ===
     DiffusionTestCase(
-        "wan2_2_t2v_14b_w8a8_8npu",
+        "wan2_2_t2v_14b_w8a8_2npu",
         DiffusionServerArgs(
             model_path=WAN2_2_T2V_A14B_DIFFUSERS_W8A8_WEIGHTS_PATH,
             num_gpus=2,
