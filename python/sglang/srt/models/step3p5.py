@@ -1019,7 +1019,13 @@ class Step3p5ForCausalLM(nn.Module):
                         )
                         loaded_params.add(actual_param_name)
 
-        print_params = set(params_dict.keys()) - loaded_params
+        # Derived parameters (e.g. blockscale_swizzled from NVFP4 quantization)
+        # are computed in process_weights_after_loading, not loaded from checkpoint.
+        print_params = {
+            p
+            for p in set(params_dict.keys()) - loaded_params
+            if "blockscale_swizzled" not in p
+        }
         assert len(print_params) == 0, f"Some parameters are not loaded: {print_params}"
 
     def get_embed_and_head(self):

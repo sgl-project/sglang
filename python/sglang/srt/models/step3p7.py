@@ -20,10 +20,23 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.step3_vl_10b import PerceptionEncoder
 from sglang.srt.models.step3p5 import Step3p5ForCausalLM
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import add_prefix
 
 
 class Step3p7ForConditionalGeneration(nn.Module):
+
+    # NVFP4 checkpoints (e.g. huangyu-nv/step3p7-nvfp4-moe-only-kvfp8) use
+    # "model.language_model." prefix, while sglang parameters are named
+    # "language_model.model.". This mapper remaps the quantization ignore
+    # patterns so that is_layer_skipped works correctly.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.language_model.": "language_model.model.",
+            "model.vision_model": "vision_model",
+            "model.vit_large_projector": "vit_large_projector",
+        }
+    )
 
     def __init__(
         self,
@@ -38,7 +51,7 @@ class Step3p7ForConditionalGeneration(nn.Module):
             config.vision_config,
             ACT2FN[config.vision_config.hidden_act],
             quant_config=None,  # Vision weights are not quantized
-            prefix=add_prefix(prefix, "vision_model"),
+            prefix=add_prefix("vision_model", prefix),
         )
         self.vit_large_projector = ColumnParallelLinear(
             config.vision_config.width * 4,
@@ -46,12 +59,12 @@ class Step3p7ForConditionalGeneration(nn.Module):
             bias=config.projector_bias,
             gather_output=True,
             quant_config=None,  # Projector weights are bf16
-            prefix=add_prefix(prefix, "vit_large_projector"),
+            prefix=add_prefix("vit_large_projector", prefix),
         )
         self.language_model = Step3p5ForCausalLM(
             config=config.text_config,
             quant_config=quant_config,
-            prefix=add_prefix(prefix, "language_model"),
+            prefix=add_prefix("language_model", prefix),
         )
 
     def _get_vision_model_output(self, input_tensor: torch.Tensor) -> torch.Tensor:
@@ -145,7 +158,15 @@ class Step3p7ForConditionalGeneration(nn.Module):
         language_weights = []
 
         for name, loaded_weight in weights:
+            # NVFP4 checkpoints use "model.language_model." prefix for
+            # language weights and "model.vision_model." for vision weights,
+            # while FP8 checkpoints use "model." and "vision_model." directly.
+            name = name.replace("language_model.", "", 1)
+
             if "vision_model" in name or "vit_large_projector" in name:
+                # Strip leading "model." for vision weights (NVFP4 format)
+                if name.startswith("model."):
+                    name = name[len("model.") :]
                 name = name.replace(r".attn.in_proj_weight", r".attn.qkv_proj.weight")
                 name = name.replace(r".attn.in_proj_bias", r".attn.qkv_proj.bias")
                 name = name.replace(r".attn.out_proj.bias", r".attn.proj.bias")
