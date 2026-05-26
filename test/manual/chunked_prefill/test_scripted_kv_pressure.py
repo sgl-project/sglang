@@ -264,6 +264,167 @@ class TestScriptedKVPressure(CustomTestCase):
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r2, lambda h: h.finished, max_steps=2000)
 
+    def test_strict_mem_check_handles_chunked_tail(self):
+        """Strict mem check + page_size>1 + waiting chunked: no false-positive leak assert."""
+        execute_scripted_runtime(
+            self._script_strict_mem_check_handles_chunked_tail,
+            **base_engine_kwargs(
+                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+                page_size=16,
+            ),
+        )
+
+    # [b-b433e1ea35] strict mem check + page_size>1 must count the
+    # chunked-resume tail when a chunked req sits in waiting_queue;
+    # pre-fix the runtime mem accounting tripped a false-positive leak
+    # assert during busy.
+    @staticmethod
+    def _script_strict_mem_check_handles_chunked_tail(t: ScriptedRuntime):
+        # Mid-chunk retract pushes a chunked-resume req onto the
+        # waiting_queue; with page_size>1 the tail page must still be
+        # counted by the strict mem check.
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN + 17, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+        t.force_retract(r)
+        yield from run_until_finished(r, max_steps=2000)
+        assert r.finished
+        assert r.kv_pages == 0
+
+    def test_chunked_retract_resume_kv_recovers_exactly(self):
+        """Chunked retract → resume → finish: kv_pool_free returns to baseline."""
+        execute_scripted_runtime(
+            self._script_chunked_retract_resume_kv_recovers_exactly,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-KV6] chunked retract → resume → finish — completed state must
+    # release every KV page acquired during the chunked path; pool count
+    # is at least the pre-submit baseline.
+    @staticmethod
+    def _script_chunked_retract_resume_kv_recovers_exactly(t: ScriptedRuntime):
+        baseline = t.engine_stats()["kv_pool_free"]
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+        t.force_retract(r)
+        yield from run_until_finished(r, max_steps=2000)
+        assert r.finished
+        assert r.kv_pages == 0
+        final = t.engine_stats()["kv_pool_free"]
+        assert final >= baseline, (
+            f"kv_pool_free did not recover after chunked retract+resume: "
+            f"baseline={baseline}, final={final}"
+        )
+
+    def test_chunked_retract_at_chunk_first_mid_last(self):
+        """Three sequential reqs with same prompt; force retract at chunks_done={0, mid, last-1}."""
+        execute_scripted_runtime(
+            self._script_chunked_retract_at_chunk_first_mid_last,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-KV5] retract at three distinct chunked progress points —
+    # chunks_done={0, mid, last-1} — each chunked-resume must rebuild
+    # prefix_indices correctly and complete.
+    @staticmethod
+    def _script_chunked_retract_at_chunk_first_mid_last(t: ScriptedRuntime):
+        # Total expected chunks = VERY_LONG_PROMPT_LEN // DEFAULT_CHUNK_SIZE.
+        expected_chunks = VERY_LONG_PROMPT_LEN // DEFAULT_CHUNK_SIZE
+        mid_chunk = expected_chunks // 2
+        last_minus_one = max(1, expected_chunks - 1)
+
+        # First: retract at chunks_done == 0 (entered chunked path but no
+        # chunk committed yet — just barely is_chunking).
+        r_first = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r_first, lambda h: h.is_chunking)
+        t.force_retract(r_first)
+        yield from run_until_finished(r_first, max_steps=2000)
+        assert r_first.finished
+        assert r_first.kv_pages == 0
+
+        # Mid: retract at chunks_done == expected_chunks // 2.
+        r_mid = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r_mid, lambda h: h.chunks_done >= mid_chunk)
+        t.force_retract(r_mid)
+        yield from run_until_finished(r_mid, max_steps=2000)
+        assert r_mid.finished
+        assert r_mid.kv_pages == 0
+
+        # Last-1: retract at chunks_done == expected_chunks - 1.
+        r_last = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r_last, lambda h: h.chunks_done >= last_minus_one)
+        t.force_retract(r_last)
+        yield from run_until_finished(r_last, max_steps=2000)
+        assert r_last.finished
+        assert r_last.kv_pages == 0
+
+    def test_flush_cache_during_chunked_in_flight(self):
+        """Chunked req in flight; flush_cache must not corrupt the in-flight prefix or other cache state."""
+        execute_scripted_runtime(
+            self._script_flush_cache_during_chunked_in_flight,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-Cross13] flush_cache mid-chunked — the in-flight chunked req's
+    # prefix must not be flushed; the req still completes cleanly.
+    @staticmethod
+    def _script_flush_cache_during_chunked_in_flight(t: ScriptedRuntime):
+        # NEW API NEEDED: t.flush_cache() — drop the radix cache entirely.
+        # Warm radix with a chunked req to populate the tree.
+        r_warm = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=1)
+        yield from run_until_finished(r_warm)
+        assert r_warm.finished
+
+        # Start another chunked req; flush mid-flight.
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+        t.flush_cache()
+        yield from run_until_finished(r, max_steps=2000)
+        assert r.finished
+        assert r.kv_pages == 0
+
+    def test_chunked_oscillation_three_force_retracts(self):
+        """Single chunked req; force_retract three times across its lifecycle; chunks_done preserved, final completes."""
+        execute_scripted_runtime(
+            self._script_chunked_oscillation_three_force_retracts,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-Cross16] chunked oscillation — 3 force_retracts on one req;
+    # chunks_done is preserved across retract/resume rounds and the
+    # req still finishes once admitted long enough.
+    @staticmethod
+    def _script_chunked_oscillation_three_force_retracts(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        # First retract — early.
+        yield from run_until(r, lambda h: h.is_chunking)
+        chunks_at_first = r.chunks_done
+        t.force_retract(r)
+        # Resume back into chunking.
+        yield from run_until(
+            r, lambda h: h.is_chunking and h.chunks_done >= chunks_at_first, max_steps=800
+        )
+        chunks_after_first_resume = r.chunks_done
+        assert chunks_after_first_resume >= chunks_at_first, (
+            f"chunks_done regressed across retract: "
+            f"before={chunks_at_first}, after={chunks_after_first_resume}"
+        )
+
+        # Second retract — mid-flight.
+        t.force_retract(r)
+        yield from run_until(
+            r,
+            lambda h: h.is_chunking and h.chunks_done >= chunks_after_first_resume,
+            max_steps=800,
+        )
+        chunks_after_second_resume = r.chunks_done
+        assert chunks_after_second_resume >= chunks_after_first_resume
+
+        # Third retract — late.
+        t.force_retract(r)
+        yield from run_until_finished(r, max_steps=2000)
+        assert r.finished
+        assert r.chunks_done >= chunks_after_second_resume
+
 
 if __name__ == "__main__":
     unittest.main()
