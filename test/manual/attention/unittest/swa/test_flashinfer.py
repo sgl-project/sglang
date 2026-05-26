@@ -30,17 +30,21 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
     HEAD_DIM = 64
     HIDDEN_SIZE = 256
 
-    # NOTE: `make_swa_prefix_input_config_cases` is *not* added here. A clone
-    # of triton's with-prefix SWA EXTEND fails on flashinfer with ~0.22 max
-    # diff. FlashInfer's prefill kernel routes prefix differently than triton
-    # for SWA. See dsv4/README discussion about flashinfer SWA prefix
-    # handling — the production code paths are not symmetric across backends.
+    # EXTEND with non-zero prefix is intentionally not covered here.
+    # FlashInfer's SWA prefill path takes the `merge_state` branch when
+    # `extend_no_prefix=False` (`flashinfer_backend.py:866-883`), which calls
+    # `prefill_wrapper_paged.forward_return_lse` on the cached portion
+    # *without* passing `window_left`, and `wrapper_paged.begin_forward`
+    # (`flashinfer_backend.py:1482`) also doesn't carry SWA settings. Even
+    # for within-window seqs, the merge_state path diverges from the
+    # reference by ~0.2 max diff. This is a production-side SGLang gap, not
+    # a fixture issue; cover only no-prefix EXTEND until the gap is closed.
     CASES = make_swa_no_prefix_input_config_cases("flashinfer")
-    # NOTE: a `runner_cuda_graph_swa_decode_above_window` clone of the triton
-    # SWA test (`prefix_lens=(7, 8, 9)`, `sliding_window_size=4`) fails on
-    # flashinfer with large diffs. FlashInfer's SWA replay metadata builder
-    # does not apply the same `min(seq_lens, window)` clipping as triton.
-    # Investigate before adding above-window decode to flashinfer SWA.
+    # Above-window decode case requires the `extend_window` reference rule
+    # (window+1 keys), not the `min_seq_len_window` rule — FlashInfer's
+    # decode metadata uses `clamp(seq_lens, max=window+1)` per
+    # `flashinfer_backend.py:1031`. See `_SWA_DECODE_EXTEND_WINDOW` in
+    # `common/attention_methods/dense_attention.py`.
     CUDA_GRAPH_CASES = (
         DenseAttentionCase(
             name="runner_cuda_graph_swa_decode_within_window",
@@ -50,6 +54,16 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
             num_kv_heads=4,
             page_size=16,
             prefix_lens=(1, 2, 3),
+            sliding_window_size=4,
+        ),
+        DenseAttentionCase(
+            name="runner_cuda_graph_swa_decode_above_window",
+            backend="flashinfer",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(7, 8, 9),
             sliding_window_size=4,
         ),
     )

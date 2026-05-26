@@ -30,15 +30,20 @@ DENSE_RTOL = 3e-2
 
 # SWA decode rule classification — production metadata builders differ:
 #   - `min_seq_len_window` rule: `window_kv_lens = min(seq_lens, window)` (the
-#     extra current-token slot is NOT included).
+#     extra current-token slot is NOT included; total = `window` keys).
 #   - `extend_window` rule: keys at `[query_pos - window, query_pos]` are
-#     allowed by the extend kernel mask (the current token IS included).
+#     allowed by the extend kernel mask (the current token IS included; total
+#     = `window + 1` keys). FlashInfer's SWA decode metadata uses
+#     `clamp(seq_lens, max=window + 1)` (`flashinfer_backend.py:1031`) which
+#     gives `window + 1` keys when `seq_len > window`, matching this rule.
+#     Within-window seqs collapse to `seq_len` in both rules, so cases that
+#     stay below the window can't distinguish them.
 # Each known backend must be classified into exactly one set; an unclassified
 # backend trips `_swa_decode_uses_min_seq_len_rule` so a future SWA backend
 # can't silently inherit the wrong rule via a fallback.
-_SWA_DECODE_MIN_SEQ_LEN_WINDOW: frozenset[str] = frozenset({"triton", "flashinfer"})
+_SWA_DECODE_MIN_SEQ_LEN_WINDOW: frozenset[str] = frozenset({"triton"})
 _SWA_DECODE_EXTEND_WINDOW: frozenset[str] = frozenset(
-    {"torch_native", "fa3", "fa4", "flex_attention", "trtllm_mha"}
+    {"torch_native", "fa3", "fa4", "flex_attention", "trtllm_mha", "flashinfer"}
 )
 
 
