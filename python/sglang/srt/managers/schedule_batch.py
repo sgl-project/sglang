@@ -1467,6 +1467,17 @@ def set_mamba_track_indices_from_reqs(batch):
     )
 
 
+def _compute_chunked_req_next_prompt_token(
+    chunked_req: Optional[Req],
+) -> Optional[int]:
+    if chunked_req is None:
+        return None
+    fill_len = len(chunked_req.fill_ids)
+    if fill_len >= len(chunked_req.origin_input_ids):
+        return None
+    return int(chunked_req.origin_input_ids[fill_len])
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -1489,6 +1500,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For chunked prefill in PP
     chunked_req: Optional[Req] = None
+    # Snapshot at batch ctor of `origin_input_ids[len(fill_ids)]` for the chunked
+    # req when it still has prompt tokens remaining; consumed by the EAGLE prefill
+    # rotation (see PR #26329).
+    chunked_req_next_prompt_token: Optional[int] = None
 
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -1657,6 +1672,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_indexer_topk=any(req.return_indexer_topk for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
+            chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
+                chunked_req
+            ),
             dllm_config=dllm_config,
         )
         return batch
