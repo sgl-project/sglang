@@ -483,91 +483,6 @@ def _unpack_swa_cache(
     return torch.cat([nope_dequant, rope_bf16], dim=-1)
 
 
-def _build_dsv4_metadata(
-    backend,
-    runner: MockDSV4ModelRunner,
-    case: DSV4AttentionCase,
-    out_cache_loc: torch.Tensor,
-):
-    """Construct a DSV4Metadata that only exercises the compress_ratio=0 path."""
-    from sglang.srt.layers.attention.deepseek_v4_backend import (
-        DSV4AttnMetadata,
-        DSV4Metadata,
-        _create_flashmla_metadata,
-        _pad_last_dim,
-    )
-
-    device = runner.device
-    num_q = case.num_input_tokens
-
-    # seq_lens_casual: per-q-token, the kv-position+1 it attends to.
-    seq_lens_casual = []
-    req_idx_per_q = []
-    positions = []
-    for req_idx, (prefix_len, ext_len) in enumerate(
-        zip(case.prefix_lens, case.input_lens)
-    ):
-        for offset in range(ext_len):
-            pos = prefix_len + offset
-            seq_lens_casual.append(pos + 1)
-            req_idx_per_q.append(req_idx)
-            positions.append(pos)
-    seq_lens_casual_t = torch.tensor(seq_lens_casual, dtype=torch.int32, device=device)
-    positions_casual = torch.tensor(positions, dtype=torch.int32, device=device)
-    req_pool_indices_repeated = torch.tensor(
-        req_idx_per_q, dtype=torch.int32, device=device
-    )
-
-    # SWA window: for each query, the last DSV4_SWA_WINDOW full locs (-1 where invalid).
-    pos_t = positions_casual.unsqueeze(1) - torch.arange(
-        DSV4_SWA_WINDOW, dtype=torch.int32, device=device
-    ).unsqueeze(0)
-    invalid = pos_t < 0
-    pos_t = pos_t.masked_fill(invalid, 0)
-    raw_full_locs = runner.req_to_token_pool.req_to_token[
-        req_pool_indices_repeated[:, None], pos_t
-    ]
-    raw_full_locs = raw_full_locs.masked_fill(invalid, -1)
-    swa_page_indices = runner.token_to_kv_pool.translate_loc_from_full_to_swa(
-        raw_full_locs
-    )
-    swa_page_indices = _pad_last_dim(swa_page_indices, multiples_of=64)
-    swa_topk_lengths = torch.clamp(seq_lens_casual_t, max=DSV4_SWA_WINDOW)
-
-    # page_table: full-token-loc page indices, one row per q token.
-    max_seq_len = max(case.seq_lens)
-    page_table = runner.req_to_token_pool.req_to_token[
-        req_pool_indices_repeated, : max_seq_len : case.page_size
-    ]
-    page_table = (page_table // case.page_size).to(torch.int32)
-
-    metadata = DSV4AttnMetadata(
-        page_size=case.page_size,
-        page_table=page_table,
-        raw_out_loc=out_cache_loc.to(torch.int32),
-        cuda_int32_kwargs={"device": device, "dtype": torch.int32},
-        seq_lens_casual=seq_lens_casual_t,
-        positions_casual=positions_casual,
-        swa_page_indices=swa_page_indices,
-        swa_topk_lengths=swa_topk_lengths,
-        c4_sparse_topk=DSV4_INDEX_TOPK,
-    )
-    # Only c1_flashmla_metadata is needed for compress_ratio=0; the C4/C128
-    # metadata slots stay unused.
-    metadata.c1_flashmla_metadata = _create_flashmla_metadata()
-    metadata.c4_flashmla_metadata = None
-    metadata.c128_flashmla_metadata = None
-    metadata.c4_sparse_topk_lengths = None
-    metadata.c4_sparse_page_indices = None
-
-    backend.forward_metadata = DSV4Metadata(
-        core_attn_metadata=metadata,
-        indexer_metadata=None,
-        c4_compress_metadata=None,
-        c128_compress_metadata=None,
-    )
-
-
 @dataclass
 class DSV4AttentionFixture:
     case: DSV4AttentionCase
@@ -749,21 +664,20 @@ def _pure_torch_dsv4_swa_reference(
     return torch.stack(outputs, dim=0).to(q.dtype)
 
 
-def run_dsv4_attention_case(
-    testcase,
-    case: DSV4AttentionCase,
+def _populate_swa_kv_cache(
+    fixture: DSV4AttentionFixture,
     *,
-    dtype: torch.dtype = torch.bfloat16,
-    device: str = "cuda",
-) -> None:
-    fixture = build_dsv4_attention_fixture(testcase, case, dtype=dtype, device=device)
-    runner = fixture.runner
-
-    # Project Q and K for every kv token (prefix + input).
+    max_context_len: int,
+    device: str,
+) -> list[torch.Tensor]:
+    """Project K for every kv token (prefix + input) and write the packed
+    FP8 nope + BF16 rope representation into the SWA pool via the production
+    pack+set path. Returns the full-pool token locs per request in causal order.
+    """
+    case = fixture.case
     full_kv_locs_per_req: list[torch.Tensor] = []
-    all_k_bf16_parts = []
-    all_k_locs_parts = []
-    max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
+    all_k_bf16_parts: list[torch.Tensor] = []
+    all_k_locs_parts: list[torch.Tensor] = []
     for req_idx, prefix in enumerate(fixture.prefix_hidden):
         input_part = fixture.input_hidden[
             sum(case.input_lens[:req_idx]) : sum(case.input_lens[: req_idx + 1])
@@ -782,24 +696,32 @@ def run_dsv4_attention_case(
         )
         full_kv_locs_per_req.append(req_locs)
         all_k_locs_parts.append(req_locs)
-
     all_k = torch.cat(all_k_bf16_parts, dim=0)
     all_k_locs = torch.cat(all_k_locs_parts, dim=0)
+    _write_swa_cache(fixture.runner, layer_id=0, loc=all_k_locs, k_bf16=all_k)
+    return full_kv_locs_per_req
 
-    # Write ALL kv (prefix + input) into the cache via the real pack+set path.
-    _write_swa_cache(runner, layer_id=0, loc=all_k_locs, k_bf16=all_k)
+
+def run_dsv4_attention_case(
+    testcase,
+    case: DSV4AttentionCase,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+) -> None:
+    fixture = build_dsv4_attention_fixture(testcase, case, dtype=dtype, device=device)
+    runner = fixture.runner
+    max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
+
+    full_kv_locs_per_req = _populate_swa_kv_cache(
+        fixture, max_context_len=max_context_len, device=device
+    )
 
     # Project Q for the input tokens only.
     q_input, _ = fixture.actual_module.project(fixture.input_hidden)
 
-    # Build DSV4Metadata directly (compress_ratio=0 path bypasses
-    # init_forward_metadata, which depends on compressor/indexer state we don't
-    # exercise here).
-    _build_dsv4_metadata(
-        fixture.backend, runner, case, fixture.forward_batch.out_cache_loc
-    )
-
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+        fixture.backend.init_forward_metadata(fixture.forward_batch)
         actual = fixture.backend.forward(
             q=q_input,
             k=q_input,  # k is v sentinel; save_kv_cache=False so it's unread
