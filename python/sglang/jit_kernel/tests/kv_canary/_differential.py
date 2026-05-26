@@ -50,6 +50,8 @@ def _run_both_plan(
     assert_equal: bool = True,
     active_verify_entries: Optional[int] = None,
     active_write_reqs: Optional[int] = None,
+    req_to_verify_expected_tokens: Optional[torch.Tensor] = None,
+    kv_token_id_vs_position_offset: int = 0,
 ) -> None:
     _ = extras
     verify_capacity = int(triton_verify.verify_slot_indices.shape[0])
@@ -63,8 +65,8 @@ def _run_both_plan(
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=verify_capacity,
-        req_to_verify_expected_tokens=None,
-        kv_token_id_vs_position_offset=0,
+        req_to_verify_expected_tokens=req_to_verify_expected_tokens,
+        kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
     )
     launch_canary_plan_kernels_torch_reference(
         verify_plan_out=ref_verify,
@@ -76,8 +78,8 @@ def _run_both_plan(
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=int(ref_verify.verify_slot_indices.shape[0]),
-        req_to_verify_expected_tokens=None,
-        kv_token_id_vs_position_offset=0,
+        req_to_verify_expected_tokens=req_to_verify_expected_tokens,
+        kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
     )
     torch.cuda.synchronize()
 
@@ -175,6 +177,7 @@ def _run_both_verify(
     real_kv_hash_mode: consts.RealKvHashMode,
     kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
     assert_equal: bool = True,
+    check_verify_expected_token: bool = True,
 ) -> None:
     launch_canary_verify_kernel(
         context=VerifyOrWriteContext(
@@ -189,7 +192,7 @@ def _run_both_verify(
             real_kv_hash_mode=real_kv_hash_mode,
         ),
         plan=plan_cuda,
-        check_verify_expected_token=True,
+        check_verify_expected_token=check_verify_expected_token,
     )
     launch_canary_verify_kernel_torch_reference(
         context=VerifyOrWriteContext(
@@ -204,7 +207,7 @@ def _run_both_verify(
             real_kv_hash_mode=real_kv_hash_mode,
         ),
         plan=plan_ref,
-        check_verify_expected_token=True,
+        check_verify_expected_token=check_verify_expected_token,
     )
     torch.cuda.synchronize()
 
@@ -417,6 +420,7 @@ def run_verify_diff(
     kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
     device: torch.device = _DEVICE,
     assert_equal: bool = True,
+    check_verify_expected_token: bool = True,
 ) -> tuple[FakeViolationLog, FakeViolationLog]:
     """Thin wrapper around ``_run_both_verify`` that creates a fresh log pair and packs (cuda, ref)
     buf/plan/source arguments into 2-tuples to drop ~8 lines of boilerplate per call site.
@@ -434,6 +438,7 @@ def run_verify_diff(
         real_kv_hash_mode=real_kv_hash_mode,
         kernel_kind=kernel_kind,
         assert_equal=assert_equal,
+        check_verify_expected_token=check_verify_expected_token,
     )
     return cuda_log, ref_log
 
@@ -496,6 +501,8 @@ def run_plan_diff(
     assert_equal: bool = True,
     active_verify_entries: Optional[int] = None,
     active_write_reqs: Optional[int] = None,
+    req_to_verify_expected_tokens: Optional[torch.Tensor] = None,
+    kv_token_id_vs_position_offset: int = 0,
 ) -> None:
     """Thin wrapper around ``_run_both_plan`` that unpacks ``((triton_v, triton_w), (ref_v, ref_w))``
     plan pairs to drop the per-call-site ``triton_verify=.../triton_write=.../ref_verify=...`` block.
@@ -516,4 +523,6 @@ def run_plan_diff(
         assert_equal=assert_equal,
         active_verify_entries=active_verify_entries,
         active_write_reqs=active_write_reqs,
+        req_to_verify_expected_tokens=req_to_verify_expected_tokens,
+        kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
     )
