@@ -1,0 +1,54 @@
+%% Paper 2408.07092 — Double Sparsity concept
+%% Two orthogonal axes of sparsity on Q·Kᵀ:
+%%   (1) channel-axis (offline, static, per-head)
+%%   (2) token-axis  (online, dynamic, per-step)
+%% Optional DS-Offload: full K,V on CPU; only selected slice ever on GPU.
+flowchart TB
+    classDef offline fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+    classDef online  fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
+    classDef offload fill:#fff3e0,stroke:#e65100,color:#bf360c,stroke-dasharray: 4 4
+
+    subgraph OFF [Offline · once per checkpoint]
+        Calib["Calibration<br/>Pile val 256 × 512<br/>collect mean&#124;Q·K&#124; per channel"]
+        CC["Channel config (JSON)<br/>{layer.proj → [[ch...] per head]}"]
+        Calib --> CC
+    end
+    class Calib,CC offline
+
+    subgraph PRE [Online · Prefill]
+        K["Full K cache<br/>shape B·H·S·D"]
+        KL["Label cache K_label<br/>shape B·H·S·r  (r ≪ D)"]
+        K -->|"gather r heavy channels"| KL
+    end
+    class K,KL online
+
+    subgraph DEC [Online · Decode step t]
+        Q["Query Qₜ"]
+        QL["Q_label  (B·H·r)"]
+        Q -->|"gather r heavy channels"| QL
+
+        SCORE["approx scores<br/>Q_label · K_labelᵀ<br/>shape B·H·S"]
+        QL --> SCORE
+        KL --> SCORE
+
+        TK["top-k token indices<br/>B·H·k"]
+        SCORE -->|"torch.topk (k tokens)"| TK
+
+        OUT["sparse attention<br/>softmax(Q·K[TK]ᵀ)·V[TK]"]
+        TK --> OUT
+        Q --> OUT
+        K --> OUT
+    end
+    class Q,QL,SCORE,TK,OUT online
+
+    CC -.->|"per-head ch indices"| KL
+    CC -.-> QL
+
+    subgraph OFL [Optional · DS-Offload]
+        CPUKV["CPU pinned K,V<br/>full size"]
+        GATHER["DGL gather_pinned_tensor_rows"]
+        CPUKV -->|"selected rows only"| GATHER
+    end
+    class CPUKV,GATHER offload
+    K -.->|"materialize only top-k"| CPUKV
+    GATHER -.-> OUT

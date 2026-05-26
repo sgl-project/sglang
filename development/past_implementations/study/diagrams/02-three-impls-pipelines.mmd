@@ -1,0 +1,41 @@
+%% Three implementations side-by-side.
+%% A — DoubleSparse (research, multi-flavour)
+%% B — sglang-last (decode-only, no offload)
+%% C — Twilight   (selector + pruner pipeline; ftka kernels orphaned)
+flowchart LR
+    classDef good   fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+    classDef caveat fill:#fff3e0,stroke:#e65100,color:#bf360c
+    classDef bad    fill:#ffebee,stroke:#c62828,color:#b71c1c
+    classDef ext    fill:#f3e5f5,stroke:#6a1b9a,color:#4a148c,stroke-dasharray:3 3
+
+    subgraph A ["A — DoubleSparse (research)"]
+        A1["calibration<br/>config/offline_calibration.py"]:::good
+        A2["JSON channel config<br/>config/*.json (13+ shipped)"]:::good
+        A3["label cache (GPU)<br/>models/model.py KVCache.k_label"]:::good
+        A4["sparse Triton kernel<br/>triton_kernels/sparse.py:fwd_sparse_no_mask"]:::good
+        A5["[opt] CPU-pinned K,V<br/>offloading/model.py + DGL gather"]:::caveat
+        A1 --> A2 --> A3 --> A4
+        A2 -.-> A5 -.-> A4
+    end
+
+    subgraph B ["B — sglang fork (decode-only)"]
+        B1["external JSON config<br/>(reuses A's tool)"]:::ext
+        B2["DoubleSparseTokenToKVPool<br/>memory_pool.py:1972-2060<br/>k+v+label ALL GPU"]:::good
+        B3["3-stage Triton kernel<br/>BGEMV → torch.topk (host) → sparse attn → reduce"]:::caveat
+        B4["DS-Offload<br/>NOT PORTED"]:::bad
+        B5["CUDA graphs<br/>DISABLED (model_runner.py:927-932)"]:::bad
+        B1 --> B2 --> B3
+        B2 -.x B4
+        B3 -.x B5
+    end
+
+    subgraph C ["C — Twilight (framework)"]
+        C1["external JSON config<br/>(hardcoded /data/chaofan/...)"]:::ext
+        C2["selector<br/>DS or Quest or SparQ ...<br/>(internal r-channel quant)"]:::good
+        C3["weight_estimator<br/>(quantize full K → approx scores)<br/>NOT paper-DS"]:::caveat
+        C4["pruner<br/>top-p mask (CUDA TopPReturnMask)<br/>or threshold"]:::good
+        C5["mask = selector & pruner<br/>applied to DENSE attn (un-fused)"]:::caveat
+        C6["ftka kernels (raft_topk, sparse-GEMV)<br/>EXIST UPSTREAM but never imported"]:::bad
+        C1 --> C2 --> C3 --> C4 --> C5
+        C5 -.x C6
+    end
