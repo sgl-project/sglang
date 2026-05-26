@@ -68,6 +68,11 @@ class InsertParams:
     chunked: bool = False
     priority: int = 0
 
+    # Optional owning Req for instrumentation (e.g., chunked hit-count
+    # inflation counter in radix_cache._inc_hit_count). Pure observability;
+    # tree mutation must not depend on this field.
+    req: Optional[Req] = None
+
 
 @dataclasses.dataclass
 class InsertResult:

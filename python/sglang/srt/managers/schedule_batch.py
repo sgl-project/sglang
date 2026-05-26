@@ -831,6 +831,12 @@ class Req(ReqDllmMixin):
         self.swa_chunked_early_return_count: int = 0
         self.swa_stash_double_free_count: int = 0
 
+        # Regression instrumentation for invariant C1: chunked requests must
+        # not increment hit_count on radix tree nodes (self-referencing
+        # inflation guard); see radix_cache._inc_hit_count for full bug
+        # history.
+        self.radix_chunked_hit_inflation_count: int = 0
+
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
         # processed.
