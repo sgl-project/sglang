@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common.attention_methods.dense_attention import (
     DenseAttentionCase,
     make_swa_no_prefix_input_config_cases,
+    make_swa_prefix_input_config_cases,
     run_dense_attention_case,
 )
 from common.runner_modes.cuda_graph_decode_runner import (
@@ -30,22 +31,9 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
     HEAD_DIM = 64
     HIDDEN_SIZE = 256
 
-    # EXTEND with non-zero prefix is intentionally not covered here.
-    # FlashInfer's SWA prefill path takes the `merge_state` branch when
-    # `extend_no_prefix=False` (`flashinfer_backend.py:866-883`). Two bugs
-    # combine in that branch:
-    #   1. Neither `prefill_wrapper_paged.forward_return_lse` nor its plan
-    #      call pass `window_left`, so per-query SWA masking is skipped.
-    #   2. `update_sliding_window` (line 1314-1317) sets
-    #      `paged_kernel_lens = min(seq_lens, window + extend_lens)` — but
-    #      when `use_ragged=True`, the K cache has only prefix tokens
-    #      written, not the extend tokens (`save_kv_cache` runs *after*
-    #      `merge_state`). The paged wrapper then reads cache positions
-    #      `[prefix_len, seq_len)` that contain stale/uninitialized data.
-    # Adding `window_left` alone is insufficient because of (2). A proper
-    # fix needs the metadata builder to branch on `use_ragged`. Out of
-    # scope for this test PR — file as a SGLang production-side follow-up.
-    CASES = make_swa_no_prefix_input_config_cases("flashinfer")
+    CASES = make_swa_no_prefix_input_config_cases(
+        "flashinfer"
+    ) + make_swa_prefix_input_config_cases("flashinfer")
     # Above-window decode case requires the `extend_window` reference rule
     # (window+1 keys), not the `min_seq_len_window` rule — FlashInfer's
     # decode metadata uses `clamp(seq_lens, max=window+1)` per

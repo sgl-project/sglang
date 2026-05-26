@@ -864,12 +864,23 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
             else:
+                # Disable sliding window attention for multi-item scoring (see
+                # the use_ragged=False branch above for rationale).
+                swa_window_left = (
+                    layer.sliding_window_size
+                    if not (
+                        self.forward_metadata.multi_item_params
+                        and self.forward_metadata.multi_item_params.is_enabled()
+                    )
+                    else -1
+                )
                 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
                     causal=causal,
                     sm_scale=layer.scaling,
+                    window_left=swa_window_left,
                     logits_soft_cap=logits_soft_cap,
                 )
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
@@ -877,6 +888,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                     causal=False,
                     sm_scale=layer.scaling,
+                    window_left=swa_window_left,
                     logits_soft_cap=logits_soft_cap,
                 )
 
@@ -1309,19 +1321,41 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
         for wrapper_id in range(2):
+            swa_paged_custom_mask = None
             if wrapper_id == 0:
-                # window attention use paged only
-                paged_kernel_lens = torch.minimum(
-                    seq_lens,
-                    torch.tensor(self.sliding_window_size) + seq_lens - prefix_lens,
-                )
-                paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+                if use_ragged:
+                    # In the ragged + merge_state EXTEND path, K for the extend
+                    # tokens is written to the KV cache AFTER the paged wrapper
+                    # runs (see forward_extend). The paged wrapper therefore
+                    # only sees prefix tokens; positions [prefix_len, seq_len)
+                    # contain stale/uninitialized data. Read prefix-only from
+                    # offset 0 and supply a per-(q, k) SWA custom mask so each
+                    # extend query only attends to prefix keys inside its
+                    # window. FlashInfer's built-in `window_left` mask anchors
+                    # Q positions at the END of `kv_len`, so it cannot express
+                    # the correct prefix-vs-extend offset; the custom mask
+                    # encodes the right semantics directly.
+                    paged_kernel_lens = prefix_lens
+                    paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+                    kv_start_idx = torch.zeros_like(seq_lens)
+                    swa_paged_custom_mask = self._build_swa_prefix_custom_mask(
+                        prefix_lens, seq_lens
+                    )
+                else:
+                    # window attention use paged only
+                    paged_kernel_lens = torch.minimum(
+                        seq_lens,
+                        torch.tensor(self.sliding_window_size)
+                        + seq_lens
+                        - prefix_lens,
+                    )
+                    paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+                    kv_start_idx = seq_lens - paged_kernel_lens
             else:
                 # full attention
                 paged_kernel_lens = seq_lens
                 paged_kernel_lens_sum = seq_lens_sum
-
-            kv_start_idx = seq_lens - paged_kernel_lens
+                kv_start_idx = seq_lens - paged_kernel_lens
             use_sliding_window_kv_pool = wrapper_id == 0 and isinstance(
                 self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
             )
@@ -1341,7 +1375,51 @@ class FlashInferIndicesUpdaterPrefill:
                 spec_info,
                 use_sliding_window_kv_pool=use_sliding_window_kv_pool,
                 multi_item_params=multi_item_params,
+                cross_attention_custom_mask=swa_paged_custom_mask,
             )
+
+    def _build_swa_prefix_custom_mask(
+        self,
+        prefix_lens: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Build a SWA custom mask for the paged wrapper in the ragged +
+        merge_state EXTEND path.
+
+        For each request the paged wrapper sees `extend_len * prefix_len`
+        (q, k) pairs (row-major). Q[i] is logically at position
+        `prefix_len + i`; with `window_left = W`, K[j] (a prefix position)
+        is visible iff `j >= prefix_len + i - W`. Returns ``None`` when
+        every cached prefix key is in-window for every extend query, in
+        which case the kernel can run without a custom mask.
+        """
+        window = self.sliding_window_size
+        if window is None or window < 0:
+            return None
+
+        prefix_lens_cpu = prefix_lens.detach().cpu().tolist()
+        extend_lens_cpu = (seq_lens - prefix_lens).detach().cpu().tolist()
+        if all(p == 0 for p in prefix_lens_cpu):
+            return None
+
+        device = prefix_lens.device
+        mask_parts: List[torch.Tensor] = []
+        need_mask = False
+        for prefix_len, extend_len in zip(prefix_lens_cpu, extend_lens_cpu):
+            if prefix_len == 0 or extend_len == 0:
+                # Empty (q, k) block — nothing to contribute. The wrapper
+                # handles zero-length requests on its own.
+                continue
+            q_pos = torch.arange(extend_len, device=device).view(-1, 1) + prefix_len
+            k_pos = torch.arange(prefix_len, device=device).view(1, -1)
+            block = (k_pos >= (q_pos - window)).to(torch.uint8)
+            if not bool(block.all()):
+                need_mask = True
+            mask_parts.append(block.view(-1))
+
+        if not need_mask or not mask_parts:
+            return None
+        return torch.cat(mask_parts)
 
     def update_cross_attention(
         self,
