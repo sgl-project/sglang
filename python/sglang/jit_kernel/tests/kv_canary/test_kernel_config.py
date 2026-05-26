@@ -436,3 +436,9 @@ def test_plan_per_req_present_or_absent(per_req_present: bool) -> None:
 
     if per_req_present:
         assert int(triton_v.verify_num_valid[0].item()) == 8
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

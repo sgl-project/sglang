@@ -61,3 +61,11 @@ def test_enums_sync() -> None:
         }
         py_normalized = {m.name: int(m.value) for m in py_enum}
         assert cpp_normalized == py_normalized
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

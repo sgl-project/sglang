@@ -1216,3 +1216,9 @@ class TestPseudoMode:
             expected_input_positions=_int32_tensor([99, 99, 99]),
         )
         assert int(cuda_log.write_index[0].item()) == 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -1882,3 +1882,9 @@ class TestVerifyExpectedInputIds:
         )
         assert int(row[consts.VIOLATION_FIELD_STORED_TOKEN]) == 42
         assert int(row[consts.VIOLATION_FIELD_EXPECTED_TOKEN]) == 123
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

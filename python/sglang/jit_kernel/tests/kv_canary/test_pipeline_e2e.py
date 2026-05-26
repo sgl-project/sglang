@@ -835,3 +835,9 @@ def test_pipeline_eagle_offset_plus_1_byte_equal() -> None:
 
     assert int(log_real.write_index[0].item()) == 0
     assert int(log_ref.write_index[0].item()) == 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

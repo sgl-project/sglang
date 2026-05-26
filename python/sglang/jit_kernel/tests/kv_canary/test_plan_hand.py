@@ -1364,3 +1364,9 @@ class TestExpectedTokenPoolValidLens:
                 req_to_verify_expected_tokens_valid_lens=None,
                 kv_token_id_vs_position_offset=0,
             )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

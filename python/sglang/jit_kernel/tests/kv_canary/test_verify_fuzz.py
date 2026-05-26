@@ -199,3 +199,9 @@ def test_verify_fuzz_full_combo(seed: int) -> None:
         summarize_fn=_summarize,
         n_iter=_FUZZ_ITER_PER_SEED,
     )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
