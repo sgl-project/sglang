@@ -93,9 +93,13 @@ class TestScriptedSampling(CustomTestCase):
         # temperature = 0 (greedy) + chunked: same prompt gives same output.
         # NEW API NEEDED: start_req(..., temperature=) — sampling kwarg passthrough.
         # NEW API NEEDED: r.output_tokens — list[int] of generated tokens.
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=8, temperature=0.0)
+        r1 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=8, temperature=0.0
+        )
         yield from run_until_finished(r1)
-        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=8, temperature=0.0)
+        r2 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=8, temperature=0.0
+        )
         yield from run_until_finished(r2)
         assert (
             r1.output_tokens == r2.output_tokens
@@ -133,7 +137,9 @@ class TestScriptedSampling(CustomTestCase):
         # ignore_eos = True + early EOS production + chunked: still runs to
         # max_new_tokens; doesn't shortcut on EOS.
         # NEW API NEEDED: start_req(..., ignore_eos=True).
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=16, ignore_eos=True)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=16, ignore_eos=True
+        )
         yield from run_until_finished(r)
         assert r.finished
         assert len(r.output_tokens) == 16
@@ -149,7 +155,9 @@ class TestScriptedSampling(CustomTestCase):
     def _script_stop_str_chunked(t: ScriptedRuntime):
         # stop=["xyz"] + chunked: stops at stop_str, doesn't reach max_new_tokens.
         # NEW API NEEDED: start_req(..., stop=["..."]).
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=512, stop=["xyz"])
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=512, stop=["xyz"]
+        )
         yield from run_until(r, lambda h: h.finished, max_steps=2000)
         assert r.finished
         assert len(r.output_tokens) < 512
@@ -213,7 +221,9 @@ class TestScriptedSampling(CustomTestCase):
     @staticmethod
     def _script_high_temperature_chunked(t: ScriptedRuntime):
         # High temperature + chunked: stable output, no crash.
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=2.0)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=2.0
+        )
         yield from run_until_finished(r)
         assert r.finished
 
@@ -227,11 +237,15 @@ class TestScriptedSampling(CustomTestCase):
     @staticmethod
     def _script_greedy_two_sequential_reqs(t: ScriptedRuntime):
         # Greedy + chunked, 2 sequential reqs — verify second matches first.
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0)
+        r1 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0
+        )
         yield from run_until_finished(r1)
         out_a = list(r1.output_tokens)
 
-        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0)
+        r2 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0
+        )
         yield from run_until_finished(r2)
         assert list(r2.output_tokens) == out_a
 
@@ -245,9 +259,13 @@ class TestScriptedSampling(CustomTestCase):
     @staticmethod
     def _script_greedy_chunked_with_radix_hit(t: ScriptedRuntime):
         # greedy + chunked + radix prefix hit. Output for r2 == r1.
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0)
+        r1 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0
+        )
         yield from run_until_finished(r1)
-        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0)
+        r2 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0
+        )
         yield from run_until_finished(r2)
         assert list(r1.output_tokens) == list(r2.output_tokens)
 
@@ -421,7 +439,9 @@ class TestScriptedSampling(CustomTestCase):
 
     @staticmethod
     def _script_greedy_chunked(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0
+        )
         yield from run_until_finished(r)
         assert r.finished
 
@@ -447,7 +467,9 @@ class TestScriptedSampling(CustomTestCase):
 
     @staticmethod
     def _script_high_temperature_chunked_extra(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=1.8)
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=1.8
+        )
         yield from run_until_finished(r)
         assert r.finished
 
@@ -533,9 +555,13 @@ class TestScriptedSampling(CustomTestCase):
     @staticmethod
     def _script_sampling_diversity_two_reqs(t: ScriptedRuntime):
         # Two reqs with same prompt and non-greedy temp: outputs may differ.
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=1.0)
+        r1 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=1.0
+        )
         yield from run_until_finished(r1)
-        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=1.0)
+        r2 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=1.0
+        )
         yield from run_until_finished(r2)
 
     def test_chunked_logprob_input_accumulates_across_chunks(self):
@@ -563,9 +589,9 @@ class TestScriptedSampling(CustomTestCase):
         )
         yield from run_until_finished(r)
         assert r.finished
-        assert r.chunks_done >= 2, (
-            f"prompt should span multiple chunks, got chunks_done={r.chunks_done}"
-        )
+        assert (
+            r.chunks_done >= 2
+        ), f"prompt should span multiple chunks, got chunks_done={r.chunks_done}"
         assert r.logprobs is not None
         input_lp = r.logprobs.input_token_logprobs_val
         # The first input token has no preceding context so it is not scored;
@@ -603,9 +629,9 @@ class TestScriptedSampling(CustomTestCase):
         )
         yield from run_until_finished(r)
         assert r.finished
-        assert r.chunks_done >= 3, (
-            f"prompt should span 3+ chunks, got chunks_done={r.chunks_done}"
-        )
+        assert (
+            r.chunks_done >= 3
+        ), f"prompt should span 3+ chunks, got chunks_done={r.chunks_done}"
         assert r.logprobs is not None
         input_lp = r.logprobs.input_token_logprobs_val
         # Only tokens at positions >= start_len contribute input logprobs.
@@ -682,9 +708,9 @@ class TestScriptedSampling(CustomTestCase):
         )
         yield from run_until_finished(r_eos, max_steps=2000)
         assert r_eos.finished
-        assert r_eos.chunks_done >= 2, (
-            f"scenario 1 should chunk; got chunks_done={r_eos.chunks_done}"
-        )
+        assert (
+            r_eos.chunks_done >= 2
+        ), f"scenario 1 should chunk; got chunks_done={r_eos.chunks_done}"
         assert r_eos.finish_reason == "stop", (
             f"ignore_eos=False + max_new_tokens=999 chunked must finish via "
             f"EOS (stop); got {r_eos.finish_reason!r}"
@@ -699,9 +725,9 @@ class TestScriptedSampling(CustomTestCase):
         )
         yield from run_until_finished(r_length)
         assert r_length.finished
-        assert r_length.chunks_done >= 2, (
-            f"scenario 2 should chunk; got chunks_done={r_length.chunks_done}"
-        )
+        assert (
+            r_length.chunks_done >= 2
+        ), f"scenario 2 should chunk; got chunks_done={r_length.chunks_done}"
         assert r_length.finish_reason == "length", (
             f"ignore_eos=True + max_new_tokens=4 chunked must finish via "
             f"length cap; got {r_length.finish_reason!r}"
