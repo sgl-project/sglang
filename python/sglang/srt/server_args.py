@@ -581,8 +581,6 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
-    speculative_adaptive: bool = False
-    speculative_adaptive_config: Optional[str] = None
     speculative_skip_dp_mlp_sync: bool = False
 
     # Speculative decoding (ngram)
@@ -595,6 +593,11 @@ class ServerArgs:
     speculative_ngram_external_sam_budget: int = 0
     speculative_ngram_external_corpus_max_tokens: int = 10000000
     enable_multi_layer_eagle: bool = False
+
+    # Adaptive speculative decoding
+    speculative_adaptive: bool = False
+    speculative_adaptive_config: Optional[str] = None
+    speculative_adaptive_max_draft_tokens: Optional[int] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -7033,17 +7036,20 @@ class ServerArgs:
         if not self.speculative_adaptive:
             return self.speculative_num_draft_tokens
 
-        from sglang.srt.speculative.adaptive_spec_params import (
-            resolve_candidate_steps_from_config,
-        )
+        if self.speculative_adaptive_max_draft_tokens is None:
+            from sglang.srt.speculative.adaptive_spec_params import (
+                resolve_candidate_steps_from_config,
+            )
 
-        candidate_steps = resolve_candidate_steps_from_config(
-            initial_steps=self.speculative_num_steps,
-            cfg_path=self.speculative_adaptive_config,
-        )
-        # TODO: adaptive spec currently requires topk=1, so each runtime state
-        # needs steps + 1 draft-token slots. Revisit this if topk>1 is supported.
-        return max(candidate_steps) + 1
+            candidate_steps = resolve_candidate_steps_from_config(
+                initial_steps=self.speculative_num_steps,
+                cfg_path=self.speculative_adaptive_config,
+            )
+            # TODO: adaptive spec currently requires topk=1, so each runtime state
+            # needs steps + 1 draft-token slots. Revisit this if topk>1 is supported.
+            self.speculative_adaptive_max_draft_tokens = max(candidate_steps) + 1
+
+        return self.speculative_adaptive_max_draft_tokens
 
     @property
     def mamba_cache_chunk_size(self) -> int:

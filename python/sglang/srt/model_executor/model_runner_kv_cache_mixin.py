@@ -91,7 +91,7 @@ class ModelRunnerKVCacheMixin:
             mamba_state_intermediate_size = (
                 config.mamba2_cache_params.mamba_cache_per_req
                 * max_running_requests
-                * server_args.speculative_num_draft_tokens
+                * server_args.effective_max_speculative_num_draft_tokens()
             )
             total_rest_memory = total_rest_memory - (
                 mamba_state_intermediate_size / (1 << 30)
