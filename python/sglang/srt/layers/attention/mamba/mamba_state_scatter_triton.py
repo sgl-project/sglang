@@ -9,6 +9,7 @@ avoiding multiple `index_elementwise_kernel` launches.
 import torch
 import triton
 import triton.language as tl
+from sglang.srt.utils import is_npu
 
 
 @triton.jit
@@ -18,6 +19,7 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     # Raw index arrays (before index_select)
     dst_indices_raw_ptr,  # [total_requests] - state_indices_tensor
     step_indices_raw_ptr,  # [total_requests] - last_correct_step_indices or mamba_steps_to_track
+    MAX_GRID_X,
     elem_per_entry: tl.constexpr,
     src_layer_stride,
     src_req_stride,
@@ -30,59 +32,53 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     """
-    Fused gather-scatter kernel with built-in masking.
-
-    This kernel fuses the index_select operations by:
-    1. Iterating over all requests (pid_req from 0 to total_requests-1)
-    2. Checking if step_indices_raw[pid_req] >= 0 (valid mask)
-    3. If valid, performing the scatter:
-       dst[l, dst_indices_raw[pid_req], :] = src[l, pid_req, step_indices_raw[pid_req], :]
-
-    Grid: (total_requests, num_layers, ceil(elem_per_entry / BLOCK_SIZE))
+    Fused gather-scatter kernel with built-in masking and Grid-Stride Loops.
+    The 3D grid is flattened to 2D (requests, layers) to bypass NPU volume limits (total blocks < 65536).
+    The element chunking (previously the Z dimension) is now handled by an inner loop.
     """
-    pid_req = tl.program_id(0)
+    pid_req_base = tl.program_id(0)
     pid_layer = tl.program_id(1).to(tl.int64)
-    pid_block = tl.program_id(2).to(tl.int64)
 
-    # Load step index to check validity (step >= 0 means valid)
-    step_idx = tl.load(step_indices_raw_ptr + pid_req).to(tl.int64)
+    # Grid-Stride Loop: Iterate over all requests securely avoiding X-dimension limits
+    for pid_req in range(pid_req_base, total_requests, MAX_GRID_X):
 
-    # Early exit if this request is not valid (step < 0)
-    if step_idx < 0:
-        return
+        # Load step index to check validity (step >= 0 means valid)
+        step_idx = tl.load(step_indices_raw_ptr + pid_req).to(tl.int64)
 
-    # Load destination index
-    dst_idx = tl.load(dst_indices_raw_ptr + pid_req).to(tl.int64)
+        # Proceed only if this request is valid
+        if step_idx >= 0:
+            # Load destination index
+            dst_idx = tl.load(dst_indices_raw_ptr + pid_req).to(tl.int64)
 
-    # Source index is just the request index itself
-    src_idx = pid_req
+            # Source index is just the request index itself
+            src_idx = pid_req
 
-    # Bounds check to avoid illegal memory access
-    if not (
-        (dst_idx >= 0)
-        & (dst_idx < dst_req_size)
-        & (src_idx >= 0)
-        & (src_idx < src_req_size)
-        & (step_idx < src_step_size)
-    ):
-        return
+            # Bounds check to avoid illegal memory access
+            is_valid_bounds = (
+                (dst_idx >= 0)
+                & (dst_idx < dst_req_size)
+                & (src_idx >= 0)
+                & (src_idx < src_req_size)
+                & (step_idx < src_step_size)
+            )
 
-    # Compute base offsets
-    src_offset = (
-        pid_layer * src_layer_stride
-        + src_idx * src_req_stride
-        + step_idx * src_step_stride
-    )
-    dst_offset = pid_layer * dst_layer_stride + dst_idx * dst_req_stride
+            if is_valid_bounds:
+                # Compute base offsets
+                src_offset = (
+                    pid_layer * src_layer_stride
+                    + src_idx * src_req_stride
+                    + step_idx * src_step_stride
+                )
+                dst_offset = pid_layer * dst_layer_stride + dst_idx * dst_req_stride
 
-    # Compute element range for this block
-    start = pid_block * BLOCK_SIZE
-    offsets = start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < elem_per_entry
+                # Inner Loop: Iterate over the elements (replaces the 3rd Grid dimension)
+                for start_offset in range(0, elem_per_entry, BLOCK_SIZE):
+                    offsets = start_offset + tl.arange(0, BLOCK_SIZE)
+                    mask = offsets < elem_per_entry
 
-    # Load from source and store to destination
-    data = tl.load(src_ptr + src_offset + offsets, mask=mask)
-    tl.store(dst_ptr + dst_offset + offsets, data, mask=mask)
+                    # Load from source and store to destination
+                    data = tl.load(src_ptr + src_offset + offsets, mask=mask)
+                    tl.store(dst_ptr + dst_offset + offsets, data, mask=mask)
 
 
 def fused_mamba_state_scatter_with_mask(
@@ -115,10 +111,13 @@ def fused_mamba_state_scatter_with_mask(
         raise ValueError(
             f"dst and src must be on the same device. {dst.device=} {src.device=}"
         )
-    if not dst.is_cuda or not src.is_cuda:
+
+    # Relaxed device check using is_npu() utility
+    if not dst.is_cuda and not is_npu():
         raise ValueError(
-            "fused_mamba_state_scatter_with_mask only supports CUDA tensors."
+            "fused_mamba_state_scatter_with_mask only supports CUDA and NPU tensors."
         )
+
     if dst.ndim < 2 or src.ndim < 3:
         raise ValueError(f"Unexpected tensor ranks: {dst.ndim=} {src.ndim=}")
     if dst.shape[0] != src.shape[0]:
@@ -166,14 +165,25 @@ def fused_mamba_state_scatter_with_mask(
     # Block size for copying elements
     BLOCK_SIZE = 1024
 
-    # Grid over all requests - invalid ones will early-exit in the kernel
-    grid = (total_requests, num_layers, triton.cdiv(elem_per_entry, BLOCK_SIZE))
+    # The NPU restricts the TOTAL volume of blocks (grid_x * grid_y * grid_z) to 65535.
+    # By omitting the Z dimension and moving it inside the kernel loop, we only need to secure X * Y.
+    if is_npu():
+        # Ensure grid_x * num_layers <= 65535
+        MAX_GRID_X = 65535 // max(1, num_layers)
+    else:
+        MAX_GRID_X = max(total_requests, 1)
+
+    grid_x = min(total_requests, MAX_GRID_X)
+
+    # 2D Grid: (Requests, Layers)
+    grid = (grid_x, num_layers)
 
     _fused_mamba_state_scatter_with_mask_kernel[grid](
         src,
         dst,
         dst_indices_raw,
         step_indices_raw,
+        MAX_GRID_X,
         elem_per_entry,
         src_layer_stride,
         src_req_stride,

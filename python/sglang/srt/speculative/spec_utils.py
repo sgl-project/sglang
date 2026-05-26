@@ -50,6 +50,7 @@ TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = (
     _is_cuda or _is_musa
 )  # This kernel is only available for CUDA and MUSA now
+TREE_GREEDY_VERIFY_AVAILABLE = _is_cuda or _is_npu  # Greedy tree verify: CUDA and NPU
 
 
 def record_stream_each(tensors, stream):
