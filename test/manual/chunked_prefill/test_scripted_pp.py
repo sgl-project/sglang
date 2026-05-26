@@ -283,9 +283,24 @@ class TestScriptedPP(CustomTestCase):
     def _script_pp_split_prefill_chunked_no_merge_assert(t: ScriptedRuntime):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r, max_steps=800)
-        assert r.finished
-        # The assertion under test is internal — if pdmux merge_batch
-        # tripped, the engine would have died before reaching this point.
+        # Concrete observable signal that pdmux + chunked actually exercised
+        # the merge_batch defense path: engine survived AND chunking happened.
+        assert r.finished, "engine died before req finished — merge_batch assert may have tripped"
+        assert r.chunks_done >= 2, (
+            f"pdmux + chunked path must produce >=2 chunks to exercise "
+            f"split_prefill_batch filter; got chunks_done={r.chunks_done}"
+        )
+        # NEW API NEEDED: t.engine_stats() should expose a
+        # ``merge_batch_assert_violations`` counter so the test can directly
+        # probe the defense path b-36ec1d7269 widened. Until then the
+        # engine-survived + chunks-done assertions above are the strongest
+        # behavior-level signal we can give.
+        stats = t.engine_stats()
+        if "merge_batch_assert_violations" in stats:
+            assert stats["merge_batch_assert_violations"] == 0, (
+                f"merge_batch assert tripped under pdmux + chunked: "
+                f"{stats['merge_batch_assert_violations']}"
+            )
 
     @unittest.skip("requires real pp_size>1 + dynamic chunking telemetry — wire up when fixture lands")
     def test_pp_dynamic_chunking_predictor(self):
