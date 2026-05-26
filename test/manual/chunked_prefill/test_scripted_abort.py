@@ -482,6 +482,157 @@ class TestScriptedAbort(CustomTestCase):
         # is itself a kind of finalize, but should not double-fire).
         assert r.finish_event_count <= 1
 
+    def test_abort_at_chunk_boundary_race(self):
+        """Abort fires the same step a chunk boundary advances chunks_done."""
+        execute_scripted_runtime(
+            self._script_abort_at_chunk_boundary_race,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-Abort1] abort raced with chunks_done increment at a chunk
+    # boundary. Drive the req to a known mid-chunk state, then abort on
+    # the same yield step the scheduler is about to commit the next
+    # chunk. No double-finalize; pending_middle_outputs must zero.
+    @staticmethod
+    def _script_abort_at_chunk_boundary_race(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        # First, observe the chunked req in flight.
+        yield from run_until(r, lambda h: h.is_chunking)
+        # Then drive to a chunk-boundary state: at least one chunk
+        # committed, still chunking (mid-stream).
+        yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
+        chunks_at_abort = r.chunks_done
+
+        t.abort(r)
+        yield  # the race step — scheduler observes both the boundary and the abort
+
+        assert (
+            r.finish_event_count <= 1
+        ), f"abort race must not double-finalize; got {r.finish_event_count}"
+        assert (
+            r.pending_middle_outputs == 0
+        ), f"abort must zero pending_middle_outputs; got {r.pending_middle_outputs}"
+        assert r.kv_pages == 0
+        # chunks_done is monotone — never goes backward across the race.
+        assert r.chunks_done >= chunks_at_abort
+
+    def test_abort_then_resubmit_same_rid_same_step(self):
+        """Abort r1 then immediately submit a new req reusing the same rid in one step."""
+        execute_scripted_runtime(
+            self._script_abort_then_resubmit_same_rid_same_step,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-Abort4 / a-Reentry4] abort + same-step resubmit with the
+    # identical rid. The new req must complete independently — the
+    # scheduler must not confuse the resubmit with the dying corpse of
+    # the aborted r1.
+    @staticmethod
+    def _script_abort_then_resubmit_same_rid_same_step(t: ScriptedRuntime):
+        r1 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN,
+            max_new_tokens=2,
+            rid="abort-resubmit-same-step",
+        )
+        yield from run_until(r1, lambda h: h.is_chunking)
+        t.abort(r1)
+        # Same yield step: resubmit a fresh req under the same rid.
+        r2 = t.start_req(
+            prompt_len=16,
+            max_new_tokens=2,
+            rid="abort-resubmit-same-step",
+        )
+        yield
+        yield from run_until_finished(r2)
+        assert r2.finished, "resubmit under same rid must complete independently"
+        assert r1.kv_pages == 0, "aborted r1 must release KV before resubmit"
+
+    def test_abort_during_gap_pending_middle_outputs_positive(self):
+        """Abort during the gap where pending_middle_outputs > 0 but is_chunking == False."""
+        execute_scripted_runtime(
+            self._script_abort_during_gap_pending_middle_outputs_positive,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-Abort3] the gap between "last chunk submitted to forward" and
+    # "Stage A drains pending_middle_outputs". In that window
+    # pending_middle_outputs > 0 yet the req is not currently chunking.
+    # Aborting here must not revive the freed row via Stage A.
+    @staticmethod
+    def _script_abort_during_gap_pending_middle_outputs_positive(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
+        # Wait for the gap window: pending_middle_outputs has been ++'d
+        # for the last admission but is_chunking is no longer True
+        # (Stage A hasn't drained the output yet).
+        yield from run_until(
+            r,
+            lambda h: h.pending_middle_outputs > 0 and not h.is_chunking,
+        )
+        assert r.pending_middle_outputs > 0
+        assert not r.is_chunking
+
+        t.abort(r)
+        yield
+
+        assert r.pending_middle_outputs == 0, (
+            f"abort in gap must zero pending_middle_outputs to block "
+            f"Stage A revival; got {r.pending_middle_outputs}"
+        )
+        assert r.kv_pages == 0
+        assert r.row_idx is None
+
+    def test_abort_when_chunked_only_then_idle(self):
+        """Aborting the only chunked req in flight leaves the engine idle."""
+        execute_scripted_runtime(
+            self._script_abort_when_chunked_only_then_idle,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-Abort8] when the only chunked req is aborted, the engine must
+    # transition all the way back to idle — chunked_req is None,
+    # chunked_in_flight_count is 0, and t.is_idle.
+    @staticmethod
+    def _script_abort_when_chunked_only_then_idle(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking)
+        assert t.chunked_in_flight_count() == 1
+
+        t.abort(r)
+        yield
+        # Give the scheduler one extra iter to settle.
+        yield
+
+        assert r.kv_pages == 0
+        assert t.chunked_in_flight_count() == 0
+        assert t.is_idle, "engine must be idle after the only chunked req is aborted"
+
+    def test_abort_chunked_with_baton_handoff(self):
+        """Abort the in-flight chunked req while a waiting chunked req takes the baton."""
+        execute_scripted_runtime(
+            self._script_abort_chunked_with_baton_handoff,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [a-Abort9] r1 holds the chunked_req slot; r2 is waiting. Abort
+    # r1: r2 must successfully claim the chunked_req baton on the next
+    # admission step.
+    @staticmethod
+    def _script_abort_chunked_with_baton_handoff(t: ScriptedRuntime):
+        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        # r1 takes the chunked slot first (FCFS).
+        yield from run_until(r1, lambda h: h.is_chunking)
+        assert t.chunked_in_flight_count() == 1
+
+        t.abort(r1)
+        yield
+
+        # r2 must now pick up the chunked baton.
+        yield from run_until(r2, lambda h: h.is_chunking)
+        assert r1.kv_pages == 0
+        yield from run_until_finished(r2)
+        assert r2.finished, "baton handoff must let r2 complete"
+
 
 if __name__ == "__main__":
     unittest.main()
