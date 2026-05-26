@@ -738,11 +738,11 @@ Splits model weights across multiple NPU devices so that large models can be loa
 
 ### Data Parallelism (`--dp-size`, `--enable-dp-attention`)
 
-Replicates the model across independent device groups to increase throughput by processing multiple requests in parallel. With `--enable-dp-attention`, the attention layers are replicated across DP ranks while the FFN/MoE layers remain tensor-parallel, which improves throughput for MoE models where attention is the bottleneck.
+With --enable-dp-attention, the attention layers are replicated across DP ranks while the FFN/MoE layers remain tensor-parallel/expert-parallel. This reduces the communication overhead of attention layers in TP (which is significant during small-batch decode) while keeping the heavy compute and memory demands of MoE layers distributed.
 
 ### Expert Parallelism (`--ep-size`)
 
-Distributes the experts of Mixture-of-Experts (MoE) models across devices. Each device holds a subset of experts and routes tokens via all-to-all communication. Supports load balancing methods including round-robin and expert-parallel load balancing (EPLB).
+Each device holds a subset of experts and routes tokens via all-to-all communication based on the model's gating network. Supports load balancing methods including default round-robin expert placement and dynamic Expert Parallelism Load Balancing (EPLB).
 
 ### Context Parallelism (`--attn-cp-size`)
 
@@ -772,13 +772,9 @@ Reduces per-token latency by predicting multiple future tokens in a single forwa
 
 Reuses KV cache across requests that share common prompt prefixes (Radix Cache), reducing repeated prefill computation and lowering time-to-first-token. Enabled by default; disable with `--disable-radix-cache` when prefix reuse is not expected (e.g., dedicated prefill nodes in PD disaggregation, or random-input benchmarks).
 
-### Multi-modal (`--enable-multimodal`)
-
-Enables inference for models that process images, video, or audio alongside text (e.g., Qwen-VL, DeepSeek-VL2). Uses Ascend-specific attention backends for multi-modal inputs. Has partial compatibility with MoE and parallelism features due to additional preprocessing and encoder overhead.
-
 ### Overlap Schedule
 
-Overlaps compute and communication operations to improve hardware utilization. On Ascend, this is controlled via environment variables `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1` and `SGLANG_ENABLE_SPEC_V2=1`. Most effective during decode with speculative decoding and DP attention, where expert dispatch/reduce communication can be overlapped with the next batch's computation. Used in nearly all best-practice decode configurations.
+On Ascend, this is primarily controlled via environment variable SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1. For speculative decoding scenarios, combining it with SGLANG_ENABLE_SPEC_V2=1 enables the optimized overlap scheduler. Most effective during decode with speculative decoding and DP attention, where expert dispatch/reduce communication can be overlapped with the next batch's computation.
 
 ### DP LM Head (`--enable-dp-lm-head`)
 
