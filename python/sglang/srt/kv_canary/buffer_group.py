@@ -46,6 +46,12 @@ class CanaryBufferGroup:
         swa_index_lut: SWA full-to-swa index mapping LUT, shape [full_pool_size + 1], int64, or None for FULL
             groups. Used by launch_canary_plan_kernels to translate verify/seed slot indices at plan time, and by
             launch_canary_write_kernel to translate write slots inline. None iff kind == PoolKind.FULL.
+        slot_token_offset: Logical-position offset between a canary slot and the source-of-truth token it
+            fingerprints. 0 for target-style pools (slot ``p`` writes token at position ``p``); 1 for EAGLE
+            draft pools where the rotation makes slot ``p`` store K/V for token at position ``p + 1``. Plan
+            side uses this to gather ``verify_expected_tokens[i] = pool[req_idx, position[i] + offset]``;
+            entries whose ``position + offset`` falls past the valid sequence (e.g. speculative draft decode
+            slots, draft rotation bonus tail) emit a ``-1`` sentinel which the verify kernel skips.
     """
 
     kind: PoolKind
@@ -56,6 +62,7 @@ class CanaryBufferGroup:
     real_kv_sources_k: tuple[RealKvSource, ...]
     real_kv_sources_v: tuple[RealKvSource, ...]
     swa_index_lut: Optional[torch.Tensor]
+    slot_token_offset: int = 0
 
     @property
     def has_v_half(self) -> bool:
