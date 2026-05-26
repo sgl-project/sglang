@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Union
+import os
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
@@ -15,6 +16,40 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+
+# Token-buf consume tracking: init to -1, assert non-negative on gather,
+# write -1 back. Catches "gather without intermediate stash" bugs. CI enables
+# via the existing SGLANG_IS_IN_CI; off in production.
+_DEBUG_ASSERT = os.getenv("SGLANG_IS_IN_CI", "").lower() == "true"
+
+
+@torch.compile(dynamic=True)
+def _assert_nonneg_and_invalidate(
+    values: torch.Tensor, buf: torch.Tensor, indices: torch.Tensor
+) -> None:
+    """Fused: assert all `values >= 0` and scatter -1 into `buf[indices]`.
+    Compiled so the reduction + assert + scatter run as one kernel launch."""
+    torch._assert_async((values >= 0).all())
+    buf[indices] = -1
+
+
+@torch.compile(dynamic=True)
+def _gather_spec_extras(
+    indices: torch.Tensor,
+    topk_p_buf: torch.Tensor,
+    topk_index_buf: torch.Tensor,
+    output_tokens_buf: torch.Tensor,
+    hidden_states_buf: Optional[torch.Tensor],
+):
+    """Compiled gather of spec extras. `hidden_states_buf` is None when the
+    build does not capture hidden states."""
+    topk_p = topk_p_buf[indices]
+    topk_index = topk_index_buf[indices]
+    bonus_tokens = output_tokens_buf[indices]
+    hidden_states = (
+        hidden_states_buf[indices] if hidden_states_buf is not None else None
+    )
+    return topk_p, topk_index, bonus_tokens, hidden_states
 
 
 def _resolve_future_token_ids_native(input_ids, future_token_ids_map):
@@ -59,8 +94,12 @@ class FutureMap:
         self.spec_algo = spec_algo
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
 
-        self.output_tokens_buf = torch.empty(
-            (self.req_pool_size,), dtype=torch.int64, device=self.device
+        self.output_tokens_buf = (
+            torch.full((self.req_pool_size,), -1, dtype=torch.int64, device=self.device)
+            if _DEBUG_ASSERT
+            else torch.empty(
+                (self.req_pool_size,), dtype=torch.int64, device=self.device
+            )
         )
         self.new_seq_lens_buf = torch.empty(
             (self.req_pool_size,), dtype=torch.int64, device=self.device
@@ -99,6 +138,10 @@ class FutureMap:
         # input_ids tokens / spec extras here.
         if self.spec_algo.is_none():
             _resolve_future_token_ids(batch.input_ids, self.output_tokens_buf)
+            if _DEBUG_ASSERT:
+                _assert_nonneg_and_invalidate(
+                    batch.input_ids, self.output_tokens_buf, batch.req_pool_indices
+                )
         else:
             self._resolve_spec_extras(batch)
 
@@ -111,11 +154,27 @@ class FutureMap:
         # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
         # record_batch_in_overlap; record_stream here is redundant.
         indices.record_stream(torch.get_device_module(self.device).current_stream())
-        draft_input.topk_p = self.topk_p_buf[indices]
-        draft_input.topk_index = self.topk_index_buf[indices]
-        draft_input.bonus_tokens = self.output_tokens_buf[indices]
-        if spec_need_hidden_states():
-            draft_input.hidden_states = self.hidden_states_buf[indices]
+        hidden_states_buf = (
+            self.hidden_states_buf if spec_need_hidden_states() else None
+        )
+        (
+            draft_input.topk_p,
+            draft_input.topk_index,
+            draft_input.bonus_tokens,
+            hidden_states,
+        ) = _gather_spec_extras(
+            indices,
+            self.topk_p_buf,
+            self.topk_index_buf,
+            self.output_tokens_buf,
+            hidden_states_buf,
+        )
+        if hidden_states is not None:
+            draft_input.hidden_states = hidden_states
+        if _DEBUG_ASSERT:
+            _assert_nonneg_and_invalidate(
+                draft_input.bonus_tokens, self.output_tokens_buf, indices
+            )
 
     def set_input_ids_sentinel(
         self, batch: ScheduleBatch, future_indices: torch.Tensor
