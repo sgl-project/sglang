@@ -87,7 +87,7 @@ class SiluAndMul(MultiPlatformOp):
         super().__init__(*args, **kwargs)
         if get_global_server_args().rl_on_policy_target is not None:
             self._forward_method = self.forward_native
-        elif _use_aiter:
+        elif _use_aiter and envs.SGLANG_OPT_USE_AITER_SILU_MUL.get():
             self._forward_method = self.forward_aiter
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:

@@ -1583,6 +1583,22 @@ class DeepseekV4ForCausalLM(nn.Module):
         if get_global_server_args().disable_shared_experts_fusion:
             return
 
+        # Waterfill needs shared-experts fusion so it can dispatch shared
+        # expert tokens to least-loaded EP ranks.
+        if get_global_server_args().enable_deepep_waterfill:
+            if self.config.n_shared_experts != 1:
+                raise ValueError(
+                    "DeepEP Waterfill for DeepSeek V4 expects exactly one shared "
+                    f"expert, but got n_shared_experts={self.config.n_shared_experts}."
+                )
+            self.num_fused_shared_experts = self.config.n_shared_experts
+            log_info_on_rank0(
+                logger,
+                "DeepSeek V4: --enable-deepep-waterfill set; KEEP shared-experts "
+                "fusion enabled so waterfill can rebalance shared expert dispatch.",
+            )
+            return
+
         get_global_server_args().disable_shared_experts_fusion = True
         log_info_on_rank0(
             logger,
