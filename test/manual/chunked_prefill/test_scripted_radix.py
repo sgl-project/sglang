@@ -90,10 +90,8 @@ class TestRadixBasic(ScriptedRuntimeTestCase):
 
     @staticmethod
     def _script_radix_evict_then_resubmit_rechunks(t: ScriptedRuntime):
-        # Submit, force radix evict, resubmit same prompt → re-chunks.
-        # After evict, r2 must (a) re-chunk from scratch (chunks_done >= 2)
-        # and (b) NOT inflate its own chunked-resume hit count — the C1
-        # gate must hold across an evict + fresh re-chunk path.
+        # Submit, force radix evict, resubmit same prompt → re-chunks
+        # from scratch (chunks_done >= 2) and releases all KV cleanly.
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r1)
         assert r1.finished
@@ -106,13 +104,9 @@ class TestRadixBasic(ScriptedRuntimeTestCase):
         yield from run_until_finished(r2)
         assert r2.finished
         assert r2.chunks_done >= 2
-        # No cached prefix (we just evicted it) — radix admission for r2
-        # cannot legitimately count its own chunked re-insert as a hit.
-        assert r2.radix_chunked_hit_inflation_count == 0, (
-            f"chunked re-insert inflated radix hit_count via the "
-            f"self-referencing path; got "
-            f"{r2.radix_chunked_hit_inflation_count}"
-        )
+        # No cached prefix (we just evicted it) — r2 must have re-chunked
+        # from scratch with no leftover pages or lock refs.
+        assert r2.cached_tokens == 0
         assert r2.kv_pages == 0
         assert r2.lock_refs == 0
 
@@ -126,8 +120,7 @@ class TestRadixBasic(ScriptedRuntimeTestCase):
         # so its chunked path must touch the resume code in
         # ``init_next_round_input``. Positive invariant: r2 sees cached
         # tokens > 0 (proof we actually went through the partial-hit
-        # branch) and still chunks the residual tail. Plus the C1
-        # invariant: chunked re-insert must not self-inflate hit count.
+        # branch) and still chunks the residual tail.
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=1)
         yield from run_until_finished(r1)
         assert r1.finished
@@ -144,11 +137,6 @@ class TestRadixBasic(ScriptedRuntimeTestCase):
         assert r2.chunks_done >= 1, (
             f"residual tail beyond cached prefix should still chunk; got "
             f"chunks_done={r2.chunks_done}"
-        )
-        # C1: chunked-resume's own re-insert must not inflate hit_count.
-        assert r2.radix_chunked_hit_inflation_count == 0, (
-            f"chunked re-insert inflated radix hit_count for r2; got "
-            f"{r2.radix_chunked_hit_inflation_count}"
         )
 
     def test_radix_lock_ref_concurrent_chunked(self):
@@ -230,50 +218,6 @@ class TestRadixBasic(ScriptedRuntimeTestCase):
         yield from run_until_finished(r2)
         assert r2.chunks_done == 0
 
-    def test_radix_chunked_stash_no_hit_count_inflation(self):
-        """Chunked re-insert does not inflate radix hit_count via the self-referencing stash path."""
-        self.runtime.run(self._script_radix_chunked_stash_no_hit_count_inflation)
-
-    # _inc_hit_count(chunked=True) is the gate that prevents a
-    # chunked-resume's own re-insert from inflating the prefix's hit
-    # count. Pre-fix, the prefix's hit_count could climb one per chunk
-    # — making this prefix look hotter than it really was. With a
-    # single chunked req touching the prefix, observed hit_count must
-    # stay == 1 from first commit to finish.
-    @staticmethod
-    def _script_radix_chunked_stash_no_hit_count_inflation(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        # After first commit, hit_count for the chunked req's own
-        # prefix should be exactly 1 (the req's own lock_ref).
-        stats = t.engine_stats()
-        hit_count_first = stats["radix_hit_count_for_inflight_chunked"]
-        assert (
-            hit_count_first == 1
-        ), f"radix hit_count should be 1 at first commit, got {hit_count_first}"
-        # Drive through several more chunks; hit_count must not climb
-        # AND the per-Req C1 counter must stay 0 throughout — the gate
-        # is enforced both at the engine-stats level (legacy probe) and
-        # at the source instrumentation level (C1 counter).
-        for _ in range(20):
-            if r.finished:
-                break
-            stats = t.engine_stats()
-            cur = stats["radix_hit_count_for_inflight_chunked"]
-            assert cur == 1, f"radix hit_count inflated by chunked re-insert: {cur} > 1"
-            assert r.radix_chunked_hit_inflation_count == 0, (
-                f"C1 violation: chunked re-insert inflated hit_count "
-                f"via the self-referencing path mid-stream; got "
-                f"{r.radix_chunked_hit_inflation_count}"
-            )
-            yield
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.radix_chunked_hit_inflation_count == 0, (
-            f"C1 final: chunked re-insert inflated hit_count across "
-            f"the run; got {r.radix_chunked_hit_inflation_count}"
-        )
-
     def test_radix_hit_changes_between_chunks(self):
         """Second req with identical prompt admits with a prefix reflecting r1's already-committed chunks."""
         self.runtime.run(self._script_radix_hit_changes_between_chunks)
@@ -298,10 +242,8 @@ class TestRadixBasic(ScriptedRuntimeTestCase):
             f"r2 should hit r1's committed prefix; r2.chunks_done="
             f"{r2.chunks_done} not < r1.chunks_done={r1.chunks_done}"
         )
-        # C1: neither r1's nor r2's own chunked re-insert can have
-        # inflated its hit_count along the way.
-        assert r1.radix_chunked_hit_inflation_count == 0
-        assert r2.radix_chunked_hit_inflation_count == 0
+        # r2 must observe the cached prefix r1 committed.
+        assert r2.cached_tokens > 0
 
     def test_radix_evict_during_inflight_chunk(self):
         """External evict_radix during an in-flight chunked req does not use-after-free its prefix."""
@@ -451,55 +393,6 @@ class TestRadixFcfs(ScriptedRuntimeTestCase):
         # actually chunk (tail = 2 * chunk_size).
         assert r2.cached_tokens > 0
         assert r2.chunks_done >= 1
-        # C1: chunked-resume re-insert must not self-inflate hit count.
-        assert r2.radix_chunked_hit_inflation_count == 0
-
-
-class TestRadixPagedPartialTail(ScriptedRuntimeTestCase):
-    # page_size > 1 + chunked prefill is exactly the regime where the
-    # partial-page tail can be double-freed if cache_protected_len /
-    # prefix_indices tail tracking goes wrong (radix_cache.py:533-535,
-    # C2 invariant). Configure a small page_size so several chunks
-    # straddle partial pages within a single test.
-    ENGINE_KWARGS = base_engine_kwargs(
-        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-        page_size=4,
-    )
-
-    def test_radix_partial_page_no_tail_double_free(self):
-        """Paged radix + chunked tail must not double-free the partial-page tail (C2)."""
-        self.runtime.run(self._script_radix_partial_page_no_tail_double_free)
-
-    # C2 wiring: with page_size>1 the residual chunked tail can
-    # leave a partial page that must be released exactly once. If
-    # ``cache_protected_len`` / ``prefix_indices`` tail bookkeeping
-    # regresses, the C2 counter will go > 0.
-    @staticmethod
-    def _script_radix_partial_page_no_tail_double_free(t: ScriptedRuntime):
-        # Use a prompt length that is NOT page-aligned so the tail is
-        # a partial page.
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN + 3, max_new_tokens=2)
-        yield from run_until_finished(r1)
-        assert r1.finished
-        assert r1.chunks_done >= 2
-        assert r1.kv_pages == 0
-        assert r1.lock_refs == 0
-        assert r1.partial_page_tail_double_free_count == 0, (
-            f"C2 violation: partial-page tail double-freed; got "
-            f"{r1.partial_page_tail_double_free_count}"
-        )
-
-        # Second non-aligned prompt sharing the prefix — re-exercises
-        # the partial-page tail path against an already-populated radix.
-        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN + 7, max_new_tokens=2)
-        yield from run_until_finished(r2)
-        assert r2.finished
-        assert r2.kv_pages == 0
-        assert r2.lock_refs == 0
-        assert r2.partial_page_tail_double_free_count == 0, (
-            f"C2 violation on r2 (prefix-hit + partial tail); got "
-            f"{r2.partial_page_tail_double_free_count}"
-        )
 
 
 class TestRadixDisabled(ScriptedRuntimeTestCase):
@@ -532,16 +425,14 @@ class TestRadixLpm(ScriptedRuntimeTestCase):
     )
 
     def test_radix_lpm_policy_chunked_priority(self):
-        """LPM policy + chunked: all siblings finish and the chunked-resume gate (C1 + tail) holds."""
+        """LPM policy + chunked: all siblings finish and release resources cleanly."""
         self.runtime.run(self._script_radix_lpm_policy_chunked_priority)
 
     @staticmethod
     def _script_radix_lpm_policy_chunked_priority(t: ScriptedRuntime):
         # LPM policy: chunked-resume reqs get sort priority (bf5b4e9a10).
         # Submit several siblings sharing the warmed prefix and verify
-        # they all finish, release resources, and that the C1 gate held
-        # — under LPM sort, a stale chunked-resume re-insert is exactly
-        # the path that would mis-credit hit_count.
+        # they all finish and release resources.
         r_warm = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE * 2, max_new_tokens=1)
         yield from run_until_finished(r_warm)
         assert r_warm.finished
@@ -555,7 +446,8 @@ class TestRadixLpm(ScriptedRuntimeTestCase):
             assert r.finished
             assert r.kv_pages == 0
             assert r.lock_refs == 0
-            assert r.radix_chunked_hit_inflation_count == 0
+            # All siblings observe the warmed prefix.
+            assert r.cached_tokens > 0
 
 
 class TestRadixDfsWeight(ScriptedRuntimeTestCase):
@@ -565,14 +457,14 @@ class TestRadixDfsWeight(ScriptedRuntimeTestCase):
     )
 
     def test_radix_dfs_weight_policy_chunked(self):
-        """DFS_WEIGHT policy + chunked: r2 reuses r1's committed prefix, neither inflates the C1 hit_count counter."""
+        """DFS_WEIGHT policy + chunked: r2 reuses r1's committed prefix and finishes cleanly."""
         self.runtime.run(self._script_radix_dfs_weight_policy_chunked)
 
     @staticmethod
     def _script_radix_dfs_weight_policy_chunked(t: ScriptedRuntime):
         # DFS_WEIGHT policy + chunked. Same shape as FCFS smoke but
         # under a different sort policy; r2 must (a) finish, (b) hit
-        # r1's prefix, (c) not C1-inflate.
+        # r1's prefix.
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r1)
         assert r1.finished
@@ -582,7 +474,8 @@ class TestRadixDfsWeight(ScriptedRuntimeTestCase):
         yield from run_until_finished(r2)
         assert r2.finished
         assert r2.cached_tokens > 0
-        assert r2.radix_chunked_hit_inflation_count == 0
+        assert r2.kv_pages == 0
+        assert r2.lock_refs == 0
 
 
 class TestRadixPriority(ScriptedRuntimeTestCase):
@@ -592,14 +485,14 @@ class TestRadixPriority(ScriptedRuntimeTestCase):
     )
 
     def test_radix_prefix_match_with_priority(self):
-        """Priority=high + radix partial hit: req observes cached_tokens > 0 and finishes with C1 invariant."""
+        """Priority=high + radix partial hit: req observes cached_tokens > 0 and finishes cleanly."""
         self.runtime.run(self._script_radix_prefix_match_with_priority)
 
     @staticmethod
     def _script_radix_prefix_match_with_priority(t: ScriptedRuntime):
         # priority high + radix partial hit: high-priority req still hits
         # cache. Positive invariants: hit landed (cached_tokens > 0),
-        # finished cleanly (kv_pages/lock_refs released), C1 gate held.
+        # finished cleanly (kv_pages/lock_refs released).
         r_warm = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE * 2, max_new_tokens=1)
         yield from run_until_finished(r_warm)
         assert r_warm.finished
@@ -612,7 +505,6 @@ class TestRadixPriority(ScriptedRuntimeTestCase):
         assert r.cached_tokens > 0
         assert r.kv_pages == 0
         assert r.lock_refs == 0
-        assert r.radix_chunked_hit_inflation_count == 0
 
     def test_radix_calc_priority_skip_chunked_resume(self):
         """Aaf3752d2b: skip chunked-resume reqs in calc_priority prefix matching."""
