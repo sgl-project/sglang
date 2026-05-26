@@ -14,8 +14,8 @@ Requires 2-4 GPUs in PD configuration.
 
 import unittest
 
-from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
+from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
@@ -23,23 +23,22 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until,
     run_until_finished,
 )
-from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
+from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 
 
-class TestScriptedDisagg(CustomTestCase):
+class TestDisaggBasic(ScriptedRuntimeTestCase):
+    # When ScriptedRuntime grows disagg topology support, the
+    # decode-side engine kwargs go through ``decode_engine_kwargs=``
+    # (or similar) — see wishlist §4 P3 (16).
+    ENGINE_KWARGS = base_engine_kwargs(
+        model_path=DEFAULT_MODEL_NAME_FOR_TEST,
+        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        disaggregation_mode="prefill",
+    )
+
     def test_naive_disagg_chunked(self):
         """Disagg x chunked: prefill engine chunks long prompt and hands off to decode."""
-        # When ScriptedRuntime grows disagg topology support, the
-        # decode-side engine kwargs go through ``decode_engine_kwargs=``
-        # (or similar) — see wishlist §4 P3 (16).
-        execute_scripted_runtime(
-            self._script_naive_disagg_chunked,
-            **base_engine_kwargs(
-                model_path=DEFAULT_MODEL_NAME_FOR_TEST,
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-                disaggregation_mode="prefill",
-            ),
-        )
+        self.runtime.run(self._script_naive_disagg_chunked)
 
     @staticmethod
     def _script_naive_disagg_chunked(t: ScriptedRuntime):
@@ -50,14 +49,7 @@ class TestScriptedDisagg(CustomTestCase):
 
     def test_disagg_prefill_per_chunk_kv_send(self):
         """Disagg-prefill multi-chunk: each middle chunk sends KV with last_chunk=False."""
-        execute_scripted_runtime(
-            self._script_disagg_prefill_per_chunk_kv_send,
-            **base_engine_kwargs(
-                model_path=DEFAULT_MODEL_NAME_FOR_TEST,
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-                disaggregation_mode="prefill",
-            ),
-        )
+        self.runtime.run(self._script_disagg_prefill_per_chunk_kv_send)
 
     # Disagg-prefill per-chunk KV send — each middle chunk must call
     # send_kv_chunk(last_chunk=False); only the final chunk uses last_chunk=True.
@@ -78,17 +70,39 @@ class TestScriptedDisagg(CustomTestCase):
             r.kv_send_last_chunk_events == 1
         ), f"expected exactly one last_chunk=True send, got {r.kv_send_last_chunk_events}"
 
+    def test_disagg_retract_resets_send_state(self):
+        """Disagg-prefill chunked retract resets start_send_idx and tmp_end_idx."""
+        self.runtime.run(self._script_disagg_retract_resets_send_state)
+
+    # Disagg chunked retract — start_send_idx must reset to 0
+    # and tmp_end_idx to -1 so the resumed prefill restarts the KV stream.
+    @staticmethod
+    def _script_disagg_retract_resets_send_state(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+        t.force_retract(r)
+        yield
+        assert (
+            r.start_send_idx == 0
+        ), f"start_send_idx must reset on retract, got {r.start_send_idx}"
+        assert (
+            r.tmp_end_idx == -1
+        ), f"tmp_end_idx must reset on retract, got {r.tmp_end_idx}"
+        yield from run_until_finished(r, max_steps=800)
+        assert r.finished
+
+
+class TestDisaggOverlap(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(
+        model_path=DEFAULT_MODEL_NAME_FOR_TEST,
+        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        disaggregation_mode="prefill",
+        disable_overlap_schedule=False,
+    )
+
     def test_disagg_overlap_mid_chunk_tmp_end_idx(self):
         """Disagg overlap mode: tmp_end_idx updates per chunk per the documented formula."""
-        execute_scripted_runtime(
-            self._script_disagg_overlap_mid_chunk_tmp_end_idx,
-            **base_engine_kwargs(
-                model_path=DEFAULT_MODEL_NAME_FOR_TEST,
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-                disaggregation_mode="prefill",
-                disable_overlap_schedule=False,
-            ),
-        )
+        self.runtime.run(self._script_disagg_overlap_mid_chunk_tmp_end_idx)
 
     # Disagg overlap + middle chunk — tmp_end_idx must advance
     # by exactly chunk_size each iter; send_kv_chunk uses tmp_end_idx as the
@@ -105,34 +119,6 @@ class TestScriptedDisagg(CustomTestCase):
             f"tmp_end_idx must advance across chunks, got "
             f"first_tmp={first_tmp}, second_tmp={second_tmp}"
         )
-        yield from run_until_finished(r, max_steps=800)
-        assert r.finished
-
-    def test_disagg_retract_resets_send_state(self):
-        """Disagg-prefill chunked retract resets start_send_idx and tmp_end_idx."""
-        execute_scripted_runtime(
-            self._script_disagg_retract_resets_send_state,
-            **base_engine_kwargs(
-                model_path=DEFAULT_MODEL_NAME_FOR_TEST,
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-                disaggregation_mode="prefill",
-            ),
-        )
-
-    # Disagg chunked retract — start_send_idx must reset to 0
-    # and tmp_end_idx to -1 so the resumed prefill restarts the KV stream.
-    @staticmethod
-    def _script_disagg_retract_resets_send_state(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        t.force_retract(r)
-        yield
-        assert (
-            r.start_send_idx == 0
-        ), f"start_send_idx must reset on retract, got {r.start_send_idx}"
-        assert (
-            r.tmp_end_idx == -1
-        ), f"tmp_end_idx must reset on retract, got {r.tmp_end_idx}"
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
 
