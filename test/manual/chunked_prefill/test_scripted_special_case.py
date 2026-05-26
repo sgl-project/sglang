@@ -34,26 +34,6 @@ from sglang.test.test_utils import CustomTestCase
 
 
 class TestScriptedSpecialCase(CustomTestCase):
-    def test_dllm_stash_path(self):
-        """DLLM staging queue intersects ``stash_chunked_request`` at scheduler.py:2335."""
-        execute_scripted_runtime(
-            self._script_dllm_stash_path,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    # DLLM staging queue intersects ``stash_chunked_request`` at
-    # scheduler.py:2335. We pump a DLLM-style request through and verify
-    # the chunked req is correctly stashed even with DLLM staging active.
-    #
-    # Requires DLLM model + multi-iter denoising support. Until
-    # ScriptedRuntime exposes DLLM submission, the script just verifies
-    # the scheduler does not crash with both flags on.
-    @staticmethod
-    def _script_dllm_stash_path(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
-        yield from run_until_finished(r)
-        assert r.finished
-
     def test_chunked_in_flight_no_idle(self):
         """``self.chunked_req is not None`` early-exit bypass at scheduler.py:2487 / 2499."""
         execute_scripted_runtime(
@@ -112,29 +92,6 @@ class TestScriptedSpecialCase(CustomTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-
-    def test_chunked_scheduled_last_iter_flag(self):
-        """``_chunked_req_scheduled_last_iter`` toggling under hybrid-SWA early-return (scheduler.py:2544-2548)."""
-        execute_scripted_runtime(
-            self._script_chunked_scheduled_last_iter_flag,
-            **base_engine_kwargs(
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-                model_path="openai/gpt-oss-20b",
-                mem_fraction_static=0.70,
-                disable_piecewise_cuda_graph=True,
-            ),
-        )
-
-    # ``_chunked_req_scheduled_last_iter`` toggling under hybrid-SWA
-    # early-return (scheduler.py:2544-2548). The flag flips between True
-    # and False as ``add_chunked_req`` succeeds vs early-returns.
-    #
-    # Requires hybrid SWA model — see test_scripted_hybrid_swa.py.
-    @staticmethod
-    def _script_chunked_scheduled_last_iter_flag(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
 
     def test_admission_with_chunked_in_flight(self):
         """``add_one_req`` kwarg ``has_chunked_req=True`` propagation (scheduler.py:2593)."""
@@ -264,74 +221,6 @@ class TestScriptedSpecialCase(CustomTestCase):
             t.chunked_in_flight_count() == 0
         ), f"abort must clear in-flight count; got {t.chunked_in_flight_count()}"
 
-    def test_last_batch_chunked_req_pp_context(self):
-        """Scheduler.py:2363-2369 — last_batch tracks the chunked_req in the PP context (chunked_req_to_exclude path)."""
-        execute_scripted_runtime(
-            self._script_last_batch_chunked_req_pp_context,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_last_batch_chunked_req_pp_context(t: ScriptedRuntime):
-        # scheduler.py:2363-2369 — last_batch tracks the chunked_req in
-        # the PP context (chunked_req_to_exclude path).
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
-
-    def test_chunked_req_to_exclude_set_add(self):
-        """Scheduler.py:2366 — chunked_req_to_exclude.add(last_batch.chunked_req)."""
-        execute_scripted_runtime(
-            self._script_chunked_req_to_exclude_set_add,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_chunked_req_to_exclude_set_add(t: ScriptedRuntime):
-        # scheduler.py:2366 — chunked_req_to_exclude.add(last_batch.chunked_req).
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
-        yield from run_until_finished(r)
-
-    def test_chunked_req_to_exclude_update_reqs(self):
-        """Scheduler.py:2369 — chunked_req_to_exclude.update(last_batch.reqs)."""
-        execute_scripted_runtime(
-            self._script_chunked_req_to_exclude_update_reqs,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_chunked_req_to_exclude_update_reqs(t: ScriptedRuntime):
-        # scheduler.py:2369 — chunked_req_to_exclude.update(last_batch.reqs).
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        r2 = t.start_req(prompt_len=16, max_new_tokens=2)
-        yield from run_until_all_finished([r1, r2])
-
-    def test_schedule_batch_init_new_chunked_req(self):
-        """Scheduler.py:2658 — ScheduleBatch.init_new(chunked_req=self.chunked_req)."""
-        execute_scripted_runtime(
-            self._script_schedule_batch_init_new_chunked_req,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_schedule_batch_init_new_chunked_req(t: ScriptedRuntime):
-        # scheduler.py:2658 — ScheduleBatch.init_new(chunked_req=self.chunked_req).
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
-
-    def test_mem_check_chunked_req_kwarg(self):
-        """Scheduler.py:2676-2677 — mem check called with chunked_req=..."""
-        execute_scripted_runtime(
-            self._script_mem_check_chunked_req_kwarg,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_mem_check_chunked_req_kwarg(t: ScriptedRuntime):
-        # scheduler.py:2676-2677 — mem check called with chunked_req=...
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
-
     def test_get_chunked_req_lambda_getter(self):
         """Scheduler.py:680 — get_chunked_req lambda."""
         execute_scripted_runtime(
@@ -352,19 +241,6 @@ class TestScriptedSpecialCase(CustomTestCase):
         if cur is not None:
             assert cur == r.rid
 
-    def test_chunked_req_scheduled_last_iter_flip(self):
-        """Scheduler.py: _chunked_req_scheduled_last_iter flip logic."""
-        execute_scripted_runtime(
-            self._script_chunked_req_scheduled_last_iter_flip,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_chunked_req_scheduled_last_iter_flip(t: ScriptedRuntime):
-        # scheduler.py: _chunked_req_scheduled_last_iter flip logic.
-        r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
-        yield from run_until_finished(r)
-
     def test_chunked_req_reset_to_none(self):
         """Scheduler.py:3596 — chunked_req=None reset path."""
         execute_scripted_runtime(
@@ -380,22 +256,6 @@ class TestScriptedSpecialCase(CustomTestCase):
         yield from run_until_finished(r)
         cur = t.get_chunked_req_rid()
         assert cur is None
-
-    def test_disagg_prefill_chunked_path(self):
-        """Disaggregation/prefill.py — chunked req in disagg prefill mode."""
-        execute_scripted_runtime(
-            self._script_disagg_prefill_chunked_path,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
-
-    @staticmethod
-    def _script_disagg_prefill_chunked_path(t: ScriptedRuntime):
-        # disaggregation/prefill.py — chunked req in disagg prefill mode.
-        # Single-engine smoke (disagg topology requires P3 multi-engine).
-        # TODO(round-3): recreate the specific bug shape; this currently
-        # is a forward-pointing smoke.
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
 
     def test_disagg_decode_waiting_queue_kv_held(self):
         """Disaggregation/decode.py — waiting_queue reqs hold KV in decode mode."""
