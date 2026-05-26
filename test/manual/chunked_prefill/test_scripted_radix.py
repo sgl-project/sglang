@@ -376,9 +376,6 @@ class TestScriptedRadix(CustomTestCase):
             saw_skip
         ), "expected priority-skip-chunked-resume branch to fire at least once"
 
-    @unittest.skip(
-        "needs ScriptedRuntime radix hit_count query — wire up when t.engine_stats() exposes radix hit_count"
-    )
     def test_radix_chunked_stash_no_hit_count_inflation(self):
         """Chunked re-insert does not inflate radix hit_count via the self-referencing stash path."""
         execute_scripted_runtime(
