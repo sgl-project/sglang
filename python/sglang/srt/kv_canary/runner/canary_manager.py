@@ -67,7 +67,11 @@ class CanaryManager:
         self._buffer_groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
 
         self._device_state = CanaryDeviceState.allocate(
-            config=config, device=device, num_tags=len(CanaryLaunchTag)
+            config=config,
+            device=device,
+            num_tags=len(CanaryLaunchTag),
+            req_to_token_alloc_size=req_to_token_pool.req_to_token.shape[0],
+            max_context_len=req_to_token_pool.max_context_len,
         )
         # Disable the chain-step position assert until warmup / cuda-graph capture finishes
         # (synthetic positions trip the +1 invariant). mark_init_finished() sets it to 1.

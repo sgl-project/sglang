@@ -23,6 +23,7 @@ from sglang.srt.kv_canary.single_forward_manager.data import (
     PostOpsInsideGraphOutputBuffer,
 )
 from sglang.srt.kv_canary.state import CanaryDeviceState
+from sglang.srt.kv_canary.token_id_validator import fill_expected_inputs_from_reqs
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 from sglang.srt.utils.phase_checker import SimplePhaseChecker
 
@@ -170,14 +171,7 @@ class SingleForwardManager:
 
         input_check_mode = self._should_enable_input_check_for_launch(forward_batch)
         if input_check_mode:
-            manager = self._token_oracle_manager
-            if manager is None:
-                raise RuntimeError(
-                    "kv-canary: input_check_mode=True requires a TokenOracleManager; pass "
-                    "token_oracle_manager=install_oracle_sampler(oracle=...) into "
-                    "install_canary(...)"
-                )
-            manager.fill_expected_inputs(
+            self._fill_expected_inputs(
                 forward_batch=forward_batch,
                 expected_inputs_out=expected_inputs,
             )
@@ -278,7 +272,9 @@ class SingleForwardManager:
     def _should_enable_input_check_for_launch(
         self, forward_batch: "ForwardBatch"
     ) -> bool:
-        if not self._config.input_check_mode:
+        if not (
+            self._config.input_check_mode or self._config.enable_req_token_ids_check
+        ):
             return False
         forward_mode = forward_batch.forward_mode
         if (
@@ -288,6 +284,36 @@ class SingleForwardManager:
         ):
             return False
         return True
+
+    def _fill_expected_inputs(
+        self,
+        *,
+        forward_batch: "ForwardBatch",
+        expected_inputs_out: ExpectedInputs,
+    ) -> None:
+        # Real-model branch wins when both flags are on: it has the stronger
+        # source-of-truth (per-req prompt+output) and does not need a mock
+        # oracle.
+        if self._config.enable_req_token_ids_check:
+            fill_expected_inputs_from_reqs(
+                forward_batch=forward_batch,
+                expected_inputs_out=expected_inputs_out,
+                pool=self._device_state.req_to_expected_token_ids_pool,
+                valid_lens=self._device_state.req_to_expected_token_ids_valid_lens,
+            )
+            return
+
+        manager = self._token_oracle_manager
+        if manager is None:
+            raise RuntimeError(
+                "kv-canary: input_check_mode=True requires a TokenOracleManager; pass "
+                "token_oracle_manager=install_oracle_sampler(oracle=...) into "
+                "install_canary(...)"
+            )
+        manager.fill_expected_inputs(
+            forward_batch=forward_batch,
+            expected_inputs_out=expected_inputs_out,
+        )
 
 
 def _is_head_tag(tag: CanaryLaunchTag) -> bool:

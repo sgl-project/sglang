@@ -434,6 +434,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
 
+    # For kv-canary real-model token-id validator: list of Req objects mirroring
+    # ScheduleBatch.reqs at the moment ForwardBatch.init_new was called. Populated
+    # only when SGLANG_KV_CANARY_ENABLE_REQ_TOKEN_IDS_CHECK is on so production
+    # paths do not retain references to scheduler-owned objects.
+    reqs: Optional[List[object]] = None
+
     @classmethod
     def init_new(
         cls,
@@ -558,6 +564,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             batch.sampling_info.bootstrap_room_ids_int = bootstrap_room_ids
             ret.rids_int = hashed
             ret.bootstrap_room_ids_int = bootstrap_room_ids
+
+        if envs.SGLANG_KV_CANARY_ENABLE_REQ_TOKEN_IDS_CHECK.get():
+            # The real-model token-id validator needs each req's prompt+output
+            # history to build expected tokens per forward.
+            ret.reqs = list(batch.reqs)
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
