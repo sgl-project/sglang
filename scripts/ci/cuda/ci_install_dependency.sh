@@ -23,6 +23,22 @@ mark_step_done() {
     _CI_MARK_PREV=${now}
 }
 
+# Retry a flaky network command (3 attempts, exponential backoff). Used for
+# git clones to GitHub since some self-hosted runners have intermittent DNS
+# resolution failures (`Could not resolve host: github.com`).
+retry_cmd() {
+    local attempts=3 delay=10
+    for i in $(seq 1 $attempts); do
+        if "$@"; then return 0; fi
+        if [ "$i" -lt "$attempts" ]; then
+            echo "Command failed (attempt $i/$attempts); sleeping ${delay}s before retry"
+            sleep "$delay"
+            delay=$((delay * 2))
+        fi
+    done
+    return 1
+}
+
 # ---------------------------------------------------------------------------
 # Functions
 # ---------------------------------------------------------------------------
@@ -493,7 +509,7 @@ install_extra_deps() {
         EXISTING_TAG=$(git -C lmms-eval describe --tags --exact-match 2>/dev/null || true)
         if [ "$EXISTING_TAG" != "$LMMS_EVAL_TAG" ]; then
             rm -rf lmms-eval
-            git clone --branch "$LMMS_EVAL_TAG" --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+            retry_cmd git clone --branch "$LMMS_EVAL_TAG" --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
         fi
         $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
     fi
@@ -512,7 +528,7 @@ install_test_tools() {
 
     # Install human-eval (subshell keeps cd local)
     $PIP_CMD install "setuptools==70.0.0" $PIP_INSTALL_SUFFIX
-    [ -d human-eval ] || git clone https://github.com/merrymercy/human-eval.git
+    [ -d human-eval ] || retry_cmd git clone https://github.com/merrymercy/human-eval.git
     (
         cd human-eval
         $PIP_CMD install -e . --no-build-isolation $PIP_INSTALL_SUFFIX
