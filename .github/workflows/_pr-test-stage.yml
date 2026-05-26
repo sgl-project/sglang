@@ -155,12 +155,17 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ fromJson(inputs.check_changes).continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite ${{ inputs.self_name }} \
-            --auto-partition-id ${{ matrix.partition }} \
-            --auto-partition-size ${{ fromJson(inputs.partitions)[inputs.self_name].size }} \
-            --partition-model-file /tmp/partition-model.json \
-            ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
-            $CONTINUE_ON_ERROR_FLAG
+          if [[ "${{ inputs.self_name }}" == "base-a-test-1-gpu-small" ]]; then
+            # SMOKE — only run coredump smoke test (revert before merge)
+            python3 -m pytest -q registered/debug_utils/test_cuda_coredump_smoke.py
+          else
+            python3 run_suite.py --hw cuda --suite ${{ inputs.self_name }} \
+              --auto-partition-id ${{ matrix.partition }} \
+              --auto-partition-size ${{ fromJson(inputs.partitions)[inputs.self_name].size }} \
+              --partition-model-file /tmp/partition-model.json \
+              ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
+              $CONTINUE_ON_ERROR_FLAG
+          fi
 
       - name: Run extra pytest
         if: inputs.extra_pytest_path != ''
