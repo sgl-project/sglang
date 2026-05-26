@@ -35,8 +35,9 @@ Implemented:
   accumulation differences; chain verify and non-spec GDN paths keep `3e-2`.
 - Each attention-method folder now has a local `README.md` capability matrix and
   progress summary. Implemented folders are `dense/`, `swa/`, `mla/`, `gdn/`, and
-  non-sparse `dual_chunk/`. Placeholder folders remain for not-yet-implemented
-  method fixtures: `dsa/` and `dsv4/`.
+  non-sparse `dual_chunk/`, plus DSA dense prefill fallback coverage. `dsv4/`
+  remains a deferred method fixture because it needs a DeepSeekV4-specific
+  packed-cache reference.
 - Phase 3 dense runner integration is implemented for representative attention
   backends: eager mode for `torch_native`, and CUDA-graph metadata capture/replay
   decode mode for `triton` and `flashinfer`. Runner coverage now includes MHA,
@@ -238,6 +239,9 @@ In progress:
   representative valid backends listed above. Remaining Phase 4 work is limited
   to backend-specific blockers and hardware-gated paths documented in the
   implemented/deferred bullets.
+- Locally runnable Phase 2 expansion now covers the non-sparse and dense-fallback
+  method fixtures identified in this pass. Remaining Phase 2 work is sparse,
+  compressed, or hardware-gated.
 
 Next implementation steps:
 - Expand Phase 2 to additional attention methods/backends with method-specific
