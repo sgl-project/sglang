@@ -580,7 +580,7 @@ def build_lightning_attention_fixture(
         case.num_input_tokens, case.num_heads, head_dim, dtype=dtype, device=device
     )
 
-    return LightningAttentionFixture(
+    fixture = LightningAttentionFixture(
         case=case,
         runner=runner,
         backend=backend,
@@ -591,10 +591,46 @@ def build_lightning_attention_fixture(
         k=k,
         v=v,
     )
+    _populate_lightning_prefix_state(fixture)
+    return fixture
 
 
 def _ssm_states(fixture: LightningAttentionFixture) -> torch.Tensor:
     return fixture.runner.req_to_token_pool.mamba2_layer_cache(0).temporal
+
+
+def _populate_lightning_prefix_state(fixture: LightningAttentionFixture) -> None:
+    """Seed per-request seg_la SSM state for `prefix_lens > 0`. Without this
+    the pool's default zero state lets cases with prefix match trivially in
+    both actual and reference paths regardless of backend correctness.
+    Save/restores the global RNG to avoid perturbing downstream consumers.
+    """
+    case = fixture.case
+    cache_indices = fixture.runner.req_to_token_pool.req_index_to_mamba_index_mapping[
+        fixture.forward_batch.req_pool_indices
+    ]
+    temporal = _ssm_states(fixture)
+    device = temporal.device
+
+    cpu_state = torch.random.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state(device=device)
+    try:
+        seed = 5701 + len(case.name) * 23
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        prefix_scale = 0.05  # match GDN/KDA — bf16 accumulation tolerance
+        for req_idx, prefix_len in enumerate(case.prefix_lens):
+            if prefix_len <= 0:
+                continue
+            state_idx = int(cache_indices[req_idx].item())
+            slot_shape = temporal[state_idx].shape
+            temporal[state_idx] = (
+                torch.randn(slot_shape, dtype=temporal.dtype, device=device)
+                * prefix_scale
+            )
+    finally:
+        torch.random.set_rng_state(cpu_state)
+        torch.cuda.set_rng_state(cuda_state, device=device)
 
 
 def _cache_indices(fixture: LightningAttentionFixture) -> torch.Tensor:

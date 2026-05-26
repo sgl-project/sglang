@@ -602,7 +602,7 @@ def build_gdn_attention_fixture(
     a = torch.randn(case.num_input_tokens, case.num_v_heads, dtype=dtype, device=device)
     b = torch.randn(case.num_input_tokens, case.num_v_heads, dtype=dtype, device=device)
 
-    return GDNAttentionFixture(
+    fixture = GDNAttentionFixture(
         case=case,
         runner=runner,
         backend=backend,
@@ -613,6 +613,12 @@ def build_gdn_attention_fixture(
         a=a,
         b=b,
     )
+    # Seed per-request SSM state for prefix_lens > 0 so both the actual and
+    # reference paths start from a non-trivial initial state — without this
+    # the pool's zero state would make any case with a "prefix" match the
+    # zero-prefix case trivially regardless of backend correctness.
+    _populate_gdn_prefix_state(fixture)
+    return fixture
 
 
 def _copy_gdn_parameters(
@@ -630,6 +636,48 @@ def _ssm_states(fixture: GDNAttentionFixture) -> torch.Tensor:
 
 def _conv_states(fixture: GDNAttentionFixture) -> torch.Tensor:
     return fixture.runner.req_to_token_pool.mamba2_layer_cache(0).conv[0]
+
+
+def _populate_gdn_prefix_state(fixture: GDNAttentionFixture) -> None:
+    """Seed the recurrent SSM state buffer with deterministic non-zero values
+    for requests that have `prefix_lens > 0`. Without this both the actual
+    backend and the pure-PyTorch reference would start from the pool's
+    default zero state and the test would match trivially regardless of
+    whether the backend honors the per-request initial state.
+
+    Uses a case-derived seed and save/restores the global RNG so this does
+    not perturb downstream randomness consumers in `build_*_attention_fixture`.
+    """
+    case = fixture.case
+    cache_indices = fixture.runner.req_to_token_pool.req_index_to_mamba_index_mapping[
+        fixture.forward_batch.req_pool_indices
+    ]
+    temporal = _ssm_states(fixture)
+    device = temporal.device
+
+    cpu_state = torch.random.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state(device=device)
+    try:
+        seed = 5101 + len(case.name) * 17
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        # Scale down the seeded state so the bf16 recurrent kernel's
+        # accumulation noise stays within the GDN tolerance for tree-verify
+        # cases (the per-step gate decay keeps a real prefix state bounded
+        # below O(1) in production, so 0.05 is conservative).
+        prefix_scale = 0.05
+        for req_idx, prefix_len in enumerate(case.prefix_lens):
+            if prefix_len <= 0:
+                continue
+            state_idx = int(cache_indices[req_idx].item())
+            slot_shape = temporal[state_idx].shape
+            temporal[state_idx] = (
+                torch.randn(slot_shape, dtype=temporal.dtype, device=device)
+                * prefix_scale
+            )
+    finally:
+        torch.random.set_rng_state(cpu_state)
+        torch.cuda.set_rng_state(cuda_state, device=device)
 
 
 def _clone_gdn_cache(fixture: GDNAttentionFixture):

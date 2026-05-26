@@ -310,6 +310,23 @@ class _FrozenKVMTPWorkerHarness:
 
 
 @contextmanager
+def _seeded_rng(seed: int, *, device: str | torch.device):
+    """Set CPU+CUDA RNG to `seed` for the body, restore on exit. The draft
+    input builders below need deterministic randomness per case but must not
+    leak that seed into the rest of the test process (build_*_fixture relies
+    on its own seeding for parameter init)."""
+    cpu_state = torch.random.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state(device=device)
+    try:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        yield
+    finally:
+        torch.random.set_rng_state(cpu_state)
+        torch.cuda.set_rng_state(cuda_state, device=device)
+
+
+@contextmanager
 def _single_rank_graph_capture():
     stream = torch.cuda.Stream()
     yield SimpleNamespace(stream=stream)
@@ -501,7 +518,7 @@ def _capture_eagle_draft_graph_runner(
         ),
         patch(
             "sglang.srt.model_executor.cuda_graph_runner.get_tensor_model_parallel_rank",
-            lambda: 1,
+            lambda: 0,
         ),
         patch(
             "sglang.srt.model_executor.cuda_graph_runner.get_available_gpu_memory",
@@ -532,7 +549,7 @@ def _capture_eagle_draft_extend_graph_runner(
         ),
         patch(
             "sglang.srt.model_executor.cuda_graph_runner.get_tensor_model_parallel_rank",
-            lambda: 1,
+            lambda: 0,
         ),
         patch(
             "sglang.srt.model_executor.cuda_graph_runner.get_available_gpu_memory",
@@ -561,7 +578,7 @@ def _capture_frozen_kv_mtp_graph_runner(
         ),
         patch(
             "sglang.srt.model_executor.cuda_graph_runner.get_tensor_model_parallel_rank",
-            lambda: 1,
+            lambda: 0,
         ),
         patch(
             "sglang.srt.model_executor.cuda_graph_runner.get_available_gpu_memory",
@@ -962,34 +979,33 @@ def _make_dense_draft_inputs(
     case: DenseAttentionCase,
     settings: EagleDraftRunnerSettings,
 ) -> dict[str, torch.Tensor]:
-    torch.manual_seed(4080 + len(case.name) + settings.topk)
-    torch.cuda.manual_seed_all(4080 + len(case.name) + settings.topk)
-    topk_index = (
-        torch.arange(
-            case.batch_size * settings.topk,
-            dtype=torch.int64,
+    with _seeded_rng(4080 + len(case.name) + settings.topk, device=settings.device):
+        topk_index = (
+            torch.arange(
+                case.batch_size * settings.topk,
+                dtype=torch.int64,
+                device=settings.device,
+            ).view(case.batch_size, settings.topk)
+            + 3
+        ) % settings.vocab_size
+        topk_p = torch.linspace(
+            0.6,
+            0.9,
+            steps=case.batch_size * settings.topk,
+            dtype=torch.float32,
             device=settings.device,
         ).view(case.batch_size, settings.topk)
-        + 3
-    ) % settings.vocab_size
-    topk_p = torch.linspace(
-        0.6,
-        0.9,
-        steps=case.batch_size * settings.topk,
-        dtype=torch.float32,
-        device=settings.device,
-    ).view(case.batch_size, settings.topk)
-    topk_p = topk_p / topk_p.sum(dim=-1, keepdim=True)
-    return {
-        "hidden_states": torch.randn(
-            case.batch_size,
-            settings.hidden_size,
-            dtype=settings.dtype,
-            device=settings.device,
-        ),
-        "topk_p": topk_p,
-        "topk_index": topk_index,
-    }
+        topk_p = topk_p / topk_p.sum(dim=-1, keepdim=True)
+        return {
+            "hidden_states": torch.randn(
+                case.batch_size,
+                settings.hidden_size,
+                dtype=settings.dtype,
+                device=settings.device,
+            ),
+            "topk_p": topk_p,
+            "topk_index": topk_index,
+        }
 
 
 def _make_dense_frozen_kv_mtp_draft_inputs(
@@ -1008,16 +1024,15 @@ def _make_dense_draft_extend_inputs(
     case: DenseAttentionCase,
     settings: EagleDraftRunnerSettings,
 ) -> dict[str, torch.Tensor]:
-    torch.manual_seed(6080 + len(case.name))
-    torch.cuda.manual_seed_all(6080 + len(case.name))
-    return {
-        "hidden_states": torch.randn(
-            case.num_input_tokens,
-            settings.hidden_size,
-            dtype=settings.dtype,
-            device=settings.device,
-        ),
-    }
+    with _seeded_rng(6080 + len(case.name), device=settings.device):
+        return {
+            "hidden_states": torch.randn(
+                case.num_input_tokens,
+                settings.hidden_size,
+                dtype=settings.dtype,
+                device=settings.device,
+            ),
+        }
 
 
 def _prepare_dense_draft_replay_state(
@@ -1566,50 +1581,48 @@ def _make_mla_draft_inputs(
     case: MLAAttentionCase,
     settings: EagleDraftRunnerSettings,
 ) -> dict[str, torch.Tensor]:
-    torch.manual_seed(5080 + len(case.name) + settings.topk)
-    torch.cuda.manual_seed_all(5080 + len(case.name) + settings.topk)
-    topk_index = (
-        torch.arange(
-            case.batch_size * settings.topk,
-            dtype=torch.int64,
+    with _seeded_rng(5080 + len(case.name) + settings.topk, device=settings.device):
+        topk_index = (
+            torch.arange(
+                case.batch_size * settings.topk,
+                dtype=torch.int64,
+                device=settings.device,
+            ).view(case.batch_size, settings.topk)
+            + 5
+        ) % settings.vocab_size
+        topk_p = torch.linspace(
+            0.55,
+            0.95,
+            steps=case.batch_size * settings.topk,
+            dtype=torch.float32,
             device=settings.device,
         ).view(case.batch_size, settings.topk)
-        + 5
-    ) % settings.vocab_size
-    topk_p = torch.linspace(
-        0.55,
-        0.95,
-        steps=case.batch_size * settings.topk,
-        dtype=torch.float32,
-        device=settings.device,
-    ).view(case.batch_size, settings.topk)
-    topk_p = topk_p / topk_p.sum(dim=-1, keepdim=True)
-    return {
-        "hidden_states": torch.randn(
-            case.batch_size,
-            settings.hidden_size,
-            dtype=settings.dtype,
-            device=settings.device,
-        ),
-        "topk_p": topk_p,
-        "topk_index": topk_index,
-    }
+        topk_p = topk_p / topk_p.sum(dim=-1, keepdim=True)
+        return {
+            "hidden_states": torch.randn(
+                case.batch_size,
+                settings.hidden_size,
+                dtype=settings.dtype,
+                device=settings.device,
+            ),
+            "topk_p": topk_p,
+            "topk_index": topk_index,
+        }
 
 
 def _make_mla_draft_extend_inputs(
     case: MLAAttentionCase,
     settings: EagleDraftRunnerSettings,
 ) -> dict[str, torch.Tensor]:
-    torch.manual_seed(7080 + len(case.name))
-    torch.cuda.manual_seed_all(7080 + len(case.name))
-    return {
-        "hidden_states": torch.randn(
-            case.num_input_tokens,
-            settings.hidden_size,
-            dtype=settings.dtype,
-            device=settings.device,
-        ),
-    }
+    with _seeded_rng(7080 + len(case.name), device=settings.device):
+        return {
+            "hidden_states": torch.randn(
+                case.num_input_tokens,
+                settings.hidden_size,
+                dtype=settings.dtype,
+                device=settings.device,
+            ),
+        }
 
 
 def _prepare_mla_draft_replay_state(

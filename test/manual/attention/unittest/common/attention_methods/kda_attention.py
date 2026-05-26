@@ -627,7 +627,7 @@ def build_kda_attention_fixture(
         a = a_raw.unflatten(-1, (case.num_v_heads, head_k_dim)).unsqueeze(0)
         b = b_raw.float().sigmoid().unsqueeze(0).to(dtype)
 
-    return KDAAttentionFixture(
+    fixture = KDAAttentionFixture(
         case=case,
         runner=runner,
         backend=backend,
@@ -640,6 +640,42 @@ def build_kda_attention_fixture(
         a_raw=a_raw,
         b_raw=b_raw,
     )
+    _populate_kda_prefix_state(fixture)
+    return fixture
+
+
+def _populate_kda_prefix_state(fixture: "KDAAttentionFixture") -> None:
+    """Seed per-request KDA SSM state for `prefix_lens > 0` so both backend
+    and reference start from a non-trivial initial state. Without this the
+    pool's default zero state would let cases with prefix match trivially.
+    Save/restores the global RNG to avoid perturbing downstream consumers.
+    """
+    case = fixture.case
+    cache_indices = fixture.runner.req_to_token_pool.req_index_to_mamba_index_mapping[
+        fixture.forward_batch.req_pool_indices
+    ]
+    temporal = _ssm_states(fixture)
+    device = temporal.device
+
+    cpu_state = torch.random.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state(device=device)
+    try:
+        seed = 5601 + len(case.name) * 19
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        prefix_scale = 0.05  # bf16 accumulation tolerance — see GDN twin
+        for req_idx, prefix_len in enumerate(case.prefix_lens):
+            if prefix_len <= 0:
+                continue
+            state_idx = int(cache_indices[req_idx].item())
+            slot_shape = temporal[state_idx].shape
+            temporal[state_idx] = (
+                torch.randn(slot_shape, dtype=temporal.dtype, device=device)
+                * prefix_scale
+            )
+    finally:
+        torch.random.set_rng_state(cpu_state)
+        torch.cuda.set_rng_state(cuda_state, device=device)
 
 
 def _copy_kda_parameters(

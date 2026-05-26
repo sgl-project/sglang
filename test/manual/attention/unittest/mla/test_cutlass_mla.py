@@ -45,15 +45,18 @@ _SUPPORTED, _SKIP_REASON = _supported()
 
 @unittest.skipIf(not _SUPPORTED, _SKIP_REASON)
 class TestCutlassMLAAttentionBackendCorrectness(CustomTestCase):
+    # CutlassMLABackend only overrides `forward_decode`; EXTEND falls through
+    # to the FlashInferMLAAttnBackend parent and bypasses cutlass code
+    # entirely. Use DECODE so the test actually exercises the cutlass kernel
+    # on Blackwell.
     CASES = (
         MLAAttentionCase(
-            name="mla_extend_zero_prefix_exact_cutlass_page",
+            name="mla_decode_cutlass_page_boundary",
             backend="cutlass_mla",
-            forward_mode=ForwardMode.EXTEND,
+            forward_mode=ForwardMode.DECODE,
             num_heads=4,
             page_size=128,
-            prefix_lens=(0,),
-            extend_lens=(128,),
+            prefix_lens=(126, 127, 128),
         ),
     )
 

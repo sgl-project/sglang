@@ -207,6 +207,8 @@ def _run_cuda_graph_decode_case(
         capture_batch_size,
         allow_padding=adapter.allow_padding,
     )
+    # NOTE: `capture_prefix_len`-vs-replay assertion happens below once the
+    # graph fixture is built (we need `backend.get_cuda_graph_seq_len_fill_value`).
 
     eager_fixture = adapter.build_fixture(testcase, case, **build_kwargs)
     eager_inputs = adapter.fixture_inputs(eager_fixture)
@@ -236,6 +238,12 @@ def _run_cuda_graph_decode_case(
     graph_replay_inputs = adapter.fixture_inputs(graph_fixture)
     graph_initial_state = adapter.clone_state(graph_fixture)
     capture_prefix_len = max(0, backend.get_cuda_graph_seq_len_fill_value() - 1)
+    if any(p < capture_prefix_len for p in case.prefix_lens):
+        raise AssertionError(
+            f"replay prefix_lens must each be >= capture_prefix_len="
+            f"{capture_prefix_len} so capture-time random KV does not leak "
+            f"into replay; got prefix_lens={case.prefix_lens}"
+        )
 
     capture_case = adapter.make_case(
         case,

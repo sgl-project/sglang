@@ -128,8 +128,16 @@ def _draft_tree_mask(
             )
         )
 
-    if draft_token_num < 3:
-        raise ValueError("Tree-draft verify coverage expects at least 3 draft tokens.")
+    if draft_token_num != 3:
+        # The tree mask below hardcodes the root + two-branch tree shape used
+        # by every existing tree-verify test case (parent_indices == (-1, 0, 0)).
+        # Anything else needs its own tree-mask builder; reject loudly instead
+        # of silently producing a malformed mask.
+        raise ValueError(
+            f"Tree-draft verify coverage hardcodes draft_token_num=3 for topk>1; "
+            f"got draft_token_num={draft_token_num}. Add a new tree-mask builder "
+            f"if you need a different tree shape."
+        )
     mask = torch.eye(draft_token_num, dtype=torch.bool, device=device)
     mask[:, 0] = True
     mask[1, :2] = True
