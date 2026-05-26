@@ -698,11 +698,7 @@ class TestScriptedRegression(CustomTestCase):
         # before-build ordering must have been observed (otherwise the
         # API never reported a stash and the test is vacuous on this
         # axis — covered by the build-co-occurrence negative above).
-        if any(
-            "stash" in p
-            for p in (prev_scheduler_path,)
-            if p is not None
-        ):
+        if any("stash" in p for p in (prev_scheduler_path,) if p is not None):
             assert stash_seen_before_build, (
                 "678bba26f0: stash event recorded but never observed "
                 "preceding a subsequent build event"
