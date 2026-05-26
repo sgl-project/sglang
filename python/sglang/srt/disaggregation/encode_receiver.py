@@ -444,6 +444,7 @@ class WaitingImageRequest:
         recv_req: TokenizedGenerateReqInput,
         mm_processor,
         encoder_urls,
+        model_type,
         host_name,
         receive_count,
         model_type: Optional[str] = None,
@@ -455,6 +456,7 @@ class WaitingImageRequest:
         self.thread = None
         self.mm_processor = mm_processor
         self.encoder_urls = encoder_urls
+        self.model_type = model_type
         self.host_name = host_name
         self.receive_count = receive_count
         self.model_type = model_type
@@ -1495,6 +1497,7 @@ class MMReceiverBase(ABC):
                     recv_req=recv_req,
                     mm_processor=self.mm_processor,
                     encoder_urls=self.encode_urls,
+                    model_type=self.model_type,
                     host_name=self.hostname,
                     receive_count=self.tp_size,
                     model_type=self.model_type,
