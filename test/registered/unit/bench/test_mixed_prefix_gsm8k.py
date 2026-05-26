@@ -23,7 +23,7 @@ except ModuleNotFoundError:
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-from sglang.test.simple_eval_gsm8k_mixed import (
+from sglang.test.simple_eval_mixed_prefix_gsm8k import (
     _MODE_LABELS,
     MixedPrefixGSM8KEval,
 )

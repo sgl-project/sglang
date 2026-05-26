@@ -66,13 +66,13 @@ class ChunkedSimpleTester:
         args = SimpleNamespace(
             base_url=base_url,
             model=model,
-            eval_name="gsm8k_mixed",
+            eval_name="mixed_prefix_gsm8k",
             api="chat_completion",
             max_tokens=self.max_tokens,
             num_examples=self.num_examples,
             num_threads=self.num_threads,
             num_shots=self.num_shots,
-            gsm8k_mixed_seed=self.seed,
+            mixed_prefix_gsm8k_seed=self.seed,
             temperature=0.0,
         )
         tic = time.perf_counter()
@@ -133,7 +133,7 @@ class ChunkedTestBase(CustomTestCase):
         if cls.process is not None:
             kill_process_tree(cls.process.pid)
 
-    def test_gsm8k_mixed_chunked(self):
+    def test_mixed_prefix_gsm8k_chunked(self):
         metrics = self._simple_tester.run_eval(
             self.base_url, self.model, type(self).__name__
         )
@@ -167,7 +167,7 @@ class ChunkedTestPDBase(PDDisaggregationServerBase):
     def tearDownClass(cls):
         PDDisaggregationServerBase.tearDownClass()
 
-    def test_gsm8k_mixed_chunked(self):
+    def test_mixed_prefix_gsm8k_chunked(self):
         metrics = self._simple_tester.run_eval(
             self.base_url, self.model, type(self).__name__
         )
