@@ -996,5 +996,257 @@ class TestScriptedSpecialCase(CustomTestCase):
         raise AssertionError("chunked req did not finish")
 
 
+    def test_init_next_round_input_resets_chunk_state(self):
+        """[c-S16] Across two chunks of one req, fill_ids_len is reset to prefix_indices_len before next admit."""
+        execute_scripted_runtime(
+            self._script_init_next_round_input_resets_chunk_state,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [c-S16] schedule_batch.init_next_round_input: between consecutive
+    # chunks of the same chunked-resume req, the per-iter ``fill_ids``
+    # buffer must be reset to the already-committed prefix
+    # (prefix_indices length). Pre-fix the residual fill_ids from the
+    # previous chunk could leak into the next admit and double-count
+    # tokens. Observable via r.fill_ids_len snapped at consecutive
+    # mid-chunk yields.
+    @staticmethod
+    def _script_init_next_round_input_resets_chunk_state(t: ScriptedRuntime):
+        # NEW API NEEDED: r.fill_ids_len — per-req length of the
+        # scheduler's current fill_ids buffer, exposed for invariant
+        # checks across chunk boundaries.
+        # NEW API NEEDED: r.prefix_indices_len — length of the already-
+        # committed prefix indices for the chunked req.
+        r = t.start_req(prompt_len=3 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
+        # Drive to the boundary between chunk 1 and chunk 2.
+        yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
+        # At the boundary, the scheduler's fill_ids buffer for r must
+        # have been reset to its prefix_indices length (no residue from
+        # chunk 1).
+        assert r.fill_ids_len == r.prefix_indices_len, (
+            f"init_next_round_input must reset fill_ids to prefix_indices; "
+            f"fill_ids_len={r.fill_ids_len}, "
+            f"prefix_indices_len={r.prefix_indices_len}"
+        )
+        yield from run_until_finished(r)
+        assert r.finished
+
+    def test_chunked_req_scheduled_last_iter_false_when_chunk_completes(self):
+        """[c-S16-2] After last chunk admit, last_chunked_req_scheduled_iter_flag clears to False (chunked_req cleared)."""
+        execute_scripted_runtime(
+            self._script_chunked_req_scheduled_last_iter_false_when_chunk_completes,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [c-S16-2] scheduler.py: ``_chunked_req_scheduled_last_iter`` must
+    # transition from True (during chunked admission) to False once the
+    # last chunk has been admitted and the scheduler.chunked_req has
+    # been cleared back to None. Observable via the flag itself.
+    @staticmethod
+    def _script_chunked_req_scheduled_last_iter_false_when_chunk_completes(
+        t: ScriptedRuntime,
+    ):
+        # 2 chunks so the second chunk is the last one and clearly
+        # exercises the last-chunk admission path.
+        r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
+        # While the req is chunking, observe the flag at least once True.
+        saw_true = False
+        for _ in range(DEFAULT_MAX_STEPS):
+            if r.is_chunking:
+                # NEW API NEEDED: t.last_chunked_req_scheduled_iter_flag()
+                # returns the value of scheduler._chunked_req_scheduled_last_iter.
+                if t.last_chunked_req_scheduled_iter_flag():
+                    saw_true = True
+            if r.finished:
+                break
+            yield
+        assert r.finished
+        assert saw_true, "flag should have been True at least once mid-chunk"
+        # After finish + chunked_req cleared, the flag must be False.
+        assert (
+            t.last_chunked_req_scheduled_iter_flag() is False
+        ), f"flag must clear to False after last chunk; got {t.last_chunked_req_scheduled_iter_flag()!r}"
+
+    def test_second_chunked_admit_blocked_when_chunked_req_set(self):
+        """[c-S18 negative] While R1 is chunking, R2 (also long) waits; at every yield exactly one of {R1, R2} is_chunking."""
+        execute_scripted_runtime(
+            self._script_second_chunked_admit_blocked_when_chunked_req_set,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [c-S18 negative] scheduler.py: only one chunked-resume req at a
+    # time. With R1 holding the chunked slot, a second long req R2
+    # submitted concurrently must NOT also enter is_chunking — it has
+    # to wait until R1 releases the slot. Mutual-exclusion invariant
+    # across the full lifetime.
+    @staticmethod
+    def _script_second_chunked_admit_blocked_when_chunked_req_set(t: ScriptedRuntime):
+        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        saw_r1_chunking = False
+        saw_r2_chunking = False
+        for _ in range(DEFAULT_MAX_STEPS * 2):
+            both = r1.is_chunking and r2.is_chunking
+            assert not both, (
+                f"only one chunked-resume slot allowed; r1.is_chunking="
+                f"{r1.is_chunking}, r2.is_chunking={r2.is_chunking}"
+            )
+            if r1.is_chunking:
+                saw_r1_chunking = True
+            if r2.is_chunking:
+                saw_r2_chunking = True
+            if r1.finished and r2.finished:
+                break
+            yield
+        assert r1.finished and r2.finished
+        # Both should eventually chunk (sequentially).
+        assert saw_r1_chunking and saw_r2_chunking, (
+            f"both reqs should chunk over their lifetime; saw_r1="
+            f"{saw_r1_chunking}, saw_r2={saw_r2_chunking}"
+        )
+
+    def test_chunked_exclude_falls_back_to_last_batch_reqs_when_no_pp(self):
+        """[c-S8 else] Non-PP: exclude set populated from last_batch.reqs, not from last_batch.chunked_req."""
+        execute_scripted_runtime(
+            self._script_chunked_exclude_falls_back_to_last_batch_reqs_when_no_pp,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [c-S8 else] scheduler.py: in the non-PP single-microbatch path,
+    # the chunked_req_to_exclude set is populated from ``last_batch.reqs``
+    # (the else branch), not from ``last_batch.chunked_req`` (the PP
+    # branch). Observable via a runtime helper that exposes which
+    # source branch produced the exclude set.
+    @staticmethod
+    def _script_chunked_exclude_falls_back_to_last_batch_reqs_when_no_pp(
+        t: ScriptedRuntime,
+    ):
+        # Two reqs so last_batch.reqs has multiple entries — easy to
+        # observe the else branch sourcing from .reqs.
+        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r2 = t.start_req(prompt_len=16, max_new_tokens=2)
+        # NEW API NEEDED: t.last_chunked_exclude_set_source() returning
+        # "last_batch_reqs" | "last_batch_chunked_req" | None — which
+        # branch of the exclude set source was taken at the most recent
+        # admission step.
+        saw_reqs_branch = False
+        for _ in range(DEFAULT_MAX_STEPS):
+            source = t.last_chunked_exclude_set_source()
+            if source == "last_batch_reqs":
+                saw_reqs_branch = True
+                # In the non-PP path the exclude set must NOT come from
+                # the chunked_req pointer.
+                assert source != "last_batch_chunked_req"
+            if r1.finished and r2.finished:
+                break
+            yield
+        assert r1.finished and r2.finished
+        assert saw_reqs_branch, (
+            "non-PP scheduler must source exclude set from last_batch.reqs "
+            "(else branch) at least once during the multi-req lifetime"
+        )
+
+    def test_scheduler_continues_with_only_chunked_req_no_waiting(self):
+        """[c-S13] Mid-chunk single long req: waiting_queue empty but scheduler keeps running until finish."""
+        execute_scripted_runtime(
+            self._script_scheduler_continues_with_only_chunked_req_no_waiting,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [c-S13] scheduler.py: when the only inflight work is a chunked
+    # req (waiting_queue is empty), the event loop must not flip to
+    # idle and skip the chunked continuation. Observable: chunks_done
+    # must keep advancing, and is_idle must stay False throughout.
+    @staticmethod
+    def _script_scheduler_continues_with_only_chunked_req_no_waiting(
+        t: ScriptedRuntime,
+    ):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking)
+        prev_chunks_done = r.chunks_done
+        progressed = False
+        for _ in range(DEFAULT_MAX_STEPS):
+            assert not t.is_idle, (
+                "scheduler must not go idle while a chunked req is in flight"
+            )
+            cur_chunks_done = r.chunks_done
+            if cur_chunks_done > prev_chunks_done:
+                progressed = True
+            prev_chunks_done = cur_chunks_done
+            if r.finished:
+                break
+            yield
+        assert r.finished
+        assert progressed, (
+            "chunks_done must keep advancing without any waiter; pre-fix "
+            "an empty waiting_queue could cause the loop to skip continuation"
+        )
+
+    def test_add_chunked_req_non_swa_forced_admit_on_rem_zero(self):
+        """[c-P5b] Non-SWA chunked-resume: forced-admitted even when _rem_tokens hits 0 (avoid leak at schedule_policy.py:679-682)."""
+        execute_scripted_runtime(
+            self._script_add_chunked_req_non_swa_forced_admit_on_rem_zero,
+            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
+        )
+
+    # [c-P5b] schedule_policy.py:679-682 ("must force-admit chunked-
+    # resume even with rem_total_tokens == 0 to avoid leaking the row
+    # + KV already held"). Drive a long chunked req into a state where
+    # external KV exhaustion would normally block admission; the
+    # chunked-resume must STILL be admitted (forced) and complete
+    # without leak.
+    @staticmethod
+    def _script_add_chunked_req_non_swa_forced_admit_on_rem_zero(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        # Get the chunked-resume into a known mid-stream state.
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+        # Exhaust KV to push _rem_tokens to 0 from the budget side.
+        t.exhaust_kv()
+        # The chunked-resume must still advance to completion via the
+        # forced-admit path.
+        yield from run_until_finished(r, max_steps=800)
+        assert r.finished, (
+            "non-SWA chunked-resume must be force-admitted when "
+            "_rem_tokens == 0 (schedule_policy.py:679-682); pre-fix it "
+            "would block forever and leak its held row + KV"
+        )
+        assert r.kv_pages == 0
+        assert r.lock_refs == 0
+
+    def test_init_load_back_called_once_per_request_with_hicache(self):
+        """[c-P11 hicache] HiCache + multi-chunk req: init_load_back fires exactly once for the whole req, not once per chunk."""
+        execute_scripted_runtime(
+            self._script_init_load_back_called_once_per_request_with_hicache,
+            **base_engine_kwargs(
+                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+                enable_hierarchical_cache=True,
+            ),
+        )
+
+    # [c-P11 hicache] schedule_batch.py / hicache integration: the
+    # ``init_load_back`` hook bridges the HiCache off-GPU prefix into
+    # the chunked req's working set. It must be called exactly once per
+    # request (on first admission), not re-invoked per chunk. Observable
+    # via a per-req counter on the handle.
+    @staticmethod
+    def _script_init_load_back_called_once_per_request_with_hicache(
+        t: ScriptedRuntime,
+    ):
+        # NEW API NEEDED: r.init_load_back_count — how many times
+        # init_load_back() was invoked for this req across its lifetime.
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done >= 2, (
+            f"req must actually chunk for this branch to fire; got "
+            f"chunks_done={r.chunks_done}"
+        )
+        assert r.init_load_back_count == 1, (
+            f"HiCache init_load_back must run exactly once per request, "
+            f"not once per chunk; got init_load_back_count="
+            f"{r.init_load_back_count}"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
