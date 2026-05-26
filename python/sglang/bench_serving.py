@@ -39,6 +39,7 @@ from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
+from sglang.benchmark.datasets.generated_shared_prefix import _finite_positive_float
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.utils import (
     get_tokenizer,
@@ -2351,6 +2352,34 @@ if __name__ == "__main__":
         "--gsp-ordered",
         action="store_true",
         help="Keep requests in order without shuffling. By default, requests are shuffled randomly.",
+    )
+    group.add_argument(
+        "--gsp-group-distribution",
+        type=str,
+        choices=["uniform", "zipf"],
+        default="uniform",
+        help=(
+            "Prefix-group sampling distribution for generated-shared-prefix. "
+            "'uniform' (default) assigns each group an equal number of requests. "
+            "'zipf' samples each request's group by rank with "
+            "p(rank) = (1/rank**alpha) / sum_k(1/k**alpha); rank starts at 1 "
+            "and group index 0 is the hottest. Requires --gsp-zipf-alpha "
+            "(a finite float > 0) when set to 'zipf'. Total request count is "
+            "still num_groups * prompts_per_group, identical to uniform mode; "
+            "only the per-request group assignment changes. In 'zipf' mode the "
+            "on-disk dataset cache is bypassed."
+        ),
+    )
+    group.add_argument(
+        "--gsp-zipf-alpha",
+        type=_finite_positive_float,
+        default=None,
+        help=(
+            "Zipf exponent alpha for --gsp-group-distribution=zipf, with "
+            "p(rank) = (1/rank**alpha) / sum_k(1/k**alpha) and rank starting "
+            "at 1. Must be a finite float strictly greater than 0; larger "
+            "values concentrate requests on lower-ranked (hotter) groups."
+        ),
     )
     mooncake_group = parser.add_argument_group("mooncake dataset arguments")
     mooncake_group.add_argument(

@@ -82,6 +82,8 @@ Generated Shared Prefix flags (for `generated-shared-prefix`):
 - `--gsp-system-prompt-len`
 - `--gsp-question-len`
 - `--gsp-output-len`
+- `--gsp-group-distribution {uniform,zipf}`: per-request prefix-group sampling distribution (default: `uniform`). With `zipf`, each request's group is sampled by rank with `p(rank) = (1/rank**alpha) / sum_k(1/k**alpha)`; rank starts at 1 and group index 0 is the hottest. The on-disk dataset cache is bypassed in `zipf` mode.
+- `--gsp-zipf-alpha FLOAT`: Zipf exponent for `--gsp-group-distribution=zipf`. Must be a finite float strictly greater than 0; larger values concentrate requests on lower-ranked (hotter) groups. Required when the distribution is `zipf`; must be omitted otherwise.
 
 Image dataset flags (for `image`):
 
@@ -293,6 +295,26 @@ python3 -m sglang.bench_serving \
   --gsp-system-prompt-len 2048 --gsp-question-len 128 --gsp-output-len 256 \
   --num-prompts 1024
 ```
+
+Zipfian / power-law prefix popularity (opt-in via `--gsp-group-distribution=zipf`):
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 --port 30000 \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --dataset-name generated-shared-prefix \
+  --gsp-num-groups 64 --gsp-prompts-per-group 16 \
+  --gsp-system-prompt-len 2048 --gsp-question-len 128 --gsp-output-len 256 \
+  --gsp-group-distribution zipf --gsp-zipf-alpha 1.2 \
+  --seed 42
+```
+
+`zipf` mode samples each request's prefix group from the rank-based distribution `p(rank) = (1/rank**alpha) / sum_k(1/k**alpha)` with rank starting at 1, so group index 0 is the hottest. The total request count stays `num_groups * prompts_per_group` — identical to `uniform` mode — and only the per-request group assignment changes. `alpha` must be a finite float strictly greater than 0; larger values concentrate requests on lower-ranked (hotter) groups.
+
+In `zipf` mode the on-disk dataset cache at `~/.cache/sglang/benchmark/gen_shared_prefix_*.pkl` is bypassed (neither read nor written), so each run regenerates the workload fresh. This avoids any risk of silently reusing a `uniform`-mode cache payload for a `zipf` invocation, or vice versa.
+
+This flag controls prefix-popularity shape only. It does not by itself reproduce any production trace or guarantee an observed cache-hit rate for a given engine.
 
 6) Tokenized prompts (ids) for strict length control (sglang only):
 
