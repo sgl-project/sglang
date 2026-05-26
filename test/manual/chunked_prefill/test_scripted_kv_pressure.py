@@ -24,6 +24,7 @@ from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
+    DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     run_until,
@@ -42,8 +43,8 @@ class TestKVPressureBasic(ScriptedRuntimeTestCase):
     @staticmethod
     def _script_kv_almost_empty_then_abort(t: ScriptedRuntime):
         # KV almost empty (1 page left), chunked req in flight, abort it.
-        # NEW API NEEDED: t.exhaust_kv(leave_pages=N) — fill KV pool to N
-        # remaining pages by spamming short reqs.
+        # Verify (a) KV fully released, (b) W3 invariant: the abort path
+        # must not double-release the chunked req's row + KV.
         t.exhaust_kv(leave_pages=1)
         yield
 
@@ -56,6 +57,11 @@ class TestKVPressureBasic(ScriptedRuntimeTestCase):
         # KV is fully released after abort.
         stats = t.engine_stats()
         assert stats["kv_pool_free"] >= 1
+        # W3 invariant — dual-queue abort must not double-release.
+        assert r.abort_double_release_count == 0, (
+            f"W3 invariant: abort path double-released the chunked req "
+            f"{r.abort_double_release_count} times"
+        )
 
     def test_kv_full_chunked_new_req_retracts(self):
         """KV pool full → new chunked req submitted → must retract or OOM-path cleanly, not deadlock."""
@@ -63,18 +69,32 @@ class TestKVPressureBasic(ScriptedRuntimeTestCase):
 
     @staticmethod
     def _script_kv_full_chunked_new_req_retracts(t: ScriptedRuntime):
-        # KV pool full → new chunked req submitted → must retract or OOM-path
-        # cleanly, not deadlock.
+        # KV pool nearly full → new chunked req submitted → must retract
+        # or OOM-path cleanly, not deadlock. S2 invariant must hold even
+        # under starvation; if the req errors out, no rows should be
+        # leaked; if it completes, kv_pages must return to 0.
+        baseline = t.engine_stats()["kv_pool_free"]
         t.exhaust_kv(leave_pages=2)
         yield
 
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(
-            r, lambda h: h.finished or h.error_message is not None, max_steps=2000
-        )
+        for _ in range(2000):
+            assert (
+                t.chunked_req_in_batch_violation_count() == 0
+            ), "S2 invariant must hold under starvation"
+            if r.finished or r.error_message is not None:
+                break
+            yield
         # Either the req completes (via retract/eviction) or it surfaces an
         # OOM-style error message — both are acceptable clean outcomes.
         assert r.finished or r.error_message is not None
+        # Whichever outcome, KV must not be retained by r.
+        assert r.kv_pages == 0
+        final = t.engine_stats()["kv_pool_free"]
+        assert final >= baseline, (
+            f"KV not released after OOM/retract path: baseline={baseline}, "
+            f"final={final}"
+        )
 
     def test_kv_full_chunked_plus_decode_retract(self):
         """KV full, chunked + decode coexist, priority retract → victim is whichever scheduler picks; both must release cleanly afterward."""
@@ -84,6 +104,10 @@ class TestKVPressureBasic(ScriptedRuntimeTestCase):
     def _script_kv_full_chunked_plus_decode_retract(t: ScriptedRuntime):
         # KV full, chunked + decode coexist, priority retract → victim is
         # whichever scheduler picks; both must release cleanly afterward.
+        # S2 invariant must hold across the pressure window: chunked_req
+        # cannot end up co-resident in the running batch even during
+        # retract / re-admit churn.
+        baseline = t.engine_stats()["kv_pool_free"]
         r_long = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         r_short = t.start_req(prompt_len=8, max_new_tokens=8)
         yield from run_until(r_long, lambda h: h.is_chunking)
@@ -92,7 +116,21 @@ class TestKVPressureBasic(ScriptedRuntimeTestCase):
         t.exhaust_kv(leave_pages=1)
         yield
 
-        yield from run_until_all_finished([r_long, r_short], max_steps=2000)
+        for _ in range(2000):
+            assert (
+                t.chunked_req_in_batch_violation_count() == 0
+            ), "S2 invariant must hold even when KV pressure forces retract"
+            if r_long.finished and r_short.finished:
+                break
+            yield
+        assert r_long.finished and r_short.finished
+        assert r_long.kv_pages == 0
+        assert r_short.kv_pages == 0
+        final = t.engine_stats()["kv_pool_free"]
+        assert final >= baseline, (
+            f"KV not fully released after pressure: baseline={baseline}, "
+            f"final={final}"
+        )
 
     def test_row_pool_tight_admits_after_release(self):
         """Row pool tight; N+1 req enters waiting; after some finish, N+1 is admitted."""
@@ -100,13 +138,29 @@ class TestKVPressureBasic(ScriptedRuntimeTestCase):
 
     @staticmethod
     def _script_row_pool_tight_admits_after_release(t: ScriptedRuntime):
-        # Row pool tight; N+1 req enters waiting; after some finish, N+1 is admitted.
-        # NEW API NEEDED: t.exhaust_row_pool(leave_rows=N).
+        # Row pool tight; N+1 req enters waiting; after some finish,
+        # N+1 must be admitted. Verify all reqs finish AND row pool is
+        # fully released back to baseline (no row leak across the
+        # admit-after-release transition).
+        baseline_rows_used = t.row_pool_used()
         t.exhaust_row_pool(leave_rows=2)
         yield
 
         reqs = [t.start_req(prompt_len=8, max_new_tokens=1) for _ in range(5)]
         yield from run_until_all_finished(reqs, max_steps=2000)
+        for r in reqs:
+            assert r.finished, f"req {r.rid} did not finish"
+            assert r.kv_pages == 0, (
+                f"row-pool pressure must not leave KV held: rid={r.rid}, "
+                f"kv_pages={r.kv_pages}"
+            )
+        # After the exhaust frame releases, row usage must return to
+        # the pre-exhaust baseline (no leaked row entries).
+        final_rows_used = t.row_pool_used()
+        assert final_rows_used <= baseline_rows_used, (
+            f"row pool leak after admit-after-release: baseline used="
+            f"{baseline_rows_used}, final used={final_rows_used}"
+        )
 
     def test_lock_refs_tight_concurrent_prefix(self):
         """Many concurrent reqs share same prefix; lock_refs tight."""
@@ -114,15 +168,32 @@ class TestKVPressureBasic(ScriptedRuntimeTestCase):
 
     @staticmethod
     def _script_lock_refs_tight_concurrent_prefix(t: ScriptedRuntime):
-        # Many concurrent reqs share same prefix; lock_refs tight.
-        # NEW API NEEDED: t.exhaust_lock_refs(...).
+        # Many concurrent reqs share same prefix; lock_refs tight. All
+        # reqs must finish AND their lock_refs must return to 0 — pre-fix
+        # the lock_ref accounting could leak when many reqs concurrently
+        # contended for the same radix prefix node under tight ref-pool.
+        baseline_lock_refs = t.lock_refs_snapshot()
         t.exhaust_lock_refs(leave_refs=4)
         yield
         # Warm prefix.
         r_warm = t.start_req(prompt_len=128, max_new_tokens=2)
         yield from run_until_finished(r_warm)
+        assert r_warm.finished
+        assert r_warm.lock_refs == 0
         reqs = [t.start_req(prompt_len=128, max_new_tokens=2) for _ in range(8)]
         yield from run_until_all_finished(reqs)
+        for r in reqs:
+            assert r.finished
+            assert (
+                r.lock_refs == 0
+            ), f"req {r.rid} leaked {r.lock_refs} lock_refs after finish"
+        # The global lock_refs counter must return to (or below) baseline
+        # — no concurrent-prefix leak.
+        final_lock_refs = t.lock_refs_snapshot()
+        assert final_lock_refs <= baseline_lock_refs, (
+            f"global lock_refs leaked from baseline={baseline_lock_refs} "
+            f"to final={final_lock_refs}"
+        )
 
     def test_kv_at_one_page_chunked_completes(self):
         """KV with only 1 free page; a tiny chunked req still completes."""
@@ -130,11 +201,18 @@ class TestKVPressureBasic(ScriptedRuntimeTestCase):
 
     @staticmethod
     def _script_kv_at_one_page_chunked_completes(t: ScriptedRuntime):
-        # KV with only 1 free page; a tiny chunked req still completes.
+        # KV at tight pressure (4 free pages); a tiny chunked req still
+        # completes AND fully releases its KV.
         t.exhaust_kv(leave_pages=4)
         yield
         r = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE + 1, max_new_tokens=1)
         yield from run_until(r, lambda h: h.finished, max_steps=2000)
+        assert r.finished, "tiny chunked req must complete under tight KV"
+        assert r.kv_pages == 0, (
+            f"tight-KV chunked completion must release all pages; got "
+            f"kv_pages={r.kv_pages}"
+        )
+        assert r.lock_refs == 0
 
     def test_kv_recovery_after_full(self):
         """KV near-exhausted -> recovery path: every existing req finishes, then a fresh req can be admitted using all the pages."""
@@ -143,16 +221,26 @@ class TestKVPressureBasic(ScriptedRuntimeTestCase):
     @staticmethod
     def _script_kv_recovery_after_full(t: ScriptedRuntime):
         # KV near-exhausted -> recovery path: every existing req finishes,
-        # then a fresh req can be admitted using all the pages.
+        # then a fresh req can be admitted using the eviction path.
         # leave_pages must be >= 1 so a 16-token req can fit; using 0 would
         # deadlock (no KV available and nothing for the scheduler to evict).
+        baseline = t.engine_stats()["kv_pool_free"]
         t.exhaust_kv(leave_pages=1)
         yield
 
-        # New req: should wait or retract until KV frees up via the eviction path.
+        # New req: must complete via the eviction path AND fully release
+        # its KV. The final pool free count must return to (or above)
+        # baseline once the exhaust frame and r both unwind.
         r = t.start_req(prompt_len=16, max_new_tokens=2)
         yield from run_until(r, lambda h: h.finished, max_steps=3000)
         assert r.finished
+        assert r.kv_pages == 0
+        assert r.lock_refs == 0
+        final = t.engine_stats()["kv_pool_free"]
+        assert final >= baseline, (
+            f"KV pool failed to recover post-pressure: baseline={baseline}, "
+            f"final={final}"
+        )
 
     def test_kv_pressure_with_retract_resume(self):
         """Chunked req mid-prefill, then KV pressure forces retract."""
@@ -161,12 +249,36 @@ class TestKVPressureBasic(ScriptedRuntimeTestCase):
     @staticmethod
     def _script_kv_pressure_with_retract_resume(t: ScriptedRuntime):
         # Chunked req mid-prefill, then KV pressure forces retract.
-        # After pressure releases, req resumes and completes.
+        # After pressure releases, req resumes and completes. The retract
+        # path must (a) finish the req, (b) drop kv_pages back to 0,
+        # (c) preserve chunks_done across resume, and (d) keep S2
+        # invariant zero during the retract-then-resume transition.
+        baseline = t.engine_stats()["kv_pool_free"]
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
+        chunks_before_retract = r.chunks_done
         t.force_retract(r)
-        yield
-        yield from run_until_finished(r)
+        # While retract+resume runs, S2 invariant must remain 0.
+        for _ in range(2000):
+            assert (
+                t.chunked_req_in_batch_violation_count() == 0
+            ), "S2 invariant must hold across force_retract / resume churn"
+            if r.finished:
+                break
+            yield
+        assert r.finished
+        assert r.kv_pages == 0
+        # Resume must not lose progress: chunks_done at finish >= the
+        # snapshot taken before retract.
+        assert r.chunks_done >= chunks_before_retract, (
+            f"chunks_done regressed across retract+resume: "
+            f"before={chunks_before_retract}, final={r.chunks_done}"
+        )
+        final = t.engine_stats()["kv_pool_free"]
+        assert final >= baseline, (
+            f"KV pool failed to recover after retract+resume: "
+            f"baseline={baseline}, final={final}"
+        )
 
     def test_cumulative_alloc_does_not_grow_unbounded(self):
         """50 reqs; cumulative bytes alloc'd never NaN / negative."""
@@ -174,12 +286,20 @@ class TestKVPressureBasic(ScriptedRuntimeTestCase):
 
     @staticmethod
     def _script_cumulative_alloc_does_not_grow_unbounded(t: ScriptedRuntime):
-        # 50 reqs; cumulative bytes alloc'd never NaN / negative.
-        # NEW API NEEDED: r.cumulative_kv_alloc_bytes (int).
+        # 50 reqs; cumulative bytes alloc'd never NaN / negative; after
+        # every req finishes, kv_pages drops to 0 and global pool returns
+        # to baseline.
+        baseline = t.engine_stats()["kv_pool_free"]
         reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(50)]
         yield from run_until_all_finished(reqs)
         for r in reqs:
+            assert r.finished
             assert r.cumulative_kv_alloc_bytes >= 0
+            assert r.kv_pages == 0, f"req {r.rid} kept {r.kv_pages} pages after finish"
+        final = t.engine_stats()["kv_pool_free"]
+        assert (
+            final >= baseline
+        ), f"50-req batch leaked KV: baseline={baseline}, final={final}"
 
     def test_engine_stats_pool_invariant(self):
         """Track engine stats before / after a run — pool counts return to baseline."""
@@ -187,13 +307,20 @@ class TestKVPressureBasic(ScriptedRuntimeTestCase):
 
     @staticmethod
     def _script_engine_stats_pool_invariant(t: ScriptedRuntime):
-        # Track engine stats before / after a run — pool counts return to baseline.
+        # Track engine stats before / after a run — pool counts return
+        # to baseline AND scheduler-level violation counters stay zero.
         before = t.engine_stats()
+        before_s2 = t.chunked_req_in_batch_violation_count()
         reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(10)]
         yield from run_until_all_finished(reqs)
         after = t.engine_stats()
         assert after["kv_pool_free"] >= before["kv_pool_free"]
         assert after["row_pool_free"] >= before["row_pool_free"]
+        # S2 must not have grown across a clean batch run.
+        assert t.chunked_req_in_batch_violation_count() == before_s2, (
+            "S2 invariant: chunked_req_in_batch_violation_count grew across "
+            "a clean batch — scheduler placed chunked_req in running batch"
+        )
 
     def test_kv_pressure_with_radix_evict(self):
         """KV pressure triggers radix eviction; subsequent submission re-chunks."""
@@ -201,16 +328,41 @@ class TestKVPressureBasic(ScriptedRuntimeTestCase):
 
     @staticmethod
     def _script_kv_pressure_with_radix_evict(t: ScriptedRuntime):
-        # KV pressure triggers radix eviction; subsequent submission re-chunks.
+        # KV pressure triggers radix eviction; subsequent submission must
+        # re-chunk under the evicted-cache state and complete without
+        # leaking KV or violating S2.
+        baseline = t.engine_stats()["kv_pool_free"]
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r1)
+        assert r1.finished
+        assert r1.kv_pages == 0
 
         # Apply pressure — forces radix eviction.
         t.exhaust_kv(leave_pages=1)
         yield
 
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r2, lambda h: h.finished, max_steps=2000)
+        # The post-evict re-chunk must complete cleanly.
+        for _ in range(2000):
+            assert (
+                t.chunked_req_in_batch_violation_count() == 0
+            ), "S2 invariant must hold during eviction-triggered re-chunk"
+            if r2.finished:
+                break
+            yield
+        assert r2.finished
+        assert r2.kv_pages == 0
+        # r2 must have actually re-chunked (radix eviction means no
+        # full prefix hit available).
+        assert r2.chunks_done >= 2, (
+            f"r2 must re-chunk after radix eviction; got chunks_done="
+            f"{r2.chunks_done}"
+        )
+        final = t.engine_stats()["kv_pool_free"]
+        assert final >= baseline, (
+            f"KV did not recover after evict + re-chunk: baseline={baseline}, "
+            f"final={final}"
+        )
 
     def test_chunked_retract_resume_kv_recovers_exactly(self):
         """Chunked retract → resume → finish: kv_pool_free returns to baseline."""
@@ -352,13 +504,36 @@ class TestKVPressurePriority(ScriptedRuntimeTestCase):
     def _script_priority_preempt_multiple_chunked(t: ScriptedRuntime):
         # priority preemption + multiple chunked reqs preempt each other.
         # Each victim's resources must release on every preemption event.
+        # S2 invariant must hold across preemption transitions: at no
+        # point can the chunked_req slot and the running batch hold the
+        # same req simultaneously.
+        baseline = t.engine_stats()["kv_pool_free"]
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
 
         r2 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="high"
         )
-        yield from run_until_all_finished([r1, r2])
+        for _ in range(DEFAULT_MAX_STEPS * 4):
+            # Mutual exclusion across both reqs: only one chunked slot.
+            assert not (r1.is_chunking and r2.is_chunking), (
+                f"two reqs cannot share the chunked slot; "
+                f"r1.is_chunking={r1.is_chunking}, r2.is_chunking={r2.is_chunking}"
+            )
+            assert (
+                t.chunked_req_in_batch_violation_count() == 0
+            ), "S2 invariant must hold across priority preemption events"
+            if r1.finished and r2.finished:
+                break
+            yield
+        assert r1.finished and r2.finished
+        assert r1.kv_pages == 0
+        assert r2.kv_pages == 0
+        final = t.engine_stats()["kv_pool_free"]
+        assert final >= baseline, (
+            f"KV pool not fully released after preemption: "
+            f"baseline={baseline}, final={final}"
+        )
 
 
 class TestKVPressurePageSize(ScriptedRuntimeTestCase):
@@ -374,18 +549,29 @@ class TestKVPressurePageSize(ScriptedRuntimeTestCase):
     # strict mem check + page_size>1 must count the
     # chunked-resume tail when a chunked req sits in waiting_queue;
     # pre-fix the runtime mem accounting tripped a false-positive leak
-    # assert during busy.
+    # assert during busy. C2 invariant directly checks the partial-page
+    # tail double-free path that this scenario can corner.
     @staticmethod
     def _script_strict_mem_check_handles_chunked_tail(t: ScriptedRuntime):
         # Mid-chunk retract pushes a chunked-resume req onto the
         # waiting_queue; with page_size>1 the tail page must still be
-        # counted by the strict mem check.
+        # counted by the strict mem check, and never double-freed.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN + 17, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         t.force_retract(r)
-        yield from run_until_finished(r, max_steps=2000)
+        # While the retract+resume runs over partial pages, C2 invariant
+        # must hold every step.
+        for _ in range(2000):
+            assert r.partial_page_tail_double_free_count == 0, (
+                f"C2 invariant: partial-page tail double-freed "
+                f"{r.partial_page_tail_double_free_count} times"
+            )
+            if r.finished:
+                break
+            yield
         assert r.finished
         assert r.kv_pages == 0
+        assert r.partial_page_tail_double_free_count == 0
 
 
 if __name__ == "__main__":
