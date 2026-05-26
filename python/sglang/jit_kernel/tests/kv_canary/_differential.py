@@ -130,6 +130,10 @@ def _assert_plans_byte_equal(
             ref_verify.verify_expected_positions[:n_verify],
         )
         assert torch.equal(
+            triton_verify.verify_expected_input_ids[:n_verify],
+            ref_verify.verify_expected_input_ids[:n_verify],
+        )
+        assert torch.equal(
             triton_verify.verify_prev_slot_indices[:n_verify],
             ref_verify.verify_prev_slot_indices[:n_verify],
         )
