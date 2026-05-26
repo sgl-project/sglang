@@ -16,6 +16,10 @@ from common.gdn_attention import (
     make_gdn_cases,
     run_gdn_attention_case,
 )
+from common.spec_runner import (
+    run_gdn_eagle_verify_case,
+    run_gdn_eagle_verify_cuda_graph_case,
+)
 from common.split_op_runner import run_gdn_split_op_extend_case
 
 
@@ -53,6 +57,36 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
                 extend_lens=(15, 8, 1),
             ),
             32,
+        ),
+    )
+    EAGLE_VERIFY_CASES = (
+        (
+            GDNAttentionCase(
+                name="runner_eagle_verify_gdn_chain",
+                backend="flashinfer",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+        ),
+    )
+    EAGLE_VERIFY_CUDA_GRAPH_CASES = (
+        (
+            GDNAttentionCase(
+                name="runner_cuda_graph_eagle_verify_gdn_chain",
+                backend="flashinfer",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
         ),
     )
 
@@ -93,6 +127,28 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
                         head_k_dim=self.HEAD_K_DIM,
                         head_v_dim=self.HEAD_V_DIM,
                     )
+
+    def test_runner_mode_eagle_verify_cases(self):
+        for case, topk in self.EAGLE_VERIFY_CASES:
+            with self.subTest(case=case.name, backend=case.backend, topk=topk):
+                run_gdn_eagle_verify_case(
+                    self,
+                    case,
+                    topk=topk,
+                    head_k_dim=self.HEAD_K_DIM,
+                    head_v_dim=self.HEAD_V_DIM,
+                )
+
+    def test_runner_mode_eagle_verify_cuda_graph_cases(self):
+        for case, topk in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:
+            with self.subTest(case=case.name, backend=case.backend, topk=topk):
+                run_gdn_eagle_verify_cuda_graph_case(
+                    self,
+                    case,
+                    topk=topk,
+                    head_k_dim=self.HEAD_K_DIM,
+                    head_v_dim=self.HEAD_V_DIM,
+                )
 
 
 if __name__ == "__main__":

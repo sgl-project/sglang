@@ -257,6 +257,7 @@ class MockGDNModelRunner(ModelRunner):
             cache_params=cache_params,
             mamba_layer_ids=[0],
             enable_mamba_extra_buffer=False,
+            speculative_num_draft_tokens=speculative_num_draft_tokens or None,
             enable_overlap_schedule=False,
         )
         max_token_loc = case.page_size + pool_batch_size * max_context_len
@@ -733,6 +734,17 @@ def make_gdn_case_with_prefix_lens(
     name: str,
     prefix_lens: tuple[int, ...],
 ) -> GDNAttentionCase:
+    extend_lens = ()
+    if not case.forward_mode.is_decode():
+        if not case.input_lens:
+            raise ValueError("Non-decode cases require input lengths.")
+        if len(prefix_lens) <= len(case.input_lens):
+            extend_lens = case.input_lens[: len(prefix_lens)]
+        else:
+            extend_lens = case.input_lens + (case.input_lens[-1],) * (
+                len(prefix_lens) - len(case.input_lens)
+            )
+
     return GDNAttentionCase(
         name=name,
         backend=case.backend,
@@ -741,6 +753,7 @@ def make_gdn_case_with_prefix_lens(
         num_v_heads=case.num_v_heads,
         page_size=case.page_size,
         prefix_lens=prefix_lens,
+        extend_lens=extend_lens,
     )
 
 

@@ -61,14 +61,16 @@ Implemented:
   SWA `triton` covers EAGLE `TARGET_VERIFY` chain and tree masks combined with a
   finite sliding window. MLA `triton` covers EAGLE `TARGET_VERIFY` chain masks;
   MLA `flashinfer` and `flashmla` cover EAGLE chain verify and EAGLE draft-extend
-  on supported DeepSeek-like shapes.
+  on supported DeepSeek-like shapes. GDN `triton` and `flashinfer` cover EAGLE
+  chain verify against the pure PyTorch gated-delta recurrence reference.
 - Phase 4 target-verify CUDA-graph-style replay now covers representative valid
   backends with fixed capture batches and distinct replay metadata/input tensors:
   dense `triton` covers EAGLE tree, DFlash chain, and NGRAM chain; dense
   `flashinfer` covers EAGLE tree, Frozen-KV MTP chain, and DFlash chain; SWA
   `triton` covers EAGLE tree with sliding-window metadata; MLA `triton` covers
   EAGLE tree with the absorb-MLA cached-KV path; MLA `flashinfer` and `flashmla`
-  cover EAGLE chain with the absorb-MLA cached-KV path.
+  cover EAGLE chain with the absorb-MLA cached-KV path; GDN `triton` and
+  `flashinfer` cover EAGLE chain with speculative Mamba state buffers.
 - Phase 4 draft-extend CUDA-graph-style replay now covers dense `flashinfer` for
   EAGLE and Frozen-KV MTP `DRAFT_EXTEND` with ragged accepted-token counts. The
   capture batch uses a fixed max accepted-token count per request, while replay
@@ -178,6 +180,16 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
+- `python -m py_compile test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/common/spec_runner.py test/manual/attention/unittest/gdn/test_triton.py test/manual/attention/unittest/gdn/test_flashinfer.py`
+- `python test/manual/attention/unittest/gdn/test_triton.py -v`
+  - Ran 5 tests in 1.179s after adding GDN EAGLE chain verify and CUDA-graph
+    replay coverage.
+- `python test/manual/attention/unittest/gdn/test_flashinfer.py -v`
+  - Ran 5 tests in 1.276s after adding GDN EAGLE chain verify and CUDA-graph
+    replay coverage.
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+  - Ran 60 tests in 22.530s after adding GDN EAGLE chain verify and CUDA-graph
+    replay coverage.
 - `python -m py_compile test/manual/attention/unittest/dense/test_trtllm_mha.py`
 - `python test/manual/attention/unittest/dense/test_trtllm_mha.py -v`
   - Ran 1 test in 0.534s after adding decode-only dense `trtllm_mha` coverage.

@@ -40,6 +40,30 @@ from .dense_attention import (
     prepare_dense_runner_inputs,
     run_dense_forward,
 )
+from .gdn_attention import DEFAULT_DEVICE as GDN_DEFAULT_DEVICE
+from .gdn_attention import DEFAULT_DTYPE as GDN_DEFAULT_DTYPE
+from .gdn_attention import (
+    DEFAULT_HEAD_K_DIM,
+    DEFAULT_HEAD_V_DIM,
+)
+from .gdn_attention import DEFAULT_MAX_CONTEXT_LEN as GDN_DEFAULT_MAX_CONTEXT_LEN
+from .gdn_attention import (
+    GDN_ATOL,
+    GDN_RTOL,
+    GDNAttentionCase,
+    _clone_gdn_cache,
+)
+from .gdn_attention import _make_forward_batch as _make_gdn_forward_batch
+from .gdn_attention import (
+    _restore_gdn_cache,
+    build_gdn_attention_fixture,
+    expected_gdn_output_from_inputs,
+    gdn_fixture_inputs,
+    make_gdn_case_with_prefix_lens,
+    make_gdn_random_inputs,
+    prepare_gdn_runner_inputs,
+    run_gdn_forward,
+)
 from .mla_attention import DEFAULT_DEVICE as MLA_DEFAULT_DEVICE
 from .mla_attention import DEFAULT_DTYPE as MLA_DEFAULT_DTYPE
 from .mla_attention import DEFAULT_HIDDEN_SIZE as MLA_DEFAULT_HIDDEN_SIZE
@@ -1051,6 +1075,189 @@ def run_dense_draft_extend_v2_cuda_graph_case(
         replay_expected,
         atol=DENSE_ATOL,
         rtol=DENSE_RTOL,
+    )
+
+
+def run_gdn_eagle_verify_case(
+    testcase,
+    case: GDNAttentionCase,
+    *,
+    topk: int,
+    head_k_dim: int = DEFAULT_HEAD_K_DIM,
+    head_v_dim: int = DEFAULT_HEAD_V_DIM,
+    max_context_len: int = GDN_DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = GDN_DEFAULT_DTYPE,
+    device: str = GDN_DEFAULT_DEVICE,
+):
+    if topk != 1:
+        raise ValueError("GDN EAGLE verify coverage currently models chain drafts.")
+    fixture = build_gdn_attention_fixture(
+        testcase,
+        case,
+        head_k_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+    )
+    _prepare_target_verify_batch(fixture.forward_batch, case, device)
+    fixture.forward_batch.spec_info = _make_eagle_verify_input(
+        case,
+        fixture.forward_batch,
+        topk=topk,
+        device=device,
+    )
+    inputs = gdn_fixture_inputs(fixture)
+    initial_state = _clone_gdn_cache(fixture)
+    expected = expected_gdn_output_from_inputs(
+        fixture,
+        case,
+        inputs,
+        initial_state,
+    )
+
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+        fixture.backend.init_forward_metadata(fixture.forward_batch)
+        actual = run_gdn_forward(fixture, fixture.forward_batch, inputs)
+
+    torch.testing.assert_close(actual, expected, atol=GDN_ATOL, rtol=GDN_RTOL)
+
+
+def _prepare_gdn_verify_batch(case, batch, *, topk: int, device: str) -> None:
+    _prepare_target_verify_batch(batch, case, device)
+    batch.spec_info = _make_eagle_verify_input(
+        case,
+        batch,
+        topk=topk,
+        device=device,
+    )
+
+
+def run_gdn_eagle_verify_cuda_graph_case(
+    testcase,
+    case: GDNAttentionCase,
+    *,
+    topk: int,
+    head_k_dim: int = DEFAULT_HEAD_K_DIM,
+    head_v_dim: int = DEFAULT_HEAD_V_DIM,
+    max_context_len: int = GDN_DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = GDN_DEFAULT_DTYPE,
+    device: str = GDN_DEFAULT_DEVICE,
+    cuda_graph_capture_batch_size: int | None = None,
+):
+    if topk != 1:
+        raise ValueError("GDN EAGLE verify CUDA graph coverage models chain drafts.")
+    cuda_graph_capture_batch_size = cuda_graph_capture_batch_size or case.batch_size
+    if case.batch_size != cuda_graph_capture_batch_size:
+        raise ValueError("GDN verify graph coverage currently uses unpadded replay.")
+
+    graph_fixture = build_gdn_attention_fixture(
+        testcase,
+        case,
+        head_k_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        disable_cuda_graph=False,
+        runner_batch_size=cuda_graph_capture_batch_size,
+    )
+    backend = graph_fixture.backend
+    initial_state = _clone_gdn_cache(graph_fixture)
+
+    capture_prefix_len = backend.get_cuda_graph_seq_len_fill_value()
+    capture_case = make_gdn_case_with_prefix_lens(
+        case,
+        f"{case.name}_cuda_graph_capture",
+        (capture_prefix_len,) * cuda_graph_capture_batch_size,
+    )
+    capture_inputs = make_gdn_random_inputs(
+        capture_case,
+        graph_fixture,
+        dtype=dtype,
+        device=device,
+    )
+    capture_batch = _make_gdn_forward_batch(
+        capture_case,
+        graph_fixture.runner,
+        max_context_len=max_context_len,
+        device=device,
+    )
+    _prepare_gdn_verify_batch(capture_case, capture_batch, topk=topk, device=device)
+    prepare_gdn_runner_inputs(
+        graph_fixture,
+        capture_case,
+        capture_batch,
+        capture_inputs,
+        max_context_len=max_context_len,
+    )
+    capture_expected = expected_gdn_output_from_inputs(
+        graph_fixture,
+        capture_case,
+        capture_inputs,
+        initial_state,
+    )
+
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
+        _init_cuda_graph_capture_metadata(
+            backend,
+            cuda_graph_capture_batch_size,
+            capture_batch,
+        )
+        capture_actual = run_gdn_forward(
+            graph_fixture,
+            capture_batch,
+            capture_inputs,
+        )
+        backend.on_after_cuda_graph_warmup()
+
+    _restore_gdn_cache(graph_fixture, initial_state)
+    replay_case = make_gdn_case_with_prefix_lens(
+        case,
+        f"{case.name}_cuda_graph_replay",
+        case.prefix_lens,
+    )
+    replay_inputs = gdn_fixture_inputs(graph_fixture)
+    replay_batch = _make_gdn_forward_batch(
+        replay_case,
+        graph_fixture.runner,
+        max_context_len=max_context_len,
+        device=device,
+    )
+    _prepare_gdn_verify_batch(replay_case, replay_batch, topk=topk, device=device)
+    prepare_gdn_runner_inputs(
+        graph_fixture,
+        replay_case,
+        replay_batch,
+        replay_inputs,
+        max_context_len=max_context_len,
+    )
+    replay_expected = expected_gdn_output_from_inputs(
+        graph_fixture,
+        replay_case,
+        replay_inputs,
+        initial_state,
+    )
+
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
+        _init_cuda_graph_replay_metadata(
+            backend,
+            cuda_graph_capture_batch_size,
+            replay_batch,
+        )
+        replay_actual = run_gdn_forward(graph_fixture, replay_batch, replay_inputs)
+
+    torch.testing.assert_close(
+        capture_actual,
+        capture_expected,
+        atol=GDN_ATOL,
+        rtol=GDN_RTOL,
+    )
+    torch.testing.assert_close(
+        replay_actual,
+        replay_expected,
+        atol=GDN_ATOL,
+        rtol=GDN_RTOL,
     )
 
 
