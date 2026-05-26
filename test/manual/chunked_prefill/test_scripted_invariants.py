@@ -699,9 +699,9 @@ class TestScriptedInvariants(CustomTestCase):
         )
         yield from run_until_finished(r)
         assert r.finished
-        assert r.chunks_done >= 2, (
-            f"VERY_LONG_PROMPT_LEN should chunk; got chunks_done={r.chunks_done}"
-        )
+        assert (
+            r.chunks_done >= 2
+        ), f"VERY_LONG_PROMPT_LEN should chunk; got chunks_done={r.chunks_done}"
         # NEW API NEEDED: r.output_tokens — list[int] of decoded tokens.
         assert len(r.output_tokens) == n, (
             f"ignore_eos=True + max_new_tokens={n} must produce exactly "
