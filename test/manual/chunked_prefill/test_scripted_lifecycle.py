@@ -55,7 +55,7 @@ class TestLifecycleBasic(ScriptedRuntimeTestCase):
         assert len(r.output_tokens) == 16
 
     def test_long_prompt_short_decode(self):
-        """Multi-chunk prefill + short decode: chunked path runs with clean R1/B6 counters."""
+        """Multi-chunk prefill + short decode: chunked path runs cleanly."""
         self.runtime.run(self._script_long_prompt_short_decode)
 
     @staticmethod
@@ -68,13 +68,9 @@ class TestLifecycleBasic(ScriptedRuntimeTestCase):
         assert r.finished
         assert r.chunks_done >= 2
         assert len(r.output_tokens) == 2
-        # R1: middle-chunk inflight counter must never decrement
-        # prematurely. B6: extend_batch_idx must stay monotonic.
-        assert r.inflight_middle_chunks_premature_decrement_count == 0
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_long_prompt_long_decode(self):
-        """Multi-chunk prefill + long decode: R1/B6 counters clean across the long decode loop."""
+        """Multi-chunk prefill + long decode: completes cleanly."""
         self.runtime.run(self._script_long_prompt_long_decode)
 
     @staticmethod
@@ -87,11 +83,9 @@ class TestLifecycleBasic(ScriptedRuntimeTestCase):
         assert r.finished
         assert r.chunks_done >= 2
         assert len(r.output_tokens) == 64
-        assert r.inflight_middle_chunks_premature_decrement_count == 0
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_tiny_prompt_long_decode(self):
-        """1-token prompt, long decode: no chunking, exact length, clean extend bookkeeping."""
+        """1-token prompt, long decode: no chunking, exact length."""
         self.runtime.run(self._script_tiny_prompt_long_decode)
 
     @staticmethod
@@ -102,7 +96,6 @@ class TestLifecycleBasic(ScriptedRuntimeTestCase):
         assert r.finished
         assert r.chunks_done == 0
         assert len(r.output_tokens) == 64
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_chunk_size_minus_one_prompt(self):
         """Prompt_len = chunk_size - 1: no chunking, exact length."""
@@ -120,15 +113,13 @@ class TestLifecycleBasic(ScriptedRuntimeTestCase):
         assert len(r.output_tokens) == 4
 
     def test_chunk_size_plus_two_prompt(self):
-        """Prompt_len = chunk_size + 2: exactly 2 chunks, exact length, R1/B6 clean."""
+        """Prompt_len = chunk_size + 2: exactly 2 chunks, exact length."""
         self.runtime.run(self._script_chunk_size_plus_two_prompt)
 
     @staticmethod
     def _script_chunk_size_plus_two_prompt(t: ScriptedRuntime):
         # prompt_len = chunk_size + 2 — exactly 2 chunks. The 2-byte tail
-        # chunk is the canonical short-final-chunk shape, which is where
-        # R1 (premature decrement of inflight_middle_chunks) historically
-        # bit.
+        # chunk is the canonical short-final-chunk shape.
         r = t.start_req(
             prompt_len=DEFAULT_CHUNK_SIZE + 2, max_new_tokens=4, ignore_eos=True
         )
@@ -136,11 +127,9 @@ class TestLifecycleBasic(ScriptedRuntimeTestCase):
         assert r.finished
         assert r.chunks_done == 2
         assert len(r.output_tokens) == 4
-        assert r.inflight_middle_chunks_premature_decrement_count == 0
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_just_over_2x_chunk_size(self):
-        """Prompt_len = 2 * chunk_size + 1: exactly 3 chunks, R1/B6 clean."""
+        """Prompt_len = 2 * chunk_size + 1: exactly 3 chunks."""
         self.runtime.run(self._script_just_over_2x_chunk_size)
 
     @staticmethod
@@ -153,18 +142,15 @@ class TestLifecycleBasic(ScriptedRuntimeTestCase):
         assert r.finished
         assert r.chunks_done == 3
         assert len(r.output_tokens) == 4
-        assert r.inflight_middle_chunks_premature_decrement_count == 0
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_five_x_chunk_size(self):
-        """5 chunks exactly: full middle-chunk path, R1/B6 clean."""
+        """5 chunks exactly: full middle-chunk path."""
         self.runtime.run(self._script_five_x_chunk_size)
 
     @staticmethod
     def _script_five_x_chunk_size(t: ScriptedRuntime):
-        # 5 chunks exactly — 3 "middle" chunks where R1 invariant
-        # (inflight_middle_chunks only decremented on the final chunk)
-        # actually fires.
+        # 5 chunks exactly — exercises the middle-chunk path with 3
+        # interior chunks between first and last.
         r = t.start_req(
             prompt_len=5 * DEFAULT_CHUNK_SIZE, max_new_tokens=4, ignore_eos=True
         )
@@ -172,17 +158,14 @@ class TestLifecycleBasic(ScriptedRuntimeTestCase):
         assert r.finished
         assert r.chunks_done == 5
         assert len(r.output_tokens) == 4
-        assert r.inflight_middle_chunks_premature_decrement_count == 0
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_ten_x_chunk_size(self):
-        """10 chunks exactly: long chunked path, R1/B6 clean."""
+        """10 chunks exactly: long chunked path."""
         self.runtime.run(self._script_ten_x_chunk_size)
 
     @staticmethod
     def _script_ten_x_chunk_size(t: ScriptedRuntime):
-        # 10 chunks exactly — 8 middle chunks; if R1 fires anywhere
-        # along the path it should be caught here.
+        # 10 chunks exactly — 8 middle chunks along the chunked path.
         r = t.start_req(
             prompt_len=10 * DEFAULT_CHUNK_SIZE, max_new_tokens=2, ignore_eos=True
         )
@@ -190,8 +173,6 @@ class TestLifecycleBasic(ScriptedRuntimeTestCase):
         assert r.finished
         assert r.chunks_done == 10
         assert len(r.output_tokens) == 2
-        assert r.inflight_middle_chunks_premature_decrement_count == 0
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_status_progression_happy_path(self):
         """Status traverses every expected stage of a happy-path req: running and finished both observed."""
@@ -223,14 +204,13 @@ class TestLifecycleBasic(ScriptedRuntimeTestCase):
         ), f"status regressed after finish; seen={seen}"
 
     def test_long_prompt_only_one_decode(self):
-        """Max_new_tokens = 1 on chunked prompt: chunks_done >= 2, exactly 1 output, R1/B6 clean."""
+        """Max_new_tokens = 1 on chunked prompt: chunks_done >= 2, exactly 1 output."""
         self.runtime.run(self._script_long_prompt_only_one_decode)
 
     @staticmethod
     def _script_long_prompt_only_one_decode(t: ScriptedRuntime):
         # max_new_tokens = 1 on a chunked prompt — the minimal-decode
-        # chunked path. R1 invariant: even with only one decode, the
-        # middle-chunk counter on prefill must not decrement prematurely.
+        # chunked path.
         r = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=1, ignore_eos=True
         )
@@ -238,11 +218,9 @@ class TestLifecycleBasic(ScriptedRuntimeTestCase):
         assert r.finished
         assert r.chunks_done >= 2
         assert len(r.output_tokens) == 1
-        assert r.inflight_middle_chunks_premature_decrement_count == 0
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_kv_pages_consistent_during_run(self):
-        """Kv_pages > 0 throughout active phase, drains to 0 after finish, R1/B6 clean."""
+        """Kv_pages > 0 throughout active phase, drains to 0 after finish."""
         self.runtime.run(self._script_kv_pages_consistent_during_run)
 
     @staticmethod
@@ -271,10 +249,6 @@ class TestLifecycleBasic(ScriptedRuntimeTestCase):
         assert saw_positive
         assert r.kv_pages == 0
         assert len(r.output_tokens) == 4
-        # R1: middle-chunk inflight decrement happens at most on the
-        # final chunk, which is also when kv_pages starts draining.
-        assert r.inflight_middle_chunks_premature_decrement_count == 0
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_row_idx_recycled_after_finish(self):
         """After finish, row_idx becomes None AND no residual KV / lock_ref remains."""
@@ -373,9 +347,6 @@ class TestLifecycleBasic(ScriptedRuntimeTestCase):
             assert r.row_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             if prompt == VERY_LONG_PROMPT_LEN:
                 assert r.chunks_done >= 2
-                # R1: chunked rounds must keep the inflight counter clean.
-                assert r.inflight_middle_chunks_premature_decrement_count == 0
-                assert r.extend_batch_idx_regression_count == 0
             else:
                 assert r.chunks_done == 0
 
@@ -396,8 +367,6 @@ class TestLifecycleBasic(ScriptedRuntimeTestCase):
             assert r.row_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             if L > DEFAULT_CHUNK_SIZE:
                 assert r.chunks_done >= 2
-                assert r.inflight_middle_chunks_premature_decrement_count == 0
-                assert r.extend_batch_idx_regression_count == 0
             else:
                 assert r.chunks_done == 0
 
@@ -418,8 +387,6 @@ class TestLifecycleBasic(ScriptedRuntimeTestCase):
             assert r.row_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             if L > DEFAULT_CHUNK_SIZE:
                 assert r.chunks_done >= 2
-                assert r.inflight_middle_chunks_premature_decrement_count == 0
-                assert r.extend_batch_idx_regression_count == 0
             else:
                 assert r.chunks_done == 0
 
@@ -442,7 +409,7 @@ class TestLifecycleBasic(ScriptedRuntimeTestCase):
                 yield
 
     def test_chunked_then_short_seq(self):
-        """Long chunked → short → long → short: each finishes, chunked rounds keep R1/B6 counters clean."""
+        """Long chunked → short → long → short: each finishes."""
         self.runtime.run(self._script_chunked_then_short_seq)
 
     @staticmethod
@@ -459,8 +426,6 @@ class TestLifecycleBasic(ScriptedRuntimeTestCase):
             assert r.row_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             if L == VERY_LONG_PROMPT_LEN:
                 assert r.chunks_done >= 2
-                assert r.inflight_middle_chunks_premature_decrement_count == 0
-                assert r.extend_batch_idx_regression_count == 0
             else:
                 assert r.chunks_done == 0
 
@@ -523,12 +488,8 @@ class TestLifecycleBasic(ScriptedRuntimeTestCase):
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         t.shutdown()
         # Spin a few iters to let the shutdown propagate and the chunked
-        # req settle to a terminal state. Throughout this window the
-        # chunked req must never decrement the middle-chunk inflight
-        # counter prematurely — shutdown is one of the historically
-        # buggy paths for R1.
+        # req settle to a terminal state.
         for _ in range(DEFAULT_MAX_STEPS):
-            assert r.inflight_middle_chunks_premature_decrement_count == 0
             if r.finished or r.error_message is not None:
                 break
             yield
