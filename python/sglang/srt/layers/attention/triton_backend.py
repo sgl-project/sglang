@@ -6,12 +6,6 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import triton
 import triton.language as tl
-from sglang.srt.utils import is_cuda
-
-if is_cuda():
-    from sgl_kernel.utils import is_arch_support_pdl
-else:
-    is_arch_support_pdl = lambda: False
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
