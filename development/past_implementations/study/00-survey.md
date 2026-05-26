@@ -69,7 +69,7 @@
   - Weight estimators: `pyimpl/quantize.py:4–25` (min-max / max per-token quant).
   - Triton kernels: `twilight/kernel/triton/channel.py:11–79 get_label_tensor_kernel`, `bgemv_int8.py:12–73`, `qk_int8_per_block.py:23–97`.
   - Config blocks: `compressor`, `selector`, `weight_estimator`, `weight_pruner` (see `benchmark/configs/config_ds_twi.json`, `config_quest_twi.json`).
-  - **`flash-topk-attention/` git submodule is empty** — the promised fused kernel never landed.
+  - **`flash-topk-attention/` git submodule** — empty until `git submodule update --init`; populated from `tsinghua-ideal/flash-topk-attention` (pinned commit `d8803b2`). Kernels (CUDA via FlashInfer JIT + Triton; TileLang backend is a stub) DID land upstream but Twilight's runtime never imports them — the only call site is `benchmark/efficiency/bench_gemv.py:8–10` (GEMV microbench). See `05-flash-topk-attention.md`.
   - **No calibration code.** Configs hardcoded to external paths like `/data/chaofan/DoubleSparse/config/…`.
 - **Entry points.** `benchmark/LongBench/pred.py`, `benchmark/passkey/passkey.py`, `benchmark/RULER/scripts/`, `benchmark/efficiency/bench_gemv.py`.
 
@@ -88,7 +88,7 @@
 | When applied — decode | Sparse: top-k token select + gather + sparse Triton attn | Sparse: 3-stage Triton (estimate → CPU topk → gather+attn → reduce) **iff** `max_seq_len ≥ sparse_decode_threshold AND min_seq_len ≥ heavy_token_num` (lines 211–214) | Mask-driven full attention: `mask_score = softmax(QKᵀ); mask = mask & pruned_mask` then re-softmax |
 | When applied — offload | Yes: `offloading/model.py` with DGL pinned-mem gather | **No** offload path | **No** offload path |
 | Sparse storage? | A-Standalone & A-Offload: yes (compressed K labels separate; offload: KV on CPU). HF adapter: dense + mask. | Yes for the label cache (`label_buffer[size+1, head_num, r]`, ~`r/D` of full size). Full KV still resident. | Yes (compressed `K_label` int8) — for the *selector* only. Full KV is kept and attended dense. |
-| Sparse compute? | Yes: dedicated `fwd_sparse_no_mask` kernel reads only top-k positions | Yes: stage-2 kernel reads only top-k positions (`_sparse_fwd_kernel_flash_decode_stage2`) | **No fused sparse-compute kernel landed** — pruner mask is applied to a *dense* attention; speedup rests on un-fused path. The promised `flash-topk-attention` submodule is empty. |
+| Sparse compute? | Yes: dedicated `fwd_sparse_no_mask` kernel reads only top-k positions | Yes: stage-2 kernel reads only top-k positions (`_sparse_fwd_kernel_flash_decode_stage2`) | **No fused sparse-compute kernel wired into runtime** — pruner mask is applied to a *dense* attention; speedup rests on un-fused path. The `flash-topk-attention` (ftka) library exists upstream (CUDA + Triton; TileLang stub) but is invoked only from the GEMV microbenchmark — see `05-flash-topk-attention.md`. |
 | Kernel surface | Triton only | Triton only (HIP path present too) | Triton (selector) + CUDA C++ via FlashInfer JIT (pruner `TopPReturnMask`) |
 | CUDA graphs | N/A | **Disabled** (`model_runner.py:932`) | N/A (monkey-patched HF model) |
 | Models supported | LLaMA / Mistral / Mixtral / Qwen2 / DeepSeek-R1-Distill-Qwen-32B via per-model `modify_*.py` adapters | Any model whose attention layers are named `model.layers.<i>.self_attn.{q,k}_proj` and that uses the standard Triton attn backend — **no MLA / DeepSeek-V3.2 / GLM coverage** | LLaMA / Mistral (monkey-patched) |
@@ -96,7 +96,7 @@
 | Tests / accuracy gates | WikiText-2 PPL, MMLU, LongBench, AIME, IfEval, LCB | One MMLU-64 ≥ 0.65 manual test | LongBench / Passkey / RULER (eval scripts, no accuracy gates) |
 | Pinned deps | torch 2.5.1, triton 3.1.0, transformers 4.47.1, DGL/cu121, xformers 0.0.28.post3 | inherits sglang | torch 2.5.0, flashinfer 0.2.0.post1, transformers 4.45.2, flash-attn 2.6.3 |
 | Evidence confidence | High (multiple flavours all readable; some open Qs on offload async) | High (small surface; one master orchestrator + 3 kernels) | High for what *is* there; the missing fused kernel limits performance reasoning |
-| Major open question | Why was "Method 1" (mean \|Q·K\|) chosen over alternatives 3–5 still commented in `get_qk_hook()`? Is offload `gather_pinned_tensor_rows` truly async? | Why was DS removed in #23009? (No rationale in commit msg.) How would label-cache & dynamic top-k interact with CUDA graphs and MLA's latent KV? | Where is `flash-topk-attention`? What are the un-fused vs fused perf numbers? Channel-config provenance? |
+| Major open question | Why was "Method 1" (mean \|Q·K\|) chosen over alternatives 3–5 still commented in `get_qk_hook()`? Is offload `gather_pinned_tensor_rows` truly async? | Why was DS removed in #23009? (No rationale in commit msg.) How would label-cache & dynamic top-k interact with CUDA graphs and MLA's latent KV? | Why are ftka kernels orphaned (built but never imported by the runtime)? Un-fused vs fused perf numbers? Channel-config provenance? |
 
 ---
 
@@ -142,7 +142,7 @@ This is the single most important framing to carry into Phase 2: **C is not a do
 
 - **A** is research-grade and standalone: multiple flavours (HF adapter / GPT-fast standalone / CPU-offload) coexist with calibration scripts, micro-bench scripts, and 13+ shipped configs. It is the most complete *algorithmic* reference but is not designed to drop into a serving stack.
 - **B** is a *minimal, decode-only, triton-only*, sglang-integrated path that takes ~1,700 LOC across one backend + one Triton file + one KV-pool subclass. **It was removed from main on 2026-04-17 (commit `44e67c683`, PR #23009) with no rationale in the commit message.** This is the closest thing to a working "production" DS in SGLang, and inspecting *why* it was removed (maintenance? coverage? MLA?) is a critical Phase-2 question.
-- **C** is a framework whose central perf promise — the fused `flash-topk-attention` kernel — never landed in this snapshot. Its measured speedups in `benchmark/efficiency/bench_gemv.py` are on the BGEMV step only.
+- **C** is a framework whose central perf promise — fused sparse attention — was never wired into the runtime path. The `flash-topk-attention` kernels DO exist upstream (now fetched: `csrc/` CUDA via FlashInfer JIT + `ftka/triton_ops/`; TileLang backend is an empty file) and are invoked only by `benchmark/efficiency/bench_gemv.py`. The Twilight accuracy numbers in the README were therefore produced with the un-fused path. See `05-flash-topk-attention.md` for the kernel-level analysis, including which ftka kernels are most reusable for the sglang-on-MLA port (headline: `raft_topk` solves B's CUDA-graph-blocking host-side `torch.topk` problem).
 
 ### 5.3 Coverage gaps for the stated target (DeepSeek-V3.2 / GLM-5.1)
 
