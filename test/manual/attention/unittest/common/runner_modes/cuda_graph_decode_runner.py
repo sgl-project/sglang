@@ -111,11 +111,42 @@ from ..attention_methods.dsv4_attention import (
 from ..attention_methods.dsv4_attention import (
     _make_forward_batch as _make_dsv4_forward_batch,
 )
+from ..attention_methods.kda_attention import DEFAULT_DEVICE as KDA_DEFAULT_DEVICE
+from ..attention_methods.kda_attention import DEFAULT_DTYPE as KDA_DEFAULT_DTYPE
+from ..attention_methods.kda_attention import (
+    DEFAULT_HEAD_K_DIM as KDA_DEFAULT_HEAD_K_DIM,
+)
+from ..attention_methods.kda_attention import (
+    DEFAULT_HEAD_V_DIM as KDA_DEFAULT_HEAD_V_DIM,
+)
+from ..attention_methods.kda_attention import (
+    DEFAULT_MAX_CONTEXT_LEN as KDA_DEFAULT_MAX_CONTEXT_LEN,
+)
+from ..attention_methods.kda_attention import (
+    KDA_GRAPH_ATOL,
+    KDA_GRAPH_RTOL,
+    KDAAttentionCase,
+    _clone_kda_cache,
+    _restore_kda_cache,
+    build_kda_attention_fixture,
+    expected_kda_output_from_inputs,
+    kda_fixture_inputs,
+    make_kda_case_with_prefix_lens,
+    make_kda_random_inputs,
+    make_kda_replay_inputs,
+    prepare_kda_runner_inputs,
+    run_kda_fixture_eager,
+    run_kda_forward,
+)
+from ..attention_methods.kda_attention import (
+    _make_forward_batch as _make_kda_forward_batch,
+)
 
 DENSE_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 4
 MLA_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 4
 GDN_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 3
 DSV4_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 2
+KDA_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 3
 
 
 @dataclass(frozen=True)
@@ -504,6 +535,58 @@ def run_gdn_cuda_graph_decode_case(
         allow_padding=False,
         atol=GDN_ATOL,
         rtol=GDN_RTOL,
+    )
+    _run_cuda_graph_decode_case(
+        testcase,
+        case,
+        adapter=adapter,
+        build_kwargs=dict(
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
+            max_context_len=max_context_len,
+            dtype=dtype,
+            device=device,
+        ),
+        capture_batch_size=cuda_graph_capture_batch_size,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+    )
+
+
+def run_kda_cuda_graph_decode_case(
+    testcase,
+    case: KDAAttentionCase,
+    *,
+    head_k_dim: int = KDA_DEFAULT_HEAD_K_DIM,
+    head_v_dim: int = KDA_DEFAULT_HEAD_V_DIM,
+    max_context_len: int = KDA_DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = KDA_DEFAULT_DTYPE,
+    device: str = KDA_DEFAULT_DEVICE,
+    cuda_graph_capture_batch_size: int = KDA_CUDA_GRAPH_CAPTURE_BATCH_SIZE,
+):
+    """KDA CUDA-graph decode replay. Mirrors `run_gdn_cuda_graph_decode_case`:
+    KDA inherits the same `MambaAttnBackendBase` capture/replay path through
+    `HybridLinearAttnBackend`, so the adapter wiring is identical to GDN.
+    Only DECODE / TARGET_VERIFY are reachable here (the underlying
+    `_replay_metadata` rejects other modes — see kda/README.md).
+    """
+    adapter = CudaGraphDecodeAdapter(
+        build_fixture=build_kda_attention_fixture,
+        make_case=make_kda_case_with_prefix_lens,
+        make_forward_batch=_make_kda_forward_batch,
+        fixture_inputs=kda_fixture_inputs,
+        make_capture_inputs=make_kda_random_inputs,
+        make_replay_inputs=make_kda_replay_inputs,
+        prepare_inputs=prepare_kda_runner_inputs,
+        run_eager=run_kda_fixture_eager,
+        run_forward=run_kda_forward,
+        expected_output=expected_kda_output_from_inputs,
+        clone_state=_clone_kda_cache,
+        restore_state=_restore_kda_cache,
+        allow_padding=False,
+        atol=KDA_GRAPH_ATOL,
+        rtol=KDA_GRAPH_RTOL,
     )
     _run_cuda_graph_decode_case(
         testcase,

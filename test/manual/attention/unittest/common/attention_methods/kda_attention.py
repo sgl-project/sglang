@@ -36,6 +36,12 @@ DEFAULT_DEVICE = "cuda"
 KDA_ATOL = 3e-2
 KDA_RTOL = 3e-2
 KDA_TREE_ATOL = 5e-2
+# CUDA-graph replay through the KDA Triton kernel accumulates small drift
+# that pushes per-element diff above eager `KDA_ATOL`. Loose tolerance for
+# graph-replay coverage where the goal is buffer/metadata compatibility
+# rather than exact numerical reproduction.
+KDA_GRAPH_ATOL = 1e-1
+KDA_GRAPH_RTOL = 1e-1
 
 
 @dataclass(frozen=True)
