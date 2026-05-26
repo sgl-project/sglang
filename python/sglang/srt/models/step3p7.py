@@ -38,6 +38,12 @@ class Step3p7ForConditionalGeneration(nn.Module):
         }
     )
 
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return Step3p5ForCausalLM.get_model_config_for_expert_location(
+            config.text_config
+        )
+
     def __init__(
         self,
         config: Step3p7Config,
