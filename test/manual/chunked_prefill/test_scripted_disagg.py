@@ -25,13 +25,6 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 
 
-def _script_naive_disagg_chunked(t: ScriptedRuntime):
-    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
-    yield from run_until_finished(r)
-    assert r.finished
-    assert r.chunks_done >= 2
-
-
 class TestScriptedDisagg(CustomTestCase):
     def test_naive_disagg_chunked(self):
         """Disagg x chunked: prefill engine chunks long prompt and hands off to decode."""
@@ -39,13 +32,20 @@ class TestScriptedDisagg(CustomTestCase):
         # decode-side engine kwargs go through ``decode_engine_kwargs=``
         # (or similar) — see wishlist §4 P3 (16).
         execute_scripted_runtime(
-            _script_naive_disagg_chunked,
+            self._script_naive_disagg_chunked,
             **base_engine_kwargs(
                 model_path=DEFAULT_MODEL_NAME_FOR_TEST,
                 chunked_prefill_size=DEFAULT_CHUNK_SIZE,
                 disaggregation_mode="prefill",
             ),
         )
+
+    @staticmethod
+    def _script_naive_disagg_chunked(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done >= 2
 
 
 if __name__ == "__main__":

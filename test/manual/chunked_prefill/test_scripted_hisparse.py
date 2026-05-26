@@ -24,20 +24,11 @@ from sglang.test.test_utils import CustomTestCase
 _HISPARSE_MODEL = "zai-org/GLM-5-FP8"
 
 
-def _script_naive_hisparse_chunked(t: ScriptedRuntime):
-    # Long enough to trigger both chunked prefill and a hisparse
-    # staging transfer mid-chunk.
-    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN * 4, max_new_tokens=4)
-    yield from run_until_finished(r)
-    assert r.finished
-    assert r.chunks_done >= 2
-
-
 class TestScriptedHiSparse(CustomTestCase):
     def test_naive_hisparse_chunked(self):
         """Long enough to trigger both chunked prefill and a hisparse staging transfer mid-chunk."""
         execute_scripted_runtime(
-            _script_naive_hisparse_chunked,
+            self._script_naive_hisparse_chunked,
             **base_engine_kwargs(
                 model_path=_HISPARSE_MODEL,
                 tp_size=8,
@@ -47,6 +38,15 @@ class TestScriptedHiSparse(CustomTestCase):
                 enable_hisparse=True,
             ),
         )
+
+    @staticmethod
+    def _script_naive_hisparse_chunked(t: ScriptedRuntime):
+        # Long enough to trigger both chunked prefill and a hisparse
+        # staging transfer mid-chunk.
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN * 4, max_new_tokens=4)
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done >= 2
 
 
 if __name__ == "__main__":

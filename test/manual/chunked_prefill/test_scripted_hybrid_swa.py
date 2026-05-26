@@ -24,21 +24,11 @@ from sglang.test.test_utils import CustomTestCase
 _SWA_MODEL = "openai/gpt-oss-20b"
 
 
-def _script_naive_swa_chunked(t: ScriptedRuntime):
-    # Length chosen to exceed both DEFAULT_CHUNK_SIZE *and* the SWA
-    # window for gpt-oss-20b (4096) — guarantees the chunk loop has to
-    # cross the SWA boundary at least once.
-    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN + 4096, max_new_tokens=4)
-    yield from run_until_finished(r)
-    assert r.finished
-    assert r.chunks_done >= 2
-
-
 class TestScriptedHybridSWA(CustomTestCase):
     def test_naive_swa_chunked(self):
         """Chunked prompt crosses the SWA window boundary at least once."""
         execute_scripted_runtime(
-            _script_naive_swa_chunked,
+            self._script_naive_swa_chunked,
             **base_engine_kwargs(
                 model_path=_SWA_MODEL,
                 chunked_prefill_size=DEFAULT_CHUNK_SIZE,
@@ -46,6 +36,16 @@ class TestScriptedHybridSWA(CustomTestCase):
                 disable_piecewise_cuda_graph=True,
             ),
         )
+
+    @staticmethod
+    def _script_naive_swa_chunked(t: ScriptedRuntime):
+        # Length chosen to exceed both DEFAULT_CHUNK_SIZE *and* the SWA
+        # window for gpt-oss-20b (4096) — guarantees the chunk loop has to
+        # cross the SWA boundary at least once.
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN + 4096, max_new_tokens=4)
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done >= 2
 
 
 if __name__ == "__main__":

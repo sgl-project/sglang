@@ -25,22 +25,11 @@ _LORA_BASE_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 _LORA_ADAPTER = "philschmid/llama-3-2-1b-instruct-finetuning-lora-cookbook-test"
 
 
-def _script_naive_lora_overlap_chunked(t: ScriptedRuntime):
-    r = t.start_req(
-        prompt_len=VERY_LONG_PROMPT_LEN,
-        max_new_tokens=4,
-        lora_path=_LORA_ADAPTER,
-    )
-    yield from run_until_finished(r)
-    assert r.finished
-    assert r.chunks_done >= 2
-
-
 class TestScriptedLoRAOverlap(CustomTestCase):
     def test_naive_lora_overlap_chunked(self):
         """LoRA overlap loading × chunked: naive ScriptedRuntime smoke."""
         execute_scripted_runtime(
-            _script_naive_lora_overlap_chunked,
+            self._script_naive_lora_overlap_chunked,
             **base_engine_kwargs(
                 model_path=_LORA_BASE_MODEL,
                 chunked_prefill_size=DEFAULT_CHUNK_SIZE,
@@ -49,6 +38,17 @@ class TestScriptedLoRAOverlap(CustomTestCase):
                 enable_lora_overlap_loading=True,
             ),
         )
+
+    @staticmethod
+    def _script_naive_lora_overlap_chunked(t: ScriptedRuntime):
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN,
+            max_new_tokens=4,
+            lora_path=_LORA_ADAPTER,
+        )
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done >= 2
 
 
 if __name__ == "__main__":
