@@ -53,7 +53,11 @@ from sglang.srt.speculative.eagle_info_v2 import (
     fill_accepted_out_cache_loc,
     fill_bonus_tokens,
 )
-from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
+from sglang.srt.speculative.eagle_utils import (
+    TreeMaskMode,
+    build_tree_kernel_efficient,
+    per_step_draft_out_cache_loc,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
@@ -438,11 +442,11 @@ class EagleDraftWorker(BaseDraftWorker):
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
 
-        out_cache_loc = out_cache_loc.reshape(
-            forward_batch.batch_size, self.topk, self.speculative_num_steps
-        )
-        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
-            self.speculative_num_steps, -1
+        out_cache_loc = per_step_draft_out_cache_loc(
+            out_cache_loc,
+            forward_batch.batch_size,
+            self.topk,
+            self.speculative_num_steps,
         )
 
         # Return values
@@ -479,8 +483,16 @@ class EagleDraftWorker(BaseDraftWorker):
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if self.topk == 1:
+                # topk=1 → degenerate single-path tree; `topk_p` is unused
+                # downstream, so skip softmax and just argmax over logits.
+                topk_index = torch.argmax(
+                    logits_output.next_token_logits, dim=-1, keepdim=True
+                )
+                topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+            else:
+                probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             maybe_detect_oob(
                 topk_index,
                 0,
@@ -552,7 +564,6 @@ class EagleDraftWorker(BaseDraftWorker):
         next_draft_input = EagleDraftInput(
             hidden_states=target_hidden_states,
             bonus_tokens=next_token_ids,
-            new_seq_lens=batch.seq_lens,
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
@@ -648,8 +659,14 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                 select_index
             ]
-        probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
-        ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+        if self.topk == 1:
+            ret_topk_index = torch.argmax(
+                draft_logits_output.next_token_logits, dim=-1, keepdim=True
+            )
+            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+        else:
+            probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
+            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
         ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values
@@ -772,9 +789,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(batch)
 
+            # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
+            # Extend processed L prompt tokens; next verify iter expects same L.
+            batch_output.new_seq_lens = batch.seq_lens
             # Publish before draft_extend so the fence is at target-end.
             if on_publish is not None:
-                on_publish(batch.seq_lens)
+                on_publish(batch_output.new_seq_lens)
 
             # Draft prefill
             with (
@@ -820,7 +840,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch_output = self.verify(batch)
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
-                on_publish(batch_output.next_draft_input.new_seq_lens)
+                on_publish(batch_output.new_seq_lens)
             with (
                 self.draft_worker.draft_tp_context(
                     self.draft_worker.draft_runner.tp_group
@@ -1033,12 +1053,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 verify_input.retrieve_next_token.shape
             ).cpu()
 
-        # Run target verify batch in the main compute stream (GPU compute)
+        # Run target verify batch in the main compute stream (GPU compute).
+        # Only skip metadata init when cuda-graph already ran replay_prepare;
+        # the non-cuda-graph path needs forward_extend's init (post-pad).
         forward_batch_output = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
+            skip_attn_backend_init=can_run_cuda_graph,
         )
         logits_output = forward_batch_output.logits_output
 
@@ -1097,9 +1119,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch, logits_output, predict, accept_index, self.speculative_num_steps
             )
 
-        next_draft_input = EagleDraftInput(
-            bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens
-        )
+        next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
 
         # verify_forward_batch transitively holds verify-time GPU tensors
         # (draft_token / out_cache_loc / ...) that must outlive the imminent
@@ -1112,6 +1132,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
             next_draft_input=next_draft_input,
             accept_lens=accept_lens,
+            new_seq_lens=new_seq_lens,
             routed_experts_output=forward_batch_output.routed_experts_output,
             indexer_topk_output=forward_batch_output.indexer_topk_output,
             extra_keep_alive_refs=[verify_forward_batch],
