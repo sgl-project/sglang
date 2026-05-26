@@ -15,23 +15,22 @@ state.
 """
 
 import logging
-import sys
 import time
 from dataclasses import dataclass
-from importlib import import_module
-from pathlib import Path
 
-import mlx.core as mx
 import psutil
-from mlx.utils import tree_flatten
 from mlx_lm import load as mlx_lm_load
 from mlx_lm.utils import quantize_model as mlx_lm_quantize_model
 
-from sglang.srt.environ import envs
+import mlx.core as mx
+from mlx.utils import tree_flatten
+from sglang.srt.hardware_backend.mlx.aot import (
+    MLX_AOT_KERNEL_REGISTRY,
+    MlxAOTKernelSet,
+)
 from sglang.srt.hardware_backend.mlx.kv_cache import (
     BatchedDecodeContext,
     ContiguousKVCache,
-    MlxAOTKernelBuildInfo,
     MLXAttentionWrapper,
     OffsetCache,
     PoolBackedCache,
@@ -45,18 +44,6 @@ from sglang.srt.hardware_backend.mlx.kv_cache.kv_pool import MlxKVPool
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 logger = logging.getLogger(__name__)
-
-
-def _import_sgl_kernel_metal():
-    try:
-        return import_module("sgl_kernel.metal")
-    except ModuleNotFoundError:
-        for parent in Path(__file__).resolve().parents:
-            candidate = parent / "sgl-kernel" / "python"
-            if (candidate / "sgl_kernel" / "metal.py").is_file():
-                sys.path.insert(0, str(candidate))
-                return import_module("sgl_kernel.metal")
-        raise
 
 
 @dataclass
@@ -165,6 +152,7 @@ class MlxModelRunner:
         self._req_synced_offset: dict[str, int] = {}
 
         self._pool_size = self._compute_pool_size(pool_size)
+        self._aot_kernels = self._build_aot_kernels()
 
     @staticmethod
     def _extract_logits(model_output):
@@ -330,74 +318,18 @@ class MlxModelRunner:
     def pool_size(self) -> int:
         return self._pool_size
 
-    def _maybe_get_rope_state(self):
-        """Build state for the AOT custom Metal RoPE kernel (opt-in).
-
-        Returns ``(rope_base, rope_config)``:
-          * ``rope_base`` is the model's RoPE theta when the AOT kernel
-            ``sgl_kernel.metal.rope_pool_fused`` is available and the model
-            uses a supported RoPE variant; ``0.0`` otherwise.
-          * ``rope_config`` is the standard dict ``{head_dim, rope_dim,
-            num_qo_heads, num_kv_heads}``; empty when the kernel is unused.
-
-        The AOT kernel is disabled by default. Set
-        ``SGLANG_MLX_USE_CUSTOM_ROPE=1`` to enable it for supported models.
-        The fallback also kicks in automatically when the kernel hasn't been
-        built (``sgl-kernel`` Metal extension missing) or when the model uses
-        an unsupported RoPE variant (``traditional=True`` or
-        ``rope_dim != head_dim``).
-        """
-        if not envs.SGLANG_MLX_USE_CUSTOM_ROPE.get():
-            return 0.0, {}
-        if hasattr(self, "_cached_rope_state"):
-            return self._cached_rope_state
-        try:
-            metal = _import_sgl_kernel_metal()
-        except Exception as exc:  # noqa: BLE001
-            logger.info(
-                "AOT Metal RoPE kernel not available (%s) - falling back to "
-                "mx.fast.rope. Build the kernel with: "
-                "`TOOLCHAINS=metal python sgl-kernel/setup_metal.py build_ext --inplace` "
-                "to enable.",
-                exc,
-            )
-            self._cached_rope_state = (0.0, {})
-            return self._cached_rope_state
-
+    def _build_aot_kernels(self) -> MlxAOTKernelSet:
+        """Build model-level set of optional registered AOT kernels."""
         layer_list, attn_attr = find_attention_layers(self.model)
         if not layer_list:
-            self._cached_rope_state = (0.0, {})
-            return self._cached_rope_state
+            return MlxAOTKernelSet()
         sample_attn = getattr(layer_list[0], attn_attr)
-        if isinstance(sample_attn, MLXAttentionWrapper):
-            sample_attn = sample_attn._inner
-        rope = getattr(sample_attn, "rope", None)
-        if rope is None or getattr(rope, "traditional", False):
-            self._cached_rope_state = (0.0, {})
-            return self._cached_rope_state
-        rope_dim = int(getattr(rope, "dims", 0))
-        if rope_dim == 0:
-            self._cached_rope_state = (0.0, {})
-            return self._cached_rope_state
         n_kv_heads, head_dim, _ = self._get_attn_config()
-        if rope_dim != head_dim:
-            # AOT kernel currently requires rope_dim == head_dim.
-            self._cached_rope_state = (0.0, {})
-            return self._cached_rope_state
-        base = float(getattr(rope, "base", 10000.0))
-        cfg = {
-            "head_dim": head_dim,
-            "rope_dim": rope_dim,
-            "num_qo_heads": int(sample_attn.n_heads),
-            "num_kv_heads": int(n_kv_heads),
-        }
-        logger.info(
-            f"AOT Metal RoPE kernel ENABLED: head_dim={head_dim}, "
-            f"n_heads={cfg['num_qo_heads']}, n_kv={cfg['num_kv_heads']}, "
-            f"base={base}"
+        return MLX_AOT_KERNEL_REGISTRY.build_kernel_set(
+            sample_attn=sample_attn,
+            n_kv_heads=int(n_kv_heads),
+            head_dim=int(head_dim),
         )
-        self._cached_rope_state = (base, cfg)
-        return self._cached_rope_state
 
     def init_kv_pool(self, req_to_token_pool: ReqToTokenPool) -> None:
         """Create MlxKVPool (+1 for padding slot 0) and wire scheduler pools."""
@@ -510,22 +442,6 @@ class MlxModelRunner:
             return
         for req_id in list(self._req_caches.keys()):
             self._sync_decode_kv_to_pool(req_id)
-
-    def _get_aot_kernel_build_info(
-        self, req_ids: list[str]
-    ) -> MlxAOTKernelBuildInfo | None:
-        """Return build inputs for optional AOT kernels."""
-        rope_base, rope_config = self._maybe_get_rope_state()
-        if rope_base <= 0.0 or not rope_config or self._kv_pool is None:
-            return None
-        return MlxAOTKernelBuildInfo(
-            rope_config=rope_config,
-            rope_base=rope_base,
-            kv_pool=self._kv_pool,
-            req_ids=req_ids,
-            req_pool_idx=self._req_pool_idx,
-            req_to_token_pool=self._req_to_token_pool,
-        )
 
     def decode_batch(
         self,
@@ -712,17 +628,16 @@ class MlxModelRunner:
                 caches=caches,
             )
 
-        seq_lens = [caches[i][0].offset for i in range(batch_size)]
-        layer_caches = [
-            [caches[i][layer_idx] for i in range(batch_size)]
-            for layer_idx in range(num_layers)
-        ]
-        ctx = BatchedDecodeContext(
-            batch_size=batch_size,
-            seq_lens=seq_lens,
-            layer_caches=layer_caches,
-            aot_build=self._get_aot_kernel_build_info(req_ids),
+        ctx = BatchedDecodeContext.from_decode(
+            caches=caches,
+            num_layers=num_layers,
+            req_ids=req_ids,
+            aot_kernels=self._aot_kernels,
+            kv_pool=self._kv_pool,
+            req_pool_idx=self._req_pool_idx,
+            req_to_token_pool=self._req_to_token_pool,
         )
+        seq_lens = ctx.seq_lens
         set_context(ctx)
         try:
             max_offset = max(seq_lens)
@@ -789,16 +704,16 @@ class MlxModelRunner:
                 caches=caches,
             )
 
-        layer_caches = [
-            [caches[i][layer_idx] for i in range(batch_size)]
-            for layer_idx in range(num_layers)
-        ]
-        ctx = BatchedDecodeContext(
-            batch_size=batch_size,
-            seq_lens=seq_lens,
-            layer_caches=layer_caches,
-            aot_build=self._get_aot_kernel_build_info(prev.req_ids),
+        ctx = BatchedDecodeContext.from_decode(
+            caches=caches,
+            num_layers=num_layers,
+            req_ids=prev.req_ids,
+            aot_kernels=self._aot_kernels,
+            kv_pool=self._kv_pool,
+            req_pool_idx=self._req_pool_idx,
+            req_to_token_pool=self._req_to_token_pool,
         )
+        seq_lens = ctx.seq_lens
         set_context(ctx)
         try:
             max_offset = max(seq_lens)

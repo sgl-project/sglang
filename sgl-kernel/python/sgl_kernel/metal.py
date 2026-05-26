@@ -16,7 +16,8 @@ try:
     _metallib_path = Path(_metal.__file__).resolve().parent / _METALLIB_NAME
     if not _metallib_path.is_file():
         raise ImportError(
-            f"{_METALLIB_NAME} not found next to sgl_kernel._metal at {_metallib_path}"
+            f"{_METALLIB_NAME} not found next to the native Metal extension "
+            f"at {_metallib_path}"
         )
     _metal.register_library(str(_metallib_path))
 except ImportError as _exc:  # pragma: no cover - import guarded at call time

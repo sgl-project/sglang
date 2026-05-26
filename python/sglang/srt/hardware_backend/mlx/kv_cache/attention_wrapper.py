@@ -2,64 +2,20 @@
 
 from __future__ import annotations
 
-import logging
-import sys
 import threading
 from dataclasses import dataclass, field
-from importlib import import_module
-from pathlib import Path
 from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-
+from sglang.srt.hardware_backend.mlx.aot import (
+    MlxAOTKernelContext,
+    MlxAOTKernelSet,
+    MlxAOTRoPEContext,
+)
 from sglang.srt.hardware_backend.mlx.kv_cache.contiguous_cache import ContiguousKVCache
 
-logger = logging.getLogger(__name__)
 _thread_local = threading.local()
-
-
-def _import_sgl_kernel_metal():
-    try:
-        metal = import_module("sgl_kernel.metal")
-    except ModuleNotFoundError:
-        for parent in Path(__file__).resolve().parents:
-            candidate = parent / "sgl-kernel" / "python"
-            if (candidate / "sgl_kernel" / "metal.py").is_file():
-                sys.path.insert(0, str(candidate))
-                metal = import_module("sgl_kernel.metal")
-                break
-        else:
-            raise
-    if getattr(metal, "_metal", None) is None:
-        raise ImportError(
-            "sgl_kernel._metal is not available. Build with "
-            "`TOOLCHAINS=metal python sgl-kernel/setup_metal.py build_ext --inplace`."
-        )
-    return metal
-
-
-@dataclass
-class MlxAOTRoPEContext:
-    config: dict
-    base: float
-    kv_pool: Any
-    new_token_slots: Optional[mx.array] = None
-
-
-@dataclass
-class MlxAOTKernelContext:
-    rope: Optional[MlxAOTRoPEContext] = None
-
-
-@dataclass
-class MlxAOTKernelBuildInfo:
-    rope_config: dict = field(default_factory=dict)
-    rope_base: float = 0.0
-    kv_pool: Optional[Any] = None
-    req_ids: Optional[list[str]] = None
-    req_pool_idx: Optional[dict[str, int]] = None
-    req_to_token_pool: Optional[Any] = None
 
 
 # TODO: Move from threading to multiprocessing or asyncio
@@ -76,7 +32,6 @@ class BatchedDecodeContext:
     # MLX decode path so future AOT kernels can be added without growing this
     # context one field at a time.
     aot: MlxAOTKernelContext = field(default_factory=MlxAOTKernelContext)
-    aot_build: Optional[MlxAOTKernelBuildInfo] = None
 
     # Derived tensors/metadata, shared across all layers in one forward pass.
     offsets: mx.array = field(init=False)
@@ -95,52 +50,37 @@ class BatchedDecodeContext:
         self.needs_padding = min(seq_lens) < max_seq_len
         self.pad_sizes = [max_seq_len - s for s in seq_lens]
         self.positions = mx.arange(self.max_len) if self.needs_padding else None
-        if self.aot_build is not None and self.aot.rope is None:
-            self.aot = self._build_aot_kernel_context()
 
-    def _build_aot_kernel_context(self) -> MlxAOTKernelContext:
-        info = self.aot_build
-        if (
-            info is None
-            or not info.rope_config
-            or info.rope_base <= 0.0
-            or info.kv_pool is None
-        ):
-            return MlxAOTKernelContext()
-
-        new_token_slots = None
-        if (
-            info.req_ids is not None
-            and info.req_pool_idx is not None
-            and info.req_to_token_pool is not None
-        ):
-            try:
-                slot_ids = []
-                for req_idx, req_id in enumerate(info.req_ids):
-                    req_pool_idx = info.req_pool_idx.get(req_id)
-                    if req_pool_idx is None:
-                        raise KeyError(req_id)
-                    slot = int(
-                        info.req_to_token_pool.req_to_token[
-                            req_pool_idx, self.layer_caches[0][req_idx].offset
-                        ].item()
-                    )
-                    slot_ids.append(slot)
-                new_token_slots = mx.array(slot_ids, dtype=mx.int32)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "AOT RoPE: failed to resolve new-token slots (%s); "
-                    "falling back to RoPE-only for this decode step",
-                    exc,
-                )
-
-        return MlxAOTKernelContext(
-            rope=MlxAOTRoPEContext(
-                config=info.rope_config,
-                base=info.rope_base,
-                kv_pool=info.kv_pool,
-                new_token_slots=new_token_slots,
-            )
+    @classmethod
+    def from_decode(
+        cls,
+        *,
+        caches: list[list[ContiguousKVCache]],
+        num_layers: int,
+        req_ids: list[str],
+        aot_kernels: MlxAOTKernelSet,
+        kv_pool: Any | None,
+        req_pool_idx: dict[str, int],
+        req_to_token_pool: Any | None,
+    ) -> "BatchedDecodeContext":
+        batch_size = len(req_ids)
+        seq_lens = [caches[i][0].offset for i in range(batch_size)]
+        layer_caches = [
+            [caches[i][layer_idx] for i in range(batch_size)]
+            for layer_idx in range(num_layers)
+        ]
+        return cls(
+            batch_size=batch_size,
+            seq_lens=seq_lens,
+            layer_caches=layer_caches,
+            aot=MlxAOTKernelContext.from_decode(
+                aot_kernels=aot_kernels,
+                kv_pool=kv_pool,
+                req_ids=req_ids,
+                req_pool_idx=req_pool_idx,
+                req_to_token_pool=req_to_token_pool,
+                layer_caches=layer_caches,
+            ),
         )
 
 
@@ -217,7 +157,6 @@ class MLXAttentionWrapper(nn.Module):
             keys = inner.rope(keys, offset=offsets)
 
         layer_caches = ctx.layer_caches[layer_idx]
-        max_len = ctx.max_len
         pad_sizes = ctx.pad_sizes
 
         # TODO: replace per-request loop with native batched/ragged
@@ -283,8 +222,6 @@ class MLXAttentionWrapper(nn.Module):
         write, RoPE-only mode). Returns rotated (queries, keys) in the
         original 4-D attention layout. ``values`` is unchanged by RoPE.
         """
-        rope_pool_fused = _import_sgl_kernel_metal().rope_pool_fused
-
         # (B, n_heads, 1, head_dim) -> (B, n_heads, head_dim) for kernel
         q_flat = queries[:, :, 0, :]
         k_flat = keys[:, :, 0, :]
@@ -299,7 +236,7 @@ class MLXAttentionWrapper(nn.Module):
         k_pool = rope_ctx.kv_pool.k_buffer[layer_idx]
         v_pool = rope_ctx.kv_pool.v_buffer[layer_idx]
 
-        q_rot, k_rot, k_pool_new, v_pool_new = rope_pool_fused(
+        q_rot, k_rot, k_pool_new, v_pool_new = rope_ctx.kernel.rope_pool_fused(
             q_flat,
             k_flat,
             v_flat,
@@ -307,10 +244,10 @@ class MLXAttentionWrapper(nn.Module):
             slots,
             k_pool,
             v_pool,
-            head_dim=rope_ctx.config["head_dim"],
-            num_qo_heads=rope_ctx.config["num_qo_heads"],
-            num_kv_heads=rope_ctx.config["num_kv_heads"],
-            rope_base=rope_ctx.base,
+            head_dim=rope_ctx.kernel.config["head_dim"],
+            num_qo_heads=rope_ctx.kernel.config["num_qo_heads"],
+            num_kv_heads=rope_ctx.kernel.config["num_kv_heads"],
+            rope_base=rope_ctx.kernel.base,
         )
         # Rebind pool buffers (zero-copy donation result).
         rope_ctx.kv_pool.k_buffer[layer_idx] = k_pool_new
