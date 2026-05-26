@@ -238,6 +238,18 @@ class MockDSV4ModelRunner:
         if compression_ratios is None:
             compression_ratios = [0]
         pool_batch_size = runner_batch_size or case.batch_size
+        # Speculative cases derive `speculative_num_draft_tokens` from the
+        # case's per-request input length (target_verify uses the draft count
+        # directly; draft_extend uses the accepted-token count). Non-spec cases
+        # leave it at 0 so the backend skips the speculative branches.
+        if case.forward_mode.is_target_verify() or case.forward_mode.is_draft_extend(
+            include_v2=True
+        ):
+            speculative_num_draft_tokens = case.input_lens[0] if case.input_lens else 0
+            speculative_eagle_topk = 1
+        else:
+            speculative_num_draft_tokens = 0
+            speculative_eagle_topk = 0
         self.device = device
         self.dtype = dtype
         self.kv_cache_dtype = dtype
@@ -265,9 +277,9 @@ class MockDSV4ModelRunner:
             pp_size=1,
             revision=None,
             speculative_algorithm=None,
-            speculative_eagle_topk=0,
-            speculative_num_draft_tokens=0,
-            speculative_num_steps=0,
+            speculative_eagle_topk=speculative_eagle_topk,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_num_steps=max(0, speculative_num_draft_tokens - 1),
             tp_size=1,
             device=device,
             mem_fraction_static=0.8,
@@ -1231,6 +1243,73 @@ def _seed_c4_sparse_indices(
     md.c4_sparse_page_indices = seed
     md.c4_sparse_topk_lengths = torch.full(
         (num_q,), num_entries, dtype=md.c4_sparse_topk_lengths.dtype, device=md.c4_sparse_topk_lengths.device
+    )
+
+
+def run_dsv4_target_verify_attention_case(
+    testcase,
+    case: DSV4AttentionCase,
+    *,
+    topk: int = 1,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+) -> None:
+    """Math-faithful EAGLE `TARGET_VERIFY` test for DSV4. Supports SWA-only,
+    SWA + C4, and SWA + C128 via `case.compress_ratio`. Chain only (`topk=1`):
+    `DeepseekV4AttnBackend.__init__` asserts `self.topk in [0, 1]` at line 369
+    so tree verify is production-unsupported for DSV4.
+
+    Pre-populates the SWA + (optionally) extra caches with the same packed K's
+    the production write path would produce, sets `EagleVerifyInput` on the
+    forward batch, lets `init_forward_metadata_target_verify` build the per-
+    draft-token metadata, then compares the backend forward output against
+    the combined SWA + extra-K reference. Chain causal masking falls out of
+    the metadata builder's per-q-token `swa_page_indices`.
+    """
+    assert topk == 1, (
+        "DSV4 target_verify is chain-only — `deepseek_v4_backend.py:369` "
+        "asserts `self.topk in [0, 1]`. Pass topk=1."
+    )
+    assert case.forward_mode.is_target_verify(), (
+        f"run_dsv4_target_verify_attention_case requires TARGET_VERIFY case; got {case.forward_mode}"
+    )
+    # Lazy import to avoid cycles (runner_modes imports attention_methods).
+    from common.runner_modes.speculative_target_verify_runner import (
+        _make_eagle_verify_input,
+        _prepare_target_verify_batch,
+    )
+
+    fixture = build_dsv4_attention_fixture(testcase, case, dtype=dtype, device=device)
+    runner = fixture.runner
+    max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
+
+    _populate_swa_kv_cache(fixture, max_context_len=max_context_len, device=device)
+    if case.compress_ratio in (4, 128):
+        _populate_extra_kv_cache(fixture, layer_id=0, num_entries=_DSV4_EXTRA_ENTRIES)
+
+    _prepare_target_verify_batch(fixture.forward_batch, case, device)
+    fixture.forward_batch.spec_info = _make_eagle_verify_input(
+        case, fixture.forward_batch, topk=topk, device=device,
+    )
+
+    q_input, _ = fixture.actual_module.project(fixture.input_hidden)
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+        fixture.backend.init_forward_metadata(fixture.forward_batch)
+        _seed_c4_if_needed(fixture)
+        actual = fixture.backend.forward(
+            q=q_input,
+            k=q_input,
+            v=q_input,
+            layer=fixture.actual_module.attn,
+            forward_batch=fixture.forward_batch,
+            compress_ratio=case.compress_ratio,
+            save_kv_cache=False,
+            attn_sink=fixture.actual_module.attn_sink,
+        )
+        expected = _pure_torch_dsv4_combined_reference(fixture, q_input)
+
+    torch.testing.assert_close(
+        actual.float(), expected.float(), atol=DSV4_ATOL, rtol=DSV4_RTOL
     )
 
 

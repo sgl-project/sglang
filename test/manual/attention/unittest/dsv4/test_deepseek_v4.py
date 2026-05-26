@@ -32,6 +32,7 @@ from common.attention_methods.dsv4_attention import (  # noqa: E402
     make_dsv4_cases,
     run_dsv4_attention_case,
     run_dsv4_compress_attention_case,
+    run_dsv4_target_verify_attention_case,
 )
 from common.runner_modes.cuda_graph_decode_runner import (  # noqa: E402
     run_dsv4_cuda_graph_decode_case,
@@ -134,6 +135,41 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_dsv4_cuda_graph_decode_case(self, case)
 
+    # EAGLE target_verify (chain only — DSV4 asserts topk <= 1). One case per
+    # compress_ratio so SWA, SWA+C4, and SWA+C128 all run through the
+    # per-draft-token causal-within-SWA + extra-K reference.
+    TARGET_VERIFY_CASES = (
+        DSV4AttentionCase(
+            name="dsv4_swa_eagle_verify_chain",
+            backend="dsv4",
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(64, 96),
+            extend_lens=(3, 3),
+        ),
+        DSV4AttentionCase(
+            name="dsv4_c4_eagle_verify_chain",
+            backend="dsv4",
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(64, 96),
+            extend_lens=(3, 3),
+            compress_ratio=4,
+        ),
+        DSV4AttentionCase(
+            name="dsv4_c128_eagle_verify_chain",
+            backend="dsv4",
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(128, 160),
+            extend_lens=(3, 3),
+            compress_ratio=128,
+        ),
+    )
+
     def test_compress_attention_cases(self):
         for case in self.COMPRESS_CASES:
             with self.subTest(
@@ -142,6 +178,15 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
                 compress_ratio=case.compress_ratio,
             ):
                 run_dsv4_compress_attention_case(self, case)
+
+    def test_eagle_target_verify_chain_cases(self):
+        for case in self.TARGET_VERIFY_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                compress_ratio=case.compress_ratio,
+            ):
+                run_dsv4_target_verify_attention_case(self, case, topk=1)
 
 
 if __name__ == "__main__":
