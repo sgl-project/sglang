@@ -396,7 +396,6 @@ class TestScriptedLifecycle(CustomTestCase):
             final >= baseline - 1
         ), f"KV pool drift: baseline={baseline}, final={final}"
 
-    @unittest.skip("needs ScriptedRuntime.shutdown — wire up when harness adds the API")
     def test_engine_shutdown_during_chunked(self):
         """Engine shutdown mid-chunk: chunked req receives a final error and no subprocess is orphaned."""
         execute_scripted_runtime(
