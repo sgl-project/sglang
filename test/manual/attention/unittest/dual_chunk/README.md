@@ -9,28 +9,31 @@ structurally wrong for this method.
 
 | Backend | Phase 2: method correctness | Phase 3: runner compatibility | Phase 4: speculative modes | Status |
 |---|---|---|---|---|
-| `dual_chunk_flash_attn` | Short-sequence eager prefill/decode coverage inside the first dual-chunk window | Not implemented | Not implemented | Uses a method-specific packed-query fixture and an independent dense causal PyTorch reference while succ/inter chunks are inactive. |
+| `dual_chunk_flash_attn` | Eager prefill/decode coverage for first-window, successor-chunk, inter-chunk, and GQA decode layouts | Not implemented | Not implemented | Uses a method-specific packed-query fixture and an independent PyTorch reference for non-sparse dual-chunk grouping. |
 
 ## Input And Config Coverage
 
 - Page size 1 extend, exact-page extend, page-boundary crossing extend, and
   ragged extend batches.
 - Decode page-boundary coverage and GQA decode coverage.
-- First-window chunk layouts where `query_succ`, `query_inter`, and critical
-  variants are present in the packed tensor but inactive in the reference.
+- Successor-chunk and inter-chunk extend/decode layouts where `query_succ` and
+  `query_inter` are active and use independent projection weights.
+- Critical query variants are present in the packed tensor; sparse critical-token
+  selection is still outside the current non-sparse reference.
 
 ## Current Progress
 
-- Phase 2 eager coverage is enabled for the first dual-chunk window.
+- Phase 2 eager coverage is enabled for first-window, successor-chunk, and
+  inter-chunk non-sparse dual-chunk layouts.
 - The fixture uses the real `dual_chunk_flash_attn` backend with method-specific
-  packed projections and an independent dense causal PyTorch reference.
-- Runner and speculative coverage are intentionally blocked until cross-chunk
-  semantics have a dedicated reference.
+  packed projections and an independent PyTorch reference that merges intra,
+  successor, and inter groups by global softmax semantics.
+- Runner and speculative coverage remain intentionally deferred until sparse and
+  graph metadata behavior are scoped.
 
 ## Next Work
 
-- Extend coverage beyond first-chunk semantics so succ/inter chunk query streams
-  and dual-chunk output merging are checked against a dedicated PyTorch reference.
-- Populate CUDA graph and PCG/BCG runner metadata after eager first-chunk coverage
+- Populate CUDA graph and PCG/BCG runner metadata after eager non-sparse coverage
   is stable across more chunk layouts.
-- Add sparse-attention reference coverage once a compact sparse config is selected.
+- Add sparse-attention and critical-token reference coverage once a compact sparse
+  config is selected.

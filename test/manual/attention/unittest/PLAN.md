@@ -35,7 +35,7 @@ Implemented:
   accumulation differences; chain verify and non-spec GDN paths keep `3e-2`.
 - Each attention-method folder now has a local `README.md` capability matrix and
   progress summary. Implemented folders are `dense/`, `swa/`, `mla/`, `gdn/`, and
-  first-chunk `dual_chunk/`. Placeholder folders remain for not-yet-implemented
+  non-sparse `dual_chunk/`. Placeholder folders remain for not-yet-implemented
   method fixtures: `dsa/` and `dsv4/`.
 - Phase 3 dense runner integration is implemented for representative attention
   backends: eager mode for `torch_native`, and CUDA-graph metadata capture/replay
@@ -138,9 +138,11 @@ Implemented:
   than a dense backend swap. The backend expects a packed five-way query
   projection (`query`, `succ`, `inter`, and critical variants), so
   `common/attention_methods/dual_chunk_attention.py` constructs a packed-query
-  module and compares first-chunk prefill/decode layouts against an independent
-  dense causal PyTorch reference while succ/inter chunks are inactive. Cross-chunk
-  and sparse-attention references remain future work.
+  module and compares prefill/decode layouts against an independent PyTorch
+  reference. The reference now covers non-sparse first-window, successor-chunk,
+  and inter-chunk grouping with distinct `query`, `query_succ`, and
+  `query_inter` projection weights. Sparse-attention and critical-token
+  references remain future work.
 - FA3/FA4 CUDA-graph replay is intentionally not enabled yet. Dense eager and
   PCG/BCG split-op paths match the HF-style reference, but the shared decode
   CUDA-graph helper currently mismatches on replay for both FA backends. Local
@@ -229,7 +231,7 @@ Next implementation steps:
 - Expand Phase 2 to additional attention methods/backends with method-specific
   fixtures rather than forcing them through the dense harness. Priority candidates:
   hardware-gated MLA kernels (`cutlass_mla`, `trtllm_mla`/`tokenspeed_mla` where
-  hardware and KV dtype support them), dual-chunk cross-chunk/sparse layouts, and
+  hardware and KV dtype support them), dual-chunk sparse layouts, and
   DSA/DSV4-style methods.
 - Keep `torch_native` SWA out of the matrix until the backend honors
   `RadixAttention.sliding_window_size`.
@@ -237,6 +239,13 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
+- Added non-sparse cross-chunk `dual_chunk_flash_attn` Phase 2 coverage with
+  distinct packed query streams for intra, successor, and inter chunk groups.
+- `python -m py_compile test/manual/attention/unittest/common/attention_methods/dual_chunk_attention.py test/manual/attention/unittest/dual_chunk/test_dual_chunk_flash_attn.py`
+- `python test/manual/attention/unittest/dual_chunk/test_dual_chunk_flash_attn.py -v`
+  - Ran 1 test in 0.668s after adding successor/inter dual-chunk attention coverage.
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+  - Ran 72 tests in 27.715s after adding successor/inter dual-chunk attention coverage.
 - Added first-chunk `dual_chunk_flash_attn` Phase 2 coverage with a packed-query
   fixture, real request/KV pools, and an independent dense causal PyTorch
   reference for short layouts where succ/inter chunks are inactive.

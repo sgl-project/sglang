@@ -23,9 +23,10 @@ from .dense_attention import (
     DenseAttentionCase,
     ReferenceDenseAttention,
     _copy_dense_weights,
-    _dense_attention_reference,
+    _expand_gqa,
     _make_forward_batch,
     _populate_prefix_kv,
+    _split_by_lens,
 )
 
 DUAL_CHUNK_CONFIG = {
@@ -84,12 +85,51 @@ def make_dual_chunk_cases(backend: str) -> tuple[DualChunkAttentionCase, ...]:
             **common,
         ),
         DualChunkAttentionCase(
+            name="dual_chunk_extend_succ_chunk",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(46,),
+            extend_lens=(4,),
+            **common,
+        ),
+        DualChunkAttentionCase(
+            name="dual_chunk_decode_succ_chunk",
+            forward_mode=ForwardMode.DECODE,
+            page_size=16,
+            prefix_lens=(48,),
+            **common,
+        ),
+        DualChunkAttentionCase(
+            name="dual_chunk_extend_inter_chunk",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(94,),
+            extend_lens=(4,),
+            **common,
+        ),
+        DualChunkAttentionCase(
+            name="dual_chunk_decode_inter_chunk",
+            forward_mode=ForwardMode.DECODE,
+            page_size=16,
+            prefix_lens=(96,),
+            **common,
+        ),
+        DualChunkAttentionCase(
             name="dual_chunk_gqa_decode_page_boundary",
             forward_mode=ForwardMode.DECODE,
             num_heads=4,
             num_kv_heads=2,
             page_size=16,
             prefix_lens=(14, 15, 16),
+            backend=backend,
+        ),
+        DualChunkAttentionCase(
+            name="dual_chunk_gqa_decode_inter_chunk",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=2,
+            page_size=16,
+            prefix_lens=(96,),
             backend=backend,
         ),
     )
@@ -248,6 +288,34 @@ class ProjectedDualChunkAttention(nn.Module):
             dtype=dtype,
             device=device,
         )
+        self.q_succ_proj = nn.Linear(
+            hidden_size,
+            num_heads * head_dim,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
+        self.q_inter_proj = nn.Linear(
+            hidden_size,
+            num_heads * head_dim,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
+        self.q_succ_critical_proj = nn.Linear(
+            hidden_size,
+            num_heads * head_dim,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
+        self.q_inter_critical_proj = nn.Linear(
+            hidden_size,
+            num_heads * head_dim,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
         self.k_proj = nn.Linear(
             hidden_size,
             num_kv_heads * head_dim,
@@ -283,11 +351,84 @@ class ProjectedDualChunkAttention(nn.Module):
         v = self.v_proj(hidden_states)
         return q, k, v
 
+    def project_dual_qkv(self, hidden_states: torch.Tensor):
+        q = self.q_proj(hidden_states)
+        q_succ = self.q_succ_proj(hidden_states)
+        q_inter = self.q_inter_proj(hidden_states)
+        q_succ_critical = self.q_succ_critical_proj(hidden_states)
+        q_inter_critical = self.q_inter_critical_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+        return q, q_succ, q_inter, q_succ_critical, q_inter_critical, k, v
+
     def forward(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
-        q, k, v = self.project_qkv(hidden_states)
-        packed_q = torch.cat((q, q, q, q, q), dim=-1)
+        q, q_succ, q_inter, q_succ_critical, q_inter_critical, k, v = (
+            self.project_dual_qkv(hidden_states)
+        )
+        packed_q = torch.cat(
+            (q, q_succ, q_inter, q_succ_critical, q_inter_critical), dim=-1
+        )
         attn_output = self.attn(packed_q, k, v, forward_batch)
         return self.o_proj(attn_output)
+
+
+class ReferenceDualChunkAttention(ReferenceDenseAttention):
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        device: str,
+    ):
+        super().__init__(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+            device=device,
+        )
+        self.q_succ_proj = nn.Linear(
+            hidden_size,
+            num_heads * head_dim,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
+        self.q_inter_proj = nn.Linear(
+            hidden_size,
+            num_heads * head_dim,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
+        self.q_succ_critical_proj = nn.Linear(
+            hidden_size,
+            num_heads * head_dim,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
+        self.q_inter_critical_proj = nn.Linear(
+            hidden_size,
+            num_heads * head_dim,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
+
+    def project_dual_qkv(self, hidden_states: torch.Tensor):
+        q = self.q_proj(hidden_states)
+        q_succ = self.q_succ_proj(hidden_states)
+        q_inter = self.q_inter_proj(hidden_states)
+        q_succ_critical = self.q_succ_critical_proj(hidden_states)
+        q_inter_critical = self.q_inter_critical_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+        return q, q_succ, q_inter, q_succ_critical, q_inter_critical, k, v
 
 
 @dataclass
@@ -296,7 +437,7 @@ class DualChunkAttentionFixture:
     runner: DualChunkMockModelRunner
     backend: object
     actual_module: ProjectedDualChunkAttention
-    reference_module: ReferenceDenseAttention
+    reference_module: ReferenceDualChunkAttention
     forward_batch: ForwardBatch
     prefix_hidden: list[torch.Tensor]
     input_hidden: torch.Tensor
@@ -320,9 +461,11 @@ def build_dual_chunk_attention_fixture(
     dtype: torch.dtype = DEFAULT_DTYPE,
     device: str = DEFAULT_DEVICE,
 ) -> DualChunkAttentionFixture:
-    chunk_len = DUAL_CHUNK_CONFIG["chunk_size"] - DUAL_CHUNK_CONFIG["local_size"]
-    if max(case.seq_lens) > chunk_len:
-        raise ValueError("Dual-chunk unit cases must stay inside the first chunk.")
+    max_context_len = max(max_context_len, max(case.seq_lens))
+    if max_context_len % case.page_size:
+        max_context_len = (
+            (max_context_len + case.page_size - 1) // case.page_size
+        ) * case.page_size
 
     seed = 3026 + len(case.name) + case.num_kv_heads
     torch.manual_seed(seed)
@@ -356,7 +499,7 @@ def build_dual_chunk_attention_fixture(
         dtype=dtype,
         device=device,
     )
-    reference_module = ReferenceDenseAttention(
+    reference_module = ReferenceDualChunkAttention(
         hidden_size=hidden_size,
         num_heads=case.num_heads,
         num_kv_heads=case.num_kv_heads,
@@ -364,7 +507,7 @@ def build_dual_chunk_attention_fixture(
         dtype=dtype,
         device=device,
     )
-    _copy_dense_weights(actual_module, reference_module)
+    _copy_dual_chunk_weights(actual_module, reference_module)
     prefix_hidden = [
         torch.randn(length, hidden_size, dtype=dtype, device=device)
         for length in case.prefix_lens
@@ -411,12 +554,111 @@ def run_dual_chunk_fixture_eager(fixture: DualChunkAttentionFixture) -> torch.Te
 def expected_dual_chunk_fixture_output(
     fixture: DualChunkAttentionFixture,
 ) -> torch.Tensor:
-    return _dense_attention_reference(
+    return _dual_chunk_attention_reference(
         fixture.reference_module,
         fixture.case,
         fixture.prefix_hidden,
         fixture.input_hidden,
     )
+
+
+def _copy_dual_chunk_weights(
+    actual: ProjectedDualChunkAttention,
+    reference: ReferenceDualChunkAttention,
+) -> None:
+    _copy_dense_weights(actual, reference)
+    with torch.no_grad():
+        reference.q_succ_proj.weight.copy_(actual.q_succ_proj.weight)
+        reference.q_inter_proj.weight.copy_(actual.q_inter_proj.weight)
+        reference.q_succ_critical_proj.weight.copy_(actual.q_succ_critical_proj.weight)
+        reference.q_inter_critical_proj.weight.copy_(
+            actual.q_inter_critical_proj.weight
+        )
+
+
+def _dual_chunk_attention_reference(
+    module: ReferenceDualChunkAttention,
+    case: DualChunkAttentionCase,
+    prefix_hidden: list[torch.Tensor],
+    input_hidden: torch.Tensor,
+) -> torch.Tensor:
+    dtype = input_hidden.dtype
+    q, q_succ, q_inter, _, _, k, v = module.project_dual_qkv(input_hidden)
+    q_parts = _split_by_lens(
+        q.view(-1, case.num_heads, module.head_dim), case.input_lens
+    )
+    q_succ_parts = _split_by_lens(
+        q_succ.view(-1, case.num_heads, module.head_dim), case.input_lens
+    )
+    q_inter_parts = _split_by_lens(
+        q_inter.view(-1, case.num_heads, module.head_dim), case.input_lens
+    )
+    k_parts = _split_by_lens(
+        k.view(-1, case.num_kv_heads, module.head_dim), case.input_lens
+    )
+    v_parts = _split_by_lens(
+        v.view(-1, case.num_kv_heads, module.head_dim), case.input_lens
+    )
+    outputs = []
+    chunk_len = DUAL_CHUNK_CONFIG["chunk_size"] - DUAL_CHUNK_CONFIG["local_size"]
+
+    for req_idx, prefix in enumerate(prefix_hidden):
+        _, _, _, _, _, prefix_k, prefix_v = module.project_dual_qkv(prefix)
+        prefix_k = prefix_k.view(-1, case.num_kv_heads, module.head_dim)
+        prefix_v = prefix_v.view(-1, case.num_kv_heads, module.head_dim)
+        req_k = torch.cat([prefix_k, k_parts[req_idx]], dim=0)
+        req_v = torch.cat([prefix_v, v_parts[req_idx]], dim=0)
+
+        for offset, query in enumerate(q_parts[req_idx]):
+            query_pos = case.prefix_lens[req_idx] + offset
+            current_chunk_start = (query_pos // chunk_len) * chunk_len
+            previous_chunk_start = current_chunk_start - chunk_len
+            groups = [
+                (
+                    query,
+                    req_k[current_chunk_start : query_pos + 1],
+                    req_v[current_chunk_start : query_pos + 1],
+                )
+            ]
+
+            if previous_chunk_start >= 0:
+                groups.append(
+                    (
+                        q_succ_parts[req_idx][offset],
+                        req_k[previous_chunk_start:current_chunk_start],
+                        req_v[previous_chunk_start:current_chunk_start],
+                    )
+                )
+
+            if previous_chunk_start > 0:
+                groups.append(
+                    (
+                        q_inter_parts[req_idx][offset],
+                        req_k[:previous_chunk_start],
+                        req_v[:previous_chunk_start],
+                    )
+                )
+
+            score_parts = []
+            value_parts = []
+            for group_query, group_k, group_v in groups:
+                keys = _expand_gqa(group_k.movedim(0, 1), case.num_heads)
+                values = _expand_gqa(group_v.movedim(0, 1), case.num_heads)
+                scores = (
+                    torch.einsum("hd,hkd->hk", group_query.float(), keys.float())
+                    * module.scaling
+                )
+                score_parts.append(scores)
+                value_parts.append(values.float())
+
+            scores = torch.cat(score_parts, dim=-1)
+            values = torch.cat(value_parts, dim=1)
+            probs = torch.softmax(scores, dim=-1)
+            out = torch.einsum("hk,hkd->hd", probs, values)
+            outputs.append(out.reshape(-1))
+
+    attn_output = torch.stack(outputs, dim=0).to(dtype)
+    return module.reconstruct_output(attn_output)
 
 
 def run_dual_chunk_attention_case(
