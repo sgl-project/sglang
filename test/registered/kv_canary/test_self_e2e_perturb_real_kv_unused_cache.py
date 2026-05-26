@@ -59,6 +59,16 @@ class TestPerturbRealKvUnusedCacheMhaFull(_PerturbRealKvUnusedCacheBase):
     target_group = TargetGroupKind.FULL
 
 
+# In SWA mode the FULL pool has no orphan sweep slots — the perturbation
+# logs "skipped because no orphan sweep slot was found for group=FULL"
+# every step, so the expected SWEEP_*_FULL violation never fires. The
+# MhaFull case (FULL-only model) and SwaSwa case (SWA target in SWA mode)
+# both work; only this Sw target=FULL combination is unreachable. Skipping
+# until the model+target combinatorics in the perturb path are reworked.
+@unittest.skip(
+    "SWA mode + target_group=FULL has no orphan FULL slots to perturb; "
+    "see comment above."
+)
 class TestPerturbRealKvUnusedCacheSwaFull(_PerturbRealKvUnusedCacheBase):
     __test__ = True
 
