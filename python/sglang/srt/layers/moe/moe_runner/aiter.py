@@ -56,6 +56,7 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     doweight_stage1: bool = False
     hidden_pad: int = 0
     intermediate_pad: int = 0
+    swiglu_limit: float = 0.0
 
 
 @dataclass
@@ -116,6 +117,7 @@ class AiterRunnerCore(MoeRunnerCore):
             return AiterRunnerOutput(hidden_states=runner_input.hidden_states)
 
         from aiter.fused_moe import fused_moe
+        from aiter.ops.flydsl.moe_common import GateMode
 
         a1_scale = (
             runner_input.a1_scale
@@ -128,6 +130,9 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
             extra["dtype"] = runner_input.output_dtype
+        if quant_info.swiglu_limit > 0:
+            extra["gate_mode"] = GateMode.INTERLEAVE.value
+            extra["swiglu_limit"] = quant_info.swiglu_limit
 
         output = fused_moe(
             hidden_states=runner_input.hidden_states,
