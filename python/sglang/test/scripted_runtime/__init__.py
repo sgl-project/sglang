@@ -1,9 +1,4 @@
-"""ScriptedRuntime: deterministic generator-driven scheduler harness for fine-grained tests.
-
-See ``docs`` and the project notes under
-``agent-context/projects/sglang/2026-05-25-chunked-prefill-rewrite/``
-for the design rationale.
-"""
+"""ScriptedRuntime: deterministic generator-driven scheduler harness for fine-grained tests."""
 
 from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
 from sglang.test.scripted_runtime.req_handle import ReqHandle, ReqStatus

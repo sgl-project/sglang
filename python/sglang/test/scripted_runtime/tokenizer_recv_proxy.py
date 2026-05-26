@@ -1,11 +1,9 @@
 """Proxy for the scheduler's ``recv_from_tokenizer`` socket.
 
-In production the proxy is a passthrough wrapper around the real zmq socket.
-In test mode (when a :class:`ScriptedRuntime` is active) the proxy ignores the
-underlying socket and instead serves requests injected directly into an
-in-process queue by ``ScriptedRuntime.start_req``. This bypasses the HTTP
-server and tokenizer manager entirely — fine-grained scheduler tests are
-not concerned with those layers.
+Production: passthrough to the zmq socket. Test (ScriptedRuntime
+active): serve from an in-process queue populated by
+``ScriptedRuntime.start_req``, bypassing the HTTP server and
+tokenizer manager.
 """
 
 from collections import deque
@@ -15,13 +13,8 @@ import zmq
 
 
 class TokenizerRecvProxy:
-    """Quacks like a ``zmq.Socket`` for the ``recv_pyobj`` calls in
-    ``SchedulerRequestReceiver._pull_raw_reqs``.
-
-    Test-mode behavior matches the real socket's contract used by the
-    scheduler: ``recv_pyobj(zmq.NOBLOCK)`` either returns a queued object
-    or raises ``zmq.ZMQError`` with ``EAGAIN``, just like a real PULL
-    socket with no pending message.
+    """Quacks like a ``zmq.Socket``. NOBLOCK semantics mirror a real
+    PULL socket: empty queue raises ``zmq.ZMQError`` with ``EAGAIN``.
     """
 
     def __init__(self, *, underlying: Optional[zmq.Socket], test_mode: bool):
@@ -47,10 +40,6 @@ class TokenizerRecvProxy:
         )
 
     def inject(self, req: Any) -> None:
-        """Place a tokenized request into the in-process delivery queue.
-
-        The request becomes visible to the scheduler on its next
-        ``recv_requests`` iteration.
-        """
+        """Queue a tokenized request; visible on the next ``recv_requests``."""
         assert self._test_mode, "TokenizerRecvProxy.inject only valid in test mode"
         self._queue.append(req)

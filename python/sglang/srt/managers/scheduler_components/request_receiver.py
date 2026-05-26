@@ -38,10 +38,8 @@ if TYPE_CHECKING:
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
-    # In production this is a real ``zmq.Socket``. When a ScriptedRuntime is
-    # active (testing only), it is a ``TokenizerRecvProxy`` that quacks the
-    # same ``recv_pyobj(flags)`` interface but serves in-process injections
-    # instead of zmq messages.
+    # Production: ``zmq.Socket``. Test (ScriptedRuntime active):
+    # ``TokenizerRecvProxy`` quacking the same ``recv_pyobj(flags)``.
     recv_from_tokenizer: Any
     recv_from_rpc: Optional[zmq.Socket]
     recv_skipper: Any
@@ -60,10 +58,9 @@ class SchedulerRequestReceiver:
     max_recv_per_poll: int
     stream_output: Callable[..., None]
     get_last_forward_mode: Callable[[], Any]
-    # Testing only. When set, ``_yield_to_script`` is invoked at the top of
-    # every ``recv_requests`` call so a generator-driven test script can
-    # observe and act between scheduler iterations. ``Any`` instead of the
-    # concrete ``ScriptedRuntime`` to avoid an import cycle.
+    # Testing only. When set, ``recv_requests`` yields to the script
+    # generator once per iteration. ``Any`` to avoid an import cycle on
+    # the concrete ``ScriptedRuntime``.
     scripted_runtime: Optional[Any] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
@@ -77,8 +74,7 @@ class SchedulerRequestReceiver:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
 
         if self.scripted_runtime is not None:
-            # Yield to the test script for exactly one step before any work.
-            # All ranks participate so the cross-rank broadcast stays balanced.
+            # All ranks must call this so the cross-rank broadcast stays balanced.
             self.scripted_runtime._yield_to_script()
 
         if self.recv_skipper is not None:

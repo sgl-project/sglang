@@ -1,7 +1,7 @@
-"""ReqHandle: lazy-lookup handle for a request submitted via ScriptedRuntime.
+"""ReqHandle: handle for a request submitted via ScriptedRuntime.
 
-Hides the raw ``Req`` object from test scripts so assertions cannot tunnel into
-scheduler internals (which would defeat the refactor-safety of the harness).
+Hides the raw ``Req`` so test scripts cannot assert on scheduler
+internals — preserves the harness's refactor-safety.
 """
 
 from __future__ import annotations

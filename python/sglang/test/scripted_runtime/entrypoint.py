@@ -1,23 +1,14 @@
 """Caller-side entry point for ScriptedRuntime tests.
 
-A test invokes :func:`execute_scripted_runtime` with a generator function.
-This module:
+:func:`execute_scripted_runtime` resolves the script generator to a
+qualified name, launches a regular :class:`Engine` with ScriptedRuntime
+fields set on ``server_args``, and blocks until the scheduler
+subprocess exits.
 
-1. Resolves the generator function to a qualified name so the scheduler
-   subprocess can import it back.
-2. Allocates a temp file path where the scheduler subprocess writes any
-   exception traceback raised by the script.
-3. Launches a regular :class:`Engine` with the ScriptedRuntime fields set
-   on ``server_args``.
-4. Waits for the scheduler subprocess(es) to exit (they exit on their own
-   when the script generator finishes).
-5. Re-raises any script-side exception on the caller side.
-
-Why qualified-name + importlib instead of cloudpickle:
-- ``mp.Process`` already pickles args; functions must be top-level to be
-  picklable across the spawn boundary without extra machinery.
-- Importable-by-name makes the path inspectable and IDE-friendly.
-- Closures / lambdas are rejected with a clear error.
+Why qualified-name + importlib rather than cloudpickle: ``mp.Process``
+spawn requires top-level picklable functions anyway; importable-by-name
+is inspectable and IDE-friendly, and lambdas / closures are rejected
+with a clear error.
 """
 
 from __future__ import annotations
@@ -56,10 +47,8 @@ def execute_scripted_runtime(
             f"qualified name; resolved {script_fn_path!r} to a different object"
         )
 
-    # Make the script module importable in the scheduler subprocess. Under
-    # spawn-mode multiprocessing the subprocess does not inherit the parent's
-    # ``sys.path``, so a pytest-collected file under ``test/srt/`` would fail
-    # ``importlib.import_module``. We forward the script file's directory.
+    # Spawn-mode mp subprocesses don't inherit the parent's ``sys.path``;
+    # forward the script's directory so it can be imported by name.
     sys_path_entry = _module_directory(script_fn.__module__)
 
     tb_fd, tb_path = tempfile.mkstemp(prefix="scripted_runtime_tb_", suffix=".txt")
@@ -74,15 +63,13 @@ def execute_scripted_runtime(
             scripted_runtime_sys_path_entry=sys_path_entry,
             **engine_overrides,
         )
-        # The subprocess watchdog SIGQUITs the parent if any scheduler subprocess
-        # exits non-zero (e.g., script assertion failure). For scripted tests
-        # we want to surface the assertion as a normal Python exception, not
-        # SIGQUIT the test process. Stop the watchdog before the script can
-        # finish.
+        # The watchdog SIGQUITs the parent on any non-zero scheduler exit.
+        # Disable it so a script-side assertion surfaces as a Python
+        # exception instead of killing the test runner.
         _stop_subprocess_watchdog(engine)
 
-        # Scheduler subprocess runs the script in its event loop and exits
-        # when the generator finishes. Block here until it does.
+        # Block until the scheduler subprocess exits — it does so on its
+        # own when the script generator finishes.
         engine._scheduler_init_result.wait_for_completion()
 
         with open(tb_path) as f:

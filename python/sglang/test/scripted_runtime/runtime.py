@@ -1,15 +1,11 @@
 """ScriptedRuntime: generator-driven scheduler harness.
 
-The runtime lives inside each scheduler subprocess. On the driver rank
-(``pp_rank == 0`` and ``tp_rank == 0`` and ``attn_cp_rank == 0``) it advances
-a caller-provided generator function exactly one step per scheduler
-event-loop iteration (one ``recv_requests`` call). Other ranks merely
-participate in the cross-rank cpu broadcast of the script's done / error
-state so they exit cleanly when the script finishes.
-
-See ``2026-05-25-fine-grained-harness-implementation.md`` and
-``2026-05-25-scripted-runtime-impl-plan.md`` in the project notes for the
-full design.
+Lives inside each scheduler subprocess. The driver rank
+(``pp_rank == tp_rank == attn_cp_rank == 0``) advances a caller-provided
+generator one step per scheduler event-loop iteration (one
+``recv_requests`` call). Non-driver ranks join the cross-rank cpu
+broadcast that carries the script's done / error state so every rank
+exits together when the script finishes.
 """
 
 from __future__ import annotations
@@ -35,10 +31,10 @@ logger = logging.getLogger(__name__)
 class ScriptedRuntimeFinished(Exception):
     """Raised on every rank when the script generator finishes.
 
-    Carries ``ok=True`` for a normal return / ``StopIteration``, and
-    ``ok=False`` with a traceback when the generator raised. The scheduler
-    subprocess entry point catches this to terminate cleanly without
-    signaling the parent process.
+    ``ok=True``: normal return / ``StopIteration``.
+    ``ok=False``: generator raised; ``exc_traceback`` carries the text.
+    Caught by ``run_scheduler_process`` to exit cleanly without
+    SIGQUITing the parent.
     """
 
     def __init__(self, *, ok: bool, exc_traceback: Optional[str] = None) -> None:
@@ -48,11 +44,9 @@ class ScriptedRuntimeFinished(Exception):
 
 
 def _resolve_fn(qualified: str) -> Callable:
-    """Resolve ``"module.path:function_name"`` to the function object.
+    """Resolve ``"module.path:qualname"`` to the function object.
 
-    Supports nested attribute access in the right-hand part
-    (``"pkg.mod:Cls.method"``) but the leaf must be a top-level callable
-    importable across processes — no lambdas / closures.
+    The leaf must be importable across processes — no lambdas / closures.
     """
     module_name, sep, fn_name = qualified.partition(":")
     if not sep or not module_name or not fn_name:
@@ -69,19 +63,14 @@ def _resolve_fn(qualified: str) -> Callable:
 
 
 class ScriptedRuntime:
-    """Per-scheduler-process harness that exposes a generator-driven API
-    to test scripts running on the driver rank.
+    """Generator-driven harness installed in every scheduler subprocess.
 
-    Lifecycle:
-      1. Constructed inside ``Scheduler.__init__`` when
-         ``server_args.scripted_runtime_fn_path`` is set.
-      2. On driver rank, the script's generator is instantiated immediately.
-      3. ``_yield_to_script`` is invoked by ``SchedulerRequestReceiver.recv_requests``
-         at the top of every event-loop iteration, advancing the generator
-         by one step and broadcasting completion status across ranks.
-      4. When the generator finishes (return or raise), every rank raises
-         ``ScriptedRuntimeFinished``; ``run_scheduler_process`` catches it
-         and terminates the subprocess with the appropriate exit code.
+    Constructed by ``Scheduler.__init__`` when ``scripted_runtime_fn_path``
+    is set. On the driver rank, instantiates the script generator and
+    advances it one step per ``_yield_to_script`` call (invoked by
+    ``SchedulerRequestReceiver.recv_requests`` every event-loop iter).
+    When the generator finishes, every rank raises
+    ``ScriptedRuntimeFinished`` so all subprocesses exit together.
     """
 
     def __init__(
@@ -125,11 +114,10 @@ class ScriptedRuntime:
         prompt_len: int,
         max_new_tokens: int = 8,
     ) -> ReqHandle:
-        """Submit a synthetic request directly into the scheduler's input queue.
+        """Inject a synthetic request into the scheduler's input queue.
 
-        The caller is on the driver rank inside the script generator. The
-        request becomes visible to the scheduler on the next ``recv_requests``
-        iteration (i.e., the next ``yield`` in the script).
+        Visible to the scheduler on the next ``yield`` (next
+        ``recv_requests`` iteration).
         """
         assert self._is_driver, "start_req is only callable from the driver rank"
         rid = f"scripted-{self._req_counter}"
@@ -163,20 +151,16 @@ class ScriptedRuntime:
     # ============================================================
 
     def _yield_to_script(self) -> None:
-        """Advance the script generator one step (driver rank only) and
-        broadcast completion state across all ranks via a cpu collective.
-
-        Raises :class:`ScriptedRuntimeFinished` on every rank when the
-        script finishes or errors.
+        """Advance the generator one step (driver only) and broadcast
+        completion state. Raises :class:`ScriptedRuntimeFinished` on
+        every rank when the script finishes or raises.
         """
         if self._is_driver:
             payload: List = list(self._advance_generator())
         else:
-            # Non-driver ranks contribute an empty payload; broadcast_pyobj
-            # ignores the value on non-source ranks.
+            # ``broadcast_pyobj`` ignores the value on non-source ranks.
             payload = []
 
-        # Broadcast (done_flag, exc_traceback) from world rank 0 to all ranks.
         payload = broadcast_pyobj(
             data=payload,
             rank=self._scheduler.world_group.rank,
@@ -210,8 +194,8 @@ class ScriptedRuntime:
         prompt_len: int,
         max_new_tokens: int,
     ) -> TokenizedGenerateReqInput:
-        # Placeholder token id 1 is BOS for most tokenizers; any valid token
-        # works since fine-grained tests don't care about decode quality.
+        # Token id 1 is BOS for most tokenizers; any valid token works
+        # since the harness does not validate decode quality.
         input_ids = array("i", [1] * prompt_len)
         sampling_params = SamplingParams(max_new_tokens=max_new_tokens)
         return TokenizedGenerateReqInput(

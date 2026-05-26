@@ -844,17 +844,13 @@ class ServerArgs:
     # For msProbe
     msprobe_dump_config: Optional[str] = None
 
-    # Scripted runtime (testing only — set programmatically, not via CLI).
-    # When ``scripted_runtime_fn_path`` is set (format: ``"module.path:function_name"``),
-    # rank-0 scheduler installs a ScriptedRuntime that drives the provided generator
-    # function via yields on every recv_requests iteration. See
-    # python/sglang/srt/test/scripted_runtime/ for details.
+    # Scripted runtime (testing only; set programmatically, not via CLI).
+    # See ``sglang.test.scripted_runtime``. ``fn_path`` is
+    # ``"module.path:qualname"``; ``traceback_path`` receives any
+    # script-side exception text; ``sys_path_entry`` is prepended to the
+    # subprocess ``sys.path`` so spawn-mode mp can import the script module.
     scripted_runtime_fn_path: Optional[str] = None
     scripted_runtime_traceback_path: Optional[str] = None
-    # Directory to prepend to ``sys.path`` in scheduler subprocesses so the
-    # script function module is importable. Needed when the script is defined
-    # in a file not on the default sys.path (e.g., pytest-collected
-    # ``test/srt/test_*.py`` under spawn-mode multiprocessing).
     scripted_runtime_sys_path_entry: Optional[str] = None
 
     def __post_init__(self):

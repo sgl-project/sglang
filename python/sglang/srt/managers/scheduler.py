@@ -558,11 +558,7 @@ class Scheduler(
         # Init the grammar backend for constrained generation
         self.grammar_manager = GrammarManager(self)
 
-        # Wire scripted runtime (test-only). When enabled, the scheduler's
-        # tokenizer-receive socket is replaced by a ``TokenizerRecvProxy``
-        # that serves in-process injections from the test script, and
-        # ``SchedulerRequestReceiver.recv_requests`` yields to the script
-        # before each iteration. See ``sglang.test.scripted_runtime``.
+        # Wire scripted runtime (test-only); see ``sglang.test.scripted_runtime``.
         if server_args.scripted_runtime_fn_path is not None:
             from sglang.test.scripted_runtime.runtime import ScriptedRuntime
             from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
@@ -3820,16 +3816,15 @@ def run_scheduler_process(
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
-    # Lazy import to keep the test-only module off the production load path
-    # while still letting ``except`` clauses below name the class.
+    # Lazy import keeps the test-only module off the production load path
+    # while still letting the ``except`` clause below name the class.
     from sglang.test.scripted_runtime.runtime import (
         ScriptedRuntimeFinished as _ScriptedRuntimeFinished,
     )
 
-    # In scripted_runtime test mode, make the script module importable. Under
-    # spawn-mode mp the subprocess does not inherit the parent's sys.path, so
-    # a script defined in a pytest-collected file would otherwise be
-    # unimportable when ScriptedRuntime.__init__ calls importlib.import_module.
+    # Spawn-mode mp subprocesses don't inherit the parent's sys.path, so
+    # forward the directory of the script module before constructing the
+    # scheduler (which imports the script by qualified name).
     if (
         server_args.scripted_runtime_fn_path is not None
         and server_args.scripted_runtime_sys_path_entry
@@ -3881,10 +3876,9 @@ def run_scheduler_process(
         scheduler.run_event_loop()
 
     except _ScriptedRuntimeFinished as finished:
-        # Expected, cooperative termination from a test script. Each rank
-        # raises this after the cross-rank broadcast in
-        # ``ScriptedRuntime._yield_to_script``. Only the driver rank
-        # (world rank 0) writes the traceback file to avoid contention.
+        # Cooperative termination from a test script; raised on every rank
+        # after the cross-rank broadcast. Only the driver rank writes the
+        # traceback file to avoid contention.
         is_driver = (
             scheduler is not None
             and scheduler.ps.pp_rank == 0
@@ -3909,11 +3903,9 @@ def run_scheduler_process(
         tb = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {tb}")
         if server_args.scripted_runtime_fn_path is not None:
-            # In scripted_runtime test mode the parent test process expects to
-            # observe failures via the traceback file + non-zero exit code,
-            # not via SIGQUIT (which would kill the test runner itself) nor
-            # via the pgroup SIGKILL that production uses to suppress sibling
-            # NCCL/TCPStore noise.
+            # Tests surface failures via the traceback file + non-zero
+            # exit code; SIGQUIT / pgroup SIGKILL would take the test
+            # runner itself down.
             if server_args.scripted_runtime_traceback_path:
                 try:
                     with open(server_args.scripted_runtime_traceback_path, "w") as f:
