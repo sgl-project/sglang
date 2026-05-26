@@ -173,18 +173,16 @@ if _is_cuda:
         weights = weights.unsqueeze(-1) * q_scale * softmax_scale
         return weights
 
+    @register_custom_op(mutates_args=["topk_indices"])
+    @register_split_op()
+    def broadcast_indexer_topk_from_rank0_(topk_indices: torch.Tensor) -> None:
+        _broadcast_indexer_topk_from_rank0_impl(topk_indices)
 
-def _broadcast_indexer_topk_from_rank0(
-    topk_indices: Optional[torch.Tensor],
-) -> Optional[torch.Tensor]:
-    # Sync only the finalized indexer output. Internal topk_transform calls can
-    # be chunked differently across ranks, which would make collectives diverge.
-    if topk_indices is None or not envs.SGLANG_DSA_TOPK_BROADCAST.get():
-        return topk_indices
 
+def _broadcast_indexer_topk_from_rank0_impl(topk_indices: torch.Tensor) -> None:
     group = get_attn_tp_group()
     if group.world_size == 1:
-        return topk_indices
+        return
 
     if topk_indices.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
         if group.pynccl_comm is None:
@@ -195,6 +193,20 @@ def _broadcast_indexer_topk_from_rank0(
             group.pynccl_comm.broadcast(topk_indices, src=0)
     else:
         group.broadcast(topk_indices, src=0)
+
+
+def _broadcast_indexer_topk_from_rank0(
+    topk_indices: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    # Sync only the finalized indexer output. Internal topk_transform calls can
+    # be chunked differently across ranks, which would make collectives diverge.
+    if topk_indices is None or not envs.SGLANG_DSA_TOPK_BROADCAST.get():
+        return topk_indices
+
+    if is_in_piecewise_cuda_graph():
+        broadcast_indexer_topk_from_rank0_(topk_indices)
+    else:
+        _broadcast_indexer_topk_from_rank0_impl(topk_indices)
     return topk_indices
 
 
