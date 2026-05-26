@@ -339,17 +339,12 @@ class TopK(MultiPlatformOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
-        if num_fused_shared_experts > 0:
-            from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.server_args import get_global_server_args
 
-            try:
-                self.enable_deepep_waterfill = (
-                    get_global_server_args().enable_deepep_waterfill
-                )
-            except ValueError:
-                self.enable_deepep_waterfill = False
-        else:
-            self.enable_deepep_waterfill = False
+        self.enable_deepep_waterfill = (
+            num_fused_shared_experts > 0
+            and get_global_server_args().enable_deepep_waterfill
+        )
 
         self.deepep_waterfill_balancer = None
         if self.enable_deepep_waterfill:
