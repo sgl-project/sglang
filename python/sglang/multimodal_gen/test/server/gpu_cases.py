@@ -668,6 +668,7 @@ TWO_GPU_CASES = [
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_I2V_14B_720P_MODEL_NAME_FOR_TEST,
             lora_path="starsfriday/Wan2.1-Divine-Power-LoRA",
+            extras=["--ulysses-degree=2"],
         ),
         TI2V_sampling_params,
         run_lora_basic_api_check=True,
@@ -676,6 +677,7 @@ TWO_GPU_CASES = [
         "wan2_1_i2v_14b_720P_2gpu",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_I2V_14B_720P_MODEL_NAME_FOR_TEST,
+            extras=["--ulysses-degree=2"],
         ),
         TI2V_sampling_params,
     ),
