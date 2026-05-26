@@ -684,7 +684,6 @@ class Scheduler(
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
             get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
             get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
-            report_double_count_violation=self._report_load_inquirer_double_count,
         )
 
         self.output_streamer = SchedulerOutputStreamer(
@@ -1063,29 +1062,6 @@ class Scheduler(
         # init_next_round_input, so running stash would double-free and
         # corrupt prefix_indices.
         self._chunked_req_scheduled_last_iter = False
-
-        # Regression instrumentation for invariant S2: self.chunked_req
-        # must NOT also appear in self.running_batch.reqs (chunked-prefill
-        # is exclusive of running). Incremented at the top of
-        # get_next_batch_to_run when the violation is observed.
-        self._chunked_req_in_batch_violation_count: int = 0
-
-        # Regression instrumentation for invariant S3: in pipeline
-        # parallelism, last_batch.chunked_req must be added to
-        # chunked_req_to_exclude before merging into running_batch.
-        # Incremented when post-merge running_batch.reqs still contains
-        # last_batch.chunked_req (see get_next_batch_to_run PP merge
-        # branch).
-        self._stale_chunked_req_merged_count: int = 0
-
-        # Regression instrumentation for invariant LI: the load inquirer
-        # tallies pending tokens from waiting_queue plus the chunked_req
-        # tail. If the chunked_req also appears in waiting_queue, its
-        # tokens get counted twice (the dual-queue dedup invariant).
-        # Incremented inside SchedulerLoadInquirer._get_num_pending_tokens
-        # when the violation is observed.
-        self._load_inquirer_double_count_count: int = 0
-
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
@@ -2204,15 +2180,6 @@ class Scheduler(
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
-                # Invariant W2: the watchdog must not abort a req that is
-                # mid-chunked-prefill. Chunked-resume reqs sit in
-                # waiting_queue across iters while actively prefilling
-                # (their entry_time is from original arrival, so a long
-                # prefill would falsely trip the timeout). The counter
-                # records any such abort so ScriptedRuntime tests can
-                # assert it stays 0; see commit 359e5ed7bd.
-                if req.inflight_middle_chunks > 0:
-                    req.watchdog_aborted_while_chunked_resume_count += 1
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
@@ -2322,14 +2289,6 @@ class Scheduler(
             req.swa_stash_double_free_count += 1
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
-    def _report_load_inquirer_double_count(self) -> None:
-        # Invariant LI report sink: SchedulerLoadInquirer invokes this
-        # when it observes the chunked_req simultaneously sitting in
-        # waiting_queue, which would otherwise double-count its pending
-        # tokens. Surfaced to ScriptedRuntime tests via
-        # Scheduler._load_inquirer_double_count_count.
-        self._load_inquirer_double_count_count += 1
-
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
         device = self.device
@@ -2367,13 +2326,6 @@ class Scheduler(
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
-        # Invariant S2: chunked_req and running_batch.reqs are mutually
-        # exclusive — the chunked req is held aside and merged back only
-        # after its final chunk. If both contain the same req, double
-        # accounting / double release follows.
-        if self.chunked_req is not None and self.chunked_req in self.running_batch.reqs:
-            self._chunked_req_in_batch_violation_count += 1
-
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
         self._abort_on_waiting_timeout()
@@ -2433,26 +2385,11 @@ class Scheduler(
 
             # Merge the new batch into the running batch.
             if not self.last_batch.is_empty():
-                # Capture before merge so we can self-check invariant S3
-                # against the post-merge running_batch contents below.
-                last_batch_chunked_req = self.last_batch.chunked_req
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
                 else:
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
-
-                # Invariant S3: in PP, last_batch.chunked_req must have
-                # been added to chunked_req_to_exclude above so it is
-                # filtered out before merge. If it still ends up inside
-                # running_batch.reqs after the merge, the exclude path
-                # was bypassed (see the chunked_req_to_exclude.add call
-                # ~40 lines above).
-                if (
-                    last_batch_chunked_req is not None
-                    and last_batch_chunked_req in self.running_batch.reqs
-                ):
-                    self._stale_chunked_req_merged_count += 1
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
@@ -3525,27 +3462,10 @@ class Scheduler(
 
     def abort_request(self, recv_req: AbortReq):
         # todo hisparse, release resources for abort requests in hisparse coordinator
-
-        # Invariant W3: build the batch-rid set up front so we can detect
-        # chunked-resume reqs that live in BOTH waiting_queue and
-        # batch.reqs simultaneously. If we abort such a req without
-        # dedup, the waiting_queue loop pops + releases AND the running
-        # batch loop sets to_finish (which releases again downstream).
-        # See commit de3859646b for the dedup fix.
-        if self.cur_batch is self.running_batch or self.cur_batch is None:
-            _abort_batch_reqs = self.running_batch.reqs
-        else:
-            _abort_batch_reqs = self.running_batch.reqs + self.cur_batch.reqs
-        _abort_batch_rids = {r.rid for r in _abort_batch_reqs}
-
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                if req.rid in _abort_batch_rids:
-                    # Dual-queue dedup miss: same req would be released by
-                    # waiting_queue path AND running batch to_finish path.
-                    req.abort_double_release_count += 1
                 to_del.append(i)
 
         # Sort in reverse order to avoid index issues when deleting

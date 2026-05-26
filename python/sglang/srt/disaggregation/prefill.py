@@ -564,11 +564,6 @@ class SchedulerDisaggregationPrefillMixin:
                     req.grammar.finished = req.finished()
             else:
                 # being chunked reqs' prefill is not finished
-                # Invariant R1: decrement only legal while still chunking
-                # (inflight_middle_chunks > 0). Disagg-prefill variant of
-                # the same self-check as batch_result_processor.
-                if req.inflight_middle_chunks <= 0:
-                    req.inflight_middle_chunks_premature_decrement_count += 1
                 req.inflight_middle_chunks -= 1
 
                 if req.return_logprob:
@@ -766,19 +761,6 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Send a prefilled chunk to the decode server
         """
-        # Invariant D3: after a retract, start_send_idx and tmp_end_idx
-        # must be reset (to 0 and -1) before the next send_kv_chunk
-        # call. If retraction_count has advanced since the last
-        # observed value AND either field still holds a stale
-        # post-send value, the reset was skipped and the decode peer
-        # would receive garbage slots. See commit 414efd4a27 for the
-        # original bug.
-        if req.retraction_count > req._send_kv_chunk_last_retraction_count and (
-            req.start_send_idx > 0 or req.tmp_end_idx >= 0
-        ):
-            req.disagg_send_state_leak_after_retract_count += 1
-        req._send_kv_chunk_last_retraction_count = req.retraction_count
-
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
         end_idx = (

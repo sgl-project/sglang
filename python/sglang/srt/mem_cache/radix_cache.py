@@ -426,7 +426,6 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         value = params.value
         priority = params.priority
         chunked = params.chunked
-        req = params.req
 
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
         key = key.page_aligned(self.page_size)
@@ -436,9 +435,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             # Debug/test fallback: use token ids themselves as values.
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
-        prefix_len = self._insert_helper(
-            self.root_node, key, value, priority, chunked, req
-        )
+        prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
         return InsertResult(prefix_len=prefix_len)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
@@ -510,26 +507,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 value=values,
                 chunked=chunked,
                 priority=getattr(req, "priority", 0) or 0,
-                req=req,
             )
         )
         new_prefix_len = result.prefix_len
-
-        # Invariant C2: with page_size > 1, the partial tail beyond
-        # cache_protected_len must be freed exactly once across the
-        # cache_unfinished_req / cache_finished_req sequence. If we are
-        # about to free a [cache_protected_len, new_prefix_len) range
-        # whose upper bound is at or below the last freed range, the
-        # same memory would be released twice. See the comment a few
-        # lines below about cache_protected_len for the full bug
-        # history.
-        if (
-            new_prefix_len > req.cache_protected_len
-            and new_prefix_len <= req._last_partial_tail_free_end
-        ):
-            req.partial_page_tail_double_free_count += 1
-        if new_prefix_len > req.cache_protected_len:
-            req._last_partial_tail_free_end = new_prefix_len
 
         self.token_to_kv_pool_allocator.free(
             kv_indices[req.cache_protected_len : new_prefix_len]
@@ -711,23 +691,13 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         return new_node
 
-    def _inc_hit_count(
-        self,
-        node: TreeNode,
-        chunked: bool = False,
-        req: Optional["Req"] = None,
-    ):
-        # Invariant C1 (self-referencing inflation guard): chunked requests
-        # must NOT increment hit_count on nodes they may have created in
-        # previous chunks. The early-return gate enforces this. The
-        # post-condition self-check below records any future regression on
-        # Req.radix_chunked_hit_inflation_count; ScriptedRuntime tests
-        # assert this counter remains 0.
-        before = node.hit_count
-        if not chunked:
-            node.hit_count += 1
-        if chunked and node.hit_count != before and req is not None:
-            req.radix_chunked_hit_inflation_count += 1
+    def _inc_hit_count(self, node: TreeNode, chunked: bool = False):
+        # Skip the hit count update for chunked requests to avoid self-referencing
+        # inflation where a chunked request increments hit_count on nodes it created
+        # in previous chunks.
+        if chunked:
+            return
+        node.hit_count += 1
 
     def _insert_helper(
         self,
@@ -736,7 +706,6 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         value,
         priority: int = 0,
         chunked: bool = False,
-        req: Optional["Req"] = None,
     ):
         # Convert None priority to 0
         if priority is None:
@@ -762,11 +731,11 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
                 new_node.priority = max(new_node.priority, priority)
-                self._inc_hit_count(new_node, chunked, req)
+                self._inc_hit_count(new_node, chunked)
                 node = new_node
             else:
                 node.priority = max(node.priority, priority)
-                self._inc_hit_count(node, chunked, req)
+                self._inc_hit_count(node, chunked)
             if len(key):
                 child_key = key.child_key(self.page_size)
 
@@ -775,7 +744,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
-            self._inc_hit_count(new_node, chunked, req)
+            self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)

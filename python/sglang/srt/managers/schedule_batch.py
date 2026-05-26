@@ -831,65 +831,6 @@ class Req(ReqDllmMixin):
         self.swa_chunked_early_return_count: int = 0
         self.swa_stash_double_free_count: int = 0
 
-        # Regression instrumentation for invariant C1: chunked requests must
-        # not increment hit_count on radix tree nodes (self-referencing
-        # inflation guard); see radix_cache._inc_hit_count for full bug
-        # history.
-        self.radix_chunked_hit_inflation_count: int = 0
-
-        # Regression instrumentation for invariant B5: HiCache breakdown
-        # fields (cached_tokens_{device,host,storage}) must be written
-        # exactly once per req lifetime — on the first chunk only. Counts
-        # actual writes; ScriptedRuntime tests assert <= 1.
-        self.hicache_cached_tokens_write_count: int = 0
-
-        # Regression instrumentation for invariant B6: extend_batch_idx must
-        # increase monotonically except on the explicit reset path
-        # (reset_for_retract). Counts assignments that produce a value
-        # smaller than the previous one outside the reset path.
-        self.extend_batch_idx_regression_count: int = 0
-
-        # Regression instrumentation for invariant R1: inflight_middle_chunks
-        # may only be decremented while the req still has chunks in flight
-        # (the > 0 precondition gated by the if/else in
-        # batch_result_processor); see decrement sites there for full
-        # context.
-        self.inflight_middle_chunks_premature_decrement_count: int = 0
-
-        # Regression instrumentation for invariant W2: the
-        # _abort_on_waiting_timeout watchdog must not abort a req that is
-        # mid-chunked-prefill (i.e., has chunks in flight). See commit
-        # 359e5ed7bd "Skip chunked-resume reqs in
-        # _abort_on_waiting_timeout" for the original fix.
-        self.watchdog_aborted_while_chunked_resume_count: int = 0
-
-        # Regression instrumentation for invariant W3: a chunked-resume
-        # req that is concurrently held in waiting_queue and batch.reqs
-        # must be released exactly once on abort. See commit de3859646b
-        # "Prep: abort_request dedup for chunked-resume dual-queue
-        # holding" for the original fix.
-        self.abort_double_release_count: int = 0
-
-        # Regression instrumentation for invariant C2: with page_size > 1,
-        # the partial-page tail past cache_protected_len in
-        # req.prefix_indices must be freed exactly once across the
-        # cache_unfinished_req / cache_finished_req sequence. Tracks the
-        # last freed prefix-len so a repeat free of the same range is
-        # detectable; see radix_cache.cache_unfinished_req for the
-        # cache_protected_len explanation.
-        self.partial_page_tail_double_free_count: int = 0
-        self._last_partial_tail_free_end: int = -1
-
-        # Regression instrumentation for invariant D3: after retract,
-        # disagg-prefill send-side state (start_send_idx, tmp_end_idx)
-        # must be reset before the next send_kv_chunk call. See commit
-        # 414efd4a27 "Reset disagg send-side state on chunked-resume
-        # retract" for the original bug. Tracks the retraction_count
-        # seen at the previous send_kv_chunk so a fresh retract
-        # leaking stale state can be detected.
-        self.disagg_send_state_leak_after_retract_count: int = 0
-        self._send_kv_chunk_last_retraction_count: int = 0
-
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
         # processed.
@@ -1377,9 +1318,6 @@ class Req(ReqDllmMixin):
         self.indexer_topk = None
         self.last_node = None
         self.cache_protected_len = 0
-        # Invariant C2: reset partial-tail free tracker so post-retract
-        # cache_unfinished_req calls are not flagged as double frees.
-        self._last_partial_tail_free_end = -1
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
         self.extend_input_len = 0
@@ -1933,14 +1871,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             assert seq_len - pre_len == req.extend_input_len
 
-            # Invariant B6: extend_batch_idx must increase monotonically here
-            # (the only non-reset mutation path). reset_for_retract zeroes it
-            # legitimately. The post-condition check below records any future
-            # regression where this path produces a non-increasing value.
-            _extend_batch_idx_before = req.extend_batch_idx
             req.extend_batch_idx += 1
-            if req.extend_batch_idx <= _extend_batch_idx_before:
-                req.extend_batch_idx_regression_count += 1
 
             # update req-level memory management fields
             req.kv_committed_len = seq_len
@@ -2002,15 +1933,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     host_portion = host_total - storage_portion
                     device_portion = max(0, len(req.prefix_indices) - host_total)
 
-                    # Invariant B5: HiCache breakdown fields must be written
-                    # exactly once per req lifetime (first chunk only). The
-                    # _cache_breakdown_computed gate above enforces this;
-                    # the counter records every actual write so tests can
-                    # assert <= 1 even if the gate is ever weakened.
                     req.cached_tokens_device = device_portion
                     req.cached_tokens_host = host_portion
                     req.cached_tokens_storage = storage_portion
-                    req.hicache_cached_tokens_write_count += 1
                     req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len
