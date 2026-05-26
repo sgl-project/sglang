@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/6366efc67b0aedd2c1721c14385370e50b297fb3/benchmarks/backend_request_func.py
 # Adapted from https://github.com/vllm-project/vllm/blob/6366efc67b0aedd2c1721c14385370e50b297fb3/benchmarks/benchmark_serving.py
 
@@ -2178,8 +2180,9 @@ if __name__ == "__main__":
         type=str,
         nargs="+",
         default=["CPU", "GPU"],
-        choices=["CPU", "GPU", "CUDA_PROFILER", "XPU"],
-        help="Profiler activities to capture: CPU, GPU, XPU, CUDA_PROFILER.",
+        choices=["CPU", "GPU", "CUDA_PROFILER", "XPU", "MEM"],
+        help="Profiler activities to capture: CPU, GPU, XPU, CUDA_PROFILER, MEM "
+        "(MEM dumps a torch.cuda.memory snapshot, viewable at https://pytorch.org/memory_viz).",
     )
     parser.add_argument(
         "--profile-start-step",

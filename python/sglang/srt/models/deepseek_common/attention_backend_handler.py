@@ -134,6 +134,12 @@ def handle_attention_trtllm_mla(attn, forward_batch):
         return _dispatch_mla_subtype(attn, forward_batch)
 
 
+def handle_attention_tokenspeed_mla(attn, forward_batch):
+    # tokenspeed_mla shares the trtllm_mla dispatch pattern: pure prefill goes
+    # via MHA chunked KV (TRT-LLM ragged), spec decode / decode goes via MLA.
+    return handle_attention_trtllm_mla(attn, forward_batch)
+
+
 def handle_attention_aiter(attn, forward_batch):
     if forward_batch.forward_mode.is_extend_without_speculative():
         return AttnForwardMethod.MHA
@@ -183,6 +189,7 @@ AttentionBackendRegistry.register("flashmla", handle_attention_flashmla)
 AttentionBackendRegistry.register("cutlass_mla", handle_attention_cutlass_mla)
 AttentionBackendRegistry.register("fa4", handle_attention_fa4)
 AttentionBackendRegistry.register("trtllm_mla", handle_attention_trtllm_mla)
+AttentionBackendRegistry.register("tokenspeed_mla", handle_attention_tokenspeed_mla)
 AttentionBackendRegistry.register("aiter", handle_attention_aiter)
 AttentionBackendRegistry.register("nsa", handle_attention_nsa)
 AttentionBackendRegistry.register("triton", handle_attention_triton)

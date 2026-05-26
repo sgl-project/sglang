@@ -9,7 +9,7 @@ from sglang.jit_kernel.diffusion.group_norm_silu import apply_group_norm_silu
 from sglang.jit_kernel.diffusion.triton.group_norm_silu import triton_group_norm_silu
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=8, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=8, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 DEVICE = "cuda"

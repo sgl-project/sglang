@@ -4,7 +4,7 @@ Launches TP=4 with flashinfer_mxfp4 MoE runner + EAGLE speculative decoding.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
 plus a GSM8K accuracy gate.
 
-Registry: stage-c-test-dsv4-4-gpu-b200 (per-commit, 4x B200)
+Registry: base-c-test-dsv4-4-gpu-b200 (per-commit, 4x B200)
 """
 
 import unittest
@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1800, suite="stage-c-test-dsv4-4-gpu-b200")
+register_cuda_ci(est_time=700, stage="base-c", runner_config="dsv4-4-gpu-b200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
@@ -29,14 +29,6 @@ DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":9
 
 _DEEPEP_ENV = {
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
-}
-
-_MEGAMOE_ENV = {
-    "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE": "1",
-    "SGLANG_OPT_FIX_MEGA_MOE_MEMORY": "1",
-    "SGLANG_OPT_FIX_NEXTN_MEGA_MOE": "1",
-    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "4096",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "0",
 }
 
 
@@ -138,8 +130,8 @@ class TestDSV4FlashFP4B200Balanced(ServerSanityMixin, CustomTestCase):
         _gsm8k_check(self)
 
 
-class TestDSV4FlashFP4B200MegaMoE(ServerSanityMixin, CustomTestCase):
-    """Balanced recipe: TP=4, DP=4, MegaMoE."""
+class TestDSV4FlashFP4B200Balanced_CP(ServerSanityMixin, CustomTestCase):
+    """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
 
     @classmethod
     def setUpClass(cls):
@@ -153,7 +145,7 @@ class TestDSV4FlashFP4B200MegaMoE(ServerSanityMixin, CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--dp",
+                "--attn-cp-size",
                 "4",
                 "--enable-dp-attention",
                 "--moe-a2a-backend",
@@ -166,8 +158,13 @@ class TestDSV4FlashFP4B200MegaMoE(ServerSanityMixin, CustomTestCase):
                 "1",
                 "--speculative-num-draft-tokens",
                 "2",
+                "--enable-nsa-prefill-context-parallel",
+                "--nsa-prefill-cp-mode",
+                "round-robin-split",
+                "--deepep-config",
+                DEEPEP_CONFIG,
             ],
-            env=_MEGAMOE_ENV,
+            env=_DEEPEP_ENV,
         )
 
     @classmethod

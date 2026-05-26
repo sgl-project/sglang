@@ -263,26 +263,30 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
         self.cached_tokens[req.metadata_buffer_index][3] = req.cached_tokens_storage
         if req.return_logprob:
-            if req.output_token_logprobs_val:  # not none or empty list
+            if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
-                    req.output_token_logprobs_val[0]
+                    req.logprob.output_token_logprobs_val[0]
                 )
-            if req.output_token_logprobs_idx:  # not none or empty list
+            if req.logprob.output_token_logprobs_idx:  # not none or empty list
                 self.output_token_logprobs_idx[req.metadata_buffer_index][0] = (
-                    req.output_token_logprobs_idx[0]
+                    req.logprob.output_token_logprobs_idx[0]
                 )
 
-            if req.output_top_logprobs_val:  # not none or empty list
+            if req.logprob.output_top_logprobs_val:  # not none or empty list
                 self.output_top_logprobs_val[req.metadata_buffer_index][
-                    : len(req.output_top_logprobs_val[0])
+                    : len(req.logprob.output_top_logprobs_val[0])
                 ] = torch.tensor(
-                    req.output_top_logprobs_val[0], dtype=torch.float32, device="cpu"
+                    req.logprob.output_top_logprobs_val[0],
+                    dtype=torch.float32,
+                    device="cpu",
                 )
-            if req.output_top_logprobs_idx:  # not none or empty list
+            if req.logprob.output_top_logprobs_idx:  # not none or empty list
                 self.output_top_logprobs_idx[req.metadata_buffer_index][
-                    : len(req.output_top_logprobs_idx[0])
+                    : len(req.logprob.output_top_logprobs_idx[0])
                 ] = torch.tensor(
-                    req.output_top_logprobs_idx[0], dtype=torch.int32, device="cpu"
+                    req.logprob.output_top_logprobs_idx[0],
+                    dtype=torch.int32,
+                    device="cpu",
                 )
         # For PD + spec decode
         if req.hidden_states_tensor is not None:
@@ -635,9 +639,9 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
     req.finished_reason = FINISH_ABORT(error_message, status_code)
 
     if req.return_logprob:
-        req.input_token_logprobs_val = []
-        req.input_token_logprobs_idx = []
-        req.input_top_logprobs_val = []
-        req.input_top_logprobs_idx = []
-        req.input_token_ids_logprobs_val = []
-        req.input_token_ids_logprobs_idx = []
+        req.logprob.input_token_logprobs_val = []
+        req.logprob.input_token_logprobs_idx = []
+        req.logprob.input_top_logprobs_val = []
+        req.logprob.input_top_logprobs_idx = []
+        req.logprob.input_token_ids_logprobs_val = []
+        req.logprob.input_token_ids_logprobs_idx = []

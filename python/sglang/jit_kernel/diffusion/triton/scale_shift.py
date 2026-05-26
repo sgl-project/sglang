@@ -664,6 +664,11 @@ if current_platform.is_mps():
 
     fuse_scale_shift_kernel = fuse_scale_shift_kernel_native
 
+if current_platform.is_musa():
+    from .torch_fallback import fuse_scale_shift_kernel_native
+
+    fuse_scale_shift_kernel = fuse_scale_shift_kernel_native
+
 if current_platform.is_cpu():
     from .torch_fallback import (
         fuse_scale_shift_kernel_native,
