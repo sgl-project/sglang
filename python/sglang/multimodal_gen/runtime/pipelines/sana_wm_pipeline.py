@@ -10,15 +10,18 @@
 #     ... -> Denoising -> SanaWMLTX2RefinerStage
 #       -> refiner decoding (LTX-2 VAE + drop clean sink anchor frame)
 #
-# The two-stage variant loads four extra refiner sub-modules through the
-# framework's `PipelineComponentLoader` by declaring them in
-# `_required_config_modules` and pointing each at the appropriate
-# `refiner/<subdir>` via `_extra_config_module_map`. The component loader
-# normalizes the trailing `_2` so `transformer_2` -> TransformerLoader,
-# `text_encoder_2` -> TextEncoderLoader, `tokenizer_2` -> TokenizerLoader.
+# Stage-2 refiner sub-modules live under `<model_path>/refiner/...` rather
+# than at the model root. We load them manually in `initialize_pipeline`
+# (mirroring how `LTX2TwoStagePipeline._initialize_premerged_stage2_transformer`
+# loads its stage-2 DiT) instead of registering them in
+# `_required_config_modules`, because the framework verifier resolves every
+# required module key as a literal top-level subdir of the materialized model.
 
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
+from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    PipelineComponentLoader,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -106,30 +109,38 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
 
     pipeline_name = "SanaWMTwoStagePipeline"
 
-    # Stage-2 refiner sub-modules live under `refiner/{transformer,connectors,text_encoder}`
-    # in the materialized checkpoint. We register them with the standard module
-    # keys (`transformer_2`, `connectors`, `text_encoder_2`, `tokenizer_2`) so
-    # the existing component loaders can drive them. The `_2` suffix is
-    # stripped by `_normalize_component_type` for loader dispatch.
-    _required_config_modules = [
-        "text_encoder",
-        "tokenizer",
-        "vae",
-        "transformer",
-        "scheduler",
-        "transformer_2",
-        "connectors",
-        "text_encoder_2",
-        "tokenizer_2",
-    ]
-    _extra_config_module_map = {
-        "transformer_2": "refiner/transformer",
-        "connectors": "refiner/connectors",
-        "text_encoder_2": "refiner/text_encoder",
-        # The refiner Gemma-3 ships its tokenizer files alongside the
-        # text_encoder weights under refiner/text_encoder/.
-        "tokenizer_2": "refiner/text_encoder",
-    }
+    # Stage-2 refiner sub-modules and their on-disk layout. Tuples are
+    # (module_name, subpath_under_model_root, transformers_or_diffusers).
+    # The `_2` suffix is stripped by `_normalize_component_type` so the
+    # component loader dispatches `transformer_2` -> TransformerLoader,
+    # `text_encoder_2` -> TextEncoderLoader, `tokenizer_2` -> TokenizerLoader.
+    # `connectors` is special-cased to "diffusers" by
+    # `ComponentLoader.resolve_transformers_or_diffusers`.
+    _REFINER_SUB_MODULES: tuple[tuple[str, str, str], ...] = (
+        ("transformer_2", "refiner/transformer", "diffusers"),
+        ("connectors", "refiner/connectors", "diffusers"),
+        ("text_encoder_2", "refiner/text_encoder", "transformers"),
+        # The refiner Gemma-3 ships its tokenizer files alongside the encoder.
+        ("tokenizer_2", "refiner/text_encoder", "transformers"),
+    )
+
+    def initialize_pipeline(self, server_args: ServerArgs) -> None:
+        super().initialize_pipeline(server_args)
+        self._load_refiner_modules(server_args)
+
+    def _load_refiner_modules(self, server_args: ServerArgs) -> None:
+        for module_name, subpath, library in self._REFINER_SUB_MODULES:
+            component_path = self._resolve_component_path(
+                server_args, module_name, subpath
+            )
+            module, memory_usage = PipelineComponentLoader.load_component(
+                component_name=module_name,
+                component_model_path=component_path,
+                transformers_or_diffusers=library,
+                server_args=server_args,
+            )
+            self.modules[module_name] = module
+            self.memory_usages[module_name] = memory_usage
 
     def _maybe_add_refiner_stage(self, server_args: ServerArgs) -> None:
         self.add_stage(
