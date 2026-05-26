@@ -865,6 +865,35 @@ def make_dense_padded_replay_inputs(
     }
 
 
+def make_dense_token_padded_inputs(
+    _case: DenseAttentionCase,
+    fixture: DenseAttentionFixture,
+    static_num_tokens: int,
+    base_inputs: dict[str, Any],
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> dict[str, Any]:
+    hidden_size = fixture.actual_module.hidden_size
+    raw_num_tokens = base_inputs["input_hidden"].shape[0]
+    if static_num_tokens < raw_num_tokens:
+        raise ValueError("static_num_tokens must cover the live input token count.")
+
+    pad_input_hidden = torch.randn(
+        static_num_tokens - raw_num_tokens,
+        hidden_size,
+        dtype=dtype,
+        device=device,
+    )
+    return {
+        "prefix_hidden": base_inputs["prefix_hidden"],
+        "input_hidden": torch.cat(
+            [base_inputs["input_hidden"], pad_input_hidden],
+            dim=0,
+        ),
+    }
+
+
 def prepare_dense_runner_inputs(
     fixture: DenseAttentionFixture,
     case: DenseAttentionCase,
@@ -889,6 +918,10 @@ def run_dense_forward(
     inputs: dict[str, Any],
 ) -> torch.Tensor:
     return fixture.actual_module(inputs["input_hidden"], batch)
+
+
+def dense_attention_layers(fixture: DenseAttentionFixture) -> list[RadixAttention]:
+    return [fixture.actual_module.attn]
 
 
 def expected_dense_output_from_inputs(

@@ -845,6 +845,35 @@ def make_mla_padded_replay_inputs(
     }
 
 
+def make_mla_token_padded_inputs(
+    _case: MLAAttentionCase,
+    fixture: MLAAttentionFixture,
+    static_num_tokens: int,
+    base_inputs: dict[str, Any],
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> dict[str, Any]:
+    hidden_size = fixture.actual_module.hidden_size
+    raw_num_tokens = base_inputs["input_hidden"].shape[0]
+    if static_num_tokens < raw_num_tokens:
+        raise ValueError("static_num_tokens must cover the live input token count.")
+
+    pad_input_hidden = torch.randn(
+        static_num_tokens - raw_num_tokens,
+        hidden_size,
+        dtype=dtype,
+        device=device,
+    )
+    return {
+        "prefix_hidden": base_inputs["prefix_hidden"],
+        "input_hidden": torch.cat(
+            [base_inputs["input_hidden"], pad_input_hidden],
+            dim=0,
+        ),
+    }
+
+
 def prepare_mla_runner_inputs(
     fixture: MLAAttentionFixture,
     case: MLAAttentionCase,
@@ -870,6 +899,10 @@ def run_mla_forward(
     inputs: dict[str, Any],
 ) -> torch.Tensor:
     return fixture.actual_module(inputs["input_hidden"], batch)
+
+
+def mla_attention_layers(fixture: MLAAttentionFixture) -> list[RadixAttention]:
+    return [fixture.actual_module.attn_mqa]
 
 
 def expected_mla_output_from_inputs(

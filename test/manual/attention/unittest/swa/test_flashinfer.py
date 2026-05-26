@@ -16,6 +16,7 @@ from common.dense_attention import (
     make_swa_no_prefix_input_config_cases,
     run_dense_attention_case,
 )
+from common.split_op_runner import run_dense_split_op_extend_case
 
 
 @unittest.skipIf(
@@ -40,6 +41,22 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
             sliding_window_size=4,
         ),
     )
+    SPLIT_OP_CASES = (
+        (
+            DenseAttentionCase(
+                name="runner_split_op_swa_extend_no_prefix_window_edges",
+                backend="flashinfer",
+                forward_mode=ForwardMode.EXTEND,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(0, 0, 0),
+                extend_lens=(3, 4, 5),
+                sliding_window_size=4,
+            ),
+            16,
+        ),
+    )
 
     def test_projected_swa_attention_cases(self):
         for case in self.CASES:
@@ -60,6 +77,24 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
                     head_dim=self.HEAD_DIM,
                     hidden_size=self.HIDDEN_SIZE,
                 )
+
+    def test_runner_mode_split_op_extend_cases(self):
+        for case, static_num_tokens in self.SPLIT_OP_CASES:
+            for breakable in (False, True):
+                runner = "bcg" if breakable else "pcg"
+                with self.subTest(
+                    case=case.name,
+                    backend=case.backend,
+                    runner=runner,
+                ):
+                    run_dense_split_op_extend_case(
+                        self,
+                        case,
+                        breakable=breakable,
+                        static_num_tokens=static_num_tokens,
+                        head_dim=self.HEAD_DIM,
+                        hidden_size=self.HIDDEN_SIZE,
+                    )
 
 
 if __name__ == "__main__":

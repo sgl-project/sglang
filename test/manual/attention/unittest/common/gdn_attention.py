@@ -529,6 +529,7 @@ def build_gdn_attention_fixture(
     dtype: torch.dtype = DEFAULT_DTYPE,
     device: str = DEFAULT_DEVICE,
     disable_cuda_graph: bool = True,
+    disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
 ) -> GDNAttentionFixture:
     seed = 4096 + len(case.name)
@@ -550,6 +551,7 @@ def build_gdn_attention_fixture(
         head_k_dim=head_k_dim,
         head_v_dim=head_v_dim,
         disable_cuda_graph=disable_cuda_graph,
+        disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
         runner_batch_size=runner_batch_size,
     )
     try:
@@ -786,6 +788,61 @@ def make_gdn_replay_inputs(
     return base_inputs
 
 
+def make_gdn_token_padded_inputs(
+    _case: GDNAttentionCase,
+    fixture: GDNAttentionFixture,
+    static_num_tokens: int,
+    base_inputs: dict[str, torch.Tensor],
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> dict[str, torch.Tensor]:
+    del fixture
+    raw_num_tokens = base_inputs["mixed_qkv"].shape[0]
+    if static_num_tokens < raw_num_tokens:
+        raise ValueError("static_num_tokens must cover the live input token count.")
+
+    pad_num_tokens = static_num_tokens - raw_num_tokens
+    return {
+        "mixed_qkv": torch.cat(
+            [
+                base_inputs["mixed_qkv"],
+                torch.randn(
+                    pad_num_tokens,
+                    base_inputs["mixed_qkv"].shape[1],
+                    dtype=dtype,
+                    device=device,
+                ),
+            ],
+            dim=0,
+        ),
+        "a": torch.cat(
+            [
+                base_inputs["a"],
+                torch.randn(
+                    pad_num_tokens,
+                    base_inputs["a"].shape[1],
+                    dtype=dtype,
+                    device=device,
+                ),
+            ],
+            dim=0,
+        ),
+        "b": torch.cat(
+            [
+                base_inputs["b"],
+                torch.randn(
+                    pad_num_tokens,
+                    base_inputs["b"].shape[1],
+                    dtype=dtype,
+                    device=device,
+                ),
+            ],
+            dim=0,
+        ),
+    }
+
+
 def prepare_gdn_runner_inputs(
     fixture: GDNAttentionFixture,
     case: GDNAttentionCase,
@@ -813,6 +870,10 @@ def run_gdn_forward(
         inputs["a"],
         inputs["b"],
     )
+
+
+def gdn_attention_layers(fixture: GDNAttentionFixture) -> list[RadixLinearAttention]:
+    return [fixture.actual_module.attn]
 
 
 def expected_gdn_output_from_inputs(

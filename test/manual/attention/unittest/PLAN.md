@@ -36,6 +36,13 @@ Implemented:
   lengths within the configured window; an above-window Triton SWA decode case
   exposes a backend/reference semantic mismatch before graph replay and should be
   investigated separately from runner coverage.
+- Phase 3 PCG/BCG split-op replay now covers representative dense MHA/GQA
+  extend, SWA extend, MLA extend, and GDN extend paths. These tests use live
+  backend metadata with a larger static token buffer to verify
+  `num_token_non_padded_cpu` slicing, not just exact-shape eager behavior.
+- MLA split-op coverage exercises the absorb-MLA cached-KV path where
+  `RadixAttention` receives `k/v=None`; the split-op wrapper now preserves that
+  contract instead of assuming materialized K/V tensors.
 - Dense input-config cases now cover page size 1, zero-prefix exact page,
   zero-prefix input lengths below/equal/above a page, prefix-length exact page,
   total-length exact page, total-length crossing a page boundary, ragged
@@ -73,13 +80,12 @@ Implemented:
   orthogonal to runner/backend metadata compatibility.
 
 In progress:
-- Phase 3 representative coverage needs one more pass before Phase 4: add
-  representative PCG/BCG split-op coverage for dense/SWA/GDN module paths.
+- Phase 4 speculative/EAGLE-style metadata coverage is next for representative
+  valid attention backends.
 
 Next implementation steps:
-- Finish the remaining Phase 3 graph coverage before implementing Phase 4.
-- Then finish Phase 4 speculative metadata coverage for representative valid
-  backends before adding more Phase 2 backend files.
+- Finish Phase 4 speculative metadata coverage for representative valid backends
+  before adding more Phase 2 backend files.
 - After representative Phase 2/3/4 coverage is stable, expand Phase 2 to additional
   attention backends such as `flashmla`, `cutlass_mla`, `trtllm_mha`,
   `trtllm_mla`, `fa3`, `fa4`, `dual_chunk_flash_attn`, and `flex_attention`.
@@ -90,6 +96,13 @@ Next implementation steps:
 
 Latest verification:
 - `python -m py_compile test/manual/attention/unittest/common/cuda_graph_runner.py test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/mla/test_triton.py test/manual/attention/unittest/gdn/test_triton.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/swa/test_flashinfer.py`
+- `python test/manual/attention/unittest/dense/test_triton.py -v`
+- `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
+- `python test/manual/attention/unittest/mla/test_triton.py -v`
+- `python test/manual/attention/unittest/gdn/test_triton.py -v`
+- `python test/manual/attention/unittest/swa/test_triton.py -v`
+- `python test/manual/attention/unittest/swa/test_flashinfer.py -v`
+- `python -m py_compile python/sglang/srt/layers/radix_attention.py test/manual/attention/unittest/common/split_op_runner.py test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/mla/test_triton.py test/manual/attention/unittest/gdn/test_triton.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/swa/test_flashinfer.py`
 - `python test/manual/attention/unittest/dense/test_triton.py -v`
 - `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
 - `python test/manual/attention/unittest/mla/test_triton.py -v`
@@ -112,6 +125,7 @@ test/manual/attention/unittest/
     dense_attention.py
     gdn_attention.py
     mla_attention.py
+    split_op_runner.py
   dense/
     test_torch_native.py
     test_triton.py
