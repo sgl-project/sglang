@@ -6,10 +6,13 @@ and underscore-prefixed (so unittest discovery skips them).
 
 import unittest
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
 from sglang.test.scripted_runtime.req_handle import ReqHandle
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
+
+register_cuda_ci(est_time=180, stage="base-b", runner_config="1-gpu-small")
 
 _COMMON_ENGINE_KWARGS = dict(
     model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,

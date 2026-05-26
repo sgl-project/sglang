@@ -23,10 +23,13 @@ What the demo covers:
 
 import unittest
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
 from sglang.test.scripted_runtime.req_handle import ReqHandle
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
+
+register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 
 
 def _demo_script(t: ScriptedRuntime):
