@@ -79,19 +79,19 @@ def fill_expected_inputs_from_reqs(
         valid_lens: Optional device tensor shape ``[req_to_token_alloc_size]``.
             Same as ``pool``.
     """
-    reqs = forward_batch.reqs
-    if reqs is None:
-        raise RuntimeError(
-            "kv-canary: fill_expected_inputs_from_reqs called but "
-            "forward_batch.reqs is None; set "
-            "SGLANG_KV_CANARY_ENABLE_REQ_TOKEN_IDS_CHECK=1 so ForwardBatch.init_new "
-            "populates it"
-        )
-
     positions = forward_batch.positions
     input_ids = forward_batch.input_ids
     num_tokens = int(input_ids.shape[0])
     if num_tokens == 0:
+        return
+
+    reqs = forward_batch.reqs
+    if reqs is None:
+        # cuda-graph capture path: synthetic batches have no real reqs / source-of-truth.
+        # Fill tautologically so the captured write kernel's assert is a no-op on dummy data.
+        # Real forwards (replay) repopulate via ForwardBatch.init_new where reqs is set.
+        expected_inputs_out.tokens[:num_tokens].copy_(input_ids.to(torch.int64))
+        expected_inputs_out.positions[:num_tokens].copy_(positions.to(torch.int64))
         return
 
     mode_offset = _logical_pos_offset(forward_batch=forward_batch)
