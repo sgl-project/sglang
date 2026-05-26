@@ -42,10 +42,9 @@ from sglang.srt.speculative.spec_utils import (
     generate_simulated_accept_index,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
-    maybe_detect_nan,
-    maybe_detect_oob,
 )
 from sglang.srt.utils import is_cuda, is_musa, next_power_of_2
+from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
 
 if is_cuda() or is_musa():
     from sgl_kernel import (

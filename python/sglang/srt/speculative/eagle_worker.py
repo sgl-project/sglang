@@ -65,9 +65,6 @@ from sglang.srt.speculative.spec_utils import (
     generate_token_bitmask,
     get_last_loc_large_page_size_large_top_k,
     load_token_map,
-    maybe_detect_inf,
-    maybe_detect_nan,
-    maybe_detect_oob,
     select_top_k_tokens,
 )
 from sglang.srt.utils import (
@@ -79,6 +76,11 @@ from sglang.srt.utils import (
     is_npu,
     log_info_on_rank0,
     next_power_of_2,
+)
+from sglang.srt.utils.async_probe import (
+    maybe_detect_inf,
+    maybe_detect_nan,
+    maybe_detect_oob,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 

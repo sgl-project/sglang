@@ -48,12 +48,14 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
-    maybe_detect_inf,
-    maybe_detect_nan,
-    maybe_detect_oob,
     record_stream_each,
     record_stream_for_v2_verify,
     select_top_k_tokens,
+)
+from sglang.srt.utils.async_probe import (
+    maybe_detect_inf,
+    maybe_detect_nan,
+    maybe_detect_oob,
 )
 from sglang.srt.utils.common import empty_context, fast_topk
 
