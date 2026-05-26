@@ -83,7 +83,7 @@ class TestFillExpectedInputs(CustomTestCase):
 
         hook.fill_expected_inputs(
             forward_batch=fb,
-            expected_inputs_out=expected_inputs,
+            out_expected_inputs=expected_inputs,
         )
 
         self.assertEqual(
@@ -127,7 +127,7 @@ class TestFillExpectedInputs(CustomTestCase):
 
         hook.fill_expected_inputs(
             forward_batch=fb,
-            expected_inputs_out=expected_inputs,
+            out_expected_inputs=expected_inputs,
         )
 
         self.assertEqual(fb.rids_int.tolist(), [hashed_a, hashed_b])
@@ -165,7 +165,7 @@ class TestFillExpectedInputs(CustomTestCase):
 
         hook.fill_expected_inputs(
             forward_batch=fb,
-            expected_inputs_out=expected_inputs,
+            out_expected_inputs=expected_inputs,
         )
 
         self.assertEqual(
@@ -200,7 +200,7 @@ class TestFillExpectedInputs(CustomTestCase):
 
         hook.fill_expected_inputs(
             forward_batch=fb,
-            expected_inputs_out=expected_inputs,
+            out_expected_inputs=expected_inputs,
         )
 
         self.assertEqual(expected_inputs.tokens.tolist(), initial_tokens.tolist())
