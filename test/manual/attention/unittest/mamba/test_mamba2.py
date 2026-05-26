@@ -1,9 +1,14 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+    MambaAttnBackendBase,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
 
@@ -101,6 +106,116 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
             "the trailing rows holding the real mamba indices instead "
             "of -1.",
         )
+
+    # Hybrid dispatch fan-out tests (MagicMock-based) — same pattern as
+    # GDN. `Mamba2AttnBackend` inherits the `MambaAttnBackendBase`
+    # capture/replay contract through `HybridLinearAttnBackend`, so a
+    # dispatch-layer slice mutation (e.g. `attn_backend_list[1:]` vs
+    # `[:1]`) would silently break Mamba2 dispatch without these spies.
+
+    def _make_dispatch_spy_backend(self):
+        full_attn_backend = MagicMock(name="full_attn_backend")
+        # `HybridLinearAttnBackend.__init__` aliases these buffer refs.
+        full_attn_backend.token_to_kv_pool = object()
+        full_attn_backend.req_to_token_pool = object()
+
+        linear_attn_backend = MagicMock(
+            spec=MambaAttnBackendBase, name="linear_attn_backend"
+        )
+
+        backend = HybridLinearAttnBackend(
+            full_attn_backend,
+            linear_attn_backend,
+            full_attn_layers=[],
+        )
+        return backend, full_attn_backend, linear_attn_backend
+
+    @staticmethod
+    def _assert_fanout_forwarded(method_mock, *sentinels):
+        """Assert `method_mock` was called exactly once and that each
+        sentinel object identity appears in the call's positional or
+        keyword args (tolerates positional↔keyword refactors inside
+        `HybridLinearAttnBackend`)."""
+        method_mock.assert_called_once()
+        call = method_mock.call_args
+        forwarded = list(call.args) + list(call.kwargs.values())
+        for sentinel in sentinels:
+            if not any(v is sentinel for v in forwarded):
+                raise AssertionError(
+                    f"sentinel {sentinel!r} not forwarded by "
+                    f"{method_mock._mock_name or method_mock}; call_args={call}"
+                )
+
+    def test_hybrid_dispatch_eager_init_forward_metadata_fan_out(self):
+        backend, full_attn_backend, linear_attn_backend = (
+            self._make_dispatch_spy_backend()
+        )
+        sentinel_forward_batch = object()
+        backend.init_forward_metadata(sentinel_forward_batch)
+        self._assert_fanout_forwarded(
+            full_attn_backend.init_forward_metadata, sentinel_forward_batch
+        )
+        self._assert_fanout_forwarded(
+            linear_attn_backend.init_forward_metadata, sentinel_forward_batch
+        )
+
+    def test_hybrid_dispatch_replay_init_forward_metadata_fan_out(self):
+        backend, full_attn_backend, linear_attn_backend = (
+            self._make_dispatch_spy_backend()
+        )
+
+        sentinel_req_pool = object()
+        sentinel_seq_lens = object()
+        sentinel_seq_lens_cpu = object()
+        sentinel_spec_info = object()
+
+        backend.init_forward_metadata_replay_cuda_graph(
+            bs=3,
+            req_pool_indices=sentinel_req_pool,
+            seq_lens=sentinel_seq_lens,
+            seq_lens_sum=42,
+            encoder_lens=None,
+            forward_mode=ForwardMode.DECODE,
+            spec_info=sentinel_spec_info,
+            seq_lens_cpu=sentinel_seq_lens_cpu,
+        )
+
+        for sub_backend in (full_attn_backend, linear_attn_backend):
+            self._assert_fanout_forwarded(
+                sub_backend.init_forward_metadata_replay_cuda_graph,
+                sentinel_req_pool,
+                sentinel_seq_lens,
+                sentinel_seq_lens_cpu,
+                sentinel_spec_info,
+                ForwardMode.DECODE,
+            )
+
+    def test_hybrid_dispatch_capture_init_forward_metadata_fan_out(self):
+        backend, full_attn_backend, linear_attn_backend = (
+            self._make_dispatch_spy_backend()
+        )
+        sentinel_req_pool = object()
+        sentinel_seq_lens = object()
+        sentinel_spec_info = object()
+
+        backend.init_forward_metadata_capture_cuda_graph(
+            bs=3,
+            num_tokens=3,
+            req_pool_indices=sentinel_req_pool,
+            seq_lens=sentinel_seq_lens,
+            encoder_lens=None,
+            forward_mode=ForwardMode.DECODE,
+            spec_info=sentinel_spec_info,
+        )
+
+        for sub_backend in (full_attn_backend, linear_attn_backend):
+            self._assert_fanout_forwarded(
+                sub_backend.init_forward_metadata_capture_cuda_graph,
+                sentinel_req_pool,
+                sentinel_seq_lens,
+                sentinel_spec_info,
+                ForwardMode.DECODE,
+            )
 
 
 if __name__ == "__main__":

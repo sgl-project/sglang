@@ -23,6 +23,22 @@ Columns are runner modes; rows are the SSM kernel backend
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | `triton` (`Mamba2AttnBackend`) | ✓ EXTEND zero-prefix exact-page / below-page / above-page, with-prefix, multi-request zero-prefix / ragged, page_size=1 (7 variants) | metadata-only: `init_forward_metadata_replay_cuda_graph` with `seq_lens_cpu=[5,1,1]` to cover the M21 padding-count mutation in `_replay_metadata`; full forward replay blocked by baseline `enable_symm_mem` bug | deferred | deferred | deferred | deferred | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
 
+## Hybrid dispatch fan-out tests (MagicMock-based)
+
+Same shape as the GDN dispatch tests. Mamba2 inherits the
+`MambaAttnBackendBase` capture/replay contract through
+`HybridLinearAttnBackend`, so a dispatch-layer slice mutation (e.g.
+`attn_backend_list[1:]` vs `[:1]`) would silently break Mamba2 dispatch
+without explicit spies. Each test constructs a `HybridLinearAttnBackend`
+with two `MagicMock` sub-backends and asserts both receive the matching
+call.
+
+| Test | Mutation covered |
+|---|---|
+| `test_hybrid_dispatch_eager_init_forward_metadata_fan_out` | M20 — `attn_backend_list[1:]` slice in `init_forward_metadata` (`hybrid_linear_attn_backend.py:825-827`) |
+| `test_hybrid_dispatch_replay_init_forward_metadata_fan_out` | M19 — `attn_backend_list[:1]` slice in `init_forward_metadata_replay_cuda_graph` (`hybrid_linear_attn_backend.py:879-900`) |
+| `test_hybrid_dispatch_capture_init_forward_metadata_fan_out` | Symmetric capture coverage (not in mutation journal) |
+
 ## Input And Config Coverage
 
 - 7 EXTEND input layouts via `make_mamba2_cases('triton')`:
