@@ -16,6 +16,7 @@
 # Text encoding is handled by SanaWMTextEncodingStage so it can mirror the
 # official chi-prompt token window without changing the shared text stage.
 
+import math
 import os
 import time
 from typing import Any
@@ -51,6 +52,134 @@ _SANA_WM_DIAGNOSTICS_ENVS = (
 
 _SANA_WM_DEFAULT_VAE_TILE_MIN_FRAMES = 96
 _SANA_WM_DEFAULT_VAE_TILE_STRIDE_FRAMES = 64
+_SANA_WM_DEFAULT_TRANSLATION_SPEED = 0.05
+_SANA_WM_DEFAULT_ROTATION_SPEED_DEG = 1.2
+_SANA_WM_DEFAULT_PITCH_LIMIT_DEG = 85.0
+_SANA_WM_ALLOWED_ACTION_KEYS: frozenset[str] = frozenset("wasdijkl")
+
+
+def _sana_wm_rot_x(angle_rad: float) -> torch.Tensor:
+    c, s = math.cos(angle_rad), math.sin(angle_rad)
+    return torch.tensor(
+        [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]], dtype=torch.float64
+    )
+
+
+def _sana_wm_rot_y(angle_rad: float) -> torch.Tensor:
+    c, s = math.cos(angle_rad), math.sin(angle_rad)
+    return torch.tensor(
+        [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]], dtype=torch.float64
+    )
+
+
+def parse_sana_wm_action_string(action: str) -> list[list[str]]:
+    """Parse upstream SANA-WM WASD/IJKL DSL into per-frame held keys."""
+
+    cleaned = "".join(action.replace("，", ",").split())
+    if not cleaned:
+        raise ValueError("SANA-WM action string is empty")
+
+    per_frame: list[list[str]] = []
+    for segment in cleaned.split(","):
+        if not segment or "-" not in segment:
+            raise ValueError(
+                f"Invalid SANA-WM action segment {segment!r}: "
+                "expected '<keys>-<duration>'."
+            )
+        keys_part, dur_str = segment.rsplit("-", 1)
+        if not dur_str.isdigit() or int(dur_str) <= 0:
+            raise ValueError(
+                f"SANA-WM action segment {segment!r} has a non-positive "
+                f"duration {dur_str!r}."
+            )
+
+        keys_lower = keys_part.lower()
+        if keys_lower == "none":
+            keys: list[str] = []
+        else:
+            bad = sorted(
+                {c for c in keys_lower if c not in _SANA_WM_ALLOWED_ACTION_KEYS}
+            )
+            if bad:
+                raise ValueError(
+                    f"SANA-WM action segment {segment!r} contains unknown keys "
+                    f"{bad}; allowed: {''.join(sorted(_SANA_WM_ALLOWED_ACTION_KEYS))}."
+                )
+            keys = sorted(set(keys_lower))
+        per_frame.extend([list(keys) for _ in range(int(dur_str))])
+    return per_frame
+
+
+def sana_wm_action_to_camera_to_world(
+    action: str,
+    *,
+    translation_speed: float = _SANA_WM_DEFAULT_TRANSLATION_SPEED,
+    rotation_speed_deg: float = _SANA_WM_DEFAULT_ROTATION_SPEED_DEG,
+    pitch_limit_deg: float = _SANA_WM_DEFAULT_PITCH_LIMIT_DEG,
+) -> torch.Tensor:
+    """Roll out upstream SANA-WM action DSL to a camera-to-world trajectory.
+
+    The DSL groups segments as ``<keys>-<frames>`` joined by commas. Movement
+    keys ``wasd`` translate on the world XZ plane; rotation keys ``ijkl`` apply
+    pitch/yaw. The coordinate convention is OpenCV: +X right, +Y down, +Z
+    forward. The returned shape is ``(N+1, 4, 4)``.
+    """
+
+    per_frame = parse_sana_wm_action_string(action)
+    rotate_rad = math.radians(float(rotation_speed_deg))
+    pitch_limit_rad = math.radians(float(pitch_limit_deg))
+    current = torch.eye(4, dtype=torch.float64)
+    poses = [current.clone()]
+    current_pitch = 0.0
+
+    for keys in per_frame:
+        held = set(keys)
+        rotation = current[:3, :3]
+        translation = current[:3, 3]
+
+        pitch_delta = (rotate_rad if "i" in held else 0.0) - (
+            rotate_rad if "k" in held else 0.0
+        )
+        new_pitch = current_pitch + pitch_delta
+        if not (-pitch_limit_rad <= new_pitch <= pitch_limit_rad):
+            pitch_delta = 0.0
+        else:
+            current_pitch = new_pitch
+
+        yaw_delta = (rotate_rad if "l" in held else 0.0) - (
+            rotate_rad if "j" in held else 0.0
+        )
+        rotation_new = (
+            _sana_wm_rot_y(yaw_delta) @ rotation @ _sana_wm_rot_x(pitch_delta)
+        )
+
+        forward = rotation_new[:, 2].clone()
+        forward[1] = 0.0
+        right = rotation_new[:, 0].clone()
+        right[1] = 0.0
+        forward_norm = float(torch.linalg.vector_norm(forward).item())
+        right_norm = float(torch.linalg.vector_norm(right).item())
+        if forward_norm > 0:
+            forward = forward / (forward_norm + 1e-6)
+        if right_norm > 0:
+            right = right / (right_norm + 1e-6)
+
+        move = torch.zeros(3, dtype=torch.float64)
+        if "w" in held:
+            move += forward * float(translation_speed)
+        if "s" in held:
+            move -= forward * float(translation_speed)
+        if "d" in held:
+            move += right * float(translation_speed)
+        if "a" in held:
+            move -= right * float(translation_speed)
+
+        current = torch.eye(4, dtype=torch.float64)
+        current[:3, :3] = rotation_new
+        current[:3, 3] = translation + move
+        poses.append(current.clone())
+
+    return torch.stack(poses, dim=0).to(dtype=torch.float32)
 
 
 def _resolve_sana_wm_vae_frame_tile_value(
@@ -498,10 +627,9 @@ class SanaWMDenoisingStage(DenoisingStage):
             getattr(server_args.pipeline_config, "dit_precision", "bf16"),
             torch.bfloat16,
         )
-        scheduler = (
-            getattr(batch, "scheduler", None)
-            or get_or_create_request_scheduler(batch, self.scheduler)
-        )
+        scheduler = getattr(
+            batch, "scheduler", None
+        ) or get_or_create_request_scheduler(batch, self.scheduler)
         timesteps = batch.timesteps
         if timesteps is None:
             raise ValueError("SANA-WM denoising requires prepared timesteps.")
@@ -527,9 +655,7 @@ class SanaWMDenoisingStage(DenoisingStage):
         neg_mask = None
         if do_cfg:
             neg_embeds = _to_device_dtype(
-                _first_tensor(
-                    server_args.pipeline_config.get_neg_prompt_embeds(batch)
-                ),
+                _first_tensor(server_args.pipeline_config.get_neg_prompt_embeds(batch)),
                 device=device,
                 dtype=target_dtype,
             )
@@ -623,9 +749,7 @@ class SanaWMDenoisingStage(DenoisingStage):
 
                 if do_cfg:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    guidance_scale = float(
-                        getattr(batch, "guidance_scale", 1.0) or 1.0
-                    )
+                    guidance_scale = float(getattr(batch, "guidance_scale", 1.0) or 1.0)
                     noise_pred = noise_pred_uncond + guidance_scale * (
                         noise_pred_text - noise_pred_uncond
                     )
@@ -647,9 +771,7 @@ class SanaWMDenoisingStage(DenoisingStage):
                     latents_shape
                 )
 
-                tokens_to_denoise = t.float() / 1000.0 - 1e-6 < (
-                    1.0 - condition_mask
-                )
+                tokens_to_denoise = t.float() / 1000.0 - 1e-6 < (1.0 - condition_mask)
                 latents = torch.where(tokens_to_denoise, denoised_latents, latents)
                 if latents.dtype != latents_dtype:
                     latents = latents.to(latents_dtype)
@@ -703,7 +825,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
     @torch.no_grad()
     def _vae_encode_image(
         self,
-        image: torch.Tensor,     # (1, C, H, W) or (1, C, 1, H, W) in [0, 1] float
+        image: torch.Tensor,  # (1, C, H, W) or (1, C, 1, H, W) in [0, 1] float
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
@@ -827,7 +949,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
     def _splice_first_frame(
         self,
         latents: torch.Tensor,  # (B, 128, T_lat, H_sp, W_sp)
-        condition_image,        # PIL Image or torch.Tensor
+        condition_image,  # PIL Image or torch.Tensor
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
@@ -845,6 +967,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         # Convert PIL to tensor if needed
         if isinstance(condition_image, PIL.Image.Image):
             import torchvision.transforms.functional as TF
+
             img_tensor = TF.to_tensor(condition_image.convert("RGB")).unsqueeze(0)
         elif isinstance(condition_image, torch.Tensor):
             img_tensor = condition_image.float()
@@ -864,6 +987,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         target_w = W_sp * self.pipeline_config.vae_stride[2]  # 32
         if img_tensor.shape[-2] != target_h or img_tensor.shape[-1] != target_w:
             import torch.nn.functional as F
+
             img_tensor = F.interpolate(
                 img_tensor,
                 size=(target_h, target_w),
@@ -924,6 +1048,119 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         return None
 
     @staticmethod
+    def _first_request_mapping_value(
+        extra: dict[str, Any],
+        diffusers_kwargs: dict[str, Any],
+        *keys: str,
+    ) -> Any:
+        for mapping in (extra, diffusers_kwargs):
+            for key in keys:
+                if key in mapping and mapping[key] is not None:
+                    return mapping[key]
+        return None
+
+    @staticmethod
+    def _request_float_value(
+        extra: dict[str, Any],
+        diffusers_kwargs: dict[str, Any],
+        *keys: str,
+        default: float,
+    ) -> float:
+        value = SanaWMBeforeDenoisingStage._first_request_mapping_value(
+            extra, diffusers_kwargs, *keys
+        )
+        return default if value is None else float(value)
+
+    @staticmethod
+    def _request_action_value(
+        extra: dict[str, Any],
+        diffusers_kwargs: dict[str, Any],
+    ) -> Any:
+        return SanaWMBeforeDenoisingStage._first_request_mapping_value(
+            extra, diffusers_kwargs, "action", "sana_wm_action"
+        )
+
+    @staticmethod
+    def _pad_or_trim_action_trajectory(
+        trajectory: torch.Tensor,
+        num_frames: int,
+    ) -> torch.Tensor:
+        current = trajectory.shape[0]
+        if current == num_frames:
+            return trajectory
+        if current > num_frames:
+            return trajectory[:num_frames]
+        pad = num_frames - current
+        return torch.cat([trajectory, trajectory[-1:].repeat(pad, 1, 1)], dim=0)
+
+    @staticmethod
+    def _coerce_action_camera_to_world(
+        value: Any,
+        *,
+        batch_size: int,
+        num_frames: int,
+        translation_speed: float,
+        rotation_speed_deg: float,
+        pitch_limit_deg: float,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if isinstance(value, str):
+            actions = [value]
+        elif isinstance(value, (list, tuple)) and all(
+            isinstance(x, str) for x in value
+        ):
+            actions = list(value)
+        else:
+            raise ValueError(
+                "SANA-WM action must be a string or a list of strings, "
+                f"got {type(value).__name__}."
+            )
+
+        trajectories = [
+            SanaWMBeforeDenoisingStage._pad_or_trim_action_trajectory(
+                sana_wm_action_to_camera_to_world(
+                    action,
+                    translation_speed=translation_speed,
+                    rotation_speed_deg=rotation_speed_deg,
+                    pitch_limit_deg=pitch_limit_deg,
+                ),
+                num_frames,
+            )
+            for action in actions
+        ]
+        camera = torch.stack(trajectories, dim=0).to(device=device, dtype=dtype)
+        if camera.shape[0] == 1 and batch_size > 1:
+            camera = camera.expand(batch_size, -1, -1, -1)
+        elif camera.shape[0] != batch_size:
+            raise ValueError(
+                f"SANA-WM action batch {camera.shape[0]} does not match {batch_size}"
+            )
+        return camera
+
+    @staticmethod
+    def _action_num_frames_for_request(batch: Req) -> int | None:
+        extra = getattr(batch, "extra", None) or {}
+        diffusers_kwargs = extra.get("diffusers_kwargs", {})
+        if not isinstance(diffusers_kwargs, dict):
+            diffusers_kwargs = {}
+        action = SanaWMBeforeDenoisingStage._request_action_value(
+            extra, diffusers_kwargs
+        )
+        if action is None:
+            return None
+        if isinstance(action, str):
+            return len(parse_sana_wm_action_string(action)) + 1
+        if isinstance(action, (list, tuple)) and all(
+            isinstance(x, str) for x in action
+        ):
+            return max(len(parse_sana_wm_action_string(x)) + 1 for x in action)
+        raise ValueError(
+            "SANA-WM action must be a string or a list of strings, "
+            f"got {type(action).__name__}."
+        )
+
+    @staticmethod
     def _coerce_camera_to_world(
         value: Any,
         *,
@@ -973,10 +1210,10 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        value = SanaWMBeforeDenoisingStage._maybe_load_npy_tensor(
-            value, "intrinsics"
+        value = SanaWMBeforeDenoisingStage._maybe_load_npy_tensor(value, "intrinsics")
+        intrinsics = (
+            value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
         )
-        intrinsics = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
         intrinsics = intrinsics.to(device=device, dtype=dtype)
 
         if intrinsics.dim() == 1 and intrinsics.shape[0] == 4:
@@ -1020,9 +1257,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             )
         if intrinsics.shape[1] == 1 and num_frames > 1:
             intrinsics = intrinsics.expand(-1, num_frames, -1)
-        return SanaWMBeforeDenoisingStage._pad_or_trim_frames(
-            intrinsics, num_frames
-        )
+        return SanaWMBeforeDenoisingStage._pad_or_trim_frames(intrinsics, num_frames)
 
     @staticmethod
     def _relative_camera_poses(camera_to_world: torch.Tensor) -> torch.Tensor:
@@ -1121,6 +1356,8 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                 "chunk_plucker",
                 "camera_to_world",
                 "intrinsics",
+                "action",
+                "sana_wm_action",
             )
         ):
             return True
@@ -1137,6 +1374,8 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                 "camera_path",
                 "intrinsics",
                 "intrinsics_path",
+                "action",
+                "sana_wm_action",
             )
         )
 
@@ -1167,6 +1406,14 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         diffusers_kwargs = extra.get("diffusers_kwargs", {})
         if not isinstance(diffusers_kwargs, dict):
             diffusers_kwargs = {}
+        action = self._request_action_value(extra, diffusers_kwargs)
+        if action is not None and (
+            camera_conditions is not None or chunk_plucker is not None
+        ):
+            raise ValueError(
+                "SANA-WM action cannot be combined with prepacked "
+                "camera_conditions/chunk_plucker."
+            )
         if camera_conditions is not None:
             camera_conditions = (
                 camera_conditions
@@ -1222,7 +1469,81 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                     "intrinsics",
                     "intrinsics_path",
                 )
-            if camera_to_world is not None:
+            if action is not None and camera_to_world is not None:
+                raise ValueError(
+                    "SANA-WM action and camera_to_world/camera_path are "
+                    "mutually exclusive."
+                )
+
+            if action is not None:
+                source = (
+                    "action" if intrinsics is not None else "action_default_intrinsics"
+                )
+                translation_speed = self._request_float_value(
+                    extra,
+                    diffusers_kwargs,
+                    "translation_speed",
+                    "action_translation_speed",
+                    "sana_wm_translation_speed",
+                    default=_SANA_WM_DEFAULT_TRANSLATION_SPEED,
+                )
+                rotation_speed_deg = self._request_float_value(
+                    extra,
+                    diffusers_kwargs,
+                    "rotation_speed_deg",
+                    "action_rotation_speed_deg",
+                    "sana_wm_rotation_speed_deg",
+                    default=_SANA_WM_DEFAULT_ROTATION_SPEED_DEG,
+                )
+                pitch_limit_deg = self._request_float_value(
+                    extra,
+                    diffusers_kwargs,
+                    "pitch_limit_deg",
+                    "action_pitch_limit_deg",
+                    "sana_wm_pitch_limit_deg",
+                    default=_SANA_WM_DEFAULT_PITCH_LIMIT_DEG,
+                )
+                camera_to_world = self._coerce_action_camera_to_world(
+                    action,
+                    batch_size=batch_size,
+                    num_frames=num_frames,
+                    translation_speed=translation_speed,
+                    rotation_speed_deg=rotation_speed_deg,
+                    pitch_limit_deg=pitch_limit_deg,
+                    device=device,
+                    dtype=camera_compute_dtype,
+                )
+                self.log_info(
+                    "SANA-WM action trajectory rolled out: frames=%d, "
+                    "translation_speed=%.6g, rotation_speed_deg=%.6g, "
+                    "pitch_limit_deg=%.6g",
+                    camera_to_world.shape[1],
+                    translation_speed,
+                    rotation_speed_deg,
+                    pitch_limit_deg,
+                )
+                if intrinsics is None:
+                    _, intrinsics_vec4 = self._default_static_camera(
+                        batch_size=batch_size,
+                        num_frames=num_frames,
+                        pixel_h=batch.height,
+                        pixel_w=batch.width,
+                        device=device,
+                        dtype=camera_compute_dtype,
+                    )
+                    self.log_info(
+                        "No intrinsics provided; using heuristic centered "
+                        "intrinsics for the action trajectory."
+                    )
+                else:
+                    intrinsics_vec4 = self._coerce_intrinsics_vec4(
+                        intrinsics,
+                        batch_size=batch_size,
+                        num_frames=num_frames,
+                        device=device,
+                        dtype=camera_compute_dtype,
+                    )
+            elif camera_to_world is not None:
                 source = (
                     "request"
                     if intrinsics is not None
@@ -1356,12 +1677,14 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
 
         # diffusers FlowMatchEulerDiscreteScheduler supports mu/shift
         import inspect
+
         sig_params = inspect.signature(scheduler.set_timesteps).parameters
         if "shift" in sig_params:
             kwargs["shift"] = flow_shift
         elif "mu" in sig_params:
             # Convert flow_shift to mu: mu ≈ log(shift)
             import math
+
             kwargs["mu"] = math.log(flow_shift)
 
         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
@@ -1397,7 +1720,17 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         dtype = torch.bfloat16  # SANA-WM runs in bf16
 
         # --- 0. Adjust num_frames to be compatible with VAE temporal stride ---
-        num_frames = batch.num_frames or 49
+        requested_num_frames = batch.num_frames or 49
+        action_num_frames = self._action_num_frames_for_request(batch)
+        if action_num_frames is not None and action_num_frames < requested_num_frames:
+            self.log_info(
+                "SANA-WM action trajectory has %d frames; capping requested "
+                "num_frames=%d before VAE stride adjustment.",
+                action_num_frames,
+                requested_num_frames,
+            )
+            requested_num_frames = action_num_frames
+        num_frames = requested_num_frames
         num_frames = self.pipeline_config.adjust_num_frames(num_frames)
         batch.num_frames = num_frames
         self.log_info(
@@ -1418,7 +1751,9 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
 
         # --- 2. Compute latent shape and initialize noise ---
         batch_size = batch.batch_size or 1
-        latent_shape = self.pipeline_config.prepare_latent_shape(batch, batch_size, num_frames)
+        latent_shape = self.pipeline_config.prepare_latent_shape(
+            batch, batch_size, num_frames
+        )
         # latent_shape: (B, 128, T_latent, H_sp, W_sp)
         latents = self._prepare_noise_latents(latent_shape, dtype, device, generator)
         log_sana_wm_tensor_stats("latents.initial_noise", latents)
@@ -1430,7 +1765,9 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         condition_image = getattr(batch, "condition_image", None)
         if condition_image is not None:
             try:
-                latents = self._splice_first_frame(latents, condition_image, dtype, device)
+                latents = self._splice_first_frame(
+                    latents, condition_image, dtype, device
+                )
                 self.log_info("First-frame spliced into noise latents.")
             except Exception as e:
                 raise RuntimeError(
@@ -1439,7 +1776,9 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                     "misleading low-quality output."
                 ) from e
         else:
-            self.log_info("No condition_image provided; using pure noise latents (T2V mode).")
+            self.log_info(
+                "No condition_image provided; using pure noise latents (T2V mode)."
+            )
 
         batch.latents = latents
 
@@ -1490,16 +1829,13 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         # --- 6. Ensure prompt_embeds is a list (DenoisingStage expects list[Tensor]) ---
         if isinstance(batch.prompt_embeds, torch.Tensor):
             batch.prompt_embeds = [batch.prompt_embeds]
-        if (
-            batch.negative_prompt_embeds is not None
-            and isinstance(batch.negative_prompt_embeds, torch.Tensor)
+        if batch.negative_prompt_embeds is not None and isinstance(
+            batch.negative_prompt_embeds, torch.Tensor
         ):
             batch.negative_prompt_embeds = [batch.negative_prompt_embeds]
 
         # --- 7. CFG setup ---
-        batch.do_classifier_free_guidance = (
-            getattr(batch, "guidance_scale", 1.0) > 1.0
-        )
+        batch.do_classifier_free_guidance = getattr(batch, "guidance_scale", 1.0) > 1.0
 
         self.log_info(
             "BeforeDenoisingStage done: latent=%s, T_lat=%d, H_sp=%d, W_sp=%d, "
