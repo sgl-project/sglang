@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any
 
 import torch
 from torch import nn
@@ -234,7 +235,11 @@ class DSAMockModelRunner(ModelRunner):
         device: str,
         max_context_len: int,
         head_dim: int,
+        disable_cuda_graph: bool = True,
+        disable_piecewise_cuda_graph: bool = True,
+        runner_batch_size: int | None = None,
     ):
+        pool_batch_size = runner_batch_size or case.batch_size
         self.device = device
         self.dtype = dtype
         self.kv_cache_dtype = dtype
@@ -247,8 +252,8 @@ class DSAMockModelRunner(ModelRunner):
         self.server_args = SimpleNamespace(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=True,
-            disable_piecewise_cuda_graph=True,
+            disable_cuda_graph=disable_cuda_graph,
+            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
             disable_radix_cache=False,
             dllm_algorithm=None,
             dllm_algorithm_config=None,
@@ -278,12 +283,12 @@ class DSAMockModelRunner(ModelRunner):
         )
         set_global_server_args_for_scheduler(self.server_args)
         self.req_to_token_pool = ReqToTokenPool(
-            size=case.batch_size,
+            size=pool_batch_size,
             max_context_len=max_context_len,
             device=device,
             enable_memory_saver=False,
         )
-        max_token_loc = case.page_size + case.batch_size * max_context_len
+        max_token_loc = case.page_size + pool_batch_size * max_context_len
         self.token_to_kv_pool = DSATokenToKVPool(
             size=max_token_loc + case.page_size,
             page_size=case.page_size,
@@ -498,6 +503,9 @@ def build_dsa_attention_fixture(
     max_context_len: int = DSA_PAGE_SIZE,
     dtype: torch.dtype = torch.bfloat16,
     device: str = DEFAULT_DEVICE,
+    disable_cuda_graph: bool = True,
+    disable_piecewise_cuda_graph: bool = True,
+    runner_batch_size: int | None = None,
 ) -> DSAAttentionFixture:
     max_context_len = max(max_context_len, max(case.seq_lens))
     if max_context_len % case.page_size:
@@ -522,6 +530,9 @@ def build_dsa_attention_fixture(
         device=device,
         max_context_len=max_context_len,
         head_dim=head_dim,
+        disable_cuda_graph=disable_cuda_graph,
+        disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+        runner_batch_size=runner_batch_size,
     )
     try:
         backend = ATTENTION_BACKENDS[case.backend](runner)
@@ -863,3 +874,180 @@ def run_dsa_sparse_attention_case(
     torch.testing.assert_close(
         actual, expected, atol=DSA_SPARSE_ATOL, rtol=DSA_SPARSE_RTOL
     )
+
+
+# ---------------------------------------------------------------------------
+# Runner-mode helpers for DSA dense fallback split-op extend
+# ---------------------------------------------------------------------------
+
+
+def make_dsa_case_with_prefix_lens(
+    case: DSAAttentionCase,
+    name: str,
+    prefix_lens: tuple[int, ...],
+) -> DSAAttentionCase:
+    """Build a variant case with new `prefix_lens`. For DECODE we drop
+    `extend_lens` (input_lens derives `(1,) * batch_size`); for EXTEND we
+    clip/pad the original `extend_lens` to match the new batch shape."""
+    if case.forward_mode.is_decode():
+        extend_lens: tuple[int, ...] = ()
+    else:
+        base = case.extend_lens or (1,)
+        if len(prefix_lens) <= len(base):
+            extend_lens = base[: len(prefix_lens)]
+        else:
+            extend_lens = base + (base[-1],) * (len(prefix_lens) - len(base))
+    return DSAAttentionCase(
+        name=name,
+        backend=case.backend,
+        forward_mode=case.forward_mode,
+        num_heads=case.num_heads,
+        num_kv_heads=case.num_kv_heads,
+        page_size=case.page_size,
+        prefix_lens=prefix_lens,
+        extend_lens=extend_lens,
+    )
+
+
+def dsa_fixture_inputs(fixture: DSAAttentionFixture) -> dict[str, Any]:
+    return {
+        "prefix_hidden": fixture.prefix_hidden,
+        "input_hidden": fixture.input_hidden,
+    }
+
+
+def make_dsa_random_inputs(
+    case: DSAAttentionCase,
+    fixture: DSAAttentionFixture,
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> dict[str, Any]:
+    hidden_size = fixture.actual_module.hidden_size
+    prefix_hidden = [
+        torch.randn(length, hidden_size, dtype=dtype, device=device)
+        for length in case.prefix_lens
+    ]
+    input_hidden = torch.randn(
+        case.num_input_tokens, hidden_size, dtype=dtype, device=device
+    )
+    return {"prefix_hidden": prefix_hidden, "input_hidden": input_hidden}
+
+
+def make_dsa_token_padded_inputs(
+    _case: DSAAttentionCase,
+    fixture: DSAAttentionFixture,
+    static_num_tokens: int,
+    base_inputs: dict[str, Any],
+    *,
+    dtype: torch.dtype,
+    device: str,
+) -> dict[str, Any]:
+    """Pad `input_hidden` to a fixed static token count. Prefix is kept
+    unchanged because DSA dense fallback uses inline K (projected from
+    prefix+input each call) — there's no K-cache write at attn time."""
+    del fixture
+    hidden_size = base_inputs["input_hidden"].shape[1]
+    raw_num_tokens = base_inputs["input_hidden"].shape[0]
+    if static_num_tokens < raw_num_tokens:
+        raise ValueError("static_num_tokens must cover the live input token count.")
+    if static_num_tokens == raw_num_tokens:
+        return base_inputs
+    pad_num_tokens = static_num_tokens - raw_num_tokens
+    return {
+        "prefix_hidden": base_inputs["prefix_hidden"],
+        "input_hidden": torch.cat(
+            [
+                base_inputs["input_hidden"],
+                torch.randn(pad_num_tokens, hidden_size, dtype=dtype, device=device),
+            ],
+            dim=0,
+        ),
+    }
+
+
+def prepare_dsa_runner_inputs(
+    fixture: DSAAttentionFixture,
+    case: DSAAttentionCase,
+    batch: ForwardBatch,
+    inputs: dict[str, Any],
+    *,
+    max_context_len: int,
+) -> None:
+    """Write the new inputs onto the fixture. DSA dense fallback doesn't
+    pre-populate K cache (K is passed inline via `attn(q, k, v, ...)`),
+    so this just rebinds `prefix_hidden`/`input_hidden`."""
+    del max_context_len
+    fixture.case = case
+    fixture.forward_batch = batch
+    fixture.prefix_hidden = inputs["prefix_hidden"]
+    fixture.input_hidden = inputs["input_hidden"]
+
+
+def run_dsa_forward(
+    fixture: DSAAttentionFixture,
+    batch: ForwardBatch,
+    inputs: dict[str, Any],
+) -> torch.Tensor:
+    """DSA dense fallback forward. Mirrors `run_dsa_fixture_eager` but
+    takes `(fixture, batch, inputs)` to fit the generic runner adapter
+    contract, and does not call `testcase.skipTest` — case selection is
+    the caller's responsibility."""
+    case = fixture.case
+    module = fixture.actual_module
+    input_hidden = inputs["input_hidden"]
+    # `input_hidden` may have trailing padding for split-op static-token
+    # contracts; project only the live token rows for QKV. The kernel
+    # respects `num_token_non_padded_cpu` via the metadata.
+    live_input_hidden = input_hidden[: case.num_input_tokens]
+    input_parts = _split_by_lens(live_input_hidden, case.input_lens)
+    kv_hidden = torch.cat(
+        [
+            torch.cat([inputs["prefix_hidden"][req_idx], input_part], dim=0)
+            for req_idx, input_part in enumerate(input_parts)
+        ],
+        dim=0,
+    )
+    q, _, _ = module.project_qkv(input_hidden)
+    _, k, v = module.project_qkv(kv_hidden)
+    backend = fixture.backend
+    attn_output = module.attn(q, k, v, batch, save_kv_cache=False)
+    attn_output = attn_output.reshape(-1, case.num_heads * module.head_dim)
+    return module.o_proj(attn_output)
+
+
+def expected_dsa_output_from_inputs(
+    fixture: DSAAttentionFixture,
+    case: DSAAttentionCase,
+    inputs: dict[str, Any],
+    state,
+) -> torch.Tensor:
+    """Pure-PyTorch dense-attention reference (DSA dense fallback IS plain
+    MHA, no sparse selection). The `state` arg is unused — dense fallback
+    has no recurrent state."""
+    del state
+    return _dense_attention_reference(
+        fixture.reference_module,
+        case,
+        inputs["prefix_hidden"],
+        inputs["input_hidden"][: case.num_input_tokens],
+    )
+
+
+def dsa_attention_layers(fixture: DSAAttentionFixture) -> list:
+    """Return the RadixAttention layers the backend forwards through. The
+    split-op runner uses this to install per-layer
+    `num_token_non_padded_cpu` metadata before forward."""
+    return [fixture.actual_module.attn]
+
+
+def _clone_dsa_cache(fixture: DSAAttentionFixture):
+    """No-op snapshot — DSA dense fallback has no recurrent state. The
+    K cache is populated inline per forward call via `save_kv_cache=False`,
+    so capture/replay independence doesn't require state snapshotting."""
+    del fixture
+    return None
+
+
+def _restore_dsa_cache(fixture: DSAAttentionFixture, state) -> None:
+    del fixture, state

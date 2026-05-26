@@ -44,6 +44,21 @@ Columns are runner modes; rows are the two DSA sub-paths exercised through the
   fall-through asserts `False` (`dsa_backend.py:629`) for anything not in
   `is_decode_or_idle` / `is_extend()` (incl. `MIXED`, `DRAFT_EXTEND`,
   `TARGET_VERIFY`, `SPLIT_PREFILL`, `DLLM_EXTEND`) / `is_draft_extend(include_v2=True)`.
+- **PCG/BCG split-op extend on the MHA_ONE_SHOT dense fallback path** —
+  structurally incompatible with `unified_attention_with_output`. DSA's
+  dense fallback passes K as concatenated `prefix + extend` (shape
+  `[sum(seq_lens), num_kv_heads, head_dim]`) to `module.attn(q, k, v,
+  forward_batch, save_kv_cache=False)`, but `unified_attention_with_output`
+  (`radix_attention.py:170-208`, which RadixAttention routes to under
+  piecewise CG) slices K to `forward_batch.num_token_non_padded_cpu` (=
+  live extend-token count) on the per-token K convention used by
+  Triton/FlashInfer/FA. The slice removes the prefix portion, so a
+  piecewise CG run diverges from the eager DSA dense fallback by ~50%
+  mismatch (~0.35 max diff) vs the HF reference. Unblocking needs
+  either (a) the DSA dense fallback rewritten to write K to cache
+  (`save_kv_cache=True`) and pass extend-only K to `module.attn` (so
+  the slicing is a no-op), or (b) a backend-hint on `RadixAttention` to
+  skip the K-slice when the kernel expects prefix-concatenated K.
 
 ## Required Fixture Work
 
@@ -52,9 +67,28 @@ Columns are runner modes; rows are the two DSA sub-paths exercised through the
   index patterns).
 - Decide hardware gates for TileLang / FA / FlashMLA-sparse paths before
   enabling default tests.
+- Runner-mode integration is now plumbed at the fixture level:
+  `DSAMockModelRunner` accepts `disable_cuda_graph`,
+  `disable_piecewise_cuda_graph`, and `runner_batch_size` kwargs;
+  `build_dsa_attention_fixture` passes them through; and
+  `dsa_attention.py` exposes the standard adapter callbacks
+  (`make_dsa_case_with_prefix_lens`, `dsa_fixture_inputs`,
+  `make_dsa_random_inputs`, `make_dsa_token_padded_inputs`,
+  `prepare_dsa_runner_inputs`, `run_dsa_forward`,
+  `expected_dsa_output_from_inputs`, `dsa_attention_layers`,
+  `_clone_dsa_cache`, `_restore_dsa_cache`). The dense fallback path
+  still can't actually exercise piecewise CG (see
+  "Production-Unsupported"); CG decode through the sparse fixture is
+  the natural next target once the sparse-fixture topk-indices
+  threading is added to the adapter contract.
 
 ## Next Work
 
-- Add CUDA graph and PCG/BCG coverage once metadata parity is clear.
+- Add CG decode coverage via the sparse fixture: the
+  `dsa_sparse_decode_*` cases are DECODE-mode and the backend selects
+  `flashmla_kv` which uses cached K (compatible with piecewise CG).
+  Needs the inputs dict to carry `topk_indices` through capture/replay
+  and a sparse-specific `run_dsa_sparse_forward(fixture, batch, inputs)`
+  that re-passes `topk_indices=inputs["topk_indices"]` on each call.
 - Add non-trailing index-layout sparse cases when a representative
   index-construction path is identified.
