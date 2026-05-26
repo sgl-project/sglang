@@ -579,7 +579,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 for buf in self.mla_indexer_pool.get_hybrid_pool_buffer():
                     super().register_buffer(buf)
                 self.has_mla_indexer_sidecar = True
-            except Exception:
+            except (KeyError, AttributeError):
                 self.mla_indexer_pool = None
                 logger.debug(
                     "MLA host pool has no usable INDEXER sidecar for Mooncake v1 path.",
