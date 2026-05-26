@@ -16,7 +16,7 @@ except ImportError:
     CuteDslMoEWrapper = None
     convert_sf_to_mma_layout = None
 
-register_cuda_ci(est_time=590, suite="stage-c-test-4-gpu-b200")
+register_cuda_ci(est_time=24, stage="extra-b", runner_config="4-gpu-b200")
 
 SKIP_TEST = torch.cuda.get_device_capability() < (10, 0)
 SKIP_REASON = "Nvfp4 Requires compute capability of 10 or above."
@@ -780,7 +780,8 @@ class TestCuteDslV2(unittest.TestCase):
 class TestCuteDslV1(unittest.TestCase):
     """Correctness tests for the CuteDSL v1 (deepep) path.
 
-    The v1 path (apply_without_routing_weights -> flashinfer_cutedsl_moe_masked)
+    The v1 path (flashinfer_cutedsl_moe_masked, dispatched via the
+    @register_fused_func("deepep", "flashinfer_cutedsl") MoeRunner entry)
     is used when --moe-runner-backend flashinfer_cutedsl and --moe-a2a-backend
     deepep are combined.  It expects:
       - W13 in default [Gate, Up] order (load_up_proj_weight_first = False)

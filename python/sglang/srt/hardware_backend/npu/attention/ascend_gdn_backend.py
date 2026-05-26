@@ -350,14 +350,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                     ssm_states.dtype, copy=False
                 )
                 ssm_states[cache_indices] = last_recurrent_state
-            if not forward_batch.spec_algorithm.is_none():
-                last_recurrent_state = last_recurrent_state.transpose(-1, -2).to(
-                    ssm_states.dtype, copy=False
-                )
-            else:
-                last_recurrent_state = last_recurrent_state.to(
-                    ssm_states.dtype, copy=False
-                )
+            last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             ssm_states[cache_indices] = last_recurrent_state
             if h is not None:
                 self._track_mamba_state_extend(
@@ -414,7 +407,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             nv=num_value_heads,
             intermediate_state=intermediate_state,
             cache_indices=cache_indices,
-            num_accept_tokens=num_accept_tokens,
+            num_accepted_tokens=num_accept_tokens,
             g=g,
         )
 
