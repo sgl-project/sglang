@@ -557,6 +557,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
         self.has_mla_indexer_sidecar = False
+        self.mla_indexer_pool = None
         assert self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
@@ -571,23 +572,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             raise TypeError("Mooncake Store Register Buffer Error.") from err
 
         # Compatibility path for DSA/NSA on v1 storage APIs:
-        # if host pool also exposes indexer page metadata, register indexer buffers
-        # and persist indexer sidecar keys together with MLA _k keys.
-        if self.is_mla_backend and hasattr(
-            self.mem_pool_host, "get_index_k_with_scale_page_buffer_meta"
-        ):
-            self.has_mla_indexer_sidecar = True
-            if hasattr(self.mem_pool_host, "get_pool"):
-                try:
-                    indexer_pool = self.mem_pool_host.get_pool(PoolName.INDEXER)
-                    for buf in indexer_pool.get_hybrid_pool_buffer():
-                        super().register_buffer(buf)
-                except Exception:
-                    logger.debug(
-                        "Detected MLA indexer metadata API but failed to register "
-                        "explicit INDEXER buffers from host pool.",
-                        exc_info=True,
-                    )
+        # if HostPoolGroup carries DSA INDEXER sidecar, persist it with MLA _k.
+        if self.is_mla_backend and hasattr(self.mem_pool_host, "get_pool"):
+            try:
+                self.mla_indexer_pool = self.mem_pool_host.get_pool(PoolName.INDEXER)
+                for buf in self.mla_indexer_pool.get_hybrid_pool_buffer():
+                    super().register_buffer(buf)
+                self.has_mla_indexer_sidecar = True
+            except Exception:
+                self.mla_indexer_pool = None
+                logger.debug(
+                    "MLA host pool has no usable INDEXER sidecar for Mooncake v1 path.",
+                    exc_info=True,
+                )
 
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
@@ -772,9 +769,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             assert len(key_list) == len(kv_ptr_list)
             return key_list, kv_ptr_list, kv_element_size_list
 
-        index_ptr_list, index_element_size_list = (
-            self.mem_pool_host.get_index_k_with_scale_page_buffer_meta(indices)
-        )
+        index_ptr_list, index_element_size_list = self.mla_indexer_pool.get_page_buffer_meta(indices)
         if len(index_ptr_list) != len(kv_ptr_list):
             raise ValueError(
                 "MLA indexer metadata length mismatch: "
