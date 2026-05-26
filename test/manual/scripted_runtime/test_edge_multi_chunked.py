@@ -6,6 +6,9 @@ mixed chunked-in-flight + normal-decode batch composition.
 """
 
 import unittest
+
+from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
+from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
@@ -14,9 +17,6 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until,
     run_until_all_finished,
 )
-
-from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.test_utils import CustomTestCase
 
 

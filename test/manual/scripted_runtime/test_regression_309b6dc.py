@@ -11,6 +11,9 @@ included but mark obvious model/feature dependencies in the docstring.
 """
 
 import unittest
+
+from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
+from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
@@ -19,9 +22,6 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until_all_finished,
     run_until_finished,
 )
-
-from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.test_utils import CustomTestCase
 
 _LORA_BASE_MODEL = "meta-llama/Llama-3.2-1B-Instruct"

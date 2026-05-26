@@ -14,6 +14,9 @@ of writing (audit doc lists exact lines).
 """
 
 import unittest
+
+from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
+from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
@@ -21,9 +24,6 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until,
     run_until_finished,
 )
-
-from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -151,7 +151,7 @@ def _script_no_idle_during_chunked(t: ScriptedRuntime):
     yield from run_until(r, lambda h: h.is_chunking)
 
     # If the scheduler had idled, the chunked req would not progress.
-    assert not t.is_idle
+    assert not t.scheduler_idle
     yield from run_until_finished(r)
 
 
