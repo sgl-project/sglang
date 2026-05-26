@@ -4,17 +4,30 @@ This folder covers standard dense MHA/GQA/MQA attention through `RadixAttention`
 Expected outputs come from independent HF-style PyTorch reference modules with
 copied random projection weights, not from another SGLang attention backend.
 
-## Current Matrix
+## Coverage Matrix
 
-| Backend | Phase 2: method correctness | Phase 3: runner compatibility | Phase 4: speculative modes | Status |
-|---|---|---|---|---|
-| `torch_native` | Full dense input-shape sweep plus MHA/GQA/MQA configs | Eager decode/extend runner checks | Not enabled | No CUDA-graph or replay path: `TorchNativeAttnBackend` does not override `init_forward_metadata_capture_cuda_graph` / `_replay_cuda_graph`, so graph runners are production-unsupported. `TARGET_VERIFY` probe currently fails in torch-native SDPA extend metadata handling. |
-| `triton` | Full dense input-shape sweep plus MHA/GQA/MQA configs | CUDA graph decode for MHA/GQA/MQA; PCG/BCG extend for MHA/GQA | EAGLE/Frozen-KV-MTP/DFlash/NGRAM verify; verify CUDA graph for EAGLE/DFlash/NGRAM; production `EAGLEDraftCudaGraphRunner` chain/tree replay; production EAGLE `DRAFT_EXTEND_V2` graph replay | `DRAFT_EXTEND` is intentionally blocked by a reference mismatch. |
-| `flashinfer` | Full dense sweep with `head_dim=64` for SM90 prefill constraints | CUDA graph decode for MHA/GQA/MQA; PCG/BCG extend for MHA/GQA | EAGLE/Frozen-KV-MTP/DFlash/NGRAM verify; verify CUDA graph for EAGLE/Frozen-KV-MTP/DFlash; production `EAGLEDraftCudaGraphRunner` chain/tree replay; production EAGLE `DRAFT_EXTEND`; production Frozen-KV MTP draft decode | `DRAFT_EXTEND_V2` graph capture is production-unsupported (see below). |
-| `fa3` | Full dense input-shape sweep plus MHA/GQA/MQA configs | PCG/BCG extend | Not enabled | Hardware-gated to SM 80-90 for non-MLA, SM 90 only for MLA (`attention_registry.py:172-180`). Decode/speculative CUDA graph replay currently mismatches the PyTorch reference. |
-| `fa4` | Full dense input-shape sweep plus MHA/GQA/MQA configs | PCG/BCG extend | Not enabled | Effective hardware gate is SM 100+ (only configured as a default on SM100 paths in `server_args.py`). Same current graph blocker as `fa3`. |
-| `flex_attention` | Full dense input-shape sweep plus MHA/GQA/MQA configs | PCG/BCG extend | Not enabled | Backend mask callback compatibility is covered; rejects cross-attention / encoder-only (`torch_flex_backend.py:267-270`) and non-causal mode (`torch_flex_backend.py:151`). No CUDA-graph capture path; graph/spec coverage is structurally production-unsupported. |
-| `trtllm_mha` | Decode-only MHA/GQA/MQA and page-size-32 coverage | Not enabled | Not enabled | Local SM90 decode passes; prefill reports unsupported architecture and graph replay mismatches. Speculative paths only support `topk == 1` (production note at `server_args.py:2391-2392`; replay branches at `trtllm_mha_backend.py:459,492` explicitly comment "Here we only support topk = 1 for now"). Page size restricted to `{16, 32, 64}` (`server_args.py:2849-2853`). |
+Columns are runner modes; rows are attention backends. Cells use:
+- **✓ \<variants\>** — exercised, with the config variants listed in the cell
+- **—** — not applicable (no production path for this combination)
+- **blocked: \<reason\>** — production-unsupported, not a follow-up
+- **deferred: \<reason\>** — could land later, currently disabled
+
+| Backend | Eager Phase 2 | CG decode | PCG extend | BCG extend | Verify eager | Verify CG | DE eager | DE CG | DE-V2 CG | EAGLE-draft runner | EAGLE-DE runner | FKVMTP runner |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `torch_native` | ✓ full MHA/GQA/MQA input sweep + decode/extend runner-eager cases | — (no `init_cuda_graph_state` / capture / replay hooks) | — (no CG path) | — (no CG path) | deferred: extend-metadata mismatch in `TARGET_VERIFY` reference | — | — | — | — | — | — | — |
+| `triton` | ✓ MHA/GQA/MQA + 10 input layouts (page 1/16/32, prefix/decode edges) | ✓ MHA/GQA/MQA decode page-boundary | ✓ MHA ragged, GQA cross-page | ✓ MHA ragged, GQA cross-page | ✓ EAGLE chain+tree, Frozen-KV-MTP chain, DFlash chain, NGRAM chain | ✓ EAGLE tree, DFlash chain, NGRAM chain | deferred: Triton `DRAFT_EXTEND` HF-ref mismatch on narrow accept layouts | — (V1 not enabled; Triton uses V2) | ✓ fixed-tokens-per-req | ✓ chain (topk=1) + tree (topk=2) | ✓ via `DRAFT_EXTEND_V2` graph runner | — (production dispatcher only wires Frozen-KV-MTP through FlashInfer-style draft backends) |
+| `flashinfer` | ✓ MHA/GQA/MQA + 10 input layouts (`head_dim=64` for SM90 prefill constraints) | ✓ MHA/GQA/MQA decode page-boundary | ✓ MHA ragged, GQA cross-page | ✓ MHA ragged, GQA cross-page | ✓ EAGLE chain+tree, Frozen-KV-MTP chain, DFlash chain, NGRAM chain | ✓ EAGLE tree, Frozen-KV-MTP chain, DFlash chain | ✓ EAGLE ragged-accept, Frozen-KV-MTP ragged-accept | ✓ EAGLE ragged-accept, Frozen-KV-MTP ragged-accept | blocked: `is_draft_extend()` default `include_v2=False` → `raise ValueError` (`flashinfer_backend.py:651,748`) | ✓ chain (topk=1) + tree (topk=2) | ✓ EAGLE ragged-accept (V1) | ✓ chain (topk=1) |
+| `fa3` | ✓ MHA/GQA/MQA input sweep (FA-friendly `head_dim=64`) | deferred: graph replay mismatches HF-ref | ✓ MHA ragged, GQA cross-page | ✓ MHA ragged, GQA cross-page | deferred: not enabled (EAGLE `TARGET_VERIFY` mismatches ~0.115) | deferred: same EAGLE/DFlash mismatch on replay | — | — | deferred: `DRAFT_EXTEND_V2` graph replay mismatches HF-ref (~0.618) | — | — | — |
+| `fa4` | ✓ MHA/GQA/MQA input sweep (FA-friendly `head_dim=64`) | deferred: same FA graph-replay mismatch as fa3 | ✓ MHA ragged, GQA cross-page | ✓ MHA ragged, GQA cross-page | deferred: same FA mismatch | deferred: same FA mismatch | — | — | deferred: same FA mismatch | — | — | — |
+| `flex_attention` | ✓ MHA/GQA/MQA input sweep | blocked: no `init_cuda_graph_state` / capture / replay hooks (`torch_flex_backend.py`) | ✓ MHA ragged, GQA cross-page | ✓ MHA ragged, GQA cross-page | blocked: no CG capture/replay path | blocked: no CG capture/replay path | — | blocked: no CG capture/replay path | blocked: no CG capture/replay path | blocked: no CG capture/replay path | blocked: no CG capture/replay path | blocked: no CG capture/replay path |
+| `trtllm_mha` | ✓ decode-only MHA/GQA/MQA + page-32 boundary (prefill blocked by `Unsupported architecture`) | deferred: replay mismatches HF-ref on SM90 | — (no extend backend) | — (no extend backend) | blocked: `topk=1` only (`server_args.py:2391-2392`, `trtllm_mha_backend.py:459,492`) | blocked: same `topk=1` constraint | — | — | — | deferred: requires chain-only graph capture wiring | — | — |
+
+### Wrapper backends (smoke tests only)
+
+| Wrapper | Coverage |
+|---|---|
+| `hybrid_attn` (`prefill=triton`, `decode=flashinfer`) | ✓ EXTEND dispatches to prefill backend; ✓ DECODE dispatches to decode backend. No CG / spec coverage — the wrapper just forwards to the chosen child. |
+| `tbo` (children=`[triton, triton]`) | ✓ EXTEND with no `tbo_children` set: delegates to `primary`. Sub-batched orchestration through TBO children needs scheduler-level batch splitting and is deferred. |
 
 ## Input And Config Coverage
 
@@ -24,49 +37,21 @@ copied random projection weights, not from another SGLang attention backend.
 - Decode page-boundary batches and batch-size-1 decode.
 - Attention config coverage for MHA, GQA, and MQA is separate from input-layout coverage.
 
-## Current Progress
+## Notes on the "—" cells
 
-- Phase 2 eager correctness covers all locally runnable dense backends with an
-  independent PyTorch reference.
-- Phase 3 runner coverage includes CUDA graph decode where supported plus
-  paged/chunked and batch-chunked extend paths.
-- Phase 4 now covers synthetic verify runners and production draft-runner graph
-  replay for the Triton and FlashInfer paths whose metadata matches the reference.
-
-## Production-Unsupported
-
-- **`torch_native` CUDA graph / speculative** — `TorchNativeAttnBackend`
-  (`python/sglang/srt/layers/attention/torch_native_backend.py`) does not
-  implement `init_cuda_graph_state` / `init_forward_metadata_capture_cuda_graph` /
-  `init_forward_metadata_replay_cuda_graph`. The base class raises
-  `NotImplementedError`
-  (`python/sglang/srt/layers/attention/base_attn_backend.py:24-55`), so any
-  graph-runner / speculative-graph integration that needs these methods cannot
-  be exercised.
-- **`flex_attention` CUDA graph capture/replay** — same as `torch_native`:
-  `TorchFlexAttnBackend` (`python/sglang/srt/layers/attention/torch_flex_backend.py`)
-  does not implement the cuda-graph capture/replay hooks. It also explicitly
-  rejects non-causal (`torch_flex_backend.py:151`) and cross / encoder-only
-  attention (`torch_flex_backend.py:267-270`).
-- **FlashInfer non-MLA `DRAFT_EXTEND_V2` graph capture/replay** — both
-  `init_forward_metadata_capture_cuda_graph` and
-  `init_forward_metadata_replay_cuda_graph` only route through
-  `is_draft_extend()` (default `include_v2=False`) at
-  `python/sglang/srt/layers/attention/flashinfer_backend.py:651,748`. Any
-  `DRAFT_EXTEND_V2` mode falls into the `else: raise ValueError` branches.
-- **FlashInfer MLA `DRAFT_EXTEND_V2` graph capture/replay** — same shape, with
-  `is_draft_extend()` branches at
-  `python/sglang/srt/layers/attention/flashinfer_mla_backend.py:432,501` and a
-  final `raise ValueError("Invalid mode")` for anything else
-  (`flashinfer_mla_backend.py:454-455,512`).
-- **`trtllm_mha` speculative `topk > 1`** — the multi-step draft backend
-  `TRTLLMHAAttnMultiStepDraftBackend`
-  (`python/sglang/srt/layers/attention/trtllm_mha_backend.py:883-897`) inherits
-  from `FlashInferMultiStepDraftBackend`, which does *not* reject topk>1, but
-  the replay path itself only handles topk=1 — the comment "Here we only
-  support topk = 1 for now" at `trtllm_mha_backend.py:459,492` is load-bearing
-  and matches the server-side note that "trtllm_mha requires
-  speculative_eagle_topk == 1" (`server_args.py:2391-2392`).
+- **`torch_native` graph rows** — `TorchNativeAttnBackend` does not override
+  `init_cuda_graph_state` / `init_forward_metadata_capture_cuda_graph` /
+  `init_forward_metadata_replay_cuda_graph`; the base class raises
+  `NotImplementedError` (`base_attn_backend.py:24-55`).
+- **`flex_attention` graph rows** — `TorchFlexAttnBackend` also has no CG hooks.
+  It additionally rejects non-causal (`torch_flex_backend.py:151`) and cross /
+  encoder-only attention (`torch_flex_backend.py:267-270`).
+- **`trtllm_mha` extend rows** — backend exposes decode only; prefill currently
+  reports `Unsupported architecture` and page sizes are restricted to
+  `{16, 32, 64}` (`server_args.py:2849-2853`).
+- **`triton` FKVMTP runner** — `FrozenKVMTPMultiStepDraftBackend` dispatch wires
+  Triton through the FlashInfer-style draft path; the dedicated runner case is
+  only enabled where production routes that draft worker.
 
 ## Next Work
 

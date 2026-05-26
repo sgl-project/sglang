@@ -8,11 +8,20 @@ reference (`state_t = exp(A*dt_t) * state_{t-1} + dt_t * B_t * x_t`,
 `norm` / `out_proj` modules through shared random weights but recomputes the
 SSM core entirely in pure torch.
 
-## Current Matrix
+## Coverage Matrix
 
-| Backend | Phase 2: method correctness | Phase 3: runner compatibility | Phase 4: speculative modes | Status |
-|---|---|---|---|---|
-| `triton` (`Mamba2AttnBackend`) | Eager EXTEND zero-prefix exact-page (16 tokens) | Not implemented | Not implemented | Tolerance loosened to `5e-2` to absorb chunked-scan reordering and bf16 `out_proj` accumulation depth. |
+Columns are runner modes; rows are the SSM kernel backend
+(`triton` `Mamba2AttnBackend` is the only one wired today). Cells use:
+- **✓ \<variants\>** — exercised, with the config variants listed in the cell
+- **metadata-only** — backend exercised through the metadata path only (no
+  forward), used to cover specific mutation surfaces
+- **—** — not applicable / not exercised
+- **blocked: \<reason\>** — production-unsupported, not a follow-up
+- **deferred: \<reason\>** — could land later, currently disabled
+
+| SSM kernel | Eager Phase 2 | CG decode | PCG extend | BCG extend | Verify eager | Verify CG | DE eager | DE CG | DE-V2 CG | EAGLE-draft runner | EAGLE-DE runner | FKVMTP runner |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `triton` (`Mamba2AttnBackend`) | ✓ EXTEND zero-prefix exact-page (16 tokens) | metadata-only: `init_forward_metadata_replay_cuda_graph` with `seq_lens_cpu=[5,1,1]` to cover the M21 padding-count mutation in `_replay_metadata`; full forward replay blocked by baseline `enable_symm_mem` bug | deferred | deferred | deferred | deferred | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
 
 ## Input And Config Coverage
 
@@ -21,41 +30,42 @@ SSM core entirely in pure torch.
   `state_size=16`, `n_groups=1`, `conv_kernel=4`,
   `mamba_chunk_size=DEFAULT_MAMBA_CHUNK_SIZE=16`, `hidden_size=32`.
 - Dims chosen as the minimum that satisfies `MambaMixer2`'s TP/chunk asserts.
-
-## Current Progress
-
-- Phase 2 eager correctness is enabled for the single representative EXTEND
-  case.
-- Runner and speculative coverage are not implemented yet; broader input-
-  shape coverage (page boundary, ragged, decode) requires the
-  `MambaAttnBackendBase` dispatch path and Mamba2 cache parameter setup to
-  be wired through the fixture.
+- Replay metadata test uses `prefix_lens=(4, 0, 0)` and feeds
+  `seq_lens_cpu=[5, 1, 1]` directly so two trailing rows match the
+  CUDA-graph fill value (`1`).
 
 ## Production-Unsupported
 
 - **`Mamba2AttnBackend.forward_decode` / `forward_extend` raise** —
-  `python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py:743-749`
-  raises `NotImplementedError` for direct `forward_decode` / `forward_extend`
-  on `Mamba2AttnBackend`. Production dispatches through
-  `HybridLinearAttnBackend.forward_extend` /
-  `HybridLinearAttnBackend.forward_decode`
-  (`hybrid_linear_attn_backend.py:899-917,868-886`) instead.
+  `hybrid_linear_attn_backend.py:743-749` raises `NotImplementedError` for
+  direct calls. Production dispatches through `HybridLinearAttnBackend`'s
+  forward (`hybrid_linear_attn_backend.py:899-917, 868-886`).
 - **CUDA-graph capture/replay outside `DECODE_OR_IDLE` / `TARGET_VERIFY`** —
   the underlying `MambaAttnBackendBase` capture/replay rejects all other
-  modes (`hybrid_linear_attn_backend.py:509,572`).
+  modes (`hybrid_linear_attn_backend.py:509, 572`).
 - **Per-mixer head_dim / chunk constraints** — `MambaMixer2.__init__` asserts
-  weight dimension sums (`mamba.py:92`), TP head divisibility
-  (`mamba.py:217,221,226`), and ssd kernels reject mismatched group / chunk
-  shapes (`ops/ssd_chunk_state.py:448-509,576-583`). These are config-time
-  asserts and the test fixture explicitly sets dims to satisfy them.
+  weight dim sums (`mamba.py:92`), TP head divisibility (`mamba.py:217, 221,
+  226`), and ssd kernels reject mismatched group / chunk shapes
+  (`ops/ssd_chunk_state.py:448-509, 576-583`). The fixture sets dims to
+  satisfy these.
+
+## Known Baseline Issue
+
+- `test_projected_mamba2_attention_cases` currently fails on the foreground
+  repo with `'SimpleNamespace' object has no attribute 'enable_symm_mem'`.
+  Root cause: the mock `server_args` `SimpleNamespace` lacks
+  `enable_symm_mem`, which the production `is_symmetric_memory_enabled()`
+  reads via `get_global_server_args()` inside `MambaMixer2.in_proj` /
+  `out_proj`. The M21 mutation test (`test_mamba2_replay_metadata_padding_indices`)
+  intentionally goes metadata-only to side-step this.
 
 ## Required Fixture Work
 
 - Wire the `HybridLinearAttnBackend` dispatch wrapper into the fixture so
-  the production `init_forward_metadata*` paths and per-layer dispatch are
-  actually exercised (currently the fixture installs `Mamba2AttnBackend`
+  production `init_forward_metadata*` paths and per-layer dispatch are
+  actually exercised (today the fixture installs `Mamba2AttnBackend`
   directly via `ForwardContext`).
-- Add a CUDA graph decode fixture with explicit recurrent cache snapshot/
+- Add a CUDA graph decode fixture with explicit recurrent cache snapshot /
   restore between capture and replay, matching the GDN runner-mode shape.
 
 ## Next Work

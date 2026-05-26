@@ -5,87 +5,76 @@ latent KV through `get_token_to_kv_pool()` before calling `attn_mqa`; expected
 outputs come from a separate HF-style PyTorch MLA reference with copied random
 weights and no SGLang backend calls.
 
-## Current Matrix
+## Coverage Matrix
 
-| Backend | Phase 2: method correctness | Phase 3: runner compatibility | Phase 4: speculative modes | Status |
-|---|---|---|---|---|
-| `triton` | Full representative MLA input-shape sweep | CUDA graph decode; PCG/BCG extend | EAGLE chain verify; EAGLE tree CUDA graph verify; production EAGLE draft decode chain/tree; production EAGLE `DRAFT_EXTEND_V2` graph replay | Regular `DRAFT_EXTEND` is not enabled for Triton MLA. |
-| `flashinfer` | Full representative MLA sweep with DeepSeek-like `kv_lora_rank=512`, `qk_rope_head_dim=64` | CUDA graph decode; PCG/BCG extend | EAGLE chain verify and CUDA graph verify; production EAGLE draft decode (chain only); production EAGLE `DRAFT_EXTEND` | EAGLE tree verify (`topk=2`) is production-unsupported — see below. |
-| `flashmla` | FlashMLA-compatible page-size-64 MLA cases with DeepSeek-like shape metadata | CUDA graph decode; PCG/BCG extend | EAGLE chain verify and CUDA graph verify; production EAGLE draft decode (chain only); EAGLE `DRAFT_EXTEND` eager | `DRAFT_EXTEND` CUDA graph capture is blocked by missing `cuda_graph_qo_indptr` in the inherited FlashInfer MLA path. EAGLE tree verify (`topk=2`) is production-unsupported — see below. |
-| `cutlass_mla` | Not enabled | Not enabled | Not enabled | Local SM90 reports compute capability 10.0 requirement. Cutlass MLA also has no `forward_extend` and only supports `is_decode_or_idle` (`cutlass_mla_backend.py:86,156,197`); tree verify (`topk=2`) inherits the FlashInfer-MLA reject when the draft side wires it. |
-| `trtllm_mla` | Not enabled | Not enabled | Not enabled | Local path reports SM120a/SM121a requirement. Multi-step draft backend inherits `topk == 1` reject — see below. |
-| `tokenspeed_mla` | Not enabled | Not enabled | Not enabled | Needs an FP8 KV-cache fixture (`kv_cache_dtype=fp8_e4m3`, enforced at `server_args.py:2814-2818`) and SM100+. Multi-step draft backend inherits `topk == 1` reject — see below. |
+Columns are runner modes; rows are attention backends. Cells use:
+- **✓ \<variants\>** — exercised, with the config variants listed in the cell
+- **—** — not applicable (no production path for this combination)
+- **blocked: \<reason\>** — production-unsupported, not a follow-up
+- **deferred: \<reason\>** — could land later, currently disabled
+- **skip:hw** — hardware-gated; skipped on this environment but enabled when
+  the gating predicate passes
+
+| Backend | Eager Phase 2 | CG decode | PCG extend | BCG extend | Verify eager | Verify CG | DE eager | DE CG | DE-V2 CG | EAGLE-draft runner | EAGLE-DE runner | FKVMTP runner |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `triton` | ✓ 10 input layouts (page 1/16/32, prefix/decode edges) | ✓ MLA decode page-boundary | ✓ ragged page-boundary extend | ✓ ragged page-boundary extend | ✓ EAGLE chain (topk=1) | ✓ EAGLE tree (topk=2) | — (V1 DE not enabled for Triton MLA; Triton uses V2 path) | — | ✓ fixed-tokens-per-req | ✓ chain (topk=1) + tree (topk=2) | ✓ via `DRAFT_EXTEND_V2` graph runner | — (no FKVMTP wiring for MLA) |
+| `flashinfer` | ✓ 10 input layouts with DeepSeek-like `kv_lora_rank=512`, `qk_rope_head_dim=64` | ✓ MLA decode page-boundary | ✓ ragged page-boundary extend | ✓ ragged page-boundary extend | ✓ EAGLE chain (topk=1) | ✓ EAGLE chain (topk=1) | ✓ EAGLE ragged-accept | ✓ EAGLE ragged-accept | blocked: `is_draft_extend()` default `include_v2=False` (`flashinfer_mla_backend.py:432,501,454-455,512`) | ✓ chain (topk=1) only — tree blocked by `topk=1` reject (`flashinfer_mla_backend.py:910-913`) | ✓ EAGLE ragged-accept (V1) | — (no FKVMTP wiring for MLA) |
+| `flashmla` | ✓ FlashMLA-compatible page-size-64 cases (zero-prefix exact page, cross page, ragged, decode page-boundary) | ✓ page-size-64 decode page-boundary | ✓ ragged page-boundary extend | ✓ ragged page-boundary extend | ✓ EAGLE chain (topk=1) | ✓ EAGLE chain (topk=1) | ✓ EAGLE ragged-accept | deferred: parent FlashInfer-MLA capture path expects 1D `cuda_graph_kv_indices`, FlashMLA allocates 2D `[max_bs, (max_context+PAGE_SIZE)//PAGE_SIZE]` (`flashmla_backend.py:347-348` + parent `init_forward_metadata_capture_cuda_graph`) | — (FlashMLA does not implement V2) | ✓ chain (topk=1) only — tree blocked by `topk=1` reject (`flashmla_backend.py:555-558`) | — (DE CG deferred above) | — |
+| `cutlass_mla` | skip:hw — needs SM 10.0+ (Blackwell); current 1 case uses `ForwardMode.EXTEND` but `CutlassMLABackend` only overrides `forward_decode` (`cutlass_mla_backend.py:226`) and falls through to FlashInfer MLA for other modes → **case should be DECODE**; PAGE_SIZE fixed at 128 (`cutlass_mla_backend.py:31`) | — (decode-only backend; no extend/CG) | — | — | blocked: tree via `topk=1` reject inherited from FlashInfer MLA parent | — | — | — | — | — | — | — |
+| `trtllm_mla` | skip:hw — needs SM 12.0a / 12.1a (`is_sm120_supported`) | — | — | — | blocked: `topk=1` only (`trtllm_mla_backend.py:1223-1229` inherits from FlashInfer MLA) | — | — | — | — | — | — | — |
+| `tokenspeed_mla` | skip:hw — needs `find_spec("tokenspeed_mla")`, SM 10.0+, and `kv_cache_dtype=fp8_e4m3` (`server_args.py:2814-2818`); current MLA fixture does not emit FP8 KV cache | — | — | — | blocked: `topk=1` only (`tokenspeed_mla_backend.py:341-347` inherits from TRT-LLM MLA) | — | — | — | — | — | — | — |
 
 ## Input And Config Coverage
 
 - Page size 1, page-boundary decode, exact-page and crossing-page extend cases.
 - Ragged page-boundary extend batches.
-- Representative page-size-32 crossing case.
-- Nonzero MLA rope dimension support is present, but RoPE math is intentionally
-  orthogonal to the runner/backend matrix.
-
-## Current Progress
-
-- Phase 2 eager correctness covers the locally runnable MLA backends with a
-  separate absorb-style PyTorch reference.
-- Phase 3 coverage includes CUDA graph decode and paged/chunked extend replay
-  for Triton, FlashInfer MLA, and FlashMLA.
-- Phase 4 now includes both synthetic EAGLE verify coverage and production
-  EAGLE draft-runner graph replay for the stable backend/mode combinations.
+- Representative page-size-32 crossing case (`triton`, `flashinfer`).
+- FlashMLA cases use `page_size=64` because `FlashMLABackend` forces that size
+  (`server_args.py:2767-2770`).
+- Nonzero MLA rope dimension support is present in the fixture, but RoPE math
+  is intentionally orthogonal to the runner/backend matrix.
 
 ## Production-Unsupported
 
 These combinations are explicitly rejected by the production speculative
-multi-step draft backends and cannot ever appear at runtime. They are recorded
-here so future test work does not add them as "next-step" follow-ups.
+multi-step draft backends and cannot ever appear at runtime.
 
 - **FlashInfer MLA tree verify / draft-extend with `topk > 1`** — raised by
   `FlashInferMLAMultiStepDraftBackend.__init__` at
   `python/sglang/srt/layers/attention/flashinfer_mla_backend.py:910-913`:
   `if topk > 1: raise ValueError("Currently Flashinfer MLA only supports topk=1
-  for speculative decoding")`. The draft side of any FlashInfer MLA spec run is
-  hard-gated, so MLA EAGLE tree (`topk=2`) on FlashInfer cannot be reached in
-  production. The dispatcher routes MLA EAGLE through this class at
-  `python/sglang/srt/speculative/draft_utils.py:126-132`.
+  for speculative decoding")`. Dispatcher: `draft_utils.py:126-132`.
 - **FlashMLA tree verify / draft-extend with `topk > 1`** — raised by
   `FlashMLAMultiStepDraftBackend.__init__` at
-  `python/sglang/srt/layers/attention/flashmla_backend.py:555-558`:
-  `if topk > 1: raise ValueError("Currently FlashMLA only supports topk=1 for
-  speculative decoding")`. Dispatched from
-  `python/sglang/srt/speculative/draft_utils.py:173-180`.
+  `python/sglang/srt/layers/attention/flashmla_backend.py:555-558`. Dispatcher:
+  `draft_utils.py:173-180`.
 - **TRT-LLM MLA tree verify / draft-extend with `topk > 1`** —
   `TRTLLMMLAMultiStepDraftBackend` inherits from
-  `FlashInferMLAMultiStepDraftBackend`
-  (`python/sglang/srt/layers/attention/trtllm_mla_backend.py:1223-1229`) so the
-  same `topk > 1` `raise ValueError` fires before any TRT-LLM-specific code
-  runs. Dispatched from `python/sglang/srt/speculative/draft_utils.py:191-203`.
+  `FlashInferMLAMultiStepDraftBackend` (`trtllm_mla_backend.py:1223-1229`).
 - **Tokenspeed MLA tree verify / draft-extend with `topk > 1`** —
   `TokenspeedMLAMultiStepDraftBackend` inherits from
-  `TRTLLMMLAMultiStepDraftBackend`
-  (`python/sglang/srt/layers/attention/tokenspeed_mla_backend.py:341-347`), so
-  the same chain-only ValueError applies.
-- **Tokenspeed MLA non-FP8 KV cache** — `tokenspeed_mla` requires
-  `kv_cache_dtype=fp8_e4m3` (server-side check at
-  `python/sglang/srt/server_args.py:2814-2818`) and constructor rejection at
-  `python/sglang/srt/layers/attention/tokenspeed_mla_backend.py:111-113`
-  (`if self.page_size not in (32, 64): raise ValueError`). The MLA fixture's
-  mock model runner does not currently emit FP8 KV cache.
-- **Cutlass MLA extend / verify / draft-extend modes** — `CutlassMLABackend`
-  only overrides `forward_decode`
-  (`python/sglang/srt/layers/attention/cutlass_mla_backend.py:226`) and only
-  handles `is_decode_or_idle` in `init_forward_metadata*`
-  (`cutlass_mla_backend.py:86,156,197`). Any non-decode mode falls through to
-  `super()` (FlashInfer MLA), so the only Cutlass-specific paths are decode.
-  Hardware-gated on SM 10.0 (Blackwell).
-- **All MLA backends fixed page size** — FlashMLA forces `page_size=64`
-  (`server_args.py:2767-2770`); Cutlass MLA forces `page_size=128`
-  (`server_args.py:2776-2779`, also hard-coded as `PAGE_SIZE=128` at
-  `cutlass_mla_backend.py:31`); TRT-LLM MLA and Tokenspeed MLA force
-  `page_size in {32, 64}` (`server_args.py:2790-2794` and `2809-2813`).
+  `TRTLLMMLAMultiStepDraftBackend` (`tokenspeed_mla_backend.py:341-347`).
+- **Cutlass MLA extend / verify / draft-extend** — `CutlassMLABackend` only
+  overrides `forward_decode` (`cutlass_mla_backend.py:226`) and only handles
+  `is_decode_or_idle` in `init_forward_metadata*` (`cutlass_mla_backend.py:86,
+  156, 197`). Anything else falls through to FlashInfer MLA.
+- **FlashInfer-MLA `DRAFT_EXTEND_V2` graph capture/replay** —
+  `flashinfer_mla_backend.py:432,501` only route through `is_draft_extend()`
+  (default `include_v2=False`); `else: raise ValueError("Invalid mode")` at
+  `flashinfer_mla_backend.py:454-455,512`.
+- **All MLA backends fixed page size** — FlashMLA forces `page_size=64`,
+  Cutlass MLA forces `page_size=128`, TRT-LLM MLA and Tokenspeed MLA force
+  `page_size in {32, 64}`.
 
 ## Next Work
 
-- Fix or work around FlashMLA draft-extend graph metadata allocation.
+- Fix or work around the FlashMLA `DRAFT_EXTEND` graph capture path (either
+  override capture/replay in `FlashMLABackend` to use its 2D layout, or
+  allocate both parent-style 1D and FlashMLA-style 2D buffers and route
+  `DRAFT_EXTEND` to the parent path).
+- Switch `mla/test_cutlass_mla.py` to `ForwardMode.DECODE` so it actually
+  exercises `CutlassMLABackend.forward_decode` instead of falling through to
+  FlashInfer MLA when SM 10.0+ is available.
 - Add hardware-gated tests for `cutlass_mla`, `trtllm_mla`, and `tokenspeed_mla`
-  decode (chain spec only) when appropriate hardware/KV dtype fixtures are
+  decode (chain spec only) when the appropriate hardware/KV dtype fixtures are
   available.
