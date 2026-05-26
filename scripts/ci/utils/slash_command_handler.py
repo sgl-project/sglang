@@ -953,7 +953,14 @@ def _check_rerun_test_permissions(gh_repo, pr, comment, user_perms, command_name
 
 
 def handle_rerun_test(
-    gh_repo, pr, comment, user_perms, test_specs, token, skip_permission_check=False
+    gh_repo,
+    pr,
+    comment,
+    user_perms,
+    test_specs,
+    token,
+    skip_permission_check=False,
+    command_label=None,
 ):
     """
     Handles the /rerun-test command. Resolves all test specs, groups them by
@@ -974,7 +981,8 @@ def handle_rerun_test(
             "- `/rerun-test registered/core/test_srt_endpoint.py::TestSRTEndpoint`\n"
             "- `/rerun-test test_srt_endpoint.py`\n"
             "- `/rerun-test test_a.py test_b.py test_c.py` (multiple tests)\n"
-            "- `/rerun-test test_*backend*.py` (wildcard — reruns every matching file)"
+            "- `/rerun-test test_*backend*.py` (wildcard — reruns every matching "
+            "file; wrap the pattern in backticks so GitHub keeps the `*` literal)"
         )
         return False
 
@@ -993,9 +1001,12 @@ def handle_rerun_test(
     expanded_specs = []
     seen_specs = set()
     for spec in test_specs:
-        # Quotes are never meaningful here (the command isn't shell-parsed),
-        # so strip them — it lets a habitually quoted `'test_*.py'` still match.
-        file_part = spec.split("::", 1)[0].strip().strip("'\"")
+        # Quotes/backticks are never meaningful here (the command isn't
+        # shell-parsed), so strip them. Backtick-wrapping is in fact the
+        # recommended way to write a glob: plain `*backend*` renders as italics
+        # in a GitHub comment, but `` `test_*backend*.py` `` stays literal — and
+        # either way the handler reads the raw body, so the `*` survives.
+        file_part = spec.split("::", 1)[0].strip().strip("\"'`")
         if not _is_glob_pattern(file_part):
             if spec not in seen_specs:
                 seen_specs.add(spec)
@@ -1045,7 +1056,8 @@ def handle_rerun_test(
     # Phase 3a: Create placeholder reply comment so we have its ID before
     # dispatching workflows. This lets each dispatched run write its
     # success/failure result back to the right line in this comment.
-    reply_comment = pr.create_issue_comment("🚀 Dispatching rerun-test workflow(s)...")
+    dispatching = f"`{command_label}`" if command_label else "rerun-test workflow(s)"
+    reply_comment = pr.create_issue_comment(f"🚀 Dispatching {dispatching}...")
 
     # Phase 3b: Dispatch one workflow per group, with a unique per-batch
     # marker each. The marker is an HTML comment that the writeback step
@@ -1100,6 +1112,11 @@ def handle_rerun_test(
         lines.append(f"⛔ `{r['spec']}`: {r['error']}")
 
     body = "\n\n".join(lines)
+    # Echo the originating command so each reply is self-identifying when
+    # several /rerun-test commands are in flight at once. Backtick-wrapping
+    # also keeps any `*` in the pattern from rendering as italics.
+    if command_label:
+        body = f"Results for `{command_label}`:\n\n{body}"
 
     successes = [dr for dr in dispatch_results if dr["success"]]
     if successes:
@@ -1111,7 +1128,9 @@ def handle_rerun_test(
     return len(successes) > 0
 
 
-def handle_rerun_group(gh_repo, pr, comment, user_perms, group_names, token):
+def handle_rerun_group(
+    gh_repo, pr, comment, user_perms, group_names, token, command_label=None
+):
     """
     Handles the /rerun-group command. Expands one or more registered test
     groups into test file specs, then reuses /rerun-test dispatch behavior.
@@ -1158,6 +1177,7 @@ def handle_rerun_group(gh_repo, pr, comment, user_perms, group_names, token):
         test_specs,
         token,
         skip_permission_check=True,
+        command_label=command_label,
     )
 
 
@@ -1268,11 +1288,27 @@ def main():
 
     elif first_line.startswith("/rerun-group"):
         group_names = first_line.split()[1:]
-        handle_rerun_group(repo, pr, comment, user_perms, group_names or None, token)
+        handle_rerun_group(
+            repo,
+            pr,
+            comment,
+            user_perms,
+            group_names or None,
+            token,
+            command_label=first_line,
+        )
 
     elif first_line.startswith("/rerun-test"):
         test_specs = first_line.split()[1:]
-        handle_rerun_test(repo, pr, comment, user_perms, test_specs or None, token)
+        handle_rerun_test(
+            repo,
+            pr,
+            comment,
+            user_perms,
+            test_specs or None,
+            token,
+            command_label=first_line,
+        )
 
     else:
         print(f"Unknown or ignored command: {first_line}")
