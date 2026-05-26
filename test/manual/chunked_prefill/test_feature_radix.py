@@ -1,10 +1,10 @@
 import unittest
 
-from sglang.test.chunked_prefill_test_utils import ChunkedRefactorTestBase
+from sglang.test.chunked_prefill_test_utils import ChunkedTestBase
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
-class TestChunkedFeatureRadix(ChunkedRefactorTestBase):
+class TestChunkedFeatureRadix(ChunkedTestBase):
     model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
     feature_args = [
         "--max-total-tokens",

@@ -6,11 +6,15 @@ from typing import ClassVar, List, Optional
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
+from sglang.test.server_fixtures.disaggregation_fixture import (
+    PDDisaggregationServerBase,
+)
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    try_cached_model,
 )
 
 DEFAULT_MODEL: str = "Qwen/Qwen3-0.6B"
@@ -27,7 +31,76 @@ DEFAULT_SEED: int = 42
 KV_CANARY_ARGS: List[str] = ["--enable-kv-canary"]
 
 
-class ChunkedRefactorTestBase(CustomTestCase):
+class ChunkedSimpleTester:
+    def __init__(
+        self,
+        feature_args: List[str] = (),
+        chunked_prefill_size: int = DEFAULT_CHUNKED_PREFILL_SIZE,
+        num_shots: int = DEFAULT_NUM_SHOTS,
+        num_examples: int = DEFAULT_NUM_EXAMPLES,
+        num_threads: int = DEFAULT_NUM_THREADS,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        score_threshold: float = SCORE_THRESHOLD,
+        seed: int = DEFAULT_SEED,
+    ):
+        self.feature_args = list(feature_args)
+        self.chunked_prefill_size = chunked_prefill_size
+        self.num_shots = num_shots
+        self.num_examples = num_examples
+        self.num_threads = num_threads
+        self.max_tokens = max_tokens
+        self.score_threshold = score_threshold
+        self.seed = seed
+
+    def build_prefill_side_args(self) -> List[str]:
+        return (
+            ["--chunked-prefill-size", str(self.chunked_prefill_size)]
+            + self.feature_args
+            + list(KV_CANARY_ARGS)
+        )
+
+    def build_decode_side_args(self) -> List[str]:
+        return list(KV_CANARY_ARGS)
+
+    def run_eval(self, base_url: str, model: str, fixture_name: str) -> dict:
+        args = SimpleNamespace(
+            base_url=base_url,
+            model=model,
+            eval_name="gsm8k_mixed",
+            api="chat_completion",
+            max_tokens=self.max_tokens,
+            num_examples=self.num_examples,
+            num_threads=self.num_threads,
+            num_shots=self.num_shots,
+            gsm8k_mixed_seed=self.seed,
+            temperature=0.0,
+        )
+        tic = time.perf_counter()
+        metrics = run_eval(args)
+        metrics["elapsed_sec"] = time.perf_counter() - tic
+        print(f"[{fixture_name}] {metrics}")
+        return metrics
+
+    def assert_score(self, testcase, metrics: dict) -> None:
+        score = metrics.get("score")
+        testcase.assertIsNotNone(score, "run_eval returned no score")
+        testcase.assertGreaterEqual(score, self.score_threshold)
+
+
+def _build_simple_tester(cls) -> ChunkedSimpleTester:
+    return ChunkedSimpleTester(
+        feature_args=cls.feature_args,
+        chunked_prefill_size=cls.chunked_prefill_size,
+        num_shots=cls.num_shots,
+        num_examples=cls.num_examples,
+        num_threads=cls.num_threads,
+        max_tokens=cls.max_tokens,
+        score_threshold=cls.score_threshold,
+        seed=cls.seed,
+    )
+
+
+class ChunkedTestBase(CustomTestCase):
     model: ClassVar[str] = DEFAULT_MODEL
     feature_args: ClassVar[List[str]] = []
 
@@ -43,22 +116,16 @@ class ChunkedRefactorTestBase(CustomTestCase):
     launch_timeout: ClassVar[int] = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
 
     process: ClassVar[Optional[object]] = None
-
-    @classmethod
-    def build_other_args(cls) -> List[str]:
-        return (
-            ["--chunked-prefill-size", str(cls.chunked_prefill_size)]
-            + list(cls.feature_args)
-            + list(KV_CANARY_ARGS)
-        )
+    _simple_tester: ClassVar[Optional[ChunkedSimpleTester]] = None
 
     @classmethod
     def setUpClass(cls):
+        cls._simple_tester = _build_simple_tester(cls)
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=cls.launch_timeout,
-            other_args=cls.build_other_args(),
+            other_args=cls._simple_tester.build_prefill_side_args(),
         )
 
     @classmethod
@@ -66,27 +133,42 @@ class ChunkedRefactorTestBase(CustomTestCase):
         if cls.process is not None:
             kill_process_tree(cls.process.pid)
 
-    def _run_gsm8k_mixed(self) -> dict:
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k_mixed",
-            api="chat_completion",
-            max_tokens=self.max_tokens,
-            num_examples=self.num_examples,
-            num_threads=self.num_threads,
-            num_shots=self.num_shots,
-            gsm8k_mixed_seed=self.seed,
-            temperature=0.0,
+    def test_gsm8k_mixed_chunked(self):
+        metrics = self._simple_tester.run_eval(
+            self.base_url, self.model, type(self).__name__
         )
-        tic = time.perf_counter()
-        metrics = run_eval(args)
-        metrics["elapsed_sec"] = time.perf_counter() - tic
-        print(f"[{type(self).__name__}] {metrics}")
-        return metrics
+        self._simple_tester.assert_score(self, metrics)
+
+
+class ChunkedTestPDBase(PDDisaggregationServerBase):
+    model: ClassVar[str] = DEFAULT_MODEL
+    feature_args: ClassVar[List[str]] = []
+
+    chunked_prefill_size: ClassVar[int] = DEFAULT_CHUNKED_PREFILL_SIZE
+    num_shots: ClassVar[int] = DEFAULT_NUM_SHOTS
+    num_examples: ClassVar[int] = DEFAULT_NUM_EXAMPLES
+    num_threads: ClassVar[int] = DEFAULT_NUM_THREADS
+    max_tokens: ClassVar[int] = DEFAULT_MAX_TOKENS
+    score_threshold: ClassVar[float] = SCORE_THRESHOLD
+    seed: ClassVar[int] = DEFAULT_SEED
+
+    _simple_tester: ClassVar[Optional[ChunkedSimpleTester]] = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls._simple_tester = _build_simple_tester(cls)
+        cls.extra_prefill_args = cls._simple_tester.build_prefill_side_args()
+        cls.extra_decode_args = cls._simple_tester.build_decode_side_args()
+        PDDisaggregationServerBase.setUpClass()
+        cls.model = try_cached_model(cls.model)
+        cls.launch_all()
+
+    @classmethod
+    def tearDownClass(cls):
+        PDDisaggregationServerBase.tearDownClass()
 
     def test_gsm8k_mixed_chunked(self):
-        metrics = self._run_gsm8k_mixed()
-        score = metrics.get("score")
-        self.assertIsNotNone(score, "run_eval returned no score")
-        self.assertGreaterEqual(score, self.score_threshold)
+        metrics = self._simple_tester.run_eval(
+            self.base_url, self.model, type(self).__name__
+        )
+        self._simple_tester.assert_score(self, metrics)

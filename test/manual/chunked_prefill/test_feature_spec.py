@@ -1,10 +1,10 @@
 import unittest
 
-from sglang.test.chunked_prefill_test_utils import ChunkedRefactorTestBase
+from sglang.test.chunked_prefill_test_utils import ChunkedTestBase
 from sglang.test.test_utils import DEFAULT_DRAFT_MODEL_EAGLE, DEFAULT_TARGET_MODEL_EAGLE
 
 
-class TestChunkedFeatureSpec(ChunkedRefactorTestBase):
+class TestChunkedFeatureSpec(ChunkedTestBase):
     model = DEFAULT_TARGET_MODEL_EAGLE
     feature_args = [
         "--speculative-algorithm",

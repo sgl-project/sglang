@@ -2,11 +2,11 @@ import unittest
 
 from sglang.test.chunked_prefill_test_utils import (
     LONG_PROMPT_NUM_SHOTS,
-    ChunkedRefactorTestBase,
+    ChunkedTestBase,
 )
 
 
-class TestChunkedFeatureHiSparse(ChunkedRefactorTestBase):
+class TestChunkedFeatureHiSparse(ChunkedTestBase):
     model = "deepseek-ai/DeepSeek-V4-Flash"
     num_shots = LONG_PROMPT_NUM_SHOTS
     max_tokens = 4000

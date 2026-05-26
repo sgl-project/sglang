@@ -1,9 +1,9 @@
 import unittest
 
-from sglang.test.chunked_prefill_test_utils import ChunkedRefactorTestBase
+from sglang.test.chunked_prefill_test_utils import ChunkedTestBase
 
 
-class TestChunkedFeatureLoRA(ChunkedRefactorTestBase):
+class TestChunkedFeatureLoRA(ChunkedTestBase):
     model = "meta-llama/Llama-2-7b-hf"
     feature_args = [
         "--enable-lora",

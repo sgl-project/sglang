@@ -1,10 +1,10 @@
 import unittest
 
-from sglang.test.chunked_prefill_test_utils import ChunkedRefactorTestBase
+from sglang.test.chunked_prefill_test_utils import ChunkedTestBase
 from sglang.test.test_utils import DEFAULT_MLA_MODEL_NAME_FOR_TEST
 
 
-class TestChunkedFeatureDPAttention(ChunkedRefactorTestBase):
+class TestChunkedFeatureDPAttention(ChunkedTestBase):
     model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
     feature_args = [
         "--trust-remote-code",
