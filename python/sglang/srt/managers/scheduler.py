@@ -3508,10 +3508,27 @@ class Scheduler(
 
     def abort_request(self, recv_req: AbortReq):
         # todo hisparse, release resources for abort requests in hisparse coordinator
+
+        # Invariant W3: build the batch-rid set up front so we can detect
+        # chunked-resume reqs that live in BOTH waiting_queue and
+        # batch.reqs simultaneously. If we abort such a req without
+        # dedup, the waiting_queue loop pops + releases AND the running
+        # batch loop sets to_finish (which releases again downstream).
+        # See commit de3859646b for the dedup fix.
+        if self.cur_batch is self.running_batch or self.cur_batch is None:
+            _abort_batch_reqs = self.running_batch.reqs
+        else:
+            _abort_batch_reqs = self.running_batch.reqs + self.cur_batch.reqs
+        _abort_batch_rids = {r.rid for r in _abort_batch_reqs}
+
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                if req.rid in _abort_batch_rids:
+                    # Dual-queue dedup miss: same req would be released by
+                    # waiting_queue path AND running batch to_finish path.
+                    req.abort_double_release_count += 1
                 to_del.append(i)
 
         # Sort in reverse order to avoid index issues when deleting

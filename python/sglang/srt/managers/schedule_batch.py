@@ -863,6 +863,13 @@ class Req(ReqDllmMixin):
         # _abort_on_waiting_timeout" for the original fix.
         self.watchdog_aborted_while_chunked_resume_count: int = 0
 
+        # Regression instrumentation for invariant W3: a chunked-resume
+        # req that is concurrently held in waiting_queue and batch.reqs
+        # must be released exactly once on abort. See commit de3859646b
+        # "Prep: abort_request dedup for chunked-resume dual-queue
+        # holding" for the original fix.
+        self.abort_double_release_count: int = 0
+
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
         # processed.
