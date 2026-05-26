@@ -243,6 +243,10 @@ class SingleForwardManager:
         violation_log = self._device_state.violation_log
         num_tokens = int(forward_batch.positions.shape[0])
         expected_inputs_slice = expected_inputs.slice(num_tokens)
+        expected_token_pool = self._device_state.req_to_expected_token_ids_pool
+        expected_token_valid_lens = (
+            self._device_state.req_to_expected_token_ids_valid_lens
+        )
         for group_idx, group in enumerate(self._buffer_groups):
             verify_plan = verify_plans[group_idx]
             write_plan = write_plans[group_idx]
@@ -253,6 +257,8 @@ class SingleForwardManager:
                 group=group,
                 req_to_token=self._req_to_token_pool.req_to_token,
                 swa_window_size=self._swa_window_size,
+                expected_token_pool=expected_token_pool,
+                expected_token_valid_lens=expected_token_valid_lens,
             )
             if self._swa_divergence_report is not None:
                 self._swa_divergence_report.observe_after_invoke_plan(

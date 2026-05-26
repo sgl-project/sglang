@@ -29,11 +29,25 @@ def launch_plan_entries_kernel(
     full_to_swa_index_mapping: Optional[torch.Tensor],
     verify_offsets_scratch: torch.Tensor,
     verify_enable: torch.Tensor,
+    expected_token_pool: Optional[torch.Tensor],
+    expected_token_valid_lens: Optional[torch.Tensor],
     out_verify_slot_indices: torch.Tensor,
     out_verify_positions: torch.Tensor,
     out_verify_prev_slot_indices: torch.Tensor,
+    out_verify_expected_tokens: torch.Tensor,
     swa_window_size: int,
+    slot_token_offset: int,
 ) -> None:
+    """Scatter per-entry verify plan rows.
+
+    Both ``expected_token_pool`` and ``expected_token_valid_lens`` must be either both set or both
+    ``None``; when ``None`` the kernel writes the ``-1`` "skip token check" sentinel into
+    ``out_verify_expected_tokens`` for every active entry.
+    """
+    if (expected_token_pool is None) != (expected_token_valid_lens is None):
+        raise ValueError(
+            "kv-canary: expected_token_pool and expected_token_valid_lens must be both None or both set"
+        )
     module = _jit_plan_entries_module()
     module.plan_entries(
         req_pool_indices,
@@ -42,8 +56,12 @@ def launch_plan_entries_kernel(
         full_to_swa_index_mapping,
         verify_offsets_scratch,
         verify_enable,
+        expected_token_pool,
+        expected_token_valid_lens,
         out_verify_slot_indices,
         out_verify_positions,
         out_verify_prev_slot_indices,
+        out_verify_expected_tokens,
         int(swa_window_size),
+        int(slot_token_offset),
     )

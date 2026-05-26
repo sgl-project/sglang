@@ -203,6 +203,9 @@ def _build_plan_inputs(
         req_to_token=req_to_token,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa,
+        expected_token_pool=None,
+        expected_token_valid_lens=None,
+        slot_token_offset=0,
         verify_capacity=int(verify_plan.verify_slot_indices.shape[0]),
     )
 
@@ -218,6 +221,9 @@ def _make_plan_callable(inputs: dict):
             req_to_token=inputs["req_to_token"],
             swa_window_size=inputs["swa_window_size"],
             full_to_swa_index_mapping=inputs["full_to_swa_index_mapping"],
+            expected_token_pool=inputs["expected_token_pool"],
+            expected_token_valid_lens=inputs["expected_token_valid_lens"],
+            slot_token_offset=inputs["slot_token_offset"],
             verify_capacity=inputs["verify_capacity"],
         )
 
