@@ -40,6 +40,7 @@ from common.runner_modes.cuda_graph_decode_runner import (  # noqa: E402
 )
 from common.runner_modes.eagle_draft_runner import (  # noqa: E402
     run_dsv4_eagle_draft_cuda_graph_runner_case,
+    run_dsv4_eagle_draft_extend_cuda_graph_runner_case,
 )
 from common.runner_modes.speculative_draft_extend_runner import (  # noqa: E402
     run_dsv4_eagle_draft_extend_cuda_graph_case,
@@ -302,6 +303,34 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
         for case in self.PRODUCTION_EAGLE_DRAFT_RUNNER_CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_dsv4_eagle_draft_cuda_graph_runner_case(self, case)
+
+    # Production EAGLE draft-extend graph runner (SWA only). Routes through
+    # the prefill-side `DeepseekV4AttnBackend` (single backend, not
+    # multi-step); `init_forward_metadata_draft_extend` forces
+    # `need_compress=False` so C4/C128 is structurally unreachable for this
+    # path.
+    # Uniform `extend_lens` because the DSV4 graph contract requires
+    # `q.shape[0] == swa_page_indices.shape[0]` and the
+    # `init_forward_metadata_draft_extend` graph path uses
+    # `num_tokens_per_bs = max_num_tokens // max_bs` (see
+    # `deepseek_v4_backend.py:646-647`). Same constraint as the metadata-
+    # style draft_extend CG case.
+    PRODUCTION_EAGLE_DRAFT_EXTEND_RUNNER_CASES = (
+        DSV4AttentionCase(
+            name="runner_production_eagle_draft_extend_dsv4_swa",
+            backend="dsv4",
+            forward_mode=ForwardMode.DRAFT_EXTEND,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(64, 96),
+            extend_lens=(4, 4),
+        ),
+    )
+
+    def test_runner_mode_production_eagle_draft_extend_cuda_graph_runner_cases(self):
+        for case in self.PRODUCTION_EAGLE_DRAFT_EXTEND_RUNNER_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_dsv4_eagle_draft_extend_cuda_graph_runner_case(self, case)
 
 
 if __name__ == "__main__":
