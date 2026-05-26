@@ -797,16 +797,35 @@ class MMEncoder:
                 final_slices[idx] = new_slices[i]
 
             # Fill in cache-hit embeddings (from prefetch or fallback)
+            cache_miss_indices = []
             if prefetch_status.item() == 1 and hit_indices:
                 hit_hashes = [mm_hashes[i] for i in hit_indices]
                 cached_slices = self.mm_global_cache.get_embeddings(
                     hit_hashes
                 )
                 for i, idx in enumerate(hit_indices):
-                    final_slices[idx] = cached_slices[i]
+                    if cached_slices[i] is not None:
+                        final_slices[idx] = cached_slices[i]
+                    else:
+                        # Prefetch allocation failed for this item, need ViT fallback
+                        cache_miss_indices.append(idx)
+                if cache_miss_indices:
+                    logger.warning(
+                        f"Req {req_id}: {len(cache_miss_indices)}/{len(hit_indices)} "
+                        f"cache-hit items failed to load (pool full), falling back to ViT"
+                    )
             elif fallback_slices is not None:
                 for i, idx in enumerate(hit_indices):
                     final_slices[idx] = fallback_slices[i]
+                cache_miss_indices = []
+
+            # ViT fallback for cache-miss items that couldn't be loaded
+            if cache_miss_indices:
+                miss_fallback_slices = await self._encode_missing(
+                    mm_feature, mm_inputs, cache_miss_indices, modality, get_feature_fn
+                )
+                for i, idx in enumerate(cache_miss_indices):
+                    final_slices[idx] = miss_fallback_slices[i]
 
             mm_embedding = torch.cat(final_slices, dim=0)
 
@@ -814,7 +833,14 @@ class MMEncoder:
             # copied the data into a new tensor.  This allows the cache
             # entries to be evicted under memory pressure.
             if prefetch_status.item() == 1 and hit_indices:
-                self.mm_global_cache.release_embeddings(hit_hashes)
+                # Only release hashes that were successfully loaded from cache
+                loaded_hashes = [
+                    mm_hashes[idx]
+                    for idx in hit_indices
+                    if idx not in set(cache_miss_indices)
+                ]
+                if loaded_hashes:
+                    self.mm_global_cache.release_embeddings(loaded_hashes)
 
             # Background insert: store newly computed embeddings into global cache.
             # Includes both original misses and fallback-recomputed hits.
@@ -823,6 +849,9 @@ class MMEncoder:
             if fallback_slices is not None:
                 all_new_hashes += [mm_hashes[i] for i in hit_indices]
                 all_new_slices += list(fallback_slices)
+            if cache_miss_indices:
+                all_new_hashes += [mm_hashes[i] for i in cache_miss_indices]
+                all_new_slices += [final_slices[i] for i in cache_miss_indices]
 
             if all_new_hashes:
 
