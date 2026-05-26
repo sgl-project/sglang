@@ -174,12 +174,21 @@ class DeepEPBuffer:
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
-            hidden_bytes = hidden_size * param_bytes
-            for config in (
-                DeepEPConfig.get_instance().normal_dispatch_config
-                or Buffer.get_dispatch_config(group.size()),
-                DeepEPConfig.get_instance().normal_combine_config
-                or Buffer.get_combine_config(group.size()),
+            dispatch_hidden_bytes = hidden_size * param_bytes
+            # combine() receives BF16 expert outputs regardless of dispatch dtype,
+            # so the combine NVL buffer must be sized for 2 bytes per element.
+            combine_hidden_bytes = hidden_size * 2
+            for config, hidden_bytes in (
+                (
+                    DeepEPConfig.get_instance().normal_dispatch_config
+                    or Buffer.get_dispatch_config(group.size()),
+                    dispatch_hidden_bytes,
+                ),
+                (
+                    DeepEPConfig.get_instance().normal_combine_config
+                    or Buffer.get_combine_config(group.size()),
+                    combine_hidden_bytes,
+                ),
             ):
                 num_nvl_bytes = max(
                     config.get_nvl_buffer_size_hint(hidden_bytes, group.size()),
