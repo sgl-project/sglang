@@ -220,6 +220,7 @@ def make_forward_batch(
         positions=positions,
         out_cache_loc=out_cache_loc,
         num_token_non_padded_cpu=num_token_non_padded_cpu,
+        req_truth_seqs=None,
     )
 
 
