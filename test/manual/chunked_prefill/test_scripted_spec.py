@@ -58,7 +58,7 @@ class TestScriptedSpec(CustomTestCase):
             **_spec_engine_kwargs(),
         )
 
-    # [a-Spec1] Spec handoff from chunked prefill — the first verify pass
+    # Spec handoff from chunked prefill — the first verify pass
     # after the last chunk must see prefix_len == prompt_len and include
     # the spec draft tokens for the freshly-finished prefill.
     @staticmethod
@@ -83,7 +83,7 @@ class TestScriptedSpec(CustomTestCase):
             **_spec_engine_kwargs(),
         )
 
-    # [a-Spec2] Spec acceptance — chunked vs non-chunked on the same
+    # Spec acceptance — chunked vs non-chunked on the same
     # prompt should yield approximately the same accept rate (chunked must
     # not pollute spec state).
     @staticmethod
@@ -110,7 +110,7 @@ class TestScriptedSpec(CustomTestCase):
             **_spec_engine_kwargs(),
         )
 
-    # [a-Spec3] Spec draft preparation racing with chunked abort —
+    # Spec draft preparation racing with chunked abort —
     # cancellation must clean up partial draft state; no orphaned spec
     # buffers.
     @staticmethod
@@ -132,7 +132,7 @@ class TestScriptedSpec(CustomTestCase):
             **_spec_engine_kwargs(disaggregation_mode="prefill"),
         )
 
-    # [c-D2] EAGLE + disagg + chunked — last chunk must capture all three
+    # EAGLE + disagg + chunked — last chunk must capture all three
     # spec tensors (topk_p, topk_index, hidden_states) for the decode side
     # to verify against.
     @staticmethod

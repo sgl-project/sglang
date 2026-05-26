@@ -59,7 +59,7 @@ class TestScriptedDisagg(CustomTestCase):
             ),
         )
 
-    # [c-D1] Disagg-prefill per-chunk KV send — each middle chunk must call
+    # Disagg-prefill per-chunk KV send — each middle chunk must call
     # send_kv_chunk(last_chunk=False); only the final chunk uses last_chunk=True.
     @staticmethod
     def _script_disagg_prefill_per_chunk_kv_send(t: ScriptedRuntime):
@@ -90,7 +90,7 @@ class TestScriptedDisagg(CustomTestCase):
             ),
         )
 
-    # [c-D3 / B3] Disagg overlap + middle chunk — tmp_end_idx must advance
+    # Disagg overlap + middle chunk — tmp_end_idx must advance
     # by exactly chunk_size each iter; send_kv_chunk uses tmp_end_idx as the
     # right end of the slice for the in-flight middle chunk.
     @staticmethod
@@ -119,7 +119,7 @@ class TestScriptedDisagg(CustomTestCase):
             ),
         )
 
-    # [b-414efd4a27] Disagg chunked retract — start_send_idx must reset to 0
+    # Disagg chunked retract — start_send_idx must reset to 0
     # and tmp_end_idx to -1 so the resumed prefill restarts the KV stream.
     @staticmethod
     def _script_disagg_retract_resets_send_state(t: ScriptedRuntime):

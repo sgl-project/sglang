@@ -471,7 +471,7 @@ class TestScriptedPriority(CustomTestCase):
             ),
         )
 
-    # [a-NEW] same-yield priority preempt + chunked admission combo.
+    # same-yield priority preempt + chunked admission combo.
     # Low-priority R3 is mid-flight; on the same yield we submit a
     # high-priority short R1 and a long chunked R2. R3 must be preempted
     # (kv_pages goes to 0), R2 must begin chunking (chunks_done starts

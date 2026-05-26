@@ -493,7 +493,7 @@ class TestScriptedAbort(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-Abort1] abort raced with chunks_done increment at a chunk
+    # abort raced with chunks_done increment at a chunk
     # boundary. Drive the req to a known mid-chunk state, then abort on
     # the same yield step the scheduler is about to commit the next
     # chunk. No double-finalize; pending_middle_outputs must zero.
@@ -527,7 +527,7 @@ class TestScriptedAbort(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-Abort4 / a-Reentry4] abort + same-step resubmit with the
+    # abort + same-step resubmit with the
     # identical rid. The new req must complete independently — the
     # scheduler must not confuse the resubmit with the dying corpse of
     # the aborted r1.
@@ -558,7 +558,7 @@ class TestScriptedAbort(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-Abort3] the gap between "last chunk submitted to forward" and
+    # the gap between "last chunk submitted to forward" and
     # "Stage A drains pending_middle_outputs". In that window
     # pending_middle_outputs > 0 yet the req is not currently chunking.
     # Aborting here must not revive the freed row via Stage A.
@@ -592,7 +592,7 @@ class TestScriptedAbort(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-Abort8] when the only chunked req is aborted, the engine must
+    # when the only chunked req is aborted, the engine must
     # transition all the way back to idle — chunked_req is None,
     # chunked_in_flight_count is 0, and t.is_idle.
     @staticmethod
@@ -617,7 +617,7 @@ class TestScriptedAbort(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-NEW] same-yield abort + new-req combo. While R1 is mid-chunk,
+    # same-yield abort + new-req combo. While R1 is mid-chunk,
     # abort R1 and submit a fresh short R2 in the same yield step. R2
     # must admit cleanly, and the scheduler's chunked_req slot must no
     # longer reference R1 (either None or R2's rid if R2 also chunked,
@@ -652,7 +652,7 @@ class TestScriptedAbort(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-NEW] same-yield combo of force_retract + abort. Both operations
+    # same-yield combo of force_retract + abort. Both operations
     # tear resources down; doing them in the same yield step must not
     # double-free and must not emit two finish events. All resources
     # released and the finalize counter capped at 1.
@@ -691,7 +691,7 @@ class TestScriptedAbort(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-Abort9] r1 holds the chunked_req slot; r2 is waiting. Abort
+    # r1 holds the chunked_req slot; r2 is waiting. Abort
     # r1: r2 must successfully claim the chunked_req baton on the next
     # admission step.
     @staticmethod

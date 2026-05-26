@@ -63,7 +63,7 @@ class TestScriptedHiSparse(CustomTestCase):
             ),
         )
 
-    # [a-HiSparse1] HiSparse staging DMA + chunk admission race — when a
+    # HiSparse staging DMA + chunk admission race — when a
     # DMA transfer is in flight at admission time the scheduler must not
     # deadlock; the chunked req must still progress and finish.
     @staticmethod
@@ -92,7 +92,7 @@ class TestScriptedHiSparse(CustomTestCase):
             ),
         )
 
-    # [a-HiSparse2] HiSparse DMA + mid-chunk + abort — cancellation must
+    # HiSparse DMA + mid-chunk + abort — cancellation must
     # complete cleanly with no orphaned staging buffers or stuck DMA.
     @staticmethod
     def _script_hisparse_abort_during_chunk_with_dma(t: ScriptedRuntime):

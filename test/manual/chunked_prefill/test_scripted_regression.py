@@ -131,7 +131,7 @@ class TestScriptedRegression(CustomTestCase):
             ),
         )
 
-    # [b-b823c16e60] Include PP microbatch reqs in abort_request
+    # Include PP microbatch reqs in abort_request
     # batch_rids dedup.
     # Bug shape: under PP=2 with the v2 scheduler, a chunked-resume req
     # can simultaneously sit in (a) mbs[0].reqs (admitting next chunk),
@@ -245,7 +245,7 @@ class TestScriptedRegression(CustomTestCase):
             ),
         )
 
-    # [b-69ef71edc4] Conditionally exclude in-flight other-mb
+    # Conditionally exclude in-flight other-mb
     # chunked-resume reqs (PP, max_new_tokens > 1).
     # Bug shape: under PP=2, when one microbatch is mid-chunk on a
     # multi-output req (max_new_tokens > 1), the OTHER microbatch's
@@ -435,7 +435,7 @@ class TestScriptedRegression(CustomTestCase):
 
     @staticmethod
     def _script_revert_bump_pending_middle_outputs(t: ScriptedRuntime):
-        # [b-e875cd36e4] Revert of pending_middle_outputs bump.
+        # Revert of pending_middle_outputs bump.
         # Bug shape: a transient fix wrongly bumped pending_middle_outputs
         # a second time when crossing the last-chunk admit boundary, so
         # the counter would briefly reach 2 (one for the prior middle
@@ -481,7 +481,7 @@ class TestScriptedRegression(CustomTestCase):
 
     @staticmethod
     def _script_filter_batch_exclude_in_flight_other_mb(t: ScriptedRuntime):
-        # [b-5c523049db / b-45347ca3a3] Exclude in-flight other-mb reqs
+        # Exclude in-flight other-mb reqs
         # in filter_batch.
         # Bug shape: filter_batch's keep-set logic did not consult the
         # cross-mb in-flight marker. After a step where another mb
@@ -542,7 +542,7 @@ class TestScriptedRegression(CustomTestCase):
 
     @staticmethod
     def _script_stage_a_chunk_stash_iter_boundary(t: ScriptedRuntime):
-        # [b-678bba26f0] Stage A chunk-stash runs at iter boundary,
+        # Stage A chunk-stash runs at iter boundary,
         # BEFORE adder.build on the next iter (not mid-iter, not after
         # adder.build).
         # Bug shape: the chunk-stash path (Stage A — cache_unfinished_req
@@ -784,7 +784,7 @@ class TestScriptedRegression(CustomTestCase):
 
     @staticmethod
     def _script_waiting_queue_pending_tokens_subtract_prefix(t: ScriptedRuntime):
-        # [b-c79a73bec4] Subtract prefix_indices from waiting_queue
+        # Subtract prefix_indices from waiting_queue
         # pending tokens sum.
         # Bug shape: load_inquirer (the admission-budget probe used by
         # the scheduler to decide whether to admit a new req in this
@@ -878,13 +878,13 @@ class TestScriptedRegression(CustomTestCase):
     # ================================================================
 
     def test_chunked_admission_reuse_branch_balanced(self):
-        """[b-74f1d8bbab] add_one_req reuse branch keeps lock_ref balanced across a multi-chunk lifecycle."""
+        """add_one_req reuse branch keeps lock_ref balanced across a multi-chunk lifecycle."""
         execute_scripted_runtime(
             self._script_chunked_admission_reuse_branch_balanced,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [b-74f1d8bbab] Unify chunked admission via add_one_req reuse branch.
+    # Unify chunked admission via add_one_req reuse branch.
     # Bug: the previous dedicated add_chunked_req method re-incremented
     # the radix lock_ref on every chunk's admission. The reuse branch
     # introduced here must skip _req_inc_lock_ref entirely (lock already
@@ -919,13 +919,13 @@ class TestScriptedRegression(CustomTestCase):
         assert r.lock_refs == 0
 
     def test_chunked_resume_lives_in_waiting_queue(self):
-        """[b-c445a82cf5] mid-chunk req sits in waiting_queue between chunks; queue empties after last chunk."""
+        """Mid-chunk req sits in waiting_queue between chunks; queue empties after last chunk."""
         execute_scripted_runtime(
             self._script_chunked_resume_lives_in_waiting_queue,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [b-c445a82cf5] Switch chunked-resume to waiting_queue holding;
+    # Switch chunked-resume to waiting_queue holding;
     # delete chunked_req fields.
     # Bug shape: pre-refactor, mid-chunk reqs were tracked via
     # Scheduler.chunked_req + ScheduleBatch.chunked_req; the v2 design
@@ -963,7 +963,7 @@ class TestScriptedRegression(CustomTestCase):
         assert r.status in ("finished", "unknown")
 
     def test_chunked_stash_bounded_by_kv_committed_len(self):
-        """[b-1c3bf8e7db] cache_unfinished_req reads only up to kv_committed_len; SWA early-return must not leak garbage prefix."""
+        """Cache_unfinished_req reads only up to kv_committed_len; SWA early-return must not leak garbage prefix."""
         execute_scripted_runtime(
             self._script_chunked_stash_bounded_by_kv_committed_len,
             **base_engine_kwargs(
@@ -974,7 +974,7 @@ class TestScriptedRegression(CustomTestCase):
             ),
         )
 
-    # [b-1c3bf8e7db] Bound cache_unfinished_req row read by
+    # Bound cache_unfinished_req row read by
     # kv_committed_len.
     # Bug shape: init_next_round_input resets req.fill_ids to
     # len(origin_input_ids) + len(output_ids) BEFORE stash, but the
@@ -1011,13 +1011,13 @@ class TestScriptedRegression(CustomTestCase):
         yield from run_until_finished(r)
 
     def test_chunked_retract_no_double_init_load_back(self):
-        """[b-d7fa48baad] retract -> re-admit chunk 2 must not run init_load_back twice (host_hit_length reset is unconditional)."""
+        """Retract -> re-admit chunk 2 must not run init_load_back twice (host_hit_length reset is unconditional)."""
         execute_scripted_runtime(
             self._script_chunked_retract_no_double_init_load_back,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [b-d7fa48baad] Reset host_hit_length unconditionally in
+    # Reset host_hit_length unconditionally in
     # prepare_for_extend.
     # Bug shape: the reset was nested inside
     #   if not req.retracted_stain:
@@ -1058,13 +1058,13 @@ class TestScriptedRegression(CustomTestCase):
         assert t.lock_refs_snapshot() == baseline_refs
 
     def test_streaming_session_multiturn_no_reuse_branch(self):
-        """[b-a79ba1b2f7] streaming-session turn N>1 must NOT take the reuse branch even though kv_committed_len > 0."""
+        """Streaming-session turn N>1 must NOT take the reuse branch even though kv_committed_len > 0."""
         execute_scripted_runtime(
             self._script_streaming_session_multiturn_no_reuse_branch,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [b-a79ba1b2f7] Tighten add_one_req reuse gate to
+    # Tighten add_one_req reuse gate to
     # has_pending_chunk.
     # Bug shape: the 'is_resume' predicate previously fired for any
     # req with kv_committed_len > 0, which incorrectly included
@@ -1110,7 +1110,7 @@ class TestScriptedRegression(CustomTestCase):
         )
 
     def test_lpm_skips_chunked_resume_prefix_match(self):
-        """[b-aaf3752d2b] calc_priority prefix matching must skip chunked-resume reqs to preserve their stashed last_node/prefix_indices."""
+        """Calc_priority prefix matching must skip chunked-resume reqs to preserve their stashed last_node/prefix_indices."""
         execute_scripted_runtime(
             self._script_lpm_skips_chunked_resume_prefix_match,
             **base_engine_kwargs(
@@ -1119,7 +1119,7 @@ class TestScriptedRegression(CustomTestCase):
             ),
         )
 
-    # [b-aaf3752d2b] Skip chunked-resume reqs in calc_priority prefix
+    # Skip chunked-resume reqs in calc_priority prefix
     # matching.
     # Bug shape: _compute_prefix_matches runs match_prefix_for_req on
     # every waiting_queue item. For a chunked-resume req that lives
@@ -1169,7 +1169,7 @@ class TestScriptedRegression(CustomTestCase):
         yield from run_until_all_finished([r1, r2])
 
     def test_chunked_resume_priority_under_lpm(self):
-        """[b-bf5b4e9a10] chunked-resume gets priority in LPM sort even when its prefix_indices length is short vs fresh long-prefix waiters."""
+        """Chunked-resume gets priority in LPM sort even when its prefix_indices length is short vs fresh long-prefix waiters."""
         execute_scripted_runtime(
             self._script_chunked_resume_priority_under_lpm,
             **base_engine_kwargs(
@@ -1178,7 +1178,7 @@ class TestScriptedRegression(CustomTestCase):
             ),
         )
 
-    # [b-bf5b4e9a10] Give chunked-resume reqs priority in LPM and
+    # Give chunked-resume reqs priority in LPM and
     # DFS_WEIGHT sorts.
     # Bug shape: a chunked-resume req's prefix_indices length reflects
     # only its already-prefilled chunks (~ kv_committed_len), not the
@@ -1223,7 +1223,7 @@ class TestScriptedRegression(CustomTestCase):
         yield from run_until_all_finished([r1, *competitors])
 
     def test_chunked_resume_immune_to_waiting_timeout(self):
-        """[b-359e5ed7bd] _abort_on_waiting_timeout must skip chunked-resume reqs even when SGLANG_REQ_WAITING_TIMEOUT triggers."""
+        """_abort_on_waiting_timeout must skip chunked-resume reqs even when SGLANG_REQ_WAITING_TIMEOUT triggers."""
         execute_scripted_runtime(
             self._script_chunked_resume_immune_to_waiting_timeout,
             **base_engine_kwargs(
@@ -1232,7 +1232,7 @@ class TestScriptedRegression(CustomTestCase):
             ),
         )
 
-    # [b-359e5ed7bd] Skip chunked-resume reqs in
+    # Skip chunked-resume reqs in
     # _abort_on_waiting_timeout.
     # Bug shape: after the v2 refactor, chunked-resume reqs live in
     # waiting_queue across iters while actively prefilling. Their
@@ -1263,13 +1263,13 @@ class TestScriptedRegression(CustomTestCase):
         assert r.finished
 
     def test_abort_chunked_resume_releases_all_resources(self):
-        """[b-96d4749094] aborting a chunked-resume req that lives ONLY in waiting_queue must release row + KV + lock_ref together."""
+        """Aborting a chunked-resume req that lives ONLY in waiting_queue must release row + KV + lock_ref together."""
         execute_scripted_runtime(
             self._script_abort_chunked_resume_releases_all_resources,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [b-96d4749094] Release row + KV + lock_ref when aborting a
+    # Release row + KV + lock_ref when aborting a
     # chunked-resume req from waiting_queue.
     # Bug shape: the waiting-queue abort path in abort_request only
     # freed disagg-decode KV and mamba state. Pre-v2 this covered every
@@ -1317,13 +1317,13 @@ class TestScriptedRegression(CustomTestCase):
         assert t.lock_refs_snapshot() == baseline_refs
 
     def test_abort_chunked_resume_dual_queue_no_double_release(self):
-        """[b-de3859646b] abort of a chunked-resume req held in BOTH waiting_queue and batch.reqs must dedup and release exactly once."""
+        """Abort of a chunked-resume req held in BOTH waiting_queue and batch.reqs must dedup and release exactly once."""
         execute_scripted_runtime(
             self._script_abort_chunked_resume_dual_queue_no_double_release,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [b-de3859646b] abort_request dedup for chunked-resume dual-queue
+    # abort_request dedup for chunked-resume dual-queue
     # holding.
     # Bug shape: under the stateless-scheduler refactor a chunked-
     # resume req can be simultaneously in waiting_queue (because it
@@ -1376,13 +1376,13 @@ class TestScriptedRegression(CustomTestCase):
         )
 
     def test_pause_retract_releases_waiting_chunked_resume(self):
-        """[b-f38e69f87d] pause_generation(retract) must release waiting_queue chunked-resume row+KV+lock_ref (not only running_batch)."""
+        """Pause_generation(retract) must release waiting_queue chunked-resume row+KV+lock_ref (not only running_batch)."""
         execute_scripted_runtime(
             self._script_pause_retract_releases_waiting_chunked_resume,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [b-f38e69f87d] Extend pause(retract) to waiting chunked-resume
+    # Extend pause(retract) to waiting chunked-resume
     # reqs.
     # Bug shape: pause_generation(retract)'s contract says "every req
     # holding KV is retracted, the cache can be flushed, recompute on
@@ -1424,13 +1424,13 @@ class TestScriptedRegression(CustomTestCase):
         )
 
     def test_retract_all_clears_batch_with_chunked(self):
-        """[b-f0388931bf] retract_all triggered mid-chunk must clear the batch (keep_indices=[] semantics), not pass List[Req] as keep_indices."""
+        """Retract_all triggered mid-chunk must clear the batch (keep_indices=[] semantics), not pass List[Req] as keep_indices."""
         execute_scripted_runtime(
             self._script_retract_all_clears_batch_with_chunked,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [b-f0388931bf] retract_all was passing List[Req] to filter_batch
+    # retract_all was passing List[Req] to filter_batch
     # as keep_indices.
     # Bug shape: after 3fd7319a3d removed the chunked_req_to_exclude
     # first positional from filter_batch, retract_all's existing call

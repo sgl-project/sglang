@@ -61,7 +61,7 @@ class TestScriptedHybridSWA(CustomTestCase):
             ),
         )
 
-    # [a-SWA1] prompt_len == sliding_window — chunked admission must
+    # prompt_len == sliding_window — chunked admission must
     # complete with the window boundary aligned to the prompt end.
     @staticmethod
     def _script_swa_prompt_equals_window(t: ScriptedRuntime):
@@ -86,7 +86,7 @@ class TestScriptedHybridSWA(CustomTestCase):
             ),
         )
 
-    # [a-SWA2] prompt = 2 * sliding_window, chunk_size = window/2 — every
+    # prompt = 2 * sliding_window, chunk_size = window/2 — every
     # chunk straddles the window boundary; output must still be correct.
     @staticmethod
     def _script_swa_prompt_2x_window_half_chunks(t: ScriptedRuntime):
@@ -111,7 +111,7 @@ class TestScriptedHybridSWA(CustomTestCase):
             ),
         )
 
-    # [c-S9 / P5a] SWA pool critical + add_chunked_req forced early-return —
+    # SWA pool critical + add_chunked_req forced early-return —
     # _chunked_req_scheduled_last_iter must flip correctly; stash must not
     # be double-freed.
     @staticmethod
@@ -147,7 +147,7 @@ class TestScriptedHybridSWA(CustomTestCase):
             ),
         )
 
-    # [c-P2] SWA _swa_budget_for_req — chunk size vs sliding window
+    # SWA _swa_budget_for_req — chunk size vs sliding window
     # combos must not overflow the budget formula or trigger OOM.
     @staticmethod
     def _script_swa_budget_for_chunked_req_math(t: ScriptedRuntime):
@@ -171,7 +171,7 @@ class TestScriptedHybridSWA(CustomTestCase):
             ),
         )
 
-    # [c-B11] SWA + overlap + chunked — the extend_batch_idx < 2 path must
+    # SWA + overlap + chunked — the extend_batch_idx < 2 path must
     # not evict; verifies skip count >= 2 on the first chunk admission.
     @staticmethod
     def _script_swa_chunk_cache_evict_skips_first_two_extends(t: ScriptedRuntime):
@@ -195,7 +195,7 @@ class TestScriptedHybridSWA(CustomTestCase):
             ),
         )
 
-    # [a-SWA4] chunk_size > sliding_window — engine must either reject
+    # chunk_size > sliding_window — engine must either reject
     # at startup or accept and complete; behavior must be consistent
     # across runs (no flaky partial init).
     @staticmethod
@@ -220,7 +220,7 @@ class TestScriptedHybridSWA(CustomTestCase):
             ),
         )
 
-    # [a-SWA5] SWA + radix + chunked — partial prefix hit that straddles
+    # SWA + radix + chunked — partial prefix hit that straddles
     # the SWA window; admission must coordinate prefix_indices with the
     # window boundary and chunk admission cleanly.
     @staticmethod
@@ -251,7 +251,7 @@ class TestScriptedHybridSWA(CustomTestCase):
             ),
         )
 
-    # [b-1c3bf8e7db] SWA early-return between two chunks — the next iter
+    # SWA early-return between two chunks — the next iter
     # must read prefix_indices only up to kv_committed_len; rows past
     # kv_committed_len are uninitialized and would corrupt the chunk.
     @staticmethod

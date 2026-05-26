@@ -475,7 +475,7 @@ class TestScriptedSampling(CustomTestCase):
 
     @staticmethod
     def _script_chunked_logprob_input_accumulates_across_chunks(t: ScriptedRuntime):
-        # Source: [c-R3/R5] — guards _apply_chunked_prefill_logprobs in
+        # Guards _apply_chunked_prefill_logprobs in
         # batch_result_processor.py (lines 274-285, 451-482). Each middle
         # chunk should append its input logprobs incrementally so that, at
         # finish time, the accumulated input_token_logprobs_val covers the
@@ -513,7 +513,7 @@ class TestScriptedSampling(CustomTestCase):
 
     @staticmethod
     def _script_logprob_start_len_inside_chunk_2(t: ScriptedRuntime):
-        # Source: [a-Sampling8] — logprob_start_len positioned inside the
+        # Logprob_start_len positioned inside the
         # 2nd chunk (chunk_size + 50 with a 4*chunk_size prompt) exercises
         # the chunked logprob-start alignment in
         # _apply_chunked_prefill_logprobs: only tokens at index >=
@@ -551,7 +551,7 @@ class TestScriptedSampling(CustomTestCase):
 
     @staticmethod
     def _script_chunked_streaming_no_mid_chunk_output(t: ScriptedRuntime):
-        # Source: [c-R2] — guards the skip_stream_req branch in
+        # Guards the skip_stream_req branch in
         # batch_result_processor.py: while a req is in the middle of
         # chunked prefill, stream_output must suppress its emission until
         # the final chunk lands.
@@ -581,7 +581,7 @@ class TestScriptedSampling(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-NEW] output-state contract: a chunked req that decodes to its
+    # output-state contract: a chunked req that decodes to its
     # natural EOS should report finish_reason == "stop"; one capped by
     # max_new_tokens under ignore_eos should report "length". Both code
     # paths must produce a populated finish_reason after a chunked
@@ -635,7 +635,7 @@ class TestScriptedSampling(CustomTestCase):
 
     @staticmethod
     def _script_seed_chunked_bit_identical_runs(t: ScriptedRuntime):
-        # Source: [a-Sampling9] — seeded sampling over a chunked prompt
+        # Seeded sampling over a chunked prompt
         # must be reproducible: running the same prompt + same seed twice
         # within one engine should yield identical output tokens despite
         # the chunked-prefill scheduling.

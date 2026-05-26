@@ -59,7 +59,7 @@ class TestScriptedPP(CustomTestCase):
             **_pp_engine_kwargs(),
         )
 
-    # [b-02b1785f0a] PP cross-mb _handle_finished_req must not double-finalize:
+    # PP cross-mb _handle_finished_req must not double-finalize:
     # a chunked req visible in mb_a + mb_other was finalized twice pre-fix.
     @staticmethod
     def _script_pp_chunked_no_double_finalize(t: ScriptedRuntime):
@@ -78,7 +78,7 @@ class TestScriptedPP(CustomTestCase):
             **_pp_engine_kwargs(),
         )
 
-    # [b-b823c16e60] PP abort_request must dedup across batch_rids:
+    # PP abort_request must dedup across batch_rids:
     # a single req can sit in mb_other.reqs and waiting_queue, abort once.
     @staticmethod
     def _script_pp_abort_during_inflight_chunk(t: ScriptedRuntime):
@@ -97,7 +97,7 @@ class TestScriptedPP(CustomTestCase):
             **_pp_engine_kwargs(),
         )
 
-    # [b-69ef71edc4] PP last-chunk cross-mb KV correctness:
+    # PP last-chunk cross-mb KV correctness:
     # gsm8k 70B accuracy 0.66 -> 0.77 after fix; decode KV positions must
     # be written correctly when the last chunk lands in the alternate mb.
     @staticmethod
@@ -120,7 +120,7 @@ class TestScriptedPP(CustomTestCase):
             **_pp_engine_kwargs(),
         )
 
-    # [a-PP1] PP=2 chunks_done aggregation across mbs — single chunked req
+    # PP=2 chunks_done aggregation across mbs — single chunked req
     # spans 4+ chunks; chunks_done increments observed by ReqHandle must
     # reflect the union of per-mb progress.
     @staticmethod
@@ -142,7 +142,7 @@ class TestScriptedPP(CustomTestCase):
             **_pp_engine_kwargs(pp_size=4),
         )
 
-    # [a-PP3] PP=4 chunked completion — verifies the cross-mb bookkeeping
+    # PP=4 chunked completion — verifies the cross-mb bookkeeping
     # scales beyond pp_size=2; long chunked req must not leak.
     @staticmethod
     def _script_pp_size_4_chunked_completes(t: ScriptedRuntime):
@@ -160,7 +160,7 @@ class TestScriptedPP(CustomTestCase):
             **_pp_engine_kwargs(),
         )
 
-    # [a-PP4] PP=2, one chunked per mb — chunked_in_flight_count must stay
+    # PP=2, one chunked per mb — chunked_in_flight_count must stay
     # <=1 per mb but the global count may reach 2.
     @staticmethod
     def _script_pp_two_chunked_one_per_mb_simultaneous(t: ScriptedRuntime):
@@ -185,7 +185,7 @@ class TestScriptedPP(CustomTestCase):
             **_pp_engine_kwargs(),
         )
 
-    # [a-PP5] PP=2 mid-mb chunked retract — exclude set must drop the
+    # PP=2 mid-mb chunked retract — exclude set must drop the
     # cross-mb chunked_req reference so it does not re-enter the batch.
     @staticmethod
     def _script_pp_retract_chunked_in_middle_mb(t: ScriptedRuntime):
@@ -204,7 +204,7 @@ class TestScriptedPP(CustomTestCase):
             **_pp_engine_kwargs(),
         )
 
-    # [c-S11] PP-path exclude set — last_batch.chunked_req can be stale
+    # PP-path exclude set — last_batch.chunked_req can be stale
     # under PP; must not re-enter the batch on the next admission.
     @staticmethod
     def _script_pp_chunked_req_to_exclude_pp_context(t: ScriptedRuntime):
@@ -225,7 +225,7 @@ class TestScriptedPP(CustomTestCase):
             **_pp_engine_kwargs(enable_pdmux=True),
         )
 
-    # [c-T1+T2 / b-34c02d6a67] pdmux + chunked — split-prefill filter must
+    # pdmux + chunked — split-prefill filter must
     # exclude chunked reqs so merge_batch assert does not fire.
     @staticmethod
     def _script_pp_split_prefill_chunked_no_merge_assert(t: ScriptedRuntime):
@@ -259,7 +259,7 @@ class TestScriptedPP(CustomTestCase):
             **_pp_engine_kwargs(enable_dynamic_chunking=True),
         )
 
-    # [c-T3 / S4 / S15] dynamic chunking under PP — predictor must populate
+    # dynamic chunking under PP — predictor must populate
     # last_chunked_prefill_size every iter the chunked req is in flight.
     @staticmethod
     def _script_pp_dynamic_chunking_predictor(t: ScriptedRuntime):

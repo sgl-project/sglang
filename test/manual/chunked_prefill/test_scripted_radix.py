@@ -383,7 +383,7 @@ class TestScriptedRadix(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [c-C2] _inc_hit_count(chunked=True) is the gate that prevents a
+    # _inc_hit_count(chunked=True) is the gate that prevents a
     # chunked-resume's own re-insert from inflating the prefix's hit
     # count. Pre-fix, the prefix's hit_count could climb one per chunk
     # — making this prefix look hotter than it really was. With a
@@ -418,7 +418,7 @@ class TestScriptedRadix(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-Radix4] r1 chunks a long prompt; r2 with the same prompt is
+    # r1 chunks a long prompt; r2 with the same prompt is
     # submitted while r1 is mid-prefill. r2's admission prefix length
     # must reflect r1's already-committed chunks (i.e. r2 starts
     # further along than if r1 had not run). r2 should therefore
@@ -446,7 +446,7 @@ class TestScriptedRadix(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-Radix6] r1 chunks a long prompt; midway through, we call
+    # r1 chunks a long prompt; midway through, we call
     # evict_radix on the in-flight prefix. The req's own lock_ref
     # must prevent the evict from freeing pages it still references;
     # the req must complete cleanly with no use-after-free.
@@ -470,7 +470,7 @@ class TestScriptedRadix(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-Radix7] Warm a long prefix, then re-submit the *exact same*
+    # Warm a long prefix, then re-submit the *exact same*
     # prompt. The cached prefix covers the entire input, so the new
     # req should bypass the chunked path entirely and go straight to
     # decode — chunks_done must be 0.
@@ -495,7 +495,7 @@ class TestScriptedRadix(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-Radix-extra] Warm a prefix, then in the same scheduler step
+    # Warm a prefix, then in the same scheduler step
     # both evict it and submit a new req that shares it. The admission
     # path must take its lock_ref before the evict can release pages,
     # otherwise the new req sees a stale pointer / use-after-free.
@@ -526,7 +526,7 @@ class TestScriptedRadix(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-NEW] retract-resume re-chunking accounting. R1 is mid-stream
+    # retract-resume re-chunking accounting. R1 is mid-stream
     # when we force_retract it; on resume it must re-chunk the
     # remaining prompt — chunks_done across the full lifetime should
     # equal the expected total chunk count for the original prompt

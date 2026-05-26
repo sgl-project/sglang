@@ -64,7 +64,7 @@ class TestScriptedPiecewiseCG(CustomTestCase):
             ),
         )
 
-    # [a-Piecewise1] chunk_size deliberately falls between captured
+    # chunk_size deliberately falls between captured
     # graph buckets — the piecewise dispatcher must fall back to
     # eager or to the next-larger bucket. Either path is fine; the
     # request must still complete cleanly with no graph-capture crash.
@@ -90,7 +90,7 @@ class TestScriptedPiecewiseCG(CustomTestCase):
             ),
         )
 
-    # [a-Piecewise2] Tiny tail chunk = 1 token. Piecewise capture
+    # Tiny tail chunk = 1 token. Piecewise capture
     # typically does not have a bucket for extend_len=1; the
     # dispatcher must fall back gracefully (or capture on demand).
     @staticmethod
@@ -116,7 +116,7 @@ class TestScriptedPiecewiseCG(CustomTestCase):
             ),
         )
 
-    # [a-Piecewise3] Force a retract mid-chunk; on resume the dynamic
+    # Force a retract mid-chunk; on resume the dynamic
     # chunker may pick a different size (different bucket). Piecewise
     # capture must dispatch the new bucket cleanly — pre-fix, the
     # capture cache could mis-route after a bucket switch.
@@ -142,7 +142,7 @@ class TestScriptedPiecewiseCG(CustomTestCase):
             ),
         )
 
-    # [c-T3e] Dynamic chunking predictor emits a sequence of chunk
+    # Dynamic chunking predictor emits a sequence of chunk
     # sizes as the batch shape evolves. Each chunk size dispatches to
     # piecewise capture independently; the dispatcher must walk the
     # bucket table without misrouting between iterations.

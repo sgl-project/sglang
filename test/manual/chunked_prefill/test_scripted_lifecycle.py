@@ -403,7 +403,7 @@ class TestScriptedLifecycle(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-Cross12] engine shutdown mid-chunked — the chunked req must
+    # engine shutdown mid-chunked — the chunked req must
     # surface a clean terminal error (not a hang) and no scheduler
     # subprocess should be left orphaned after the engine tears down.
     @staticmethod

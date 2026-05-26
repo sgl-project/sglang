@@ -423,7 +423,7 @@ class TestScriptedChunkSize(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=16, page_size=16),
         )
 
-    # [a-Boundary6] chunk_size == page_size — every chunk is exactly one
+    # chunk_size == page_size — every chunk is exactly one
     # page; the chunked path must not double-allocate or leak.
     @staticmethod
     def _script_chunk_size_equals_page_size(t: ScriptedRuntime):
@@ -442,7 +442,7 @@ class TestScriptedChunkSize(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=15, page_size=16),
         )
 
-    # [a-Boundary7] chunk_size = page_size - 1 — misaligned boundaries
+    # chunk_size = page_size - 1 — misaligned boundaries
     # exercise the partial-page tail; finishing without leaks is the
     # property under test.
     @staticmethod
@@ -462,7 +462,7 @@ class TestScriptedChunkSize(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-Boundary3 / Prompt2] N*chunk_size ± 1 sweep — verifies that the
+    # N*chunk_size ± 1 sweep — verifies that the
     # ceil-div arithmetic in the chunked admission path is correct at
     # every chunk multiple, both just below and just above.
     @staticmethod

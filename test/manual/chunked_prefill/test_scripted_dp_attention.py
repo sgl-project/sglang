@@ -54,7 +54,7 @@ class TestScriptedDPAttention(CustomTestCase):
             ),
         )
 
-    # [a-DP1] DP rank imbalance — rank 0 has a long chunked req while
+    # DP rank imbalance — rank 0 has a long chunked req while
     # rank 1 stays idle; rank 1 must not block the chunked progress on
     # rank 0 via the cross-rank barrier.
     @staticmethod
@@ -81,7 +81,7 @@ class TestScriptedDPAttention(CustomTestCase):
             ),
         )
 
-    # [a-DP2] Per-rank chunked reqs with different sizes — each rank
+    # Per-rank chunked reqs with different sizes — each rank
     # tracks its own chunks_done; ranks must not cross-contaminate.
     @staticmethod
     def _script_dp_two_chunked_one_per_rank(t: ScriptedRuntime):
@@ -109,7 +109,7 @@ class TestScriptedDPAttention(CustomTestCase):
             ),
         )
 
-    # [a-DP3] DP completion skew — rank 0 finishes early; rank 1 keeps
+    # DP completion skew — rank 0 finishes early; rank 1 keeps
     # chunking. The cross-rank broadcast must stay consistent and rank 0
     # must report idle once done.
     @staticmethod

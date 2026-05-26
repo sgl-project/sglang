@@ -556,7 +556,7 @@ class TestScriptedInvariants(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-Status1] chunked status legal-set — during chunked admission a
+    # chunked status legal-set — during chunked admission a
     # req's externally observable status must remain in {waiting, running}
     # while chunking, never a synthetic "mid-chunk" leak; once chunked
     # completes it transitions to finished and never re-enters waiting.
@@ -585,7 +585,7 @@ class TestScriptedInvariants(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-Status4 / revert e875cd36e4] pending_middle_outputs cap — at any
+    # pending_middle_outputs cap — at any
     # iteration there must be at most one pending middle output; the
     # revert of e875cd36e4 re-established this invariant.
     @staticmethod
@@ -625,7 +625,7 @@ class TestScriptedInvariants(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-Status7] finished is terminal — once a req has finished, its
+    # finished is terminal — once a req has finished, its
     # observable status must never roll back to waiting / running /
     # unknown across subsequent yields.
     @staticmethod
@@ -646,7 +646,7 @@ class TestScriptedInvariants(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-NEW] chunks_done should make forward progress on every iter
+    # chunks_done should make forward progress on every iter
     # the chunked req is actively chunking — a plateau (two consecutive
     # mid-chunk yields with the same chunks_done) would indicate the
     # scheduler stalled or wasted an iter on an in-flight chunked req.
@@ -683,7 +683,7 @@ class TestScriptedInvariants(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-NEW] output-state contract: when ignore_eos=True forces decode
+    # output-state contract: when ignore_eos=True forces decode
     # to run to completion across max_new_tokens iters, the recorded
     # output_tokens list must contain exactly N tokens regardless of
     # how many chunks the prefill spanned.
@@ -715,7 +715,7 @@ class TestScriptedInvariants(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-NEW] output-state contract: r.num_input_tokens must reflect the
+    # output-state contract: r.num_input_tokens must reflect the
     # original prompt length regardless of how many chunks the prefill
     # took. Pre-fix bugs in some refactor branches accidentally reported
     # the size of the *last* chunk, not the whole prompt.
@@ -739,7 +739,7 @@ class TestScriptedInvariants(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-NEW] post-finish invariant: a long chunked req must observe
+    # post-finish invariant: a long chunked req must observe
     # chunked_in_flight_count() == 1 while in flight, then == 0 for at
     # least 3 idle yields after finish. Guards against stale chunked_req
     # pointers leaking into the in-flight counter.
@@ -766,7 +766,7 @@ class TestScriptedInvariants(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-NEW] post-finish invariant: once a chunked req finishes, the
+    # post-finish invariant: once a chunked req finishes, the
     # pending_middle_outputs counter on the handle must drain to 0 and
     # stay there across idle yields. Guards against the e875cd36e4-style
     # bump leaking past finish.
@@ -782,13 +782,13 @@ class TestScriptedInvariants(CustomTestCase):
             )
 
     def test_decode_side_chunked_req_always_none(self):
-        """[c-S25 control] pure decode workload: get_chunked_req_rid() is always None."""
+        """Pure decode workload: get_chunked_req_rid() is always None."""
         execute_scripted_runtime(
             self._script_decode_side_chunked_req_always_none,
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [c-S25 control] scheduler.py decode-side branch: when the workload
+    # scheduler.py decode-side branch: when the workload
     # is pure decode (no req with a chunked prefill), the scheduler's
     # chunked_req slot must remain None across the entire lifetime.
     # Negative control for the chunked admission paths — proves the

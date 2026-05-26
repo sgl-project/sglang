@@ -77,7 +77,7 @@ class TestScriptedLoRAOverlap(CustomTestCase):
             ),
         )
 
-    # [a-LoRA-OL1] H2D copy of adapter B is overlapping the scheduler
+    # H2D copy of adapter B is overlapping the scheduler
     # loop when r_b's first chunk wants to admit. Pre-fix, the chunked
     # admission would race the not-yet-resident weight pointer; the
     # admission must wait for H2D to settle. r_a continues chunking on
@@ -122,7 +122,7 @@ class TestScriptedLoRAOverlap(CustomTestCase):
             ),
         )
 
-    # [a-LoRA-OL2 / issue 25413] r_a chunks on adapter A. r_b on adapter
+    # r_a chunks on adapter A. r_b on adapter
     # B is submitted, forcing an overlapped H2D of adapter B and a
     # chunked admission event for r_b. Aborting r_b mid-H2D must cancel
     # cleanly: no double-fire on the completion event, no orphaned
@@ -172,7 +172,7 @@ class TestScriptedLoRAOverlap(CustomTestCase):
             ),
         )
 
-    # [a-LoRA-OL3] Several chunked reqs submitted back-to-back, each on
+    # Several chunked reqs submitted back-to-back, each on
     # a distinct adapter, with overlap loading on and only one adapter
     # resident at a time. Each adapter must H2D-load to completion
     # before its req's first chunk runs, and every req finishes on its

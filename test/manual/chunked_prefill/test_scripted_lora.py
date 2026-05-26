@@ -81,7 +81,7 @@ class TestScriptedLoRA(CustomTestCase):
             ),
         )
 
-    # [c-L6+L7 / b-5ed4faf0ab] LoRA drainer must not block a chunked-resume
+    # LoRA drainer must not block a chunked-resume
     # req that's parked in waiting_queue between chunks. Before the fix,
     # the drainer would refuse to admit further work while it tried to
     # evict adapter A, leaving the chunked-resume req stuck mid-prefill.
@@ -133,7 +133,7 @@ class TestScriptedLoRA(CustomTestCase):
             ),
         )
 
-    # [a-LoRA1] R1 chunks with adapter A and R2 chunks with adapter B,
+    # R1 chunks with adapter A and R2 chunks with adapter B,
     # both in flight simultaneously. Each req's lora_path stays pinned
     # to its own adapter across chunk boundaries — no cross-contamination.
     @staticmethod
@@ -169,7 +169,7 @@ class TestScriptedLoRA(CustomTestCase):
             ),
         )
 
-    # [a-LoRA2] N chunked reqs, N adapters. With max_loras_per_batch < N
+    # N chunked reqs, N adapters. With max_loras_per_batch < N
     # the pool must rotate adapters cleanly; no deadlock, every req
     # completes. With only two distinct adapter slots configured here,
     # the rotation is forced by ``max_loras_per_batch=2`` vs 4 reqs.
@@ -201,7 +201,7 @@ class TestScriptedLoRA(CustomTestCase):
             ),
         )
 
-    # [a-LoRA3] r_a is parked between chunks (chunked-resume). r_b on
+    # r_a is parked between chunks (chunked-resume). r_b on
     # a different adapter is submitted; with max_loaded_loras=1 it forces
     # an adapter eviction. Per b-5ed4faf0ab the chunked-resume must
     # bypass the drainer gate, so r_a's adapter is preserved (re-loaded)
@@ -240,7 +240,7 @@ class TestScriptedLoRA(CustomTestCase):
             ),
         )
 
-    # [a-LoRA4] Triple-race: LoRA + chunked + abort. r_a is mid-chunk on
+    # Triple-race: LoRA + chunked + abort. r_a is mid-chunk on
     # adapter A; r_b on adapter B forces an eviction; then abort r_a
     # while the eviction is in flight. Expected: no orphaned adapter
     # ref, no leaked KV pages.
@@ -281,7 +281,7 @@ class TestScriptedLoRA(CustomTestCase):
             ),
         )
 
-    # [c-L3] return_logprob + LoRA + chunked exercises the lm_head pass
+    # return_logprob + LoRA + chunked exercises the lm_head pass
     # index code path on the LoRA wrapper. Forward-pointing pin: once
     # ``start_req`` learns ``return_logprob=`` (wishlist §4 P2 (12)) and
     # ``ReqHandle`` exposes ``num_input_logprobs``, this asserts that

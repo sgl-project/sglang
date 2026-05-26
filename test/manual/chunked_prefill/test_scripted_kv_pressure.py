@@ -276,7 +276,7 @@ class TestScriptedKVPressure(CustomTestCase):
             ),
         )
 
-    # [b-b433e1ea35] strict mem check + page_size>1 must count the
+    # strict mem check + page_size>1 must count the
     # chunked-resume tail when a chunked req sits in waiting_queue;
     # pre-fix the runtime mem accounting tripped a false-positive leak
     # assert during busy.
@@ -299,7 +299,7 @@ class TestScriptedKVPressure(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-KV6] chunked retract → resume → finish — completed state must
+    # chunked retract → resume → finish — completed state must
     # release every KV page acquired during the chunked path; pool count
     # is at least the pre-submit baseline.
     @staticmethod
@@ -324,7 +324,7 @@ class TestScriptedKVPressure(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-KV5] retract at three distinct chunked progress points —
+    # retract at three distinct chunked progress points —
     # chunks_done={0, mid, last-1} — each chunked-resume must rebuild
     # prefix_indices correctly and complete.
     @staticmethod
@@ -366,7 +366,7 @@ class TestScriptedKVPressure(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-Cross13] flush_cache mid-chunked — the in-flight chunked req's
+    # flush_cache mid-chunked — the in-flight chunked req's
     # prefix must not be flushed; the req still completes cleanly.
     @staticmethod
     def _script_flush_cache_during_chunked_in_flight(t: ScriptedRuntime):
@@ -391,7 +391,7 @@ class TestScriptedKVPressure(CustomTestCase):
             **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
         )
 
-    # [a-Cross16] chunked oscillation — 3 force_retracts on one req;
+    # chunked oscillation — 3 force_retracts on one req;
     # chunks_done is preserved across retract/resume rounds and the
     # req still finishes once admitted long enough.
     @staticmethod
