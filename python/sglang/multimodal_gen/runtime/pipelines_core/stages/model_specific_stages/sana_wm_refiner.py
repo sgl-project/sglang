@@ -359,8 +359,8 @@ class SanaWMLTX2RefinerStage(PipelineStage):
                 patch_size_t=patch_size_t,
             )
             velocity_current = velocity_5d[:, :, sink_size:].to(self.dtype)
-            dt = (sigmas[step_idx + 1] - sigma).to(self.dtype)
-            noisy = noisy + velocity_current * dt
+            dt = (sigmas[step_idx + 1] - sigma).float()
+            noisy = (noisy.float() + velocity_current.float() * dt).to(self.dtype)
             log_sana_wm_tensor_stats(
                 f"refiner.step_{step_idx}.velocity_current", velocity_current
             )

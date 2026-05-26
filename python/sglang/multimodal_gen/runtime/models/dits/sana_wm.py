@@ -1402,9 +1402,10 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         else:
             combined = main_raw
 
-        # Shared output gate + shared output projection
-        gate = F.silu(self.output_gate(x).float())
-        combined = combined * gate.to(combined.dtype)
+        # Shared output gate + shared output projection. Upstream evaluates
+        # the SiLU gate in fp32 and multiplies before casting for proj.
+        gate = F.silu(self.output_gate(x).to(torch.float32))
+        combined = combined * gate
         return self.proj(combined.to(self.proj.weight.dtype))
 
 
@@ -1657,6 +1658,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             hidden_size=self.inner_dim,
             token_num=arch.model_max_length,
         )
+        self.y_norm = bool(getattr(arch, "y_norm", True))
         self.attention_y_norm = _RMSNorm(
             self.inner_dim,
             scale_factor=getattr(arch, "y_norm_scale_factor", 1.0),
@@ -1802,7 +1804,8 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         y = self.y_embedder(y).squeeze(1)              # (B, L, D)
         if y.shape[0] != B:
             y = y.expand(B, -1, -1).contiguous()
-        y = self.attention_y_norm(y)
+        if self.y_norm:
+            y = self.attention_y_norm(y)
         if encoder_attention_mask is not None and encoder_attention_mask.shape[0] != B:
             encoder_attention_mask = encoder_attention_mask.expand(B, -1).contiguous()
 

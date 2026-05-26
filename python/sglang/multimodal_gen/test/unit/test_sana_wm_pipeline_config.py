@@ -54,6 +54,17 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         shape = self.config.prepare_latent_shape(batch, batch_size=1, num_frames=49)
         self.assertEqual(shape, (1, 128, 7, 22, 40))
 
+    def test_prepare_latent_shape_requires_spatial_stride_alignment(self) -> None:
+        batch = SimpleNamespace(height=705, width=1280)
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            self.config.prepare_latent_shape(batch, batch_size=1, num_frames=49)
+
+    def test_prepare_latent_shape_uses_axis_specific_spatial_strides(self) -> None:
+        self.config.vae_stride = (8, 16, 32)
+        batch = SimpleNamespace(height=704, width=1280)
+        shape = self.config.prepare_latent_shape(batch, batch_size=1, num_frames=49)
+        self.assertEqual(shape, (1, 128, 7, 44, 40))
+
     def test_prepare_pos_cond_kwargs_passes_camera_from_batch_extra(self) -> None:
         # SanaWMBeforeDenoisingStage packs c2w + intrinsics into the upstream
         # latent-frame (B, T_lat, 20) raymap plus a (B, 48, T_lat, H, W)
@@ -233,6 +244,7 @@ class TestSanaWMSamplingParams(unittest.TestCase):
         self.assertEqual(params.num_frames, 49)
         self.assertEqual(params.num_inference_steps, 20)
         self.assertEqual(params.guidance_scale, 4.5)
+        self.assertEqual(params.negative_prompt, "")
 
     def test_build_request_extra_omits_camera_by_default(self) -> None:
         params = SanaWMSamplingParams()
@@ -388,6 +400,13 @@ class TestSanaWMBeforeDenoisingStage(unittest.TestCase):
                 torch.tensor([16.0, 16.0, 10.0, 6.0]),
             )
         )
+
+    def test_explicit_camera_request_detects_diffusers_path_kwargs(self) -> None:
+        batch = SimpleNamespace(
+            extra={"diffusers_kwargs": {"camera_to_world_path": "/tmp/cam.npy"}}
+        )
+
+        self.assertTrue(SanaWMBeforeDenoisingStage._has_explicit_camera_request(batch))
 
     def test_latent_frame_camera_conditions_samples_stride_indices(self) -> None:
         original = torch.arange(1 * 17 * 20, dtype=torch.float32).reshape(1, 17, 20)

@@ -169,11 +169,19 @@ class SanaWMPipelineConfig(PipelineConfig):
         T_latent = ceil((num_frames - 1) / temporal_stride) + 1
         """
         t_stride = self.vae_stride[0]
-        s_stride = self.vae_stride[1]
+        h_stride = self.vae_stride[1]
+        w_stride = self.vae_stride[2] if len(self.vae_stride) > 2 else h_stride
+
+        if batch.height % h_stride != 0 or batch.width % w_stride != 0:
+            raise ValueError(
+                "SANA-WM height/width must be divisible by the LTX-2 spatial "
+                f"stride ({h_stride}, {w_stride}); got "
+                f"height={batch.height}, width={batch.width}."
+            )
 
         T_latent = (num_frames - 1) // t_stride + 1
-        H_sp = batch.height // s_stride
-        W_sp = batch.width // s_stride
+        H_sp = batch.height // h_stride
+        W_sp = batch.width // w_stride
         z_dim = self.vae_config.arch_config.latent_channels  # 128
 
         return (batch_size, z_dim, T_latent, H_sp, W_sp)

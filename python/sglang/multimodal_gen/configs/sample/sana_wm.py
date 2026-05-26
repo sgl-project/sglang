@@ -49,12 +49,8 @@ class SanaWMSamplingParams(SamplingParams):
     # Classifier-free guidance scale
     guidance_scale: float = 4.5
 
-    negative_prompt: str = (
-        "low quality, low resolution, blurry, overexposed, underexposed, "
-        "distorted, deformed, disfigured, bad anatomy, extra limbs, "
-        "watermark, text, signature, ugly, noisy, artifacts, camera shake, "
-        "jitter, lens flare"
-    )
+    # NVlabs' SANA-WM inference defaults to an empty negative prompt.
+    negative_prompt: str = ""
 
     # --- Camera trajectory (6-DoF) — optional ---
     camera_to_world: Optional[CameraTensorLike] = None

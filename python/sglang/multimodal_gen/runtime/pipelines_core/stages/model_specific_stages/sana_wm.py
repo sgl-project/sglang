@@ -836,10 +836,10 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
 
         if isinstance(condition_image, list):
             if len(condition_image) == 0:
-                logger.warning(
-                    "condition_image list is empty; skipping first-frame splice."
+                raise ValueError(
+                    "condition_image list is empty; SANA-WM requires a first "
+                    "frame conditioning image."
                 )
-                return latents
             condition_image = condition_image[0]
 
         # Convert PIL to tensor if needed
@@ -853,8 +853,10 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             elif img_tensor.dim() == 5 and img_tensor.shape[2] == 1:
                 img_tensor = img_tensor.squeeze(2)
         else:
-            logger.warning("condition_image type unsupported; skipping first-frame splice.")
-            return latents
+            raise TypeError(
+                "condition_image must be a PIL image, tensor, or non-empty list; "
+                f"got {type(condition_image).__name__}."
+            )
 
         # Resize if needed to match latent spatial dims
         B, C, T_lat, H_sp, W_sp = latents.shape
@@ -1107,6 +1109,35 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         ).view(1, 1, 4)
         intrinsics = intrinsics.repeat(batch_size, num_frames, 1)
         return camera_to_world, intrinsics
+
+    @staticmethod
+    def _has_explicit_camera_request(batch: Req) -> bool:
+        extra = getattr(batch, "extra", None) or {}
+        if any(
+            key in extra and extra[key] is not None
+            for key in (
+                "camera_conditions",
+                "chunk_plucker",
+                "camera_to_world",
+                "intrinsics",
+            )
+        ):
+            return True
+        diffusers_kwargs = extra.get("diffusers_kwargs", {})
+        if not isinstance(diffusers_kwargs, dict):
+            return False
+        return any(
+            key in diffusers_kwargs and diffusers_kwargs[key] is not None
+            for key in (
+                "camera_conditions",
+                "chunk_plucker",
+                "camera_to_world",
+                "camera_to_world_path",
+                "camera_path",
+                "intrinsics",
+                "intrinsics_path",
+            )
+        )
 
     def _build_camera_conditioning(
         self,
@@ -1401,7 +1432,11 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                 latents = self._splice_first_frame(latents, condition_image, dtype, device)
                 self.log_info("First-frame spliced into noise latents.")
             except Exception as e:
-                logger.warning(f"First-frame splice failed: {e}. Using pure noise latents.")
+                raise RuntimeError(
+                    "SANA-WM first-frame conditioning failed; refusing to "
+                    "continue with pure-noise latents because that produces "
+                    "misleading low-quality output."
+                ) from e
         else:
             self.log_info("No condition_image provided; using pure noise latents (T2V mode).")
 
@@ -1424,6 +1459,11 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                 )
             )
         except Exception as e:
+            if self._has_explicit_camera_request(batch):
+                raise RuntimeError(
+                    "SANA-WM camera conditioning failed for an explicitly "
+                    "provided camera/intrinsics request."
+                ) from e
             logger.warning(
                 "SANA-WM camera conditioning failed: %s. Disabling camera branch.",
                 e,
