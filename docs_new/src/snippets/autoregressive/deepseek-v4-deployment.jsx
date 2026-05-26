@@ -909,6 +909,20 @@ export const DeepSeekV4Deployment = () => {
         `#   NVSHMEM_HCA_LIST=<your-hca-list>\n` +
         cmd;
     }
+    // GB200 Pro with MegaMoE disabled runs the DeepEP a2a backend, which is
+    // currently only packaged in the CUDA 12.9 image — the default `:latest`
+    // ships CUDA 13 and does not include a compatible DeepEP build.
+    if (
+      hardware === "gb200" &&
+      isBig &&
+      megamoe === "disabled" &&
+      flags.some((f) => f.includes("--moe-a2a-backend deepep"))
+    ) {
+      cmd =
+        `# NOTE: for the DeepEP backend, use the cu129 docker image\n` +
+        `# (lmsysorg/sglang:latest-cu129) instead of the default \`:latest\`.\n` +
+        cmd;
+    }
     const withMultinode = multinode ? prependMultiNodeNote(cmd, nnodes) : cmd;
 
     // H200 Pro low-latency: show BOTH a single-node (TP=8 marlin) variant
