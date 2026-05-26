@@ -167,10 +167,7 @@ def scatter_req_token_ids_torch_reference(
     req_pool_indices: torch.Tensor,
     pool_out: torch.Tensor,
 ) -> None:
-    """Plain-PyTorch reference for :func:`launch_scatter_req_token_ids_kernel`.
-
-    Equivalent semantics; used by the unit test to byte-equal the Triton output.
-    """
+    """Plain-PyTorch reference for :func:`launch_scatter_req_token_ids_kernel`."""
     bs = int(req_pool_indices.shape[0])
     offsets_host = offsets.detach().cpu().tolist()
     req_pool_indices_host = req_pool_indices.detach().cpu().tolist()
