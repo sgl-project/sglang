@@ -127,7 +127,9 @@ class TestScriptedInvariants(CustomTestCase):
                     + comp.get("decode", [])
                     + comp.get("chunked", [])
                 )
-                assert r.rid in all_rids, f"running but not in batch_composition: {comp}"
+                assert (
+                    r.rid in all_rids
+                ), f"running but not in batch_composition: {comp}"
             if r.finished:
                 return
             yield
@@ -244,7 +246,8 @@ class TestScriptedInvariants(CustomTestCase):
     def _script_chunked_in_flight_count_le_one(t: ScriptedRuntime):
         # main-upstream invariant: at most one chunked req in flight.
         reqs = [
-            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2) for _ in range(3)
+            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+            for _ in range(3)
         ]
         for _ in range(DEFAULT_MAX_STEPS * 3):
             assert t.chunked_in_flight_count() <= 1
@@ -564,7 +567,9 @@ class TestScriptedInvariants(CustomTestCase):
         for _ in range(DEFAULT_MAX_STEPS):
             s = r.status
             if r.finished:
-                assert s == "finished", f"finished req must report status 'finished', got {s!r}"
+                assert (
+                    s == "finished"
+                ), f"finished req must report status 'finished', got {s!r}"
                 return
             assert s in legal_pre_finish, (
                 f"chunked req observed illegal status {s!r}; "
@@ -615,9 +620,9 @@ class TestScriptedInvariants(CustomTestCase):
         assert r.status == "finished"
         for _ in range(50):
             yield
-            assert r.status == "finished", (
-                f"status rolled back from finished to {r.status!r}"
-            )
+            assert (
+                r.status == "finished"
+            ), f"status rolled back from finished to {r.status!r}"
 
 
 if __name__ == "__main__":
