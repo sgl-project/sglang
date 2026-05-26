@@ -203,6 +203,7 @@ def make_forward_batch(
         is_decode=lambda: is_decode_or_idle,
         is_decode_or_idle=lambda: is_decode_or_idle,
         is_target_verify=lambda: is_target_verify,
+        is_draft_extend=lambda include_v2=False: include_v2 and is_draft_extend_v2,
         is_draft_extend_v2=lambda: is_draft_extend_v2,
     )
     return SimpleNamespace(
