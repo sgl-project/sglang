@@ -2,7 +2,7 @@
 
 ## Current progress
 
-Last updated: 2026-05-26
+Last updated: 2026-05-27
 
 Implemented:
 - Shared dense MHA/GQA correctness helpers exist in
@@ -43,15 +43,27 @@ Implemented:
   10-case input matrix via `make_kda_cases`, plus a Lightning (Bailing-style
   segmented linear attention) fixture under `lightning/` that uses the same
   10-case matrix (`head_dim=128` to satisfy the seg_la kernel's K/V split
-  constraints), plus an initial Mamba2 state-space-model fixture under `mamba/`
-  with an eager EXTEND case that drives `Mamba2AttnBackend` end-to-end through
-  a real `MambaMixer2`. `dsv4/` now has an initial SWA-only (`compress_ratio=0`)
-  Phase 2 fixture under `dsv4/` that drives the real `DeepseekV4AttnBackend`
-  through `flash_mla` with the production packed FP8-nope/BF16-rope SWA cache
-  and an independent PyTorch reference that dequantizes the same cache and
-  applies sliding-window MLA math with a virtual-key attention-sink correction.
-  C4/C128 compressed-attention paths, decode mode, speculative paths, and
-  graph runners remain explicit DSV4 follow-ups.
+  constraints), plus a Mamba2 state-space-model fixture under `mamba/`
+  with 7 eager EXTEND cases (zero-prefix exact-page, below-page, above-page,
+  with-prefix, multi-request zero-prefix, multi-request ragged, page_size=1)
+  that drive `Mamba2AttnBackend` end-to-end through a real `MambaMixer2`;
+  DECODE remains unwired because `MambaMixer2.forward_decode` requires
+  `initialize_mamba_selective_state_update_backend()` that only the
+  production model runner installs. `dsv4/` now covers SWA-only
+  (`compress_ratio=0`) plus C4 (`compress_ratio=4`) and C128
+  (`compress_ratio=128`) compressed-attention paths through the real
+  `DeepseekV4AttnBackend` with the production packed FP8-nope/BF16-rope
+  SWA cache and an independent vanilla-BF16 PyTorch reference (the
+  reference does NOT read bytes back from the production cache so a pack
+  bug cannot self-cancel). EAGLE target_verify chain (eager + CUDA-graph
+  replay) is covered for all three compress_ratios; EAGLE draft_extend
+  (eager + CUDA-graph replay) is covered for SWA-only — C4/C128 +
+  draft_extend is production-unreachable because the DSV4 NextN draft
+  model hardcodes `compress_ratio_override=0`. Remaining DSV4 follow-ups
+  are limited to the production EAGLE draft runner / draft-extend runner
+  integration paths and modeling the `Compressor` / `C4Indexer`
+  themselves (today the indexer is bypassed and `c4_sparse_page_indices`
+  is seeded manually).
 - Phase 3 dense runner integration is implemented for representative attention
   backends: eager mode for `torch_native`, and CUDA-graph metadata capture/replay
   decode mode for `triton` and `flashinfer`. Runner coverage now includes MHA,
@@ -203,15 +215,34 @@ Implemented:
   decode. Dense fallback cases compare against an independent dense PyTorch
   reference; sparse cases compare against an independent top-k PyTorch
   reference.
-- DSV4 has an initial SWA-only (`compress_ratio=0`) Phase 2 fixture using the
-  real `DeepseekV4AttnBackend` and `DeepSeekV4TokenToKVPool` with the production
-  packed FP8-nope/BF16-rope SWA cache, plus an independent PyTorch reference
-  that dequantizes the same cache. Remaining DSV4 work is explicitly deferred
-  as follow-ups: C4 (4×) and C128 (128×) compressed-attention paths and their
-  `Compressor`/`C4Indexer` metadata, decode mode SWA, speculative target-verify
-  and draft-extend paths (`DSV4RawVerifyMetadata`, `DSV4RawDecodeMetadata`),
-  `seq_len > SWA_WINDOW` cases, non-zero attention sinks, and CUDA-graph
-  capture/replay coverage.
+- DSV4 has both SWA-only (`compress_ratio=0`) AND C4/C128 compressed
+  attention Phase 2 fixtures using the real `DeepseekV4AttnBackend`
+  and `DeepSeekV4TokenToKVPool` with the production packed
+  FP8-nope/BF16-rope SWA cache. The reference is an independent vanilla
+  PyTorch softmax over the projected BF16 K the fixture stashes on
+  `fixture._swa_bf16_k_per_req` / `fixture._extra_bf16_k`. It does NOT
+  read bytes back from the production cache — earlier coupling between
+  reference and `quant_to_nope_fp8_rope_bf16_pack_triton` /
+  `set_swa_key_buffer_radix` was removed so a silent pack/write bug
+  would no longer corrupt both paths identically (audit finding #4).
+  Coverage includes: SWA eager EXTEND (no-prefix / prefix-within-window
+  / nonzero `attn_sink` / above-window) + DECODE within-window + multi-
+  request + above-window; SWA + C4 (eager EXTEND `prefix=64,extend=16` +
+  DECODE `prefix=64`) and SWA + C128 (eager EXTEND `prefix=128,extend=16`
+  + DECODE `prefix=128`); CUDA-graph decode replay for SWA + C4 + C128;
+  EAGLE target_verify chain (`topk=1`) eager + CUDA-graph replay across
+  SWA + C4 + C128; EAGLE draft_extend eager + CUDA-graph replay for
+  SWA-only. C4/C128 cases bypass `Compressor`/`C4Indexer` (extra K is
+  written via `set_extra_key_buffer` and `c4_sparse_page_indices` is
+  manually seeded after `on_after_cuda_graph_warmup`). DSV4 + EAGLE
+  draft_extend with `compress_ratio={4,128}` is *production-unreachable*
+  because `DeepseekV4ModelNextN` hardcodes the draft layer to
+  `compress_ratio_override=0`; the runner asserts on
+  `case.compress_ratio==0` at the call site to make this loud. Tree
+  speculative is also structurally impossible (`assert topk in [0, 1]`
+  at `deepseek_v4_backend.py:369`). Remaining DSV4 follow-ups:
+  production EAGLEDraftCudaGraphRunner + EAGLEDraftExtendCudaGraphRunner
+  integration; modeling the `Compressor` / `C4Indexer` math itself.
 - FA3/FA4 CUDA-graph replay is intentionally not enabled yet. Dense eager and
   PCG/BCG split-op paths match the HF-style reference, but the shared decode
   CUDA-graph helper currently mismatches on replay for both FA backends. Local
@@ -297,9 +328,9 @@ Current status:
   implemented/deferred bullets.
 - Locally runnable Phase 2 expansion now covers the non-sparse, dense-fallback,
   DSA sparse top-k, dual-chunk sparse all-column, torch-native SWA, KDA
-  (Kimi Delta), Lightning (Bailing seg_la), Mamba2 (SSM), and DSV4 SWA-only
-  method fixtures. Remaining Phase 2 work is compressed (DSV4 C4/C128),
-  hardware-gated, or sparse pruning layouts beyond the local DSA/dual-chunk
+  (Kimi Delta), Lightning (Bailing seg_la), Mamba2 SSM (7 EXTEND variants),
+  and DSV4 (SWA + C4 + C128) method fixtures. Remaining Phase 2 work is
+  hardware-gated or sparse pruning layouts beyond the local DSA/dual-chunk
   slices.
 - Phase 4b worker-integration tests (StandaloneWorker, MultiLayerEagleWorker,
   DFlashWorker, NGRAMWorker) are deferred. The worker boundary requires
@@ -322,6 +353,34 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Expanded Mamba2 EXTEND coverage from 1 case to 7 cases by switching
+  `mamba/test_mamba2.py` to consume `make_mamba2_cases('triton')`:
+  zero-prefix exact-page (16 tokens), zero-prefix below-page (8 tokens),
+  zero-prefix above-page (32 tokens, cross-page), with-prefix
+  (`prefix=16, extend=16`), multi-request zero-prefix
+  (`extend=(16, 16)`), multi-request ragged
+  (`prefix=(0, 16), extend=(16, 16)`), and `page_size=1` (16 tokens).
+  DECODE intentionally not enabled — `MambaMixer2.forward_decode`
+  requires `initialize_mamba_selective_state_update_backend()` which is
+  not wired in the fixture.
+- `python test/manual/attention/unittest/mamba/test_mamba2.py -v`
+  - Ran 2 tests in 1.096s (7 EXTEND subcases + 1 replay metadata
+    padding mutation test) after expanding `make_mamba2_cases`.
+- Audited the full attention unittest matrix (28 test files across
+  dense/swa/mla/gdn/kda/lightning/mamba/dsa/dsv4/dual_chunk) for input-
+  config coverage. The audit produced a backend-by-backend coverage
+  matrix; key findings recorded in per-method READMEs. Several
+  "mechanical" gaps the audit surfaced turned out *not* to be
+  mechanical: page_size=1 in dense is already covered
+  (`mha_extend_page_size_1`); flashinfer SWA with-prefix EXTEND,
+  above-window DECODE, and split-op prefix-within-window EXTEND fail
+  with ~0.2 max diff vs reference (flashinfer's SWA prefill/replay
+  paths diverge structurally from triton); DSA/dual_chunk/KDA/Lightning
+  runner integration is deliberately deferred per their READMEs and
+  requires substantial new infrastructure rather than mechanical clones.
+  The flashinfer SWA divergence is now documented in
+  `swa/test_flashinfer.py` so future maintainers don't repeat the
+  attempt.
 - Expanded Phase 2 input-shape coverage for KDA, Lightning, dual_chunk sparse,
   and DSA. KDA: switched `kda/test_triton.py` to consume the existing
   `make_kda_cases('triton')` enumeration so the dense-style 10-case matrix
