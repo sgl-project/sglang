@@ -1,0 +1,109 @@
+name: Release Docker Images Nightly XPU (Intel)
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 12 * * *'
+
+concurrency:
+  # A PR number if a pull request and otherwise the commit hash. This cancels
+  # queued and in-progress runs for the same PR (presubmit) or commit
+  # (postsubmit). The workflow name is prepended to avoid conflicts between
+  # different workflows.
+  group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: intel-bmg
+    environment: 'prod'
+    strategy:
+      fail-fast: false
+      matrix:
+        gpu_arch: ['bmg']
+        build_type: ['all']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required for git describe to find tags
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: "Set Date"
+        run: |
+          echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
+
+      - name: Get version from latest tag
+        id: version
+        run: |
+          # Use the shared helper so stable/post releases sort above rc tags.
+          VERSION=$(python3 python/tools/get_version_tag.py --tag-only | sed 's/^v//')
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not determine version from git tags"
+            exit 1
+          fi
+
+          # Get short commit hash of current HEAD
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+
+          # Compose pretend version for setuptools_scm: e.g., 0.5.8.dev20260129+g1a2b3c4
+          PRETEND_VERSION="${VERSION}.dev${{ env.DATE }}+g${COMMIT_HASH}"
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "pretend_version=${PRETEND_VERSION}" >> $GITHUB_OUTPUT
+          echo "Detected version: ${VERSION}"
+          echo "Pretend version for pip: ${PRETEND_VERSION}"
+
+      - name: Login to Intel Harbor (gar-registry.caas.intel.com)
+        uses: docker/login-action@v2
+        with:
+          registry: gar-registry.caas.intel.com
+          username: ${{ secrets.INTEL_HARBOR_USERNAME }}
+          password: ${{ secrets.INTEL_HARBOR_TOKEN }}
+
+      - name: Build and Push to gar-registry.caas.intel.com/sglang/sglang-xpu
+        run: |
+          version=${{ steps.version.outputs.version }}
+          pretend_version=${{ steps.version.outputs.pretend_version }}
+          echo "Version: ${version}"
+          echo "Pretend version: ${pretend_version}"
+
+          if [ "${{ matrix.gpu_arch }}" = "bmg" ]; then
+            xpu_tag="xpu-bmg"
+          else
+            echo "Unsupported xpu arch: ${{ matrix.gpu_arch }}"
+            exit 1
+          fi
+
+          tag=v${version}-${xpu_tag}
+          echo "IMAGE_TAG=${tag}-${{ env.DATE }}" >> $GITHUB_ENV
+
+          image="gar-registry.caas.intel.com/sglang/sglang-xpu:${tag}-${{ env.DATE }}"
+
+          docker build . \
+            -f docker/xpu.Dockerfile \
+            --build-arg SG_LANG_BRANCH=${{ github.ref_name }} \
+            --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} \
+            -t "${image}" \
+            --no-cache --progress=plain
+          docker push "${image}"
+
+      # Persist the tag right after the push succeeds so a downstream mirror or
+      # cache job can read exactly the tag that landed on the registry, even if
+      # a later step in this job fails.
+      - name: Save published image tag
+        run: |
+          mkdir -p image-tag
+          echo "${{ env.IMAGE_TAG }}" > "image-tag/${{ matrix.gpu_arch }}.txt"
+
+      - name: Upload image tag artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-tag-${{ matrix.gpu_arch }}
+          path: image-tag/${{ matrix.gpu_arch }}.txt
+          retention-days: 1
