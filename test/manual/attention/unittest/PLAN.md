@@ -975,8 +975,17 @@ Representative Phase 3 status:
   active forward context and reference/eager comparison. This now includes dense
   `fa3`, `fa4`, and `flex_attention`; full server-level PCG/BCG capture can remain
   in registered integration tests.
-- `hybrid_attn` and TBO composition should be added as focused Phase 3 cases after
-  the base backend graph paths are stable.
+- `hybrid_attn` and TBO eager composition are now covered by focused Phase 3
+  unit tests under `dense/test_hybrid_attn.py` and `dense/test_tbo.py`. The
+  hybrid_attn cases verify that EXTEND dispatches to the prefill backend and
+  DECODE dispatches to the decode backend by composing `HybridAttnBackend(
+  prefill=triton, decode=flashinfer)` on top of a dense fixture and comparing
+  the wrapper output against the independent dense PyTorch reference. The TBO
+  case composes `TboAttnBackend(primary=triton, children=[triton, triton])`
+  and validates that the eager (no-`tbo_children`) path delegates correctly to
+  the primary. Genuine sub-batched TBO orchestration (driven by the scheduler
+  / CUDA-graph capture via `tbo_children`, `compute_split_indices_for_cuda_graph_replay`,
+  and `split_spec_info`) is documented as a Phase 3 graph-expansion follow-up.
 
 ### Phase 4 matrix: speculative decoding attention
 

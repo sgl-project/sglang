@@ -846,6 +846,12 @@ def run_dense_fixture_eager(fixture: DenseAttentionFixture) -> torch.Tensor:
         return fixture.actual_module(fixture.input_hidden, fixture.forward_batch)
 
 
+def replace_backend(fixture: DenseAttentionFixture, backend) -> DenseAttentionFixture:
+    """Swap the backend on a built fixture (used to wire wrapper backends)."""
+    fixture.backend = backend
+    return fixture
+
+
 def expected_dense_fixture_output(fixture: DenseAttentionFixture) -> torch.Tensor:
     return _dense_attention_reference(
         fixture.reference_module,
