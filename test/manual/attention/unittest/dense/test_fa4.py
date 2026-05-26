@@ -27,10 +27,6 @@ class TestFA4DenseAttentionBackendCorrectness(CustomTestCase):
     HIDDEN_SIZE = 256
 
     CASES = make_dense_cases("fa4")
-    # See test_fa3.py for the FA-specific CG capture/replay note — FA's
-    # capture path assigns buffer slices without populating them; the
-    # test runner's `_backend_needs_capture_replay_init` shim populates
-    # them via an extra replay-init at capture time.
     CUDA_GRAPH_CASES = (
         DenseAttentionCase(
             name="runner_cuda_graph_fa4_mha_decode_page_boundary",

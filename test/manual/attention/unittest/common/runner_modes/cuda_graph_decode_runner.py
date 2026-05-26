@@ -246,28 +246,6 @@ def _check_decode_cuda_graph_case(case, capture_batch_size: int, *, allow_paddin
         )
 
 
-def _backend_needs_capture_replay_init(backend) -> bool:
-    """Backends whose `init_forward_metadata_capture_cuda_graph` assigns
-    metadata buffer slices *without* populating them, leaving the
-    populating work entirely to
-    `init_forward_metadata_replay_cuda_graph`. FlashAttention v3/v4 are
-    in this bucket — their capture path stores buffer slice references on
-    metadata but doesn't write valid `cache_seqlens` / `page_table` /
-    `cu_seqlens_k` values. In production, the capture-time forward is a
-    JIT warmup whose output is discarded so this is fine, but the unit
-    tests assert capture-time output against the reference, so the
-    buffers need to be populated before the capture forward runs.
-
-    Most other backends (Triton, FlashInfer, GDN/KDA/Lightning/Mamba2,
-    DSV4) populate buffers in their capture path already, and an extra
-    replay-init perturbs their state machines (GDN's `_replay_metadata`
-    mutates `req_pool_indices`, etc.). Default off; opt in via this
-    helper for backends that need it.
-    """
-    cls_name = type(backend).__name__
-    return cls_name in {"FlashAttentionBackend", "FlashAttentionMultiStepBackend"}
-
-
 def _init_cuda_graph_capture_metadata(backend, capture_batch_size: int, batch):
     backend.init_cuda_graph_state(
         max_bs=capture_batch_size,
@@ -282,21 +260,6 @@ def _init_cuda_graph_capture_metadata(backend, capture_batch_size: int, batch):
         forward_mode=batch.forward_mode,
         spec_info=batch.spec_info,
     )
-    if _backend_needs_capture_replay_init(backend):
-        backend._replay_forward_batch = batch
-        try:
-            backend.init_forward_metadata_replay_cuda_graph(
-                bs=capture_batch_size,
-                req_pool_indices=batch.req_pool_indices,
-                seq_lens=batch.seq_lens,
-                seq_lens_sum=batch.seq_lens_sum,
-                encoder_lens=batch.encoder_lens,
-                forward_mode=batch.forward_mode,
-                spec_info=batch.spec_info,
-                seq_lens_cpu=batch.seq_lens_cpu,
-            )
-        finally:
-            backend._replay_forward_batch = None
 
 
 def _init_cuda_graph_replay_metadata(backend, capture_batch_size: int, batch):
@@ -401,18 +364,17 @@ def _run_cuda_graph_decode_case(
 
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
         _init_cuda_graph_capture_metadata(backend, capture_batch_size, capture_batch)
-        capture_actual = adapter.run_forward(
-            graph_fixture,
-            capture_batch,
-            capture_inputs,
-        )
+        # Capture forward is a JIT warmup that mirrors production: the
+        # captured CUDA graph records kernel launches against buffers
+        # that *will* be populated by `init_forward_metadata_replay_cuda_graph`
+        # at replay. The capture-time output itself is discarded in
+        # production — and we discard it here too. Backends like FA3/FA4
+        # legitimately assign-but-don't-populate metadata buffers at
+        # capture, which makes the capture-time output undefined; only
+        # the replay output is contractually required to match the
+        # reference.
+        adapter.run_forward(graph_fixture, capture_batch, capture_inputs)
         backend.on_after_cuda_graph_warmup()
-        capture_expected = adapter.expected_output(
-            graph_fixture,
-            capture_case,
-            capture_inputs,
-            graph_initial_state,
-        )
 
         adapter.restore_state(graph_fixture, graph_initial_state)
         replay_pad_prefix_lens = (capture_prefix_len,) * (
@@ -451,12 +413,6 @@ def _run_cuda_graph_decode_case(
             replay_inputs,
         )
 
-    torch.testing.assert_close(
-        capture_actual,
-        capture_expected,
-        atol=adapter.atol,
-        rtol=adapter.rtol,
-    )
     replay_expected = adapter.expected_output(
         graph_fixture,
         replay_case,

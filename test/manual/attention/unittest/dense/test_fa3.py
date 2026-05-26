@@ -27,11 +27,6 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
     HIDDEN_SIZE = 256
 
     CASES = make_dense_cases("fa3")
-    # CG decode replay: the test runner populates FA's metadata buffers
-    # at capture time via the replay-init shim
-    # (`_backend_needs_capture_replay_init`) — without this, FA's capture
-    # path leaves the page_table buffer at zeros and the test would fail
-    # with ~93% mismatch. See cuda_graph_decode_runner.py for context.
     CUDA_GRAPH_CASES = (
         DenseAttentionCase(
             name="runner_cuda_graph_fa3_mha_decode_page_boundary",
