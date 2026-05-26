@@ -1113,10 +1113,9 @@ class ServerArgs:
         if self.enable_nan_detection:
             logger.warning(
                 "--enable-nan-detection is deprecated. "
-                "Use SGLANG_SPEC_NAN_DETECTION=1 and SGLANG_SPEC_OOB_DETECTION=1 instead."
+                "Use SGLANG_ENABLE_ASYNC_ASSERT=1 instead."
             )
-            envs.SGLANG_SPEC_NAN_DETECTION.set(True)
-            envs.SGLANG_SPEC_OOB_DETECTION.set(True)
+            envs.SGLANG_ENABLE_ASYNC_ASSERT.set(True)
 
         # Deprecated attention-backend alias: "compressed" -> "dsv4".
         for attr in (
@@ -6396,7 +6395,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-nan-detection",
             action="store_true",
-            help="[Deprecated] Use SGLANG_SPEC_NAN_DETECTION=1 and SGLANG_SPEC_OOB_DETECTION=1 instead.",
+            help="[Deprecated] Use SGLANG_ENABLE_ASYNC_ASSERT=1 instead.",
         )
         parser.add_argument(
             "--enable-p2p-check",
