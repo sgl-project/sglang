@@ -34,8 +34,8 @@ Implemented:
   tests use a scoped `5e-2` absolute tolerance for bf16 recurrent-kernel
   accumulation differences; chain verify and non-spec GDN paths keep `3e-2`.
 - Each attention-method folder now has a local `README.md` capability matrix and
-  progress summary. Implemented folders are `dense/`, `swa/`, `mla/`, `gdn/`, and
-  non-sparse `dual_chunk/`, plus DSA dense prefill fallback coverage. `dsv4/`
+  progress summary. Implemented folders are `dense/`, `swa/`, `mla/`, `gdn/`,
+  non-sparse `dual_chunk/`, plus DSA dense fallback and sparse top-k coverage. `dsv4/`
   remains a deferred method fixture because it needs a DeepSeekV4-specific
   packed-cache reference.
 - Phase 3 dense runner integration is implemented for representative attention
@@ -144,12 +144,14 @@ Implemented:
   and inter-chunk grouping with distinct `query`, `query_succ`, and
   `query_inter` projection weights. Sparse-attention and critical-token
   references remain future work.
-- DSA has a first locally runnable Phase 2 fixture in
+- DSA has locally runnable Phase 2 fixtures in
   `common/attention_methods/dsa_attention.py`. It builds a DeepSeek-DSA-shaped
   runner with real `DSATokenToKVPool`, exercises the `dsa` backend's
   MHA_ONE_SHOT dense prefill fallback for no-prefix and prefix extend batches,
-  and compares against the independent dense PyTorch reference. Sparse/indexer
-  top-k prefill/decode remains future work.
+  sparse prefill through `flashmla_sparse`, and sparse decode through the default
+  `flashmla_kv` path. Dense fallback cases compare against an independent dense
+  PyTorch reference; sparse cases compare against an independent top-k PyTorch
+  reference.
 - DSV4 remains deferred from the default unit matrix because its CUDA backend is
   not a compact backend swap: it hard-codes `head_dim=512`, `page_size=256`, and
   the DeepSeekV4 packed FP8/BF16 KV-cache layout before routing through FlashMLA
@@ -240,19 +242,25 @@ In progress:
   to backend-specific blockers and hardware-gated paths documented in the
   implemented/deferred bullets.
 - Locally runnable Phase 2 expansion now covers the non-sparse, dense-fallback,
-  and torch-native SWA method fixtures identified in this pass. Remaining Phase 2
-  work is sparse, compressed, or hardware-gated.
+  DSA sparse top-k, and torch-native SWA method fixtures identified in this pass.
+  Remaining Phase 2 work is compressed, hardware-gated, or sparse layouts beyond
+  the local DSA top-k slice.
 
 Next implementation steps:
 - Expand Phase 2 to additional attention methods/backends with method-specific
   fixtures rather than forcing them through the dense harness. Priority candidates:
   hardware-gated MLA kernels (`cutlass_mla`, `trtllm_mla`/`tokenspeed_mla` where
-  hardware and KV dtype support them), dual-chunk sparse layouts, DSA
-  sparse/indexer paths, and DSV4-style methods.
+  hardware and KV dtype support them), dual-chunk sparse layouts, additional DSA
+  index layouts, and DSV4-style methods.
 - Defer Phase 2 expansion for additional backends until representative Phase 3 and
   Phase 4 tests are passing.
 
 Latest verification:
+- Added DSA sparse top-k Phase 2 coverage for prefill (`flashmla_sparse`) and
+  decode (`flashmla_kv`) with a production-shaped DSA projected-attention fixture.
+- `python -m py_compile test/manual/attention/unittest/common/attention_methods/dsa_attention.py test/manual/attention/unittest/dsa/test_dsa.py`
+- `python test/manual/attention/unittest/dsa/test_dsa.py -v`
+  - Ran 2 tests in 0.897s after adding DSA sparse top-k coverage.
 - Added torch-native SWA Phase 2 coverage and updated `TorchNativeAttnBackend` to
   pass an explicit finite-window mask to PyTorch SDPA.
 - `python -m py_compile python/sglang/srt/layers/attention/torch_native_backend.py test/manual/attention/unittest/swa/test_torch_native.py`
@@ -1150,6 +1158,8 @@ Initial implementation slice:
   production path.
 - `swa/test_torch_native.py` covers torch-native eager SWA extend, prefix extend,
   decode, and GQA decode window boundaries using an explicit SDPA attention mask.
+- `dsa/test_dsa.py` covers DSA dense prefill fallback plus sparse top-k prefill
+  and decode paths with a DSA-specific projected-attention fixture.
 - FlashInfer cases use `head_dim=64` to match FlashInfer kernel constraints.
 - `mla/test_triton.py` and `gdn/test_triton.py` cover the representative dense-style
   input edge cases for method-specific Triton paths.
