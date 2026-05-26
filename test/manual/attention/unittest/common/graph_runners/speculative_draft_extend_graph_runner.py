@@ -7,24 +7,24 @@ from sglang.srt.model_executor.forward_context import ForwardContext, forward_co
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPDraftExtendInput
 
-from .cuda_graph_runner import (
-    _init_cuda_graph_capture_metadata,
-    _init_cuda_graph_replay_metadata,
-)
-from .dense_attention import DEFAULT_DEVICE as DENSE_DEFAULT_DEVICE
-from .dense_attention import DEFAULT_DTYPE as DENSE_DEFAULT_DTYPE
-from .dense_attention import (
+from ..attention_methods.dense_attention import DEFAULT_DEVICE as DENSE_DEFAULT_DEVICE
+from ..attention_methods.dense_attention import DEFAULT_DTYPE as DENSE_DEFAULT_DTYPE
+from ..attention_methods.dense_attention import (
     DEFAULT_HEAD_DIM,
     DEFAULT_HIDDEN_SIZE,
 )
-from .dense_attention import DEFAULT_MAX_CONTEXT_LEN as DENSE_DEFAULT_MAX_CONTEXT_LEN
-from .dense_attention import (
+from ..attention_methods.dense_attention import (
+    DEFAULT_MAX_CONTEXT_LEN as DENSE_DEFAULT_MAX_CONTEXT_LEN,
+)
+from ..attention_methods.dense_attention import (
     DENSE_ATOL,
     DENSE_RTOL,
     DenseAttentionCase,
 )
-from .dense_attention import _make_forward_batch as _make_dense_forward_batch
-from .dense_attention import (
+from ..attention_methods.dense_attention import (
+    _make_forward_batch as _make_dense_forward_batch,
+)
+from ..attention_methods.dense_attention import (
     build_dense_attention_fixture,
     dense_fixture_inputs,
     expected_dense_output_from_inputs,
@@ -33,21 +33,27 @@ from .dense_attention import (
     prepare_dense_runner_inputs,
     run_dense_forward,
 )
-from .mla_attention import DEFAULT_DEVICE as MLA_DEFAULT_DEVICE
-from .mla_attention import DEFAULT_DTYPE as MLA_DEFAULT_DTYPE
-from .mla_attention import DEFAULT_HIDDEN_SIZE as MLA_DEFAULT_HIDDEN_SIZE
-from .mla_attention import (
+from ..attention_methods.mla_attention import DEFAULT_DEVICE as MLA_DEFAULT_DEVICE
+from ..attention_methods.mla_attention import DEFAULT_DTYPE as MLA_DEFAULT_DTYPE
+from ..attention_methods.mla_attention import (
+    DEFAULT_HIDDEN_SIZE as MLA_DEFAULT_HIDDEN_SIZE,
+)
+from ..attention_methods.mla_attention import (
     DEFAULT_KV_LORA_RANK,
 )
-from .mla_attention import DEFAULT_MAX_CONTEXT_LEN as MLA_DEFAULT_MAX_CONTEXT_LEN
-from .mla_attention import (
+from ..attention_methods.mla_attention import (
+    DEFAULT_MAX_CONTEXT_LEN as MLA_DEFAULT_MAX_CONTEXT_LEN,
+)
+from ..attention_methods.mla_attention import (
     DEFAULT_QK_ROPE_HEAD_DIM,
     MLA_ATOL,
     MLA_RTOL,
     MLAAttentionCase,
 )
-from .mla_attention import _make_forward_batch as _make_mla_forward_batch
-from .mla_attention import (
+from ..attention_methods.mla_attention import (
+    _make_forward_batch as _make_mla_forward_batch,
+)
+from ..attention_methods.mla_attention import (
     build_mla_attention_fixture,
     expected_mla_output_from_inputs,
     make_mla_case_with_lens,
@@ -57,6 +63,10 @@ from .mla_attention import (
     mla_fixture_inputs,
     prepare_mla_runner_inputs,
     run_mla_forward,
+)
+from .cuda_graph_decode_runner import (
+    _init_cuda_graph_capture_metadata,
+    _init_cuda_graph_replay_metadata,
 )
 
 DraftExtendKind = Literal["eagle", "frozen_kv_mtp"]

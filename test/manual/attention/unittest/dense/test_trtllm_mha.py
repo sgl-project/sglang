@@ -11,7 +11,10 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from common.dense_attention import DenseAttentionCase, run_dense_attention_case
+from common.attention_methods.dense_attention import (
+    DenseAttentionCase,
+    run_dense_attention_case,
+)
 
 
 @unittest.skipIf(

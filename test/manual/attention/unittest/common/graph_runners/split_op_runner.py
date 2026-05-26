@@ -14,14 +14,16 @@ from sglang.srt.model_executor.breakable_cuda_graph.context import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 
-from .dense_attention import DEFAULT_DEVICE as DENSE_DEFAULT_DEVICE
-from .dense_attention import DEFAULT_DTYPE as DENSE_DEFAULT_DTYPE
-from .dense_attention import (
+from ..attention_methods.dense_attention import DEFAULT_DEVICE as DENSE_DEFAULT_DEVICE
+from ..attention_methods.dense_attention import DEFAULT_DTYPE as DENSE_DEFAULT_DTYPE
+from ..attention_methods.dense_attention import (
     DEFAULT_HEAD_DIM,
     DEFAULT_HIDDEN_SIZE,
 )
-from .dense_attention import DEFAULT_MAX_CONTEXT_LEN as DENSE_DEFAULT_MAX_CONTEXT_LEN
-from .dense_attention import (
+from ..attention_methods.dense_attention import (
+    DEFAULT_MAX_CONTEXT_LEN as DENSE_DEFAULT_MAX_CONTEXT_LEN,
+)
+from ..attention_methods.dense_attention import (
     DENSE_ATOL,
     DENSE_RTOL,
     DenseAttentionCase,
@@ -34,14 +36,16 @@ from .dense_attention import (
     run_dense_fixture_eager,
     run_dense_forward,
 )
-from .gdn_attention import DEFAULT_DEVICE as GDN_DEFAULT_DEVICE
-from .gdn_attention import DEFAULT_DTYPE as GDN_DEFAULT_DTYPE
-from .gdn_attention import (
+from ..attention_methods.gdn_attention import DEFAULT_DEVICE as GDN_DEFAULT_DEVICE
+from ..attention_methods.gdn_attention import DEFAULT_DTYPE as GDN_DEFAULT_DTYPE
+from ..attention_methods.gdn_attention import (
     DEFAULT_HEAD_K_DIM,
     DEFAULT_HEAD_V_DIM,
 )
-from .gdn_attention import DEFAULT_MAX_CONTEXT_LEN as GDN_DEFAULT_MAX_CONTEXT_LEN
-from .gdn_attention import (
+from ..attention_methods.gdn_attention import (
+    DEFAULT_MAX_CONTEXT_LEN as GDN_DEFAULT_MAX_CONTEXT_LEN,
+)
+from ..attention_methods.gdn_attention import (
     GDN_ATOL,
     GDN_RTOL,
     GDNAttentionCase,
@@ -56,14 +60,18 @@ from .gdn_attention import (
     run_gdn_fixture_eager,
     run_gdn_forward,
 )
-from .mla_attention import DEFAULT_DEVICE as MLA_DEFAULT_DEVICE
-from .mla_attention import DEFAULT_DTYPE as MLA_DEFAULT_DTYPE
-from .mla_attention import DEFAULT_HIDDEN_SIZE as MLA_DEFAULT_HIDDEN_SIZE
-from .mla_attention import (
+from ..attention_methods.mla_attention import DEFAULT_DEVICE as MLA_DEFAULT_DEVICE
+from ..attention_methods.mla_attention import DEFAULT_DTYPE as MLA_DEFAULT_DTYPE
+from ..attention_methods.mla_attention import (
+    DEFAULT_HIDDEN_SIZE as MLA_DEFAULT_HIDDEN_SIZE,
+)
+from ..attention_methods.mla_attention import (
     DEFAULT_KV_LORA_RANK,
 )
-from .mla_attention import DEFAULT_MAX_CONTEXT_LEN as MLA_DEFAULT_MAX_CONTEXT_LEN
-from .mla_attention import (
+from ..attention_methods.mla_attention import (
+    DEFAULT_MAX_CONTEXT_LEN as MLA_DEFAULT_MAX_CONTEXT_LEN,
+)
+from ..attention_methods.mla_attention import (
     DEFAULT_QK_ROPE_HEAD_DIM,
     MLA_ATOL,
     MLA_RTOL,

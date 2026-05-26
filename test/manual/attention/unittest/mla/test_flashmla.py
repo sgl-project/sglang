@@ -9,14 +9,19 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from common.cuda_graph_runner import run_mla_cuda_graph_decode_case
-from common.draft_extend import run_mla_eagle_draft_extend_case
-from common.mla_attention import MLAAttentionCase, run_mla_attention_case
-from common.split_op_runner import run_mla_split_op_extend_case
-from common.target_verify import (
+from common.attention_methods.mla_attention import (
+    MLAAttentionCase,
+    run_mla_attention_case,
+)
+from common.graph_runners.cuda_graph_decode_runner import run_mla_cuda_graph_decode_case
+from common.graph_runners.speculative_draft_extend_graph_runner import (
+    run_mla_eagle_draft_extend_case,
+)
+from common.graph_runners.speculative_target_verify_graph_runner import (
     run_mla_eagle_verify_case,
     run_mla_eagle_verify_cuda_graph_case,
 )
+from common.graph_runners.split_op_runner import run_mla_split_op_extend_case
 
 MLA_SHAPE_KWARGS = dict(
     kv_lora_rank=512,

@@ -9,18 +9,20 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from common.cuda_graph_runner import run_dense_cuda_graph_decode_case
-from common.dense_attention import (
+from common.attention_methods.dense_attention import (
     DenseAttentionCase,
     make_swa_no_prefix_input_config_cases,
     make_swa_prefix_input_config_cases,
     run_dense_attention_case,
 )
-from common.split_op_runner import run_dense_split_op_extend_case
-from common.target_verify import (
+from common.graph_runners.cuda_graph_decode_runner import (
+    run_dense_cuda_graph_decode_case,
+)
+from common.graph_runners.speculative_target_verify_graph_runner import (
     run_dense_spec_verify_case,
     run_dense_spec_verify_cuda_graph_case,
 )
+from common.graph_runners.split_op_runner import run_dense_split_op_extend_case
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")

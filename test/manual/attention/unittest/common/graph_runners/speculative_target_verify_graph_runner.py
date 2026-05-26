@@ -9,24 +9,24 @@ from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPVerifyInput
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 
-from .cuda_graph_runner import (
-    _init_cuda_graph_capture_metadata,
-    _init_cuda_graph_replay_metadata,
-)
-from .dense_attention import DEFAULT_DEVICE as DENSE_DEFAULT_DEVICE
-from .dense_attention import DEFAULT_DTYPE as DENSE_DEFAULT_DTYPE
-from .dense_attention import (
+from ..attention_methods.dense_attention import DEFAULT_DEVICE as DENSE_DEFAULT_DEVICE
+from ..attention_methods.dense_attention import DEFAULT_DTYPE as DENSE_DEFAULT_DTYPE
+from ..attention_methods.dense_attention import (
     DEFAULT_HEAD_DIM,
     DEFAULT_HIDDEN_SIZE,
 )
-from .dense_attention import DEFAULT_MAX_CONTEXT_LEN as DENSE_DEFAULT_MAX_CONTEXT_LEN
-from .dense_attention import (
+from ..attention_methods.dense_attention import (
+    DEFAULT_MAX_CONTEXT_LEN as DENSE_DEFAULT_MAX_CONTEXT_LEN,
+)
+from ..attention_methods.dense_attention import (
     DENSE_ATOL,
     DENSE_RTOL,
     DenseAttentionCase,
 )
-from .dense_attention import _make_forward_batch as _make_dense_forward_batch
-from .dense_attention import (
+from ..attention_methods.dense_attention import (
+    _make_forward_batch as _make_dense_forward_batch,
+)
+from ..attention_methods.dense_attention import (
     build_dense_attention_fixture,
     dense_attention_reference_with_custom_mask,
     dense_fixture_inputs,
@@ -36,22 +36,26 @@ from .dense_attention import (
     prepare_dense_runner_inputs,
     run_dense_forward,
 )
-from .gdn_attention import DEFAULT_DEVICE as GDN_DEFAULT_DEVICE
-from .gdn_attention import DEFAULT_DTYPE as GDN_DEFAULT_DTYPE
-from .gdn_attention import (
+from ..attention_methods.gdn_attention import DEFAULT_DEVICE as GDN_DEFAULT_DEVICE
+from ..attention_methods.gdn_attention import DEFAULT_DTYPE as GDN_DEFAULT_DTYPE
+from ..attention_methods.gdn_attention import (
     DEFAULT_HEAD_K_DIM,
     DEFAULT_HEAD_V_DIM,
 )
-from .gdn_attention import DEFAULT_MAX_CONTEXT_LEN as GDN_DEFAULT_MAX_CONTEXT_LEN
-from .gdn_attention import (
+from ..attention_methods.gdn_attention import (
+    DEFAULT_MAX_CONTEXT_LEN as GDN_DEFAULT_MAX_CONTEXT_LEN,
+)
+from ..attention_methods.gdn_attention import (
     GDN_ATOL,
     GDN_RTOL,
     GDN_TREE_ATOL,
     GDNAttentionCase,
     _clone_gdn_cache,
 )
-from .gdn_attention import _make_forward_batch as _make_gdn_forward_batch
-from .gdn_attention import (
+from ..attention_methods.gdn_attention import (
+    _make_forward_batch as _make_gdn_forward_batch,
+)
+from ..attention_methods.gdn_attention import (
     _restore_gdn_cache,
     build_gdn_attention_fixture,
     expected_gdn_verify_output_from_inputs,
@@ -61,21 +65,27 @@ from .gdn_attention import (
     prepare_gdn_runner_inputs,
     run_gdn_forward,
 )
-from .mla_attention import DEFAULT_DEVICE as MLA_DEFAULT_DEVICE
-from .mla_attention import DEFAULT_DTYPE as MLA_DEFAULT_DTYPE
-from .mla_attention import DEFAULT_HIDDEN_SIZE as MLA_DEFAULT_HIDDEN_SIZE
-from .mla_attention import (
+from ..attention_methods.mla_attention import DEFAULT_DEVICE as MLA_DEFAULT_DEVICE
+from ..attention_methods.mla_attention import DEFAULT_DTYPE as MLA_DEFAULT_DTYPE
+from ..attention_methods.mla_attention import (
+    DEFAULT_HIDDEN_SIZE as MLA_DEFAULT_HIDDEN_SIZE,
+)
+from ..attention_methods.mla_attention import (
     DEFAULT_KV_LORA_RANK,
 )
-from .mla_attention import DEFAULT_MAX_CONTEXT_LEN as MLA_DEFAULT_MAX_CONTEXT_LEN
-from .mla_attention import (
+from ..attention_methods.mla_attention import (
+    DEFAULT_MAX_CONTEXT_LEN as MLA_DEFAULT_MAX_CONTEXT_LEN,
+)
+from ..attention_methods.mla_attention import (
     DEFAULT_QK_ROPE_HEAD_DIM,
     MLA_ATOL,
     MLA_RTOL,
     MLAAttentionCase,
 )
-from .mla_attention import _make_forward_batch as _make_mla_forward_batch
-from .mla_attention import (
+from ..attention_methods.mla_attention import (
+    _make_forward_batch as _make_mla_forward_batch,
+)
+from ..attention_methods.mla_attention import (
     build_mla_attention_fixture,
     make_mla_case_with_prefix_lens,
     make_mla_padded_replay_inputs,
@@ -84,6 +94,10 @@ from .mla_attention import (
     mla_fixture_inputs,
     prepare_mla_runner_inputs,
     run_mla_forward,
+)
+from .cuda_graph_decode_runner import (
+    _init_cuda_graph_capture_metadata,
+    _init_cuda_graph_replay_metadata,
 )
 
 SpecVerifyKind = Literal["eagle", "frozen_kv_mtp", "dflash", "ngram"]
