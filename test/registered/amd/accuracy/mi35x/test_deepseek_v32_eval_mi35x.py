@@ -176,7 +176,7 @@ class TestDeepSeekV32EvalMI35x(unittest.TestCase):
     def setUpClass(cls):
         cls.models = MI35X_DEEPSEEK_V32_MODELS
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "200"))
+        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 
     def test_deepseek_v32_accuracy(self):
         """Test DeepSeek-V3.2 models with GSM8K completion benchmark."""
