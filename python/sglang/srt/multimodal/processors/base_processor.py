@@ -204,12 +204,21 @@ class BaseMultimodalProcessor(ABC):
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
 
+        # Default bumped 4 → 16: under high concurrency with many image URLs,
+        # 4 workers serialized network fetches hard. Override with SGLANG_IO_WORKERS.
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=int(os.environ.get("SGLANG_IO_WORKERS", 4))
+            max_workers=int(os.environ.get("SGLANG_IO_WORKERS", 8))
         )
         self.cpu_executor = concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context("fork"),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
+        )
+        # Dedicated pool for offloading the sync HF processor (process_and_combine_mm_data)
+        # off the TokenizerManager event loop. Separate from io_executor so
+        # network fetches and CPU-bound HF processing don't starve each other.
+        self.mm_processor_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=int(os.environ.get("SGLANG_MM_PROC_WORKERS", 8)),
+            thread_name_prefix="sgl-mmproc",
         )
 
         # Mapping from attribute names to modality types

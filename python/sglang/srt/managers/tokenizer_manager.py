@@ -345,6 +345,32 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenizer_backend=server_args.tokenizer_backend,
                 )
 
+        # Wrap the shared HF fast tokenizer in a deepcopy pool so concurrent
+        # calls from the TM event loop and mm_processor_executor threads don't
+        # race on the same PyO3 RefCell (which produces "RuntimeError: Already
+        # borrowed").  The __class__ swap is in-place: every aliased reference
+        # (TM.tokenizer, processor.tokenizer, mm_processor._tokenizer, …)
+        # transparently gains pool behavior. Must be placed AFTER all tokenizer
+        # attribute mutations (e.g. attach_additional_stop_token_ids).
+        # Only needed for multimodal models where mm_processor_executor threads
+        # call the tokenizer concurrently with the event loop.
+        if self.model_config.is_multimodal and self.tokenizer is not None:
+            try:
+                from sglang.srt.utils.thread_safe_tokenizer import (
+                    maybe_make_thread_pool,
+                )
+
+                pool_copies = int(os.environ.get("SGLANG_MM_PROC_WORKERS", "8")) + 1
+                maybe_make_thread_pool(self.tokenizer, copies=pool_copies)
+                logger.info(
+                    "Tokenizer thread-safe pool enabled: copies=%d", pool_copies
+                )
+            except Exception as e:
+                logger.warning(
+                    "Tokenizer thread-safe pool init failed: %s; continuing without pool",
+                    e,
+                )
+
         # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
         if (
             server_args.enable_dynamic_batch_tokenizer

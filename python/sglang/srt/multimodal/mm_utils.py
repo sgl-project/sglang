@@ -269,7 +269,9 @@ def process_anyres_image(image, processor, grid_pinpoints):
 
 
 def load_image_from_base64(image):
-    return Image.open(BytesIO(pybase64.b64decode(image, validate=True)))
+    img = Image.open(BytesIO(pybase64.b64decode(image, validate=True)))
+    img.load()
+    return img
 
 
 def expand2square(pil_img, background_color):

@@ -897,7 +897,12 @@ def _load_image(
             logger.warning(
                 f"Failed to decode JPEG on GPU, falling back to CPU. Error: {e}"
             )
-    return Image.open(BytesIO(image_bytes))
+    # Force pixel decode to happen here on the worker thread rather than
+    # lazily on first pixel access (which would otherwise land back on the
+    # event-loop / scheduler thread). Mirrors vLLM multimodal/media/image.py.
+    img = Image.open(BytesIO(image_bytes))
+    img.load()
+    return img
 
 
 def load_image(
@@ -940,13 +945,65 @@ def load_image(
     return image, image_size
 
 
+# ---------------------------------------------------------------------------
+# Process-global shared HTTP session for image URL fetching.
+#
+# The previous implementation created a fresh requests.get() (new TCP+TLS
+# handshake) for every image URL, with a 3 s timeout and only 4 io_executor
+# workers. Under high concurrency that serialized network fetches and
+# frequently timed out on slow hosts.
+#
+# Tunables (env vars):
+#   SGLANG_HTTP_POOL_CONNS    default 64   urllib3 pool_connections (keepalive)
+#   SGLANG_HTTP_POOL_MAXSIZE  default 128  urllib3 pool_maxsize (max total)
+#   SGLANG_HTTP_CONNECT_TIMEOUT default 15 s TCP connect timeout (was 3 s)
+#   SGLANG_HTTP_READ_TIMEOUT   default 30 s read timeout after connect (was 3 s)
+# ---------------------------------------------------------------------------
+_HTTP_SESSION_LOCK = threading.Lock()
+_HTTP_SESSION: Optional[requests.Session] = None
+
+
+def _get_http_session() -> requests.Session:
+    global _HTTP_SESSION
+    if _HTTP_SESSION is None:
+        with _HTTP_SESSION_LOCK:
+            if _HTTP_SESSION is None:
+                from requests.adapters import HTTPAdapter
+                from urllib3.util.retry import Retry
+
+                s = requests.Session()
+                retry = Retry(
+                    total=2,
+                    connect=2,
+                    read=1,
+                    backoff_factor=0.2,
+                    status_forcelist=[502, 503, 504],
+                    allowed_methods=frozenset(["GET"]),
+                    raise_on_status=False,
+                )
+                adapter = HTTPAdapter(
+                    pool_connections=int(
+                        os.getenv("SGLANG_HTTP_POOL_CONNS", "64")
+                    ),
+                    pool_maxsize=int(os.getenv("SGLANG_HTTP_POOL_MAXSIZE", "128")),
+                    max_retries=retry,
+                )
+                s.mount("http://", adapter)
+                s.mount("https://", adapter)
+                _HTTP_SESSION = s
+    return _HTTP_SESSION
+
+
 def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
     """Normalize various image inputs into raw bytes."""
     if isinstance(image_file, bytes):
         return image_file
     if image_file.startswith(("http://", "https://")):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, timeout=timeout)
+        connect_timeout = float(os.getenv("SGLANG_HTTP_CONNECT_TIMEOUT", "15"))
+        read_timeout = float(os.getenv("SGLANG_HTTP_READ_TIMEOUT", "30"))
+        response = _get_http_session().get(
+            image_file, timeout=(connect_timeout, read_timeout)
+        )
         try:
             response.raise_for_status()
             result = response.content

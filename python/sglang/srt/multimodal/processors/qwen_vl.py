@@ -1,3 +1,5 @@
+import asyncio
+import functools
 import math
 import os
 import re
@@ -680,7 +682,11 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         preprocess_time = time.perf_counter()
 
+        # Offload the heavy HF processor call (CPU-bound, ~hundreds of ms per
+        # request) off the TokenizerManager event loop so concurrent requests
+        # don't serialize through a single event loop thread.
         # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
+        loop = asyncio.get_running_loop()
         if self.hf_config.model_type in (
             "qwen3_vl",
             "qwen3_vl_moe",
@@ -688,15 +694,24 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5_moe",
             "intern_s2_preview",
         ):
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output,
-                self.mm_tokens,
-                video_metadata=video_metadata,
-                do_sample_frames=False,
+            mm_items, input_ids, ret = await loop.run_in_executor(
+                self.mm_processor_executor,
+                functools.partial(
+                    self.process_and_combine_mm_data,
+                    base_output,
+                    self.mm_tokens,
+                    video_metadata=video_metadata,
+                    do_sample_frames=False,
+                ),
             )
         else:
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output, self.mm_tokens
+            mm_items, input_ids, ret = await loop.run_in_executor(
+                self.mm_processor_executor,
+                functools.partial(
+                    self.process_and_combine_mm_data,
+                    base_output,
+                    self.mm_tokens,
+                ),
             )
 
         audio_feature_lengths = None
