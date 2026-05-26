@@ -1,8 +1,16 @@
+from typing import Literal
+
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput, EagleVerifyInput
+from sglang.srt.speculative.frozen_kv_mtp_info import (
+    FrozenKVMTPDraftExtendInput,
+    FrozenKVMTPVerifyInput,
+)
+from sglang.srt.speculative.ngram_info import NgramVerifyInput
 
 from .dense_attention import DEFAULT_DEVICE as DENSE_DEFAULT_DEVICE
 from .dense_attention import DEFAULT_DTYPE as DENSE_DEFAULT_DTYPE
@@ -38,6 +46,9 @@ from .mla_attention import (
     mla_fixture_inputs,
     run_mla_forward,
 )
+
+SpecVerifyKind = Literal["eagle", "frozen_kv_mtp", "dflash", "ngram"]
+DraftExtendKind = Literal["eagle", "frozen_kv_mtp"]
 
 
 def _check_target_verify_case(case) -> int:
@@ -105,15 +116,13 @@ def _make_custom_masks(
     return masks_by_req, torch.cat(flattened_masks, dim=0)
 
 
-def _make_eagle_verify_input(
+def _make_retrieve_tensors(
     case,
-    batch,
     *,
     topk: int,
     device: str,
 ):
     draft_token_num = _check_target_verify_case(case)
-    _, custom_mask = _make_custom_masks(case, topk=topk, device=device)
     retrieve_index = torch.arange(
         draft_token_num,
         dtype=torch.long,
@@ -125,7 +134,53 @@ def _make_eagle_verify_input(
         retrieve_next_token[:, 0] = 1
         retrieve_next_sibling[:, 1] = 2
 
-    return EagleVerifyInput(
+    return retrieve_index, retrieve_next_token, retrieve_next_sibling
+
+
+def _make_spec_verify_input(
+    case,
+    batch,
+    *,
+    topk: int,
+    device: str,
+    spec_kind: SpecVerifyKind,
+):
+    draft_token_num = _check_target_verify_case(case)
+    _, custom_mask = _make_custom_masks(case, topk=topk, device=device)
+    retrieve_index, retrieve_next_token, retrieve_next_sibling = _make_retrieve_tensors(
+        case,
+        topk=topk,
+        device=device,
+    )
+
+    if spec_kind == "dflash":
+        if topk != 1:
+            raise ValueError("DFlash verify is linear and expects topk=1.")
+        return DFlashVerifyInput(
+            draft_token=batch.input_ids,
+            positions=batch.positions,
+            draft_token_num=draft_token_num,
+            topk=1,
+            custom_mask=custom_mask,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
+
+    if spec_kind == "ngram":
+        return NgramVerifyInput(
+            draft_token=batch.input_ids,
+            tree_mask=custom_mask,
+            positions=batch.positions,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            draft_token_num=draft_token_num,
+        )
+
+    verify_cls = {
+        "eagle": EagleVerifyInput,
+        "frozen_kv_mtp": FrozenKVMTPVerifyInput,
+    }[spec_kind]
+    return verify_cls(
         draft_token=batch.input_ids,
         custom_mask=custom_mask,
         positions=batch.positions,
@@ -144,6 +199,22 @@ def _make_eagle_verify_input(
         capture_hidden_mode=CaptureHiddenMode.FULL,
         seq_lens_sum=batch.seq_lens_sum,
         seq_lens_cpu=batch.seq_lens_cpu,
+    )
+
+
+def _make_eagle_verify_input(
+    case,
+    batch,
+    *,
+    topk: int,
+    device: str,
+):
+    return _make_spec_verify_input(
+        case,
+        batch,
+        topk=topk,
+        device=device,
+        spec_kind="eagle",
     )
 
 
@@ -176,11 +247,47 @@ def _make_eagle_draft_extend_input(case, batch, *, device: str):
     )
 
 
-def run_dense_eagle_verify_case(
+def _make_frozen_kv_mtp_draft_extend_input(case, batch, *, device: str):
+    draft_extend_input = _make_eagle_draft_extend_input(case, batch, device=device)
+    return FrozenKVMTPDraftExtendInput(
+        hidden_states=draft_extend_input.hidden_states,
+        num_correct_drafts=draft_extend_input.num_correct_drafts,
+        num_accept_tokens=draft_extend_input.num_accept_tokens,
+        num_accept_tokens_cpu=draft_extend_input.num_accept_tokens_cpu,
+        input_ids=draft_extend_input.input_ids,
+        seq_lens=draft_extend_input.seq_lens,
+        seq_lens_cpu=draft_extend_input.seq_lens_cpu,
+        req_pool_indices=draft_extend_input.req_pool_indices,
+        positions=draft_extend_input.positions,
+        bonus_tokens=draft_extend_input.bonus_tokens,
+        capture_hidden_mode=draft_extend_input.capture_hidden_mode,
+        num_tokens_per_req=draft_extend_input.num_tokens_per_req,
+        num_tokens_for_logprob_per_req=(
+            draft_extend_input.num_tokens_for_logprob_per_req
+        ),
+    )
+
+
+def _make_draft_extend_input(
+    case,
+    batch,
+    *,
+    device: str,
+    spec_kind: DraftExtendKind,
+):
+    if spec_kind == "eagle":
+        return _make_eagle_draft_extend_input(case, batch, device=device)
+    if spec_kind == "frozen_kv_mtp":
+        return _make_frozen_kv_mtp_draft_extend_input(case, batch, device=device)
+    raise ValueError(f"Unsupported draft-extend spec kind: {spec_kind}")
+
+
+def run_dense_spec_verify_case(
     testcase,
     case: DenseAttentionCase,
     *,
     topk: int,
+    spec_kind: SpecVerifyKind = "eagle",
     head_dim: int = DEFAULT_HEAD_DIM,
     hidden_size: int = DEFAULT_HIDDEN_SIZE,
     max_context_len: int = DENSE_DEFAULT_MAX_CONTEXT_LEN,
@@ -198,11 +305,12 @@ def run_dense_eagle_verify_case(
     )
     _prepare_target_verify_batch(fixture.forward_batch, case, device)
     masks_by_req, _ = _make_custom_masks(case, topk=topk, device=device)
-    fixture.forward_batch.spec_info = _make_eagle_verify_input(
+    fixture.forward_batch.spec_info = _make_spec_verify_input(
         case,
         fixture.forward_batch,
         topk=topk,
         device=device,
+        spec_kind=spec_kind,
     )
     inputs = dense_fixture_inputs(fixture)
     expected = dense_attention_reference_with_custom_mask(
@@ -220,6 +328,30 @@ def run_dense_eagle_verify_case(
     torch.testing.assert_close(actual, expected, atol=DENSE_ATOL, rtol=DENSE_RTOL)
 
 
+def run_dense_eagle_verify_case(
+    testcase,
+    case: DenseAttentionCase,
+    *,
+    topk: int,
+    head_dim: int = DEFAULT_HEAD_DIM,
+    hidden_size: int = DEFAULT_HIDDEN_SIZE,
+    max_context_len: int = DENSE_DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = DENSE_DEFAULT_DTYPE,
+    device: str = DENSE_DEFAULT_DEVICE,
+):
+    run_dense_spec_verify_case(
+        testcase,
+        case,
+        topk=topk,
+        spec_kind="eagle",
+        head_dim=head_dim,
+        hidden_size=hidden_size,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+    )
+
+
 def run_dense_eagle_draft_extend_case(
     testcase,
     case: DenseAttentionCase,
@@ -229,6 +361,7 @@ def run_dense_eagle_draft_extend_case(
     max_context_len: int = DENSE_DEFAULT_MAX_CONTEXT_LEN,
     dtype: torch.dtype = DENSE_DEFAULT_DTYPE,
     device: str = DENSE_DEFAULT_DEVICE,
+    spec_kind: DraftExtendKind = "eagle",
 ):
     if not case.forward_mode.is_draft_extend():
         raise ValueError("EAGLE draft-extend coverage expects DRAFT_EXTEND cases.")
@@ -241,10 +374,11 @@ def run_dense_eagle_draft_extend_case(
         dtype=dtype,
         device=device,
     )
-    fixture.forward_batch.spec_info = _make_eagle_draft_extend_input(
+    fixture.forward_batch.spec_info = _make_draft_extend_input(
         case,
         fixture.forward_batch,
         device=device,
+        spec_kind=spec_kind,
     )
     inputs = dense_fixture_inputs(fixture)
     expected = expected_dense_output_from_inputs(fixture, case, inputs, None)

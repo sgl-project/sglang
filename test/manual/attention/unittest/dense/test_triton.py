@@ -15,7 +15,9 @@ from common.dense_attention import (
     make_dense_cases,
     run_dense_attention_case,
 )
-from common.spec_runner import run_dense_eagle_verify_case
+from common.spec_runner import (
+    run_dense_spec_verify_case,
+)
 from common.split_op_runner import run_dense_split_op_extend_case
 
 
@@ -79,7 +81,7 @@ class TestTritonDenseAttentionBackendCorrectness(CustomTestCase):
             4,
         ),
     )
-    EAGLE_VERIFY_CASES = (
+    SPEC_VERIFY_CASES = (
         (
             DenseAttentionCase(
                 name="runner_eagle_verify_chain",
@@ -92,6 +94,7 @@ class TestTritonDenseAttentionBackendCorrectness(CustomTestCase):
                 extend_lens=(3, 3),
             ),
             1,
+            "eagle",
         ),
         (
             DenseAttentionCase(
@@ -105,6 +108,49 @@ class TestTritonDenseAttentionBackendCorrectness(CustomTestCase):
                 extend_lens=(3, 3),
             ),
             2,
+            "eagle",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_frozen_kv_mtp_verify_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "frozen_kv_mtp",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_dflash_verify_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "dflash",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_ngram_verify_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "ngram",
         ),
     )
 
@@ -134,10 +180,20 @@ class TestTritonDenseAttentionBackendCorrectness(CustomTestCase):
                         static_num_tokens=static_num_tokens,
                     )
 
-    def test_runner_mode_eagle_verify_cases(self):
-        for case, topk in self.EAGLE_VERIFY_CASES:
-            with self.subTest(case=case.name, backend=case.backend, topk=topk):
-                run_dense_eagle_verify_case(self, case, topk=topk)
+    def test_runner_mode_spec_verify_cases(self):
+        for case, topk, spec_kind in self.SPEC_VERIFY_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                topk=topk,
+                spec_kind=spec_kind,
+            ):
+                run_dense_spec_verify_case(
+                    self,
+                    case,
+                    topk=topk,
+                    spec_kind=spec_kind,
+                )
 
 
 if __name__ == "__main__":

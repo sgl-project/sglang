@@ -43,11 +43,13 @@ Implemented:
 - MLA split-op coverage exercises the absorb-MLA cached-KV path where
   `RadixAttention` receives `k/v=None`; the split-op wrapper now preserves that
   contract instead of assuming materialized K/V tensors.
-- Phase 4 synthetic EAGLE metadata coverage has started for representative
+- Phase 4 synthetic speculative metadata coverage has started for representative
   backends. Dense `triton` and `flashinfer` now cover `TARGET_VERIFY` chain
-  (`topk=1`) and tree (`topk=2`) masks. Dense `flashinfer` also covers
-  `DRAFT_EXTEND` with ragged accepted-token counts. MLA `triton` covers
-  `TARGET_VERIFY` chain masks.
+  (`topk=1`) and tree (`topk=2`) masks for `EagleVerifyInput`, plus chain verify
+  metadata for `FrozenKVMTPVerifyInput`, `DFlashVerifyInput`, and
+  `NgramVerifyInput`. Dense `flashinfer` also covers `DRAFT_EXTEND` with ragged
+  accepted-token counts for both EAGLE and Frozen-KV MTP draft-extend input tags.
+  MLA `triton` covers EAGLE `TARGET_VERIFY` chain masks.
 - The synthetic EAGLE verify helper uses realistic target-verify semantics:
   `ForwardBatch.seq_lens` represents prefix KV lengths, while `spec_info`
   supplies the draft tokens, positions, retrieve indices, and custom tree mask.
@@ -58,6 +60,11 @@ Implemented:
   layouts, while FlashInfer `DRAFT_EXTEND` passes. Keep this as a focused follow-up
   on Triton draft-extend metadata/reference semantics rather than weakening Phase 4
   checks.
+- Target-verify CUDA-graph replay is intentionally not enabled yet. A synthetic
+  fixed-capture-batch helper passed capture warmup but mismatched the HF-style
+  reference on replay for both `triton` and `flashinfer`. This should be addressed
+  with a production `CudaGraphRunner`-shaped fixture, or by fixing the replay
+  metadata semantics, before adding green tests.
 - Dense input-config cases now cover page size 1, zero-prefix exact page,
   zero-prefix input lengths below/equal/above a page, prefix-length exact page,
   total-length exact page, total-length crossing a page boundary, ragged
@@ -95,8 +102,10 @@ Implemented:
   orthogonal to runner/backend metadata compatibility.
 
 In progress:
-- Phase 4 speculative/EAGLE-style metadata coverage is being expanded beyond the
-  initial EAGLE synthetic cases.
+- Phase 4 CUDA-graph worker-runner coverage remains open for target verify and
+  draft runners. The next useful unit slice should model the production
+  `CudaGraphRunner` buffer path rather than calling backend replay metadata in
+  isolation.
 
 Next implementation steps:
 - Finish Phase 4 speculative metadata coverage for representative valid backends
@@ -110,6 +119,10 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
+- `python -m py_compile test/manual/attention/unittest/common/spec_runner.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py`
+- `python test/manual/attention/unittest/dense/test_triton.py -v`
+- `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
+- `python test/manual/attention/unittest/mla/test_triton.py -v`
 - `python -m py_compile test/manual/attention/unittest/common/spec_runner.py test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/mla/test_triton.py`
 - `python test/manual/attention/unittest/dense/test_triton.py -v`
 - `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
@@ -527,12 +540,15 @@ Also test:
 - Tree-mask equivalence for `topk=1` chain draft and `topk=4` tree draft.
 
 Current Layer A status:
-- Dense `triton` and `flashinfer`: `TARGET_VERIFY` chain/tree custom-mask coverage.
-- Dense `flashinfer`: `DRAFT_EXTEND` ragged accepted-token coverage.
+- Dense `triton` and `flashinfer`: EAGLE `TARGET_VERIFY` chain/tree custom-mask
+  coverage, plus Frozen-KV MTP, DFlash, and NGRAM chain verify metadata coverage.
+- Dense `flashinfer`: EAGLE and Frozen-KV MTP `DRAFT_EXTEND` ragged accepted-token
+  coverage.
 - MLA `triton`: `TARGET_VERIFY` chain custom-mask coverage.
 - Deferred: Triton `DRAFT_EXTEND` until the fixture/reference semantics are
-  clarified; GDN speculative verify until recurrent speculative-state setup is
-  represented faithfully.
+  clarified; target-verify CUDA-graph replay until the production runner-buffer path
+  is represented faithfully; GDN speculative verify until recurrent speculative-state
+  setup is represented faithfully.
 
 #### Layer B: worker and draft-runner integration tests
 

@@ -18,7 +18,7 @@ from common.dense_attention import (
 )
 from common.spec_runner import (
     run_dense_eagle_draft_extend_case,
-    run_dense_eagle_verify_case,
+    run_dense_spec_verify_case,
 )
 from common.split_op_runner import run_dense_split_op_extend_case
 
@@ -90,7 +90,7 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
             4,
         ),
     )
-    EAGLE_VERIFY_CASES = (
+    SPEC_VERIFY_CASES = (
         (
             DenseAttentionCase(
                 name="runner_eagle_verify_chain",
@@ -103,6 +103,7 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
                 extend_lens=(3, 3),
             ),
             1,
+            "eagle",
         ),
         (
             DenseAttentionCase(
@@ -116,18 +117,77 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
                 extend_lens=(3, 3),
             ),
             2,
+            "eagle",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_frozen_kv_mtp_verify_chain",
+                backend="flashinfer",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "frozen_kv_mtp",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_dflash_verify_chain",
+                backend="flashinfer",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "dflash",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_ngram_verify_chain",
+                backend="flashinfer",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "ngram",
         ),
     )
     EAGLE_DRAFT_EXTEND_CASES = (
-        DenseAttentionCase(
-            name="runner_eagle_draft_extend_ragged_accept",
-            backend="flashinfer",
-            forward_mode=ForwardMode.DRAFT_EXTEND,
-            num_heads=4,
-            num_kv_heads=4,
-            page_size=16,
-            prefix_lens=(2, 5),
-            extend_lens=(1, 3),
+        (
+            DenseAttentionCase(
+                name="runner_eagle_draft_extend_ragged_accept",
+                backend="flashinfer",
+                forward_mode=ForwardMode.DRAFT_EXTEND,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(2, 5),
+                extend_lens=(1, 3),
+            ),
+            "eagle",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_frozen_kv_mtp_draft_extend_ragged_accept",
+                backend="flashinfer",
+                forward_mode=ForwardMode.DRAFT_EXTEND,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(2, 5),
+                extend_lens=(1, 3),
+            ),
+            "frozen_kv_mtp",
         ),
     )
 
@@ -169,25 +229,36 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
                         hidden_size=self.HIDDEN_SIZE,
                     )
 
-    def test_runner_mode_eagle_verify_cases(self):
-        for case, topk in self.EAGLE_VERIFY_CASES:
-            with self.subTest(case=case.name, backend=case.backend, topk=topk):
-                run_dense_eagle_verify_case(
+    def test_runner_mode_spec_verify_cases(self):
+        for case, topk, spec_kind in self.SPEC_VERIFY_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                topk=topk,
+                spec_kind=spec_kind,
+            ):
+                run_dense_spec_verify_case(
                     self,
                     case,
                     topk=topk,
+                    spec_kind=spec_kind,
                     head_dim=self.HEAD_DIM,
                     hidden_size=self.HIDDEN_SIZE,
                 )
 
     def test_runner_mode_eagle_draft_extend_cases(self):
-        for case in self.EAGLE_DRAFT_EXTEND_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
+        for case, spec_kind in self.EAGLE_DRAFT_EXTEND_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                spec_kind=spec_kind,
+            ):
                 run_dense_eagle_draft_extend_case(
                     self,
                     case,
                     head_dim=self.HEAD_DIM,
                     hidden_size=self.HIDDEN_SIZE,
+                    spec_kind=spec_kind,
                 )
 
 
