@@ -342,6 +342,9 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        self.dp_dispatch_ack_seq = 0
+        self.dp_dispatch_ack_cum_tokens = 0
+        self._dp_dispatch_accounted: Dict[int, int] = {}
 
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
@@ -662,6 +665,8 @@ class Scheduler(
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
             get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
             get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
+            get_dp_dispatch_ack_seq=lambda: self.dp_dispatch_ack_seq,
+            get_dp_dispatch_ack_cum_tokens=lambda: self.dp_dispatch_ack_cum_tokens,
         )
 
         self.output_streamer = SchedulerOutputStreamer(
@@ -1633,6 +1638,7 @@ class Scheduler(
                 self.return_health_check_ipcs.append(
                     getattr(recv_req, "http_worker_ipc", None)
                 )
+                self.observe_dp_dispatch_accounted(recv_req)
                 continue
 
             output = self._request_dispatcher(recv_req)
@@ -1642,10 +1648,31 @@ class Scheduler(
                 else:
                     if self.ipc_channels.recv_from_rpc is not None:
                         self.ipc_channels.recv_from_rpc.send_pyobj(output)
+            self.observe_dp_dispatch_accounted(recv_req)
 
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
+
+    def observe_dp_dispatch_accounted(self, recv_req):
+        if isinstance(
+            recv_req, (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput)
+        ):
+            for req in recv_req:
+                self.observe_dp_dispatch_accounted(req)
+            return
+
+        dispatch_seq = getattr(recv_req, "dp_dispatch_seq", 0) or 0
+        if dispatch_seq <= 0 or dispatch_seq <= self.dp_dispatch_ack_seq:
+            return
+
+        self._dp_dispatch_accounted[dispatch_seq] = (
+            getattr(recv_req, "dp_dispatch_cum_tokens", 0) or 0
+        )
+        while self.dp_dispatch_ack_seq + 1 in self._dp_dispatch_accounted:
+            next_seq = self.dp_dispatch_ack_seq + 1
+            self.dp_dispatch_ack_seq = next_seq
+            self.dp_dispatch_ack_cum_tokens = self._dp_dispatch_accounted.pop(next_seq)
 
     def init_req_max_new_tokens(self, req):
         input_len = len(req.origin_input_ids)
