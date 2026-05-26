@@ -59,13 +59,39 @@ STAGE_2_DISTILLED_SIGMA_VALUES: tuple[float, ...] = (0.909375, 0.725, 0.421875, 
 _REFINER_TEXT_MAX_LENGTH = 1024
 
 
-def _skip_refiner_enabled() -> bool:
-    return os.getenv("SGLANG_SANA_WM_SKIP_REFINER", "").strip().lower() in {
+def _truthy_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def sana_wm_skip_refiner_enabled(batch: Req | None = None) -> bool:
+    if os.getenv("SGLANG_SANA_WM_SKIP_REFINER", "").strip().lower() in {
         "1",
         "true",
         "yes",
         "on",
-    }
+    }:
+        return True
+    if batch is None:
+        return False
+    extra = getattr(batch, "extra", None) or {}
+    diffusers_kwargs = extra.get("diffusers_kwargs", {})
+    if not isinstance(diffusers_kwargs, dict):
+        diffusers_kwargs = {}
+    return any(
+        _truthy_flag(value)
+        for value in (
+            extra.get("skip_refiner"),
+            extra.get("sana_wm_skip_refiner"),
+            diffusers_kwargs.get("skip_refiner"),
+            diffusers_kwargs.get("sana_wm_skip_refiner"),
+        )
+    )
 
 
 def default_sana_wm_refiner_dtype(server_args: ServerArgs) -> torch.dtype:
@@ -155,7 +181,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        if _skip_refiner_enabled():
+        if sana_wm_skip_refiner_enabled():
             return []
 
         # Declare every component this stage forwards through so
@@ -382,7 +408,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
                 f"got {tuple(batch.latents.shape)}."
             )
 
-        if _skip_refiner_enabled():
+        if sana_wm_skip_refiner_enabled(batch):
             if batch.extra is None:
                 batch.extra = {}
             batch.extra["sana_wm_refiner_applied"] = False
@@ -427,6 +453,18 @@ class SanaWMRefinerDecodingStage(SanaWMDecodingStage):
     """Decode refined latents and drop the clean sink anchor frame."""
 
     @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs):
+        self._drop_refiner_sink = bool(
+            (getattr(batch, "extra", None) or {}).get(
+                "sana_wm_refiner_applied", True
+            )
+        )
+        try:
+            return super().forward(batch, server_args)
+        finally:
+            self._drop_refiner_sink = True
+
+    @torch.no_grad()
     def decode(
         self,
         latents: torch.Tensor,
@@ -446,6 +484,9 @@ class SanaWMRefinerDecodingStage(SanaWMDecodingStage):
                 "SANA-WM refiner decoding expected a sink frame plus refined "
                 f"frames, got temporal length {frames.shape[2]}."
             )
+        if not getattr(self, "_drop_refiner_sink", True):
+            log_sana_wm_tensor_stats("refiner.decode.frames_output", frames)
+            return frames
         # Match NVlabs `inference_sana_wm.py`: decode with the clean sink anchor,
         # then drop the first frame from the returned video.
         frames = frames[:, :, 1:].contiguous()

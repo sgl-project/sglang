@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import Decodin
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_refiner import (
     SanaWMLTX2RefinerStage,
     SanaWMRefinerDecodingStage,
+    sana_wm_skip_refiner_enabled,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
     SanaWMBeforeDenoisingStage,
@@ -463,6 +464,10 @@ class TestSanaWMTextEncodingStage(unittest.TestCase):
 
 
 class TestSanaWMRefinerStage(unittest.TestCase):
+    def test_skip_refiner_flag_accepts_request_extra(self) -> None:
+        batch = SimpleNamespace(extra={"diffusers_kwargs": {"skip_refiner": True}})
+        self.assertTrue(sana_wm_skip_refiner_enabled(batch))
+
     def test_prompt_resolution_broadcasts_single_prompt(self) -> None:
         batch = Req(prompt="drive forward")
         prompts = SanaWMLTX2RefinerStage._prompts_for_batch(batch, batch_size=2)
@@ -485,6 +490,20 @@ class TestSanaWMRefinerStage(unittest.TestCase):
             )
 
         self.assertTrue(torch.equal(frames, decoded[:, :, 1:]))
+
+    def test_refiner_decoding_keeps_sink_frame_when_refiner_skipped(self) -> None:
+        stage = SanaWMRefinerDecodingStage(vae=None)
+        decoded = torch.arange(1 * 3 * 4 * 2 * 2).reshape(1, 3, 4, 2, 2)
+        stage._drop_refiner_sink = False
+
+        with patch.object(DecodingStage, "decode", return_value=decoded):
+            frames = stage.decode(
+                torch.empty(1, 128, 4, 2, 2),
+                SimpleNamespace(),
+                vae_dtype=torch.bfloat16,
+            )
+
+        self.assertTrue(torch.equal(frames, decoded))
 
 
 if __name__ == "__main__":

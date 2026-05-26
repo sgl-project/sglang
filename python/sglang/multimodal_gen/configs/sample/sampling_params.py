@@ -660,7 +660,7 @@ class SamplingParams:
                 raise
 
         user_kwargs = dict(kwargs)
-        user_kwargs.pop("diffusers_kwargs", None)
+        diffusers_kwargs = user_kwargs.pop("diffusers_kwargs", None)
 
         user_sampling_params = type(sampling_params)(*args, **user_kwargs)
         # TODO: refactor
@@ -668,6 +668,8 @@ class SamplingParams:
             user_sampling_params, explicit_fields=set(user_kwargs.keys())
         )
         sampling_params._explicit_fields = set(user_kwargs.keys())
+        if diffusers_kwargs is not None:
+            sampling_params.diffusers_kwargs = diffusers_kwargs
         sampling_params._adjust(server_args)
 
         sampling_params._validate_with_pipeline_config(server_args.pipeline_config)

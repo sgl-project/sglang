@@ -46,6 +46,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     SanaWMLTX2RefinerStage,
     SanaWMRefinerDecodingStage,
     default_sana_wm_refiner_dtype,
+    sana_wm_skip_refiner_enabled,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -161,6 +162,12 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
 
     def initialize_pipeline(self, server_args: ServerArgs) -> None:
         super().initialize_pipeline(server_args)
+        if sana_wm_skip_refiner_enabled():
+            logger.info(
+                "SANA-WM refiner component loading skipped by "
+                "SGLANG_SANA_WM_SKIP_REFINER."
+            )
+            return
         self._load_refiner_modules(server_args)
 
     def _resolve_refiner_paths(self, server_args: ServerArgs) -> tuple[str, str]:
@@ -276,6 +283,8 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
             self.memory_usages[module_name] = memory_usage
 
     def _maybe_add_refiner_stage(self, server_args: ServerArgs) -> None:
+        if sana_wm_skip_refiner_enabled():
+            return
         self.add_stage(
             SanaWMLTX2RefinerStage(
                 transformer=self.get_module("transformer_2"),
@@ -288,6 +297,8 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
         )
 
     def _add_decoding_stage(self) -> None:
+        if sana_wm_skip_refiner_enabled():
+            return super()._add_decoding_stage()
         self.add_stage(
             SanaWMRefinerDecodingStage(
                 vae=self.get_module("vae"),
