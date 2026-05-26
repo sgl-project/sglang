@@ -225,7 +225,6 @@ class Sampler(nn.Module):
                         sampling_info.top_ks,
                         sampling_info.top_ps,
                         filter_apply_order="joint",
-                        check_nan=False,
                     )
             elif backend == "pytorch":
                 # A slower fallback implementation with torch native operations.
