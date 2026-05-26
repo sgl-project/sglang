@@ -401,14 +401,8 @@ class EAGLEDraftExtendCudaGraphRunner:
                 forward_batch.positions,
                 forward_batch,
             )
-            if self.topk == 1:
-                ret.topk_index = torch.argmax(
-                    ret.next_token_logits, dim=-1, keepdim=True
-                )
-                ret.topk_p = torch.ones_like(ret.topk_index, dtype=torch.float32)
-            else:
-                probs = torch.softmax(ret.next_token_logits, dim=-1)
-                ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
+            probs = torch.softmax(ret.next_token_logits, dim=-1)
+            ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
