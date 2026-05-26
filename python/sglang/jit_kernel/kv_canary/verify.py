@@ -207,11 +207,8 @@ class VerifyPlan:
             verify_slot_indices=torch.empty(
                 verify_capacity, dtype=torch.int64, device=device
             ),
-            # verify_expected_input_ids defaults to -1 so test helpers and pre-plan
-            # observers see the "skip token check" sentinel; the plan kernel rewrites
-            # every active entry per step.
-            verify_expected_input_ids=torch.full(
-                (verify_capacity,), -1, dtype=torch.int64, device=device
+            verify_expected_input_ids=torch.empty(
+                verify_capacity, dtype=torch.int64, device=device
             ),
             verify_expected_positions=torch.empty(
                 verify_capacity, dtype=torch.int64, device=device
