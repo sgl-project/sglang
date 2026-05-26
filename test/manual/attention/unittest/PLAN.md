@@ -257,10 +257,21 @@ Current status:
   to backend-specific blockers and hardware-gated paths documented in the
   implemented/deferred bullets.
 - Locally runnable Phase 2 expansion now covers the non-sparse, dense-fallback,
-  DSA sparse top-k, dual-chunk sparse all-column, and torch-native SWA method
-  fixtures identified in this pass. Remaining Phase 2 work is compressed,
+  DSA sparse top-k, dual-chunk sparse all-column, torch-native SWA, KDA
+  (Kimi Delta), Lightning (Bailing seg_la), Mamba2 (SSM), and DSV4 SWA-only
+  method fixtures. Remaining Phase 2 work is compressed (DSV4 C4/C128),
   hardware-gated, or sparse pruning layouts beyond the local DSA/dual-chunk
   slices.
+- Phase 4b worker-integration tests (StandaloneWorker, MultiLayerEagleWorker,
+  DFlashWorker, NGRAMWorker) are deferred. The worker boundary requires
+  loading a real draft model and a real `TpModelWorker` target, which is
+  outside the fast-running module-level fixture pattern used by Phase 2/3/4a.
+  The production speculative graph runner contracts those workers depend on
+  are already covered by `common/runner_modes/eagle_draft_runner.py`,
+  `speculative_target_verify_runner.py`, and
+  `speculative_draft_extend_runner.py` using mock model runners. Worker-level
+  metadata/forward integration should land as registered (not unit) tests in
+  a follow-up because they need real model load and meaningful runtime.
 
 Deferred follow-ups:
 - Expand Phase 2 to additional attention methods/backends with method-specific
