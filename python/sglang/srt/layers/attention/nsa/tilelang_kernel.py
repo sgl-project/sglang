@@ -1,4 +1,5 @@
 import functools
+import os
 from functools import lru_cache
 from typing import Any, Optional, Tuple
 
@@ -1347,6 +1348,73 @@ def tilelang_sparse_fwd(
     if _is_hip:
         is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
         if is_fp8_kv:
+            # ------------------------------------------------------------------
+            # Fast path: single-pass Triton kernel bypasses the TileLang
+            # partial_o (~1.5 GB HBM round-trip) when total_tokens >= 256.
+            # Conditions:
+            #   - AMD HIP backend (already inside _is_hip branch)
+            #   - FP8 KV cache (same as TileLang fp8 path)
+            #   - d_v == 512 and tail_dim == 0 (absorbed NSA attention, K=V)
+            #   - indices are 2D [total_tokens, topk] after squeeze of kv_group=1
+            # Set SGLANG_DISABLE_TRITON_PREFILL_FUSED=1 to force TileLang path
+            # (useful for A/B benchmarking against the TileLang baseline).
+            # ------------------------------------------------------------------
+            _triton_disabled = os.environ.get(
+                "SGLANG_DISABLE_TRITON_PREFILL_FUSED", "0"
+            ) == "1"
+            total_tokens = q.shape[0]
+
+            # ── FlyDSL fast path (gfx950 MFMA, no split-K buffer) ──────────
+            # Priority: FlyDSL > Triton > TileLang.
+            # Enable with SGLANG_FLYDSL_PREFILL=1 (or =auto for gfx950 autodetect).
+            _flydsl_mode = os.environ.get("SGLANG_FLYDSL_PREFILL", "auto")
+            if (
+                _flydsl_mode != "0"
+                and d_v == 512
+                and tail_dim == 0
+                and indices.shape[1] == 1  # kv_group == 1
+                and total_tokens >= 16  # at least one TILE_M
+            ):
+                try:
+                    from sglang.srt.layers.attention.nsa.flydsl_nsa_prefill import (
+                        flydsl_nsa_prefill,
+                        _is_available as _flydsl_available,
+                    )
+                    if _flydsl_mode == "1" or _flydsl_available():
+                        indices_2d = indices.squeeze(1)  # [total_tokens, topk]
+                        kv_2d = kv.squeeze(1)            # [num_pages, head_dim]
+                        return flydsl_nsa_prefill(
+                            q=q,
+                            kv=kv_2d,
+                            indices=indices_2d,
+                            sm_scale=sm_scale,
+                        )
+                except Exception:
+                    pass  # fall through to Triton / TileLang
+
+            from sglang.srt.layers.attention.nsa.triton_decode.triton_mla_kernels_prefill_fused import (
+                TRITON_PREFILL_MIN_TOKENS,
+                fused_gather_attn_nsa_prefill,
+            )
+            if (
+                not _triton_disabled
+                and d_v == 512
+                and tail_dim == 0
+                and total_tokens >= TRITON_PREFILL_MIN_TOKENS
+                and indices.shape[1] == 1  # kv_group == 1
+            ):
+                # Reshape to remove the kv_group=1 dimension.
+                # q: [total_tokens, h_q, 512], kv: [num_pages, 1, 512],
+                # indices: [total_tokens, 1, topk] → squeeze kv_group.
+                indices_2d = indices.squeeze(1)  # [total_tokens, topk]
+                output, _lse = fused_gather_attn_nsa_prefill(
+                    q=q,
+                    kv=kv,
+                    indices=indices_2d,
+                    sm_scale=sm_scale,
+                )
+                # Return shape matches TileLang output: [total_tokens, h_q, d_v]
+                return output
             if q.dtype != kv.dtype:
                 q = q.to(kv.dtype)
             if _is_gfx95_supported:
