@@ -124,10 +124,11 @@ def make_mamba2_cases(backend: str) -> tuple[Mamba2AttentionCase, ...]:
         mamba_chunk_size=DEFAULT_MAMBA_CHUNK_SIZE,
         hidden_size=DEFAULT_HIDDEN_SIZE,
     )
-    # DECODE is intentionally not enabled here: `MambaMixer2.forward_decode`
-    # requires `initialize_mamba_selective_state_update_backend()` which is
-    # only wired by the production model runner. EXTEND covers the chunked-
-    # scan kernel path that's reachable in the fixture.
+    # DECODE coverage requires `initialize_mamba_selective_state_update_backend()`
+    # to install the global selective-state-update backend that
+    # `MambaMixer2.forward_decode` calls into. The fixture's
+    # `MockMamba2ModelRunner.__init__` mirrors what the scheduler does
+    # at startup, so DECODE is reachable.
     return (
         Mamba2AttentionCase(
             name="mamba2_extend_zero_prefix_exact_page",
@@ -183,6 +184,20 @@ def make_mamba2_cases(backend: str) -> tuple[Mamba2AttentionCase, ...]:
             page_size=1,
             prefix_lens=(0,),
             extend_lens=(16,),
+            **common,
+        ),
+        Mamba2AttentionCase(
+            name="mamba2_decode_page_boundary",
+            forward_mode=ForwardMode.DECODE,
+            page_size=16,
+            prefix_lens=(14, 15, 16),
+            **common,
+        ),
+        Mamba2AttentionCase(
+            name="mamba2_decode_bsz1_nonzero_prefix",
+            forward_mode=ForwardMode.DECODE,
+            page_size=16,
+            prefix_lens=(7,),
             **common,
         ),
     )
@@ -265,6 +280,12 @@ class MockMamba2ModelRunner(ModelRunner):
             linear_attn_backend="triton",
             linear_attn_decode_backend=None,
             linear_attn_prefill_backend=None,
+            # `initialize_mamba_selective_state_update_backend` consults
+            # `server_args.mamba_backend` (defaults to "triton") to install
+            # the global selective-state-update backend that
+            # `MambaMixer2.forward_decode` calls into. Set it explicitly so
+            # the DECODE fixture path becomes reachable.
+            mamba_backend="triton",
             mamba_cache_chunk_size=64,
             max_running_requests=None,
             model_path=None,
@@ -286,6 +307,16 @@ class MockMamba2ModelRunner(ModelRunner):
         from sglang.srt.server_args import set_global_server_args_for_scheduler
 
         set_global_server_args_for_scheduler(self.server_args)
+
+        # Install the selective-state-update backend that
+        # `MambaMixer2.forward_decode` requires. In production the
+        # scheduler calls this during initialization; the fixture must
+        # mirror that or DECODE crashes with a missing-backend error.
+        from sglang.srt.layers.attention.mamba.ops import (
+            initialize_mamba_selective_state_update_backend,
+        )
+
+        initialize_mamba_selective_state_update_backend(self.server_args)
         cache_shape = Mamba2StateShape.create(
             tp_world_size=1,
             intermediate_size=case.intermediate_size,

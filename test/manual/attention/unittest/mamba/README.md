@@ -21,7 +21,7 @@ Columns are runner modes; rows are the SSM kernel backend
 
 | SSM kernel | Eager Phase 2 | CG decode | PCG extend | BCG extend | Verify eager | Verify CG | DE eager | DE CG | DE-V2 CG | EAGLE-draft runner | EAGLE-DE runner | FKVMTP runner |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `triton` (`Mamba2AttnBackend`) | ✓ EXTEND zero-prefix exact-page / below-page / above-page, with-prefix, multi-request zero-prefix / ragged, page_size=1 (7 variants) | metadata-only: `init_forward_metadata_replay_cuda_graph` with `seq_lens_cpu=[5,1,1]` to cover the M21 padding-count mutation in `_replay_metadata`; full forward replay blocked by baseline `enable_symm_mem` bug | deferred | deferred | deferred | deferred | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
+| `triton` (`Mamba2AttnBackend`) | ✓ EXTEND zero-prefix exact-page / below-page / above-page, with-prefix, multi-request zero-prefix / ragged, page_size=1 (7 variants) + DECODE page-boundary + DECODE bsz=1 nonzero-prefix (9 variants total) | metadata-only: `init_forward_metadata_replay_cuda_graph` with `seq_lens_cpu=[5,1,1]` to cover the M21 padding-count mutation in `_replay_metadata`; full forward replay blocked by baseline `enable_symm_mem` bug | deferred | deferred | deferred | deferred | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
 
 ## Hybrid dispatch fan-out tests (MagicMock-based)
 
@@ -41,16 +41,18 @@ call.
 
 ## Input And Config Coverage
 
-- 7 EXTEND input layouts via `make_mamba2_cases('triton')`:
-  zero-prefix exact-page (16 tokens), zero-prefix below-page (8 tokens),
-  zero-prefix above-page (32 tokens, cross-page), with-prefix
-  (`prefix=16, extend=16`), multi-request zero-prefix
-  (`extend=(16, 16)`), multi-request ragged (`prefix=(0, 16),
-  extend=(16, 16)`), and `page_size=1` (16 tokens).
-- DECODE is intentionally not exercised: `MambaMixer2.forward_decode`
-  requires `initialize_mamba_selective_state_update_backend()`, which is
-  only wired by the production model runner. The fixture cannot reach
-  it without further plumbing.
+- 9 input layouts via `make_mamba2_cases('triton')`:
+  - **EXTEND (7):** zero-prefix exact-page (16 tokens), zero-prefix
+    below-page (8 tokens), zero-prefix above-page (32 tokens,
+    cross-page), with-prefix (`prefix=16, extend=16`), multi-request
+    zero-prefix (`extend=(16, 16)`), multi-request ragged
+    (`prefix=(0, 16), extend=(16, 16)`), and `page_size=1` (16 tokens).
+  - **DECODE (2):** page-boundary (`prefix_lens=(14, 15, 16)`) and
+    bsz=1 nonzero-prefix (`prefix_lens=(7,)`). The fixture's
+    `MockMamba2ModelRunner.__init__` calls
+    `initialize_mamba_selective_state_update_backend(server_args)`
+    (mirroring scheduler startup) so `MambaMixer2.forward_decode`
+    finds the global selective-state-update backend.
 - `num_heads=DEFAULT_NUM_HEADS=2`, `head_dim=DEFAULT_HEAD_DIM=16`,
   `state_size=16`, `n_groups=1`, `conv_kernel=4`,
   `mamba_chunk_size=DEFAULT_MAMBA_CHUNK_SIZE=16`, `hidden_size=32`.
@@ -95,7 +97,6 @@ call.
 
 ## Next Work
 
-- Wire `initialize_mamba_selective_state_update_backend()` into the
-  fixture so DECODE becomes reachable.
-- Add `HybridLinearAttnBackend` dispatch coverage.
-- Add CUDA graph decode replay with recurrent state isolation.
+- Add CUDA graph decode replay with recurrent state isolation
+  (`MambaMixer2.forward_decode` is now reachable; the missing piece is
+  the recurrent-cache snapshot/restore plumbing modeled on GDN/KDA).
