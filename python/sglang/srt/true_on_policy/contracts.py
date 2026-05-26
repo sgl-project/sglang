@@ -5,11 +5,13 @@ from typing import Any, Optional
 
 from sglang.srt.true_on_policy.schema import (
     QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA,
+    QWEN3_MOE_TRUE_ON_POLICY_V1_SCHEMA,
     TrueOnPolicyContractName,
     TrueOnPolicyContractSchema,
 )
 
 QWEN3_DENSE_TRUE_ON_POLICY_V1 = QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA.name
+QWEN3_MOE_TRUE_ON_POLICY_V1 = QWEN3_MOE_TRUE_ON_POLICY_V1_SCHEMA.name
 
 
 @dataclass(frozen=True)
@@ -26,6 +28,11 @@ class SGLangTrueOnPolicyRuntimePolicy:
     tp_invariant_row_linear: bool
     deterministic_tree_all_reduce: bool
     disable_fused_qk_norm_mrope: bool
+    deterministic_moe_routing: bool
+    moe_topk_tiebreak: Optional[str]
+    deterministic_moe_dispatch: bool
+    deterministic_moe_combine: bool
+    ep_invariant_moe: bool
 
 
 DEFAULT_RUNTIME_POLICY = SGLangTrueOnPolicyRuntimePolicy(
@@ -39,6 +46,11 @@ DEFAULT_RUNTIME_POLICY = SGLangTrueOnPolicyRuntimePolicy(
     tp_invariant_row_linear=False,
     deterministic_tree_all_reduce=False,
     disable_fused_qk_norm_mrope=False,
+    deterministic_moe_routing=False,
+    moe_topk_tiebreak=None,
+    deterministic_moe_dispatch=False,
+    deterministic_moe_combine=False,
+    ep_invariant_moe=False,
 )
 
 
@@ -54,6 +66,8 @@ class SGLangTrueOnPolicyContract:
 
     def policy_for(self, server_args: Any) -> SGLangTrueOnPolicyRuntimePolicy:
         uses_tp_invariant_rollout = getattr(server_args, "tp_size", 1) > 1
+        uses_ep_invariant_moe = getattr(server_args, "ep_size", 1) > 1
+        is_moe = self.schema.model_family == "qwen3_moe"
         return SGLangTrueOnPolicyRuntimePolicy(
             contract_name=self.name,
             enabled=True,
@@ -65,6 +79,11 @@ class SGLangTrueOnPolicyContract:
             tp_invariant_row_linear=uses_tp_invariant_rollout,
             deterministic_tree_all_reduce=uses_tp_invariant_rollout,
             disable_fused_qk_norm_mrope=True,
+            deterministic_moe_routing=is_moe,
+            moe_topk_tiebreak="stable_sort" if is_moe else None,
+            deterministic_moe_dispatch=is_moe and uses_ep_invariant_moe,
+            deterministic_moe_combine=is_moe and uses_ep_invariant_moe,
+            ep_invariant_moe=is_moe and uses_ep_invariant_moe,
         )
 
 
@@ -72,11 +91,15 @@ QWEN3_DENSE_TRUE_ON_POLICY_CONTRACT = SGLangTrueOnPolicyContract(
     schema=QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA,
 )
 
+QWEN3_MOE_TRUE_ON_POLICY_CONTRACT = SGLangTrueOnPolicyContract(
+    schema=QWEN3_MOE_TRUE_ON_POLICY_V1_SCHEMA,
+)
+
 
 _CONTRACT_BY_NAME = {
     QWEN3_DENSE_TRUE_ON_POLICY_CONTRACT.name: QWEN3_DENSE_TRUE_ON_POLICY_CONTRACT,
+    QWEN3_MOE_TRUE_ON_POLICY_CONTRACT.name: QWEN3_MOE_TRUE_ON_POLICY_CONTRACT,
 }
-
 
 def get_true_on_policy_contract(contract_name: str) -> SGLangTrueOnPolicyContract:
     try:
