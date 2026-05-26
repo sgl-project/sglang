@@ -9,16 +9,13 @@ finishes a baseline run, then asserts ``engine_stats`` returns to
 import unittest
 
 from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
-from sglang.test.scripted_runtime.req_handle import ReqHandle
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
-    run_until,
     run_until_all_finished,
-    run_until_finished,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -29,9 +26,9 @@ def _script_hundred_reqs_no_leak(t: ScriptedRuntime):
     reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(100)]
     yield from run_until_all_finished(reqs, max_steps=4000)
     final = t.engine_stats()
-    assert final["kv_pool_free"] >= baseline["kv_pool_free"], (
-        f"KV leak: {baseline['kv_pool_free']} -> {final['kv_pool_free']}"
-    )
+    assert (
+        final["kv_pool_free"] >= baseline["kv_pool_free"]
+    ), f"KV leak: {baseline['kv_pool_free']} -> {final['kv_pool_free']}"
     assert final["row_pool_free"] >= baseline["row_pool_free"]
 
 

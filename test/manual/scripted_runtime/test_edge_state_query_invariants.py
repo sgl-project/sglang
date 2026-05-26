@@ -73,10 +73,12 @@ def _script_batch_composition_consistent_with_status(t: ScriptedRuntime):
     for _ in range(DEFAULT_MAX_STEPS):
         if r.status == "running":
             comp = t.batch_composition()
-            all_rids = comp.get("prefill", []) + comp.get("decode", []) + comp.get("chunked", [])
-            assert r.rid in all_rids, (
-                f"running but not in batch_composition: {comp}"
+            all_rids = (
+                comp.get("prefill", [])
+                + comp.get("decode", [])
+                + comp.get("chunked", [])
             )
+            assert r.rid in all_rids, f"running but not in batch_composition: {comp}"
         if r.finished:
             return
         yield
@@ -88,9 +90,7 @@ def _script_is_idle_excludes_chunked_in_flight(t: ScriptedRuntime):
     r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     for _ in range(DEFAULT_MAX_STEPS):
         if t.chunked_in_flight_count() > 0:
-            assert not t.is_idle, (
-                "is_idle must be False when chunked is in flight"
-            )
+            assert not t.is_idle, "is_idle must be False when chunked is in flight"
         if r.finished:
             return
         yield
@@ -146,8 +146,7 @@ def _script_lock_refs_non_negative(t: ScriptedRuntime):
 def _script_chunked_in_flight_count_le_one(t: ScriptedRuntime):
     # main-upstream invariant: at most one chunked req in flight.
     reqs = [
-        t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        for _ in range(3)
+        t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2) for _ in range(3)
     ]
     for _ in range(DEFAULT_MAX_STEPS * 3):
         assert t.chunked_in_flight_count() <= 1
@@ -165,9 +164,9 @@ def _script_status_transition_monotone(t: ScriptedRuntime):
     for _ in range(DEFAULT_MAX_STEPS):
         cur_rank = rank[r.status]
         # waiting can come after running once (retract), so accept rank ≥ prev - 1.
-        assert cur_rank >= prev_rank - 1, (
-            f"status regressed: {r.status} (prev rank {prev_rank})"
-        )
+        assert (
+            cur_rank >= prev_rank - 1
+        ), f"status regressed: {r.status} (prev rank {prev_rank})"
         prev_rank = max(prev_rank, cur_rank)
         if r.finished:
             return

@@ -9,7 +9,6 @@ trickle) all reach a clean terminal state for every req.
 import unittest
 
 from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
-from sglang.test.scripted_runtime.req_handle import ReqHandle
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
@@ -81,8 +80,7 @@ def _script_five_identical_prompts(t: ScriptedRuntime):
     yield from run_until_finished(r1)
 
     others = [
-        t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        for _ in range(4)
+        t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2) for _ in range(4)
     ]
     yield from run_until_all_finished(others)
     for r in others:
@@ -141,8 +139,7 @@ def _script_concurrent_short_and_long(t: ScriptedRuntime):
 def _script_three_long_back_to_back(t: ScriptedRuntime):
     # Three long chunked reqs submitted back-to-back.
     reqs = [
-        t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        for _ in range(3)
+        t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2) for _ in range(3)
     ]
     yield from run_until_all_finished(reqs, max_steps=1500)
     for r in reqs:

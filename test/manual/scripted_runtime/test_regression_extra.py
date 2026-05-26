@@ -12,7 +12,6 @@ is still in effect.
 import unittest
 
 from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
-from sglang.test.scripted_runtime.req_handle import ReqHandle
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,

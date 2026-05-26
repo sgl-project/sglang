@@ -8,15 +8,11 @@ across (default / greedy / high temperature / top-k / top-p) ×
 import unittest
 
 from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
-from sglang.test.scripted_runtime.req_handle import ReqHandle
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
-    DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
-    run_until,
-    run_until_all_finished,
     run_until_finished,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -30,9 +26,7 @@ def _script_default_sampling_chunked(t: ScriptedRuntime):
 
 
 def _script_greedy_chunked(t: ScriptedRuntime):
-    r = t.start_req(
-        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0
-    )
+    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0)
     yield from run_until_finished(r)
     assert r.finished
 
@@ -44,9 +38,7 @@ def _script_high_temperature_short(t: ScriptedRuntime):
 
 
 def _script_high_temperature_chunked(t: ScriptedRuntime):
-    r = t.start_req(
-        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=1.8
-    )
+    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=1.8)
     yield from run_until_finished(r)
     assert r.finished
 
@@ -90,13 +82,9 @@ def _script_default_sampling_short(t: ScriptedRuntime):
 
 def _script_sampling_diversity_two_reqs(t: ScriptedRuntime):
     # Two reqs with same prompt and non-greedy temp: outputs may differ.
-    r1 = t.start_req(
-        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=1.0
-    )
+    r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=1.0)
     yield from run_until_finished(r1)
-    r2 = t.start_req(
-        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=1.0
-    )
+    r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=1.0)
     yield from run_until_finished(r2)
 
 

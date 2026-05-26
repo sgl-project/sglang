@@ -474,9 +474,7 @@ class TestScriptedRuntimeFunctional(CustomTestCase):
         execute_scripted_runtime(_script_api_smoke_r_row_idx, **_COMMON_ENGINE_KWARGS)
 
     def test_api_smoke_r_lock_refs(self):
-        execute_scripted_runtime(
-            _script_api_smoke_r_lock_refs, **_COMMON_ENGINE_KWARGS
-        )
+        execute_scripted_runtime(_script_api_smoke_r_lock_refs, **_COMMON_ENGINE_KWARGS)
 
     def test_api_smoke_r_pending_middle_outputs(self):
         execute_scripted_runtime(

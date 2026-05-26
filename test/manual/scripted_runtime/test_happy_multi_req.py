@@ -7,16 +7,13 @@ batch sizes and mixed-shape concurrency.
 import unittest
 
 from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
-from sglang.test.scripted_runtime.req_handle import ReqHandle
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
-    run_until,
     run_until_all_finished,
-    run_until_finished,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -64,8 +61,7 @@ def _script_multiple_chunked_staggered(t: ScriptedRuntime):
 def _script_eight_concurrent_chunked(t: ScriptedRuntime):
     # 8 chunked reqs submitted together. Single-in-flight invariant holds.
     reqs = [
-        t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        for _ in range(8)
+        t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2) for _ in range(8)
     ]
     for _ in range(DEFAULT_MAX_STEPS * 5):
         assert t.chunked_in_flight_count() <= 1
@@ -128,8 +124,7 @@ def _script_parallel_with_priority(t: ScriptedRuntime):
     # 3 normal + 2 high-priority reqs.
     normal = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(3)]
     high = [
-        t.start_req(prompt_len=16, max_new_tokens=2, priority="high")
-        for _ in range(2)
+        t.start_req(prompt_len=16, max_new_tokens=2, priority="high") for _ in range(2)
     ]
     yield from run_until_all_finished(normal + high)
 

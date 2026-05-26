@@ -12,15 +12,11 @@ no resource leak).
 import unittest
 
 from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
-from sglang.test.scripted_runtime.req_handle import ReqHandle
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime_chunked_helpers import (
-    DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
-    VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     run_until,
-    run_until_all_finished,
     run_until_finished,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -201,9 +197,7 @@ def _script_chunks_done_monotone_under_chunk_size_1(t: ScriptedRuntime):
     prev = 0
     for _ in range(DEFAULT_MAX_STEPS):
         cur = r.chunks_done
-        assert cur >= prev, (
-            f"chunks_done regressed: prev={prev}, cur={cur}"
-        )
+        assert cur >= prev, f"chunks_done regressed: prev={prev}, cur={cur}"
         prev = cur
         if r.finished:
             return

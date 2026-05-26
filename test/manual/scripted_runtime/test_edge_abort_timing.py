@@ -13,7 +13,6 @@ from sglang.test.scripted_runtime.req_handle import ReqHandle
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
-    DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     run_until,
@@ -56,7 +55,9 @@ def _script_abort_then_start_same_step_new_rid(t: ScriptedRuntime):
 
 def _script_abort_then_start_same_step_same_rid(t: ScriptedRuntime):
     # Abort r1; resubmit with the same rid — must work as a fresh req.
-    r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, rid="abort-reuse")
+    r1 = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, rid="abort-reuse"
+    )
     yield from run_until(r1, lambda h: h.is_chunking)
     t.abort(r1)
     yield
@@ -68,8 +69,7 @@ def _script_abort_then_start_same_step_same_rid(t: ScriptedRuntime):
 def _script_abort_five_chunked_in_a_row(t: ScriptedRuntime):
     # 5 chunked reqs submitted; abort all 5 sequentially.
     reqs = [
-        t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        for _ in range(5)
+        t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2) for _ in range(5)
     ]
     yield from run_until(reqs[0], lambda h: h.is_chunking)
     for r in reqs:
@@ -176,8 +176,7 @@ def _script_abort_one_of_three_others_finish(t: ScriptedRuntime):
 def _script_abort_in_separate_yields(t: ScriptedRuntime):
     # Submit 3 chunked, abort in 3 separate yield steps.
     reqs = [
-        t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        for _ in range(3)
+        t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2) for _ in range(3)
     ]
     yield from run_until(reqs[0], lambda h: h.is_chunking)
     for r in reqs:

@@ -8,15 +8,11 @@ scheduler properly handles "submit, wait, submit again, wait,
 import unittest
 
 from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
-from sglang.test.scripted_runtime.req_handle import ReqHandle
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
-    DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
-    run_until,
-    run_until_all_finished,
     run_until_finished,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -100,9 +96,7 @@ def _script_seq_engine_stats_stable(t: ScriptedRuntime):
         r = t.start_req(prompt_len=16, max_new_tokens=2)
         yield from run_until_finished(r)
     final = t.engine_stats()["kv_pool_free"]
-    assert final >= baseline - 1, (
-        f"KV pool drift: baseline={baseline}, final={final}"
-    )
+    assert final >= baseline - 1, f"KV pool drift: baseline={baseline}, final={final}"
 
 
 class TestHappySequential(CustomTestCase):

@@ -9,11 +9,9 @@ already-cached prefix tokens.
 import unittest
 
 from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
-from sglang.test.scripted_runtime.req_handle import ReqHandle
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
-    DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     run_until,
@@ -41,8 +39,7 @@ def _script_radix_full_prefix_hit_nine_reqs(t: ScriptedRuntime):
     yield from run_until_finished(r1)
 
     others = [
-        t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        for _ in range(9)
+        t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2) for _ in range(9)
     ]
     yield from run_until_all_finished(others)
     for r in others:
@@ -92,7 +89,9 @@ def _script_radix_resume_init_next_round_path(t: ScriptedRuntime):
     # ``init_next_round_input`` no-tree-cache branch is reached.
     r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=1)
     yield from run_until_finished(r1)
-    r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN + DEFAULT_CHUNK_SIZE, max_new_tokens=2)
+    r2 = t.start_req(
+        prompt_len=VERY_LONG_PROMPT_LEN + DEFAULT_CHUNK_SIZE, max_new_tokens=2
+    )
     yield from run_until_finished(r2)
 
     # NEW API NEEDED: t.last_scheduler_path() — last branch taken in
@@ -191,13 +190,9 @@ def _script_radix_prefix_match_with_priority(t: ScriptedRuntime):
 def _script_radix_calc_priority_skip_chunked_resume(t: ScriptedRuntime):
     # aaf3752d2b: skip chunked-resume reqs in calc_priority prefix matching.
     # Two reqs share a prefix; one is chunked-resume.
-    r1 = t.start_req(
-        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="high"
-    )
+    r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="high")
     yield from run_until(r1, lambda h: h.is_chunking)
-    r2 = t.start_req(
-        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="low"
-    )
+    r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="low")
     yield from run_until_all_finished([r1, r2])
 
 

@@ -8,7 +8,6 @@ prompt-length × decode-length combinations. These are baseline
 import unittest
 
 from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
-from sglang.test.scripted_runtime.req_handle import ReqHandle
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
@@ -16,7 +15,6 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     run_until,
-    run_until_all_finished,
     run_until_finished,
 )
 from sglang.test.test_utils import CustomTestCase

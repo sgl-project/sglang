@@ -9,11 +9,9 @@ asserts no deadlock and correct cleanup paths.
 import unittest
 
 from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
-from sglang.test.scripted_runtime.req_handle import ReqHandle
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
-    DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     run_until,
@@ -73,10 +71,7 @@ def _script_row_pool_tight_admits_after_release(t: ScriptedRuntime):
     t.exhaust_row_pool(leave_rows=2)
     yield
 
-    reqs = [
-        t.start_req(prompt_len=8, max_new_tokens=1)
-        for _ in range(5)
-    ]
+    reqs = [t.start_req(prompt_len=8, max_new_tokens=1) for _ in range(5)]
     yield from run_until_all_finished(reqs, max_steps=2000)
 
 
@@ -88,9 +83,7 @@ def _script_lock_refs_tight_concurrent_prefix(t: ScriptedRuntime):
     # Warm prefix.
     r_warm = t.start_req(prompt_len=128, max_new_tokens=2)
     yield from run_until_finished(r_warm)
-    reqs = [
-        t.start_req(prompt_len=128, max_new_tokens=2) for _ in range(8)
-    ]
+    reqs = [t.start_req(prompt_len=128, max_new_tokens=2) for _ in range(8)]
     yield from run_until_all_finished(reqs)
 
 
@@ -100,9 +93,7 @@ def _script_priority_preempt_multiple_chunked(t: ScriptedRuntime):
     r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
     yield from run_until(r1, lambda h: h.is_chunking)
 
-    r2 = t.start_req(
-        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="high"
-    )
+    r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="high")
     yield from run_until_all_finished([r1, r2])
 
 
@@ -139,9 +130,7 @@ def _script_kv_pressure_with_retract_resume(t: ScriptedRuntime):
 def _script_cumulative_alloc_does_not_grow_unbounded(t: ScriptedRuntime):
     # 50 reqs; cumulative bytes alloc'd never NaN / negative.
     # NEW API NEEDED: r.cumulative_kv_alloc_bytes (int).
-    reqs = [
-        t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(50)
-    ]
+    reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(50)]
     yield from run_until_all_finished(reqs)
     for r in reqs:
         assert r.cumulative_kv_alloc_bytes >= 0

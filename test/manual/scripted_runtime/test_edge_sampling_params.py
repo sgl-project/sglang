@@ -13,7 +13,6 @@ expansion plan §6 as P0/P1 wishlist items.
 import unittest
 
 from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
-from sglang.test.scripted_runtime.req_handle import ReqHandle
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
@@ -21,7 +20,6 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     run_until,
-    run_until_all_finished,
     run_until_finished,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -58,17 +56,13 @@ def _script_greedy_chunked_deterministic(t: ScriptedRuntime):
     # temperature = 0 (greedy) + chunked: same prompt gives same output.
     # NEW API NEEDED: start_req(..., temperature=) — sampling kwarg passthrough.
     # NEW API NEEDED: r.output_tokens — list[int] of generated tokens.
-    r1 = t.start_req(
-        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=8, temperature=0.0
-    )
+    r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=8, temperature=0.0)
     yield from run_until_finished(r1)
-    r2 = t.start_req(
-        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=8, temperature=0.0
-    )
+    r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=8, temperature=0.0)
     yield from run_until_finished(r2)
-    assert r1.output_tokens == r2.output_tokens, (
-        f"greedy non-determinism: {r1.output_tokens} != {r2.output_tokens}"
-    )
+    assert (
+        r1.output_tokens == r2.output_tokens
+    ), f"greedy non-determinism: {r1.output_tokens} != {r2.output_tokens}"
 
 
 def _script_return_logprob_chunked(t: ScriptedRuntime):
@@ -88,9 +82,7 @@ def _script_ignore_eos_chunked(t: ScriptedRuntime):
     # ignore_eos = True + early EOS production + chunked: still runs to
     # max_new_tokens; doesn't shortcut on EOS.
     # NEW API NEEDED: start_req(..., ignore_eos=True).
-    r = t.start_req(
-        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=16, ignore_eos=True
-    )
+    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=16, ignore_eos=True)
     yield from run_until_finished(r)
     assert r.finished
     assert len(r.output_tokens) == 16
@@ -99,9 +91,7 @@ def _script_ignore_eos_chunked(t: ScriptedRuntime):
 def _script_stop_str_chunked(t: ScriptedRuntime):
     # stop=["xyz"] + chunked: stops at stop_str, doesn't reach max_new_tokens.
     # NEW API NEEDED: start_req(..., stop=["..."]).
-    r = t.start_req(
-        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=512, stop=["xyz"]
-    )
+    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=512, stop=["xyz"])
     yield from run_until(r, lambda h: h.finished, max_steps=2000)
     assert r.finished
     assert len(r.output_tokens) < 512
@@ -110,9 +100,7 @@ def _script_stop_str_chunked(t: ScriptedRuntime):
 def _script_top_p_chunked(t: ScriptedRuntime):
     # top_p sampling + chunked: doesn't hang or crash.
     # NEW API NEEDED: start_req(..., top_p=).
-    r = t.start_req(
-        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, top_p=0.9
-    )
+    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, top_p=0.9)
     yield from run_until_finished(r)
     assert r.finished
 
@@ -120,9 +108,7 @@ def _script_top_p_chunked(t: ScriptedRuntime):
 def _script_top_k_chunked(t: ScriptedRuntime):
     # top_k sampling + chunked.
     # NEW API NEEDED: start_req(..., top_k=).
-    r = t.start_req(
-        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, top_k=50
-    )
+    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, top_k=50)
     yield from run_until_finished(r)
     assert r.finished
 
@@ -141,37 +127,27 @@ def _script_top_p_top_k_combined_chunked(t: ScriptedRuntime):
 
 def _script_high_temperature_chunked(t: ScriptedRuntime):
     # High temperature + chunked: stable output, no crash.
-    r = t.start_req(
-        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=2.0
-    )
+    r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=2.0)
     yield from run_until_finished(r)
     assert r.finished
 
 
 def _script_greedy_two_sequential_reqs(t: ScriptedRuntime):
     # Greedy + chunked, 2 sequential reqs — verify second matches first.
-    r1 = t.start_req(
-        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0
-    )
+    r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0)
     yield from run_until_finished(r1)
     out_a = list(r1.output_tokens)
 
-    r2 = t.start_req(
-        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0
-    )
+    r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0)
     yield from run_until_finished(r2)
     assert list(r2.output_tokens) == out_a
 
 
 def _script_greedy_chunked_with_radix_hit(t: ScriptedRuntime):
     # greedy + chunked + radix prefix hit. Output for r2 == r1.
-    r1 = t.start_req(
-        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0
-    )
+    r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0)
     yield from run_until_finished(r1)
-    r2 = t.start_req(
-        prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0
-    )
+    r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, temperature=0.0)
     yield from run_until_finished(r2)
     assert list(r1.output_tokens) == list(r2.output_tokens)
 
