@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional
 
@@ -52,6 +53,10 @@ def _eagle_prefill_tail_tokens(
 ) -> torch.Tensor:
     """Per-seq tail token for EAGLE prefill rotation; uses next prompt token for
     non-final chunks (chunked-prefill chain consistency, see PR #26329)."""
+    if os.environ.get("SGLANG_DISABLE_PR_26329_FIX") == "1":
+        # Reverts to the pre-PR-26329 behavior so the canary token-id validator
+        # has a deterministic failure to fire on. Test-only escape hatch.
+        return next_token_ids.to(batch.input_ids.dtype)
     tail_tokens = next_token_ids.to(batch.input_ids.dtype)
     next_prompt_token = batch.chunked_req_next_prompt_token
     if next_prompt_token is not None:
