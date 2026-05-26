@@ -77,8 +77,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.req_pool_indices = torch.tensor(
             req_pool_indices, dtype=torch.int64, device=self.device
         )
-        # Host mirror of req_pool_indices. Built once here at prebuilt-batch
-        # creation (only when new disagg reqs arrive), then carried/filtered on
+        # Host mirror, built once at prebuilt creation (rare) then carried on
         # the host, so per-decode-iter consumers avoid a D2H.
         self.req_pool_indices_cpu = self.req_pool_indices.cpu()
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
