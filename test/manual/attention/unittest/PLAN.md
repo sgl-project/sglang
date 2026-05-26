@@ -75,9 +75,10 @@ Implemented:
   cover EAGLE chain with the absorb-MLA cached-KV path; GDN `triton` and
   `flashinfer` cover EAGLE chain and tree with speculative Mamba state buffers.
 - Phase 4 draft-extend CUDA-graph-style replay now covers dense `flashinfer` for
-  EAGLE and Frozen-KV MTP `DRAFT_EXTEND` with ragged accepted-token counts. The
-  capture batch uses a fixed max accepted-token count per request, while replay
-  uses distinct ragged request metadata/input tensors.
+  EAGLE and Frozen-KV MTP `DRAFT_EXTEND`, plus MLA `flashinfer` for EAGLE
+  `DRAFT_EXTEND`, with ragged accepted-token counts. The capture batch uses a
+  fixed max accepted-token count per request, while replay uses distinct ragged
+  request metadata/input tensors.
 - Phase 4 `DRAFT_EXTEND_V2` CUDA-graph-style replay now covers dense and MLA
   `triton` with a fixed token count per request, matching the multi-layer EAGLE
   v2 graph contract where attention metadata receives prefix lengths and the
@@ -101,6 +102,10 @@ Implemented:
 - FlashInfer MLA EAGLE tree verify (`topk=2`) is intentionally not enabled yet.
   Chain verify (`topk=1`) passes, but the tree custom-mask path currently
   mismatches the HF-style PyTorch reference on realistic MLA shapes.
+- FlashMLA MLA `DRAFT_EXTEND` CUDA-graph replay is intentionally not enabled yet.
+  The eager path passes, but capture currently raises
+  `AttributeError: 'FlashMLABackend' object has no attribute 'cuda_graph_qo_indptr'`
+  from the inherited FlashInfer MLA capture metadata path.
 - Cutlass MLA and TRT-LLM MLA are hardware-gated in this environment. Cutlass MLA
   decode reports support only for compute capability 10.0, while the TRT-LLM MLA
   XQA path reports an SM120a/SM121a requirement. Keep their tests hardware-gated
@@ -187,6 +192,16 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
+- `python -m py_compile test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/common/spec_runner.py test/manual/attention/unittest/mla/test_flashinfer.py test/manual/attention/unittest/mla/test_flashmla.py`
+- `python test/manual/attention/unittest/mla/test_flashinfer.py -v`
+  - Ran 7 tests in 1.304s after adding FlashInfer MLA `DRAFT_EXTEND`
+    CUDA-graph replay coverage.
+- `python test/manual/attention/unittest/mla/test_flashmla.py -v`
+  - Ran 6 tests in 1.354s after confirming FlashMLA remains on supported eager
+    draft-extend and verify/decode graph paths.
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+  - Ran 61 tests in 22.582s after adding FlashInfer MLA `DRAFT_EXTEND`
+    CUDA-graph replay coverage.
 - Probed dense FA3/FA4 speculative CUDA-graph candidates:
   - `run_dense_draft_extend_v2_cuda_graph_case` mismatched the HF-style reference
     for both FA3 and FA4 (`max abs diff ~= 0.618`).

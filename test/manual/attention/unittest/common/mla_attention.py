@@ -962,6 +962,23 @@ def make_mla_case_with_prefix_lens(
     )
 
 
+def make_mla_case_with_lens(
+    case: MLAAttentionCase,
+    name: str,
+    prefix_lens: tuple[int, ...],
+    input_lens: tuple[int, ...],
+) -> MLAAttentionCase:
+    return MLAAttentionCase(
+        name=name,
+        backend=case.backend,
+        forward_mode=case.forward_mode,
+        num_heads=case.num_heads,
+        page_size=case.page_size,
+        prefix_lens=prefix_lens,
+        extend_lens=input_lens,
+    )
+
+
 def mla_fixture_inputs(fixture: MLAAttentionFixture) -> dict[str, Any]:
     return {
         "prefix_hidden": fixture.prefix_hidden,

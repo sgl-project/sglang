@@ -82,6 +82,7 @@ from .mla_attention import _make_forward_batch as _make_mla_forward_batch
 from .mla_attention import (
     build_mla_attention_fixture,
     expected_mla_output_from_inputs,
+    make_mla_case_with_lens,
     make_mla_case_with_prefix_lens,
     make_mla_padded_replay_inputs,
     make_mla_random_inputs,
@@ -1500,6 +1501,192 @@ def run_mla_eagle_verify_cuda_graph_case(
         dtype=dtype,
         device=device,
         capture_batch_size=cuda_graph_capture_batch_size,
+        atol=MLA_ATOL,
+        rtol=MLA_RTOL,
+    )
+
+
+def run_mla_draft_extend_cuda_graph_case(
+    testcase,
+    case: MLAAttentionCase,
+    *,
+    kv_lora_rank: int = DEFAULT_KV_LORA_RANK,
+    qk_rope_head_dim: int = DEFAULT_QK_ROPE_HEAD_DIM,
+    hidden_size: int = MLA_DEFAULT_HIDDEN_SIZE,
+    max_context_len: int = MLA_DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = MLA_DEFAULT_DTYPE,
+    device: str = MLA_DEFAULT_DEVICE,
+    cuda_graph_capture_batch_size: int = 4,
+):
+    if not case.forward_mode.is_draft_extend():
+        raise ValueError("Draft-extend CUDA graph coverage expects DRAFT_EXTEND.")
+    if case.batch_size > cuda_graph_capture_batch_size:
+        raise ValueError("Draft-extend capture batch must cover replay batch size.")
+
+    num_tokens_per_req = max(case.input_lens)
+    graph_fixture = build_mla_attention_fixture(
+        testcase,
+        case,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        hidden_size=hidden_size,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        disable_cuda_graph=False,
+        runner_batch_size=cuda_graph_capture_batch_size,
+    )
+    backend = graph_fixture.backend
+    backend.init_cuda_graph_state(
+        max_bs=cuda_graph_capture_batch_size,
+        max_num_tokens=cuda_graph_capture_batch_size * num_tokens_per_req,
+    )
+
+    graph_batch = graph_fixture.forward_batch
+    graph_batch.spec_info = _make_eagle_draft_extend_input(
+        case,
+        graph_batch,
+        device=device,
+    )
+    graph_inputs = mla_fixture_inputs(graph_fixture)
+    graph_expected = expected_mla_output_from_inputs(
+        graph_fixture,
+        case,
+        graph_inputs,
+        None,
+    )
+
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
+        backend.init_forward_metadata(graph_batch)
+        graph_eager_actual = run_mla_forward(
+            graph_fixture,
+            graph_batch,
+            graph_inputs,
+        )
+
+    torch.testing.assert_close(
+        graph_eager_actual,
+        graph_expected,
+        atol=MLA_ATOL,
+        rtol=MLA_RTOL,
+    )
+
+    capture_prefix_len = backend.get_cuda_graph_seq_len_fill_value()
+    capture_case = make_mla_case_with_lens(
+        case,
+        f"{case.name}_cuda_graph_capture",
+        (capture_prefix_len,) * cuda_graph_capture_batch_size,
+        (num_tokens_per_req,) * cuda_graph_capture_batch_size,
+    )
+    capture_inputs = make_mla_random_inputs(
+        capture_case,
+        graph_fixture,
+        dtype=dtype,
+        device=device,
+    )
+    capture_batch = _make_mla_forward_batch(
+        capture_case,
+        graph_fixture.runner,
+        max_context_len=max_context_len,
+        device=device,
+    )
+    capture_batch.spec_info = _make_eagle_draft_extend_input(
+        capture_case,
+        capture_batch,
+        device=device,
+    )
+    prepare_mla_runner_inputs(
+        graph_fixture,
+        capture_case,
+        capture_batch,
+        capture_inputs,
+        max_context_len=max_context_len,
+    )
+    capture_expected = expected_mla_output_from_inputs(
+        graph_fixture,
+        capture_case,
+        capture_inputs,
+        None,
+    )
+
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
+        _init_cuda_graph_capture_metadata(
+            backend,
+            cuda_graph_capture_batch_size,
+            capture_batch,
+        )
+        capture_actual = run_mla_forward(
+            graph_fixture,
+            capture_batch,
+            capture_inputs,
+        )
+        backend.on_after_cuda_graph_warmup()
+
+    replay_pad_prefix_lens = (capture_prefix_len,) * (
+        cuda_graph_capture_batch_size - case.batch_size
+    )
+    replay_case = make_mla_case_with_lens(
+        case,
+        f"{case.name}_cuda_graph_replay",
+        case.prefix_lens + replay_pad_prefix_lens,
+        case.input_lens + (num_tokens_per_req,) * len(replay_pad_prefix_lens),
+    )
+    replay_inputs = make_mla_padded_replay_inputs(
+        replay_case,
+        graph_fixture,
+        replay_pad_prefix_lens,
+        graph_inputs,
+        dtype=dtype,
+        device=device,
+    )
+    replay_batch = _make_mla_forward_batch(
+        replay_case,
+        graph_fixture.runner,
+        max_context_len=max_context_len,
+        device=device,
+    )
+    replay_batch.spec_info = _make_eagle_draft_extend_input(
+        replay_case,
+        replay_batch,
+        device=device,
+    )
+    prepare_mla_runner_inputs(
+        graph_fixture,
+        replay_case,
+        replay_batch,
+        replay_inputs,
+        max_context_len=max_context_len,
+    )
+    replay_expected = expected_mla_output_from_inputs(
+        graph_fixture,
+        replay_case,
+        replay_inputs,
+        None,
+    )
+
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
+        _init_cuda_graph_replay_metadata(
+            backend,
+            cuda_graph_capture_batch_size,
+            replay_batch,
+        )
+        replay_actual = run_mla_forward(graph_fixture, replay_batch, replay_inputs)
+
+    torch.testing.assert_close(
+        capture_actual,
+        capture_expected,
+        atol=MLA_ATOL,
+        rtol=MLA_RTOL,
+    )
+    torch.testing.assert_close(
+        replay_actual,
+        replay_expected,
+        atol=MLA_ATOL,
+        rtol=MLA_RTOL,
+    )
+    torch.testing.assert_close(
+        replay_actual[: case.num_input_tokens],
+        graph_eager_actual,
         atol=MLA_ATOL,
         rtol=MLA_RTOL,
     )
