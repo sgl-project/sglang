@@ -113,9 +113,13 @@ Implemented:
   projection (`query`, `succ`, `inter`, and critical variants), so the dense
   Q/K/V module is structurally wrong for it even when short sequences would make
   the mask mathematically close to ordinary causal attention.
-- FA3/FA4 decode CUDA-graph replay is intentionally not enabled yet. Dense eager
-  and PCG/BCG split-op paths match the HF-style reference, but the shared decode
-  CUDA-graph helper currently mismatches on replay for both FA backends.
+- FA3/FA4 CUDA-graph replay is intentionally not enabled yet. Dense eager and
+  PCG/BCG split-op paths match the HF-style reference, but the shared decode
+  CUDA-graph helper currently mismatches on replay for both FA backends. Local
+  probes also show larger-than-tolerance mismatches for FA3/FA4 EAGLE
+  `TARGET_VERIFY` graph replay and `DRAFT_EXTEND_V2` graph replay, so keep them
+  as a focused FlashAttention graph-metadata follow-up rather than enabling
+  partial speculative graph coverage.
 - `trtllm_mha` dense coverage is decode-only for now. Local SM90 probes show MHA,
   GQA, MQA, and page-size-32 decode match the HF-style reference, while prefill
   goes through FlashInfer TRT-LLM Gen FMHA and reports `Unsupported architecture`.
@@ -183,6 +187,11 @@ Next implementation steps:
   Phase 4 tests are passing.
 
 Latest verification:
+- Probed dense FA3/FA4 speculative CUDA-graph candidates:
+  - `run_dense_draft_extend_v2_cuda_graph_case` mismatched the HF-style reference
+    for both FA3 and FA4 (`max abs diff ~= 0.618`).
+  - `run_dense_spec_verify_cuda_graph_case(..., topk=2, spec_kind="eagle")`
+    mismatched the HF-style reference for both FA3 and FA4 (`max abs diff ~= 0.115`).
 - `python -m py_compile test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/common/spec_runner.py test/manual/attention/unittest/gdn/test_triton.py test/manual/attention/unittest/gdn/test_flashinfer.py`
 - `python test/manual/attention/unittest/gdn/test_triton.py -v`
   - Ran 5 tests in 1.228s after adding GDN EAGLE tree verify/replay coverage.
