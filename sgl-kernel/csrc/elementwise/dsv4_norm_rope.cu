@@ -120,18 +120,40 @@ __device__ __forceinline__ float inv_scale_ue8m0(int32_t exp) {
   return __uint_as_float(static_cast<uint32_t>((127 + 127 - exp) << 23));
 }
 
-static constexpr float kFP8Max = 448.0f;
+#ifdef USE_ROCM
+// Runtime GPU architecture detection for ROCm multi-arch FP8 support
+inline static bool is_gfx950_gpu() {
+  static int cached_result = -1;  // -1 = not detected, 0 = no, 1 = yes
+  if (cached_result == -1) {
+    hipDeviceProp_t prop;
+    hipGetDeviceProperties(&prop, 0);
+    // gfx950 uses E4M3FN (max=448), older archs (gfx942, etc.) use E4M3FNUZ (max=224)
+    cached_result = (strncmp(prop.gcnArchName, "gfx950", 6) == 0) ? 1 : 0;
+  }
+  return cached_result == 1;
+}
+
+inline static float get_fp8_max() {
+  static const float fp8_max = is_gfx950_gpu() ? 448.0f : 224.0f;
+  return fp8_max;
+}
+#endif
+
+static constexpr float kFP8Max = 448.0f;  // CUDA default, overridden at runtime for ROCm
 
 #ifndef USE_ROCM
+template <int FP8_MAX = 448>
 __device__ __forceinline__ fp8x2_e4m3_t pack_fp8(float x, float y) {
-  x = fmaxf(fminf(x, kFP8Max), -kFP8Max);
-  y = fmaxf(fminf(y, kFP8Max), -kFP8Max);
+  constexpr float kMax = static_cast<float>(FP8_MAX);
+  x = fmaxf(fminf(x, kMax), -kMax);
+  y = fmaxf(fminf(y, kMax), -kMax);
   return __nv_fp8x2_e4m3(float2{x, y});
 }
 #else
 // Software float -> FP8 E4M3 conversion for ROCm
+template <int FP8_MAX = 448>
 __device__ __forceinline__ uint8_t cvt_float_to_fp8_e4m3(float val) {
-  constexpr float kMax = kFP8Max;
+  constexpr float kMax = static_cast<float>(FP8_MAX);
   val = fmaxf(fminf(val, kMax), -kMax);
   if (val == 0.0f) return 0;
 
@@ -169,9 +191,10 @@ __device__ __forceinline__ uint8_t cvt_float_to_fp8_e4m3(float val) {
   return sign | (static_cast<uint8_t>(exp8) << 3) | static_cast<uint8_t>(mant3);
 }
 
+template <int FP8_MAX = 448>
 __device__ __forceinline__ fp8x2_e4m3_t pack_fp8(float x, float y) {
-  uint8_t x8 = cvt_float_to_fp8_e4m3(x);
-  uint8_t y8 = cvt_float_to_fp8_e4m3(y);
+  uint8_t x8 = cvt_float_to_fp8_e4m3<FP8_MAX>(x);
+  uint8_t y8 = cvt_float_to_fp8_e4m3<FP8_MAX>(y);
   return static_cast<uint16_t>(x8) | (static_cast<uint16_t>(y8) << 8);
 }
 #endif
@@ -324,7 +347,7 @@ struct FusedKNormRopeFlashMLAParams {
   float eps;
 };
 
-template <int64_t kHeadDim, int64_t kRopeDim, int32_t kPageBits>
+template <int64_t kHeadDim, int64_t kRopeDim, int32_t kPageBits, int FP8_MAX = 448>
 __global__ __launch_bounds__(kFusedKBlockSize, 8) void fused_k_norm_rope_flashmla_kernel(
     const __grid_constant__ FusedKNormRopeFlashMLAParams params) {
   constexpr int64_t kVecSize = 2;
@@ -394,10 +417,11 @@ __global__ __launch_bounds__(kFusedKBlockSize, 8) void fused_k_norm_rope_flashml
   } else {
     float x = data[0], y = data[1];
     float abs_max = warp_reduce_max(fmaxf(fabsf(x), fabsf(y)));
-    float scale_raw = fmaxf(1e-4f, abs_max) / kFP8Max;
+    constexpr float fp8_max = static_cast<float>(FP8_MAX);
+    float scale_raw = fmaxf(1e-4f, abs_max) / fp8_max;
     int32_t scale_ue8m0 = cast_to_ue8m0(scale_raw);
     float inv_scale = inv_scale_ue8m0(scale_ue8m0);
-    fp8x2_e4m3_t result = pack_fp8(x * inv_scale, y * inv_scale);
+    fp8x2_e4m3_t result = pack_fp8<FP8_MAX>(x * inv_scale, y * inv_scale);
     auto scale_ptr = page_ptr + (576ll << kPageBits) + offset * 8;
     reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = result;
     if (lane_id == 0) static_cast<uint8_t*>(scale_ptr)[warp_id] = static_cast<uint8_t>(scale_ue8m0);
@@ -421,6 +445,7 @@ struct FusedQIndexerRopeHadamardQuantParams {
   uint32_t num_heads;
 };
 
+template <int FP8_MAX = 448>
 __global__ __launch_bounds__(kFusedQBlockSize, 16) void fused_q_indexer_rope_hadamard_quant_kernel(
     const __grid_constant__ FusedQIndexerRopeHadamardQuantParams params) {
   constexpr int64_t kHeadDim = 128;
@@ -506,12 +531,13 @@ __global__ __launch_bounds__(kFusedQBlockSize, 16) void fused_q_indexer_rope_had
     for (int i = 1; i < kVecSize; ++i)
       local_max = fmaxf(local_max, fabsf(data[i]));
     float abs_max = warp_reduce_max(local_max);
-    float scale = fmaxf(1e-4f, abs_max) / kFP8Max;
+    constexpr float fp8_max = static_cast<float>(FP8_MAX);
+    float scale = fmaxf(1e-4f, abs_max) / fp8_max;
     float inv_scale = 1.0f / scale;
 
     OutStorage result;
-    result[0] = pack_fp8(data[0] * inv_scale, data[1] * inv_scale);
-    result[1] = pack_fp8(data[2] * inv_scale, data[3] * inv_scale);
+    result[0] = pack_fp8<FP8_MAX>(data[0] * inv_scale, data[1] * inv_scale);
+    result[1] = pack_fp8<FP8_MAX>(data[2] * inv_scale, data[3] * inv_scale);
 
     auto out_row = static_cast<uint8_t*>(params.q_fp8) + work_id * kHeadDim;
     result.store(out_row, lane_id);
@@ -619,9 +645,21 @@ void dsv4_fused_k_norm_rope_flashmla(
   // Dispatch on page_size (must be power of 2).
   TORCH_CHECK(page_size > 0 && (page_size & (page_size - 1)) == 0, "page_size must be a power of 2");
 
-#define LAUNCH_K_KERNEL(PAGE_BITS)                                 \
-  fused_k_norm_rope_flashmla_kernel<kHeadDim, kRopeDim, PAGE_BITS> \
+#ifdef USE_ROCM
+  const bool use_gfx950_fp8 = is_gfx950_gpu();
+#define LAUNCH_K_KERNEL(PAGE_BITS)                                           \
+  if (use_gfx950_fp8) {                                                      \
+    fused_k_norm_rope_flashmla_kernel<kHeadDim, kRopeDim, PAGE_BITS, 448>    \
+        <<<static_cast<uint32_t>(B), kFusedKBlockSize, 0, stream>>>(params); \
+  } else {                                                                   \
+    fused_k_norm_rope_flashmla_kernel<kHeadDim, kRopeDim, PAGE_BITS, 224>    \
+        <<<static_cast<uint32_t>(B), kFusedKBlockSize, 0, stream>>>(params); \
+  }
+#else
+#define LAUNCH_K_KERNEL(PAGE_BITS)                                      \
+  fused_k_norm_rope_flashmla_kernel<kHeadDim, kRopeDim, PAGE_BITS, 448> \
       <<<static_cast<uint32_t>(B), kFusedKBlockSize, 0, stream>>>(params)
+#endif
 
   switch (page_size) {
     case 1:
@@ -696,5 +734,13 @@ void dsv4_fused_q_indexer_rope_hadamard_quant(
   const uint32_t total_works = static_cast<uint32_t>(B * H);
   const uint32_t num_blocks = CEILDIV(total_works, kFusedQNumWarps);
 
-  fused_q_indexer_rope_hadamard_quant_kernel<<<num_blocks, kFusedQBlockSize, 0, stream>>>(params);
+#ifdef USE_ROCM
+  if (is_gfx950_gpu()) {
+    fused_q_indexer_rope_hadamard_quant_kernel<448><<<num_blocks, kFusedQBlockSize, 0, stream>>>(params);
+  } else {
+    fused_q_indexer_rope_hadamard_quant_kernel<224><<<num_blocks, kFusedQBlockSize, 0, stream>>>(params);
+  }
+#else
+  fused_q_indexer_rope_hadamard_quant_kernel<448><<<num_blocks, kFusedQBlockSize, 0, stream>>>(params);
+#endif
 }
