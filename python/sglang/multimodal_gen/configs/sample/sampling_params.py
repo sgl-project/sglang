@@ -76,12 +76,15 @@ class DataType(Enum):
     IMAGE = auto()
     VIDEO = auto()
     MESH = auto()
+    TEXT = auto()
 
     def get_default_extension(self) -> str:
         if self == DataType.IMAGE:
             return "png"
         if self == DataType.VIDEO:
             return "mp4"
+        if self == DataType.TEXT:
+            return "txt"
         return "glb"
 
 
@@ -848,6 +851,52 @@ class SamplingParams:
             type=float,
             dest="cfg_normalization",
             help="CFG renormalization factor (for Z-Image). ",
+        )
+        add_argument(
+            "--max-new-tokens",
+            type=int,
+            dest="max_new_tokens",
+            help="Maximum number of new tokens to generate (for text diffusion models)",
+        )
+        add_argument(
+            "--T",
+            type=float,
+            help="Flow matching endpoint T (for text diffusion models)",
+        )
+        add_argument(
+            "--block-size",
+            type=int,
+            dest="block_size",
+            help="Block size for block-wise diffusion (for text diffusion models)",
+        )
+        add_argument(
+            "--patch-size",
+            type=int,
+            dest="patch_size",
+            help="Patch size for latent patching (for text diffusion models)",
+        )
+        add_argument(
+            "--temperature",
+            type=float,
+            help="Sampling temperature (0 = greedy)",
+        )
+        add_argument(
+            "--top-k",
+            type=int,
+            dest="top_k",
+            help="Top-k sampling parameter",
+        )
+        add_argument(
+            "--top-p",
+            type=float,
+            dest="top_p",
+            help="Top-p (nucleus) sampling parameter",
+        )
+        add_argument(
+            "--repetition-penalty",
+            type=float,
+            dest="repetition_penalty",
+            help="Repetition penalty for sampling",
         )
         add_argument(
             "--boundary-ratio",
