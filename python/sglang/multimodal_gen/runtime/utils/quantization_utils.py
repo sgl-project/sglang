@@ -438,14 +438,22 @@ def _build_nvfp4_config_from_safetensors_files(
                 "group_size": group_size,
                 "ignore": exclude_modules,
                 "checkpoint_uses_packed_qkv": checkpoint_uses_packed_qkv,
+                # The official FLUX.2 mixed NVFP4 export is detected by its
+                # packed QKV tensors and stores block scales in the
+                # FlashInfer/CUTLASS-swizzled layout. SGLang-converted
+                # transformer repos keep the linear layout.
+                "checkpoint_weight_scale_layout": (
+                    "swizzled" if checkpoint_uses_packed_qkv else "linear"
+                ),
             }
         )
         logger.info(
-            "Built NVFP4 quant config from %d safetensors: group_size=%d, %d excluded modules, packed_qkv=%s",
+            "Built NVFP4 quant config from %d safetensors: group_size=%d, %d excluded modules, packed_qkv=%s, scale_layout=%s",
             len(files_with_nvfp4_signal),
             group_size,
             len(exclude_modules),
             checkpoint_uses_packed_qkv,
+            getattr(result, "checkpoint_weight_scale_layout", "linear"),
         )
         return result
     except Exception as e:

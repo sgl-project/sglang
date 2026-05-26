@@ -42,6 +42,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -326,12 +327,10 @@ class Lfm2MoeShortConv(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
-        layer_cache = forward_batch.req_to_token_pool.mamba2_layer_cache(self.layer_idx)
+        layer_cache = get_req_to_token_pool().mamba2_layer_cache(self.layer_idx)
         conv_state = layer_cache.conv[0]
         req_pool_indices = forward_batch.req_pool_indices
-        mamba_indices = forward_batch.req_to_token_pool.get_mamba_indices(
-            req_pool_indices
-        )
+        mamba_indices = get_req_to_token_pool().get_mamba_indices(req_pool_indices)
 
         proj, _ = self.in_proj(hidden_states)
         B_gate, C_gate, x = proj.chunk(3, dim=-1)
@@ -360,10 +359,12 @@ class Lfm2MoeShortConv(nn.Module):
                 query_start_loc[:-1] = extend_start_loc
                 query_start_loc[-1] = T
                 cache_indices = mamba_indices.to(torch.int32)
+                has_initial_state = forward_batch.extend_prefix_lens > 0
             else:
                 # Single sequence: [0, T]
                 query_start_loc = hidden_states.new_tensor([0, T], dtype=torch.int32)
                 cache_indices = mamba_indices[:1].to(torch.int32)
+                has_initial_state = forward_batch.extend_prefix_lens[:1] > 0
 
             conv_out = causal_conv1d_fn(
                 Bx_t,
@@ -371,7 +372,7 @@ class Lfm2MoeShortConv(nn.Module):
                 self.conv_bias,
                 query_start_loc=query_start_loc,
                 cache_indices=cache_indices,
-                has_initial_state=None,
+                has_initial_state=has_initial_state,
                 conv_states=conv_state,
                 activation=None,
             ).transpose(0, 1)

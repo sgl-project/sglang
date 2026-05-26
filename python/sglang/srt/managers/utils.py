@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, List, Optional, Union
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, List, Optional, Union
 
 import torch
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.server_args import ServerArgs
@@ -38,15 +39,23 @@ class GenerationBatchResult:
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
-    future_indices: Optional[FutureIndices] = None
+    future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
 
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
 
+    # Next-iter seq_lens; published via on_publish.
+    new_seq_lens: Optional[torch.Tensor] = None
+
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
+
+    # Refs the worker wants scheduler to keep alive for the same 2-iter window
+    # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
+    # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).
+    extra_keep_alive_refs: Optional[List[Any]] = None
 
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None
@@ -59,7 +68,7 @@ class GenerationBatchResult:
     fpm_start_event: Optional[torch.cuda.Event] = None
     fpm_end_event: Optional[torch.cuda.Event] = None
 
-    def copy_to_cpu(self, return_logprob: bool):
+    def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
@@ -88,7 +97,7 @@ class GenerationBatchResult:
                     v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_token_ids_logprobs_val
                 ]
-        if self.logits_output.hidden_states is not None:
+        if return_hidden_states and self.logits_output.hidden_states is not None:
             self.logits_output.hidden_states = self.logits_output.hidden_states.to(
                 "cpu", non_blocking=True
             )
@@ -235,3 +244,56 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
         raise NotImplementedError(
             "get_alloc_len_per_decode not implemented for page_size > 1 and spec_topk > 1"
         )
+
+
+@dataclass
+class EmbeddingBatchResult:
+    """Result from an embedding/classification forward pass.
+
+    Attributes:
+        embeddings: Model output — pooled embeddings or classification logits.
+        pooled_hidden_states: Raw hidden states before the task head.  Present
+            only when the batch contained ``return_pooled_hidden_states=True``
+            requests.  Tensor (uniform shapes) or list of tensors (MIS).
+        copy_done: CUDA event recorded after the async CPU copy completes.
+    """
+
+    embeddings: torch.Tensor
+    pooled_hidden_states: Optional[torch.Tensor] = None
+    copy_done: Optional[torch.cuda.Event] = None
+
+    @property
+    def can_run_cuda_graph(self) -> bool:
+        return False
+
+    def copy_to_cpu(self):
+        """Copy embeddings and pooled hidden states to CPU for overlap scheduling."""
+        if isinstance(self.embeddings, torch.Tensor):
+            self.copy_done = torch.get_device_module(self.embeddings.device).Event()
+            self.embeddings = self.embeddings.to("cpu", non_blocking=True)
+        else:
+            assert isinstance(self.embeddings, list)
+            if len(self.embeddings) == 0:
+                return
+
+            self.copy_done = torch.get_device_module(self.embeddings[0].device).Event()
+            self.embeddings = [
+                emb.to("cpu", non_blocking=True) for emb in self.embeddings
+            ]
+
+        if self.pooled_hidden_states is not None:
+            if isinstance(self.pooled_hidden_states, list):
+                self.pooled_hidden_states = [
+                    t.to("cpu", non_blocking=True) for t in self.pooled_hidden_states
+                ]
+            else:
+                self.pooled_hidden_states = self.pooled_hidden_states.to(
+                    "cpu", non_blocking=True
+                )
+
+        self.copy_done.record()
+
+
+def is_health_check_generate_req(recv_req):
+    rid = getattr(recv_req, "rid", None)
+    return rid is not None and rid.startswith(HEALTH_CHECK_RID_PREFIX)
