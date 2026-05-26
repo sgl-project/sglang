@@ -35,11 +35,15 @@ Implemented:
   accumulation differences; chain verify and non-spec GDN paths keep `3e-2`.
 - Each attention-method folder now has a local `README.md` capability matrix and
   progress summary. Implemented folders are `dense/`, `swa/`, `mla/`, `gdn/`,
-  `dual_chunk/`, plus DSA dense fallback and sparse top-k coverage, and an
-  initial KDA (Kimi Delta Attention) linear-attention fixture under `kda/` with
-  an eager EXTEND Triton case, plus an initial Lightning (Bailing-style
-  segmented linear attention) fixture under `lightning/` with an eager EXTEND
-  Triton case, plus an initial Mamba2 state-space-model fixture under `mamba/`
+  `dual_chunk/`, plus DSA dense fallback (4 layouts) and sparse top-k coverage
+  (7 layouts: long-prefix prefill, multi-token sparse prefill, multi-request
+  sparse prefill, decode with bsz=2 trailing-topk, decode with sub-topk prefix
+  padding, ragged 3-request decode, long-prefix decode), and a KDA (Kimi Delta
+  Attention) linear-attention fixture under `kda/` that consumes the full
+  10-case input matrix via `make_kda_cases`, plus a Lightning (Bailing-style
+  segmented linear attention) fixture under `lightning/` that uses the same
+  10-case matrix (`head_dim=128` to satisfy the seg_la kernel's K/V split
+  constraints), plus an initial Mamba2 state-space-model fixture under `mamba/`
   with an eager EXTEND case that drives `Mamba2AttnBackend` end-to-end through
   a real `MambaMixer2`. `dsv4/` now has an initial SWA-only (`compress_ratio=0`)
   Phase 2 fixture under `dsv4/` that drives the real `DeepseekV4AttnBackend`
@@ -172,17 +176,26 @@ Implemented:
   module and compares prefill/decode layouts against an independent PyTorch
   reference. The reference now covers non-sparse first-window, successor-chunk,
   and inter-chunk grouping with distinct `query`, `query_succ`, and
-  `query_inter` projection weights, plus a sparse all-column prefill layout that
-  exercises the sparse vertical/slash kernel path with a dense-equivalent
-  reference. Sparse critical-token pruning beyond the all-column path remains
-  future work.
+  `query_inter` projection weights, plus three sparse all-column prefill layouts
+  that exercise the sparse vertical/slash kernel path with a dense-equivalent
+  reference (single-request, multi-request first-chunk, and page-boundary
+  first-chunk), plus a separate threshold-gated sparse case
+  (`sparse_attention_threshold=100` with seq_len=16) that confirms the
+  `current_orig_seq_len > threshold` gate disables sparse and falls back to
+  dense prefill. Sparse critical-token pruning that meaningfully diverges from
+  the dense reference (i.e., true sub-context-window selection) remains future
+  work because it requires a non-trivial independent sparse reference.
 - DSA has locally runnable Phase 2 fixtures in
   `common/attention_methods/dsa_attention.py`. It builds a DeepSeek-DSA-shaped
   runner with real `DSATokenToKVPool`, exercises the `dsa` backend's
-  MHA_ONE_SHOT dense prefill fallback for no-prefix and prefix extend batches,
-  sparse prefill through `flashmla_sparse`, and sparse decode through the default
-  `flashmla_kv` path. Dense fallback cases compare against an independent dense
-  PyTorch reference; sparse cases compare against an independent top-k PyTorch
+  MHA_ONE_SHOT dense prefill fallback for no-prefix ragged, no-prefix exact-page,
+  prefix-ragged, cross-page-boundary, prefix-exact-page, and total-exact-page
+  batches, sparse prefill through `flashmla_sparse` for long-prefix bsz=1,
+  long-prefix multi-token extend, and multi-request long-prefix layouts, and
+  sparse decode through the default `flashmla_kv` path for short-trailing-topk
+  decode, sub-topk-with-padding decode, ragged 3-request decode, and long-prefix
+  decode. Dense fallback cases compare against an independent dense PyTorch
+  reference; sparse cases compare against an independent top-k PyTorch
   reference.
 - DSV4 has an initial SWA-only (`compress_ratio=0`) Phase 2 fixture using the
   real `DeepseekV4AttnBackend` and `DeepSeekV4TokenToKVPool` with the production
@@ -303,6 +316,43 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Expanded Phase 2 input-shape coverage for KDA, Lightning, dual_chunk sparse,
+  and DSA. KDA: switched `kda/test_triton.py` to consume the existing
+  `make_kda_cases('triton')` enumeration so the dense-style 10-case matrix
+  (page_size_1, zero/nonzero prefix, page-boundary, ragged, page32-cross,
+  decode page-boundary, decode bsz=1) actually runs. Lightning: bumped
+  `DEFAULT_HEAD_DIM` from 32 to 128 in
+  `common/attention_methods/lightning_attention.py` (decoded by `seg_la_d_kernel`
+  requiring `K_SPLIT_DIM=128` and prefill bs>2 requiring `V_SPLIT_DIM=64`),
+  expanded `make_lightning_cases` to the same 10-case shape used by GDN/KDA, and
+  wired the test to use it. Dual-chunk sparse: added two new all-column sparse
+  cases (multi-request first-chunk and page-boundary first-chunk) and a separate
+  threshold-gated config (`DUAL_CHUNK_SPARSE_THRESHOLD_GATED_CONFIG` with
+  `sparse_attention_threshold=100`) plus a new
+  `test_sparse_dual_chunk_threshold_gated_cases` method that exercises the
+  `current_orig_seq_len > threshold` gate falling back to dense prefill while
+  keeping `sparse_attention_enabled=True`. DSA: added three more dense
+  MHA_ONE_SHOT layouts (cross-page, prefix-exact-page, total-exact-page) and
+  five more sparse top-k layouts (multi-token sparse prefill, multi-request
+  sparse prefill, short-prefix-with-padding decode, ragged 3-request decode,
+  long-prefix decode).
+- `python -m py_compile test/manual/attention/unittest/common/attention_methods/kda_attention.py test/manual/attention/unittest/common/attention_methods/lightning_attention.py test/manual/attention/unittest/common/attention_methods/dual_chunk_attention.py test/manual/attention/unittest/common/attention_methods/dsa_attention.py test/manual/attention/unittest/kda/test_triton.py test/manual/attention/unittest/lightning/test_triton.py test/manual/attention/unittest/dual_chunk/test_dual_chunk_flash_attn.py test/manual/attention/unittest/dsa/test_dsa.py`
+- `python test/manual/attention/unittest/kda/test_triton.py -v`
+  - Ran 1 test in 32.149s (10 KDA subcases) after wiring the full
+    `make_kda_cases` matrix.
+- `python test/manual/attention/unittest/lightning/test_triton.py -v`
+  - Ran 1 test in 0.741s (10 Lightning subcases) after bumping
+    `DEFAULT_HEAD_DIM=128` and expanding `make_lightning_cases`.
+- `python test/manual/attention/unittest/dual_chunk/test_dual_chunk_flash_attn.py -v`
+  - Ran 3 tests in 0.727s after adding the new sparse all-column variants and
+    the threshold-gated method.
+- `python test/manual/attention/unittest/dsa/test_dsa.py -v`
+  - Ran 2 tests in 1.063s after expanding dense fallback and sparse layouts.
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+  - Ran 87 tests in 30.518s after the step 10 expansion (1 new top-level test
+    method from the dual_chunk threshold-gated suite). The remaining 1 failure
+    is the pre-existing Mamba2 `'SimpleNamespace' object has no attribute
+    'enable_symm_mem'` baseline issue, not introduced by this expansion.
 - Added initial DSV4 (DeepSeek V4) Phase 2 fixture scoped to the SWA-only
   (`compress_ratio=0`) path. The actual path constructs a real
   `DeepSeekV4TokenToKVPool` with the production packed FP8-nope/BF16-rope SWA

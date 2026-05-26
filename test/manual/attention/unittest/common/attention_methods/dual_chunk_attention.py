@@ -47,6 +47,13 @@ DUAL_CHUNK_SPARSE_ALL_COLUMN_CONFIG = {
         0: {str(head_id): ("vertical_and_slash", 16, 16, None) for head_id in range(4)}
     },
 }
+# Same vertical/slash sizes as all-column, but with a threshold so short
+# sequences bypass the sparse kernel and fall back to dense prefill. This
+# exercises the `current_orig_seq_len > self.sparse_attention_threshold` gate.
+DUAL_CHUNK_SPARSE_THRESHOLD_GATED_CONFIG = {
+    **DUAL_CHUNK_SPARSE_ALL_COLUMN_CONFIG,
+    "sparse_attention_threshold": 100,
+}
 
 # Unit tests run without distributed initialization. Sparse dual-chunk config
 # lookup should see the single-rank default.
@@ -152,16 +159,58 @@ def make_dual_chunk_cases(backend: str) -> tuple[DualChunkAttentionCase, ...]:
 
 
 def make_dual_chunk_sparse_cases(backend: str) -> tuple[DualChunkAttentionCase, ...]:
+    common = dict(backend=backend, num_heads=4, num_kv_heads=4)
     return (
         DualChunkAttentionCase(
             name="dual_chunk_sparse_prefill_all_columns",
-            backend=backend,
             forward_mode=ForwardMode.EXTEND,
-            num_heads=4,
-            num_kv_heads=4,
             page_size=16,
             prefix_lens=(0,),
             extend_lens=(16,),
+            **common,
+        ),
+        # Multi-request batch within the first chunk: every request's seq_len <= 16
+        # so the sparse path's per-request all-column selection still covers all keys
+        # and matches the dense reference. Exercises per-request `cu_seqlens_*` slicing
+        # in `_dual_chunk_flash_attn_prefill_func` under sparse enabled.
+        DualChunkAttentionCase(
+            name="dual_chunk_sparse_prefill_multi_request_first_chunk",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(0, 0),
+            extend_lens=(8, 12),
+            **common,
+        ),
+        # Page-boundary extend (prefix + extend crosses page=16) while staying within
+        # one chunk (chunk_size=64). Sparse path still sees <= 16 keys per request so
+        # last_q + vertical/slash select all → dense-equivalent.
+        DualChunkAttentionCase(
+            name="dual_chunk_sparse_prefill_cross_page_first_chunk",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(15,),
+            extend_lens=(1,),
+            **common,
+        ),
+    )
+
+
+def make_dual_chunk_sparse_threshold_gated_cases(
+    backend: str,
+) -> tuple[DualChunkAttentionCase, ...]:
+    common = dict(backend=backend, num_heads=4, num_kv_heads=4)
+    return (
+        # sparse_attention_enabled=True with threshold=100; with seq_len=16 the
+        # backend's `current_orig_seq_len > threshold` check should disable sparse
+        # per request and fall back to the dense chunk-flash kernel. The output
+        # must match the dense reference exactly.
+        DualChunkAttentionCase(
+            name="dual_chunk_sparse_threshold_gated_short_seq",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(0,),
+            extend_lens=(16,),
+            **common,
         ),
     )
 
@@ -739,6 +788,29 @@ def run_dual_chunk_sparse_attention_case(
         dtype=dtype,
         device=device,
         dual_chunk_attention_config=DUAL_CHUNK_SPARSE_ALL_COLUMN_CONFIG,
+    )
+    actual = run_dual_chunk_fixture_eager(fixture)
+    expected = expected_dual_chunk_fixture_output(fixture)
+    torch.testing.assert_close(actual, expected, atol=DENSE_ATOL, rtol=DENSE_RTOL)
+
+
+def run_dual_chunk_sparse_threshold_gated_case(
+    testcase,
+    case: DualChunkAttentionCase,
+    *,
+    max_context_len: int = DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = DEFAULT_DTYPE,
+    device: str = DEFAULT_DEVICE,
+) -> None:
+    fixture = build_dual_chunk_attention_fixture(
+        testcase,
+        case,
+        head_dim=128,
+        hidden_size=128,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        dual_chunk_attention_config=DUAL_CHUNK_SPARSE_THRESHOLD_GATED_CONFIG,
     )
     actual = run_dual_chunk_fixture_eager(fixture)
     expected = expected_dual_chunk_fixture_output(fixture)

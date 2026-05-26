@@ -75,6 +75,31 @@ def make_dsa_dense_fallback_cases(backend: str) -> tuple[DSAAttentionCase, ...]:
             extend_lens=(2, 3),
             **common,
         ),
+        # Prefix + extend crosses a page boundary (`page_size=64`), so the dense
+        # fallback path must read both the existing page and the freshly-allocated
+        # next page during the MHA_ONE_SHOT projection-and-attention.
+        DSAAttentionCase(
+            name="dsa_mha_one_shot_cross_page_boundary",
+            prefix_lens=(DSA_PAGE_SIZE - 1,),
+            extend_lens=(2,),
+            **common,
+        ),
+        # Prefix exactly fills one page and extend opens the next: covers the
+        # page-aligned prefix branch of `_token_loc` / `req_to_token` setup.
+        DSAAttentionCase(
+            name="dsa_mha_one_shot_prefix_exact_page",
+            prefix_lens=(DSA_PAGE_SIZE,),
+            extend_lens=(2,),
+            **common,
+        ),
+        # prefix + extend exactly equals one page so total length lands on the
+        # boundary without crossing it.
+        DSAAttentionCase(
+            name="dsa_mha_one_shot_total_exact_page",
+            prefix_lens=(DSA_PAGE_SIZE - 16,),
+            extend_lens=(16,),
+            **common,
+        ),
     )
 
 
@@ -95,10 +120,54 @@ def make_dsa_sparse_cases(backend: str) -> tuple[DSAAttentionCase, ...]:
             extend_lens=(1,),
             **common,
         ),
+        # Sparse prefill with multi-token extend: per-query trailing-topk rows must
+        # advance with `offset`, exercising the prefill dispatch on more than one
+        # query token while staying above the dense one-shot threshold.
+        DSAAttentionCase(
+            name="dsa_sparse_prefill_long_extend",
+            forward_mode=ForwardMode.EXTEND,
+            prefix_lens=(2048,),
+            extend_lens=(4,),
+            **common,
+        ),
+        # Sparse prefill with multiple requests above the dense one-shot threshold,
+        # so the flashmla_sparse path runs with bsz > 1.
+        DSAAttentionCase(
+            name="dsa_sparse_prefill_multi_request",
+            forward_mode=ForwardMode.EXTEND,
+            prefix_lens=(2048, 2048),
+            extend_lens=(1, 1),
+            **common,
+        ),
         DSAAttentionCase(
             name="dsa_sparse_decode_flashmla_kv_topk",
             forward_mode=ForwardMode.DECODE,
             prefix_lens=(127, 128),
+            **common,
+        ),
+        # Decode with prefix < topk so trailing-row indices include the -1 padding
+        # tail and the kernel must mask the unused topk slots.
+        DSAAttentionCase(
+            name="dsa_sparse_decode_short_prefix_padding",
+            forward_mode=ForwardMode.DECODE,
+            prefix_lens=(64, 96),
+            **common,
+        ),
+        # Decode with ragged prefix across 3 requests: covers (key_count < topk),
+        # (key_count == topk), and (key_count > topk) at the same time so the
+        # per-request topk slicing must vary across the batch.
+        DSAAttentionCase(
+            name="dsa_sparse_decode_ragged_prefix",
+            forward_mode=ForwardMode.DECODE,
+            prefix_lens=(64, 128, 192),
+            **common,
+        ),
+        # Long-prefix decode: prefix >> topk so the trailing topk window walks
+        # deep into the KV cache and exercises page-table indexing past many pages.
+        DSAAttentionCase(
+            name="dsa_sparse_decode_long_prefix",
+            forward_mode=ForwardMode.DECODE,
+            prefix_lens=(2048,),
             **common,
         ),
     )

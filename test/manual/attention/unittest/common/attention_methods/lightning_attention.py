@@ -28,7 +28,13 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 _dp_attention.get_attention_tp_size = lambda: 1
 _dp_attention.get_attention_tp_rank = lambda: 0
 
-DEFAULT_HEAD_DIM = 32
+# seg_la kernel constraints (see seg_la.py:683-694):
+#   - decode (`seg_la_d_kernel`): K_SPLIT_DIM = 128, so head_dim must be >= 128
+#     for `k_dim_block = head_dim // K_SPLIT_DIM` to be at least 1.
+#   - prefill with bs > 2 (`seg_la_p_kernel`): V_SPLIT_DIM = 64, so head_dim must
+#     be >= 64 for `v_dim_block = head_dim // V_SPLIT_DIM` to be at least 1.
+# We use 128 so both decode and ragged multi-request extend exercise valid kernel grids.
+DEFAULT_HEAD_DIM = 128
 DEFAULT_MAX_CONTEXT_LEN = 64
 DEFAULT_DTYPE = torch.bfloat16
 DEFAULT_DEVICE = "cuda"
@@ -69,11 +75,81 @@ def make_lightning_cases(backend: str) -> tuple[LightningAttentionCase, ...]:
     common = dict(backend=backend, num_heads=2)
     return (
         LightningAttentionCase(
+            name="lightning_extend_page_size_1",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=1,
+            prefix_lens=(2, 4),
+            extend_lens=(3, 1),
+            **common,
+        ),
+        LightningAttentionCase(
             name="lightning_extend_zero_prefix_exact_page",
             forward_mode=ForwardMode.EXTEND,
             page_size=16,
             prefix_lens=(0,),
             extend_lens=(16,),
+            **common,
+        ),
+        LightningAttentionCase(
+            name="lightning_extend_zero_prefix_input_page_edges",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(0, 0, 0),
+            extend_lens=(15, 16, 17),
+            **common,
+        ),
+        LightningAttentionCase(
+            name="lightning_extend_prefix_exact_page",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(16,),
+            extend_lens=(2,),
+            **common,
+        ),
+        LightningAttentionCase(
+            name="lightning_extend_total_exact_page",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(8,),
+            extend_lens=(8,),
+            **common,
+        ),
+        LightningAttentionCase(
+            name="lightning_extend_cross_page_boundary",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(15,),
+            extend_lens=(2,),
+            **common,
+        ),
+        LightningAttentionCase(
+            name="lightning_extend_ragged_page_boundary",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(0, 8, 16),
+            extend_lens=(15, 8, 1),
+            **common,
+        ),
+        LightningAttentionCase(
+            name="lightning_extend_page32_cross_boundary",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=32,
+            prefix_lens=(31,),
+            extend_lens=(2,),
+            **common,
+        ),
+        LightningAttentionCase(
+            name="lightning_decode_page_boundary",
+            forward_mode=ForwardMode.DECODE,
+            page_size=16,
+            prefix_lens=(14, 15, 16),
+            **common,
+        ),
+        LightningAttentionCase(
+            name="lightning_decode_bsz1_nonzero_prefix",
+            forward_mode=ForwardMode.DECODE,
+            page_size=16,
+            prefix_lens=(7,),
             **common,
         ),
     )
