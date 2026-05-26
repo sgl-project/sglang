@@ -51,6 +51,7 @@ class SchedulerLoadInquirer:
     get_disagg_decode_transfer_queue: Callable
     get_spec_total_num_accept_tokens: Callable
     get_spec_total_num_forward_ct: Callable
+    report_double_count_violation: Callable[[], None]
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
@@ -67,9 +68,18 @@ class SchedulerLoadInquirer:
                 0 is correct.
         """
         num_pending_tokens = sum(req.seqlen for req in self.get_waiting_queue())
-        if self.get_chunked_req() is not None:
-            req = self.get_chunked_req()
-            num_pending_tokens += req.seqlen - len(req.prefix_indices) - chunk_deduct
+        chunked_req = self.get_chunked_req()
+        if chunked_req is not None:
+            # Invariant LI: chunked_req must not also appear in
+            # waiting_queue or its tokens get counted twice (full seqlen
+            # from waiting_queue plus the tail here). Report the
+            # violation to the scheduler so ScriptedRuntime tests can
+            # assert the dual-queue dedup invariant.
+            if any(req is chunked_req for req in self.get_waiting_queue()):
+                self.report_double_count_violation()
+            num_pending_tokens += (
+                chunked_req.seqlen - len(chunked_req.prefix_indices) - chunk_deduct
+            )
         return num_pending_tokens
 
     def get_loads(self, req: GetLoadsReqInput = None) -> GetLoadsReqOutput:

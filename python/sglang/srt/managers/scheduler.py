@@ -684,6 +684,7 @@ class Scheduler(
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
             get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
             get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
+            report_double_count_violation=self._report_load_inquirer_double_count,
         )
 
         self.output_streamer = SchedulerOutputStreamer(
@@ -1076,6 +1077,14 @@ class Scheduler(
         # last_batch.chunked_req (see get_next_batch_to_run PP merge
         # branch).
         self._stale_chunked_req_merged_count: int = 0
+
+        # Regression instrumentation for invariant LI: the load inquirer
+        # tallies pending tokens from waiting_queue plus the chunked_req
+        # tail. If the chunked_req also appears in waiting_queue, its
+        # tokens get counted twice (the dual-queue dedup invariant).
+        # Incremented inside SchedulerLoadInquirer._get_num_pending_tokens
+        # when the violation is observed.
+        self._load_inquirer_double_count_count: int = 0
 
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None
@@ -2312,6 +2321,14 @@ class Scheduler(
         if req is self.chunked_req and not self._chunked_req_scheduled_last_iter:
             req.swa_stash_double_free_count += 1
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+
+    def _report_load_inquirer_double_count(self) -> None:
+        # Invariant LI report sink: SchedulerLoadInquirer invokes this
+        # when it observes the chunked_req simultaneously sitting in
+        # waiting_queue, which would otherwise double-count its pending
+        # tokens. Surfaced to ScriptedRuntime tests via
+        # Scheduler._load_inquirer_double_count_count.
+        self._load_inquirer_double_count_count += 1
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
