@@ -14,7 +14,14 @@
 # ==============================================================================
 """Configuration class for Zyphra ZAYA1 series models."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, List, Optional
+
 from transformers.configuration_utils import PretrainedConfig
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 
 
 class ZayaConfig(PretrainedConfig):
@@ -215,6 +222,55 @@ class ZayaConfig(PretrainedConfig):
             eos_token_id=eos_token_id,
             tie_word_embeddings=self.tie_word_embeddings,
             **kwargs,
+        )
+
+    # -- Hybrid model interface (HybridReqToTokenPool / MambaPool) ----------
+
+    @property
+    def full_attention_layer_ids(self) -> List[int]:
+        if self.zaya_layers:
+            return [i for i, lt in enumerate(self.zaya_layers) if lt == "a"]
+        return [i for i in range(self.num_hidden_layers) if i % 2 == 0]
+
+    @property
+    def linear_layer_ids(self) -> List[int]:
+        return self.full_attention_layer_ids
+
+    @property
+    def mamba_chunk_size(self) -> int:
+        return 1
+
+    @property
+    def mamba2_cache_params(self) -> Optional[Mamba2CacheParams]:
+        from sglang.srt.configs.mamba_utils import (
+            Mamba2CacheParams,
+            Mamba2StateShape,
+            mamba2_state_dtype,
+        )
+
+        attn_layer_ids = self.linear_layer_ids
+        if not attn_layer_ids:
+            return None
+
+        in_out_ch = (self.num_attention_heads + self.num_key_value_heads) * self.head_dim
+        total_padding = (self.cca_time0 - 1) + (self.cca_time1 - 1)
+
+        shape = Mamba2StateShape(
+            conv=[(in_out_ch, total_padding), (self.hidden_size, 1)],
+            temporal=(1, 1, 0),
+            intermediate_size=in_out_ch,
+            conv_dim=in_out_ch,
+            ssm_state_size=0,
+            num_heads=1,
+            head_dim=1,
+            state_size=0,
+            conv_kernel=total_padding + 1,
+        )
+
+        return Mamba2CacheParams(
+            shape=shape,
+            layers=attn_layer_ids,
+            dtype=mamba2_state_dtype(self),
         )
 
 

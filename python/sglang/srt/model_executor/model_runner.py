@@ -51,6 +51,7 @@ from sglang.srt.configs import (
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Qwen3NextConfig,
+    ZayaConfig,
 )
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
@@ -2146,7 +2147,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             | NemotronHConfig
             | Lfm2Config
             | Lfm2MoeConfig
-            | Lfm2VlConfig,
+            | Lfm2VlConfig
+            | ZayaConfig,
         ):
             return config
         if isinstance(config, NemotronH_Nano_VL_V2_Config):

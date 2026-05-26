@@ -31,9 +31,9 @@ for the full design notes):
   averaging across MoE layers) and MOD (mixture-of-depths skip expert).
 - Per-layer :class:`ResidualScaling` keeps the residual stream in fp32 with
   affine scale/bias both on the residual and on the post-mixer hidden states.
-- Per-request CCA state (``conv_state`` + ``prev_hs``) is held by each CCA
-  module as buffers indexed by ``forward_batch.req_pool_indices``; it is sized
-  lazily on the first forward pass.
+- Per-request CCA state (``conv_state`` + ``prev_hs``) is managed by
+  SGLang's centralized ``MambaPool`` inside ``HybridReqToTokenPool``,
+  accessed via ``get_req_to_token_pool().mamba2_layer_cache()``.
 """
 
 from __future__ import annotations
@@ -67,6 +67,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
 
@@ -246,73 +247,18 @@ class CCA(nn.Module):
         # Per-K-head learnable temperature scalar.
         self.temp = nn.Parameter(torch.zeros(self.num_k_heads))
 
-        # Per-request state buffers. Sized lazily on the first forward call
-        # once the actual request-pool layout is observable.
-        self.register_buffer(
-            "conv_state_pool",
-            torch.zeros(1, self.in_out_ch, self.total_padding),
-            persistent=False,
-        )
-        self.register_buffer(
-            "prev_hs_pool",
-            torch.zeros(1, self.hidden_size),
-            persistent=False,
-        )
-
     # ----- helpers ---------------------------------------------------------
 
-    def _ensure_pool(self, forward_batch: ForwardBatch) -> None:
-        """Grow the per-request state pools to cover all seen ``req_pool_indices``.
-
-        ``ForwardBatch`` does not expose ``req_to_token_pool`` to the model, so
-        the required size is inferred from the current batch's indices and from
-        the server-side ``max_running_requests``. Pools only ever grow: a
-        warmup / profile batch with N indices triggers a single resize, then
-        all subsequent forwards reuse the same buffer.
-        """
-        device = (
-            forward_batch.input_ids.device
-            if forward_batch.input_ids is not None
-            else self.conv_state_pool.device
-        )
-
-        if (
-            getattr(forward_batch, "req_pool_indices", None) is not None
-            and forward_batch.req_pool_indices.numel() > 0
-        ):
-            current_max = int(forward_batch.req_pool_indices.max().item()) + 1
-        else:
-            current_max = 1
-
-        try:
-            from sglang.srt.server_args import get_global_server_args
-
-            server_args = get_global_server_args()
-            server_cap = int(getattr(server_args, "max_running_requests", 0) or 0)
-        except Exception:
-            server_cap = 0
-
-        required = max(current_max, server_cap, self.conv_state_pool.shape[0])
-        if (
-            required <= self.conv_state_pool.shape[0]
-            and self.conv_state_pool.device == device
-        ):
-            return
-
-        dtype = self.conv_state_pool.dtype
-        self.conv_state_pool = torch.zeros(
-            required,
-            self.in_out_ch,
-            self.total_padding,
-            dtype=dtype,
-            device=device,
-        )
-        self.prev_hs_pool = torch.zeros(
-            required,
-            self.hidden_size,
-            dtype=dtype,
-            device=device,
-        )
+    def _get_pool_state(self, forward_batch: ForwardBatch):
+        """Retrieve per-request CCA state from the centralized MambaPool."""
+        req_to_token_pool = get_req_to_token_pool()
+        layer_cache = req_to_token_pool.mamba2_layer_cache(self.layer_id)
+        conv_state = layer_cache.conv[0]
+        prev_hs_state = layer_cache.conv[1]
+        mamba_indices = req_to_token_pool.get_mamba_indices(
+            forward_batch.req_pool_indices
+        ).to(torch.long)
+        return conv_state, prev_hs_state, mamba_indices
 
     def _normalize_qk(
         self, query: torch.Tensor, key: torch.Tensor
@@ -429,10 +375,9 @@ class CCA(nn.Module):
 
         Walks every request in the batch, applies the conv with each request's
         own initial state (zero on first chunk, cached otherwise), writes the
-        updated state and ``prev_hs`` back into the per-request pools, and
+        updated state and ``prev_hs`` back into the centralized MambaPool, and
         returns the concatenated q/k/v in the original token layout.
         """
-        device = hidden_states.device
         dtype = hidden_states.dtype
         T = hidden_states.shape[0]
 
@@ -446,19 +391,20 @@ class CCA(nn.Module):
         qk_out = torch.empty_like(qk)
         v2_input = torch.empty_like(hidden_states)
 
+        conv_state, prev_hs_state, mamba_indices = self._get_pool_state(forward_batch)
+
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu or []
         extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu or []
-        req_pool_indices = forward_batch.req_pool_indices
 
         start = 0
         for i, seq_len in enumerate(extend_seq_lens_cpu):
             end = start + int(seq_len)
-            req_idx = int(req_pool_indices[i].item())
+            mamba_idx = int(mamba_indices[i].item())
             has_prefix = int(extend_prefix_lens_cpu[i]) > 0
 
             qk_cur = qk[start:end].transpose(0, 1).unsqueeze(0)  # [1, C, S_cur]
             if has_prefix:
-                left_pad = self.conv_state_pool[req_idx].unsqueeze(0).to(dtype)
+                left_pad = conv_state[mamba_idx].unsqueeze(0).to(dtype)
             else:
                 left_pad = qk_cur.new_zeros((1, self.in_out_ch, self.total_padding))
             padded = torch.cat([left_pad, qk_cur], dim=-1)
@@ -466,25 +412,20 @@ class CCA(nn.Module):
             out = self._conv_qk_run(padded)  # [1, C, S_cur]
             qk_out[start:end] = out.squeeze(0).transpose(0, 1)
 
-            # Persist the tail (last `total_padding` columns) of (left_pad ‖ qk_cur)
-            # as the conv state for the next chunk of this request.
             new_state = padded[..., -self.total_padding :]
-            self.conv_state_pool[req_idx] = new_state.squeeze(0).to(
-                self.conv_state_pool.dtype
-            )
+            conv_state[mamba_idx] = new_state.squeeze(0).to(conv_state.dtype)
 
-            # val_proj2 sees the hidden_state right-shifted by one within the
-            # request; the very first slot is filled from the cached prev_hs (or
-            # zero for the first chunk).
             hs_cur = hidden_states[start:end]
             if has_prefix:
-                first = self.prev_hs_pool[req_idx].to(dtype).unsqueeze(0)
+                first = prev_hs_state[mamba_idx].squeeze(-1).to(dtype).unsqueeze(0)
             else:
                 first = hidden_states.new_zeros((1, self.hidden_size))
             shifted = torch.cat([first, hs_cur[:-1]], dim=0)
             v2_input[start:end] = shifted
 
-            self.prev_hs_pool[req_idx] = hs_cur[-1].to(self.prev_hs_pool.dtype)
+            prev_hs_state[mamba_idx] = hs_cur[-1].unsqueeze(-1).to(
+                prev_hs_state.dtype
+            )
 
             start = end
 
@@ -516,13 +457,15 @@ class CCA(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Single-token decode path for a whole batch.
 
-        Reads each request's cached conv state and ``prev_hs`` via
-        ``index_select``, runs the conv on the small ``[T, C, total_padding+1]``
-        window, and writes the updated state back via ``index_copy_``.
+        Reads each request's cached conv state and ``prev_hs`` from the
+        centralized MambaPool via ``index_select``, runs the conv on the
+        small ``[T, C, total_padding+1]`` window, and writes back via
+        ``index_copy_``.
         """
         T = hidden_states.shape[0]
         dtype = hidden_states.dtype
-        req_idx = forward_batch.req_pool_indices.to(torch.long)
+
+        conv_state, prev_hs_state, mamba_indices = self._get_pool_state(forward_batch)
 
         q_raw, _ = self.linear_q(hidden_states)
         k_raw, _ = self.linear_k(hidden_states)
@@ -531,20 +474,15 @@ class CCA(nn.Module):
         query_pre = q_raw.view(T, self.num_q_heads, self.head_dim)
         key_base = k_raw.view(T, self.num_k_heads, self.head_dim)
 
-        left_pad = self.conv_state_pool.index_select(0, req_idx).to(dtype)
+        left_pad = conv_state.index_select(0, mamba_indices).to(dtype)
         cur = qk.unsqueeze(-1)  # [T, C, 1]
         padded = torch.cat([left_pad, cur], dim=-1)  # [T, C, total_padding+1]
-        # Use the standard conv module so cuDNN/MIOpen accumulate in fp32 and
-        # match the prefill path numerically on bf16 inputs. A hand-rolled
-        # einsum here accumulates in the input dtype and silently drifts.
         out = self._conv_qk_run(padded)  # [T, C, 1]
         qk_out = out.squeeze(-1)  # [T, C]
 
-        # New conv state = last total_padding columns of `padded` (the first
-        # column is shifted out for the next step).
         new_state = padded[..., -self.total_padding :]
-        self.conv_state_pool.index_copy_(
-            0, req_idx, new_state.to(self.conv_state_pool.dtype)
+        conv_state.index_copy_(
+            0, mamba_indices, new_state.to(conv_state.dtype)
         )
 
         query_conv = qk_out[:, : self.latent_q_dim].view(
@@ -559,9 +497,7 @@ class CCA(nn.Module):
         )
         query, key = self._normalize_qk(query, key)
 
-        # val_proj2 consumes the previous hidden_state (one per request); after
-        # we use it, refresh the pool with the current token's hidden_state.
-        prev_hs = self.prev_hs_pool.index_select(0, req_idx).to(dtype)
+        prev_hs = prev_hs_state.index_select(0, mamba_indices).squeeze(-1).to(dtype)
         v1, _ = self.val_proj1(hidden_states)
         v2, _ = self.val_proj2(prev_hs)
         value = (
@@ -569,8 +505,8 @@ class CCA(nn.Module):
             .view(T, self.num_k_heads, self.head_dim)
             .to(torch.float32)
         )
-        self.prev_hs_pool.index_copy_(
-            0, req_idx, hidden_states.to(self.prev_hs_pool.dtype)
+        prev_hs_state.index_copy_(
+            0, mamba_indices, hidden_states.unsqueeze(-1).to(prev_hs_state.dtype)
         )
         return query, key, value
 
@@ -587,8 +523,6 @@ class CCA(nn.Module):
             k : [T, num_k_heads, head_dim]
             v : [T, num_k_heads, head_dim]
         """
-        # Zero-token batches (e.g. idle DP rank, dummy forward) bypass the
-        # pool entirely.
         if hidden_states.shape[0] == 0:
             zero = hidden_states.new_zeros((0,))
             return (
@@ -596,8 +530,6 @@ class CCA(nn.Module):
                 zero.view(0, self.num_k_heads, self.head_dim).to(torch.float32),
                 zero.view(0, self.num_k_heads, self.head_dim).to(torch.float32),
             )
-
-        self._ensure_pool(forward_batch)
 
         if forward_batch.forward_mode.is_decode_or_idle():
             return self._forward_decode(hidden_states, forward_batch)

@@ -48,16 +48,7 @@ class TestZayaServer(CustomTestCase):
         cls.model = _MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
 
-        # Two SGLang features are disabled until follow-up work lands:
-        # - Prefix caching is unsafe because the CCA conv state is keyed by
-        #   request and is not yet propagated through radix-cache nodes, so a
-        #   prefix hit would silently reuse a stale conv state.
-        # - CUDA / HIP graph capture cannot tolerate the device-to-host sync
-        #   used to lazily resize the per-request state pool on the first
-        #   forward pass.
         other_args = [
-            "--disable-radix-cache",
-            "--disable-cuda-graph",
             "--mem-fraction-static",
             "0.5",
             "--max-running-requests",

@@ -62,6 +62,31 @@ class TestZayaConfig(CustomTestCase):
         with self.assertRaises(AssertionError):
             ZayaConfig(num_query_groups=4, num_key_value_heads=2)
 
+    def test_hybrid_model_properties(self):
+        """Verify properties required for HybridReqToTokenPool integration."""
+        cfg = ZayaConfig()
+        # Default 80 layers: even layers are attention, odd are MoE
+        self.assertEqual(cfg.full_attention_layer_ids, list(range(0, 80, 2)))
+        self.assertEqual(cfg.linear_layer_ids, cfg.full_attention_layer_ids)
+        self.assertEqual(cfg.mamba_chunk_size, 1)
+
+        params = cfg.mamba2_cache_params
+        self.assertIsNotNone(params)
+        # conv[0] = conv_state: (in_out_ch, total_padding)
+        in_out_ch = (cfg.num_attention_heads + cfg.num_key_value_heads) * cfg.head_dim
+        total_padding = (cfg.cca_time0 - 1) + (cfg.cca_time1 - 1)
+        self.assertEqual(params.shape.conv[0], (in_out_ch, total_padding))
+        # conv[1] = prev_hs: (hidden_size, 1)
+        self.assertEqual(params.shape.conv[1], (cfg.hidden_size, 1))
+        self.assertEqual(params.layers, cfg.linear_layer_ids)
+
+    def test_hybrid_model_properties_with_zaya_layers(self):
+        """When zaya_layers is provided, layer IDs derive from the list."""
+        cfg = ZayaConfig(zaya_layers=["a", 16, "a", 16])
+        self.assertEqual(cfg.num_hidden_layers, 4)
+        self.assertEqual(cfg.full_attention_layer_ids, [0, 2])
+        self.assertEqual(cfg.linear_layer_ids, [0, 2])
+
     def test_auto_config_registration_is_idempotent(self):
         # Calling the helper twice must not raise even though importing the
         # module already registered the model type.
