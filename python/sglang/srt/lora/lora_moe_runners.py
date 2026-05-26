@@ -205,14 +205,7 @@ def _compute_token_lora_mapping(
     hidden_states: torch.Tensor,
     lora_info: LoRAInfo,
 ) -> torch.Tensor:
-    """Map each token to its LoRA adapter index (-1 for no LoRA).
-
-    Under DP-attention, `hidden_states` is the gathered batch (local + foreign
-    tokens) but `seg_indptr` / `req_to_lora` cover only local requests, so
-    `searchsorted` on foreign positions would index one past the end. Pad
-    `req_to_lora` with a -1 sentinel; foreign outputs are discarded by the
-    DP-attention scatter anyway.
-    """
+    """Map each token to its LoRA adapter index (-1 for no LoRA)."""
     token_positions = torch.arange(
         hidden_states.shape[0], device=hidden_states.device, dtype=torch.int32
     )
@@ -221,11 +214,7 @@ def _compute_token_lora_mapping(
         token_positions,
         right=True,
     )
-    req_to_lora = lora_info.req_to_lora.to(torch.int32)
-    req_to_lora_padded = torch.cat(
-        [req_to_lora, req_to_lora.new_full((1,), -1)], dim=0
-    )
-    return req_to_lora_padded[req_indices]
+    return lora_info.req_to_lora.to(torch.int32)[req_indices]
 
 
 def _compute_lora_alignment(
@@ -360,6 +349,7 @@ def _add_lora_gate_up_delta(
     r = lora_info.max_lora_rank
     gate_up_a = lora_info.gate_up_lora_a_weights
     gate_up_b = lora_info.gate_up_lora_b_weights
+
     if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
         gate_up_a = gate_up_a.expand(-1, lora_info.num_experts, -1, -1)
 
@@ -369,8 +359,6 @@ def _add_lora_gate_up_delta(
     if is_gated:
         inter_size = gate_up_b.shape[2] // 2
         lora_a_stacked = [gate_up_a[:, :, :r, :], gate_up_a[:, :, r : 2 * r, :]]
-        # B halves are also the tuple form the virtual-experts kernel wants
-        # (one shrink at K=2*r, two expands at K=r each).
         lora_b_stacked = [
             gate_up_b[:, :, :inter_size, :],
             gate_up_b[:, :, inter_size:, :],
@@ -384,7 +372,7 @@ def _add_lora_gate_up_delta(
             output=intermediate_cache,
             hidden_states=hidden_states,
             lora_a=gate_up_a,
-            lora_b=tuple(lora_b_stacked) if is_gated else gate_up_b,
+            lora_b=gate_up_b,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
             token_lora_mapping=token_lora_mapping,
@@ -459,8 +447,6 @@ def _add_lora_down_delta(
     down_lora_a = lora_info.down_lora_a_weights
     down_lora_b = lora_info.down_lora_b_weights
     if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
-        # fused_moe_lora requires B's expert_dim to match A's; expand the
-        # shared B view.
         down_lora_b = down_lora_b.expand(-1, lora_info.num_experts, -1, -1)
 
     if lora_info.fully_sharded and lora_info.tp_size > 1:
