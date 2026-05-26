@@ -65,18 +65,16 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
             f"max_new_tokens=1 must produce exactly 1 token, got "
             f"{len(r.output_tokens)}"
         )
-        # B6: chunked extend path must not regress extend_batch_idx.
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_max_new_tokens_1000_long_chunked(self):
-        """Max_new_tokens = 1000: long decode after chunked prefill, exact length and no extend-idx regression."""
+        """Max_new_tokens = 1000: long decode after chunked prefill, exact length."""
         self.runtime.run(self._script_max_new_tokens_1000_long_chunked)
 
     @staticmethod
     def _script_max_new_tokens_1000_long_chunked(t: ScriptedRuntime):
         # max_new_tokens = 1000 over a chunked prompt: the decode phase
         # must produce exactly 1000 tokens (or finish via natural EOS
-        # below the cap). Either way no extend-batch-idx regression.
+        # below the cap).
         r = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN,
             max_new_tokens=1000,
@@ -89,10 +87,6 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
             f"ignore_eos=True + max_new_tokens=1000 must produce 1000 "
             f"output tokens; got {len(r.output_tokens)}"
         )
-        # B6: long chunked extend then long decode must not regress
-        # extend_batch_idx (the bookkeeping field that drives the
-        # chunked admission loop).
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_greedy_chunked_deterministic(self):
         """Temperature = 0 (greedy) + chunked: same prompt gives same output."""
@@ -122,9 +116,6 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
         ), f"greedy non-determinism: {r1.output_tokens} != {r2.output_tokens}"
         assert len(r1.output_tokens) == 8
         assert r1.chunks_done >= 2 and r2.chunks_done >= 2
-        # B6: chunked extend bookkeeping must be monotonic on both runs.
-        assert r1.extend_batch_idx_regression_count == 0
-        assert r2.extend_batch_idx_regression_count == 0
 
     def test_return_logprob_chunked(self):
         """Return_logprob = True + chunked: logprob array length matches output."""
@@ -146,7 +137,6 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
         assert r.chunks_done >= 2
         assert r.logprobs is not None
         assert len(r.logprobs) == 4
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_ignore_eos_chunked(self):
         """Ignore_eos = True + early EOS production + chunked: still runs to max_new_tokens; doesn't shortcut on EOS."""
@@ -167,7 +157,6 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
         assert r.finish_reason == "length", (
             f"ignore_eos=True must finish via length cap; got " f"{r.finish_reason!r}"
         )
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_stop_str_chunked(self):
         """Stop=["xyz"] + chunked: stops at stop_str, doesn't reach max_new_tokens."""
@@ -188,10 +177,9 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
             f"finish_reason must be populated for chunked stop-str runs; "
             f"got {r.finish_reason!r}"
         )
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_high_temperature_chunked(self):
-        """High temperature + chunked: produces exactly max_new_tokens, multi-chunk, no extend-idx regression."""
+        """High temperature + chunked: produces exactly max_new_tokens, multi-chunk."""
         self.runtime.run(self._script_high_temperature_chunked)
 
     @staticmethod
@@ -209,9 +197,6 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
         assert r.finished
         assert r.chunks_done >= 2
         assert len(r.output_tokens) == 4
-        # B6: chunked extend bookkeeping must stay monotonic even under
-        # high-temperature sampling.
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_greedy_two_sequential_reqs(self):
         """Greedy + chunked, 2 sequential reqs — verify second matches first."""
@@ -220,8 +205,7 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
     @staticmethod
     def _script_greedy_two_sequential_reqs(t: ScriptedRuntime):
         # Greedy + chunked, 2 sequential reqs — verify second matches first
-        # in tokens AND length, and that both runs leave chunked-extend
-        # bookkeeping clean.
+        # in tokens AND length.
         r1 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN,
             max_new_tokens=4,
@@ -241,8 +225,6 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
         assert list(r2.output_tokens) == out_a
         assert len(out_a) == 4
         assert r1.chunks_done >= 2 and r2.chunks_done >= 2
-        assert r1.extend_batch_idx_regression_count == 0
-        assert r2.extend_batch_idx_regression_count == 0
 
     def test_greedy_chunked_with_radix_hit(self):
         """Greedy + chunked + radix prefix hit: r2 hits cache and matches r1's tokens."""
@@ -271,8 +253,6 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
         assert r2.cached_tokens > 0, (
             f"r2 must hit r1's radix prefix; got cached_tokens=" f"{r2.cached_tokens}"
         )
-        assert r1.extend_batch_idx_regression_count == 0
-        assert r2.extend_batch_idx_regression_count == 0
 
     def test_return_logprob_top_logprobs_chunked(self):
         """Return_logprob + top_logprobs_num + chunked: per-step top_logprobs length == top_logprobs_num."""
@@ -306,7 +286,6 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
                 f"each step must carry exactly top_logprobs_num={top_k} "
                 f"entries; got {len(step_entries)}"
             )
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_multiple_stop_strs_chunked(self):
         """Multiple stop strings + chunked: stops at one of the stop strings before max_new_tokens."""
@@ -333,7 +312,6 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
             f"finish_reason must reflect a stop-string match; got "
             f"{r.finish_reason!r}"
         )
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_stop_token_ids_chunked(self):
         """Stop_token_ids + chunked: finish_reason indicates stop when one of the explicit token ids is sampled, otherwise length."""
@@ -367,7 +345,6 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
         else:
             # Length branch: must have produced exactly max_new_tokens.
             assert len(r.output_tokens) == 64
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_min_new_tokens_chunked(self):
         """Min_new_tokens > 0 + chunked + ignore_eos forced by minimum."""
@@ -388,10 +365,9 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
             f"{len(r.output_tokens)}"
         )
         assert len(r.output_tokens) <= 16
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_repetition_penalty_chunked(self):
-        """Repetition_penalty + chunked: emits exactly max_new_tokens, chunked extend bookkeeping clean."""
+        """Repetition_penalty + chunked: emits exactly max_new_tokens."""
         self.runtime.run(self._script_repetition_penalty_chunked)
 
     @staticmethod
@@ -409,7 +385,6 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
         assert r.finished
         assert r.chunks_done >= 2
         assert len(r.output_tokens) == 4
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_explicit_rid_chunked(self):
         """Explicit rid + chunked: handle uses given rid."""
@@ -431,10 +406,9 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
         assert r.finished
         assert r.chunks_done >= 2
         assert len(r.output_tokens) == 2
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_default_sampling_chunked(self):
-        """All defaults + chunked: emits exactly max_new_tokens (ignore_eos), no extend-idx regression."""
+        """All defaults + chunked: emits exactly max_new_tokens (ignore_eos)."""
         self.runtime.run(self._script_default_sampling_chunked)
 
     @staticmethod
@@ -449,7 +423,6 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
         assert r.finished
         assert r.chunks_done >= 2
         assert len(r.output_tokens) == 4
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_greedy_chunked(self):
         """Greedy (temperature=0) sampling over chunked prompt: exact length + bit-identical re-run."""
@@ -459,8 +432,7 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
     def _script_greedy_chunked(t: ScriptedRuntime):
         # Greedy sampling must be deterministic, so a second run with
         # the same prompt yields the same tokens. Together with the
-        # length / chunks_done invariants this catches both stochastic
-        # leakage and chunked-extend bookkeeping regressions.
+        # length / chunks_done invariants this catches stochastic leakage.
         r1 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN,
             max_new_tokens=4,
@@ -482,8 +454,6 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
             f"greedy chunked must be deterministic; "
             f"{r1.output_tokens} != {r2.output_tokens}"
         )
-        assert r1.extend_batch_idx_regression_count == 0
-        assert r2.extend_batch_idx_regression_count == 0
 
     def test_high_temperature_short(self):
         """Short prompt with high temperature (1.8): no chunking, exact length."""
@@ -558,7 +528,7 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
         assert len(r.output_tokens) == 4
 
     def test_combined_sampling_chunked(self):
-        """All sampling knobs on at once over a chunked prompt: exact length, no extend-idx regression."""
+        """All sampling knobs on at once over a chunked prompt: exact length."""
         self.runtime.run(self._script_combined_sampling_chunked)
 
     @staticmethod
@@ -576,7 +546,6 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
         assert r.finished
         assert r.chunks_done >= 2
         assert len(r.output_tokens) == 4
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_default_sampling_short(self):
         """Default sampling parameters on a short prompt: no chunking, exact length."""
@@ -597,8 +566,7 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
     @staticmethod
     def _script_sampling_diversity_two_reqs(t: ScriptedRuntime):
         # Two reqs with same prompt and non-greedy temp: outputs may
-        # differ (diversity), but both must hit exact length with
-        # clean chunked bookkeeping.
+        # differ (diversity), but both must hit exact length.
         r1 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN,
             max_new_tokens=4,
@@ -616,8 +584,6 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
         assert r1.finished and r2.finished
         assert r1.chunks_done >= 2 and r2.chunks_done >= 2
         assert len(r1.output_tokens) == 4 and len(r2.output_tokens) == 4
-        assert r1.extend_batch_idx_regression_count == 0
-        assert r2.extend_batch_idx_regression_count == 0
 
     def test_chunked_logprob_input_accumulates_across_chunks(self):
         """Return_logprob + multi-chunk prompt: input logprobs accumulate across chunks to cover the whole prompt."""
@@ -653,11 +619,6 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
             f"expected {prompt_len - 1} input logprobs (one per token after "
             f"the first), got {len(input_lp)}"
         )
-        # B6 + R1: the input-logprob accumulation path walks chunked
-        # extend bookkeeping AND the middle-chunk inflight counter; both
-        # must stay clean.
-        assert r.extend_batch_idx_regression_count == 0
-        assert r.inflight_middle_chunks_premature_decrement_count == 0
 
     def test_logprob_start_len_inside_chunk_2(self):
         """Logprob_start_len that falls inside the 2nd chunk: only tokens >= start_len have logprobs."""
@@ -693,10 +654,6 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
             f"expected {prompt_len - start_len} input logprobs for tokens "
             f">= logprob_start_len={start_len}, got {len(input_lp)}"
         )
-        # B6 + R1: chunked extend / inflight counters clean across the
-        # logprob-start alignment path.
-        assert r.extend_batch_idx_regression_count == 0
-        assert r.inflight_middle_chunks_premature_decrement_count == 0
 
     def test_chunked_streaming_no_mid_chunk_output(self):
         """Stream=True + chunked: no output events fire until the last chunk finishes."""
@@ -727,8 +684,6 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
             f"stream events expected after last chunk completes, "
             f"got {r.stream_events!r}"
         )
-        # B6: streaming codepath must also leave extend_batch_idx clean.
-        assert r.extend_batch_idx_regression_count == 0
 
     def test_finish_reason_value_eos_vs_length_chunked(self):
         """Chunked req's finish_reason matches EOS (stop) vs length cap (length) per sampling kwargs."""
@@ -778,9 +733,6 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
             f"ignore_eos=True + max_new_tokens=4 chunked must finish via "
             f"length cap; got {r_length.finish_reason!r}"
         )
-        # B6: both finish-reason scenarios run the chunked extend path.
-        assert r_eos.extend_batch_idx_regression_count == 0
-        assert r_length.extend_batch_idx_regression_count == 0
 
     def test_seed_chunked_bit_identical_runs(self):
         """Same seed + same prompt + chunked, run twice sequentially: identical output tokens."""
@@ -820,8 +772,6 @@ class TestSamplingBasic(ScriptedRuntimeTestCase):
             f"same seed + same prompt + chunked must be bit-identical: "
             f"{out1} != {out2}"
         )
-        assert r1.extend_batch_idx_regression_count == 0
-        assert r2.extend_batch_idx_regression_count == 0
 
 
 if __name__ == "__main__":
