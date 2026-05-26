@@ -1,8 +1,9 @@
 """DSV4 attention correctness — SWA-only (compress_ratio=0) slice.
 
-This is the first DSV4 unit test. It is intentionally narrow: one eager EXTEND
-case on the SWA path. C4 (4x) and C128 (128x) compressor + indexer paths and
-speculative modes are explicit follow-ups.
+Covers the eager EXTEND and DECODE paths of `DeepseekV4AttnBackend.forward`
+through flash_mla with the production packed FP8-nope/BF16-rope SWA cache.
+C4 (4x) and C128 (128x) compressor + indexer paths and speculative modes are
+explicit follow-ups.
 """
 
 import importlib.util

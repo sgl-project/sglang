@@ -53,7 +53,7 @@ DSV4_RTOL = 5e-2
 
 @dataclass(frozen=True)
 class DSV4AttentionCase:
-    """One EXTEND case scoped to compress_ratio=0 (SWA-only)."""
+    """One EXTEND or DECODE case scoped to compress_ratio=0 (SWA-only)."""
 
     name: str
     backend: str
@@ -61,7 +61,9 @@ class DSV4AttentionCase:
     num_heads: int
     page_size: int
     prefix_lens: tuple[int, ...]
-    extend_lens: tuple[int, ...]
+    # For EXTEND: per-request extend lengths. For DECODE: ignored (each
+    # request decodes one token, so input_lens is implicitly (1,) * batch_size).
+    extend_lens: tuple[int, ...] = ()
     # compress_ratio is fixed at 0 for this slice; C4/C128 are follow-ups.
     compress_ratio: int = 0
     # Per-head attention-sink value. The DSV4 backend forwards this to flash_mla
@@ -77,6 +79,8 @@ class DSV4AttentionCase:
 
     @property
     def input_lens(self) -> tuple[int, ...]:
+        if self.forward_mode.is_decode():
+            return (1,) * self.batch_size
         return self.extend_lens
 
     @property
@@ -121,6 +125,26 @@ def make_dsv4_cases(backend: str) -> tuple[DSV4AttentionCase, ...]:
             extend_lens=(16,),
             attn_sink_value=0.0,
             **common,
+        ),
+        # DECODE: one new token per request, attending to the existing prefix
+        # plus its own position. The flash_mla `compress_ratio=0` path is
+        # forward_mode-agnostic; the only differences are positions / seq_lens
+        # / extend_* metadata, which the fixture handles via `input_lens`.
+        DSV4AttentionCase(
+            name="dsv4_swa_decode_within_window",
+            backend=backend,
+            forward_mode=ForwardMode.DECODE,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(64,),
+        ),
+        DSV4AttentionCase(
+            name="dsv4_swa_decode_multi_request_within_window",
+            backend=backend,
+            forward_mode=ForwardMode.DECODE,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(32, 96),
         ),
     )
 
@@ -582,17 +606,22 @@ def _make_forward_batch(
         seq_lens_sum=sum(seq_lens),
         positions=torch.tensor(positions, dtype=torch.int64, device=device),
     )
-    extend_seq_lens = torch.tensor(input_lens, dtype=torch.int32, device=device)
-    batch.extend_prefix_lens = torch.tensor(
-        case.prefix_lens, dtype=torch.int32, device=device
-    )
-    batch.extend_prefix_lens_cpu = list(case.prefix_lens)
-    batch.extend_seq_lens = extend_seq_lens
-    batch.extend_seq_lens_cpu = list(input_lens)
-    batch.extend_start_loc = torch.zeros_like(extend_seq_lens)
-    if case.batch_size > 1:
-        batch.extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
-    batch.extend_num_tokens = case.num_input_tokens
+    # extend_* fields are only populated for extend-shaped modes. DECODE leaves
+    # them at their defaults; the flash_mla path reads metadata directly from
+    # DSV4AttnMetadata so the extend fields are unused for the compress_ratio=0
+    # DECODE path.
+    if case.forward_mode.is_extend(include_draft_extend_v2=True):
+        extend_seq_lens = torch.tensor(input_lens, dtype=torch.int32, device=device)
+        batch.extend_prefix_lens = torch.tensor(
+            case.prefix_lens, dtype=torch.int32, device=device
+        )
+        batch.extend_prefix_lens_cpu = list(case.prefix_lens)
+        batch.extend_seq_lens = extend_seq_lens
+        batch.extend_seq_lens_cpu = list(input_lens)
+        batch.extend_start_loc = torch.zeros_like(extend_seq_lens)
+        if case.batch_size > 1:
+            batch.extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+        batch.extend_num_tokens = case.num_input_tokens
     return batch
 
 
