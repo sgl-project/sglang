@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -56,6 +57,15 @@ STAGE_2_DISTILLED_SIGMA_VALUES: tuple[float, ...] = (0.909375, 0.725, 0.421875, 
 
 # Default Gemma-3 token budget for the refiner prompt encoder.
 _REFINER_TEXT_MAX_LENGTH = 1024
+
+
+def _skip_refiner_enabled() -> bool:
+    return os.getenv("SGLANG_SANA_WM_SKIP_REFINER", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def default_sana_wm_refiner_dtype(server_args: ServerArgs) -> torch.dtype:
@@ -145,6 +155,9 @@ class SanaWMLTX2RefinerStage(PipelineStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
+        if _skip_refiner_enabled():
+            return []
+
         # Declare every component this stage forwards through so
         # ComponentResidencyManager moves them onto GPU before the stage runs.
         # Without this, `dit_cpu_offload=True` keeps the refiner sub-modules on
@@ -368,6 +381,15 @@ class SanaWMLTX2RefinerStage(PipelineStage):
                 "SANA-WM refiner expects 5D latents shaped (B, C, T, H, W), "
                 f"got {tuple(batch.latents.shape)}."
             )
+
+        if _skip_refiner_enabled():
+            if batch.extra is None:
+                batch.extra = {}
+            batch.extra["sana_wm_refiner_applied"] = False
+            self.log_info(
+                "SANA-WM LTX-2 refiner skipped by SGLANG_SANA_WM_SKIP_REFINER."
+            )
+            return batch
 
         batch_size = int(batch.latents.shape[0])
         prompts = self._prompts_for_batch(batch, batch_size)

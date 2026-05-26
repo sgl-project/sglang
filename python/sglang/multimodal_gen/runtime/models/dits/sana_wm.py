@@ -85,17 +85,23 @@ class _RMSNorm(nn.Module):
     Parameter name: ``weight`` (shape ``(dim,)``).
     """
 
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+    def __init__(
+        self,
+        dim: int,
+        scale_factor: float = 1.0,
+        eps: float = 1e-6,
+    ) -> None:
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim) * scale_factor)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # fp32 reduction for stability
+        # Upstream Sana RMSNorm does both normalization and weight multiply in
+        # fp32 before casting back to the input dtype.
         x_in = x
         x32 = x.float()
         rms = x32.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
-        return (x32 * rms).to(x_in.dtype) * self.weight
+        return (x32 * rms * self.weight.to(dtype=x32.dtype)).type_as(x_in)
 
 
 class _ShortConvolution(nn.Module):
@@ -335,10 +341,10 @@ def _unproject_grid(
     Returns (B, F, H, W, 3).
     """
     B, F_dim = x_fov.shape
-    # Pixel centers in latent grid coords (matches upstream's
-    # ``ucm_unproject_grid_fov`` with xi=0 pinhole assumption).
-    u = (torch.arange(W, device=device, dtype=dtype) + 0.5)
-    v = (torch.arange(H, device=device, dtype=dtype) + 0.5)
+    # Upstream `create_grid` uses integer pixel coordinates [0, W-1] /
+    # [0, H-1] rather than half-pixel centers.
+    u = torch.arange(W, device=device, dtype=dtype)
+    v = torch.arange(H, device=device, dtype=dtype)
     u = u.view(1, 1, 1, W).expand(B, F_dim, H, W)
     v = v.view(1, 1, H, 1).expand(B, F_dim, H, W)
     cx_e = cx.view(B, F_dim, 1, 1)
@@ -388,24 +394,15 @@ def process_camera_conditions_ucpe(
 
     d_cam = _unproject_grid(x_fov, y_fov, H, W, cx_lat, cy_lat, device, dtype)  # (B,F,H,W,3)
 
-    # Build per-token "ray<-world" 4x4. Rotation = orthonormal frame with
-    # third column = world-space ray direction. Translation = camera origin.
+    # Build per-token "ray<-world" 4x4 following upstream `world_to_ray_mats`.
     R_c2w = C_to_W[..., :3, :3]                 # (B, F, 3, 3)
     t_c2w = C_to_W[..., :3, 3]                  # (B, F, 3)
-    # d_world: (B, F, H, W, 3)
     d_world = torch.einsum("bfij,bfhwj->bfhwi", R_c2w, d_cam)
-    d_world = F.normalize(d_world, dim=-1)
-
-    # Build orthonormal local frame [e1 | e2 | d_world]
-    up = torch.zeros_like(d_world)
-    up[..., 1] = 1.0
-    is_par = (d_world * up).sum(-1).abs() > 0.99
-    up_alt = torch.zeros_like(d_world)
-    up_alt[..., 0] = 1.0
-    up = torch.where(is_par.unsqueeze(-1), up_alt, up)
-    e1 = F.normalize(torch.cross(up, d_world, dim=-1), dim=-1)
-    e2 = F.normalize(torch.cross(d_world, e1, dim=-1), dim=-1)
-    R_ray_to_world = torch.stack([e1, e2, d_world], dim=-1)  # (B,F,H,W,3,3)
+    z_ray = F.normalize(d_world, dim=-1, eps=1e-6)
+    cam_y = R_c2w[..., :, 1].view(B, F_dim, 1, 1, 3).expand(B, F_dim, H, W, 3)
+    x_ray = F.normalize(torch.cross(cam_y, z_ray, dim=-1), dim=-1, eps=1e-6)
+    y_ray = F.normalize(torch.cross(z_ray, x_ray, dim=-1), dim=-1, eps=1e-6)
+    R_ray_to_world = torch.stack([x_ray, y_ray, z_ray], dim=-1)
 
     # P = ray<-world = inverse of [R_ray_to_world | t_c2w]
     R_w_to_ray = R_ray_to_world.transpose(-1, -2)
@@ -417,6 +414,10 @@ def process_camera_conditions_ucpe(
     raymats[..., :3, :3] = R_w_to_ray
     raymats[..., :3, 3] = t_w_to_ray
     raymats[..., 3, 3] = 1.0
+    invalid = torch.isnan(d_world).any(dim=-1)
+    if bool(invalid.any()):
+        eye = torch.eye(4, device=device, dtype=dtype)
+        raymats[invalid] = eye
     return raymats
 
 
@@ -888,6 +889,125 @@ def _gdn_scan_bidirectional(
     return (num_fwd + num_bwd) / (den_fwd + den_bwd + eps)
 
 
+def _single_path_delta_scan_forward(
+    q_rot: torch.Tensor,
+    k_rot: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
+) -> torch.Tensor:
+    """Numerator-only camera delta-rule recurrence from SANA-WM upstream.
+
+    This is intentionally separate from ``_gdn_scan_forward``. The
+    SANA-WM camera branch in ``BidirectionalGDNUCPESinglePathLiteLA`` does not
+    use the GDN denominator path; using the main-branch GDN recurrence here
+    changes the latent distribution substantially once camera conditioning is
+    enabled.
+    """
+    B, H, D, N = q_rot.shape
+    T = beta.shape[2]
+    S = N // T
+
+    def fold(x: torch.Tensor) -> torch.Tensor:
+        return x.view(B, H, D, T, S).permute(0, 1, 3, 2, 4)
+
+    q_rot = fold(q_rot)
+    k_rot = fold(k_rot)
+    v = fold(v)
+
+    if beta.ndim == 4:
+        beta_e = beta.unsqueeze(3)
+    else:
+        beta_e = beta.view(B, H, T, 1, 1)
+    decay_e = decay.view(B, H, T, 1, 1)
+
+    state_kv = torch.zeros(B, H, D, D, device=q_rot.device, dtype=q_rot.dtype)
+    out_list = []
+    for t in range(T):
+        qrt = q_rot[:, :, t]
+        krt = k_rot[:, :, t]
+        vt = v[:, :, t]
+        bt = beta_e[:, :, t]
+        gt = decay_e[:, :, t]
+
+        state_kv = state_kv * gt
+        v_pred = torch.matmul(state_kv, krt)
+        delta_v = (vt - v_pred) * bt
+        state_kv = state_kv + torch.matmul(delta_v, krt.transpose(-1, -2))
+        out_list.append(torch.matmul(state_kv, qrt))
+
+    out = torch.stack(out_list, dim=2)
+    return out.permute(0, 1, 3, 2, 4).reshape(B, H, D, N)
+
+
+def _single_path_delta_scan_bidirectional(
+    q_rot: torch.Tensor,
+    k_rot: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
+    HW: Tuple[int, int, int],
+) -> torch.Tensor:
+    """Bidirectional single-path camera scan.
+
+    Mirrors upstream ``BidirectionalGDNUCPESinglePathLiteLA``: inclusive
+    forward scan plus exclusive backward scan with ``flip_and_shift`` on K/V,
+    beta, and decay.
+    """
+    out_fwd = _single_path_delta_scan_forward(q_rot, k_rot, v, beta, decay)
+
+    B, H, D, N = q_rot.shape
+    T, H_sp, W_sp = HW
+    S = H_sp * W_sp
+
+    def to_time(x: torch.Tensor) -> torch.Tensor:
+        return x.view(B, H, D, T, S).permute(0, 1, 3, 2, 4)
+
+    def from_time(x: torch.Tensor) -> torch.Tensor:
+        return x.permute(0, 1, 3, 2, 4).reshape(B, H, D, N)
+
+    q_rot_t = to_time(q_rot)
+    k_rot_t = to_time(k_rot)
+    v_t = to_time(v)
+
+    q_rot_bwd = torch.flip(q_rot_t, dims=[2])
+    k_rot_bwd = _flip_and_shift(k_rot_t, dim=2, shift_val=0.0)
+    v_bwd = _flip_and_shift(v_t, dim=2, shift_val=0.0)
+    beta_bwd = _flip_and_shift(beta, dim=2, shift_val=0.0)
+    decay_bwd = _flip_and_shift(decay, dim=2, shift_val=1.0)
+
+    out_bwd_flipped = _single_path_delta_scan_forward(
+        from_time(q_rot_bwd),
+        from_time(k_rot_bwd),
+        from_time(v_bwd),
+        beta_bwd,
+        decay_bwd,
+    )
+    out_bwd = torch.flip(
+        out_bwd_flipped.view(B, H, D, T, S),
+        dims=[3],
+    ).reshape(B, H, D, N)
+    return out_fwd + out_bwd
+
+
+def _downscale_to_reference_rms(
+    ref: torch.Tensor,
+    transformed: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Clamp UCPE-transformed channel RMS to the pre-transform envelope.
+
+    SANA-WM's released checkpoint uses the PostUCPERenorm camera variant.
+    The UCPE matrices include translations that can inflate transformed Q/K/V
+    magnitudes; upstream downscales per (batch, head, token) before the camera
+    recurrence so inference stays on the training distribution.
+    """
+    ref_rms = ref.square().mean(dim=2, keepdim=True).add(eps).sqrt()
+    transformed_rms = transformed.square().mean(dim=2, keepdim=True).add(eps).sqrt()
+    scale = (ref_rms / transformed_rms.clamp_min(eps)).clamp(max=1.0)
+    return transformed * scale
+
+
 # ---------------------------------------------------------------------------
 # SANA-WM attention block: main GDN (or softmax) + UCPE camera branch
 # (single SinglePath module; cam branch shares ``proj`` / ``output_gate``
@@ -911,7 +1031,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         qk_norm: bool = True,
         conv_kernel_size: int = 4,
         k_conv_only: bool = True,
-        eps: float = 1e-6,
+        eps: float = 1e-8,
         softmax_main: bool = False,
     ) -> None:
         super().__init__()
@@ -1160,24 +1280,99 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         v_bhnd = v.permute(0, 2, 1, 3)
 
         q_proj = apply_q(q_bhnd)
-        k_proj = apply_kv(k_bhnd)
-        v_proj = v_bhnd  # value is untransformed
+        kv_proj = apply_kv(torch.cat([k_bhnd, v_bhnd], dim=1))
+        k_proj, v_proj = torch.chunk(kv_proj, chunks=2, dim=1)
 
+        q_pre_dn = q_bhnd.permute(0, 1, 3, 2)
         q_dn = q_proj.permute(0, 1, 3, 2)
+        k_pre_dn = k_bhnd.permute(0, 1, 3, 2)
         k_dn = k_proj.permute(0, 1, 3, 2)
+        v_pre_dn = v_bhnd.permute(0, 1, 3, 2)
         v_dn = v_proj.permute(0, 1, 3, 2)
 
+        q_dn = _downscale_to_reference_rms(q_pre_dn, q_dn)
+        k_dn = _downscale_to_reference_rms(k_pre_dn, k_dn)
+        v_dn = _downscale_to_reference_rms(v_pre_dn, v_dn)
+
+        pre_ucpe_k_norm = torch.linalg.vector_norm(
+            k_pre_dn.float(), dim=2, keepdim=True
+        ).clamp_min(1e-6)
+        post_ucpe_k_norm = torch.linalg.vector_norm(
+            k_dn.float(), dim=2, keepdim=True
+        ).clamp_min(1e-6)
+        inflation_sq = (post_ucpe_k_norm / pre_ucpe_k_norm) ** 2
+        frame_inflation_sq = inflation_sq.view(B, self.heads, T, S).mean(dim=-1)
+        if beta.ndim == 3:
+            beta = beta / frame_inflation_sq.clamp_min(1.0)
+        elif beta.ndim == 4:
+            beta = beta / frame_inflation_sq.unsqueeze(-1).clamp_min(1.0)
+
         dtype = q_dn.dtype
-        out = _gdn_scan_bidirectional(
-            q_dn.float(), k_dn.float(), v_dn.float(),
-            q_dn.float(), k_dn.float(),  # UCPE already applied (no extra RoPE on numerator)
-            beta.float(), decay.float(),
-            HW=HW, eps=self.eps,
+        out = _single_path_delta_scan_bidirectional(
+            q_dn.float(),
+            k_dn.float(),
+            v_dn.float(),
+            beta.float(),
+            decay.float(),
+            HW=HW,
         ).to(dtype)
         # apply inverse UCPE projection on output
         out_bhnd = out.permute(0, 1, 3, 2)
         out_bhnd = apply_o(out_bhnd)
         return out_bhnd.permute(0, 2, 1, 3).reshape(B, N, C)
+
+    def _cam_branch_softmax(
+        self,
+        x: torch.Tensor,
+        HW: Tuple[int, int, int],
+        apply_q: Callable,
+        apply_kv: Callable,
+        apply_o: Callable,
+    ) -> torch.Tensor:
+        B, N, C = x.shape
+
+        q = self.q_proj_cam(x).reshape(B, N, self.heads, self.dim)
+        k = self.k_proj_cam(x).reshape(B, N, self.heads, self.dim)
+        v = self.v_proj_cam(x).reshape(B, N, self.heads, self.dim)
+
+        if self.conv_k_cam is not None:
+            k = self._temporal_short_conv(
+                k.reshape(B, N, C), self.conv_k_cam, HW, bidirectional=True
+            )
+            k = k.reshape(B, N, self.heads, self.dim)
+
+        q = self.q_norm_cam(q.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
+        k = self.k_norm_cam(k.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
+
+        q_bhnd = q.permute(0, 2, 1, 3)
+        k_bhnd = k.permute(0, 2, 1, 3)
+        v_bhnd = v.permute(0, 2, 1, 3)
+
+        q_proj = apply_q(q_bhnd)
+        kv_proj = apply_kv(torch.cat([k_bhnd, v_bhnd], dim=1))
+        k_proj, v_proj = torch.chunk(kv_proj, chunks=2, dim=1)
+
+        q_pre_dn = q_bhnd.permute(0, 1, 3, 2)
+        k_pre_dn = k_bhnd.permute(0, 1, 3, 2)
+        v_pre_dn = v_bhnd.permute(0, 1, 3, 2)
+        q_dn = _downscale_to_reference_rms(
+            q_pre_dn, q_proj.permute(0, 1, 3, 2)
+        )
+        k_dn = _downscale_to_reference_rms(
+            k_pre_dn, k_proj.permute(0, 1, 3, 2)
+        )
+        v_dn = _downscale_to_reference_rms(
+            v_pre_dn, v_proj.permute(0, 1, 3, 2)
+        )
+
+        q_in = q_dn.permute(0, 3, 1, 2).contiguous()
+        k_in = k_dn.permute(0, 3, 1, 2).contiguous()
+        v_in = v_dn.permute(0, 3, 1, 2).contiguous()
+        out = self.softmax_attn(q_in, k_in, v_in)  # (B, N, H, D)
+
+        out_bhnd = out.transpose(1, 2).contiguous()
+        out_bhnd = apply_o(out_bhnd)
+        return out_bhnd.transpose(1, 2).reshape(B, N, C)
 
     # ------------------------------------------------------------------ #
 
@@ -1195,7 +1390,14 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
 
         if prope_fns is not None:
             apply_q, apply_kv, apply_o = prope_fns
-            cam_raw = self._cam_branch(x, HW, apply_q, apply_kv, apply_o, beta, decay)
+            if self.softmax_main:
+                cam_raw = self._cam_branch_softmax(
+                    x, HW, apply_q, apply_kv, apply_o
+                )
+            else:
+                cam_raw = self._cam_branch(
+                    x, HW, apply_q, apply_kv, apply_o, beta, decay
+                )
             combined = main_raw + self.out_proj_cam(cam_raw)
         else:
             combined = main_raw
@@ -1434,6 +1636,9 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.out_channels = arch.out_channels
         self.num_channels_latents = arch.num_channels_latents
         self.vae_temporal_stride = arch.vae_temporal_stride
+        self.timestep_norm_scale_factor = getattr(
+            arch, "timestep_norm_scale_factor", 1.0
+        )
 
         # --- Embedders (upstream names: x_embedder, t_embedder, t_block,
         # y_embedder, attention_y_norm, raymap_embedder, plucker_embedder) ---
@@ -1452,7 +1657,11 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             hidden_size=self.inner_dim,
             token_num=arch.model_max_length,
         )
-        self.attention_y_norm = _RMSNorm(self.inner_dim, eps=1e-6)
+        self.attention_y_norm = _RMSNorm(
+            self.inner_dim,
+            scale_factor=getattr(arch, "y_norm_scale_factor", 1.0),
+            eps=getattr(arch, "y_norm_eps", 1e-5),
+        )
 
         # 3-channel raymap embedder -- kept for state_dict compatibility but
         # only invoked when ``use_chunk_plucker_post_attn`` is False.
@@ -1567,12 +1776,19 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         # so the clean first-frame condition can stay at timestep 0 while the
         # remaining latent frames denoise. Keep the scalar path for generic
         # scheduler compatibility.
-        if timestep.dim() == 1:
-            t_emb = self.t_embedder(timestep)          # (B, D)
+        if self.timestep_norm_scale_factor != 1.0:
+            timestep_for_embed = (
+                timestep.float() / self.timestep_norm_scale_factor
+            ).to(torch.float32)
+        else:
+            timestep_for_embed = timestep.long().to(torch.float32)
+
+        if timestep_for_embed.dim() == 1:
+            t_emb = self.t_embedder(timestep_for_embed)  # (B, D)
             t6 = self.t_block(t_emb)                   # (B, 6D)
         else:
-            timestep_shape = tuple(timestep.shape)
-            t_flat = self.t_embedder(timestep.flatten())
+            timestep_shape = tuple(timestep_for_embed.shape)
+            t_flat = self.t_embedder(timestep_for_embed.flatten())
             t6_flat = self.t_block(t_flat)
             t_emb = t_flat.unflatten(0, timestep_shape)
             t6 = t6_flat.unflatten(0, timestep_shape)

@@ -8,6 +8,7 @@ import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
+from sglang.multimodal_gen.configs.models.dits.sana_wm import SanaWMConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.registry import _get_config_info, get_pipeline_config_classes
 from sglang.multimodal_gen.runtime.pipelines.sana_wm_pipeline import (
@@ -26,7 +27,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     _align_sana_wm_cfg_text_conditions,
     configure_sana_wm_ltx2_vae_for_long_video,
 )
-from sglang.multimodal_gen.runtime.models.dits.sana_wm import compute_chunk_plucker
+from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
+    _RMSNorm,
+    _downscale_to_reference_rms,
+    compute_chunk_plucker,
+)
 from sglang.multimodal_gen.runtime.utils.model_overlay import (
     resolve_model_overlay_target,
 )
@@ -80,6 +85,13 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         self.assertEqual(self.config.text_encoder_extra_args[0]["padding"], "max_length")
         self.assertTrue(self.config.text_encoder_extra_args[0]["return_attention_mask"])
         self.assertTrue(self.config.chi_prompt)
+
+    def test_dit_arch_text_norm_defaults_match_upstream(self) -> None:
+        arch = SanaWMConfig().arch_config
+        self.assertTrue(arch.y_norm)
+        self.assertEqual(arch.y_norm_scale_factor, 0.01)
+        self.assertEqual(arch.y_norm_eps, 1e-5)
+        self.assertEqual(arch.timestep_norm_scale_factor, 1.0)
 
     def test_prepare_neg_cond_kwargs_keeps_camera_for_cfg(self) -> None:
         camera_conditions = torch.zeros(1, 7, 20)
@@ -404,6 +416,20 @@ class TestSanaWMBeforeDenoisingStage(unittest.TestCase):
         )
 
         self.assertEqual(chunk_plucker.shape, (1, 48, 3, 12, 20))
+
+    def test_post_ucpe_rms_stabilization_clamps_inflated_tensors(self) -> None:
+        ref = torch.ones(1, 2, 4, 3)
+        transformed = ref * 8.0
+
+        stabilized = _downscale_to_reference_rms(ref, transformed)
+
+        ref_rms = ref.square().mean(dim=2, keepdim=True).sqrt()
+        stabilized_rms = stabilized.square().mean(dim=2, keepdim=True).sqrt()
+        self.assertTrue(torch.all(stabilized_rms <= ref_rms + 1e-5))
+
+    def test_rmsnorm_scale_factor_initializes_weight(self) -> None:
+        norm = _RMSNorm(4, scale_factor=0.01)
+        self.assertTrue(torch.allclose(norm.weight, torch.full((4,), 0.01)))
 
 
 class TestSanaWMTextEncodingStage(unittest.TestCase):

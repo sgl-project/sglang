@@ -40,10 +40,14 @@ class SanaWMArchConfig(DiTArchConfig):
     # Gemma-2-2b-it hidden size (input to y_embedder.y_proj).
     caption_channels: int = 2304
     model_max_length: int = 300
+    y_norm: bool = True
+    y_norm_scale_factor: float = 0.01
+    y_norm_eps: float = 1e-5
 
     mlp_ratio: float = 3.0
     qk_norm: bool = True
     norm_eps: float = 1e-6
+    timestep_norm_scale_factor: float = 1.0
 
     # --- Hybrid GDN/Softmax attention ---
     # softmax_every_n=4 => blocks where (i+1)%4 == 0 use softmax main branch,

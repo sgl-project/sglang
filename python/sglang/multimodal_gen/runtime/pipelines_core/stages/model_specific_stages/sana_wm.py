@@ -902,6 +902,26 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         return torch.cat([tensor, last], dim=1)
 
     @staticmethod
+    def _maybe_load_npy_tensor(value: Any, field_name: str) -> Any:
+        if isinstance(value, (str, os.PathLike)):
+            import numpy as np
+
+            path = os.fspath(value)
+            if not path.endswith(".npy"):
+                raise ValueError(
+                    f"{field_name} path must point to a .npy file, got {path!r}"
+                )
+            return torch.from_numpy(np.load(path))
+        return value
+
+    @staticmethod
+    def _first_mapping_value(mapping: dict[str, Any], *keys: str) -> Any:
+        for key in keys:
+            if key in mapping and mapping[key] is not None:
+                return mapping[key]
+        return None
+
+    @staticmethod
     def _coerce_camera_to_world(
         value: Any,
         *,
@@ -910,6 +930,9 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
+        value = SanaWMBeforeDenoisingStage._maybe_load_npy_tensor(
+            value, "camera_to_world"
+        )
         camera = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
         if camera.dim() == 3:
             camera = camera.unsqueeze(0)
@@ -948,6 +971,9 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
+        value = SanaWMBeforeDenoisingStage._maybe_load_npy_tensor(
+            value, "intrinsics"
+        )
         intrinsics = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
         intrinsics = intrinsics.to(device=device, dtype=dtype)
 
@@ -1106,6 +1132,9 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
 
         camera_conditions = extra.get("camera_conditions", None)
         chunk_plucker = extra.get("chunk_plucker", None)
+        diffusers_kwargs = extra.get("diffusers_kwargs", {})
+        if not isinstance(diffusers_kwargs, dict):
+            diffusers_kwargs = {}
         if camera_conditions is not None:
             camera_conditions = (
                 camera_conditions
@@ -1148,6 +1177,19 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         else:
             camera_to_world = extra.get("camera_to_world", None)
             intrinsics = extra.get("intrinsics", None)
+            if camera_to_world is None:
+                camera_to_world = self._first_mapping_value(
+                    diffusers_kwargs,
+                    "camera_to_world",
+                    "camera_to_world_path",
+                    "camera_path",
+                )
+            if intrinsics is None:
+                intrinsics = self._first_mapping_value(
+                    diffusers_kwargs,
+                    "intrinsics",
+                    "intrinsics_path",
+                )
             if camera_to_world is not None:
                 source = (
                     "request"
