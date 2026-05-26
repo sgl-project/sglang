@@ -61,6 +61,10 @@ class XPUAttentionBackend(AttentionBackend):
         self.device = model_runner.device
         self.decode_cuda_graph_metadata = {}
         self.target_verify_metadata = {}
+        # Pool refs — captured at construction so they survive deletion of the
+        # corresponding ForwardBatch fields.
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
@@ -122,7 +126,7 @@ class XPUAttentionBackend(AttentionBackend):
                         ),
                         (1, 0),
                     )
-                    metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                    metadata.page_table = self.req_to_token_pool.req_to_token[
                         forward_batch.req_pool_indices, : metadata.max_seq_len_k
                     ]
                 else:
@@ -142,7 +146,7 @@ class XPUAttentionBackend(AttentionBackend):
                         ),
                         (1, 0),
                     )
-                    metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                    metadata.page_table = self.req_to_token_pool.req_to_token[
                         forward_batch.req_pool_indices, : metadata.max_seq_len_k
                     ]
 
@@ -186,7 +190,7 @@ class XPUAttentionBackend(AttentionBackend):
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
                 )
-                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                metadata.page_table = self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
             # TODO: we need to test this part for llama 4 eagle case
@@ -214,7 +218,7 @@ class XPUAttentionBackend(AttentionBackend):
                     ),
                     (1, 0),
                 )
-                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                metadata.page_table = self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
 
@@ -236,7 +240,7 @@ class XPUAttentionBackend(AttentionBackend):
                     ),
                     (1, 0),
                 )
-                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                metadata.page_table = self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
 
@@ -297,7 +301,7 @@ class XPUAttentionBackend(AttentionBackend):
                 )
                 _, sort_order = torch.sort(keys, dim=1)
                 non_masked_page_table = (
-                    forward_batch.req_to_token_pool.req_to_token[
+                    self.req_to_token_pool.req_to_token[
                         forward_batch.req_pool_indices, :
                     ]
                     .gather(1, cols)
@@ -324,7 +328,7 @@ class XPUAttentionBackend(AttentionBackend):
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
             )
-            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+            metadata.page_table = self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
 
@@ -357,12 +361,12 @@ class XPUAttentionBackend(AttentionBackend):
                 (1, 0),
             )
             metadata.encoder_max_seq_len_k = metadata.encoder_lens_int32.max().item()
-            metadata.encoder_page_table = forward_batch.req_to_token_pool.req_to_token[
+            metadata.encoder_page_table = self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.encoder_max_seq_len_k
             ]
 
             # Currently only support forward_batch.encoder_lens.numel() == 1
-            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+            metadata.page_table = self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices,
                 metadata.encoder_max_seq_len_k : (
                     metadata.encoder_max_seq_len_k + metadata.max_seq_len_k
@@ -418,11 +422,11 @@ class XPUAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                    self.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
                 else:
-                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    self.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
                         cache_loc,
                         k,
@@ -501,9 +505,7 @@ class XPUAttentionBackend(AttentionBackend):
         # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
-            key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id
-            )
+            key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             key_cache = key_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
             )
@@ -614,9 +616,9 @@ class XPUAttentionBackend(AttentionBackend):
                 return output
             else:
                 # Do absorbed multi-latent attention
-                kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
-                    layer.layer_id
-                ).to(q.dtype)
+                kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
+                    q.dtype
+                )
                 k_rope = kv_cache[:, :, layer.v_head_dim :]
                 c_kv = kv_cache[:, :, : layer.v_head_dim]
                 k_rope_cache = k_rope.view(
@@ -710,14 +712,14 @@ class XPUAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                    self.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
                 else:
                     k_rope_val = (
                         k_rope if k_rope is not None else k[:, :, layer.v_head_dim :]
                     )
-                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    self.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
                         cache_loc,
                         k,
@@ -768,9 +770,7 @@ class XPUAttentionBackend(AttentionBackend):
         if not self.use_mla:
             # Do multi-head attention
 
-            key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id
-            )
+            key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             key_cache = key_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
             )
@@ -876,9 +876,7 @@ class XPUAttentionBackend(AttentionBackend):
                     o = result
         else:
             # Do absorbed multi-latent attention
-            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-                q.dtype
-            )
+            kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
             assert not use_cascade_attn, "Cascade attention is not supported with MLA"
 
             if q_rope is not None:
@@ -926,6 +924,17 @@ class XPUAttentionBackend(AttentionBackend):
         if cu_seqlens_q is None or cache_seqlens_int32 is None or page_table is None:
             metadata.local_attn_metadata = None
             return
+
+        # make_local_attention_virtual_batches expects a page-granularity block table:
+        # column p is the logical page number, and the value stored at that column is the
+        # physical page index. The raw req_to_token table is token-granularity (column i =
+        # the KV slot for token i), so when page_size > 1 we must stride and divide first
+        # so that block_starts = k_seqstarts_absolute // page_size correctly indexes the table.
+        if self.page_size > 1:
+            strided_indices = torch.arange(
+                0, page_table.shape[1], self.page_size, device=page_table.device
+            )
+            page_table = page_table[:, strided_indices] // self.page_size
 
         cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
         seq_lens_np = cache_seqlens_int32.cpu().numpy()
