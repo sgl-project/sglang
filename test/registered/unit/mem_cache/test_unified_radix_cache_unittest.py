@@ -244,7 +244,7 @@ class UnifiedRadixCacheSuite:
         req = Req(
             rid=self._rid,
             origin_input_text="",
-            origin_input_ids=[],
+            origin_input_ids=array("q"),
             sampling_params=sp,
         )
         self._rid += 1
