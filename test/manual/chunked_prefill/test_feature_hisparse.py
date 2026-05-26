@@ -9,7 +9,6 @@ from sglang.test.chunked_prefill_test_utils import (
 class TestChunkedFeatureHiSparse(ChunkedRefactorTestBase):
     model = "deepseek-ai/DeepSeek-V4-Flash"
     num_shots = LONG_PROMPT_NUM_SHOTS
-    # DSV4-Flash generations can be longer; allow more headroom.
     max_tokens = 4000
     feature_args = [
         "--trust-remote-code",

@@ -38,9 +38,6 @@ class MixedPrefixGSM8KEval(GSM8KEval):
         data_path: Optional[str] = None,
         seed: int = 42,
     ):
-        # Bypass GSM8KEval.__init__: it builds a single ``_few_shot_prompt``
-        # we don't use, and its training-prefix slicing conflicts with our
-        # multi-block pool reservation.
         self._num_threads = num_threads
         self._num_shots = num_shots
         self._num_clusters = num_clusters
@@ -130,8 +127,6 @@ class MixedPrefixGSM8KEval(GSM8KEval):
             )
             convo = prompt_messages + [dict(content=response_text, role="assistant")]
 
-            # One per-mode key per sample so aggregate_results averages each
-            # ``score_<mode>`` only over samples in that mode.
             return SingleEvalResult(
                 html=html,
                 score=score,

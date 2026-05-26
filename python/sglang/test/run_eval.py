@@ -179,11 +179,6 @@ def run_eval(args):
             data_path=getattr(args, "gsm8k_data_path", None),
         )
     elif args.eval_name == "gsm8k_mixed":
-        # Mixed-prefix GSM8K: deterministic 4-way mix of standard / cluster /
-        # random-sample / zero-shot prefixes per question. See
-        # sglang.test.simple_eval_gsm8k_mixed for motivation. Intended for
-        # chunked-prefill testing where uniform shared prefix collapses radix
-        # cache and hides chunked-path coverage.
         from sglang.test.simple_eval_gsm8k_mixed import MixedPrefixGSM8KEval
 
         eval_obj = MixedPrefixGSM8KEval(

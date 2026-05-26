@@ -23,7 +23,6 @@ DEFAULT_NUM_THREADS: int = 128
 DEFAULT_MAX_TOKENS: int = 512
 DEFAULT_SEED: int = 42
 
-# Flip this once the KV canary PR lands.
 KV_CANARY_ARGS: List[str] = []
 
 
