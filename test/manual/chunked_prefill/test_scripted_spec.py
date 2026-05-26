@@ -124,9 +124,9 @@ class TestScriptedSpec(CustomTestCase):
         yield
         assert r.kv_pages == 0
         assert r.lock_refs == 0
-        assert r.spec_draft_state_cleared, (
-            "spec draft state must be cleared after abort during chunked prefill"
-        )
+        assert (
+            r.spec_draft_state_cleared
+        ), "spec draft state must be cleared after abort during chunked prefill"
 
     @unittest.skip("requires real EAGLE + disagg topology — wire up when fixture lands")
     def test_spec_eagle_disagg_chunked(self):
