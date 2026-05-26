@@ -211,16 +211,6 @@ class AscendAttnMaskBuilder:
         )
         return attn_mask
 
-    def get_swa_mask(self, seq_lens: torch.Tensor, s2: int, left_context=512):
-        if seq_lens.dim() == 1:
-            seq_lens = seq_lens.unsqueeze(1)
-        b = seq_lens.size(0)
-        device = seq_lens.device
-        indices = torch.arange(s2, device=device).unsqueeze(0).expand(b, -1)
-        start_indices = torch.clamp(seq_lens - left_context, min=0)
-        mask = (indices < start_indices) | (indices >= seq_lens)
-        return mask.unsqueeze(1).to(self.device, non_blocking=True)
-
 
 def _cp_allgather_and_save_kv_npu(
     forward_batch, layer, k, v, cp_size, token_to_kv_pool
