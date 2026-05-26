@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import ClassVar, List, Optional
 
@@ -31,31 +32,21 @@ DEFAULT_SEED: int = 42
 KV_CANARY_ARGS: List[str] = ["--enable-kv-canary"]
 
 
+@dataclass
 class ChunkedSimpleTester:
-    def __init__(
-        self,
-        feature_args: List[str] = (),
-        chunked_prefill_size: int = DEFAULT_CHUNKED_PREFILL_SIZE,
-        num_shots: int = DEFAULT_NUM_SHOTS,
-        num_examples: int = DEFAULT_NUM_EXAMPLES,
-        num_threads: int = DEFAULT_NUM_THREADS,
-        max_tokens: int = DEFAULT_MAX_TOKENS,
-        score_threshold: float = SCORE_THRESHOLD,
-        seed: int = DEFAULT_SEED,
-    ):
-        self.feature_args = list(feature_args)
-        self.chunked_prefill_size = chunked_prefill_size
-        self.num_shots = num_shots
-        self.num_examples = num_examples
-        self.num_threads = num_threads
-        self.max_tokens = max_tokens
-        self.score_threshold = score_threshold
-        self.seed = seed
+    feature_args: List[str]
+    chunked_prefill_size: int
+    num_shots: int
+    num_examples: int
+    num_threads: int
+    max_tokens: int
+    score_threshold: float
+    seed: int
 
     def build_prefill_side_args(self) -> List[str]:
         return (
             ["--chunked-prefill-size", str(self.chunked_prefill_size)]
-            + self.feature_args
+            + list(self.feature_args)
             + list(KV_CANARY_ARGS)
         )
 
