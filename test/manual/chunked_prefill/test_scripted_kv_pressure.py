@@ -20,8 +20,8 @@ NEW API NEEDED:
 
 import unittest
 
-from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
+from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
@@ -30,16 +30,14 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until_all_finished,
     run_until_finished,
 )
-from sglang.test.test_utils import CustomTestCase
 
 
-class TestScriptedKVPressure(CustomTestCase):
+class TestKVPressureBasic(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
+
     def test_kv_almost_empty_then_abort(self):
         """KV almost empty (1 page left), chunked req in flight, abort it."""
-        execute_scripted_runtime(
-            self._script_kv_almost_empty_then_abort,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_kv_almost_empty_then_abort)
 
     @staticmethod
     def _script_kv_almost_empty_then_abort(t: ScriptedRuntime):
@@ -61,10 +59,7 @@ class TestScriptedKVPressure(CustomTestCase):
 
     def test_kv_full_chunked_new_req_retracts(self):
         """KV pool full → new chunked req submitted → must retract or OOM-path cleanly, not deadlock."""
-        execute_scripted_runtime(
-            self._script_kv_full_chunked_new_req_retracts,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_kv_full_chunked_new_req_retracts)
 
     @staticmethod
     def _script_kv_full_chunked_new_req_retracts(t: ScriptedRuntime):
@@ -83,10 +78,7 @@ class TestScriptedKVPressure(CustomTestCase):
 
     def test_kv_full_chunked_plus_decode_retract(self):
         """KV full, chunked + decode coexist, priority retract → victim is whichever scheduler picks; both must release cleanly afterward."""
-        execute_scripted_runtime(
-            self._script_kv_full_chunked_plus_decode_retract,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_kv_full_chunked_plus_decode_retract)
 
     @staticmethod
     def _script_kv_full_chunked_plus_decode_retract(t: ScriptedRuntime):
@@ -104,10 +96,7 @@ class TestScriptedKVPressure(CustomTestCase):
 
     def test_row_pool_tight_admits_after_release(self):
         """Row pool tight; N+1 req enters waiting; after some finish, N+1 is admitted."""
-        execute_scripted_runtime(
-            self._script_row_pool_tight_admits_after_release,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_row_pool_tight_admits_after_release)
 
     @staticmethod
     def _script_row_pool_tight_admits_after_release(t: ScriptedRuntime):
@@ -121,10 +110,7 @@ class TestScriptedKVPressure(CustomTestCase):
 
     def test_lock_refs_tight_concurrent_prefix(self):
         """Many concurrent reqs share same prefix; lock_refs tight."""
-        execute_scripted_runtime(
-            self._script_lock_refs_tight_concurrent_prefix,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_lock_refs_tight_concurrent_prefix)
 
     @staticmethod
     def _script_lock_refs_tight_concurrent_prefix(t: ScriptedRuntime):
@@ -138,34 +124,9 @@ class TestScriptedKVPressure(CustomTestCase):
         reqs = [t.start_req(prompt_len=128, max_new_tokens=2) for _ in range(8)]
         yield from run_until_all_finished(reqs)
 
-    def test_priority_preempt_multiple_chunked(self):
-        """Priority preemption + multiple chunked reqs preempt each other."""
-        execute_scripted_runtime(
-            self._script_priority_preempt_multiple_chunked,
-            **base_engine_kwargs(
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-                enable_priority_scheduling=True,
-            ),
-        )
-
-    @staticmethod
-    def _script_priority_preempt_multiple_chunked(t: ScriptedRuntime):
-        # priority preemption + multiple chunked reqs preempt each other.
-        # Each victim's resources must release on every preemption event.
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r1, lambda h: h.is_chunking)
-
-        r2 = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="high"
-        )
-        yield from run_until_all_finished([r1, r2])
-
     def test_kv_at_one_page_chunked_completes(self):
         """KV with only 1 free page; a tiny chunked req still completes."""
-        execute_scripted_runtime(
-            self._script_kv_at_one_page_chunked_completes,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_kv_at_one_page_chunked_completes)
 
     @staticmethod
     def _script_kv_at_one_page_chunked_completes(t: ScriptedRuntime):
@@ -177,10 +138,7 @@ class TestScriptedKVPressure(CustomTestCase):
 
     def test_kv_recovery_after_full(self):
         """KV near-exhausted -> recovery path: every existing req finishes, then a fresh req can be admitted using all the pages."""
-        execute_scripted_runtime(
-            self._script_kv_recovery_after_full,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_kv_recovery_after_full)
 
     @staticmethod
     def _script_kv_recovery_after_full(t: ScriptedRuntime):
@@ -198,10 +156,7 @@ class TestScriptedKVPressure(CustomTestCase):
 
     def test_kv_pressure_with_retract_resume(self):
         """Chunked req mid-prefill, then KV pressure forces retract."""
-        execute_scripted_runtime(
-            self._script_kv_pressure_with_retract_resume,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_kv_pressure_with_retract_resume)
 
     @staticmethod
     def _script_kv_pressure_with_retract_resume(t: ScriptedRuntime):
@@ -215,10 +170,7 @@ class TestScriptedKVPressure(CustomTestCase):
 
     def test_cumulative_alloc_does_not_grow_unbounded(self):
         """50 reqs; cumulative bytes alloc'd never NaN / negative."""
-        execute_scripted_runtime(
-            self._script_cumulative_alloc_does_not_grow_unbounded,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_cumulative_alloc_does_not_grow_unbounded)
 
     @staticmethod
     def _script_cumulative_alloc_does_not_grow_unbounded(t: ScriptedRuntime):
@@ -231,10 +183,7 @@ class TestScriptedKVPressure(CustomTestCase):
 
     def test_engine_stats_pool_invariant(self):
         """Track engine stats before / after a run — pool counts return to baseline."""
-        execute_scripted_runtime(
-            self._script_engine_stats_pool_invariant,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_engine_stats_pool_invariant)
 
     @staticmethod
     def _script_engine_stats_pool_invariant(t: ScriptedRuntime):
@@ -248,10 +197,7 @@ class TestScriptedKVPressure(CustomTestCase):
 
     def test_kv_pressure_with_radix_evict(self):
         """KV pressure triggers radix eviction; subsequent submission re-chunks."""
-        execute_scripted_runtime(
-            self._script_kv_pressure_with_radix_evict,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_kv_pressure_with_radix_evict)
 
     @staticmethod
     def _script_kv_pressure_with_radix_evict(t: ScriptedRuntime):
@@ -266,38 +212,9 @@ class TestScriptedKVPressure(CustomTestCase):
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r2, lambda h: h.finished, max_steps=2000)
 
-    def test_strict_mem_check_handles_chunked_tail(self):
-        """Strict mem check + page_size>1 + waiting chunked: no false-positive leak assert."""
-        execute_scripted_runtime(
-            self._script_strict_mem_check_handles_chunked_tail,
-            **base_engine_kwargs(
-                chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-                page_size=16,
-            ),
-        )
-
-    # strict mem check + page_size>1 must count the
-    # chunked-resume tail when a chunked req sits in waiting_queue;
-    # pre-fix the runtime mem accounting tripped a false-positive leak
-    # assert during busy.
-    @staticmethod
-    def _script_strict_mem_check_handles_chunked_tail(t: ScriptedRuntime):
-        # Mid-chunk retract pushes a chunked-resume req onto the
-        # waiting_queue; with page_size>1 the tail page must still be
-        # counted by the strict mem check.
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN + 17, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        t.force_retract(r)
-        yield from run_until_finished(r, max_steps=2000)
-        assert r.finished
-        assert r.kv_pages == 0
-
     def test_chunked_retract_resume_kv_recovers_exactly(self):
         """Chunked retract → resume → finish: kv_pool_free returns to baseline."""
-        execute_scripted_runtime(
-            self._script_chunked_retract_resume_kv_recovers_exactly,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_chunked_retract_resume_kv_recovers_exactly)
 
     # chunked retract → resume → finish — completed state must
     # release every KV page acquired during the chunked path; pool count
@@ -319,10 +236,7 @@ class TestScriptedKVPressure(CustomTestCase):
 
     def test_chunked_retract_at_chunk_first_mid_last(self):
         """Three sequential reqs with same prompt; force retract at chunks_done={0, mid, last-1}."""
-        execute_scripted_runtime(
-            self._script_chunked_retract_at_chunk_first_mid_last,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_chunked_retract_at_chunk_first_mid_last)
 
     # retract at three distinct chunked progress points —
     # chunks_done={0, mid, last-1} — each chunked-resume must rebuild
@@ -361,10 +275,7 @@ class TestScriptedKVPressure(CustomTestCase):
 
     def test_flush_cache_during_chunked_in_flight(self):
         """Chunked req in flight; flush_cache must not corrupt the in-flight prefix or other cache state."""
-        execute_scripted_runtime(
-            self._script_flush_cache_during_chunked_in_flight,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_flush_cache_during_chunked_in_flight)
 
     # flush_cache mid-chunked — the in-flight chunked req's
     # prefix must not be flushed; the req still completes cleanly.
@@ -386,10 +297,7 @@ class TestScriptedKVPressure(CustomTestCase):
 
     def test_chunked_oscillation_three_force_retracts(self):
         """Single chunked req; force_retract three times across its lifecycle; chunks_done preserved, final completes."""
-        execute_scripted_runtime(
-            self._script_chunked_oscillation_three_force_retracts,
-            **base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE),
-        )
+        self.runtime.run(self._script_chunked_oscillation_three_force_retracts)
 
     # chunked oscillation — 3 force_retracts on one req;
     # chunks_done is preserved across retract/resume rounds and the
@@ -428,6 +336,56 @@ class TestScriptedKVPressure(CustomTestCase):
         yield from run_until_finished(r, max_steps=2000)
         assert r.finished
         assert r.chunks_done >= chunks_after_second_resume
+
+
+class TestKVPressurePriority(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(
+        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        enable_priority_scheduling=True,
+    )
+
+    def test_priority_preempt_multiple_chunked(self):
+        """Priority preemption + multiple chunked reqs preempt each other."""
+        self.runtime.run(self._script_priority_preempt_multiple_chunked)
+
+    @staticmethod
+    def _script_priority_preempt_multiple_chunked(t: ScriptedRuntime):
+        # priority preemption + multiple chunked reqs preempt each other.
+        # Each victim's resources must release on every preemption event.
+        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r1, lambda h: h.is_chunking)
+
+        r2 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="high"
+        )
+        yield from run_until_all_finished([r1, r2])
+
+
+class TestKVPressurePageSize(ScriptedRuntimeTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(
+        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        page_size=16,
+    )
+
+    def test_strict_mem_check_handles_chunked_tail(self):
+        """Strict mem check + page_size>1 + waiting chunked: no false-positive leak assert."""
+        self.runtime.run(self._script_strict_mem_check_handles_chunked_tail)
+
+    # strict mem check + page_size>1 must count the
+    # chunked-resume tail when a chunked req sits in waiting_queue;
+    # pre-fix the runtime mem accounting tripped a false-positive leak
+    # assert during busy.
+    @staticmethod
+    def _script_strict_mem_check_handles_chunked_tail(t: ScriptedRuntime):
+        # Mid-chunk retract pushes a chunked-resume req onto the
+        # waiting_queue; with page_size>1 the tail page must still be
+        # counted by the strict mem check.
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN + 17, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+        t.force_retract(r)
+        yield from run_until_finished(r, max_steps=2000)
+        assert r.finished
+        assert r.kv_pages == 0
 
 
 if __name__ == "__main__":
