@@ -2062,7 +2062,9 @@ class AscendAttnBackend(AttentionBackend):
                     block_size = self.page_size
                     max_model_len = block_tables.shape[-1] * block_size
                     swa_mask = self.ascend_attn_mask_builder.get_swa_mask(
-                        self.forward_metadata.seq_lens, max_model_len, layer.sliding_window_size
+                        self.forward_metadata.seq_lens,
+                        max_model_len,
+                        layer.sliding_window_size,
                     )
                     attn_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
                         q.view(
