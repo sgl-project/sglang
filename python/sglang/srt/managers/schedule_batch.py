@@ -880,6 +880,16 @@ class Req(ReqDllmMixin):
         self.partial_page_tail_double_free_count: int = 0
         self._last_partial_tail_free_end: int = -1
 
+        # Regression instrumentation for invariant D3: after retract,
+        # disagg-prefill send-side state (start_send_idx, tmp_end_idx)
+        # must be reset before the next send_kv_chunk call. See commit
+        # 414efd4a27 "Reset disagg send-side state on chunked-resume
+        # retract" for the original bug. Tracks the retraction_count
+        # seen at the previous send_kv_chunk so a fresh retract
+        # leaking stale state can be detected.
+        self.disagg_send_state_leak_after_retract_count: int = 0
+        self._send_kv_chunk_last_retraction_count: int = 0
+
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
         # processed.
