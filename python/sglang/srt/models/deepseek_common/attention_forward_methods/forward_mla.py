@@ -13,6 +13,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
+from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
 )
@@ -380,7 +381,7 @@ class DeepseekMLAForwardMixin:
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        if dsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
             # support allgather+rerrange
             k_nope, k_pe = self.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
