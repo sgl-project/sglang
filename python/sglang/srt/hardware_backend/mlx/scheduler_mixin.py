@@ -132,7 +132,7 @@ class SchedulerMlxOverlapMixin:
                 pending.reqs,
             )
             if result.next_token_ids is not None:
-                pending.batch_copy.output_ids = result.next_token_ids
+                pending.batch_copy.input_ids = result.next_token_ids
             self.process_batch_result(pending.batch_copy, result)
 
         def _launch_fresh(batch: "ScheduleBatch") -> MlxPendingJob:
@@ -211,7 +211,7 @@ class SchedulerMlxOverlapMixin:
                 self.cur_batch = pending_curr.batch_copy
                 self.last_batch = pending_curr.batch_copy
                 if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                    self.self_check_during_busy()
+                    self.invariant_checker.self_check_during_busy()
                 continue
 
             # 4. Chain is broken. Finalise pending_next (if any), then
@@ -230,4 +230,4 @@ class SchedulerMlxOverlapMixin:
 
             self.last_batch = next_batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                self.self_check_during_busy()
+                self.invariant_checker.self_check_during_busy()
