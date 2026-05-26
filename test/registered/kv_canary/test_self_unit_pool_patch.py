@@ -137,7 +137,12 @@ class TestPoolPatchBufferInfos(PoolPatchHelper, CustomTestCase):
         contiguous_before, _, _ = pool.get_contiguous_buf_infos()
         state_before, _, _ = pool.get_state_buf_infos()
 
-        attach_canary_buffers(pool=pool, config=self.config, device=self.device)
+        attach_canary_buffers(
+            pool=pool,
+            config=self.config,
+            device=self.device,
+            kv_token_id_vs_position_offset=0,
+        )
 
         contiguous_after, _, _ = pool.get_contiguous_buf_infos()
         state_after, _, _ = pool.get_state_buf_infos()

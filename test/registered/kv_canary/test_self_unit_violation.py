@@ -61,12 +61,12 @@ class TestViolationReporter(CustomTestCase):
         )
         self.assertEqual(
             out,
-            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=chain_hash+position+real_kv_hash "
+            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=verify_chain_hash+verify_position+verify_real_kv_hash "
             "slot_idx=17 position=42 stored_token=111 expected_token=0 stored_chain_hash=0x1111111111111111 "
             "expected_aux=0x2222222222222222\n"
             "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=17, position=42)\n"
             "canary_kind:       per_forward_head_k_full\n"
-            "  fail_reasons: chain_hash position real_kv_hash\n"
+            "  fail_reasons: verify_chain_hash verify_position verify_real_kv_hash\n"
             "  stored:   token_id=111   position=42 prev_hash=0x1111111111111111\n"
             "  expected: prev_hash=0x2222222222222222\n"
             "  total_violations=1 ring_overflow=False step_when_pumped=7",
@@ -157,12 +157,12 @@ class TestViolationReporter(CustomTestCase):
         )
         self.assertEqual(
             out,
-            "kv_canary violation: launch_tag=unknown(9999) fail_reason=chain_hash slot_idx=17 position=42 "
+            "kv_canary violation: launch_tag=unknown(9999) fail_reason=verify_chain_hash slot_idx=17 position=42 "
             "stored_token=111 expected_token=0 stored_chain_hash=0x0000000000000000 "
             "expected_aux=0x0000000000000000\n"
             "KV cache canary violation detected (kernel_kind=unknown(9999), slot_idx=17, position=42)\n"
             "canary_kind:       unknown(9999)\n"
-            "  fail_reasons: chain_hash\n"
+            "  fail_reasons: verify_chain_hash\n"
             "  stored:   token_id=111   position=42 prev_hash=0x0000000000000000\n"
             "  expected: prev_hash=0x0000000000000000\n"
             "  total_violations=1 ring_overflow=False step_when_pumped=0",
@@ -224,36 +224,36 @@ class TestLogOrRaiseViolation(CustomTestCase):
         messages: list[str] = [call.args[0] for call in mock_warning.call_args_list]
         self.assertEqual(
             messages[0],
-            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=chain_hash slot_idx=11 position=101 "
+            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=verify_chain_hash slot_idx=11 position=101 "
             "stored_token=111 expected_token=0 stored_chain_hash=0x0000000000000000 "
             "expected_aux=0x0000000000000000\n"
             "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=11, position=101)\n"
             "canary_kind:       per_forward_head_k_full\n"
-            "  fail_reasons: chain_hash\n"
+            "  fail_reasons: verify_chain_hash\n"
             "  stored:   token_id=111   position=101 prev_hash=0x0000000000000000\n"
             "  expected: prev_hash=0x0000000000000000\n"
             "  total_violations=3 ring_overflow=False step_when_pumped=7",
         )
         self.assertEqual(
             messages[1],
-            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=position slot_idx=22 position=202 "
+            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=verify_position slot_idx=22 position=202 "
             "stored_token=111 expected_token=0 stored_chain_hash=0x0000000000000000 "
             "expected_aux=0x0000000000000000\n"
             "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=22, position=202)\n"
             "canary_kind:       per_forward_head_k_full\n"
-            "  fail_reasons: position\n"
+            "  fail_reasons: verify_position\n"
             "  stored:   token_id=111   position=202 prev_hash=0x0000000000000000\n"
             "  expected: prev_hash=0x0000000000000000\n"
             "  total_violations=3 ring_overflow=False step_when_pumped=7",
         )
         self.assertEqual(
             messages[2],
-            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=real_kv_hash slot_idx=33 position=303 "
+            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=verify_real_kv_hash slot_idx=33 position=303 "
             "stored_token=111 expected_token=0 stored_chain_hash=0x0000000000000000 "
             "expected_aux=0x0000000000000000\n"
             "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=33, position=303)\n"
             "canary_kind:       per_forward_head_k_full\n"
-            "  fail_reasons: real_kv_hash\n"
+            "  fail_reasons: verify_real_kv_hash\n"
             "  stored:   token_id=111   position=303 prev_hash=0x0000000000000000\n"
             "  expected: prev_hash=0x0000000000000000\n"
             "  total_violations=3 ring_overflow=False step_when_pumped=7",
@@ -287,30 +287,30 @@ class TestLogOrRaiseViolation(CustomTestCase):
 
         self.assertEqual(
             str(ctx.exception),
-            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=chain_hash slot_idx=11 position=101 "
+            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=verify_chain_hash slot_idx=11 position=101 "
             "stored_token=111 expected_token=0 stored_chain_hash=0x0000000000000000 "
             "expected_aux=0x0000000000000000\n"
             "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=11, position=101)\n"
             "canary_kind:       per_forward_head_k_full\n"
-            "  fail_reasons: chain_hash\n"
+            "  fail_reasons: verify_chain_hash\n"
             "  stored:   token_id=111   position=101 prev_hash=0x0000000000000000\n"
             "  expected: prev_hash=0x0000000000000000\n"
             "  total_violations=3 ring_overflow=False step_when_pumped=5\n"
-            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=position slot_idx=22 position=202 "
+            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=verify_position slot_idx=22 position=202 "
             "stored_token=111 expected_token=0 stored_chain_hash=0x0000000000000000 "
             "expected_aux=0x0000000000000000\n"
             "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=22, position=202)\n"
             "canary_kind:       per_forward_head_k_full\n"
-            "  fail_reasons: position\n"
+            "  fail_reasons: verify_position\n"
             "  stored:   token_id=111   position=202 prev_hash=0x0000000000000000\n"
             "  expected: prev_hash=0x0000000000000000\n"
             "  total_violations=3 ring_overflow=False step_when_pumped=5\n"
-            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=real_kv_hash slot_idx=33 position=303 "
+            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=verify_real_kv_hash slot_idx=33 position=303 "
             "stored_token=111 expected_token=0 stored_chain_hash=0x0000000000000000 "
             "expected_aux=0x0000000000000000\n"
             "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=33, position=303)\n"
             "canary_kind:       per_forward_head_k_full\n"
-            "  fail_reasons: real_kv_hash\n"
+            "  fail_reasons: verify_real_kv_hash\n"
             "  stored:   token_id=111   position=303 prev_hash=0x0000000000000000\n"
             "  expected: prev_hash=0x0000000000000000\n"
             "  total_violations=3 ring_overflow=False step_when_pumped=5",
