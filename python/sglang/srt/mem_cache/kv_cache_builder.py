@@ -246,8 +246,8 @@ def build_kv_cache(
         """Infer per-modality embedding dimensions from hf_config."""
         from sglang.srt.managers.schedule_batch import Modality
 
-        default = self.model_config.hidden_size
-        hf_cfg = self.model_config.hf_config
+        default = model_config.hidden_size
+        hf_cfg = model_config.hf_config
         thinker_cfg = getattr(hf_cfg, "thinker_config", None)
         dims = {
             Modality.IMAGE: default,
