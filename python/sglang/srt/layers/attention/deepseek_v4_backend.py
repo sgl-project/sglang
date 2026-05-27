@@ -455,8 +455,10 @@ class DeepseekV4AttnBackend(
         self.page_size = model_runner.page_size
         assert self.page_size == 256, "the system hardcodes page_size=256"
 
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
+        self.hisparse_coordinator = model_runner.hisparse_coordinator
+        self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -1141,19 +1143,30 @@ class DeepseekV4AttnBackend(
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens.to(torch.int32)
         seq_lens_cpu = forward_batch.seq_lens_cpu
-        assert forward_batch.req_to_token_pool.req_to_token is self.req_to_token
+       assert self.req_to_token_pool.req_to_token is self.req_to_token
 
         assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
         assert seq_lens_cpu is not None
         max_seq_len = int(seq_lens_cpu.max().item())
 
         if forward_batch.forward_mode.is_decode_or_idle():
+            # DSv4 bakes this step's KV write target (c4/c128) into metadata,
+            # so slice the shared multi-step out_cache_loc now rather than at
+            # forward time.
+            out_cache_loc = forward_batch.out_cache_loc
+            if self.topk > 0 and self.speculative_num_steps > 1:
+                out_cache_loc = per_step_draft_out_cache_loc(
+                    out_cache_loc,
+                    forward_batch.batch_size,
+                    self.topk,
+                    self.speculative_num_steps,
+                )[self.speculative_step_id]
             self._clear_online_c128_verify_context()
             metadata = self.init_forward_metadata_decode(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
-                out_cache_loc=forward_batch.out_cache_loc,
+                out_cache_loc=out_cache_loc,
             )
         elif forward_batch.forward_mode.is_target_verify():
             self._set_online_c128_verify_context(
@@ -1446,7 +1459,7 @@ class DeepseekV4AttnBackend(
         layer_id = layer.layer_id
         metadata = self.forward_metadata
         core_attn_metadata = metadata.core_attn_metadata
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = self.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
@@ -1682,36 +1695,10 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
                     speculative_num_steps=self.speculative_num_steps,
                 )
             )
-    def _split_out_cache_loc_by_step(
-        self, out_cache_loc: Optional[torch.Tensor]
-    ) -> Optional[torch.Tensor]:
-        if out_cache_loc is None:
-            return None
-
-        slots_per_req = self.topk * self.speculative_num_steps
-        assert out_cache_loc.numel() % slots_per_req == 0, (
-            "DeepSeekV4 EAGLE draft expects out_cache_loc to be laid out as "
-            f"[bs, topk, speculative_num_steps], got {out_cache_loc.shape=} "
-            f"{self.topk=} {self.speculative_num_steps=}"
-        )
-        num_reqs = out_cache_loc.numel() // slots_per_req
-        return (
-            out_cache_loc.reshape(num_reqs, self.topk, self.speculative_num_steps)
-            .permute(2, 0, 1)
-            .reshape(self.speculative_num_steps, -1)
-        )
     
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        original_out_cache_loc = forward_batch.out_cache_loc
-        step_out_cache_loc = self._split_out_cache_loc_by_step(original_out_cache_loc)
-
-        try:
-            for i in range(self.speculative_num_steps - 1):
-                if step_out_cache_loc is not None:
-                    forward_batch.out_cache_loc = step_out_cache_loc[i]
-                self.attn_backends[i].init_forward_metadata(forward_batch)
-        finally:
-            forward_batch.out_cache_loc = original_out_cache_loc
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_metadata(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps):
@@ -1738,9 +1725,6 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
     ):
         if self.speculative_num_steps == 1:
             return
-        step_out_cache_loc = self._split_out_cache_loc_by_step(
-            forward_batch.out_cache_loc
-        )
         self.attn_backends[0]._replay_forward_batch = forward_batch
         self.attn_backends[0].init_forward_metadata_replay_cuda_graph(
             bs=bs,
