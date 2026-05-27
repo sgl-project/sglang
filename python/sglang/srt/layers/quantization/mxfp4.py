@@ -1237,10 +1237,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_pad=self.intermediate_pad,
                 # Triggers aiter's INTERLEAVE gate_mode dispatch (required for our
                 # preshuffled gate/up-interleaved weight layout) and applies the
-                # model's swiglu clamp. `gemm1_clamp_limit` here is the same scalar
-                # that aiter exposes as `swiglu_limit`; see the rename in
-                # `models/gpt_oss.py` (`self.gemm1_clamp_limit = config.swiglu_limit`).
-                swiglu_limit=(self.moe_runner_config.gemm1_clamp_limit or 0.0),
+                # model's swiglu clamp. Models populate the same scalar under
+                # different MoeRunnerConfig fields: gpt-oss uses `gemm1_clamp_limit`
+                # (renamed in `models/gpt_oss.py` from `config.swiglu_limit`); DSv4
+                # / FP8 uses `swiglu_limit` directly. Accept either.
+                swiglu_limit=(
+                    self.moe_runner_config.gemm1_clamp_limit
+                    or self.moe_runner_config.swiglu_limit
+                    or 0.0
+                ),
             )
             return self.runner.run(
                 dispatch_output._replace(hidden_states=x_padded), quant_info
