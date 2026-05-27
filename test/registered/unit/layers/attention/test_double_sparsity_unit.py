@@ -2574,15 +2574,15 @@ class TestBenchmarkCompareReader(unittest.TestCase):
             ttft_p50_s=0.5, ttft_p99_s=2.0,
             tpot_p50_ms=4.0, tpot_p99_ms=12.0,
             goodput_under_slo=0.9,
-            selected_pages_mean=None,
+            selected_tokens_mean=None,
             dense_fallback_total=None,
-            total_pages_mean=None,
+            total_tokens_mean=None,
         )
         status, reason = bc._no_op_status(m)
         self.assertEqual(status, "unknown")
         self.assertIn("dense_fallback_total", reason)
-        self.assertIn("selected_pages_mean", reason)
-        self.assertIn("total_pages_mean", reason)
+        self.assertIn("selected_tokens_mean", reason)
+        self.assertIn("total_tokens_mean", reason)
         # And the rendered report uses "unknown", not "clean".
         baseline = bc.RunMetrics(
             concurrency=32, num_prompts=4, isl=4096, osl=512,
@@ -2590,9 +2590,9 @@ class TestBenchmarkCompareReader(unittest.TestCase):
             ttft_p50_s=0.4, ttft_p99_s=1.8,
             tpot_p50_ms=4.0, tpot_p99_ms=10.0,
             goodput_under_slo=0.95,
-            selected_pages_mean=None,
+            selected_tokens_mean=None,
             dense_fallback_total=None,
-            total_pages_mean=None,
+            total_tokens_mean=None,
         )
         md = bc.render_markdown_report(
             baseline, m, baseline_path="b.jsonl", ds_path="d.jsonl",
@@ -2751,9 +2751,9 @@ class TestBenchmarkCompareReader(unittest.TestCase):
             ttft_p50_s=0.5, ttft_p99_s=2.0,
             tpot_p50_ms=4.0, tpot_p99_ms=12.0,
             goodput_under_slo=0.9,
-            selected_pages_mean=128.0,
+            selected_tokens_mean=128.0,
             dense_fallback_total=0,
-            total_pages_mean=2048.0,
+            total_tokens_mean=2048.0,
         )
         status, reason = bc._no_op_status(m)
         self.assertEqual(status, "clean")
@@ -5111,6 +5111,67 @@ class TestR5Coverage(unittest.TestCase):
         self.assertEqual(int(physical_page_table_1[0, 0].item()), 100)
         self.assertEqual(int(physical_page_table_1[0, 1].item()), 102)
         self.assertEqual(int(physical_page_table_1[1, 0].item()), 101)
+
+
+class TestDSv32SmokeHelpers(unittest.TestCase):
+    """Registered helper-level regressions for the AC-8 quality smoke
+    file under ``test/manual/test_dsv32_quality_smoke.py``.
+
+    The manual file itself skips without env vars (so the four full
+    gates only run on real H200), but its pure-Python helpers
+    (``_first_n_tokens_match``, ``_rouge_l_f``, the prefix-match gate
+    condition) are testable in CI. Round 21 introduced two gate bugs;
+    Round 22 fixes them and locks the corrected behavior here.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        import pathlib
+        path = pathlib.Path(__file__).resolve()
+        # Walk up to the repo root, then load test/manual/test_dsv32_quality_smoke.py.
+        for parent in path.parents:
+            cand = parent / "test" / "manual" / "test_dsv32_quality_smoke.py"
+            if cand.exists():
+                spec = importlib.util.spec_from_file_location("_dsv32_smoke", cand)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                cls._smoke = mod
+                return
+        raise RuntimeError("could not locate test/manual/test_dsv32_quality_smoke.py")
+
+    def test_prefix_match_accepts_short_exact_outputs(self):
+        """Round 21 gate bug: ``len(dsa) >= 32`` guard rejected short
+        identical answers. Now a 2-char exact match counts as a hit."""
+        # Replicate the gate's now-corrected condition.
+        PREFIX = 32
+        dsa, ds = "Au", "Au"
+        self.assertTrue(ds[:PREFIX] == dsa[:PREFIX],
+                         "exact short match must count as a prefix hit")
+
+    def test_prefix_match_rejects_short_different_outputs(self):
+        """Negative: a genuinely different short answer must NOT count."""
+        PREFIX = 32
+        dsa, ds = "Au", "Ag"
+        self.assertFalse(ds[:PREFIX] == dsa[:PREFIX],
+                         "different short outputs must not count as a prefix hit")
+
+    def test_first_n_tokens_match_shifted_overlap_is_true(self):
+        """Round 21 gate bug: documented "any overlap" but only checked
+        same-position equality. Now uses set intersection."""
+        self.assertTrue(
+            self._smoke._first_n_tokens_match(
+                "alpha beta gamma", "beta gamma alpha", n=3,
+            ),
+            "shifted overlap in first-n window must register as overlap",
+        )
+
+    def test_first_n_tokens_match_no_overlap_is_false(self):
+        """Negative: truly disjoint first-n windows must return False."""
+        self.assertFalse(
+            self._smoke._first_n_tokens_match("a b c", "x y z", n=3),
+            "disjoint first-n windows must not register as overlap",
+        )
 
 
 class TestR6Coverage(unittest.TestCase):

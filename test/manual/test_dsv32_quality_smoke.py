@@ -206,13 +206,19 @@ def _rouge_l_f(reference: str, candidate: str) -> float:
 
 
 def _first_n_tokens_match(a: str, b: str, n: int = 8) -> bool:
-    """Whitespace-token first-n comparison."""
+    """Whitespace-token first-n comparison — "any overlap" semantics.
+
+    The AC-8 gate is that NO prompt has its first-8 tokens *entirely*
+    different between DS and DSA. Even a single shared token in the
+    first-n window (regardless of position) counts as overlap. The
+    earlier zipped same-position scan failed shifted overlaps like
+    ``"alpha beta gamma"`` vs ``"beta gamma alpha"``.
+    """
     a_toks = a.split()[:n]
     b_toks = b.split()[:n]
     if not a_toks or not b_toks:
         return False
-    # Any overlap at all means they're not "entirely different".
-    return any(at == bt for at, bt in zip(a_toks, b_toks))
+    return bool(set(a_toks) & set(b_toks))
 
 
 # ----- Test class ------------------------------------------------------
@@ -278,10 +284,12 @@ class TestDSv32QualitySmoke(unittest.TestCase):
         )
 
         # --- gate 1: prefix-match rate ---
+        # An identical short answer (e.g. "Au" == "Au") counts as a hit;
+        # the prior `len(dsa) >= 32` guard was too strict and would
+        # reject ~12/20 of the deliberate "Output only X" smoke prompts.
         prefix_match_hits = sum(
             1 for _, dsa, ds in paired
             if ds[: self.PREFIX_MATCH_CHARS] == dsa[: self.PREFIX_MATCH_CHARS]
-            and len(dsa) >= self.PREFIX_MATCH_CHARS
         )
         prefix_match_rate = prefix_match_hits / max(1, len(paired))
 

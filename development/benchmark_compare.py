@@ -22,7 +22,7 @@ SLO gate per AC-8: each row is annotated with `pass` / `fail` against
 ``per_request_output_tps_p50 >= 30`` and ``ttft_p99_s <= 22``.
 
 No-op detector per AC-7: a row is flagged if any of
-``selected_pages == total_pages`` or ``dense_fallback_total != 0``.
+``selected_tokens == total_tokens`` or ``dense_fallback_total != 0``.
 """
 
 from __future__ import annotations
@@ -58,9 +58,9 @@ class RunMetrics:
     tpot_p50_ms: Optional[float]
     tpot_p99_ms: Optional[float]
     goodput_under_slo: Optional[float]
-    selected_pages_mean: Optional[float]
+    selected_tokens_mean: Optional[float]
     dense_fallback_total: Optional[int]
-    total_pages_mean: Optional[float]
+    total_tokens_mean: Optional[float]
 
 
 @dataclass
@@ -208,9 +208,9 @@ def _read_bench_jsonl(path: str) -> Tuple[RunContext, RunMetrics]:
         tpot_p50_ms=_float("median_tpot_ms"),
         tpot_p99_ms=_float("p99_tpot_ms"),
         goodput_under_slo=_float("goodput_under_slo"),
-        selected_pages_mean=_float("selected_pages_mean"),
+        selected_tokens_mean=_float("selected_tokens_mean"),
         dense_fallback_total=_int("dense_fallback_total"),
-        total_pages_mean=_float("total_pages_mean"),
+        total_tokens_mean=_float("total_tokens_mean"),
     )
     return context, metrics
 
@@ -271,16 +271,16 @@ def _no_op_status(m: RunMetrics) -> Tuple[str, str]:
     missing: List[str] = []
     if m.dense_fallback_total is None:
         missing.append("dense_fallback_total")
-    if m.selected_pages_mean is None:
-        missing.append("selected_pages_mean")
-    if m.total_pages_mean is None:
-        missing.append("total_pages_mean")
+    if m.selected_tokens_mean is None:
+        missing.append("selected_tokens_mean")
+    if m.total_tokens_mean is None:
+        missing.append("total_tokens_mean")
     if missing:
         return ("unknown", "no-op inputs missing: " + ", ".join(missing))
     if m.dense_fallback_total != 0:
         return ("triggered", f"dense_fallback={m.dense_fallback_total}")
-    if m.selected_pages_mean == m.total_pages_mean:
-        return ("triggered", "selected_pages == total_pages")
+    if m.selected_tokens_mean == m.total_tokens_mean:
+        return ("triggered", "selected_tokens == total_tokens")
     return ("clean", "")
 
 
@@ -312,8 +312,8 @@ def render_markdown_report(
         ("TPOT P50 (ms)", baseline_metrics.tpot_p50_ms, ds_metrics.tpot_p50_ms),
         ("TPOT P99 (ms)", baseline_metrics.tpot_p99_ms, ds_metrics.tpot_p99_ms),
         ("Goodput-under-SLO", baseline_metrics.goodput_under_slo, ds_metrics.goodput_under_slo),
-        ("Selected pages (mean)", baseline_metrics.selected_pages_mean, ds_metrics.selected_pages_mean),
-        ("Total pages (mean)", baseline_metrics.total_pages_mean, ds_metrics.total_pages_mean),
+        ("Selected tokens (mean)", baseline_metrics.selected_tokens_mean, ds_metrics.selected_tokens_mean),
+        ("Total tokens (mean)", baseline_metrics.total_tokens_mean, ds_metrics.total_tokens_mean),
         ("dense_fallback_total", baseline_metrics.dense_fallback_total, ds_metrics.dense_fallback_total),
     ]
     for label, a, b in pairs:
