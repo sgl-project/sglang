@@ -1231,6 +1231,10 @@ module.exports = {
             ['fm-budget',         'fm_budget_tracker',   '25M'],
             ['fm-projects',       'fm_project_manager',  '30M'],
             ['fm-landing',        'fm_landing_pages',    '25M'],
+            ['fm-cdn-proxy',      'fm_cdn_proxy',        '40M'],
+            ['fm-recs',           'fm_recommendation_engine', '30M'],
+            ['fm-audit',          'fm_audit_log',        '25M'],
+            ['fm-l10n',           'fm_localization',     '25M'],
         ].map(([name, script, mem]) => ({
             name,
             script:            `agents/${script}.py`,

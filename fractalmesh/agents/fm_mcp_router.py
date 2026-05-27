@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     147,
+        "agents":     151,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -261,6 +261,10 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "budget_tracker":    7898,
             "project_manager":   7899,
             "landing_pages":     7900,
+            "cdn_proxy":         7901,
+            "recommendation":    7902,
+            "audit_log":         7903,
+            "localization":      7904,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -608,6 +612,10 @@ _INTENTS = {
     "budget_record":           lambda a, k: {"action": "budget_record_queued", "category": k.get("category", ""), "amount": k.get("amount", 0), "type": k.get("type", "expense")},
     "task_create":             lambda a, k: {"action": "task_create_queued", "project_id": k.get("project_id", ""), "title": k.get("title", "")},
     "lead_capture":            lambda a, k: {"action": "lead_capture_queued", "email": k.get("email", ""), "page_id": k.get("page_id", "")},
+    "cdn_purge":               lambda a, k: {"action": "cdn_purge_queued", "urls": k.get("urls", [])},
+    "rec_event":               lambda a, k: {"action": "rec_event_queued", "user_id": k.get("user_id", ""), "item_id": k.get("item_id", ""), "event_type": k.get("event_type", "view")},
+    "audit_log":               lambda a, k: {"action": "audit_log_queued", "actor_id": k.get("actor_id", ""), "action": k.get("action", ""), "resource": k.get("resource", "")},
+    "translate_key":           lambda a, k: {"action": "translate_key_queued", "key_path": k.get("key_path", ""), "target_locale": k.get("target_locale", "")},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
