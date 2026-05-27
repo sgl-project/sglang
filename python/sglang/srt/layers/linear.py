@@ -1535,6 +1535,13 @@ class RowParallelLinear(LinearBase):
             symm_ctx = use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             )
+        # emulate_global_tp_chunks (opt-in via the per-layer attribute, e.g. the
+        # DP-attention o_proj/out_proj which run on the attn-TP group): split the
+        # local matmul into global_tp/attn_tp chunks and accumulate in fp32 so the
+        # fp reduction granularity matches a full global-TP run. This is NOT a
+        # no-op vs a single GEMM (same sum, different fp accumulation order); it
+        # exists for global-TP numerical parity (batch-invariance / train-inference
+        # consistency). Other layers never set the attribute and skip this path.
         emulate_global_tp_chunks = 1
         # Local import to avoid a circular import at module load time.
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
