@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     151,
+        "agents":     152,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -265,6 +265,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "recommendation":    7902,
             "audit_log":         7903,
             "localization":      7904,
+            "oauth_server":      7905,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -616,6 +617,7 @@ _INTENTS = {
     "rec_event":               lambda a, k: {"action": "rec_event_queued", "user_id": k.get("user_id", ""), "item_id": k.get("item_id", ""), "event_type": k.get("event_type", "view")},
     "audit_log":               lambda a, k: {"action": "audit_log_queued", "actor_id": k.get("actor_id", ""), "action": k.get("action", ""), "resource": k.get("resource", "")},
     "translate_key":           lambda a, k: {"action": "translate_key_queued", "key_path": k.get("key_path", ""), "target_locale": k.get("target_locale", "")},
+    "oauth_token":             lambda a, k: {"action": "oauth_token_queued", "grant_type": k.get("grant_type", "client_credentials"), "client_id": k.get("client_id", "")},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
