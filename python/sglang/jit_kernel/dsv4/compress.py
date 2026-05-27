@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union
+from typing import Literal, NamedTuple, Optional, Union
 
 import torch
+from tvm_ffi.module import Module
 
 from sglang.jit_kernel.utils import (
     cache_once,
@@ -12,9 +13,6 @@ from sglang.jit_kernel.utils import (
 )
 
 from .utils import make_name
-
-if TYPE_CHECKING:
-    from tvm_ffi.module import Module
 
 
 @cache_once
@@ -259,9 +257,10 @@ class CompressorPrefillPlan(NamedTuple):
         full_to_swa: torch.Tensor,
         num_q_tokens: int,
         swa_page_size: int,
+        use_cuda_graph: bool = False,
     ) -> CompressorPrefillPlan:
-        seq_lens_cpu = seq_lens.to(torch.int64)
-        extend_lens_cpu = extend_lens.to(torch.int64)
+        seq_lens_cpu = seq_lens.detach().to(torch.int64).cpu()
+        extend_lens_cpu = extend_lens.detach().to(torch.int64).cpu()
         rid_i64 = req_pool_indices.to(torch.int64)
         r2t_i32 = req_to_token.to(torch.int32)
         f2s_i64 = full_to_swa.to(torch.int64)
@@ -284,6 +283,7 @@ class CompressorPrefillPlan(NamedTuple):
             plan_c_dev,
             plan_w_dev,
             int(swa_page_size),
+            bool(use_cuda_graph),
         )
         return CompressorPrefillPlan(
             128,
