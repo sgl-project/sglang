@@ -101,3 +101,26 @@ Columns are runner modes; rows are kernel-path modes of the single
   fixture's backend instance. Until that lands, the all-column sparse +
   threshold-gated cases keep the kernel/wrapper integration covered but
   the per-column sparse math is unverified.
+
+  **Production-side bugs surfaced while attempting Option 3
+  (smoke-test "sparse output != dense output"):** two issues block even a
+  smoke-only sub-window test today.
+
+  - `dual_chunk_flashattention_backend.py:1110-1122`: when a chunk's
+    `intra_vertical_indices.nelement() == 0`, the fallback appends
+    `torch.arange(0, intra_K_size, max(1, intra_K_size/5))`. With
+    `intra_K_size=48` this is `arange(0, 48, 9.6)` → 5 elements, but the
+    `vertical_buffer` is sized to `vertical_size` (=4 in a sub-window
+    config). The copy at line 1132 then raises
+    `RuntimeError: The size of tensor a (4) must match the size of
+    tensor b (5)`. The fallback should clip to `vertical_size` slots.
+  - With `vertical_size=8` to clear the overflow, the sparse kernel
+    crashes with `cudaErrorIllegalAddress` deep inside
+    `_vertical_slash_sparse_attention`, suggesting the
+    `convert_vertical_slash_indexes` block math has an unstated
+    invariant that `vertical_size + slash_size >= chunk_len_blocks` or
+    similar. Needs a kernel-side audit.
+
+  The smoke-test helper `run_dual_chunk_sparse_sub_window_case` is wired
+  through `common/attention_methods/dual_chunk_attention.py` for when
+  those production bugs are fixed; no test method invokes it today.

@@ -54,6 +54,29 @@ DUAL_CHUNK_SPARSE_THRESHOLD_GATED_CONFIG = {
     **DUAL_CHUNK_SPARSE_ALL_COLUMN_CONFIG,
     "sparse_attention_threshold": 100,
 }
+# Sub-context-window sparse: vertical_size + slash_size < intra K count, so
+# the kernel's vertical+slash topk genuinely prunes (the union of selected
+# columns + slashes does NOT cover every K column). We can't predict the
+# exact selection because it's content-aware top-k by softmax-summed scores,
+# but we can verify the sparse path runs, produces finite output, and
+# differs from the dense reference (proving pruning happened, not silent
+# fallback). See dual_chunk/README.md for the engineering paths to a strict
+# correctness reference.
+DUAL_CHUNK_SPARSE_SUB_WINDOW_CONFIG = {
+    **DUAL_CHUNK_CONFIG,
+    "sparse_attention_enabled": True,
+    "sparse_attention_threshold": 0,
+    "sparse_attention_last_q": 8,
+    "sparse_attention_config": {
+        0: {str(head_id): ("vertical_and_slash", 8, 8, None) for head_id in range(4)}
+    },
+}
+# `vertical_size=8` (not 4): the production fallback at
+# dual_chunk_flashattention_backend.py:1110-1122 appends
+# `torch.arange(0, k_states_intra.size(0), max(1, k_states_intra.size(0)/5))`
+# when a chunk gets zero vertical indices, which can produce 5 elements
+# into a `vertical_size`-slot buffer. vertical_size >= 8 avoids that
+# overflow path. This is a known production edge case, not a test bug.
 
 # Unit tests run without distributed initialization. Sparse dual-chunk config
 # lookup should see the single-rank default.
@@ -825,6 +848,72 @@ def run_dual_chunk_sparse_threshold_gated_case(
     actual = run_dual_chunk_fixture_eager(fixture)
     expected = expected_dual_chunk_fixture_output(fixture)
     torch.testing.assert_close(actual, expected, atol=DENSE_ATOL, rtol=DENSE_RTOL)
+
+
+def run_dual_chunk_sparse_sub_window_case(
+    testcase,
+    case: DualChunkAttentionCase,
+    *,
+    max_context_len: int = DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = DEFAULT_DTYPE,
+    device: str = DEFAULT_DEVICE,
+) -> None:
+    """Smoke test for genuine sub-context-window sparse pruning.
+
+    The vertical+slash topk in `_dual_chunk_flash_attn_prefill_func` is
+    content-aware (per-head top-k by softmax-summed attention scores), so we
+    can't predict the exact v_idx/s_idx and thus can't build a strict
+    PyTorch reference without re-implementing ~300 lines of inline production
+    logic (see `dual_chunk/README.md` for the engineering paths). This case
+    instead verifies:
+
+    1. The sparse path runs without crash on a sub-window config (4 vertical
+       + 4 slash, intra K count > 8).
+    2. The output is finite (no NaN/inf).
+    3. The output shape matches the dense reference.
+    4. The output **differs** from the dense reference — proving the kernel
+       genuinely pruned rather than silently falling back to dense.
+    """
+    fixture = build_dual_chunk_attention_fixture(
+        testcase,
+        case,
+        head_dim=128,
+        hidden_size=128,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        dual_chunk_attention_config=DUAL_CHUNK_SPARSE_SUB_WINDOW_CONFIG,
+    )
+    actual = run_dual_chunk_fixture_eager(fixture)
+    expected = expected_dual_chunk_fixture_output(fixture)
+    testcase.assertEqual(actual.shape, expected.shape)
+    testcase.assertTrue(
+        torch.isfinite(actual).all(),
+        f"sparse sub-window output has non-finite values: {actual}",
+    )
+    # Bound the absolute magnitude to catch runaway softmax/scaling bugs.
+    max_abs = actual.abs().max().item()
+    testcase.assertLess(
+        max_abs,
+        1e3,
+        f"sparse sub-window output magnitude {max_abs} suggests a numerical bug",
+    )
+    # The sparse path must differ from dense for at least one element by
+    # more than bf16 FP-noise (~1e-3 at typical accumulation depth). A
+    # silent fallback to dense produces diff ~0 on identical inputs, so the
+    # 5e-4 floor cleanly distinguishes "kernel pruned something" from
+    # "fallback to dense + FP noise".
+    abs_diff = (actual.float() - expected.float()).abs()
+    max_diff = abs_diff.max().item()
+    testcase.assertGreater(
+        max_diff,
+        5e-4,
+        "sparse sub-window output is too close to dense — the sparse path "
+        "may not have actually pruned. Check `sparse_attn_enabled` gate and "
+        "config (vertical_size + slash_size should be < intra K count, and "
+        "seq_len should exceed the production-hardcoded vertical[:30]=inf "
+        "and slash[-100:]=inf always-include heuristics).",
+    )
 
 
 # ---------------------------------------------------------------------------
