@@ -3779,7 +3779,28 @@ class Scheduler(
                     f"req_pool_idx={req.req_pool_idx}"
                 )
                 if self.disaggregation_mode != DisaggregationMode.DECODE:
+                    # C11: disagg PREFILL stashed-chunked req has already been
+                    # sending KV chunks to the peer decode node. Signal abort so
+                    # the peer doesn't wait forever for the remaining chunks.
+                    # Mirrors pause_generation(retract) PREFILL handling
+                    # (scheduler.py pause section).
+                    if (
+                        self.disaggregation_mode == DisaggregationMode.PREFILL
+                        and req.disagg_kv_sender is not None
+                    ):
+                        if hasattr(req.disagg_kv_sender, "abort"):
+                            req.disagg_kv_sender.abort()
+                        req.disagg_kv_sender = None
+
                     release_kv_cache(req, self.tree_cache, is_insert=False)
+
+                    # C11: PREFILL mode also needs to release the metadata buffer
+                    # slot. Mirrors abort_request waiting-segment PREFILL handling.
+                    if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                        release_req_to_metadata_buffer(
+                            req, self.req_to_metadata_buffer_idx_allocator
+                        )
+
                     req.has_pending_chunk = False
                     req.pending_middle_outputs = 0
                     self._deactivate(req)
