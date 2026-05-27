@@ -66,6 +66,57 @@ def _get_sycl_aot_flags() -> List[str]:
 
 DEFAULT_SYCL_INCLUDE = [str(KERNEL_PATH / "include")]
 
+def _get_sgl_kernel_jit_path() -> pathlib.Path | None:
+    """
+    Get sgl-kernel's JIT kernel headers path.
+    
+    Returns the path to sgl-kernel's jit_kernel directory if found, None otherwise.
+    sgl-kernel-xpu is the required dependency for XPU JIT kernel support.
+    """
+    try:
+        import sgl_kernel
+        
+        # Get the sgl_kernel package path
+        sgl_kernel_path = pathlib.Path(sgl_kernel.__file__).parent
+        
+        # Check for JIT kernel headers in the package
+        jit_kernel_path = sgl_kernel_path / "include" / "sgl_kernel" / "jit_kernel"
+        
+        if jit_kernel_path.exists():
+            return jit_kernel_path
+    except ImportError:
+        pass
+    
+    return None
+
+def _resolve_sycl_kernel_path() -> pathlib.Path:
+    """
+    Resolve the path to SYCL JIT kernel headers.
+    
+    Requires sgl-kernel-xpu to be installed. This is the XPU equivalent of
+    requiring CUDA toolkit for CUDA JIT kernels.
+    
+    Raises:
+        RuntimeError: If sgl-kernel-xpu is not installed
+    """
+    sgl_kernel_path = _get_sgl_kernel_jit_path()
+    
+    if sgl_kernel_path is not None:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"Using JIT kernel headers from sgl-kernel: {sgl_kernel_path}")
+        return sgl_kernel_path
+    
+    raise RuntimeError(
+        "XPU JIT kernel compilation requires sgl-kernel-xpu to be installed.\n"
+        "Install it with: pip install sgl-kernel-xpu\n"
+        "Or build from source: cd sgl-kernel-xpu && pip install -e .\n\n"
+        "This is similar to CUDA requiring CUDA toolkit for JIT compilation."
+    )
+
+# Get the SYCL kernel path (checks sgl-kernel first, then local)
+_SYCL_KERNEL_PATH = _resolve_sycl_kernel_path()
+
 def _get_pytorch_sycl_lib_path() -> str:
     """Get the directory containing PyTorch's libsycl.so."""
     try:
@@ -310,7 +361,7 @@ def load_jit_sycl(
 
     :param args: Unique marker of the JIT module. Must be distinct for different kernels.
     :type args: str
-    :param sycl_files: A list of SYCL source files (relative to csrc_sycl/).
+    :param sycl_files: A list of SYCL source files (relative to sgl-kernel jit_kernel directory).
     :type sycl_files: List[str] | None
     :param cpp_files: A list of C++ source files.
     :type cpp_files: List[str] | None
@@ -368,7 +419,7 @@ def load_jit_sycl(
     # Read source files
     sycl_sources = []
     for f in sycl_files:
-        sycl_path = (KERNEL_PATH / "csrc_sycl" / f).resolve()
+        sycl_path = (_SYCL_KERNEL_PATH / f).resolve()
         if not sycl_path.exists():
             raise FileNotFoundError(f"SYCL source file not found: {sycl_path}")
         sycl_sources.append(sycl_path.read_text())
@@ -389,7 +440,7 @@ def load_jit_sycl(
 
     # Resolve sycl_files to absolute paths for unambiguous cache keying
     resolved_sycl_files = [
-        str((KERNEL_PATH / "csrc_sycl" / f).resolve()) for f in sycl_files
+        str((_SYCL_KERNEL_PATH / f).resolve()) for f in sycl_files
     ]
 
     # Compute cache key from compilation-affecting inputs
@@ -428,7 +479,7 @@ def load_jit_sycl(
             main_source = tmpdir_path / "kernel.cpp"
             includes = []
             for f in sycl_files:
-                sycl_path = (KERNEL_PATH / "csrc_sycl" / f).resolve()
+                sycl_path = (_SYCL_KERNEL_PATH / f).resolve()
                 includes.append(f'#include "{sycl_path}"')
 
             main_source.write_text("\n".join(includes) + "\n")
