@@ -35,3 +35,7 @@ class TestTorchNpuPatchUtils(unittest.TestCase):
     def test_apply_torch_npu_patches_requires_supported_api(self):
         with self.assertRaises(AttributeError):
             apply_torch_npu_patches(types.SimpleNamespace(), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
