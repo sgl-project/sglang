@@ -1112,7 +1112,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 and forward_batch.forward_mode == ForwardMode.EXTEND
             ):
                 logger.warning(
-                    "[FlyDSL] dispatching prefill kernel q=%s kv=%s indices=%s",
+                    "[FlyDSL] dispatching prefill kernel q=%s kv_packed=%s indices=%s",
                     q.shape,
                     extra_k_cache.shape,
                     extra_indices.shape,
@@ -1121,18 +1121,59 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                     from sglang.srt.layers.attention.nsa.tilelang_kernel import (
                         tilelang_sparse_fwd,
                     )
-
-                    # Flatten the paged C4 cache:
-                    # [num_c4_pages, page_size_c4, kv_group, head_dim]
-                    # -> [total_c4_slots, kv_group, head_dim]
-                    kv_flat = extra_k_cache.view(
-                        -1,
-                        extra_k_cache.shape[-2],
-                        extra_k_cache.shape[-1],
+                    from sglang.srt.layers.quantization.fp8_kernel import (
+                        is_fp8_fnuz as _is_fp8_fnuz,
                     )
+
+                    # The C4 buffer raw layout per token (576-byte data stride):
+                    #   [0,   448): fp8  nope  (448 bytes)
+                    #   [448, 576): bf16 rope  (128 bytes = 64 bf16 values)
+                    #   Scale is packed at the END of each page, not inline.
+                    #
+                    # c4_sparse_page_indices contains flat token-slot indices:
+                    #   slot = physical_page * c4_page_sz + offset_in_page
+                    # so they index directly into the flattened [P*T, 512] kv.
+                    #
+                    # WARNING: the `extra_k_cache` variable at this point has been
+                    # reshaped with a 584-byte stride (line ~1046), which does NOT
+                    # match the actual 576-byte data stride.  We must re-fetch the
+                    # raw uint8 buffer and extract from it directly.
+                    _raw_c4 = token_to_kv_pool.get_extra_key_buffer(layer_id)
+                    _num_c4_pages = _raw_c4.shape[0]
+                    _c4_psz = page_sizes[4]   # = page_size // 4
+                    _nope = 448               # fp8 bytes per token
+                    _rope = 64                # bf16 elements per token
+                    _tok_stride = _nope + _rope * 2  # 576 bytes per token
+
+                    # data section: [P, T, 576] uint8  (all per-token data, no scale)
+                    _data = _raw_c4[:, : _c4_psz * _tok_stride].view(
+                        _num_c4_pages, _c4_psz, _tok_stride
+                    )
+
+                    _fp8_t = (
+                        torch.float8_e4m3fnuz
+                        if _is_fp8_fnuz()
+                        else torch.float8_e4m3fn
+                    )
+                    # nope: [P, T, 448] fp8 — bytes are already fp8, just reinterpret
+                    _nope_fp8 = _data[:, :, :_nope].contiguous().view(_fp8_t)
+                    # rope: [P, T, 64] fp8 — cast from bf16
+                    _rope_fp8 = (
+                        _data[:, :, _nope : _tok_stride]
+                        .contiguous()
+                        .view(torch.bfloat16)
+                        .to(_fp8_t)
+                    )
+                    # kv_flat: [P*T, 1, 512] fp8
+                    _kv_flat = (
+                        torch.cat([_nope_fp8, _rope_fp8], dim=-1)
+                        .view(_num_c4_pages * _c4_psz, 512)
+                        .unsqueeze(1)
+                    )
+
                     o = tilelang_sparse_fwd(
                         q=q,
-                        kv=kv_flat,
+                        kv=_kv_flat,
                         indices=extra_indices,
                         sm_scale=self.softmax_scale,
                         d_v=self.head_dim_v,
