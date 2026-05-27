@@ -515,16 +515,21 @@ Latest verification:
   `test/srt/test_dsv4_c4_indexer.py`) for the Compressor/Indexer math
   itself. Same rationale as RoPE: pre-processing modules whose outputs
   are inputs to the attention backend.
-- **GB300 (SM10.3 / Blackwell) verified run with layout-robustness
-  tests included.** After switching the cluster to the correct branch,
-  applying hardware-gate fixes to five test skip conditions, and
-  including the new layout-robustness infrastructure and per-backend
-  coverage, the suite reaches **19 failed, 157 passed, 86 skipped,
-  433 subtests passed in ~205s** on GB300 (sglang-kernel 0.4.3). The
-  12 new layout-robustness test items all pass or skip correctly (+12
-  passed, +10 skipped vs the pre-layout-robustness GB300 baseline).
-  All 19 remaining failures are container-level blockers (the container
-  image does not ship GB300-compatible builds for these libraries):
+- **GB300 (SM10.3 / Blackwell) verified run with DSA + dual_chunk
+  layout-robustness tests included.** After applying all hardware-gate
+  fixes and including the new layout-robustness infrastructure and
+  per-backend coverage (dense, SWA, MLA, FA3/FA4, DSA, dual_chunk),
+  the suite reaches **21 failed, 160 passed, 87 skipped, 436 subtests
+  passed in ~215s** on GB300 (sglang-kernel 0.4.3). DSA
+  layout-robustness tests all pass on GB300. The 2 new failures vs
+  the pre-DSA/dual_chunk run are `layout_dual_chunk_*` with
+  `interleaved_pages` — same container-level
+  `ImportError: cannot import name 'flash_attn_varlen_func'`
+  root cause as all other dual_chunk failures (confirmed from
+  traceback). The `non_monotonic_extend` layout case is correctly
+  SUBSKIPPED via `LAYOUT_KNOWN_FAILURES`.
+  All 21 failures are container-level blockers (the container image
+  does not ship GB300-compatible builds for these libraries):
 
   | Backend / impl | Count | Error | Action |
   |---|---|---|---|
