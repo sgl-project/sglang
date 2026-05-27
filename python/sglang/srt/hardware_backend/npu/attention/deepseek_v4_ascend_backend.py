@@ -874,11 +874,16 @@ class DeepseekV4AscendAttnBackend(
           * ``c{ratio}_loc`` (decode only) comes straight from the
             :class:`DSV4OutCacheLoc` bundle that
             :class:`DSV4NPUTokenToKVPoolAllocator` produced during alloc.
-
-        State page tables / state_loc are derived on the fly via
-        ``pool.translate_kv_loc_to_compress_state_loc``; the state pool is
-        not allocated through ``DSV4NPUTokenToKVPoolAllocator`` (state ring
-        buffer is managed inside the V4 KV pool).
+          * ``c{ratio}_state_page_table`` is sliced from
+            ``req_to_token_pool.req_to_token_c{4,128}_state`` (per-raw-token
+            state-pool slot ids written by the dsv4_common_hooks after each
+            allocator call), then ``[:, :: page_size] // page_size`` →
+            kernel-view block ids. State pool is paged (cache_mode=1
+            on Atlas A3); ring-hash translation is not supported.
+          * ``c{ratio}_state_loc`` (decode only) comes from the
+            :class:`DSV4OutCacheLoc` bundle's ``out_c{4,128}_state_loc``
+            field. One slot per raw decode token (state is per-token,
+            not per-ratio).
 
         Returns dict keys:
           - c{ratio}_state_page_table  (always present for ratio in {4,128})
@@ -896,33 +901,46 @@ class DeepseekV4AscendAttnBackend(
         seq_lens_max = int(seq_lens.max().item()) if bs > 0 else 0
         n_pages = max(1, (seq_lens_max + self.page_size - 1) // self.page_size)
 
-        # State page tables — for each request, for each page, the state-buffer
-        # page index. Use the FIRST token of each page as the representative
-        # (tokens within the same SWA page produce contiguous state-buffer slots).
-        page_starts = torch.arange(
-            0, n_pages * self.page_size, self.page_size, device=device
-        )  # [n_pages]
-        # [bs, n_pages] flattened token positions; positions past seq_len are
-        # clamped to 0 (will be masked out by _get_kv_indices' kv_len).
-        page_starts_2d = page_starts.unsqueeze(0).expand(bs, n_pages)
-        # Index req_to_token: [bs, n_pages] of full-kv-pool slot ids.
-        raw_loc = req_to_token[
-            req_pool.unsqueeze(1).expand(-1, n_pages), page_starts_2d
-        ]
-
         for ratio in self._dsv4_compress_ratios:
             if ratio not in (4, 128):
                 continue
-            # State page table — translate each (bs, n_pages) raw kv slot to a
-            # state-buffer page id. translate_kv_loc_to_compress_state_loc gives
-            # the flat state slot; divide by page_size for the page id.
-            state_loc_2d = pool.translate_kv_loc_to_compress_state_loc(raw_loc, ratio)
-            state_page_2d = (state_loc_2d // self.page_size).to(torch.int32)
+            # State page table from req_to_token_c{ratio}_state. The table
+            # stores one state-pool slot id per RAW token (state is not
+            # ratio-compressed); take one slot per page boundary and divide
+            # by page_size to get the kernel's block id. Unallocated tail
+            # entries default to 0 — the kernel treats block 0 as
+            # skip-sentinel (NPUCompressStatePool reserves it).
+            state_table = (
+                req_to_token_pool.req_to_token_c4_state
+                if ratio == 4
+                else req_to_token_pool.req_to_token_c128_state
+            )
+            state_slots_2d = state_table[
+                req_pool.to(torch.int64), :n_pages * self.page_size
+            ]
+            state_page_2d = (
+                state_slots_2d[:, :: self.page_size] // self.page_size
+            ).to(torch.int32)
 
             if is_decode:
-                state_loc_decode = pool.translate_kv_loc_to_compress_state_loc(
-                    out_cache_loc, ratio
-                )
+                # Decode-time state_loc for the new raw token: one slot per
+                # req from the allocator bundle. None on idle DP-attention
+                # ranks (alloc_decode short-circuited).
+                state_loc_decode = None
+                if out_cache_loc_dsv4 is not None:
+                    state_loc_decode = (
+                        out_cache_loc_dsv4.out_c4_state_loc
+                        if ratio == 4
+                        else out_cache_loc_dsv4.out_c128_state_loc
+                    )
+                if state_loc_decode is None:
+                    # Fallback shape-correct buffer of zeros (block 0 dummy)
+                    # for idle ranks so downstream kernels see a valid tensor.
+                    state_loc_decode = torch.zeros(
+                        bs, dtype=torch.int32, device=device,
+                    )
+                else:
+                    state_loc_decode = state_loc_decode.to(torch.int32)
                 # c{ratio}_loc comes from the DSV4OutCacheLoc bundle the
                 # allocator stashed in alloc_decode. The kernel expects a
                 # [bs]-shaped tensor (0 padding for non-compressing reqs);

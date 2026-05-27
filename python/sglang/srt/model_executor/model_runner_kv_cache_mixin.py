@@ -363,13 +363,57 @@ class ModelRunnerKVCacheMixin:
                 ] * self.num_effective_layers
             else:
                 compression_ratios = self.model_config.compress_ratios
-            self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
+
+            # NPU + DSV4 → use the paged-state subclass. The on-NPU fused
+            # compressor kernel (torch.ops.custom.compressor cache_mode=1)
+            # requires a paged state pool; Atlas A3 rejects cache_mode=2
+            # (ring), so we cannot share the CUDA ring-buffer state path.
+            # CUDA keeps the original DeepSeekV4TokenToKVPool exactly as
+            # before. NPU state pool sizes are recomputed here (they
+            # depend on max_running_requests; pool_configurator's earlier
+            # ring-based formula is overridden for NPU).
+            from sglang.srt.utils import is_npu as _is_npu_fn
+
+            if _is_npu_fn():
+                from sglang.srt.hardware_backend.npu.dsv4_memory_pool import (
+                    DSV4NPUTokenToKVPool,
+                )
+                from sglang.srt.hardware_backend.npu.dsv4_state_pool import (
+                    npu_state_pool_size,
+                )
+
+                pool_cls = DSV4NPUTokenToKVPool
+                # Recompute state pool sizes for the NPU paged formula.
+                # CUDA's ring sizes (already in self.c{4,128}_state_pool_size)
+                # are dropped on the NPU dispatch. With tail-only allocation
+                # (see ScheduleBatch._compute_dsv4_state_lens_extend), the
+                # reference per-req-budget formula is sufficient regardless of
+                # prefill length — long prompts only allocate ``tail+128``
+                # state slots for c4 and ``tail`` for c128 (tail = seq_len %
+                # 128), and steady-state decode is drained by sliding
+                # eviction in ``ScheduleBatch._evict_swa``.
+                c4_state_pool_size = npu_state_pool_size(
+                    ratio=4,
+                    page_size=self.page_size,
+                    max_num_reqs=self.max_running_requests,
+                )
+                c128_state_pool_size = npu_state_pool_size(
+                    ratio=128,
+                    page_size=self.page_size,
+                    max_num_reqs=self.max_running_requests,
+                )
+            else:
+                pool_cls = DeepSeekV4TokenToKVPool
+                c4_state_pool_size = self.c4_state_pool_size
+                c128_state_pool_size = self.c128_state_pool_size
+
+            self.token_to_kv_pool = pool_cls(
                 max_num_reqs=self.max_running_requests,
                 swa_size=self.swa_max_total_num_tokens,
                 c4_size=self.c4_max_total_num_tokens,
                 c128_size=self.c128_max_total_num_tokens,
-                c4_state_pool_size=self.c4_state_pool_size,
-                c128_state_pool_size=self.c128_state_pool_size,
+                c4_state_pool_size=c4_state_pool_size,
+                c128_state_pool_size=c128_state_pool_size,
                 page_size=self.page_size,
                 swa_page_size=swa_page_size,
                 dtype=self.kv_cache_dtype,

@@ -92,6 +92,32 @@ def maybe_write_dsv4_extend(
         ratio=128,
     )
 
+    # c4_state / c128_state writes: tail-only. Bundle is now of length
+    # ``sum(c{N}_state_alloc_len_i)`` (NOT total raw extend tokens) per
+    # ScheduleBatch._compute_dsv4_state_lens_extend. Each req's slot ids go
+    # at raw positions ``[req.c{N}_state_alloc_offset, seq_len)`` —
+    # corresponds to the trailing window the compressor reads / writes.
+    if bundle.out_c4_state_loc is not None and hasattr(
+        req_to_token_pool, "write_c4_state"
+    ):
+        _write_state_tail_per_req(
+            req_to_token_pool.write_c4_state,
+            req_pool_indices_cpu,
+            [r.c4_state_alloc_offset for r in batch.reqs],
+            seq_lens_cpu,
+            bundle.out_c4_state_loc,
+        )
+    if bundle.out_c128_state_loc is not None and hasattr(
+        req_to_token_pool, "write_c128_state"
+    ):
+        _write_state_tail_per_req(
+            req_to_token_pool.write_c128_state,
+            req_pool_indices_cpu,
+            [r.c128_state_alloc_offset for r in batch.reqs],
+            seq_lens_cpu,
+            bundle.out_c128_state_loc,
+        )
+
 
 def maybe_write_dsv4_decode(
     batch: "ScheduleBatch",
@@ -145,6 +171,64 @@ def maybe_write_dsv4_decode(
         bundle.out_c128_loc,
         ratio=128,
     )
+
+    # State table decode writes: one slot per raw decode token (ratio=1).
+    if bundle.out_c4_state_loc is not None and hasattr(
+        req_to_token_pool, "write_c4_state"
+    ):
+        _write_per_req_slice(
+            req_to_token_pool.write_c4_state,
+            req_pool_indices_cpu,
+            prefix_lens_cpu,
+            seq_lens_cpu,
+            bundle.out_c4_state_loc,
+            ratio=1,
+        )
+    if bundle.out_c128_state_loc is not None and hasattr(
+        req_to_token_pool, "write_c128_state"
+    ):
+        _write_per_req_slice(
+            req_to_token_pool.write_c128_state,
+            req_pool_indices_cpu,
+            prefix_lens_cpu,
+            seq_lens_cpu,
+            bundle.out_c128_state_loc,
+            ratio=1,
+        )
+
+
+def _write_state_tail_per_req(
+    write_fn,
+    req_pool_indices_cpu: torch.Tensor,
+    state_alloc_offsets: list,
+    seq_lens_cpu: torch.Tensor,
+    flat_loc: torch.Tensor,
+) -> None:
+    """Distribute the tail-only state bundle across reqs.
+
+    ``flat_loc`` length == ``sum_i (seq_lens_i - state_alloc_offsets_i)``
+    (set by the allocator's c{N}_state_attn_allocator.alloc_extend, which
+    received per-req prefix/seq diffs equal to per-req alloc_lens). Each
+    req's bundle slice goes at raw positions
+    ``[state_alloc_offsets[i], seq_lens[i])`` in ``req_to_token_c{N}_state``.
+
+    flat_loc may be None when the c{N}_state allocator is uninitialized
+    (model has no c{N} layers); skip then.
+    """
+    if flat_loc is None or flat_loc.numel() == 0:
+        return
+    pt = 0
+    n_reqs = req_pool_indices_cpu.shape[0]
+    for i in range(n_reqs):
+        offset = int(state_alloc_offsets[i])
+        seq = int(seq_lens_cpu[i].item())
+        alloc_len = max(0, seq - offset)
+        if alloc_len == 0:
+            continue
+        req_idx = int(req_pool_indices_cpu[i].item())
+        chunk = flat_loc[pt : pt + alloc_len].to(torch.int32)
+        write_fn((req_idx, slice(offset, seq)), chunk)
+        pt += alloc_len
 
 
 def _write_per_req_slice(

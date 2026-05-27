@@ -84,6 +84,24 @@ class DSV4NPUReqToTokenPool(ReqToTokenPool):
                 dtype=torch.int32,
                 device=device,
             )
+            # State tables: 1 slot per raw token (state pool is per-token in
+            # the NPU paged layout used by torch.ops.custom.compressor
+            # cache_mode=1). Backend builds
+            # ``c{N}_state_page_table = req_to_token_c{N}_state[req, ::page_size]
+            # // page_size`` to feed the kernel's state_block_table. Init zero
+            # so unallocated columns map to block 0 (the kernel's skip
+            # sentinel, see NPUCompressStatePool which clears block 0 to
+            # kv=0/score=-inf).
+            self.req_to_token_c4_state = torch.zeros(
+                (self._alloc_size, max_context_len),
+                dtype=torch.int32,
+                device=device,
+            )
+            self.req_to_token_c128_state = torch.zeros(
+                (self._alloc_size, max_context_len),
+                dtype=torch.int32,
+                device=device,
+            )
 
     # ------------------------------------------------------------------
     # Per-pool write helpers. mem_cache/common.py calls these directly
@@ -100,6 +118,12 @@ class DSV4NPUReqToTokenPool(ReqToTokenPool):
 
     def write_c128(self, indices, values: torch.Tensor) -> None:
         self.req_to_token_c128[indices] = values
+
+    def write_c4_state(self, indices, values: torch.Tensor) -> None:
+        self.req_to_token_c4_state[indices] = values
+
+    def write_c128_state(self, indices, values: torch.Tensor) -> None:
+        self.req_to_token_c128_state[indices] = values
 
     def clear(self):
         super().clear()

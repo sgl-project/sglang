@@ -669,6 +669,11 @@ class Compressor(nn.Module):
         write_req_indices: list[torch.Tensor] = []
         write_pos_in_req: list[torch.Tensor] = []
         seqlen_offset = 0
+        # Running offset into the tail-only state bundle. The bundle's flat
+        # layout is ``[req0_alloc_len_slots, req1_alloc_len_slots, ...]``
+        # where ``alloc_len_i = seqlen_i - c{ratio}_state_alloc_offset_i`` —
+        # NOT the raw seqlen (see ScheduleBatch._compute_dsv4_state_lens_extend).
+        state_bundle_offset = 0
 
         for idx, seqlen in enumerate(seq_lens_cpu):
             seqlen = int(seqlen)
@@ -676,16 +681,51 @@ class Compressor(nn.Module):
                 continue
             if is_prefill:
                 pos_req = positions[seqlen_offset : seqlen_offset + seqlen]
-                # State writes index the compress STATE pool (flat ring buffer),
-                # not the full kv pool. Translate via the V4 token pool helper.
-                raw_kv_loc = forward_batch.out_cache_loc[
-                    seqlen_offset : seqlen_offset + seqlen
-                ]
-                out_cache_loc = token_to_kv_pool.translate_kv_loc_to_compress_state_loc(
-                    raw_kv_loc, ratio
+
+                # Per-req tail-only state alloc range. Same formula as
+                # ScheduleBatch._compute_dsv4_state_lens_extend; recomputed
+                # here to avoid threading another tensor through forward_batch.
+                tail_128 = seqlen % 128
+                if ratio == 4:
+                    c_alloc_len = (
+                        tail_128 + 128
+                        if (tail_128 <= 3 and seqlen >= 128)
+                        else tail_128
+                    )
+                else:  # ratio == 128
+                    c_alloc_len = tail_128
+                c_alloc_offset = seqlen - c_alloc_len
+
+                # Bundle slice for this req. The NPU paged state pool emits
+                # real slot ids in the bundle (no ring-hash); slice by
+                # ``state_bundle_offset`` (cumulative alloc_len across reqs),
+                # NOT by ``seqlen_offset`` (cumulative raw seqlen).
+                bundle = forward_batch.out_cache_loc_dsv4
+                assert bundle is not None, (
+                    "Compressor.forward_npu prefill on NPU needs the DSV4 "
+                    "alloc bundle; expected maybe_write_dsv4_extend to have "
+                    "populated batch.out_cache_loc_dsv4 before forward."
                 )
+                bundle_state_loc = (
+                    bundle.out_c4_state_loc
+                    if ratio == 4
+                    else bundle.out_c128_state_loc
+                )
+                assert bundle_state_loc is not None and bundle_state_loc.numel() > 0, (
+                    f"Compressor.forward_npu prefill: bundle.out_c{ratio}_state_loc "
+                    f"is empty/None — DSV4NPUTokenToKVPoolAllocator's "
+                    f"c{ratio}_state_attn_allocator was not initialized (check "
+                    f"pool_configurator's NPU branch + npu_state_pool_size)."
+                )
+                out_cache_loc = bundle_state_loc[
+                    state_bundle_offset : state_bundle_offset + c_alloc_len
+                ]
+                state_bundle_offset += c_alloc_len
                 remainder = seqlen % ratio
                 cutoff = seqlen - remainder
+                # ``cutoff`` in raw coords; subtract ``c_alloc_offset`` for
+                # slice-relative indexing into the per-req bundle slice.
+                cutoff_in_slice = cutoff - c_alloc_offset
                 should_compress = cutoff >= ratio
                 # ratio-strided positions for the cutoff chunks (one rope
                 # position per compressed token).
@@ -696,12 +736,17 @@ class Compressor(nn.Module):
                 if overlap and cutoff >= ratio:
                     # Stash the trailing ratio tokens of the cutoff so the
                     # next decode step can do overlap compression across the
-                    # boundary.
+                    # boundary. State alloc covers [cutoff - ratio, seqlen)
+                    # for ratio=4 by construction (formula picks tail+128 or
+                    # tail; in both cases the [cutoff-ratio, cutoff) window
+                    # is inside [alloc_offset, seqlen)).
                     kv_state_to_be_cached.append(kv[cutoff - ratio : cutoff])
                     score_state_to_be_cached.append(
                         score[cutoff - ratio : cutoff] + self.ape
                     )
-                    state_loc_list.append(out_cache_loc[cutoff - ratio : cutoff])
+                    state_loc_list.append(
+                        out_cache_loc[cutoff_in_slice - ratio : cutoff_in_slice]
+                    )
                 if remainder > 0:
                     kv_cut, kv_rem = kv.split([cutoff, remainder], dim=0)
                     score_cut, score_rem = score.split([cutoff, remainder], dim=0)

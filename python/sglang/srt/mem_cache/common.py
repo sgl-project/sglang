@@ -355,6 +355,30 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
             tree_cache.evict(EvictParams(num_tokens=num_tokens))
 
 
+def _collect_dsv4_state_kwargs(batch) -> Optional[dict]:
+    """Pull the per-req c{4,128}_state pool lens off the batch.
+
+    Populated by :meth:`ScheduleBatch._compute_dsv4_state_lens_extend` /
+    ``..._decode`` when the allocator is DSV4-NPU; absent otherwise. Returns
+    None when the helper did not run (CUDA / non-V4 paths), so the
+    ``alloc_paged_token_slots_*`` forwarding stays a no-op.
+    """
+    if getattr(batch, "c4_state_seq_lens", None) is None:
+        return None
+    return {
+        "c4_state_prefix_lens": batch.c4_state_prefix_lens,
+        "c4_state_prefix_lens_cpu": batch.c4_state_prefix_lens_cpu,
+        "c4_state_seq_lens": batch.c4_state_seq_lens,
+        "c4_state_seq_lens_cpu": batch.c4_state_seq_lens_cpu,
+        "c4_state_extend_num_tokens": batch.c4_state_extend_num_tokens,
+        "c128_state_prefix_lens": batch.c128_state_prefix_lens,
+        "c128_state_prefix_lens_cpu": batch.c128_state_prefix_lens_cpu,
+        "c128_state_seq_lens": batch.c128_state_seq_lens,
+        "c128_state_seq_lens_cpu": batch.c128_state_seq_lens_cpu,
+        "c128_state_extend_num_tokens": batch.c128_state_extend_num_tokens,
+    }
+
+
 def alloc_paged_token_slots_extend(
     tree_cache: BasePrefixCache,
     prefix_lens: torch.Tensor,
@@ -365,6 +389,7 @@ def alloc_paged_token_slots_extend(
     extend_num_tokens: int,
     backup_state: bool = False,
     req_pool_indices: Optional[torch.Tensor] = None,
+    dsv4_state_kwargs: Optional[dict] = None,
 ):
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -375,14 +400,17 @@ def alloc_paged_token_slots_extend(
     if backup_state:
         state = allocator.backup_state()
 
-    # DSV4-NPU allocator additionally needs req_pool_indices to look up the
-    # c-pool last_loc from per-req tables. Gate via hasattr so non-DSV4
-    # allocators (no req_pool_indices kwarg in signature) stay unchanged.
+    # DSV4-NPU allocator additionally needs req_pool_indices (for c-pool
+    # last_loc lookup via per-req tables) and per-req c{4,128}_state pool
+    # lens (tail-only allocation in a separate paged slot space). Gate via
+    # hasattr so non-DSV4 allocators stay unchanged.
     extra_alloc_kwargs = {}
     if req_pool_indices is not None and hasattr(
         allocator, "register_req_to_token_pool"
     ):
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
+        if dsv4_state_kwargs:
+            extra_alloc_kwargs.update(dsv4_state_kwargs)
 
     out_cache_loc = allocator.alloc_extend(
         prefix_lens,
@@ -486,6 +514,7 @@ def alloc_for_extend(
             last_loc=torch.cat(last_loc),
             extend_num_tokens=batch.extend_num_tokens,
             req_pool_indices=req_pool_indices_device,
+            dsv4_state_kwargs=_collect_dsv4_state_kwargs(batch),
         )
 
     # Write to req_to_token_pool
@@ -528,6 +557,7 @@ def alloc_paged_token_slots_decode(
     last_loc: torch.Tensor,
     token_per_req: int = 1,
     req_pool_indices: Optional[torch.Tensor] = None,
+    dsv4_state_kwargs: Optional[dict] = None,
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -535,14 +565,16 @@ def alloc_paged_token_slots_decode(
     num_tokens = len(seq_lens) * allocator.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
 
-    # DSV4-NPU allocator additionally needs req_pool_indices to look up the
-    # c-pool last_loc from per-req tables. Gate via hasattr so non-DSV4
-    # allocators stay unchanged.
+    # DSV4-NPU allocator additionally needs req_pool_indices and per-req
+    # c{4,128}_state pool lens; gate via hasattr so non-DSV4 allocators
+    # stay unchanged.
     extra_alloc_kwargs = {}
     if req_pool_indices is not None and hasattr(
         allocator, "register_req_to_token_pool"
     ):
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
+        if dsv4_state_kwargs:
+            extra_alloc_kwargs.update(dsv4_state_kwargs)
 
     out_cache_loc = allocator.alloc_decode(
         seq_lens, seq_lens_cpu, last_loc, **extra_alloc_kwargs
@@ -590,6 +622,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             last_loc=last_loc,
             token_per_req=token_per_req,
             req_pool_indices=batch.req_pool_indices,
+            dsv4_state_kwargs=_collect_dsv4_state_kwargs(batch),
         )
 
     # Write to req_to_token_pool

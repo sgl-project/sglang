@@ -120,6 +120,89 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             need_sort=need_sort,
         )
 
+        # State pool allocators (NPU-only paged path). Layer 0's attention /
+        # indexer state pools serve as the KVCache pointer here — all layers
+        # share the same per-pool size budget driven by
+        # ``c{4,128}_state_pool_size``, and per-layer buffer access happens
+        # via DeepSeekV4TokenToKVPool.get_attention/indexer_compress_state_cache
+        # (which routes to ``compress_state_pools[layer_id]``). The allocator
+        # only needs a KVCache-conforming object for its constructor; the
+        # actual slot allocation is layer-agnostic.
+        #
+        # ``c{4,128}_state_pool_size`` is the ALLOCATOR size (= num_usable_pages
+        # * page_size, output of :func:`npu_state_pool_size`); the underlying
+        # NPUCompressStatePool buffer over-allocates one page so the
+        # ``free_pages = arange(1, num_pages+1)`` convention works without
+        # OOB. Each pool has its own state slot space (kv attention vs
+        # indexer) so allocations are independent.
+        self.c4_state_attn_allocator: Optional[NPUPagedTokenToKVPoolAllocator] = None
+        self.c128_state_attn_allocator: Optional[NPUPagedTokenToKVPoolAllocator] = None
+        self.c4_index_state_attn_allocator: Optional[
+            NPUPagedTokenToKVPoolAllocator
+        ] = None
+        if (
+            getattr(kvcache, "compress_state_pools", None) is not None
+            and len(kvcache.compress_state_pools) > 0
+        ):
+            c4_state_pool = next(
+                (
+                    p
+                    for ratio, p in zip(
+                        kvcache.compression_ratios, kvcache.compress_state_pools
+                    )
+                    if ratio == 4 and p is not None
+                ),
+                None,
+            )
+            c128_state_pool = next(
+                (
+                    p
+                    for ratio, p in zip(
+                        kvcache.compression_ratios, kvcache.compress_state_pools
+                    )
+                    if ratio == 128 and p is not None
+                ),
+                None,
+            )
+            c4_index_state_pool = next(
+                (
+                    p
+                    for ratio, p in zip(
+                        kvcache.compression_ratios,
+                        kvcache.indexer_compress_state_pools,
+                    )
+                    if ratio == 4 and p is not None
+                ),
+                None,
+            )
+            if c4_state_pool is not None and kvcache.c4_state_pool_size > 0:
+                self.c4_state_attn_allocator = NPUPagedTokenToKVPoolAllocator(
+                    kvcache.c4_state_pool_size,
+                    page_size=page_size,
+                    dtype=dtype,
+                    device=device,
+                    kvcache=c4_state_pool,
+                    need_sort=need_sort,
+                )
+            if c128_state_pool is not None and kvcache.c128_state_pool_size > 0:
+                self.c128_state_attn_allocator = NPUPagedTokenToKVPoolAllocator(
+                    kvcache.c128_state_pool_size,
+                    page_size=page_size,
+                    dtype=dtype,
+                    device=device,
+                    kvcache=c128_state_pool,
+                    need_sort=need_sort,
+                )
+            if c4_index_state_pool is not None and kvcache.c4_state_pool_size > 0:
+                self.c4_index_state_attn_allocator = NPUPagedTokenToKVPoolAllocator(
+                    kvcache.c4_state_pool_size,
+                    page_size=page_size,
+                    dtype=dtype,
+                    device=device,
+                    kvcache=c4_index_state_pool,
+                    need_sort=need_sort,
+                )
+
         # Cached zero-length int64 tensor returned by _alloc_c_extend when a
         # batch produces no new compressed tokens this step (e.g. decode of
         # reqs that haven't yet closed a ratio chunk). Avoids per-step
@@ -158,11 +241,87 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     def register_req_to_token_pool(self, req_to_token_pool) -> None:
         """Wire the DSV4NPUReqToTokenPool back-ref so ``_alloc_c_extend``
-        can look up the real c-pool last_loc from the per-req
-        ``req_to_token_c{4,128}`` table. Called from
+        / ``_alloc_state_extend`` can look up the real per-pool last_loc
+        from the per-req ``req_to_token_c{4,128}`` and
+        ``req_to_token_c{4,128}_state`` tables. Called from
         :meth:`DSV4NPUReqToTokenPool.register_dsv4_allocator` right after
         the pool object is constructed."""
         self._req_to_token_pool = req_to_token_pool
+
+    def _alloc_state_extend(
+        self,
+        allocator: Optional[NPUPagedTokenToKVPoolAllocator],
+        raw_prefix_lens: torch.Tensor,
+        state_prefix_lens: torch.Tensor,
+        state_prefix_lens_cpu: torch.Tensor,
+        state_seq_lens: torch.Tensor,
+        state_seq_lens_cpu: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        last_loc_dtype: torch.dtype,
+        state_extend_num_tokens: int,
+        ratio: int,
+    ) -> torch.Tensor:
+        """Allocate state-pool slots for an extend at ``ratio``.
+
+        State pool is a **separate paged slot space** from raw token
+        positions: each req allocates only the trailing window
+        (``c4_alloc_len`` / ``c128_alloc_len`` per-req, computed by
+        ``ScheduleBatch._compute_dsv4_state_lens_extend``). The state pool's
+        cumulative slot count for a req grows monotonically across
+        extends/decodes; this method takes ``state_prefix_lens`` (prev
+        cumulative count) and ``state_seq_lens`` (new cumulative count) for
+        the underlying paged allocator.
+
+        ``state_last_loc`` is looked up from ``req_to_token_c{ratio}_state``
+        at raw position ``raw_prefix_lens - 1`` — the LAST raw position
+        already populated by the previous extend / decode step. For fresh
+        reqs (raw_prefix_lens == 0), ``get_last_loc`` returns -1 (its
+        sentinel for "no prior allocation"). For decode, caller passes
+        ``raw_prefix_lens = pre_decode_seq_lens`` so the lookup hits the
+        position of the previous decode's token.
+
+        Returns ``self._empty_loc`` when the allocator is not initialized
+        (e.g., ``c{ratio}_state_pool_size == 0`` — DSV4 model has no
+        c{ratio} layers) or when ``state_extend_num_tokens == 0``.
+        """
+        if allocator is None or state_extend_num_tokens == 0:
+            return self._empty_loc
+
+        assert self._req_to_token_pool is not None, (
+            "DSV4NPUTokenToKVPoolAllocator.register_req_to_token_pool was not "
+            "called — state-pool last_loc lookup needs the per-req table "
+            "back-ref. Wire it from DSV4NPUReqToTokenPool.register_dsv4_allocator."
+        )
+        state_table = (
+            self._req_to_token_pool.req_to_token_c4_state
+            if ratio == 4
+            else self._req_to_token_pool.req_to_token_c128_state
+        )
+        # last_loc lookup uses RAW position (table is indexed by raw token
+        # position, holding state-pool slot ids at populated tail positions).
+        # ``raw_prefix_lens - 1`` = last position of previous extend / decode.
+        state_last_loc = get_last_loc(
+            state_table, req_pool_indices, raw_prefix_lens
+        ).to(last_loc_dtype)
+
+        result = allocator.alloc_extend(
+            state_prefix_lens,
+            state_prefix_lens_cpu,
+            state_seq_lens,
+            state_seq_lens_cpu,
+            state_last_loc,
+            state_extend_num_tokens,
+        )
+        if result is None:
+            raise RuntimeError(
+                f"DSV4 c{ratio} state pool exhausted: need "
+                f"{state_extend_num_tokens} new slots, "
+                f"available={allocator.available_size()}. Either raise "
+                f"--mem-fraction-static, lower --max-running-requests, or "
+                f"check that DSV4NPUTokenToKVPoolAllocator.free(req=...) is "
+                f"releasing state slots on req finish."
+            )
+        return result
 
     def _alloc_c_extend(
         self,
@@ -249,6 +408,16 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         extend_num_tokens: int,
         *,
         req_pool_indices: Optional[torch.Tensor] = None,
+        c4_state_prefix_lens: Optional[torch.Tensor] = None,
+        c4_state_prefix_lens_cpu: Optional[torch.Tensor] = None,
+        c4_state_seq_lens: Optional[torch.Tensor] = None,
+        c4_state_seq_lens_cpu: Optional[torch.Tensor] = None,
+        c4_state_extend_num_tokens: Optional[int] = None,
+        c128_state_prefix_lens: Optional[torch.Tensor] = None,
+        c128_state_prefix_lens_cpu: Optional[torch.Tensor] = None,
+        c128_state_seq_lens: Optional[torch.Tensor] = None,
+        c128_state_seq_lens_cpu: Optional[torch.Tensor] = None,
+        c128_state_extend_num_tokens: Optional[int] = None,
     ):
         out_full_loc = super().alloc_extend(
             prefix_lens,
@@ -295,11 +464,45 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             ratio=128,
         )
 
+        # State-pool extends: tail-only per-req allocation. ScheduleBatch's
+        # ``_compute_dsv4_state_lens_extend`` precomputes per-pool prefix /
+        # seq tensors (in state-pool cumulative slot space) and the sum
+        # extend_num_tokens. We pass them through to ``_alloc_state_extend``
+        # which feeds the underlying paged allocator.
+        assert c4_state_seq_lens is not None and c128_state_seq_lens is not None, (
+            "DSV4NPUTokenToKVPoolAllocator.alloc_extend requires "
+            "c{4,128}_state_{prefix,seq}_lens kwargs (set by "
+            "ScheduleBatch._compute_dsv4_state_lens_extend / forwarded by "
+            "alloc_paged_token_slots_extend's dsv4_state_kwargs)."
+        )
+        out_c4_state_loc = self._alloc_state_extend(
+            self.c4_state_attn_allocator,
+            prefix_lens,
+            c4_state_prefix_lens, c4_state_prefix_lens_cpu,
+            c4_state_seq_lens, c4_state_seq_lens_cpu,
+            req_pool_indices,
+            last_loc.dtype,
+            c4_state_extend_num_tokens,
+            ratio=4,
+        )
+        out_c128_state_loc = self._alloc_state_extend(
+            self.c128_state_attn_allocator,
+            prefix_lens,
+            c128_state_prefix_lens, c128_state_prefix_lens_cpu,
+            c128_state_seq_lens, c128_state_seq_lens_cpu,
+            req_pool_indices,
+            last_loc.dtype,
+            c128_state_extend_num_tokens,
+            ratio=128,
+        )
+
         self._last_dsv4_alloc = DSV4OutCacheLoc(
             out_full_loc=out_full_loc,
             out_swa_loc=out_swa_loc,
             out_c4_loc=out_c4_loc,
             out_c128_loc=out_c128_loc,
+            out_c4_state_loc=out_c4_state_loc,
+            out_c128_state_loc=out_c128_state_loc,
         )
         return out_full_loc
 
@@ -310,6 +513,16 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         last_loc: torch.Tensor,
         *,
         req_pool_indices: Optional[torch.Tensor] = None,
+        c4_state_prefix_lens: Optional[torch.Tensor] = None,
+        c4_state_prefix_lens_cpu: Optional[torch.Tensor] = None,
+        c4_state_seq_lens: Optional[torch.Tensor] = None,
+        c4_state_seq_lens_cpu: Optional[torch.Tensor] = None,
+        c4_state_extend_num_tokens: Optional[int] = None,
+        c128_state_prefix_lens: Optional[torch.Tensor] = None,
+        c128_state_prefix_lens_cpu: Optional[torch.Tensor] = None,
+        c128_state_seq_lens: Optional[torch.Tensor] = None,
+        c128_state_seq_lens_cpu: Optional[torch.Tensor] = None,
+        c128_state_extend_num_tokens: Optional[int] = None,
     ):
         out_full_loc = super().alloc_decode(seq_lens, seq_lens_cpu, last_loc)
         if out_full_loc is None:
@@ -349,11 +562,44 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             ratio=128,
         )
 
+        # State-pool decode: per-req cumulative slot lens precomputed by
+        # ScheduleBatch._compute_dsv4_state_lens_decode (each req +1 slot per
+        # pool). Raw prefix_lens (pre-decode seq_lens) drives the
+        # last_loc lookup at req_to_token_c{N}_state[req, pre_decode_seq_len-1].
+        assert c4_state_seq_lens is not None and c128_state_seq_lens is not None, (
+            "DSV4NPUTokenToKVPoolAllocator.alloc_decode requires "
+            "c{4,128}_state_{prefix,seq}_lens kwargs (set by "
+            "ScheduleBatch._compute_dsv4_state_lens_decode / forwarded by "
+            "alloc_paged_token_slots_decode's dsv4_state_kwargs)."
+        )
+        out_c4_state_loc = self._alloc_state_extend(
+            self.c4_state_attn_allocator,
+            prefix_lens,
+            c4_state_prefix_lens, c4_state_prefix_lens_cpu,
+            c4_state_seq_lens, c4_state_seq_lens_cpu,
+            req_pool_indices,
+            last_loc.dtype,
+            c4_state_extend_num_tokens,
+            ratio=4,
+        )
+        out_c128_state_loc = self._alloc_state_extend(
+            self.c128_state_attn_allocator,
+            prefix_lens,
+            c128_state_prefix_lens, c128_state_prefix_lens_cpu,
+            c128_state_seq_lens, c128_state_seq_lens_cpu,
+            req_pool_indices,
+            last_loc.dtype,
+            c128_state_extend_num_tokens,
+            ratio=128,
+        )
+
         self._last_dsv4_alloc = DSV4OutCacheLoc(
             out_full_loc=out_full_loc,
             out_swa_loc=out_swa_loc,
             out_c4_loc=out_c4_loc,
             out_c128_loc=out_c128_loc,
+            out_c4_state_loc=out_c4_state_loc,
+            out_c128_state_loc=out_c128_state_loc,
         )
         return out_full_loc
 
@@ -369,6 +615,16 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     def c128_available_size(self):
         return self.c128_attn_allocator.available_size()
+
+    def c4_state_available_size(self) -> int:
+        if self.c4_state_attn_allocator is None:
+            return 0
+        return self.c4_state_attn_allocator.available_size()
+
+    def c128_state_available_size(self) -> int:
+        if self.c128_state_attn_allocator is None:
+            return 0
+        return self.c128_state_attn_allocator.available_size()
 
     def free(
         self,
@@ -418,6 +674,41 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             c128_slots = req_to_token_pool.req_to_token_c128[req_pool_idx, :c128_n]
             self.c128_attn_allocator.free(c128_slots.to(torch.int64))
 
+        # State pool slots are 1-per-raw-token. Free only the tail
+        # ``[c{N}_state_alloc_offset, kv_len)`` — the prefix
+        # ``[0, c{N}_state_alloc_offset)`` was already returned by
+        # ScheduleBatch._evict_swa as SWA evicted the corresponding raw
+        # KV slots (state ride-along eviction). Without that offset we
+        # double-free, which the paged allocator's debug_mode assert
+        # catches (and corrupts the free list either way).
+        c4_state_off = getattr(req, "c4_state_alloc_offset", 0)
+        c128_state_off = getattr(req, "c128_state_alloc_offset", 0)
+        if (
+            self.c4_state_attn_allocator is not None
+            and hasattr(req_to_token_pool, "req_to_token_c4_state")
+            and kv_len > c4_state_off
+        ):
+            c4_state_slots = req_to_token_pool.req_to_token_c4_state[
+                req_pool_idx, c4_state_off:kv_len
+            ]
+            self.c4_state_attn_allocator.free(c4_state_slots.to(torch.int64))
+            if self.c4_index_state_attn_allocator is not None:
+                # Indexer state slot ids share the c4_state table (NPU
+                # convention); separate allocator pool space, freed in
+                # parallel.
+                self.c4_index_state_attn_allocator.free(
+                    c4_state_slots.to(torch.int64)
+                )
+        if (
+            self.c128_state_attn_allocator is not None
+            and hasattr(req_to_token_pool, "req_to_token_c128_state")
+            and kv_len > c128_state_off
+        ):
+            c128_state_slots = req_to_token_pool.req_to_token_c128_state[
+                req_pool_idx, c128_state_off:kv_len
+            ]
+            self.c128_state_attn_allocator.free(c128_state_slots.to(torch.int64))
+
     def clear(self):
         super().clear()
         # SWATokenToKVPoolAllocator.__init__ calls self.clear() at line 375,
@@ -428,4 +719,11 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.c4_attn_allocator.clear()
         if hasattr(self, "c128_attn_allocator"):
             self.c128_attn_allocator.clear()
+        # State allocators may be None (no c{N} layers in this model config).
+        if getattr(self, "c4_state_attn_allocator", None) is not None:
+            self.c4_state_attn_allocator.clear()
+        if getattr(self, "c128_state_attn_allocator", None) is not None:
+            self.c128_state_attn_allocator.clear()
+        if getattr(self, "c4_index_state_attn_allocator", None) is not None:
+            self.c4_index_state_attn_allocator.clear()
         self._last_dsv4_alloc = None
