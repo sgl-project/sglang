@@ -1189,6 +1189,9 @@ module.exports = {
             ['fm-document-forge', 'fm_document_forge',  '30M'],
             ['fm-social-manager', 'fm_social_manager',  '30M'],
             ['fm-inventory',      'fm_inventory_manager','30M'],
+            ['fm-crm',            'fm_crm_engine',      '35M'],
+            ['fm-cloud-storage',  'fm_cloud_storage',   '30M'],
+            ['fm-search',         'fm_search_engine',   '30M'],
         ].map(([name, script, mem]) => ({
             name,
             script:            `agents/${script}.py`,

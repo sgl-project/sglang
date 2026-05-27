@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     105,
+        "agents":     108,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -219,6 +219,9 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "document_forge":    7857,
             "social_manager":    7858,
             "inventory_manager": 7859,
+            "crm_engine":        7860,
+            "cloud_storage":     7861,
+            "search_engine":     7862,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -525,6 +528,9 @@ _INTENTS = {
     "doc_generate":            lambda a, k: {"action": "doc_generate_queued", "doc_type": k.get("doc_type", "invoice"), "recipient_email": k.get("recipient_email", ""), "variables": k.get("variables", {})},
     "social_post":             lambda a, k: {"action": "social_post_queued", "platform": k.get("platform", "twitter"), "content": k.get("content", ""), "scheduled_for": k.get("scheduled_for", None)},
     "inventory_adjust":        lambda a, k: {"action": "inventory_adjust_queued", "sku": k.get("sku", ""), "quantity": k.get("quantity", 0), "reason": k.get("reason", "")},
+    "crm_contact":             lambda a, k: {"action": "crm_contact_queued", "email": k.get("email", ""), "lifecycle_stage": k.get("lifecycle_stage", "lead"), "source": k.get("source", "mesh")},
+    "storage_upload":          lambda a, k: {"action": "storage_upload_queued", "key": k.get("key", ""), "backend": k.get("backend", "auto")},
+    "web_search":              lambda a, k: {"action": "web_search_queued", "query": k.get("query", ""), "backends": k.get("backends", "all"), "limit": k.get("limit", 10)},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
