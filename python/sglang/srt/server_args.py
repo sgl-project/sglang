@@ -2360,7 +2360,7 @@ class ServerArgs:
                 support_mamba_cache=True,
                 support_mamba_cache_extra_buffer=True,
             )
-        elif model_arch in ["NemotronHForCausalLM"]:
+        elif model_arch in ["NemotronHForCausalLM", "NemotronHPuzzleForCausalLM"]:
             from sglang.srt.arg_groups.nemotron_h_hook import (
                 apply_nemotron_h_defaults,
             )
