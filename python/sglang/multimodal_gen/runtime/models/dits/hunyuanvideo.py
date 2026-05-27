@@ -411,12 +411,20 @@ class MMSingleStreamBlock(nn.Module):
         # route through the fused QK-Norm + RoPE kernel in a single in-place
         # pass (replacing the prior 2x RMSNorm + 2x _apply_rotary_emb pattern)
         # and the text portion through the fused QK-Norm only kernel.
+        #
+        # Only Q and K need contiguous tensors: the fused kernel only mutates
+        # those (see `mutates_args=["q", "k"]` on `fused_inplace_qknorm_rope`).
+        # The V tensors stay as strided views -- ``UlyssesAttention.forward``
+        # does ``torch.cat([q, k, v], dim=0)`` downstream, which handles
+        # non-contiguous inputs fine and avoids two unnecessary full-size
+        # copies per single-stream block (~2x extra HBM traffic at LTX-2 /
+        # HunyuanVideo shapes).
         img_q = qkv[:, :img_len, 0].contiguous()
         img_k = qkv[:, :img_len, 1].contiguous()
-        img_v = qkv[:, :img_len, 2].contiguous()
+        img_v = qkv[:, :img_len, 2]
         txt_q = qkv[:, img_len:, 0].contiguous()
         txt_k = qkv[:, img_len:, 1].contiguous()
-        txt_v = qkv[:, img_len:, 2].contiguous()
+        txt_v = qkv[:, img_len:, 2]
 
         cos, sin = freqs_cis
         cos_sin_cache = torch.cat(
