@@ -38,8 +38,11 @@ from common.attention_methods.dsv4_attention import (  # noqa: E402
 from common.runner_modes.cuda_graph_decode_runner import (  # noqa: E402
     run_dsv4_cuda_graph_decode_case,
 )
-from common.runner_modes.eagle_draft_runner import (  # noqa: E402
+from common.runner_modes.speculative_draft_runner import (
+    # noqa: E402
     run_dsv4_eagle_draft_cuda_graph_runner_case,
+)
+from common.runner_modes.speculative_draft_extend_runner import (
     run_dsv4_eagle_draft_extend_cuda_graph_runner_case,
 )
 from common.runner_modes.speculative_draft_extend_runner import (  # noqa: E402
