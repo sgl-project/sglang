@@ -189,6 +189,7 @@ class BaseTpWorker(ABC):
                 recv_req.dtypes,
                 recv_req.shapes,
                 recv_req.group_name,
+                recv_req.load_format,
             )
         else:
             success, message = self.model_runner.update_weights_from_distributed(

@@ -1476,6 +1476,8 @@ class UpdateRelayWeightsFromDistributedReqInput(BaseReq):
     flush_cache: bool = True
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
+    # Optional format specification for loading
+    load_format: Optional[str] = None
 
 
 @dataclass

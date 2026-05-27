@@ -293,29 +293,9 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 
 logger = logging.getLogger(__name__)
 
-WEIGHT_SYNC_P2P_OPS_PER_BATCH = int(os.environ.get("WEIGHT_SYNC_P2P_OPS_PER_BATCH", 64))
 WEIGHT_SYNC_MAX_PENDING_RELAY_BYTES = int(
     os.environ.get("WEIGHT_SYNC_MAX_PENDING_RELAY_BYTES", 8 * 1024 * 1024 * 1024)
 )
-
-
-def _run_weight_sync_p2p_ops(ops):
-    ops_per_batch = WEIGHT_SYNC_P2P_OPS_PER_BATCH
-
-    batch = []
-
-    def flush_batch():
-        if not batch:
-            return
-        for work in dist.batch_isend_irecv(batch):
-            work.wait()
-        batch.clear()
-
-    for op in ops:
-        batch.append(op)
-        if len(batch) >= ops_per_batch:
-            flush_batch()
-    flush_batch()
 
 
 def resolve_language_model(model: nn.Module) -> nn.Module:
@@ -2358,7 +2338,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(error_msg)
             return False, error_msg
 
-    def update_relay_weights_from_distributed(self, names, dtypes, shapes, group_name):
+    def update_relay_weights_from_distributed(
+        self, names, dtypes, shapes, group_name, load_format: Optional[str] = None
+    ):
         total_bytes = 0
         weight_specs = []
         for name, dtype, shape in zip(names, dtypes, shapes):
@@ -2368,13 +2350,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             numel = 1
             for dim in shape:
                 numel *= dim
-            total_bytes += numel * torch.empty((), dtype=target_dtype).element_size()
-            weight_specs.append((name, target_dtype, shape))
+            tensor_bytes = numel * torch.empty((), dtype=target_dtype).element_size()
+            total_bytes += tensor_bytes
+            weight_specs.append((name, target_dtype, shape, tensor_bytes))
 
         reserved_pending_bytes = False
         try:
+            if load_format not in (None, "flattened_bucket"):
+                raise NotImplementedError(f"Unknown load_format={load_format}")
+
             relay_weight_loader = self._get_relay_weight_loader()
             is_receiver = self.tp_rank == 0
+            send_group = None
             if is_receiver:
                 if group_name not in self._model_update_group:
                     message = (
@@ -2387,24 +2374,43 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             relay_weight_loader.reserve(total_bytes)
             reserved_pending_bytes = True
-            weights = []
             recv_ops = []
-            for name, target_dtype, shape in weight_specs:
-                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
+            if load_format == "flattened_bucket":
+                flattened_tensor = torch.empty(
+                    total_bytes, dtype=torch.uint8, device=self.device
+                )
                 if is_receiver:
                     recv_ops.append(
                         dist.P2POp(
                             dist.irecv,
-                            weight,
+                            flattened_tensor,
                             group=send_group,
                             group_peer=0,
                         )
                     )
-                weights.append((name, weight))
+                weights = self._reconstruct_flattened_weight_specs(
+                    flattened_tensor=flattened_tensor,
+                    weight_specs=weight_specs,
+                )
+            else:
+                weights = []
+                for name, target_dtype, shape, _tensor_bytes in weight_specs:
+                    weight = torch.empty(shape, dtype=target_dtype, device=self.device)
+                    if is_receiver:
+                        recv_ops.append(
+                            dist.P2POp(
+                                dist.irecv,
+                                weight,
+                                group=send_group,
+                                group_peer=0,
+                            )
+                        )
+                    weights.append((name, weight))
             if recv_ops:
                 assert self._relay_weight_dist_lock is not None
                 with self._relay_weight_dist_lock:
-                    _run_weight_sync_p2p_ops(recv_ops)
+                    for work in dist.batch_isend_irecv(recv_ops):
+                        work.wait()
                 # The background loader runs in another Python thread with its
                 # own default stream. Make the P2P writes visible before handing
                 # the tensors to that thread.
@@ -2423,6 +2429,46 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             logger.error(error_msg)
             return False, error_msg
+
+    @staticmethod
+    def _reconstruct_flattened_weight_specs(flattened_tensor, weight_specs):
+        metadata = []
+        start_idx = 0
+        for name, target_dtype, shape, tensor_bytes in weight_specs:
+            end_idx = start_idx + tensor_bytes
+            metadata.append(
+                FlattenedTensorMetadata(
+                    name=name,
+                    shape=torch.Size(shape),
+                    dtype=target_dtype,
+                    start_idx=start_idx,
+                    end_idx=end_idx,
+                    numel=tensor_bytes,
+                )
+            )
+            start_idx = end_idx
+        return ModelRunner._reconstruct_flattened_tensors(
+            flattened_tensor=flattened_tensor,
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def _reconstruct_flattened_tensors(flattened_tensor, metadata):
+        converted_metadata = [
+            FlattenedTensorMetadata(
+                name=meta.name,
+                shape=meta.shape,
+                dtype=meta.dtype,
+                start_idx=meta.start_idx,
+                end_idx=meta.end_idx,
+                numel=meta.numel,
+            )
+            for meta in metadata
+        ]
+        return FlattenedTensorBucket(
+            flattened_tensor=flattened_tensor,
+            metadata=converted_metadata,
+        ).reconstruct_tensors()
 
     def _update_bucketed_weights_from_distributed(
         self, names, dtypes, shapes, group_name
@@ -2490,25 +2536,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Handle flattened bucket format for weight updates"""
         flattened_tensor = flattened_tensor_bucket_dict["flattened_tensor"]
         metadata = flattened_tensor_bucket_dict["metadata"]
-
-        # Convert metadata dict to our format
-        converted_metadata = []
-        for meta in metadata:
-            converted_meta = FlattenedTensorMetadata(
-                name=meta.name,
-                shape=meta.shape,
-                dtype=meta.dtype,
-                start_idx=meta.start_idx,
-                end_idx=meta.end_idx,
-                numel=meta.numel,
-            )
-            converted_metadata.append(converted_meta)
-
-        # Create bucket and reconstruct tensors
-        bucket = FlattenedTensorBucket(
-            flattened_tensor=flattened_tensor, metadata=converted_metadata
+        reconstructed_tensors = self._reconstruct_flattened_tensors(
+            flattened_tensor=flattened_tensor,
+            metadata=metadata,
         )
-        reconstructed_tensors = bucket.reconstruct_tensors()
 
         # Load the reconstructed tensors using the standard method
         self.model.load_weights(reconstructed_tensors)
