@@ -336,6 +336,7 @@ def align_evict_mask_to_page_size(
         tl.store(evict_mask + bid * num_draft_tokens + i, False)
 
 
+@torch.compile(dynamic=True, disable=_is_npu)
 def get_src_tgt_cache_loc(
     seq_lens: torch.Tensor,
     out_cache_loc: torch.Tensor,
@@ -345,7 +346,9 @@ def get_src_tgt_cache_loc(
     page_size: int,
 ):
     src_cache_loc = out_cache_loc[accept_index]
-    tgt_cache_loc = torch.empty_like(src_cache_loc)
+    # zeros_like, not empty_like: any uncovered tail stays at slot 0 (padding)
+    # instead of caching-allocator garbage.
+    tgt_cache_loc = torch.zeros_like(src_cache_loc)
     extended_len = seq_lens + draft_token_num
     keep_len = torch.minimum(
         (seq_lens + num_correct_drafts + 1 + page_size - 1) // page_size * page_size,
