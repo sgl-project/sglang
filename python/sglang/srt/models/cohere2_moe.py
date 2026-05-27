@@ -26,6 +26,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -355,13 +356,14 @@ class Cohere2MoeSparseMoeBlock(nn.Module):
         (flashinfer_cutlass) for big batches.
         ``topk_output`` is a StandardTopKOutput(topk_weights, topk_ids, router_logits).
         """
-        # _small_batch_moe calls fused_experts with no quant args, so it only
-        # works for unquantized weights. For fp8/int8 it would feed a bf16
-        # activation into an fp8-weight tl.dot ("Unsupported rhs dtype fp8e4nv"
-        # on SM100); route those through the standard runner instead.
-        is_unquantized = self.experts.w13_weight.dtype not in (
-            torch.float8_e4m3fn,
-            torch.int8,
+        # _small_batch_moe calls fused_experts with raw weights and no quant
+        # args, so it is only valid for the unquantized method. Any quantized
+        # scheme (fp8, int8, W4A4/NVFP4/MXFP4 packed into uint8, AWQ/GPTQ, ...)
+        # must go through the standard runner, which applies the scales and the
+        # packed weight layout. Keying off quant_method (not weight dtype) covers
+        # all of them — a dtype denylist misses the uint8-packed 4-bit formats.
+        is_unquantized = isinstance(
+            self.experts.quant_method, UnquantizedFusedMoEMethod
         )
         if hidden_states.shape[0] <= _NATIVE_MOE_BATCH_THRESHOLD and is_unquantized:
             return _small_batch_moe(self.experts, hidden_states, topk_output)
