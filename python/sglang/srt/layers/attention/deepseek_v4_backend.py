@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import enum
 import functools
+import json
 import logging
+import os
+import time
+import urllib.request
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -53,7 +57,6 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import ceil_align
 
@@ -68,6 +71,85 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
+
+
+# #region debug-point online-c128:report
+def _debug_online_c128_event(
+    hypothesis_id: str,
+    location: str,
+    msg: str,
+    data: Optional[Dict] = None,
+) -> None:
+    if os.environ.get("SGLANG_DEBUG_ONLINE_C128_MTP") != "1":
+        return
+    url = os.environ.get("DEBUG_SERVER_URL", "http://127.0.0.1:7777/event")
+    session_id = os.environ.get("DEBUG_SESSION_ID", "cuda-illegal-address")
+    env_path = os.environ.get(
+        "SGLANG_DEBUG_ONLINE_C128_ENV", ".dbg/cuda-illegal-address.env"
+    )
+    try:
+        with open(env_path) as f:
+            for line in f:
+                if line.startswith("DEBUG_SERVER_URL="):
+                    url = line.split("=", 1)[1].strip()
+                elif line.startswith("DEBUG_SESSION_ID="):
+                    session_id = line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    payload = {
+        "sessionId": session_id,
+        "runId": os.environ.get("SGLANG_DEBUG_RUN_ID", "pre-fix"),
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "msg": f"[DEBUG] {msg}",
+        "data": data or {},
+        "ts": int(time.time() * 1000),
+    }
+    if os.environ.get("SGLANG_DEBUG_ONLINE_C128_LOGGER") == "1":
+        logger.warning(
+            "[DEBUG][online-c128][%s] %s %s",
+            hypothesis_id,
+            location,
+            json.dumps(payload, default=str, ensure_ascii=False),
+        )
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(
+                url,
+                data=json.dumps(payload, default=str).encode(),
+                headers={"Content-Type": "application/json"},
+            ),
+            timeout=0.2,
+        ).read()
+    except Exception:
+        pass
+
+
+def _debug_online_c128_sync(location: str, data: Optional[Dict] = None) -> None:
+    if os.environ.get("SGLANG_DEBUG_ONLINE_C128_SYNC") != "1":
+        return
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            _debug_online_c128_event(
+                "D",
+                location,
+                "skip cuda synchronize during cuda graph capture",
+                data,
+            )
+            return
+        torch.cuda.synchronize()
+        _debug_online_c128_event("D", location, "cuda synchronize ok", data)
+    except Exception as e:
+        _debug_online_c128_event(
+            "D",
+            location,
+            "cuda synchronize failed",
+            {"error": repr(e), **(data or {})},
+        )
+        raise
+
+
+# #endregion
 
 
 T = TypeVar("T", bound=Optional[torch.Tensor])
@@ -292,6 +374,8 @@ class DSV4RawVerifyMetadata:
     out_cache_loc: torch.Tensor
 
     extend_seq_lens: Optional[torch.Tensor] = None
+    seq_lens_host: Optional[torch.Tensor] = None
+    extend_seq_lens_host: Optional[torch.Tensor] = None
 
     def copy_(self, other: DSV4RawVerifyMetadata):
         self.req_pool_indices.copy_(other.req_pool_indices)
@@ -299,6 +383,8 @@ class DSV4RawVerifyMetadata:
         self.out_cache_loc.copy_(other.out_cache_loc)
 
         self.extend_seq_lens = other.extend_seq_lens
+        self.seq_lens_host = other.seq_lens_host
+        self.extend_seq_lens_host = other.extend_seq_lens_host
 
 
 @dataclass
@@ -329,6 +415,19 @@ class _GraphBucket(enum.Enum):
         raise NotImplementedError(f"unsupported {forward_mode=}")
 
 
+@dataclass
+class _OnlineC128VerifyLayerState:
+    pre_state: torch.Tensor
+    kv_score_input: Optional[torch.Tensor] = None
+
+
+@dataclass
+class _OnlineC128VerifyContext:
+    req_pool_indices: torch.Tensor
+    seq_lens: torch.Tensor
+    layer_states: Dict[int, _OnlineC128VerifyLayerState] = field(default_factory=dict)
+
+
 class DeepseekV4AttnBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
@@ -341,6 +440,7 @@ class DeepseekV4AttnBackend(
         speculative_num_steps=0,
     ):
         super().__init__()
+        self.model_runner = model_runner
         self.device = torch.device(model_runner.device)
         head_dim = model_runner.model_config.head_dim
         assert (
@@ -355,10 +455,8 @@ class DeepseekV4AttnBackend(
         self.page_size = model_runner.page_size
         assert self.page_size == 256, "the system hardcodes page_size=256"
 
-        self.req_to_token_pool = model_runner.req_to_token_pool
-        self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
-        self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -380,10 +478,367 @@ class DeepseekV4AttnBackend(
             DSV4RawDecodeMetadata,
         ] = None
         self._replay_forward_batch: Optional[ForwardBatch] = None  # FIXME: out-of-band
+        self._online_c128_verify_ctx: Optional[_OnlineC128VerifyContext] = None
+        self._online_c128_kv_score_refs: Dict[int, torch.Tensor] = {}
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
         return pin_tensor.to(self.device, non_blocking=True)
+
+    def _to_pinned_cpu_i64(self, x: torch.Tensor) -> torch.Tensor:
+        pinned = torch.empty(
+            x.shape, dtype=torch.int64, device="cpu", pin_memory=True
+        )
+        pinned.copy_(x.to(torch.int64), non_blocking=False)
+        return pinned
+
+    def _online_c128_mtp_enabled(self) -> bool:
+        return (
+            envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+            and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+            and self.mtp_enabled
+        )
+
+    def _clear_online_c128_verify_context(self) -> None:
+        self._online_c128_verify_ctx = None
+
+    def _set_online_c128_verify_context(
+        self, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor
+    ) -> None:
+        if not self._online_c128_mtp_enabled():
+            self._online_c128_verify_ctx = None
+            return
+        self._online_c128_verify_ctx = _OnlineC128VerifyContext(
+            req_pool_indices=req_pool_indices.detach(),
+            seq_lens=seq_lens.detach(),
+        )
+        _debug_online_c128_event(
+            "C",
+            "deepseek_v4_backend:_set_online_c128_verify_context",
+            "set verify context",
+            {
+                "req_pool_indices_shape": list(req_pool_indices.shape),
+                "seq_lens_shape": list(seq_lens.shape),
+                "seq_lens_head": seq_lens[:8].detach().cpu().tolist(),
+            },
+        )
+        self._prepare_online_c128_verify_layers()
+
+    def _get_chunk_slot_indices(
+        self, req_pool_indices: torch.Tensor, chunk_starts: torch.Tensor
+    ) -> torch.Tensor:
+        req_pool_indices_i64 = req_pool_indices.to(torch.int64)
+        chunk_starts_i64 = chunk_starts.to(torch.int64)
+        full_loc = self.req_to_token[req_pool_indices_i64, chunk_starts_i64]
+        full_to_swa = self.token_to_kv_pool.full_to_swa_index_mapping.detach()
+        swa_loc = full_to_swa[full_loc].to(torch.int64)
+        return swa_loc // self.token_to_kv_pool.swa_page_size
+
+    def _get_online_c128_layer_state(
+        self, layer_id: int
+    ) -> Optional[_OnlineC128VerifyLayerState]:
+        ctx = self._online_c128_verify_ctx
+        if ctx is None:
+            return None
+        return ctx.layer_states.get(layer_id)
+
+    def _iter_online_c128_layers(self):
+        for layer in self.model_runner.model.model.layers:
+            attn = getattr(layer, "self_attn", None)
+            compressor = getattr(attn, "compressor", None)
+            if compressor is not None and compressor.ratio == 128:
+                yield compressor.layer_id, compressor
+
+    def _prepare_online_c128_verify_layers(self) -> None:
+        ctx = self._online_c128_verify_ctx
+        if ctx is None:
+            return
+
+        bs = ctx.seq_lens.shape[0]
+        has_partial = (ctx.seq_lens > 0) & ((ctx.seq_lens % 128) != 0)
+        slots = None
+        if has_partial.any():
+            chunk_starts = ((ctx.seq_lens[has_partial].to(torch.int64) - 1) // 128) * 128
+            slots = self._get_chunk_slot_indices(
+                req_pool_indices=ctx.req_pool_indices[has_partial],
+                chunk_starts=chunk_starts,
+            )
+            _debug_online_c128_event(
+                "A",
+                "deepseek_v4_backend:_prepare_online_c128_verify_layers",
+                "prepare partial state slots",
+                {
+                    "bs": int(bs),
+                    "num_partial": int(has_partial.sum().item()),
+                    "chunk_starts_head": chunk_starts[:8].detach().cpu().tolist(),
+                    "slots_head": slots[:8].detach().cpu().tolist(),
+                },
+            )
+
+        for layer_id, compressor in self._iter_online_c128_layers():
+            temp_pool = self.token_to_kv_pool.get_temp_attention_compress_states(layer_id)
+            pre_state = torch.zeros(
+                (bs, compressor.head_dim * 3),
+                dtype=temp_pool.kv_score_buffer.kv_score.dtype,
+                device=temp_pool.kv_score_buffer.kv_score.device,
+            )
+            if has_partial.any():
+                main_pool = self.token_to_kv_pool.get_attention_compress_states(layer_id)
+                assert slots is not None
+                main_state = main_pool.kv_score_buffer.kv_score[slots].clone()
+                pre_state[has_partial] = main_state
+                temp_pool.kv_score_buffer.kv_score[slots] = main_state
+            ctx.layer_states[layer_id] = _OnlineC128VerifyLayerState(
+                pre_state=pre_state,
+                kv_score_input=self._online_c128_kv_score_refs.get(layer_id),
+            )
+
+    def get_override_compress_state_pool(
+        self,
+        compressor,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        forward_batch: ForwardBatch,
+    ):
+        if (
+            not self._online_c128_mtp_enabled()
+            or forward_batch.forward_mode != ForwardMode.TARGET_VERIFY
+            or compressor.is_in_indexer
+            or compressor.ratio != 128
+        ):
+            return None
+
+        ctx = self._online_c128_verify_ctx
+        if ctx is None:
+            self._set_online_c128_verify_context(
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens.to(torch.int32),
+            )
+            ctx = self._online_c128_verify_ctx
+            assert ctx is not None
+
+        layer_state = ctx.layer_states.get(compressor.layer_id)
+        temp_pool = token_to_kv_pool.get_temp_attention_compress_states(compressor.layer_id)
+        if layer_state is None:
+            self._prepare_online_c128_verify_layers()
+        return temp_pool
+
+    def capture_online_c128_verify_inputs(
+        self,
+        layer_id: int,
+        compressor,
+        kv_score_input: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        if (
+            not self._online_c128_mtp_enabled()
+            or forward_batch.forward_mode != ForwardMode.TARGET_VERIFY
+            or compressor.is_in_indexer
+            or compressor.ratio != 128
+        ):
+            return
+        layer_state = self._get_online_c128_layer_state(layer_id)
+        if layer_state is None:
+            return
+        if (
+            layer_state.kv_score_input is None
+            or layer_state.kv_score_input.shape != kv_score_input.shape
+        ):
+            layer_state.kv_score_input = kv_score_input.detach().clone()
+        else:
+            layer_state.kv_score_input.copy_(kv_score_input)
+        self._online_c128_kv_score_refs[layer_id] = layer_state.kv_score_input
+        _debug_online_c128_event(
+            "C",
+            "deepseek_v4_backend:capture_online_c128_verify_inputs",
+            "captured verify kv_score_input",
+            {
+                "layer_id": int(layer_id),
+                "kv_score_shape": list(kv_score_input.shape),
+                "cached_shape": list(layer_state.kv_score_input.shape),
+                "forward_mode": str(forward_batch.forward_mode),
+            },
+        )
+        _debug_online_c128_sync(
+            "deepseek_v4_backend:capture_online_c128_verify_inputs",
+            {"layer_id": int(layer_id)},
+        )
+
+    def update_online_c128_state_after_mtp_verify(
+        self,
+        accept_lens: torch.Tensor,
+        model,
+    ) -> None:
+        if not self._online_c128_mtp_enabled():
+            return
+
+        ctx = self._online_c128_verify_ctx
+        if ctx is None or accept_lens.numel() == 0:
+            self._clear_online_c128_verify_context()
+            return
+
+        accept_lens_i64 = accept_lens.to(torch.int64)
+        actual_bs = accept_lens_i64.shape[0]
+        num_verify_tokens = int(self.speculative_num_draft_tokens)
+        accepted_kv_lens_all = torch.minimum(
+            accept_lens_i64,
+            torch.full_like(accept_lens_i64, num_verify_tokens),
+        )
+        _debug_online_c128_event(
+            "E",
+            "deepseek_v4_backend:update_online_c128_state_after_mtp_verify",
+            "commit start",
+            {
+                "accept_lens": accept_lens_i64.detach().cpu().tolist(),
+                "accepted_kv_lens": accepted_kv_lens_all.detach().cpu().tolist(),
+                "actual_bs": int(actual_bs),
+                "ctx_seq_lens_shape": list(ctx.seq_lens.shape),
+                "ctx_req_pool_shape": list(ctx.req_pool_indices.shape),
+                "num_verify_tokens": int(num_verify_tokens),
+            },
+        )
+
+        for layer in model.model.layers:
+            attn = getattr(layer, "self_attn", None)
+            compressor = getattr(attn, "compressor", None)
+            if compressor is None or compressor.ratio != 128:
+                continue
+
+            layer_state = ctx.layer_states.get(compressor.layer_id)
+            if layer_state is None or layer_state.kv_score_input is None:
+                continue
+
+            kv_score_input = layer_state.kv_score_input
+            head_dim = compressor.head_dim
+            if kv_score_input.numel() == 0:
+                continue
+
+            total_bs = kv_score_input.numel() // (num_verify_tokens * head_dim * 2)
+            layer_bs = min(
+                actual_bs,
+                ctx.seq_lens.shape[0],
+                ctx.req_pool_indices.shape[0],
+                layer_state.pre_state.shape[0],
+                total_bs,
+            )
+            if layer_bs == 0:
+                continue
+
+            accept_lens_layer = accept_lens_i64[:layer_bs]
+            seq_lens_before = ctx.seq_lens[:layer_bs].to(torch.int64)
+            req_pool_indices = ctx.req_pool_indices[:layer_bs]
+            kv_score_steps = kv_score_input.view(total_bs, num_verify_tokens, head_dim * 2)[
+                :layer_bs
+            ]
+            bias = compressor.ape.view(128, head_dim).to(kv_score_steps.dtype)
+
+            pre_state = layer_state.pre_state[:layer_bs]
+            run_max = pre_state[:, :head_dim].to(kv_score_steps.dtype).clone()
+            run_sum = pre_state[:, head_dim : 2 * head_dim].to(
+                kv_score_steps.dtype
+            ).clone()
+            run_kv = pre_state[:, 2 * head_dim :].to(kv_score_steps.dtype).clone()
+            if layer_bs != actual_bs or total_bs != actual_bs:
+                _debug_online_c128_event(
+                    "A",
+                    "deepseek_v4_backend:update_online_c128_state_after_mtp_verify",
+                    "batch size mismatch before commit",
+                    {
+                        "layer_id": int(compressor.layer_id),
+                        "actual_bs": int(actual_bs),
+                        "layer_bs": int(layer_bs),
+                        "total_bs": int(total_bs),
+                        "ctx_seq_lens_bs": int(ctx.seq_lens.shape[0]),
+                        "pre_state_bs": int(layer_state.pre_state.shape[0]),
+                        "kv_score_shape": list(kv_score_input.shape),
+                    },
+                )
+
+            start_positions = (seq_lens_before % 128).to(torch.int64)
+            for step in range(num_verify_tokens):
+                active = step < accept_lens_layer
+                if not active.any():
+                    break
+
+                pos = (start_positions + step) % 128
+                kv_step = kv_score_steps[:, step, :head_dim]
+                score_step = kv_score_steps[:, step, head_dim:] + bias[pos]
+
+                start_new = active & (pos == 0)
+                if start_new.any():
+                    run_kv[start_new] = kv_step[start_new]
+                    run_max[start_new] = score_step[start_new]
+                    run_sum[start_new] = 1.0
+
+                cont = active & ~start_new
+                if cont.any():
+                    old_max = run_max[cont]
+                    old_sum = run_sum[cont]
+                    old_kv = run_kv[cont]
+                    new_score = score_step[cont]
+                    new_kv = kv_step[cont]
+                    new_max = torch.maximum(old_max, new_score)
+                    old_sum_scaled = old_sum * torch.exp(old_max - new_max)
+                    new_exp = torch.exp(new_score - new_max)
+                    new_sum = old_sum_scaled + new_exp
+                    run_kv[cont] = (
+                        old_kv * old_sum_scaled + new_kv * new_exp
+                    ) / new_sum
+                    run_max[cont] = new_max
+                    run_sum[cont] = new_sum
+
+                closed = active & (pos == 127)
+                if closed.any():
+                    run_max[closed] = 0
+                    run_sum[closed] = 0
+                    run_kv[closed] = 0
+
+            final_seq_lens = seq_lens_before + accept_lens_layer
+            has_partial = (accept_lens_layer > 0) & ((final_seq_lens % 128) != 0)
+            if not has_partial.any():
+                continue
+
+            chunk_starts = ((final_seq_lens[has_partial] - 1) // 128) * 128
+            slots = self._get_chunk_slot_indices(
+                req_pool_indices=req_pool_indices[has_partial],
+                chunk_starts=chunk_starts,
+            )
+            state_to_commit = torch.cat(
+                [
+                    run_max[has_partial],
+                    run_sum[has_partial],
+                    run_kv[has_partial],
+                ],
+                dim=-1,
+            ).to(layer_state.pre_state.dtype)
+            _debug_online_c128_event(
+                "A",
+                "deepseek_v4_backend:update_online_c128_state_after_mtp_verify",
+                "commit layer states",
+                {
+                    "layer_id": int(compressor.layer_id),
+                    "layer_bs": int(layer_bs),
+                    "num_commit": int(has_partial.sum().item()),
+                    "seq_before_head": seq_lens_before[:8].detach().cpu().tolist(),
+                    "accept_lens_head": accept_lens_layer[:8].detach().cpu().tolist(),
+                    "final_seq_head": final_seq_lens[:8].detach().cpu().tolist(),
+                    "chunk_starts_head": chunk_starts[:8].detach().cpu().tolist(),
+                    "slots_head": slots[:8].detach().cpu().tolist(),
+                },
+            )
+            main_pool = self.token_to_kv_pool.get_attention_compress_states(compressor.layer_id)
+            main_pool.kv_score_buffer.kv_score[slots] = state_to_commit
+            _debug_online_c128_sync(
+                "deepseek_v4_backend:update_online_c128_state_after_mtp_verify",
+                {"layer_id": int(compressor.layer_id), "num_commit": int(has_partial.sum().item())},
+            )
+
+        self._clear_online_c128_verify_context()
+        _debug_online_c128_event(
+            "A",
+            "deepseek_v4_backend:update_online_c128_state_after_mtp_verify",
+            "commit done",
+            {"actual_bs": int(actual_bs)},
+        )
 
     def init_forward_metadata_indexer(self, core_attn_metadata: DSV4AttnMetadata):
         return PagedIndexerMetadata(
@@ -508,12 +963,22 @@ class DeepseekV4AttnBackend(
                     [self.speculative_num_draft_tokens] * 1025, device=self.device
                 )
             extend_seq_lens = self.extend_seq_lens_buffer[: len(seq_lens)]
+            seq_lens_host = self._to_pinned_cpu_i64(seq_lens)
+            extend_seq_lens_host = torch.full(
+                (len(seq_lens),),
+                self.speculative_num_draft_tokens,
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=True,
+            )
 
             return DSV4RawVerifyMetadata(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc,
                 extend_seq_lens=extend_seq_lens,
+                seq_lens_host=seq_lens_host,
+                extend_seq_lens_host=extend_seq_lens_host,
             )
         else:
             seq_lens_cpu = seq_lens.tolist()
@@ -566,6 +1031,11 @@ class DeepseekV4AttnBackend(
         bs, num_draft_tokens = len(seq_lens), self.speculative_num_draft_tokens
         seq_lens = seq_lens + self.speculative_num_draft_tokens
         extend_seq_lens = raw_metadata.extend_seq_lens
+        seq_lens_host = raw_metadata.seq_lens_host
+        extend_seq_lens_host = raw_metadata.extend_seq_lens_host
+        assert seq_lens_host is not None
+        assert extend_seq_lens_host is not None
+        seq_lens_planner = seq_lens_host + self.speculative_num_draft_tokens
 
         seq_lens_casual, req_pool_indices_repeated = (
             self.expand_extend_with_same_length(
@@ -587,8 +1057,8 @@ class DeepseekV4AttnBackend(
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
             req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            extend_lens=extend_seq_lens,
+            seq_lens=seq_lens_planner,
+            extend_lens=extend_seq_lens_host,
             seq_lens_cpu=None,
             extend_lens_cpu=None,
             use_prefill_cuda_graph=True,
@@ -665,36 +1135,31 @@ class DeepseekV4AttnBackend(
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
+            self._clear_online_c128_verify_context()
             return
 
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens.to(torch.int32)
         seq_lens_cpu = forward_batch.seq_lens_cpu
-        assert self.req_to_token_pool.req_to_token is self.req_to_token
+        assert forward_batch.req_to_token_pool.req_to_token is self.req_to_token
 
         assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
         assert seq_lens_cpu is not None
         max_seq_len = int(seq_lens_cpu.max().item())
 
         if forward_batch.forward_mode.is_decode_or_idle():
-            # DSv4 bakes this step's KV write target (c4/c128) into metadata,
-            # so slice the shared multi-step out_cache_loc now rather than at
-            # forward time.
-            out_cache_loc = forward_batch.out_cache_loc
-            if self.topk > 0 and self.speculative_num_steps > 1:
-                out_cache_loc = per_step_draft_out_cache_loc(
-                    out_cache_loc,
-                    forward_batch.batch_size,
-                    self.topk,
-                    self.speculative_num_steps,
-                )[self.speculative_step_id]
+            self._clear_online_c128_verify_context()
             metadata = self.init_forward_metadata_decode(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
-                out_cache_loc=out_cache_loc,
+                out_cache_loc=forward_batch.out_cache_loc,
             )
         elif forward_batch.forward_mode.is_target_verify():
+            self._set_online_c128_verify_context(
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+            )
             metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
@@ -702,6 +1167,7 @@ class DeepseekV4AttnBackend(
                 out_cache_loc=forward_batch.out_cache_loc,
             )
         elif forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
+            self._clear_online_c128_verify_context()
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             extend_seq_lens = forward_batch.extend_seq_lens
             assert (
@@ -850,6 +1316,10 @@ class DeepseekV4AttnBackend(
                 out_cache_loc=out_cache_loc_padded,
             )
         elif bucket == _GraphBucket.TARGET_VERIFY:
+            self._set_online_c128_verify_context(
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+            )
             assert out_cache_loc is not None
             num_tokens = self.speculative_num_draft_tokens * bs
             out_cache_loc_padded = torch.nn.functional.pad(
@@ -866,6 +1336,7 @@ class DeepseekV4AttnBackend(
                 use_prefill_cuda_graph=True,
             )
         elif bucket == _GraphBucket.DRAFT_EXTEND:
+            self._clear_online_c128_verify_context()
             num_tokens_per_bs = self.draft_extend_num_tokens_per_bs
             temp_metadata = self.init_forward_metadata_draft_extend(
                 max_seq_len=chosen_max_seq_len,
@@ -876,6 +1347,7 @@ class DeepseekV4AttnBackend(
                 use_prefill_cuda_graph=True,
             )
         else:
+            self._clear_online_c128_verify_context()
             raise NotImplementedError
 
         self.replay_cuda_graph_metadata_from(
@@ -974,7 +1446,7 @@ class DeepseekV4AttnBackend(
         layer_id = layer.layer_id
         metadata = self.forward_metadata
         core_attn_metadata = metadata.core_attn_metadata
-        token_to_kv_pool = self.token_to_kv_pool
+        token_to_kv_pool = forward_batch.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
@@ -1197,6 +1669,7 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
     ):
         super().__init__(model_runner)
+        self.model_runner = model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.attn_backends: List[DeepseekV4AttnBackend] = []
@@ -1209,10 +1682,36 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
                     speculative_num_steps=self.speculative_num_steps,
                 )
             )
+    def _split_out_cache_loc_by_step(
+        self, out_cache_loc: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        if out_cache_loc is None:
+            return None
 
+        slots_per_req = self.topk * self.speculative_num_steps
+        assert out_cache_loc.numel() % slots_per_req == 0, (
+            "DeepSeekV4 EAGLE draft expects out_cache_loc to be laid out as "
+            f"[bs, topk, speculative_num_steps], got {out_cache_loc.shape=} "
+            f"{self.topk=} {self.speculative_num_steps=}"
+        )
+        num_reqs = out_cache_loc.numel() // slots_per_req
+        return (
+            out_cache_loc.reshape(num_reqs, self.topk, self.speculative_num_steps)
+            .permute(2, 0, 1)
+            .reshape(self.speculative_num_steps, -1)
+        )
+    
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata(forward_batch)
+        original_out_cache_loc = forward_batch.out_cache_loc
+        step_out_cache_loc = self._split_out_cache_loc_by_step(original_out_cache_loc)
+
+        try:
+            for i in range(self.speculative_num_steps - 1):
+                if step_out_cache_loc is not None:
+                    forward_batch.out_cache_loc = step_out_cache_loc[i]
+                self.attn_backends[i].init_forward_metadata(forward_batch)
+        finally:
+            forward_batch.out_cache_loc = original_out_cache_loc
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps):
@@ -1239,7 +1738,9 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
     ):
         if self.speculative_num_steps == 1:
             return
-
+        step_out_cache_loc = self._split_out_cache_loc_by_step(
+            forward_batch.out_cache_loc
+        )
         self.attn_backends[0]._replay_forward_batch = forward_batch
         self.attn_backends[0].init_forward_metadata_replay_cuda_graph(
             bs=bs,
