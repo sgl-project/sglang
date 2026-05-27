@@ -81,7 +81,7 @@ RUN ${PIP_INSTALL} memfabric-hybrid==1.0.8
 ### Install zbal
 RUN if [ "$TARGETARCH" = "arm64" ]; then \
       ${PIP_INSTALL} memfabric-zbal==1.1.1; \
-    fi \
+    fi
 
 ### Install SGLang Model Gateway
 RUN ${PIP_INSTALL} sglang-router
