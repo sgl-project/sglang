@@ -297,6 +297,126 @@ def _parse_mmlu_letter(response: str) -> Optional[str]:
     return None
 
 
+# ----- MMLU example loader (pure helper, CI-testable) ------------------
+
+
+def _load_mmlu_examples(
+    dev_dir: str,
+    test_dir: str,
+    *,
+    subjects: Optional[List[str]] = None,
+    max_examples: int = 200,
+    seed: int = 0xAC12,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Build the AC-12 MMLU example list from on-disk CSV trees.
+
+    Round 27 still allowed a silent skip when ``dev/`` and ``test/``
+    were present but contained no usable examples (empty dirs,
+    missing paired CSVs, < 5 dev rows, malformed test rows). This
+    helper raises ``ValueError`` for ALL of those cases so the
+    caller can convert them into a hard test failure rather than
+    a silent skip. Pure-function — no unittest dependency, easy
+    CI coverage.
+
+    Returns ``(examples, per_subject_totals)``. ``examples`` is the
+    deterministically-shuffled list of dicts the test loop consumes;
+    ``per_subject_totals`` is the per-subject test-row count (for
+    artifact recording).
+
+    Raises ``ValueError`` if the dataset cannot be loaded, with a
+    message naming the resolved directories and the missing piece.
+    """
+    import pandas as pd
+
+    if not os.path.isdir(test_dir):
+        raise ValueError(
+            f"MMLU test dir is not a directory: {test_dir!r}"
+        )
+    if not os.path.isdir(dev_dir):
+        raise ValueError(
+            f"MMLU dev dir is not a directory: {dev_dir!r}"
+        )
+
+    discovered = sorted(
+        f.split("_test.csv")[0]
+        for f in os.listdir(test_dir)
+        if f.endswith("_test.csv")
+    )
+    if subjects is None or (
+        isinstance(subjects, str) and subjects.strip().lower() == "all"
+    ):
+        chosen = discovered
+    else:
+        chosen = [s.strip() for s in subjects if s and s.strip()]
+
+    if not chosen:
+        raise ValueError(
+            f"MMLU loader: no subjects found. Expected "
+            f"`{test_dir}/*_test.csv` files (looked for any with "
+            f"`_test.csv` suffix). Operator: pre-populate via "
+            f"`python benchmark/mmlu/bench_sglang.py` or set "
+            f"`AC12_MMLU_DATA_DIR` to a valid MMLU CSV tree."
+        )
+
+    examples: List[Dict[str, Any]] = []
+    per_subject_totals: Dict[str, int] = {}
+    rejected_subjects: List[str] = []
+    for subject in chosen:
+        dev_path = os.path.join(dev_dir, subject + "_dev.csv")
+        test_path = os.path.join(test_dir, subject + "_test.csv")
+        if not (os.path.isfile(dev_path) and os.path.isfile(test_path)):
+            rejected_subjects.append(
+                f"{subject} (missing dev or test CSV)"
+            )
+            continue
+        try:
+            dev_df = pd.read_csv(dev_path, header=None)
+            test_df = pd.read_csv(test_path, header=None)
+        except Exception as exc:
+            rejected_subjects.append(f"{subject} (CSV read failed: {exc})")
+            continue
+        if dev_df.shape[0] < 5:
+            rejected_subjects.append(
+                f"{subject} (only {dev_df.shape[0]} dev rows, need 5)"
+            )
+            continue
+        dev_rows = dev_df.iloc[:5].values.tolist()
+        kept = 0
+        for i in range(test_df.shape[0]):
+            row = test_df.iloc[i].tolist()
+            if len(row) < 6:
+                continue
+            examples.append(
+                {"subject": subject, "dev": dev_rows, "row": row}
+            )
+            kept += 1
+        if kept == 0:
+            rejected_subjects.append(
+                f"{subject} (no test row had ≥6 columns)"
+            )
+            continue
+        per_subject_totals[subject] = (
+            per_subject_totals.get(subject, 0) + kept
+        )
+
+    if not examples:
+        reasons = "; ".join(rejected_subjects) if rejected_subjects else "no subjects matched"
+        raise ValueError(
+            f"MMLU loader: no usable examples in {dev_dir!r} / "
+            f"{test_dir!r}. Rejected subjects: {reasons}. Required "
+            f"layout: `{{dev,test}}/{{subject}}_{{dev,test}}.csv` with "
+            f"≥5 dev rows and ≥6 columns per test row."
+        )
+
+    # Deterministic shuffle so the same examples are evaluated each run.
+    rng = random.Random(seed)
+    rng.shuffle(examples)
+    if max_examples > 0 and len(examples) > max_examples:
+        examples = examples[:max_examples]
+
+    return examples, per_subject_totals
+
+
 # ----- MMLU data self-prep (Hendrycks tarball) --------------------------
 
 
@@ -541,51 +661,33 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
 
         # Subject set: default `all`; override AC12_MMLU_SUBJECTS=foo,bar
         # to narrow.
-        all_subjects = sorted(
-            f.split("_test.csv")[0]
-            for f in os.listdir(test_dir)
-            if f.endswith("_test.csv")
-        )
         env_subjects = os.environ.get("AC12_MMLU_SUBJECTS", "all")
         if env_subjects.strip().lower() == "all":
-            subjects = all_subjects
+            subjects_arg = None  # signals "discover all"
         else:
-            subjects = [s.strip() for s in env_subjects.split(",") if s.strip()]
-
+            subjects_arg = [
+                s.strip() for s in env_subjects.split(",") if s.strip()
+            ]
         max_examples = _env_int("AC12_MMLU_NUM_EXAMPLES", 200)
 
-        # Build a single shuffled list of (subject, dev_rows, test_row,
-        # gold_letter) so we honour the cap across the whole MMLU mix
-        # rather than per-subject (matches simple_evals harness style).
-        examples: List[Dict[str, Any]] = []
-        per_subject_totals: Dict[str, int] = {}
-        for subject in subjects:
-            dev_path = os.path.join(dev_dir, subject + "_dev.csv")
-            test_path = os.path.join(test_dir, subject + "_test.csv")
-            if not (os.path.isfile(dev_path) and os.path.isfile(test_path)):
-                continue
-            dev_df = pd.read_csv(dev_path, header=None)
-            test_df = pd.read_csv(test_path, header=None)
-            if dev_df.shape[0] < 5:
-                continue
-            dev_rows = dev_df.iloc[:5].values.tolist()
-            for i in range(test_df.shape[0]):
-                row = test_df.iloc[i].tolist()
-                if len(row) < 6:
-                    continue
-                examples.append(
-                    {"subject": subject, "dev": dev_rows, "row": row}
-                )
-            per_subject_totals[subject] = per_subject_totals.get(subject, 0) + test_df.shape[0]
-
-        # Deterministic shuffle so the same examples are evaluated each run.
-        rng = random.Random(0xAC12)
-        rng.shuffle(examples)
-        if max_examples > 0 and len(examples) > max_examples:
-            examples = examples[:max_examples]
-
-        if not examples:
-            self.skipTest("MMLU data dir present but produced no usable examples")
+        # Build the example list via the validated loader. The Round
+        # 27 silent skip ("MMLU data dir present but produced no
+        # usable examples") would have masked AC-12 here when servers
+        # were configured — class-level skipUnless already passed, so
+        # we're inside the gate and must fail loudly.
+        try:
+            examples, _per_subject_totals = _load_mmlu_examples(
+                dev_dir, test_dir,
+                subjects=subjects_arg,
+                max_examples=max_examples,
+            )
+        except ValueError as exc:
+            self.fail(
+                f"AC-12 MMLU loader failed at {data_dir}: {exc}. "
+                "Pre-populate the dataset via "
+                "`python benchmark/mmlu/bench_sglang.py` or set "
+                "AC12_MMLU_DATA_DIR to a valid MMLU CSV tree."
+            )
             return
 
         def _eval_against(url: str) -> Dict[str, Any]:

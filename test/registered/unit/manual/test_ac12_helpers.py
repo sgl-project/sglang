@@ -319,6 +319,145 @@ class TestAC12HarnessHelpers(unittest.TestCase):
                     self._h._ensure_mmlu_data_dir(data_dir)
             self.assertIn("download failed", str(ctx.exception))
 
+    # ---- Round 28: _load_mmlu_examples validates CSV usability --------
+
+    def _write_csv(self, path: str, rows: List[List[str]]) -> None:
+        with open(path, "w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(",".join(row) + "\n")
+
+    def _make_subject(
+        self, dev_dir: str, test_dir: str, subject: str,
+        *, dev_rows: int = 5, test_rows: int = 1, test_cols: int = 6,
+    ) -> None:
+        os.makedirs(dev_dir, exist_ok=True)
+        os.makedirs(test_dir, exist_ok=True)
+        dev_data = [
+            [f"q{i}", "alpha", "beta", "gamma", "delta", "ABCD"[i % 4]]
+            for i in range(dev_rows)
+        ]
+        self._write_csv(
+            os.path.join(dev_dir, f"{subject}_dev.csv"), dev_data,
+        )
+        # Test CSV: optionally truncate columns so each row has `test_cols`.
+        test_data = []
+        for i in range(test_rows):
+            full = [f"tq{i}", "A1", "B1", "C1", "D1", "A"]
+            test_data.append(full[:test_cols])
+        self._write_csv(
+            os.path.join(test_dir, f"{subject}_test.csv"), test_data,
+        )
+
+    def test_load_mmlu_examples_happy_path(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            dev_dir = os.path.join(tmp, "dev")
+            test_dir = os.path.join(tmp, "test")
+            self._make_subject(dev_dir, test_dir, "abstract_algebra",
+                               dev_rows=5, test_rows=3)
+            examples, totals = self._h._load_mmlu_examples(
+                dev_dir, test_dir, max_examples=100,
+            )
+            self.assertEqual(len(examples), 3)
+            self.assertEqual(totals["abstract_algebra"], 3)
+            ex = examples[0]
+            self.assertIn("subject", ex)
+            self.assertIn("dev", ex)
+            self.assertIn("row", ex)
+            self.assertEqual(len(ex["dev"]), 5)
+
+    def test_load_mmlu_examples_raises_on_empty_test_dir(self):
+        """Codex Round 27 review bug: empty dev/test dirs used to skip."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            dev_dir = os.path.join(tmp, "dev")
+            test_dir = os.path.join(tmp, "test")
+            os.makedirs(dev_dir)
+            os.makedirs(test_dir)
+            with self.assertRaises(ValueError) as ctx:
+                self._h._load_mmlu_examples(dev_dir, test_dir)
+            self.assertIn("no subjects found", str(ctx.exception))
+
+    def test_load_mmlu_examples_raises_on_too_few_dev_rows(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            dev_dir = os.path.join(tmp, "dev")
+            test_dir = os.path.join(tmp, "test")
+            # 3 dev rows, expected ≥ 5 → rejected.
+            self._make_subject(dev_dir, test_dir, "tiny",
+                               dev_rows=3, test_rows=2)
+            with self.assertRaises(ValueError) as ctx:
+                self._h._load_mmlu_examples(dev_dir, test_dir)
+            self.assertIn("dev rows, need 5", str(ctx.exception))
+
+    def test_load_mmlu_examples_raises_on_malformed_test_rows(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            dev_dir = os.path.join(tmp, "dev")
+            test_dir = os.path.join(tmp, "test")
+            # 5 dev rows OK, but test rows only have 4 columns → no ≥6 row.
+            self._make_subject(dev_dir, test_dir, "broken",
+                               dev_rows=5, test_rows=2, test_cols=4)
+            with self.assertRaises(ValueError) as ctx:
+                self._h._load_mmlu_examples(dev_dir, test_dir)
+            self.assertIn("≥6 columns", str(ctx.exception))
+
+    def test_load_mmlu_examples_raises_on_missing_dev_csv(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            dev_dir = os.path.join(tmp, "dev")
+            test_dir = os.path.join(tmp, "test")
+            os.makedirs(dev_dir)
+            os.makedirs(test_dir)
+            # Only test CSV exists; dev CSV missing.
+            self._write_csv(
+                os.path.join(test_dir, "x_test.csv"),
+                [["q", "A", "B", "C", "D", "A"]],
+            )
+            with self.assertRaises(ValueError) as ctx:
+                self._h._load_mmlu_examples(dev_dir, test_dir)
+            self.assertIn("missing dev or test CSV", str(ctx.exception))
+
+    def test_load_mmlu_examples_deterministic_seed_and_cap(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            dev_dir = os.path.join(tmp, "dev")
+            test_dir = os.path.join(tmp, "test")
+            self._make_subject(dev_dir, test_dir, "z_subject",
+                               dev_rows=5, test_rows=10)
+            # Two calls with same seed → same example order.
+            ex1, _ = self._h._load_mmlu_examples(
+                dev_dir, test_dir, max_examples=10, seed=42,
+            )
+            ex2, _ = self._h._load_mmlu_examples(
+                dev_dir, test_dir, max_examples=10, seed=42,
+            )
+            self.assertEqual(
+                [e["row"][0] for e in ex1],
+                [e["row"][0] for e in ex2],
+            )
+            # max_examples cap is honored.
+            ex_capped, _ = self._h._load_mmlu_examples(
+                dev_dir, test_dir, max_examples=3, seed=42,
+            )
+            self.assertEqual(len(ex_capped), 3)
+
+    def test_load_mmlu_examples_explicit_subjects_filter(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            dev_dir = os.path.join(tmp, "dev")
+            test_dir = os.path.join(tmp, "test")
+            self._make_subject(dev_dir, test_dir, "alpha",
+                               dev_rows=5, test_rows=2)
+            self._make_subject(dev_dir, test_dir, "beta",
+                               dev_rows=5, test_rows=4)
+            examples, totals = self._h._load_mmlu_examples(
+                dev_dir, test_dir, subjects=["beta"],
+            )
+            self.assertEqual(len(examples), 4)
+            self.assertIn("beta", totals)
+            self.assertNotIn("alpha", totals)
+
     def test_ensure_mmlu_data_dir_raises_when_archive_missing_subdirs(self):
         """Tar with no data/dev or data/test must fail loudly."""
         import tarfile
