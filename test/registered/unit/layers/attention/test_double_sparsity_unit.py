@@ -3076,7 +3076,8 @@ class TestCUDAGraphCapture(unittest.TestCase):
         sel, req_to_token = self._make_bound_selector_cuda(device)
         # max_seq_len=4 matches the 4-token fixture; stored in state for graph-safe path.
         state = allocate_graph_state(
-            max_bs=1, max_top_k=2, max_seq_len=4, device=device,
+            max_bs=1, max_top_k=2, max_seq_len=4,
+            num_local_heads=1, label_dim=1, device=device,
         )
         queries = torch.ones(1, 1, 1, dtype=torch.float32, device=device)
         req_pool = torch.zeros(1, dtype=torch.int32, device=device)
@@ -3122,7 +3123,8 @@ class TestCUDAGraphCapture(unittest.TestCase):
         device = torch.device("cuda")
         sel, req_to_token = self._make_bound_selector_cuda(device)
         state = allocate_graph_state(
-            max_bs=1, max_top_k=2, max_seq_len=4, device=device,
+            max_bs=1, max_top_k=2, max_seq_len=4,
+            num_local_heads=1, label_dim=1, device=device,
         )
         queries = torch.ones(1, 1, 1, dtype=torch.float32, device=device)
         req_pool = torch.zeros(1, dtype=torch.int32, device=device)
@@ -3150,6 +3152,126 @@ class TestCUDAGraphCapture(unittest.TestCase):
             torch.equal(idx[0, :2], torch.tensor([2, 3], dtype=torch.int32, device=device)),
             f"unexpected indices: {idx[0, :2].tolist()}",
         )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_retrieve_topk_graph_safe_zero_allocs_after_warmup(self):
+        """retrieve_topk_graph_safe with pre-allocated scratch is 0-alloc after warmup."""
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            allocate_graph_state, assert_no_alloc_in_region,
+        )
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            retrieve_topk_graph_safe,
+        )
+        device = torch.device("cuda")
+        sel, req_to_token = self._make_bound_selector_cuda(device)
+        state = allocate_graph_state(
+            max_bs=1, max_top_k=2, max_seq_len=4,
+            num_local_heads=1, label_dim=1, device=device,
+        )
+        queries = torch.ones(1, 1, 1, dtype=torch.float32, device=device)
+        req_pool = torch.zeros(1, dtype=torch.int32, device=device)
+        seq_lens = torch.tensor([4], dtype=torch.int32, device=device)
+
+        kwargs = dict(
+            queries=queries,
+            token_signatures=sel.token_label_table.signatures,
+            written=sel.token_label_table.written,
+            channel_selection=sel.channel_mask.channel_selection,
+            channel_weights=sel.channel_mask.channel_weights,
+            layer_id=0,
+            req_pool_indices=req_pool,
+            req_to_token=req_to_token,
+            seq_lens=seq_lens,
+            max_seq_len=4,
+            max_top_k=2,
+            out_indices=state.selected_indices,
+            out_lengths=state.valid_lengths,
+            scratch_scores=state.scratch_scores,
+            scratch_topk_values=state.scratch_topk_values,
+            scratch_topk_indices=state.scratch_topk_indices,
+            scratch_invalid_mask=state.scratch_invalid_mask,
+            scratch_sorted_vals=state.scratch_sorted_vals,
+            scratch_boundary=state.scratch_boundary,
+            scratch_valid_i64=state.scratch_valid_i64,
+            scratch_throwaway_idx=state.scratch_throwaway_idx,
+        )
+
+        # Warmup pass — allowed to allocate (Triton autotune, caching allocator).
+        retrieve_topk_graph_safe(**kwargs)
+        torch.cuda.synchronize()
+
+        # Second call must be 0-alloc.
+        with assert_no_alloc_in_region("retrieve_topk_graph_safe-second-call"):
+            retrieve_topk_graph_safe(**kwargs)
+        torch.cuda.synchronize()
+
+        # Correctness sanity: top-2 logical positions are [2, 3], valid_lengths=2.
+        self.assertEqual(int(state.valid_lengths[0].item()), 2)
+        self.assertTrue(
+            torch.equal(
+                state.selected_indices[0, :2],
+                torch.tensor([2, 3], dtype=torch.int32, device=device),
+            ),
+            f"unexpected: {state.selected_indices[0, :2].tolist()}",
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_retrieve_topk_graph_safe_per_request_valid_masks_position(self):
+        """per_request_valid masks out a position so it is excluded from top-K."""
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            allocate_graph_state,
+        )
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            retrieve_topk_graph_safe,
+        )
+        device = torch.device("cuda")
+        sel, req_to_token = self._make_bound_selector_cuda(device)
+        state = allocate_graph_state(
+            max_bs=1, max_top_k=2, max_seq_len=4,
+            num_local_heads=1, label_dim=1, device=device,
+        )
+        queries = torch.ones(1, 1, 1, dtype=torch.float32, device=device)
+        req_pool = torch.zeros(1, dtype=torch.int32, device=device)
+        seq_lens = torch.tensor([4], dtype=torch.int32, device=device)
+        # Mask out logical position 2 (which would otherwise score 9.0 via
+        # req_to_token=[2,3,0,1] → physical slot 0 → sig 9.0, the top score).
+        per_request_valid = torch.tensor(
+            [[True, True, False, True]], dtype=torch.bool, device=device,
+        )
+
+        retrieve_topk_graph_safe(
+            queries=queries,
+            token_signatures=sel.token_label_table.signatures,
+            written=sel.token_label_table.written,
+            channel_selection=sel.channel_mask.channel_selection,
+            channel_weights=sel.channel_mask.channel_weights,
+            layer_id=0,
+            req_pool_indices=req_pool,
+            req_to_token=req_to_token,
+            seq_lens=seq_lens,
+            max_seq_len=4,
+            max_top_k=2,
+            out_indices=state.selected_indices,
+            out_lengths=state.valid_lengths,
+            scratch_scores=state.scratch_scores,
+            scratch_topk_values=state.scratch_topk_values,
+            scratch_topk_indices=state.scratch_topk_indices,
+            scratch_invalid_mask=state.scratch_invalid_mask,
+            scratch_sorted_vals=state.scratch_sorted_vals,
+            scratch_boundary=state.scratch_boundary,
+            scratch_valid_i64=state.scratch_valid_i64,
+            per_request_valid=per_request_valid,
+            scratch_pv_mask=state.scratch_pv_mask,
+            scratch_throwaway_idx=state.scratch_throwaway_idx,
+        )
+        torch.cuda.synchronize()
+        # Position 2 must NOT appear; expect [3, ?] with ? from {0, 1}.
+        # Scores at remaining valid positions: logical 0→1.0, 1→2.0, 3→8.0.
+        # Top-2 from {1.0, 2.0, 8.0} = {2.0, 8.0} at logical positions {1, 3}.
+        result = state.selected_indices[0, :2].tolist()
+        self.assertNotIn(2, result, f"position 2 should be masked out: {result}")
+        self.assertEqual(int(state.valid_lengths[0].item()), 2)
+        self.assertEqual(sorted(result), [1, 3])
 
 
 _CUDA_AVAILABLE = torch.cuda.is_available()

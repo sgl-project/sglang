@@ -55,6 +55,95 @@ def _next_pow2(n: int) -> int:
 if _TRITON_AVAILABLE:
 
     @triton.jit
+    def _logical_score_kernel(
+        q_ptr,          # [bs, H, head_dim] fp32
+        ch_sel_ptr,     # [H, label_dim] int32 (per-layer slice)
+        ch_w_ptr,       # [H, label_dim] fp32 (per-layer slice)
+        sig_ptr,        # [T, H, label_dim] fp32 (per-layer slice)
+        written_ptr,    # [T] bool (per-layer slice)
+        rpi_ptr,        # [bs] int32
+        rtt_ptr,        # [num_pools, max_pool_len] int32
+        sl_ptr,         # [bs] int32
+        out_ptr,        # [bs, max_seq_len] fp32 (pre-allocated)
+        num_heads: tl.constexpr,
+        max_seq_len: tl.constexpr,
+        label_dim: tl.constexpr,
+        max_pool_len: tl.constexpr,
+        max_tokens: tl.constexpr,
+        q_stride_b: tl.constexpr,
+        q_stride_h: tl.constexpr,
+        ch_sel_stride_h: tl.constexpr,
+        ch_w_stride_h: tl.constexpr,
+        sig_stride_t: tl.constexpr,
+        sig_stride_h: tl.constexpr,
+        rtt_stride_p: tl.constexpr,
+        out_stride_b: tl.constexpr,
+        TOKEN_BLOCK: tl.constexpr,
+        LABEL_DIM_POW2: tl.constexpr,
+    ):
+        batch_id = tl.program_id(0)
+        tok_blk = tl.program_id(1)
+        tok_offs = tok_blk * TOKEN_BLOCK + tl.arange(0, TOKEN_BLOCK)
+        in_range = tok_offs < max_seq_len
+
+        seq_len_i = tl.load(sl_ptr + batch_id).to(tl.int32)
+        pos_valid = in_range & (tok_offs < seq_len_i)
+
+        pool_idx = tl.load(rpi_ptr + batch_id).to(tl.int64)
+        safe_tok = tl.minimum(tok_offs, max_pool_len - 1)
+        phys = tl.load(
+            rtt_ptr + pool_idx * rtt_stride_p + safe_tok,
+            mask=in_range,
+            other=0,
+        ).to(tl.int64)
+        safe_phys = tl.minimum(tl.maximum(phys, 0), max_tokens - 1)
+
+        written = tl.load(
+            written_ptr + safe_phys, mask=in_range, other=0
+        ).to(tl.int1)
+        valid = pos_valid & written
+
+        d_offs = tl.arange(0, LABEL_DIM_POW2)
+        d_mask = d_offs < label_dim
+
+        max_score = tl.full((TOKEN_BLOCK,), float("-inf"), dtype=tl.float32)
+        for h in range(num_heads):
+            sel_h = tl.load(
+                ch_sel_ptr + h * ch_sel_stride_h + d_offs,
+                mask=d_mask,
+                other=0,
+            ).to(tl.int64)
+            w_h = tl.load(
+                ch_w_ptr + h * ch_w_stride_h + d_offs,
+                mask=d_mask,
+                other=0.0,
+            ).to(tl.float32)
+            q_base = q_ptr + batch_id * q_stride_b + h * q_stride_h
+            q_h = tl.load(q_base + sel_h, mask=d_mask, other=0.0).to(tl.float32)
+            q_proj_h = q_h * w_h
+
+            sig_offs = (
+                safe_phys[:, None] * sig_stride_t
+                + h * sig_stride_h
+                + d_offs[None, :]
+            )
+            sig_block = tl.load(
+                sig_ptr + sig_offs,
+                mask=in_range[:, None] & d_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            dot = tl.sum(q_proj_h[None, :] * sig_block, axis=1)
+            max_score = tl.where(dot > max_score, dot, max_score)
+
+        out_score = tl.where(
+            valid,
+            max_score,
+            tl.full(max_score.shape, float("-inf"), dtype=tl.float32),
+        )
+        tl.store(out_ptr + batch_id * out_stride_b + tok_offs, out_score, mask=in_range)
+
+
+    @triton.jit
     def _compute_token_scores_kernel(
         q_proj_ptr,  # [bs, H, label_dim] fp32
         sig_ptr,     # [T, H, label_dim] fp16 or fp32
@@ -499,6 +588,63 @@ def retrieve_topk_via_labels(
     return indices, valid_lengths
 
 
+def _logical_score_triton(
+    q_proj_input: torch.Tensor,         # [bs, H, head_dim] fp32 (the raw queries; gather via ch_sel inside)
+    channel_selection_layer: torch.Tensor,  # [H, label_dim] int32
+    channel_weights_layer: torch.Tensor,    # [H, label_dim] fp32
+    sig_layer: torch.Tensor,            # [T, H, label_dim] fp32 (cast outside if not fp32)
+    written_layer: torch.Tensor,        # [T] bool
+    req_pool_indices: torch.Tensor,     # [bs] int32
+    req_to_token: torch.Tensor,         # [num_pools, max_pool_len] int32
+    seq_lens: torch.Tensor,             # [bs] int32
+    out: torch.Tensor,                  # [bs_buf, max_seq_len] fp32 (pre-allocated, slice [bs])
+    max_seq_len: int,
+    *,
+    token_block: int = 64,
+) -> None:
+    """Fill ``out[:bs, :max_seq_len]`` with per-(batch, logical-position) scores.
+
+    All allocations happen in the caller. No `.item()` host syncs.
+    """
+    bs, num_heads, _head_dim = q_proj_input.shape
+    label_dim = int(channel_selection_layer.shape[1])
+    max_pool_len = int(req_to_token.shape[1])
+    max_tokens = int(sig_layer.shape[0])
+
+    desired_block = min(token_block, max(max_seq_len, 1))
+    token_block_pow2 = _next_pow2(desired_block)
+    label_dim_pow2 = _next_pow2(max(label_dim, 1))
+    num_token_blocks = (max_seq_len + token_block_pow2 - 1) // token_block_pow2
+    grid = (bs, num_token_blocks)
+
+    _logical_score_kernel[grid](
+        q_proj_input,
+        channel_selection_layer,
+        channel_weights_layer,
+        sig_layer,
+        written_layer,
+        req_pool_indices,
+        req_to_token,
+        seq_lens,
+        out,
+        num_heads=num_heads,
+        max_seq_len=max_seq_len,
+        label_dim=label_dim,
+        max_pool_len=max_pool_len,
+        max_tokens=max_tokens,
+        q_stride_b=q_proj_input.stride(0),
+        q_stride_h=q_proj_input.stride(1),
+        ch_sel_stride_h=channel_selection_layer.stride(0),
+        ch_w_stride_h=channel_weights_layer.stride(0),
+        sig_stride_t=sig_layer.stride(0),
+        sig_stride_h=sig_layer.stride(1),
+        rtt_stride_p=req_to_token.stride(0),
+        out_stride_b=out.stride(0),
+        TOKEN_BLOCK=token_block_pow2,
+        LABEL_DIM_POW2=label_dim_pow2,
+    )
+
+
 def retrieve_topk_graph_safe(
     *,
     queries: torch.Tensor,
@@ -514,35 +660,173 @@ def retrieve_topk_graph_safe(
     max_top_k: int,
     out_indices: torch.Tensor,
     out_lengths: torch.Tensor,
+    # Pre-allocated scratch tensors (required for CUDA / Triton fast path)
+    scratch_scores: Optional[torch.Tensor] = None,         # fp32 [max_bs, max_seq_len]
+    scratch_topk_values: Optional[torch.Tensor] = None,    # fp32 [max_bs, max_top_k]
+    scratch_topk_indices: Optional[torch.Tensor] = None,   # int64 [max_bs, max_top_k]
+    scratch_invalid_mask: Optional[torch.Tensor] = None,   # bool [max_bs, max_top_k]
+    scratch_sorted_vals: Optional[torch.Tensor] = None,    # int64 [max_bs, max_top_k]
+    scratch_boundary: Optional[torch.Tensor] = None,       # int64 [max_bs, 1] = max_seq_len
+    scratch_valid_i64: Optional[torch.Tensor] = None,      # int64 [max_bs, 1]
+    per_request_valid: Optional[torch.Tensor] = None,      # bool [bs, max_seq_len]
+    scratch_pv_mask: Optional[torch.Tensor] = None,        # bool [max_bs, max_seq_len]
+    scratch_throwaway_idx: Optional[torch.Tensor] = None,  # int64 [max_bs, max_top_k]
     process_group=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Capture-safe retrieve_topk that writes results into caller-owned output buffers.
+    """Capture-safe retrieve_topk that writes results into caller-owned buffers.
 
-    ``max_seq_len`` must be a static Python int — no ``.item()`` call is made
-    inside, making this function safe to use inside a ``torch.cuda.graph``
-    capture region.  Pass ``state.selected_indices`` and
-    ``state.valid_lengths`` as ``out_indices`` / ``out_lengths`` to route
-    results directly into the pre-allocated :class:`DSGraphState` buffers so
-    graph replay writes to the same stable addresses every step.
+    On CUDA with Triton + all scratch buffers provided: uses an allocation-free
+    pipeline.  After a single warmup call, subsequent calls perform zero new
+    CUDA allocations:
+
+        1. ``_logical_score_kernel`` fills ``scratch_scores`` directly.
+        2. (optional) ``per_request_valid`` is applied via in-place masked_fill_.
+        3. ``topk`` with ``out=(values, indices)`` (allocation-free after warmup).
+        4. ``isneginf`` + ``masked_fill_`` to sentinel-out invalid entries.
+        5. ``topk(largest=False, sorted=True)`` for an allocation-free ascending sort.
+        6. ``ge`` + ``masked_fill_`` to convert sentinels to ``-1`` in output.
+        7. ``searchsorted`` with ``out=`` for valid_lengths.
+
+    Fallback path (CPU, or scratch tensors missing): calls the legacy
+    :func:`retrieve_topk_via_labels`.  This branch is intended for unit tests;
+    do NOT route production graph capture through it.
     """
-    indices, valid = retrieve_topk_via_labels(
-        queries=queries,
-        token_signatures=token_signatures,
-        written=written,
-        channel_selection=channel_selection,
-        channel_weights=channel_weights,
-        layer_id=layer_id,
-        max_top_k=max_top_k,
-        process_group=process_group,
-        req_pool_indices=req_pool_indices,
-        req_to_token=req_to_token,
-        seq_lens=seq_lens,
+    bs = req_pool_indices.shape[0]
+    device = queries.device
+    use_triton_fast = (
+        _TRITON_AVAILABLE
+        and device.type == "cuda"
+        and scratch_scores is not None
+        and scratch_topk_values is not None
+        and scratch_topk_indices is not None
+        and scratch_invalid_mask is not None
+        and scratch_sorted_vals is not None
+        and scratch_boundary is not None
+        and scratch_valid_i64 is not None
+        and scratch_throwaway_idx is not None
+    )
+
+    if not use_triton_fast:
+        indices, valid = retrieve_topk_via_labels(
+            queries=queries,
+            token_signatures=token_signatures,
+            written=written,
+            channel_selection=channel_selection,
+            channel_weights=channel_weights,
+            layer_id=layer_id,
+            max_top_k=max_top_k,
+            process_group=process_group,
+            per_request_valid=per_request_valid,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+        )
+        mtk = indices.shape[1]
+        out_indices[:bs, :mtk].copy_(indices)
+        out_lengths[:bs].copy_(valid)
+        return out_indices, out_lengths
+
+    # Triton fast path — zero-allocation after warmup.
+    sel_layer = channel_selection[layer_id]
+    w_layer = channel_weights[layer_id]
+    sig_layer = token_signatures[layer_id]
+    written_layer = written[layer_id]
+
+    if sig_layer.dtype != torch.float32:
+        sig_layer = sig_layer.to(torch.float32)
+    if queries.dtype != torch.float32:
+        queries_f32 = queries.to(torch.float32)
+    else:
+        queries_f32 = queries
+    if w_layer.dtype != torch.float32:
+        w_layer = w_layer.to(torch.float32)
+    if sel_layer.dtype != torch.int32:
+        sel_layer = sel_layer.to(torch.int32)
+
+    scores_view = scratch_scores[:bs, :max_seq_len]
+    _logical_score_triton(
+        q_proj_input=queries_f32,
+        channel_selection_layer=sel_layer,
+        channel_weights_layer=w_layer,
+        sig_layer=sig_layer,
+        written_layer=written_layer,
+        req_pool_indices=req_pool_indices.to(torch.int32) if req_pool_indices.dtype != torch.int32 else req_pool_indices,
+        req_to_token=req_to_token.to(torch.int32) if req_to_token.dtype != torch.int32 else req_to_token,
+        seq_lens=seq_lens.to(torch.int32) if seq_lens.dtype != torch.int32 else seq_lens,
+        out=scores_view,
         max_seq_len=max_seq_len,
     )
-    bs = indices.shape[0]
-    mtk = indices.shape[1]
-    out_indices[:bs, :mtk].copy_(indices)
-    out_lengths[:bs].copy_(valid)
+
+    if process_group is not None and torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(
+            scores_view, op=torch.distributed.ReduceOp.SUM, group=process_group
+        )
+
+    if per_request_valid is not None:
+        assert scratch_pv_mask is not None, (
+            "per_request_valid requires scratch_pv_mask in graph-safe path"
+        )
+        pv_view = scratch_pv_mask[:bs, :max_seq_len]
+        # copy_ handles dtype conversion in-place (no allocation when shapes match).
+        pv_view.copy_(per_request_valid)
+        # In-place flip: True = valid → True = invalid; then masked_fill_(invalid, -inf).
+        torch.logical_not(pv_view, out=pv_view)
+        scores_view.masked_fill_(pv_view, float("-inf"))
+
+    effective_k = min(max_top_k, max_seq_len)
+    topk_vals_view = scratch_topk_values[:bs, :effective_k]
+    topk_idx_view = scratch_topk_indices[:bs, :effective_k]
+    invalid_view = scratch_invalid_mask[:bs, :effective_k]
+    sorted_vals_view = scratch_sorted_vals[:bs, :effective_k]
+    boundary_view = scratch_boundary[:bs]
+    valid_i64_view = scratch_valid_i64[:bs]
+
+    # Step 1: top-K by score (unsorted, largest).
+    torch.topk(
+        scores_view,
+        effective_k,
+        dim=-1,
+        largest=True,
+        sorted=False,
+        out=(topk_vals_view, topk_idx_view),
+    )
+
+    # Step 2: sentinel-out invalid (-inf) entries; replace their position with max_seq_len.
+    torch.isneginf(topk_vals_view, out=invalid_view)
+    topk_idx_view.masked_fill_(invalid_view, max_seq_len)
+
+    # Step 3: ascending sort using topk(largest=False, sorted=True).
+    # PyTorch's topk requires output indices NOT to alias input — aliasing
+    # corrupts the read (observed: input [3, 1] → output values [0, 1]).
+    # Route throwaway gather indices into a dedicated scratch.
+    assert scratch_throwaway_idx is not None, (
+        "scratch_throwaway_idx is required for the graph-safe topk pipeline"
+    )
+    throwaway_view = scratch_throwaway_idx[:bs, :effective_k]
+    torch.topk(
+        topk_idx_view,
+        effective_k,
+        dim=-1,
+        largest=False,
+        sorted=True,
+        out=(sorted_vals_view, throwaway_view),
+    )
+
+    # Step 4: copy sorted positions to int32 output, then sentinel → -1.
+    out_indices[:bs, :effective_k].copy_(sorted_vals_view)
+    torch.ge(sorted_vals_view, max_seq_len, out=invalid_view)
+    out_indices[:bs, :effective_k].masked_fill_(invalid_view, -1)
+    if effective_k < out_indices.shape[1]:
+        out_indices[:bs, effective_k:].fill_(-1)
+
+    # Step 5: count valid (< max_seq_len) entries via searchsorted on the sorted vector.
+    boundary_view.fill_(max_seq_len)
+    torch.searchsorted(
+        sorted_vals_view, boundary_view, right=False, out=valid_i64_view
+    )
+    out_lengths[:bs].copy_(valid_i64_view.squeeze(-1))
+
     return out_indices, out_lengths
 
 

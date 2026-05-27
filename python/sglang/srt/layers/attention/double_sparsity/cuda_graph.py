@@ -56,6 +56,18 @@ class DSGraphState:
     scratch_partial_indices: Optional[torch.Tensor] = None  # [max_bs, num_blocks, partial_k]
     max_seq_len: int = 0  # static sequence width for graph-safe logical scoring
 
+    # Allocation-free graph-safe path scratch (sized at allocate_graph_state time).
+    # Populated when num_local_heads > 0, label_dim > 0, max_seq_len > 0.
+    scratch_scores: Optional[torch.Tensor] = None         # fp32 [max_bs, max_seq_len]
+    scratch_topk_values: Optional[torch.Tensor] = None    # fp32 [max_bs, max_top_k]
+    scratch_topk_indices: Optional[torch.Tensor] = None   # int64 [max_bs, max_top_k]
+    scratch_invalid_mask: Optional[torch.Tensor] = None   # bool [max_bs, max_top_k]
+    scratch_sorted_vals: Optional[torch.Tensor] = None    # int64 [max_bs, max_top_k]
+    scratch_boundary: Optional[torch.Tensor] = None       # int64 [max_bs, 1]
+    scratch_valid_i64: Optional[torch.Tensor] = None      # int64 [max_bs, 1]
+    scratch_pv_mask: Optional[torch.Tensor] = None        # bool [max_bs, max_seq_len]
+    scratch_throwaway_idx: Optional[torch.Tensor] = None  # int64 [max_bs, max_top_k]
+
 
 def allocate_graph_state(
     *,
@@ -64,6 +76,8 @@ def allocate_graph_state(
     max_seq_len: int = 0,
     num_score_blocks: int = 1,
     partial_topk: int = 0,
+    num_local_heads: int = 0,
+    label_dim: int = 0,
     device: Optional[torch.device] = None,
 ) -> DSGraphState:
     """Pre-allocate replay-stable buffers for the DS decode path.
@@ -77,7 +91,18 @@ def allocate_graph_state(
     ``capture_decode_step`` uses as a static Python int to avoid the
     ``seq_lens.max().item()`` host sync during CUDA graph capture. Set to
     the maximum sequence length at the configured concurrency.
+
+    When ``max_seq_len > 0``, the allocation-free graph-safe path scratch
+    buffers (``scratch_scores``, ``scratch_topk_values``,
+    ``scratch_topk_indices``, ``scratch_invalid_mask``, ``scratch_sorted_vals``,
+    ``scratch_boundary``, ``scratch_valid_i64``, ``scratch_pv_mask``) are also
+    allocated, sized to the worst-case ``(max_bs, max_seq_len)`` / ``(max_bs,
+    max_top_k)``.  ``num_local_heads`` and ``label_dim`` are accepted for
+    future-proofing the API contract; the scratch above does not actually
+    depend on them (the Triton kernel reads heads/label_dim from the bound
+    selector at call time).
     """
+    del num_local_heads, label_dim  # API parity; not used for scratch sizing today.
 
     if max_bs <= 0:
         raise ValueError(f"max_bs must be positive, got {max_bs}.")
@@ -90,10 +115,10 @@ def allocate_graph_state(
         (max_bs, max_top_k), -1, dtype=torch.int32, device=device
     )
     valid = torch.zeros((max_bs,), dtype=torch.int32, device=device)
-    scratch_scores = None
+    scratch_scores_partial = None
     scratch_indices = None
     if num_score_blocks > 0 and partial_topk > 0:
-        scratch_scores = torch.zeros(
+        scratch_scores_partial = torch.zeros(
             (max_bs, num_score_blocks, partial_topk),
             dtype=torch.float32,
             device=device,
@@ -105,12 +130,60 @@ def allocate_graph_state(
             device=device,
         )
 
+    # Allocation-free graph-safe scratch (only when max_seq_len is known).
+    scratch_scores = None
+    scratch_topk_values = None
+    scratch_topk_indices = None
+    scratch_invalid_mask = None
+    scratch_sorted_vals = None
+    scratch_boundary = None
+    scratch_valid_i64 = None
+    scratch_pv_mask = None
+    scratch_throwaway_idx = None
+    if max_seq_len > 0:
+        scratch_scores = torch.zeros(
+            (max_bs, max_seq_len), dtype=torch.float32, device=device,
+        )
+        scratch_topk_values = torch.zeros(
+            (max_bs, max_top_k), dtype=torch.float32, device=device,
+        )
+        scratch_topk_indices = torch.zeros(
+            (max_bs, max_top_k), dtype=torch.int64, device=device,
+        )
+        scratch_invalid_mask = torch.zeros(
+            (max_bs, max_top_k), dtype=torch.bool, device=device,
+        )
+        scratch_sorted_vals = torch.zeros(
+            (max_bs, max_top_k), dtype=torch.int64, device=device,
+        )
+        scratch_boundary = torch.full(
+            (max_bs, 1), max_seq_len, dtype=torch.int64, device=device,
+        )
+        scratch_valid_i64 = torch.zeros(
+            (max_bs, 1), dtype=torch.int64, device=device,
+        )
+        scratch_pv_mask = torch.zeros(
+            (max_bs, max_seq_len), dtype=torch.bool, device=device,
+        )
+        scratch_throwaway_idx = torch.zeros(
+            (max_bs, max_top_k), dtype=torch.int64, device=device,
+        )
+
     return DSGraphState(
         selected_indices=selected,
         valid_lengths=valid,
-        scratch_partial_scores=scratch_scores,
+        scratch_partial_scores=scratch_scores_partial,
         scratch_partial_indices=scratch_indices,
         max_seq_len=max_seq_len,
+        scratch_scores=scratch_scores,
+        scratch_topk_values=scratch_topk_values,
+        scratch_topk_indices=scratch_topk_indices,
+        scratch_invalid_mask=scratch_invalid_mask,
+        scratch_sorted_vals=scratch_sorted_vals,
+        scratch_boundary=scratch_boundary,
+        scratch_valid_i64=scratch_valid_i64,
+        scratch_pv_mask=scratch_pv_mask,
+        scratch_throwaway_idx=scratch_throwaway_idx,
     )
 
 
@@ -182,39 +255,71 @@ def capture_decode_step(
         return _eager_replay
 
     # CUDA path: warm up, then capture.
+    # When the selector is bound AND scratch is allocated, route through the
+    # allocation-free graph-safe retrieve_topk_graph_safe. Otherwise fall back
+    # to selector.retrieve_topk (allocates during capture; not zero-alloc).
+    use_graph_safe = (
+        getattr(selector, "token_label_table", None) is not None
+        and getattr(selector, "channel_mask", None) is not None
+        and state.scratch_scores is not None
+    )
+
+    def _call_into_state() -> None:
+        if use_graph_safe:
+            from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+                retrieve_topk_graph_safe,
+            )
+
+            retrieve_topk_graph_safe(
+                queries=queries,
+                token_signatures=selector.token_label_table.signatures,
+                written=selector.token_label_table.written,
+                channel_selection=selector.channel_mask.channel_selection,
+                channel_weights=selector.channel_mask.channel_weights,
+                layer_id=layer_id,
+                req_pool_indices=req_pool_indices,
+                req_to_token=req_to_token,
+                seq_lens=seq_lens,
+                max_seq_len=_max_seq_len,
+                max_top_k=selector.max_top_k,
+                out_indices=state.selected_indices,
+                out_lengths=state.valid_lengths,
+                scratch_scores=state.scratch_scores,
+                scratch_topk_values=state.scratch_topk_values,
+                scratch_topk_indices=state.scratch_topk_indices,
+                scratch_invalid_mask=state.scratch_invalid_mask,
+                scratch_sorted_vals=state.scratch_sorted_vals,
+                scratch_boundary=state.scratch_boundary,
+                scratch_valid_i64=state.scratch_valid_i64,
+                per_request_valid=sparse_mask,
+                scratch_pv_mask=state.scratch_pv_mask,
+                scratch_throwaway_idx=state.scratch_throwaway_idx,
+                process_group=getattr(selector, "process_group", None),
+            )
+        else:
+            out_idx, out_len = selector.retrieve_topk(
+                queries=queries,
+                layer_id=layer_id,
+                req_pool_indices=req_pool_indices,
+                sparse_mask=sparse_mask,
+                seq_lens=seq_lens,
+                req_to_token=req_to_token,
+                max_seq_len=_max_seq_len,
+            )
+            bs = out_idx.shape[0]
+            mtk = out_idx.shape[1]
+            state.selected_indices[:bs, :mtk].copy_(out_idx)
+            state.valid_lengths[:bs].copy_(out_len)
+
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        out_idx, out_len = selector.retrieve_topk(
-            queries=queries,
-            layer_id=layer_id,
-            req_pool_indices=req_pool_indices,
-            sparse_mask=sparse_mask,
-            seq_lens=seq_lens,
-            req_to_token=req_to_token,
-            max_seq_len=_max_seq_len,
-        )
-        bs = out_idx.shape[0]
-        mtk = out_idx.shape[1]
-        state.selected_indices[:bs, :mtk].copy_(out_idx)
-        state.valid_lengths[:bs].copy_(out_len)
+        _call_into_state()
     torch.cuda.current_stream().wait_stream(stream)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        out_idx, out_len = selector.retrieve_topk(
-            queries=queries,
-            layer_id=layer_id,
-            req_pool_indices=req_pool_indices,
-            sparse_mask=sparse_mask,
-            seq_lens=seq_lens,
-            req_to_token=req_to_token,
-            max_seq_len=_max_seq_len,
-        )
-        bs = out_idx.shape[0]
-        mtk = out_idx.shape[1]
-        state.selected_indices[:bs, :mtk].copy_(out_idx)
-        state.valid_lengths[:bs].copy_(out_len)
+        _call_into_state()
 
     def _replay() -> Tuple[torch.Tensor, torch.Tensor]:
         graph.replay()
