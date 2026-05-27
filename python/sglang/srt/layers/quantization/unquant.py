@@ -237,6 +237,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # print('[[[[[[[[[[[[[[]]]]]]]]]]]]]]')
         _should_use_aiter_moe = _use_aiter and (
             get_moe_runner_backend().is_auto() or get_moe_runner_backend().is_aiter()
         )
@@ -331,6 +332,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
 
         if _is_npu:
+            print('ssssssssssss')
             for weight_name in ["w13_weight", "w2_weight"]:
                 weight = getattr(layer, weight_name)
                 origin_weight = weight.data.transpose(1, 2)
@@ -352,11 +354,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         block layout. During weight update, checkpoint tensors are in
         canonical layout and need a temporary shape restore for copy.
         """
+        # raise NotImplementedError
         if not get_moe_runner_backend().is_flashinfer_trtllm_routed():
+            # print('rrrrrrrrrrrrrr')
             return
 
         expected_shape = None
         if weight_name.endswith(".experts.w13_weight"):
+            print('----------------')
             w13_rows = (
                 2 * layer.intermediate_size_per_partition
                 if layer.moe_runner_config.is_gated
@@ -364,6 +369,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
             expected_shape = (layer.num_local_experts, w13_rows, layer.hidden_size)
         elif weight_name.endswith(".experts.w2_weight"):
+            print('/////////////')
             expected_shape = (
                 layer.num_local_experts,
                 layer.hidden_size,

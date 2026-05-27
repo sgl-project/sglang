@@ -1145,6 +1145,7 @@ class Qwen3MoeForCausalLM(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
+                # print('wwwwwww')
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
                     continue
@@ -1162,6 +1163,7 @@ class Qwen3MoeForCausalLM(nn.Module):
                     continue
                 if name not in params_dict:
                     continue
+                print('stack')
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -1186,6 +1188,8 @@ class Qwen3MoeForCausalLM(nn.Module):
 
                     param = params_dict[name]
                     weight_loader = param.weight_loader
+                    print(weight_loader.__class__.__name__,type(param))
+                    print(param.shape,loaded_weight.shape,name,shard_id,1185)
                     weight_loader(
                         param,
                         loaded_weight,

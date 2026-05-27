@@ -70,6 +70,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_hip,
+    is_npu,
     print_info_once,
     round_up,
 )
@@ -78,6 +79,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
@@ -391,6 +393,7 @@ class FusedMoE(torch.nn.Module):
         # Load grouped weight scales for group quantization
         # or model weights
         if shard_id == "w2":
+            # print(expert_data.shape,'sssssssssssssss')#[2048 384]---aft[384,2048]
             self._load_w2(
                 shard_id=shard_id,
                 shard_dim=shard_dim,
@@ -537,6 +540,9 @@ class FusedMoE(torch.nn.Module):
             # this parameter is a weight matrix
             # for w2 in TP, it shards the input_features, i.e., shard_dim=2
             shard_size = expert_data.shape[shard_dim]
+            # print(expert_data.shape)#[2048,384]----aft---[384,2048]
+        if loaded_weight.dim() == 2 and shard_dim >= loaded_weight.dim():
+            shard_dim = shard_dim - 1
 
         if self.use_padded_loading:
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
@@ -551,7 +557,13 @@ class FusedMoE(torch.nn.Module):
         else:
             if not is_bias and not self.use_presharded_weights:
                 if self.use_triton_kernels:
+                    print(self.use_triton_kernels)
                     loaded_weight = loaded_weight.transpose(-2, -1)
+                    # if loaded_weight.dim() == 2:
+                    #     shard_dim = int(not shard_dim)
+                    # else:  # 3D
+                    #     shard_dim = 2 if shard_dim == 1 else 1
+                print(shard_size * tp_rank,shard_size)
                 loaded_weight = loaded_weight.narrow(
                     shard_dim, shard_size * tp_rank, shard_size
                 )
@@ -605,6 +617,8 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: Optional[int],
     ) -> None:
+        print('llllllllll')
+        print('------xxxxx------',param.shape)
         # if expert_id is None, then
         # all the experts are loaded at the same time
         if (
@@ -680,6 +694,7 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
+        print('------phi------',param.shape)
         # WARN: This makes the `expert_id` mean "local" and "global" in different cases
         if not getattr(param, "_sglang_require_global_experts", False):
             expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
@@ -759,6 +774,7 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
+        print('------------',param.shape)
         tp_rank = self.moe_tp_rank
 
         # Special case for GGUF weights
@@ -778,6 +794,13 @@ class FusedMoE(torch.nn.Module):
         # expert weights into block layout. During weight update, we must restore
         # canonical load-time shapes before copying checkpoint tensors.
         if isinstance(method, UnquantizedFusedMoEMethod):
+            if _is_npu:
+                if weight_name.endswith(".experts.w2_weight") or weight_name.endswith(
+                    ".experts.w13_weight"
+                ):
+                    if param.data.shape[1] != loaded_weight.shape[0]:
+                        param.data = param.data.transpose(1, 2).contiguous()
+            print('=======================')
             method.maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
                 layer=self,
                 param=param,
@@ -807,6 +830,7 @@ class FusedMoE(torch.nn.Module):
             or isinstance(method, UnquantizedFusedMoEMethod)
             or isinstance(method, CompressedTensorsMxInt4MoE)
         ):
+            print('fififi')
             shard_id = {"w1": "w3", "w3": "w1", "w2": "w2"}[shard_id]
 
         WEIGHT_SCALE_SUPPORTED = [e.value for e in FusedMoeWeightScaleSupported]
@@ -814,8 +838,10 @@ class FusedMoE(torch.nn.Module):
         # based on the shard id. This will be whatever
         # dimension intermediate_size is used.
         SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
+        print(SHARD_ID_TO_SHARDED_DIM)
 
         expert_data = param.data[expert_id]
+        print(expert_data.shape,'eee')
 
         # is_transposed: if the dim to shard the weight
         # should be flipped. Required by GPTQ, compressed-tensors
@@ -826,6 +852,8 @@ class FusedMoE(torch.nn.Module):
             is_transposed = True
         if is_transposed:
             shard_dim = int(not shard_dim)
+        print('ttttttttttttt',is_transposed)
+        print('ttttttttttttt',shard_dim)
 
         # Case input scale: input_scale loading is only supported for fp8
         if "input_scale" in weight_name:
@@ -885,6 +913,7 @@ class FusedMoE(torch.nn.Module):
                     expert_id=expert_id,
                 )
             elif "weight" in weight_name:
+                print('11111111111111')
                 self._load_model_weight_or_group_weight_scale(
                     shard_id=shard_id,
                     shard_dim=shard_dim,
@@ -918,6 +947,7 @@ class FusedMoE(torch.nn.Module):
                 FusedMoeWeightScaleSupported.GROUP.value,
                 FusedMoeWeightScaleSupported.BLOCK.value,
             ]:
+                print('22222222222222')
                 self._load_model_weight_or_group_weight_scale(
                     shard_id=shard_id,
                     shard_dim=shard_dim,
@@ -952,6 +982,10 @@ class FusedMoE(torch.nn.Module):
 
         # Case model weights
         if "weight" in weight_name:
+            # print('33333333333333333')
+            print(f'{shard_id=}{shard_dim=}{loaded_weight.shape=}{expert_data.shape=}{tp_rank=}')
+            # if expert_data.shape==torch.Size([384,2048]):
+            #     raise NotImplementedError
             self._load_model_weight_or_group_weight_scale(
                 shard_id=shard_id,
                 shard_dim=shard_dim,
@@ -980,6 +1014,7 @@ class FusedMoE(torch.nn.Module):
         weight_name: str,
         shard_id: str,
     ) -> None:
+        # print('ssssssssssssssssssss')
         tp_rank = self.moe_tp_rank
 
         if (
@@ -1043,6 +1078,7 @@ class FusedMoE(torch.nn.Module):
 
         # Case model weights
         if "weight" in weight_name:
+            print('4444444444444444')
             self._load_model_weight_or_group_weight_scale(
                 shard_id=shard_id,
                 shard_dim=shard_dim,

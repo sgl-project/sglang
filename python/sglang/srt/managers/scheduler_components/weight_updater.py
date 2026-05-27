@@ -58,6 +58,8 @@ class SchedulerWeightUpdaterManager:
             assert flush_cache_success, "Cache flush failed after updating weights"
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+        print('SchedulerWeightUpdaterManager.update_weights_from_disk')
+        print(recv_req.model_path)
         """In-place update of the weights from disk."""
         success, message = self.tp_worker.update_weights_from_disk(recv_req)
         tp_success = success

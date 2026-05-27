@@ -1907,7 +1907,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # We need to get device after patch otherwise the device would be wrong
         device_module = torch.get_device_module(self.device)
         infered_device = device_module.current_device()
-
+        print(type(named_tensors))
         named_tensors = [
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
             for name, tensor in named_tensors
