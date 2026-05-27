@@ -417,26 +417,29 @@ class RotaryEmbedding(MultiPlatformOp):
         positions = torch.add(positions, offsets) if offsets is not None else positions
 
         if fused_set_kv_buffer_arg is not None:
-            from sgl_kernel import apply_rope_inplace_with_kvcache_xpu
+            try:
+                from sgl_kernel import apply_rope_inplace_with_kvcache_xpu
+            except ImportError:
+                pass
+            else:
+                nq_heads = query.shape[-1] // self.head_size
+                nkv_heads = key.shape[-1] // self.head_size
+                q3 = query.view(-1, nq_heads, self.head_size)
+                k3 = key.view(-1, nkv_heads, self.head_size)
+                v3 = fused_set_kv_buffer_arg.value.view(-1, nkv_heads, self.head_size)
 
-            nq_heads = query.shape[-1] // self.head_size
-            nkv_heads = key.shape[-1] // self.head_size
-            q3 = query.view(-1, nq_heads, self.head_size)
-            k3 = key.view(-1, nkv_heads, self.head_size)
-            v3 = fused_set_kv_buffer_arg.value.view(-1, nkv_heads, self.head_size)
-
-            apply_rope_inplace_with_kvcache_xpu(
-                q3,
-                k3,
-                v3,
-                k_cache=fused_set_kv_buffer_arg.k_buffer,
-                v_cache=fused_set_kv_buffer_arg.v_buffer,
-                cos_sin_cache=self.cos_sin_cache,
-                positions=positions,
-                out_loc=fused_set_kv_buffer_arg.cache_loc,
-                is_neox=self.is_neox_style,
-            )
-            return query, key
+                apply_rope_inplace_with_kvcache_xpu(
+                    q3,
+                    k3,
+                    v3,
+                    k_cache=fused_set_kv_buffer_arg.k_buffer,
+                    v_cache=fused_set_kv_buffer_arg.v_buffer,
+                    cos_sin_cache=self.cos_sin_cache,
+                    positions=positions,
+                    out_loc=fused_set_kv_buffer_arg.cache_loc,
+                    is_neox=self.is_neox_style,
+                )
+                return query, key
 
         # Unfused SYCL kernel expects cos_sin_cache in same dtype as query
         if not hasattr(self, "_cos_sin_cache_bf16"):
