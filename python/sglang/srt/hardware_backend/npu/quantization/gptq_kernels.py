@@ -281,9 +281,7 @@ class GPTQMoEAscendKernel:
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert (
-            self.moe_runner_config is not None
-        ), (
+        assert self.moe_runner_config is not None, (
             "moe_runner_config is not set. "
             "Did you forget to call create_weights/create_moe_runner?"
         )
