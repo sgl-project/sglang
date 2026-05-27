@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     131,
+        "agents":     135,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -245,6 +245,10 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "marketplace":       7882,
             "events_manager":    7883,
             "feedback_engine":   7884,
+            "affiliate_network": 7885,
+            "loyalty_program":   7886,
+            "content_delivery":  7887,
+            "invoice_engine":    7888,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -576,6 +580,10 @@ _INTENTS = {
     "marketplace_purchase":    lambda a, k: {"action": "marketplace_purchase_queued", "listing_id": k.get("listing_id", ""), "buyer_email": k.get("buyer_email", "")},
     "event_ticket":            lambda a, k: {"action": "event_ticket_queued", "event_id": k.get("event_id", ""), "ticket_type_id": k.get("ticket_type_id", 0), "attendee_email": k.get("attendee_email", "")},
     "nps_submit":              lambda a, k: {"action": "nps_submit_queued", "score": k.get("score", 0), "comment": k.get("comment", ""), "customer_email": k.get("customer_email", "")},
+    "affiliate_convert":       lambda a, k: {"action": "affiliate_convert_queued", "short_code": k.get("short_code", ""), "order_ref": k.get("order_ref", ""), "order_value": k.get("order_value", 0)},
+    "loyalty_earn":            lambda a, k: {"action": "loyalty_earn_queued", "member_id": k.get("member_id", ""), "type": k.get("type", "purchase"), "order_value": k.get("order_value", 0)},
+    "asset_upload":            lambda a, k: {"action": "asset_upload_queued", "filename": k.get("filename", ""), "folder": k.get("folder", "/")},
+    "invoice_create":          lambda a, k: {"action": "invoice_create_queued", "client_id": k.get("client_id", ""), "items": k.get("items", [])},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────

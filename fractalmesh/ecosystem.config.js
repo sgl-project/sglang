@@ -1214,7 +1214,11 @@ module.exports = {
             ['fm-podcast',        'fm_podcast_engine',  '30M'],
             ['fm-marketplace',    'fm_marketplace',     '30M'],
             ['fm-events',         'fm_events_manager',  '30M'],
-            ['fm-feedback',       'fm_feedback_engine', '25M'],
+            ['fm-feedback',       'fm_feedback_engine',  '25M'],
+            ['fm-affiliate',      'fm_affiliate_network','25M'],
+            ['fm-loyalty',        'fm_loyalty_program',  '25M'],
+            ['fm-cdn',            'fm_content_delivery', '35M'],
+            ['fm-invoices',       'fm_invoice_engine',   '30M'],
         ].map(([name, script, mem]) => ({
             name,
             script:            `agents/${script}.py`,
