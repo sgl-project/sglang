@@ -685,9 +685,7 @@ def _check_l2_global_cache(
     try:
 
         def check_global_cache():
-            return asyncio.run(
-                mm_global_cache_controller.batch_is_exist(check_hashes)
-            )
+            return asyncio.run(mm_global_cache_controller.batch_is_exist(check_hashes))
 
         # Quick check with short timeout to avoid blocking encoder
         # Use dedicated read executor to avoid being blocked by background writes
@@ -842,9 +840,7 @@ def _sync_tp_cache_hits(
     # Items that this rank hit but other ranks missed need to go to ViT
     # Update chunk_entries and collect items for recompute
     items_to_recompute = []
-    for req_idx, (chunk_entries, chunk_start, chunk_end) in enumerate(
-        pending_requests
-    ):
+    for req_idx, (chunk_entries, chunk_start, chunk_end) in enumerate(pending_requests):
         updated_entries = []
         for item, emb, start, end in chunk_entries:
             if item.hash not in synced_hash_set and (
@@ -897,7 +893,9 @@ def _write_back_l2_cache(locally_encoded: list) -> None:
 
     def _background_insert():
         try:
-            mm_global_cache_controller.insert_batch(hashes_to_insert, embeddings_to_insert)
+            mm_global_cache_controller.insert_batch(
+                hashes_to_insert, embeddings_to_insert
+            )
         except Exception as e:
             logger.warning(f"Background global cache write failed: {e}")
 
