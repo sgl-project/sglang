@@ -1313,9 +1313,14 @@ class TritonMultiStepDraftBackend:
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
         if seq_lens_sum is None:
-            # Eager path: the overlap scheduler skips producing seq_lens_sum for
-            # this backend, so recover it here (eager already syncs anyway).
-            seq_lens_sum = int(forward_batch.seq_lens.sum())
+            # No-verify-sync path: seq_lens_sum only bounds the kv_indices slice
+            # below, which the draft attn reads via ragged kv_indptr offsets -- an
+            # over-estimate is safe (the slice clamps to the buffer length and the
+            # tail is never indexed). This runs on every draft decode step (eager
+            # and cuda-graph replay alike), so recovering it via seq_lens.sum().item()
+            # is a per-iter D2H sync; use a static host upper bound instead
+            # (sum(seq_lens) <= num_seqs * max_context_len).
+            seq_lens_sum = num_seqs * self.max_context_len
 
         generate_draft_decode_kv_indices[
             (self.speculative_num_steps, num_seqs, self.topk)
