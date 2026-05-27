@@ -1894,6 +1894,160 @@ class TestCalibrateMethod1(unittest.TestCase):
             f"Q importance must be 1.0 for all heads/channels.\nActual:\n{actual}",
         )
 
+    def test_3d_hook_output_handled(self):
+        """Hook outputs of shape [1, T, W] (batch dim) must yield identical importance to [T, W].
+
+        _extract_mla_nope_prefix flattens all leading dims with
+        ``tensor.reshape(-1, tensor.shape[-1])`` before the per-head reshape,
+        so adding a batch dimension must not change the computed values.
+        """
+        import tempfile
+        import torch.nn as nn
+
+        num_layers, num_heads, k_head_dim, v_head_dim = 1, 2, 4, 4
+        T = 3
+
+        # 2-D reference: _make_fake_model uses seed=42, T=3
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_2d, model_2d, _, _ = self._make_fake_model(
+                num_layers=num_layers, num_heads=num_heads,
+                k_head_dim=k_head_dim, v_head_dim=v_head_dim,
+                has_q_proj=True, is_mla=True,
+            )
+            importance_2d, _ = self._run_calibration(cfg_2d, model_2d, tmpdir)
+
+        # 3-D variant: same random values but outputs are [1, T, W] instead of [T, W].
+        # Regenerate with the same seed so tensors match _make_fake_model exactly.
+        k_full = num_heads * (k_head_dim + v_head_dim)
+        q_full = num_heads * (k_head_dim + 64)
+        rng = torch.Generator().manual_seed(42)
+        k_out_3d = torch.rand(T, k_full, generator=rng).unsqueeze(0)   # [1, T, W_k]
+        q_out_3d = torch.rand(T, q_full, generator=rng).unsqueeze(0)   # [1, T, W_q]
+
+        class _3DLinear(nn.Module):
+            def __init__(self, out_3d):
+                super().__init__()
+                self._out = out_3d
+            def forward(self, x):
+                return (self._out,)
+
+        class _FakeAttn3D(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.kv_b_proj = _3DLinear(k_out_3d)
+                self.q_b_proj = _3DLinear(q_out_3d)
+            def forward(self, x):
+                self.kv_b_proj(x)
+                self.q_b_proj(x)
+
+        class _FakeLayer3D(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = _FakeAttn3D()
+            def forward(self, x):
+                self.self_attn(x)
+
+        class _FakeInner3D(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([_FakeLayer3D()])
+            def forward(self, x):
+                for layer in self.layers:
+                    layer(x)
+
+        class _FakeTopModel3D(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = _FakeInner3D()
+            def forward(self, **_kwargs):
+                self.model(torch.zeros(1))
+            @property
+            def device(self):
+                return torch.device("cpu")
+
+        cfg_3d = SimpleNamespace(
+            num_hidden_layers=num_layers,
+            num_attention_heads=num_heads,
+            qk_nope_head_dim=k_head_dim,
+            v_head_dim=v_head_dim,
+            head_dim=k_head_dim + 64,
+            hidden_size=num_heads * (k_head_dim + 64),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            importance_3d, _ = self._run_calibration(cfg_3d, _FakeTopModel3D(), tmpdir)
+
+        actual_2d = importance_2d[0].cpu()
+        actual_3d = importance_3d[0].cpu()
+
+        self.assertTrue(
+            actual_3d.isfinite().all(),
+            f"3-D hook outputs produced non-finite importance:\n{actual_3d}",
+        )
+        self.assertTrue(
+            torch.allclose(actual_3d, actual_2d, atol=1e-5),
+            f"3-D and 2-D hook outputs must produce identical importance.\n"
+            f"2D:\n{actual_2d}\n3D:\n{actual_3d}",
+        )
+
+    def test_pile_val_blocks_concatenate_across_docs(self):
+        """_build_pile_val_token_blocks concatenates across document boundaries.
+
+        Three short docs of 200 tokens each (600 total) with block_size=512:
+        the single output block must span all three documents — not just truncate
+        the first document.
+        """
+        from unittest.mock import patch
+
+        from sglang.srt.layers.attention.double_sparsity.calibrate import (
+            _build_pile_val_token_blocks,
+        )
+
+        # Doc i yields token IDs [i*200 .. i*200+199]
+        # Concatenated stream: [0..199][200..399][400..599] = 600 tokens total
+        # A block_size=512 block must include tokens from all 3 docs.
+        doc_texts = ["doc0_text", "doc1_text", "doc2_text"]
+        fake_examples = [{"text": t} for t in doc_texts]
+
+        mock_ds = MagicMock()
+        mock_ds.__iter__ = MagicMock(return_value=iter(fake_examples))
+        mock_ds.shuffle.return_value = mock_ds
+
+        def fake_tokenize(text, add_special_tokens=False, return_attention_mask=False):
+            if "doc0" in text:
+                return {"input_ids": list(range(0, 200))}
+            elif "doc1" in text:
+                return {"input_ids": list(range(200, 400))}
+            else:
+                return {"input_ids": list(range(400, 600))}
+
+        fake_tok = MagicMock(side_effect=fake_tokenize)
+
+        mock_datasets_module = MagicMock()
+        mock_datasets_module.load_dataset.return_value = mock_ds
+
+        with patch.dict(sys.modules, {"datasets": mock_datasets_module}):
+            blocks = _build_pile_val_token_blocks(
+                fake_tok, num_blocks=1, block_size=512, seed=42,
+            )
+
+        self.assertEqual(len(blocks), 1, "Must return exactly 1 block")
+        self.assertEqual(tuple(blocks[0].shape), (1, 512), "Block shape must be [1, 512]")
+
+        block_ids = blocks[0][0].tolist()
+        # Doc 0 occupies positions 0..199 → token IDs 0..199
+        self.assertEqual(block_ids[0], 0)
+        self.assertEqual(block_ids[199], 199)
+        # Doc 1 occupies positions 200..399 → token IDs 200..399
+        self.assertEqual(block_ids[200], 200)
+        # Position 511 is in doc 2 range (400..599); token ID equals position
+        # since each doc's IDs equal their position in the concatenated stream.
+        self.assertEqual(
+            block_ids[511], 511,
+            f"Token at index 511 must come from doc 2 (cross-document boundary). "
+            f"Got {block_ids[511]}; docs were merely truncated if this fails.",
+        )
+
     def test_512d_channel_index_rejected(self):
         """load_channel_mask must reject channel indices >= head_dim=128."""
         import tempfile

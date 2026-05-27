@@ -1,30 +1,31 @@
 """Offline calibration script for the Double Sparsity channel mask file.
 
 The calibrator runs a forward pass over a calibration corpus on the target
-model, collects per-channel L2 importance statistics on the K projections,
+model, accumulates **Method 1** ``mean(abs(Q_nope * K_nope))`` per-channel
+importance (hooks on both ``kv_b_proj`` K-side and ``q_b_proj`` Q-side),
 selects the top-``label_dim`` channels per (layer, head), and writes a
 ``safetensors`` file that the runtime selector consumes.
 
-Default corpus: a NIAH-shaped synthetic dataset that puts a "needle"
-token at a known position in a 4K-token "haystack" — small, deterministic,
-and self-contained for CI. ``--dataset`` overrides with a path to an
-external corpus (newline-delimited prompts).
+Default production dataset: Pile validation (``mit-han-lab/pile-val-backup``),
+shuffled with ``seed=42``, tokenized and concatenated into exactly 256 fixed
+blocks of 512 tokens each. ``--dataset`` overrides with a path to an external
+newline-delimited corpus. ``--allow-synthetic`` enables a small NIAH-shaped
+synthetic fallback reserved for CI and developer smoke tests only.
 
-Production recipe (DeepSeek-V3.2 FP8 on 2-node H200):
+Production recipe (DeepSeek-V3.2 on H200 cluster):
 
     python -m sglang.srt.layers.attention.double_sparsity.calibrate \\
-        --model deepseek-ai/DeepSeek-V3.2 \\
-        --dtype fp8_e4m3 \\
-        --tp 8 \\
-        --output dsv32-fp8-channel-mask.safetensors \\
+        --model /cluster-storage/models/deepseek-ai/DeepSeek-V3.2 \\
+        --dtype bfloat16 \\
+        --tp 1 \\
+        --output /models/dsv32-fp8-channel-mask.safetensors \\
         --label-dim 16 \\
         --page-size 64 \\
-        --batch-size 4 \\
-        --num-samples 1024
+        --num-samples 256 \\
+        --block-size 512 \\
+        --seed 42
 
-CI runs against a tiny NSA-shaped fixture under one minute with ``--tp 1
---allow-synthetic`` (the synthetic fallback is opt-in; HF repo IDs without
-that flag must succeed through ``AutoModelForCausalLM.from_pretrained``).
+CI runs with ``--allow-synthetic`` against a tiny fixture (no network, <1 min).
 """
 
 from __future__ import annotations
@@ -113,18 +114,26 @@ def _extract_mla_nope_prefix(
     ``q_b_proj``  → ``[Q_nope_h0 | Q_rope_h0 | Q_nope_h1 | Q_rope_h1 | ...]``
 
     Flat-slicing the first ``H * nope_dim`` columns before reshape selects V or
-    RoPE columns from later heads.  The correct approach: reshape to
-    ``[-1, H, nope_dim + suffix_dim]`` first, then slice ``[..., :nope_dim]``.
+    RoPE columns from later heads.  The correct approach: flatten all leading
+    dimensions first (handles both 2-D ``[tokens, width]`` from cached-key paths
+    and 3-D ``[batch, seq, width]`` from HuggingFace forward hooks), then reshape
+    ``[-1, H, nope_dim + suffix_dim]``, then slice ``[..., :nope_dim]``.
     """
-    T = tensor.shape[0]
-    return tensor.reshape(T, num_heads, nope_dim + suffix_dim)[..., :nope_dim].contiguous()
+    flat = tensor.reshape(-1, tensor.shape[-1])
+    return flat.reshape(-1, num_heads, nope_dim + suffix_dim)[..., :nope_dim].contiguous()
 
 
-def _pile_val_blocks(num_blocks: int, block_size: int, seed: int) -> List[str]:
-    """Load Pile validation split, shuffle with ``seed``, return ``num_blocks`` text examples.
+def _build_pile_val_token_blocks(
+    tokenizer,
+    num_blocks: int,
+    block_size: int,
+    seed: int,
+) -> List[torch.Tensor]:
+    """Tokenize shuffled Pile-val docs, concatenate, and return fixed-size token blocks.
 
-    Each returned string is one Pile document; the caller's tokenizer will
-    truncate to ``block_size`` tokens during the forward-pass loop.
+    Produces exactly ``num_blocks`` tensors of shape ``[1, block_size]``.
+    Short documents are concatenated across boundaries; raises ``RuntimeError``
+    if the corpus does not contain enough tokens.
     """
     try:
         from datasets import load_dataset
@@ -134,20 +143,36 @@ def _pile_val_blocks(num_blocks: int, block_size: int, seed: int) -> List[str]:
             "Install via 'pip install datasets'."
         ) from exc
 
+    needed = num_blocks * block_size
     ds = load_dataset("mit-han-lab/pile-val-backup", split="validation")
     ds = ds.shuffle(seed=seed)
-    texts: List[str] = []
+
+    all_ids: List[int] = []
     for example in ds:
         text = example.get("text", "")
-        if text.strip():
-            texts.append(text)
-        if len(texts) >= num_blocks:
+        if not text.strip():
+            continue
+        enc = tokenizer(text, add_special_tokens=False, return_attention_mask=False)
+        ids = enc["input_ids"]
+        if isinstance(ids, torch.Tensor):
+            ids = ids.tolist()
+        all_ids.extend(ids)
+        if len(all_ids) >= needed:
             break
-    if not texts:
+
+    if len(all_ids) < needed:
         raise RuntimeError(
-            "mit-han-lab/pile-val-backup returned no non-empty text examples."
+            f"mit-han-lab/pile-val-backup produced only {len(all_ids)} tokens "
+            f"after shuffling; need {needed} ({num_blocks} blocks × {block_size} "
+            "tokens). Reduce --num-samples or increase corpus coverage."
         )
-    return texts[:num_blocks]
+
+    blocks: List[torch.Tensor] = []
+    for i in range(num_blocks):
+        start = i * block_size
+        block_ids = all_ids[start : start + block_size]
+        blocks.append(torch.tensor([block_ids], dtype=torch.long))
+    return blocks
 
 
 def _collect_channel_importance(
@@ -161,6 +186,8 @@ def _collect_channel_importance(
     prompts: List[str],
     allow_synthetic: bool,
     block_size: Optional[int] = None,
+    use_pile_val: bool = False,
+    pile_val_seed: int = 42,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the calibration forward pass and return ``(importance, weights)``.
 
@@ -408,16 +435,33 @@ def _collect_channel_importance(
         if has_q:
             handles.append(qproj.register_forward_hook(_make_q_hook(layer_idx)))
 
-    tok_kwargs: dict = {"return_tensors": "pt"}
-    if block_size is not None:
-        tok_kwargs["max_length"] = block_size
-        tok_kwargs["truncation"] = True
+    # Build the input feed: either fixed Pile-val token blocks or tokenized prompts.
+    if use_pile_val:
+        _bsz = block_size or 512
+        logger.info(
+            "Building Pile-val token blocks: %d blocks × %d tokens (seed=%d).",
+            len(prompts), _bsz, pile_val_seed,
+        )
+        token_blocks = _build_pile_val_token_blocks(
+            tokenizer, len(prompts), _bsz, pile_val_seed
+        )
+    else:
+        tok_kwargs: dict = {"return_tensors": "pt"}
+        if block_size is not None:
+            tok_kwargs["max_length"] = block_size
+            tok_kwargs["truncation"] = True
+        token_blocks = None
 
     try:
-        for prompt in prompts:
-            inputs = tokenizer(prompt, **tok_kwargs).to(model.device)
-            with torch.no_grad():
-                model(**inputs)
+        if token_blocks is not None:
+            for block in token_blocks:
+                with torch.no_grad():
+                    model(input_ids=block.to(model.device))
+        else:
+            for prompt in prompts:
+                inputs = tokenizer(prompt, **tok_kwargs).to(model.device)
+                with torch.no_grad():
+                    model(**inputs)
     finally:
         for h in handles:
             h.remove()
@@ -457,6 +501,7 @@ def calibrate(args: argparse.Namespace) -> str:
     block_size = args.block_size
     seed = args.seed
 
+    use_pile_val = False
     if args.dataset:
         prompts = _read_corpus_file(args.dataset, args.num_samples)
         dataset_source = f"file:{args.dataset}"
@@ -464,9 +509,12 @@ def calibrate(args: argparse.Namespace) -> str:
         prompts = _niah_synthetic_prompts(args.num_samples, args.ctx_len)
         dataset_source = "niah_synthetic"
     else:
-        # Production path: Pile validation, seed=42, 256 × block_size tokens.
-        prompts = _pile_val_blocks(args.num_samples, block_size, seed)
+        # Production path: Pile validation, seed=42, exactly num_samples × block_size tokens.
+        # Block construction happens inside _collect_channel_importance after the tokenizer
+        # is loaded so token IDs are concatenated correctly across document boundaries.
+        prompts = [""] * args.num_samples  # length-hint only; content ignored when use_pile_val=True
         dataset_source = "mit-han-lab/pile-val-backup"
+        use_pile_val = True
 
     importance, weights = _collect_channel_importance(
         model_path=args.model,
@@ -478,6 +526,8 @@ def calibrate(args: argparse.Namespace) -> str:
         prompts=prompts,
         allow_synthetic=args.allow_synthetic,
         block_size=block_size,
+        use_pile_val=use_pile_val,
+        pile_val_seed=seed,
     )
 
     L, H, head_dim = importance.shape
