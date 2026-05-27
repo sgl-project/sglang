@@ -500,6 +500,8 @@ class NixlKVManager(CommonKVManager):
             self.server_args.chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
+            cp_rank=int(getattr(self, "attn_cp_rank", 0)),
+            cp_size=max(1, int(getattr(self, "attn_cp_size", 1))),
         )
         self._staging_ctx.prefetched_rooms.add(room)
 
@@ -1721,10 +1723,17 @@ class NixlKVManager(CommonKVManager):
         page_start = int(components[6])
         num_pages = int(components[7])
         agent_name = components[8] if len(components) > 8 else ""
-        self._track_kv_arrival(room, chunk_id, is_last_chunk, pp_rank)
+        # Order matters: under CP-kv-reshard each CP rank has its own
+        # chunk_idx, but _track_kv_arrival's _maybe_submit_last_scatter
+        # uses chunk_staging_infos[-1] as the "final" chunk. If we mark
+        # arrival before scattering, last-rank-arrived sees its own
+        # chunk_info still populated and rescatters it, recording a
+        # second event on the same alloc_id which then double-frees in
+        # advance_scatter. Scatter+zero chunk_infos first, then track.
         self._handle_staging_chunk_arrived(
             room, chunk_idx, page_start, num_pages, agent_name
         )
+        self._track_kv_arrival(room, chunk_id, is_last_chunk, pp_rank)
 
     def _handle_aux_notification(self, room: int, components: List[str]):
         """Handle an aux notification and trigger last scatter if staging is complete.
@@ -1865,7 +1874,6 @@ class NixlKVManager(CommonKVManager):
                 required_dst_info_num = self.transfer_infos[room][
                     agent_name
                 ].required_dst_info_num
-                logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
                 if len(self.transfer_infos[room]) == required_dst_info_num:
                     self.req_to_decode_prefix_len[room] = next(
                         (

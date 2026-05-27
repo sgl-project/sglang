@@ -123,8 +123,15 @@ class CommonKVManager(BaseKVManager):
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
+        # CP KV-reshard implies "each CP rank sends only its slice" per
+        # DESIGN_kv_reshard.md §3 (contiguous, token-dim partition reusing
+        # page_indices_to_cp_rank_page_indices). The receiver therefore must
+        # query every CP rank to assemble the full KV. Auto-enable the flag
+        # when reshard is on so users don't also need to export
+        # SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.
         self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
+            or getattr(server_args, "enable_cp_kv_reshard", False)
         )
 
         # bind zmq socket
@@ -801,6 +808,7 @@ class CommonKVSender(BaseKVSender):
                 self.kv_mgr,
                 kv_indices,
                 index_slice,
+                total_request_pages=self.num_kv_indices,
             )
         elif self.kv_mgr.is_dummy_cp_rank:
             if not is_last_chunk:
