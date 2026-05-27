@@ -52,6 +52,7 @@ TRACE_EVENT_SCHEMAS: dict[tuple[str, str], list[str]] = {
         "raw_tail_lens_by_req",
         "committed_lens_by_req",
         "output_lens_by_req",
+        "num_stale_snapshots",
     ),
     ("verifier", "build_update_batch"): _fields(
         "forward_mode",
@@ -62,9 +63,8 @@ TRACE_EVENT_SCHEMAS: dict[tuple[str, str], list[str]] = {
         "num_close",
         "pre_committed_lens_by_req",
         "draft_buffer_lens_by_req",
-        "accepted_tail_lens_by_req",
-        "bonus_token_ids_by_req",
-        "snapshot_candidate_token_ids_by_req",
+        "committed_segment_lens_by_req",
+        "last_committed_token_ids_by_req",
         "committed_lens_by_req",
         "commit_output_lens_by_req",
         "commit_dst_drafter_ranks",
@@ -72,13 +72,12 @@ TRACE_EVENT_SCHEMAS: dict[tuple[str, str], list[str]] = {
         "close_dst_drafter_ranks",
     ),
     ("drafter", "sync_control_messages"): _fields(
-        "num_messages",
         "num_sync",
         "num_commit",
         "num_close",
         "num_created_reqs",
         "num_applied_commit",
-        "num_pending_commit",
+        "num_commit_echo",
         "num_sleeping_reqs",
     ),
     ("drafter", "emit_draft_tokens"): _fields(
@@ -123,10 +122,14 @@ TRACE_EVENT_SCHEMAS: dict[tuple[str, str], list[str]] = {
         "num_already_committed_outputs",
         "num_stale_gap_outputs",
         "num_unknown_request_outputs",
+        "num_pending_expected_match_outputs",
+        "num_pending_expected_reject_outputs",
+        "num_pending_expected_gap_outputs",
         "appended_token_lens_by_req",
         "tail_lens_after_by_req",
         "consumable_tail_lens_after_by_req",
         "committed_lens_after_by_req",
+        "pending_expected_lens_after_by_req",
     ),
     ("draft_proxy", "apply_control_batch"): _fields(
         "verifier_rank",
@@ -137,14 +140,18 @@ TRACE_EVENT_SCHEMAS: dict[tuple[str, str], list[str]] = {
         "num_close",
         "commit_rids",
         "pre_committed_lens_by_req",
-        "accepted_tail_lens_by_req",
+        "committed_segment_lens_by_req",
+        "last_committed_token_ids_by_req",
+        "matched_tail_lens_by_req",
         "raw_tail_lens_before_by_req",
-        "bonus_token_ids_by_req",
-        "buffer_candidate_token_ids_by_req",
-        "bonus_match_by_req",
+        "mismatch_tail_token_ids_by_req",
+        "mismatch_committed_token_ids_by_req",
         "preserved_suffix_lens_by_req",
         "tail_lens_after_by_req",
         "committed_lens_after_by_req",
+        "pending_expected_lens_before_by_req",
+        "pending_expected_lens_after_by_req",
+        "pending_expected_added_by_req",
     ),
     ("token_sync_thread", "recv_control_batch"): _fields(
         "drafter_rank",
@@ -188,8 +195,6 @@ TRACE_EVENT_SCHEMAS: dict[tuple[str, str], list[str]] = {
         "drafter_rank",
         "pending_controls_before",
         "pending_controls_after",
-        "num_control_batches",
-        "num_control_messages",
     ),
     ("token_sync_thread", "idle_wait"): _fields(
         "drafter_rank",
@@ -292,6 +297,11 @@ def _non_empty_result(
     kwargs: dict[str, Any],
     result: Any,
 ) -> bool:
+    if result is None:
+        return False
+    is_empty = getattr(result, "is_empty", None)
+    if callable(is_empty):
+        return not is_empty()
     return bool(result)
 
 
@@ -303,16 +313,67 @@ def _control_batch_messages(batch: Any) -> list[Any]:
     ]
 
 
-def _is_sync_message(message: Any) -> bool:
-    return hasattr(message, "committed_output_ids")
+def _control_payload_fields(owner: Any, payload: Any) -> dict[str, Any] | None:
+    if payload is None:
+        return None
 
+    if hasattr(payload, "ready_commit_segments") and hasattr(payload, "close_keys"):
+        sync_messages = list(getattr(payload, "sync_messages", []) or [])
+        commit_segments = list(getattr(payload, "ready_commit_segments", []) or [])
+        close_keys = list(getattr(payload, "close_keys", []) or [])
+        return {
+            "drafter_rank": int(owner.drafter_rank),
+            "batch_size": payload.extracted_control_count(),
+            "rids": [
+                *[message.request_id for message in sync_messages],
+                *[segment.draft_key.request_id for segment in commit_segments],
+                *[key.request_id for key in close_keys],
+            ],
+            "num_sync": len(sync_messages),
+            "num_commit": len(commit_segments),
+            "num_close": len(close_keys),
+        }
 
-def _is_commit_message(message: Any) -> bool:
-    return hasattr(message, "bonus_token_pos")
+    if hasattr(payload, "verifier_commit_segments") and hasattr(
+        payload, "close_keys"
+    ):
+        sync_messages = list(getattr(payload, "sync_messages", []) or [])
+        commit_segments = list(
+            getattr(payload, "verifier_commit_segments", {}).values()
+        )
+        close_keys = list(getattr(payload, "close_keys", []) or [])
+        return {
+            "drafter_rank": int(owner.drafter_rank),
+            "batch_size": payload.pending_control_count(),
+            "rids": [
+                *[message.request_id for message in sync_messages],
+                *[segment.draft_key.request_id for segment in commit_segments],
+                *[key.request_id for key in close_keys],
+            ],
+            "num_sync": len(sync_messages),
+            "num_commit": len(commit_segments),
+            "num_close": len(close_keys),
+        }
 
-
-def _is_close_message(message: Any) -> bool:
-    return hasattr(message, "reason")
+    messages = (
+        _control_batch_messages(payload)
+        if hasattr(payload, "verify_commit_messages")
+        else payload
+    )
+    return {
+        "drafter_rank": int(owner.drafter_rank),
+        "batch_size": len(messages),
+        "rids": [message.request_id for message in messages],
+        "num_sync": sum(
+            hasattr(message, "committed_output_ids") for message in messages
+        ),
+        "num_commit": sum(
+            hasattr(message, "pre_verify_committed_len")
+            and hasattr(message, "committed_token_ids")
+            for message in messages
+        ),
+        "num_close": sum(hasattr(message, "reason") for message in messages),
+    }
 
 
 def _draft_proxy_send_control_fields(
@@ -339,14 +400,18 @@ def _draft_proxy_apply_control_fields(
         or {
             "commit_rids": [],
             "pre_committed_lens_by_req": [],
-            "accepted_tail_lens_by_req": [],
+            "committed_segment_lens_by_req": [],
+            "last_committed_token_ids_by_req": [],
+            "matched_tail_lens_by_req": [],
             "raw_tail_lens_before_by_req": [],
-            "bonus_token_ids_by_req": [],
-            "buffer_candidate_token_ids_by_req": [],
-            "bonus_match_by_req": [],
+            "mismatch_tail_token_ids_by_req": [],
+            "mismatch_committed_token_ids_by_req": [],
             "preserved_suffix_lens_by_req": [],
             "tail_lens_after_by_req": [],
             "committed_lens_after_by_req": [],
+            "pending_expected_lens_before_by_req": [],
+            "pending_expected_lens_after_by_req": [],
+            "pending_expected_added_by_req": [],
         }
     )
     return fields
@@ -397,6 +462,9 @@ def _draft_proxy_append_tail_fields(
             "num_already_committed_outputs": 0,
             "num_stale_gap_outputs": 0,
             "num_unknown_request_outputs": 0,
+            "num_pending_expected_match_outputs": 0,
+            "num_pending_expected_reject_outputs": 0,
+            "num_pending_expected_gap_outputs": 0,
             "appended_token_lens_by_req": [0] * len(request_ids),
             "tail_lens_after_by_req": [0] * len(request_ids),
             "consumable_tail_lens_after_by_req": [0] * len(request_ids),
@@ -404,6 +472,7 @@ def _draft_proxy_append_tail_fields(
                 owner.draft_tail_buffer.get_committed_len(request_id) or 0
                 for request_id in request_ids
             ],
+            "pending_expected_lens_after_by_req": [0] * len(request_ids),
         }
     )
     return fields
@@ -425,18 +494,8 @@ def _token_sync_control_message_fields(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     result: Any,
-) -> dict[str, Any]:
-    messages = result
-    if messages is None:
-        return None
-    return {
-        "drafter_rank": int(owner.drafter_rank),
-        "batch_size": len(messages),
-        "rids": [message.request_id for message in messages],
-        "num_sync": sum(_is_sync_message(message) for message in messages),
-        "num_commit": sum(_is_commit_message(message) for message in messages),
-        "num_close": sum(_is_close_message(message) for message in messages),
-    }
+) -> dict[str, Any] | None:
+    return _control_payload_fields(owner, result)
 
 
 def _token_sync_enqueue_result_fields(

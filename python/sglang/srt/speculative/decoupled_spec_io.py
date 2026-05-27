@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional
 
 
 class DraftMeshMessageType(str, Enum):
@@ -54,16 +54,19 @@ class VerifyCommit:
     """
     Sent from verifier to drafter to commit a portion of the draft outputs.
 
-    Drafter relies on pre_verify_committed_len and bonus_token_pos to
-    correctly push forward the verifier_committed_prefix_len.
+    committed_token_ids is the verifier-committed contiguous output segment:
+    output_ids[
+        pre_verify_committed_len:
+        pre_verify_committed_len + len(committed_token_ids)
+    ].
+    It is always non-empty.
     """
 
     request_id: str
     src_verifier_rank: int
     dst_drafter_rank: int
     pre_verify_committed_len: int
-    bonus_token_id: int
-    bonus_token_pos: int
+    committed_token_ids: list[int]
 
     @property
     def draft_key(self) -> DraftReqKey:
@@ -71,6 +74,20 @@ class VerifyCommit:
             src_verifier_rank=int(self.src_verifier_rank),
             request_id=self.request_id,
         )
+
+    def validate_committed_token_ids(self) -> None:
+        if not self.committed_token_ids:
+            raise ValueError(
+                "VerifyCommit committed_token_ids must be non-empty: "
+                f"request_id={self.request_id} "
+                f"pre_verify_committed_len={self.pre_verify_committed_len}"
+            )
+        if int(self.pre_verify_committed_len) < 0:
+            raise ValueError(
+                "VerifyCommit pre_verify_committed_len must be non-negative: "
+                f"request_id={self.request_id} "
+                f"pre_verify_committed_len={self.pre_verify_committed_len}"
+            )
 
 
 @dataclass
@@ -115,16 +132,181 @@ class DraftControlBatch:
     close_messages: list[DraftClose] = field(default_factory=list)
 
 
-DraftControlMessage = DraftSync | VerifyCommit | DraftClose
+@dataclass
+class VerifierCommitSegment:
+    draft_key: DraftReqKey
+    dst_drafter_rank: int
+    pre_verify_committed_len: int
+    committed_token_ids: list[int] = field(default_factory=list)
+
+    @property
+    def end_committed_len(self) -> int:
+        return int(self.pre_verify_committed_len) + len(self.committed_token_ids)
+
+    def append_message(self, message: VerifyCommit) -> None:
+        if message.draft_key != self.draft_key:
+            raise RuntimeError(
+                "Verifier commit segment received a commit for a different "
+                f"request: segment_key={self.draft_key} message_key={message.draft_key}"
+            )
+        if int(message.dst_drafter_rank) != int(self.dst_drafter_rank):
+            raise RuntimeError(
+                "Verifier commit segment received a commit for a different "
+                "drafter rank: "
+                f"request_id={message.request_id} "
+                f"segment_drafter_rank={self.dst_drafter_rank} "
+                f"message_drafter_rank={message.dst_drafter_rank}"
+            )
+        message.validate_committed_token_ids()
+        pre_verify_committed_len = int(message.pre_verify_committed_len)
+        if pre_verify_committed_len != self.end_committed_len:
+            raise RuntimeError(
+                "Verifier commit segment requires contiguous VerifyCommit "
+                "messages: "
+                f"request_id={message.request_id} "
+                f"expected_pre_verify_committed_len={self.end_committed_len} "
+                f"actual_pre_verify_committed_len={pre_verify_committed_len}"
+            )
+
+        token_ids = [int(token_id) for token_id in message.committed_token_ids]
+        self.committed_token_ids.extend(token_ids)
+
+    def extract_prefix(self, num_tokens: int) -> "VerifierCommitSegment":
+        num_tokens = int(num_tokens)
+        if num_tokens <= 0:
+            raise ValueError(
+                "Verifier commit segment prefix length must be positive: "
+                f"request_id={self.draft_key.request_id} num_tokens={num_tokens}"
+            )
+        if num_tokens > len(self.committed_token_ids):
+            raise ValueError(
+                "Verifier commit segment prefix length exceeds segment length: "
+                f"request_id={self.draft_key.request_id} "
+                f"num_tokens={num_tokens} "
+                f"segment_len={len(self.committed_token_ids)}"
+            )
+
+        prefix_tokens = [
+            int(token_id) for token_id in self.committed_token_ids[:num_tokens]
+        ]
+        remaining_tokens = [
+            int(token_id) for token_id in self.committed_token_ids[num_tokens:]
+        ]
+        prefix_segment = VerifierCommitSegment(
+            draft_key=self.draft_key,
+            dst_drafter_rank=int(self.dst_drafter_rank),
+            pre_verify_committed_len=int(self.pre_verify_committed_len),
+            committed_token_ids=prefix_tokens,
+        )
+        self.pre_verify_committed_len = (
+            int(self.pre_verify_committed_len) + num_tokens
+        )
+        self.committed_token_ids = remaining_tokens
+        return prefix_segment
 
 
-def iter_control_batch_messages(batch: DraftControlBatch) -> list[DraftControlMessage]:
-    return [
-        *batch.sync_messages,
-        *batch.verify_commit_messages,
-        *batch.close_messages,
-    ]
+@dataclass
+class DraftControlInbox:
+    sync_messages: list[DraftSync] = field(default_factory=list)
+    verifier_commit_segments: dict[DraftReqKey, VerifierCommitSegment] = field(
+        default_factory=dict
+    )
+    close_keys: set[DraftReqKey] = field(default_factory=set)
 
+    def is_empty(self) -> bool:
+        return (
+            not self.sync_messages
+            and not self.verifier_commit_segments
+            and not self.close_keys
+        )
+
+    def pending_control_count(self) -> int:
+        return (
+            len(self.sync_messages)
+            + len(self.verifier_commit_segments)
+            + len(self.close_keys)
+        )
+
+    def add_control_batch_locked(self, batch: DraftControlBatch) -> None:
+        for message in batch.close_messages:
+            self.add_close_key_locked(message.draft_key)
+        for message in batch.sync_messages:
+            if message.draft_key not in self.close_keys:
+                self.sync_messages.append(message)
+        for message in batch.verify_commit_messages:
+            self.add_verify_commit_locked(message)
+
+    def add_close_key_locked(self, draft_key: DraftReqKey) -> None:
+        self.close_keys.add(draft_key)
+        self.verifier_commit_segments.pop(draft_key, None)
+        self.sync_messages = [
+            message
+            for message in self.sync_messages
+            if message.draft_key != draft_key
+        ]
+
+    def add_verify_commit_locked(self, message: VerifyCommit) -> None:
+        if message.draft_key in self.close_keys:
+            return
+        segment = self.verifier_commit_segments.get(message.draft_key)
+        if segment is None:
+            segment = VerifierCommitSegment(
+                draft_key=message.draft_key,
+                dst_drafter_rank=int(message.dst_drafter_rank),
+                pre_verify_committed_len=int(message.pre_verify_committed_len),
+            )
+            segment.append_message(message)
+            self.verifier_commit_segments[message.draft_key] = segment
+            return
+        segment.append_message(message)
+
+    def extract_ready_controls_locked(
+        self,
+        consumable_commit_len: Callable[[VerifierCommitSegment], int],
+    ) -> "ReadyDraftControls":
+        ready_controls = ReadyDraftControls()
+
+        if self.close_keys:
+            ready_controls.close_keys = self.close_keys
+            self.close_keys = set()
+
+        if self.sync_messages:
+            ready_controls.sync_messages = self.sync_messages
+            self.sync_messages = []
+
+        for draft_key, segment in list(self.verifier_commit_segments.items()):
+            consumable_len = consumable_commit_len(segment)
+            if consumable_len <= 0:
+                continue
+
+            ready_controls.ready_commit_segments.append(
+                segment.extract_prefix(consumable_len)
+            )
+            if not segment.committed_token_ids:
+                self.verifier_commit_segments.pop(draft_key, None)
+
+        return ready_controls
+
+
+@dataclass
+class ReadyDraftControls:
+    sync_messages: list[DraftSync] = field(default_factory=list)
+    close_keys: set[DraftReqKey] = field(default_factory=set)
+    ready_commit_segments: list[VerifierCommitSegment] = field(default_factory=list)
+
+    def is_empty(self) -> bool:
+        return (
+            not self.sync_messages
+            and not self.close_keys
+            and not self.ready_commit_segments
+        )
+
+    def extracted_control_count(self) -> int:
+        return (
+            len(self.sync_messages)
+            + len(self.close_keys)
+            + len(self.ready_commit_segments)
+        )
 
 @dataclass
 class DraftMeshMessage:

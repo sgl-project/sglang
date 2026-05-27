@@ -2,21 +2,18 @@ from __future__ import annotations
 
 import queue
 import threading
-from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import zmq
 
 from sglang.srt.speculative.decoupled_spec_io import (
-    DraftClose,
     DraftControlBatch,
+    DraftControlInbox,
     DraftMeshMessage,
     DraftMeshMessageType,
-    DraftSync,
     DraftTailStreamOutputBatch,
-    VerifyCommit,
-    iter_control_batch_messages,
+    ReadyDraftControls,
 )
 from sglang.srt.speculative.tracer import (
     SpecTraceEvent,
@@ -24,8 +21,6 @@ from sglang.srt.speculative.tracer import (
     trace_speculative,
 )
 from sglang.srt.utils.network import get_zmq_socket
-
-DraftControlMessage = DraftSync | VerifyCommit | DraftClose
 
 TOKEN_SYNC_THREAD_IDLE_WAIT_TIMEOUT_S = 0.0005  # 0.5ms
 
@@ -38,12 +33,14 @@ class TokenSyncThread:
     control_bind_endpoint: str | None = None
     verifier_result_endpoints: list[str] | tuple[str, ...] | None = None
     drafter_rank: int = 0
-    _pending_controls: deque[DraftControlMessage] = field(default_factory=deque)
+    _pending_control_inbox: DraftControlInbox = field(
+        default_factory=DraftControlInbox
+    )
     # verifier -> drafter controls
     control_recv_socket: zmq.Socket | None = None
     # drafter -> verifier draft tokens
     result_send_sockets: dict[int, zmq.Socket] = field(default_factory=dict)
-    # protects _pending_controls
+    # protects _pending_control_inbox
     _pending_lock: threading.Lock = field(default_factory=threading.Lock)
     _outgoing_results: queue.SimpleQueue[DraftTailStreamOutputBatch] = field(
         default_factory=queue.SimpleQueue
@@ -106,40 +103,33 @@ class TokenSyncThread:
 
     @trace_speculative(SpecTraceEvent.TOKEN_SYNC_DRAIN_CONTROL_SOCKET)
     def _drain_control_socket(self) -> bool | dict[str, Any]:
-        pending_controls_before = self._pending_controls_size()
-        num_control_batches = 0
-        num_control_messages = 0
+        pending_controls_before = self._pending_control_count()
         did_work = False
         if self.control_recv_socket is None:
             return did_work
 
         while True:
             try:
-                control_messages = self._recv_control_messages_from_socket()
+                control_batch = self._recv_control_batch_from_socket()
             except zmq.error.ContextTerminated:
                 raise
             except zmq.ZMQError:
                 break
             did_work = True
-            if control_messages is None:
+            if control_batch is None:
                 continue
-            num_control_batches += 1
-            num_control_messages += len(control_messages)
-            if control_messages:
-                with self._pending_lock:
-                    self._pending_controls.extend(control_messages)
+            with self._pending_lock:
+                self._pending_control_inbox.add_control_batch_locked(control_batch)
         if not did_work:
             return False
         return {
             "drafter_rank": int(self.drafter_rank),
             "pending_controls_before": pending_controls_before,
-            "pending_controls_after": self._pending_controls_size(),
-            "num_control_batches": num_control_batches,
-            "num_control_messages": num_control_messages,
+            "pending_controls_after": self._pending_control_count(),
         }
 
     @trace_speculative(SpecTraceEvent.TOKEN_SYNC_RECV_CONTROL_BATCH)
-    def _recv_control_messages_from_socket(self) -> list[DraftControlMessage] | None:
+    def _recv_control_batch_from_socket(self) -> DraftControlBatch | None:
         message = self.control_recv_socket.recv_pyobj(zmq.NOBLOCK)
         if not isinstance(message, DraftMeshMessage):
             raise RuntimeError(f"Unexpected draft control message: {message}")
@@ -151,16 +141,16 @@ class TokenSyncThread:
         control_batch = message.control_batch
         if int(control_batch.dst_drafter_rank) != int(self.drafter_rank):
             return None
-        return iter_control_batch_messages(control_batch)
+        return control_batch
 
     @trace_speculative(SpecTraceEvent.TOKEN_SYNC_DRAIN_CONTROL_BATCH)
-    def drain_control_messages(self) -> list[DraftControlMessage]:
-        """Drain all pending control messages while preserving arrival order."""
-        drained_messages: list[DraftControlMessage] = []
+    def collect_ready_draft_controls(
+        self,
+        collector: Callable[[DraftControlInbox], ReadyDraftControls],
+    ) -> ReadyDraftControls:
+        """Extract ready controls from the live inbox under the inbox lock."""
         with self._pending_lock:
-            while self._pending_controls:
-                drained_messages.append(self._pending_controls.popleft())
-        return drained_messages
+            return collector(self._pending_control_inbox)
 
     @trace_speculative(
         SpecTraceEvent.TOKEN_SYNC_ENQUEUE_DRAFT_RESULT_BATCH
@@ -231,19 +221,19 @@ class TokenSyncThread:
         except (AttributeError, NotImplementedError):
             return -1
 
-    def _pending_controls_size(self) -> int:
+    def _pending_control_count(self) -> int:
         with self._pending_lock:
-            return len(self._pending_controls)
+            return self._pending_control_inbox.pending_control_count()
 
     @trace_speculative(SpecTraceEvent.TOKEN_SYNC_IDLE_WAIT)
     def _idle_wait(self) -> dict[str, Any]:
         queue_size_before = self._outgoing_results_size()
-        pending_controls_before = self._pending_controls_size()
+        pending_controls_before = self._pending_control_count()
         wakeup_set_before = self._wakeup.is_set()
         self._wakeup.wait(timeout=TOKEN_SYNC_THREAD_IDLE_WAIT_TIMEOUT_S)
         wakeup_set_after = self._wakeup.is_set()
         queue_size_after = self._outgoing_results_size()
-        pending_controls_after = self._pending_controls_size()
+        pending_controls_after = self._pending_control_count()
         self._wakeup.clear()
         return {
             "drafter_rank": int(self.drafter_rank),

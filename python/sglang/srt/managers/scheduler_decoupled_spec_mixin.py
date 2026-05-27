@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import logging
-from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Deque, Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
 import triton
@@ -18,11 +17,13 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.decoupled_spec_io import (
     DraftClose,
     DraftControlBatch,
-    DraftControlMessage,
+    DraftControlInbox,
     DraftReqKey,
     DraftSync,
     DraftTailStreamOutput,
     DraftTailStreamOutputBatch,
+    ReadyDraftControls,
+    VerifierCommitSegment,
     VerifyCommit,
     build_draft_scheduler_rid,
     parse_draft_scheduler_rid,
@@ -48,8 +49,6 @@ class DraftReqState:
     key: DraftReqKey
     req: Optional[Req] = None
     verifier_committed_prefix_len: int = 0
-    pending_verify_commits: Deque[VerifyCommit] = field(default_factory=deque)
-    pending_close: Optional[DraftClose] = None
     is_sleeping: bool = False
     mamba_checkpoint_positions: set[int] = field(default_factory=set)
     mamba_checkpoint_slots: Optional[torch.Tensor] = None
@@ -177,7 +176,6 @@ class SchedulerDecoupledSpecMixin:
     def init_draft_state_tables(self: Scheduler) -> None:
         self.draft_req_table: Dict[DraftReqKey, DraftReqState] = {}
         self.draft_sleeping_reqs: Dict[DraftReqKey, Req] = {}
-        self.draft_pending_verify_commit_keys: set[DraftReqKey] = set()
         self.decoupled_verify_drafter_ranks: list[int] = []
         self.decoupled_verify_req_to_drafter_rank: Dict[str, int] = {}
         self.decoupled_verify_drafter_loads: Dict[int, int] = {}
@@ -343,40 +341,49 @@ class SchedulerDecoupledSpecMixin:
             and self.attn_cp_rank == 0
         )
 
-    def _broadcast_draft_control_messages(
+    def _broadcast_ready_draft_controls(
         self: Scheduler,
-        messages: list[DraftControlMessage] | None,
-    ) -> list[DraftControlMessage]:
+        ready_controls: ReadyDraftControls | None,
+    ) -> ReadyDraftControls:
         """
-        Broadcast draft control messages among all ranks:
+        Broadcast ready draft controls among all ranks:
         DraftSync: build a new draft request based on its prompt token_ids
-        VerifyCommit: overwrite the bonus token and truncate the suffix if needed
+        VerifierCommitSegment: apply the verifier-committed segment and
+        truncate suffix if needed
         """
         if getattr(self.server_args, "enable_dp_attention", False):
             if self.attn_tp_size != 1:
-                messages = broadcast_pyobj(
-                    messages,
+                ready_controls = broadcast_pyobj(
+                    ready_controls,
                     self.attn_tp_group.rank,
                     self.attn_tp_cpu_group,
                     src=self.attn_tp_group.ranks[0],
                 )
             if self.attn_cp_size != 1:
-                messages = broadcast_pyobj(
-                    messages,
+                ready_controls = broadcast_pyobj(
+                    ready_controls,
                     self.attn_cp_group.rank,
                     self.attn_cp_cpu_group,
                     src=self.attn_cp_group.ranks[0],
                 )
-            return list(messages or [])
+            return (
+                ready_controls
+                if ready_controls is not None
+                else ReadyDraftControls()
+            )
 
         if self.tp_size != 1:
-            messages = broadcast_pyobj(
-                messages,
+            ready_controls = broadcast_pyobj(
+                ready_controls,
                 self.tp_group.rank,
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
             )
-        return list(messages or [])
+        return (
+            ready_controls
+            if ready_controls is not None
+            else ReadyDraftControls()
+        )
 
     def _get_token_sync_thread(self: Scheduler):
         token_sync_thread = self.token_sync_thread
@@ -668,8 +675,8 @@ class SchedulerDecoupledSpecMixin:
         if batch is None or batch.is_empty():
             raise RuntimeError(
                 "Decoupled draft batch metadata update requires a non-empty "
-                "running_batch. VerifyCommit metadata updates should only be "
-                "queued for requests in running_batch."
+                "running_batch. Verifier commit segment metadata updates should "
+                "only be queued for requests in running_batch."
             )
         if (
             batch.seq_lens_cpu is None
@@ -688,8 +695,8 @@ class SchedulerDecoupledSpecMixin:
         if len(req_batch_idx_set) != len(batch_metadata_updates):
             raise RuntimeError(
                 "Decoupled draft batch metadata update received duplicate batch "
-                "indices in one flush. This indicates multiple VerifyCommit "
-                "rewrites for the same in-flight request."
+                "indices in one flush. This indicates multiple verifier commit "
+                "segment rewrites for the same in-flight request."
             )
 
         device = batch.seq_lens.device
@@ -735,82 +742,72 @@ class SchedulerDecoupledSpecMixin:
 
         batch_metadata_updates.clear()
 
-    def apply_verify_commit(
+    def apply_verifier_commit_segment(
         self: Scheduler,
         req: Req,
-        message: VerifyCommit,
+        segment: VerifierCommitSegment,
         *,
         req_batch_idx: Optional[int] = None,
         kv_truncations: list[DraftKVTruncation],
         batch_metadata_updates: list[DraftBatchMetadataUpdate],
     ) -> None:
         """
-        apply the verify result (pre_verify_committed_len, bonus_token_pos,
-        bonus_token_id) to the draft request:
-        1. overwrite the bonus token and update output_ids, grammar,
-           KV cache, stream output, etc. when needed
-        2. update the scheduler state's verifier_committed_prefix_len to (bonus_token_pos + 1)
+        Apply the verifier-committed output segment to the draft request.
+
+        This path handles already-materialized matching segments and a single
+        divergent verifier token. Callers must split verifier commit segments
+        before applying them so mismatched suffixes are committed incrementally.
         """
         state = self._get_draft_state_by_req(req)
-        if state.key != message.draft_key:
+        if state.key != segment.draft_key:
             raise RuntimeError(
-                "VerifyCommit arrived for a mismatched draft request: "
+                "VerifierCommitSegment arrived for a mismatched draft request: "
                 f"req_rid={req.rid} req_draft_key={state.key} "
-                f"message_draft_key={message.draft_key}"
+                f"segment_draft_key={segment.draft_key}"
             )
-        pre_verify_committed_len = int(message.pre_verify_committed_len)
-        bonus_token_pos = int(message.bonus_token_pos)
-        bonus_token_id = int(message.bonus_token_id)
+        pre_verify_committed_len = int(segment.pre_verify_committed_len)
+        committed_token_ids = [
+            int(token_id) for token_id in segment.committed_token_ids
+        ]
+        if not committed_token_ids:
+            raise ValueError(
+                "VerifierCommitSegment committed_token_ids must be non-empty: "
+                f"request_id={segment.draft_key.request_id} "
+                f"pre_verify_committed_len={pre_verify_committed_len}"
+            )
+        committed_segment_len = len(committed_token_ids)
         current_committed_len = int(state.verifier_committed_prefix_len)
-        new_committed_len = bonus_token_pos + 1
+        new_committed_len = pre_verify_committed_len + committed_segment_len
         output_len = len(req.output_ids)
         prompt_len = len(req.origin_input_ids)
         materialized_kv_len = prompt_len + max(output_len - 1, 0)
 
         if new_committed_len <= current_committed_len:
             raise RuntimeError(
-                "VerifyCommit must advance the drafter committed prefix: "
-                f"request_id={message.request_id} "
-                f"src_verifier_rank={message.src_verifier_rank} "
+                "VerifierCommitSegment must advance the drafter committed prefix: "
+                f"request_id={segment.draft_key.request_id} "
+                f"src_verifier_rank={segment.draft_key.src_verifier_rank} "
                 f"pre_verify_committed_len={pre_verify_committed_len} "
-                f"bonus_token_pos={bonus_token_pos} "
+                f"committed_segment_len={committed_segment_len} "
                 f"current_committed_len={current_committed_len} "
                 f"new_committed_len={new_committed_len}"
             )
 
         if pre_verify_committed_len > current_committed_len:
             raise RuntimeError(
-                "VerifyCommit depends on a prefix the drafter has not committed: "
-                f"request_id={message.request_id} "
-                f"src_verifier_rank={message.src_verifier_rank} "
+                "VerifierCommitSegment depends on a prefix the drafter has not "
+                "committed: "
+                f"request_id={segment.draft_key.request_id} "
+                f"src_verifier_rank={segment.draft_key.src_verifier_rank} "
                 f"pre_verify_committed_len={pre_verify_committed_len} "
                 f"current_committed_len={current_committed_len}"
-            )
-
-        if bonus_token_pos < pre_verify_committed_len:
-            raise RuntimeError(
-                "VerifyCommit bonus token is before its pre-verify prefix: "
-                f"request_id={message.request_id} "
-                f"src_verifier_rank={message.src_verifier_rank} "
-                f"pre_verify_committed_len={pre_verify_committed_len} "
-                f"bonus_token_pos={bonus_token_pos}"
-            )
-
-        if bonus_token_pos >= output_len:
-            raise RuntimeError(
-                "Decoupled draft attempted to apply an unmaterialized verify commit: "
-                f"request_id={state.key.request_id} "
-                f"bonus_token_pos={bonus_token_pos} "
-                f"output_len={output_len} "
-                f"committed_prefix_len={state.verifier_committed_prefix_len} "
-                f"pre_verify_committed_len={pre_verify_committed_len}"
             )
 
         if req.kv_committed_freed:
             raise RuntimeError(
                 "Decoupled draft verify commit found freed KV cache: "
                 f"request_id={state.key.request_id} "
-                f"bonus_token_pos={bonus_token_pos} "
+                f"new_committed_len={new_committed_len} "
                 f"output_len={output_len} "
                 f"kv_committed_len={req.kv_committed_len} "
                 f"kv_allocated_len={req.kv_allocated_len}"
@@ -824,7 +821,7 @@ class SchedulerDecoupledSpecMixin:
                 "Decoupled draft KV prefix is shorter than the materialized "
                 "output prefix: "
                 f"request_id={state.key.request_id} "
-                f"bonus_token_pos={bonus_token_pos} "
+                f"new_committed_len={new_committed_len} "
                 f"output_len={output_len} "
                 f"prompt_len={prompt_len} "
                 f"materialized_kv_len={materialized_kv_len} "
@@ -832,26 +829,70 @@ class SchedulerDecoupledSpecMixin:
                 f"kv_allocated_len={req.kv_allocated_len}"
             )
 
-        bonus_token_matches = (
-            bonus_token_pos < output_len
-            and int(req.output_ids[bonus_token_pos]) == bonus_token_id
+        matched_segment_len = 0
+        max_possible_match_len = min(
+            committed_segment_len,
+            max(0, output_len - pre_verify_committed_len),
         )
+        while (
+            matched_segment_len < max_possible_match_len
+            and int(req.output_ids[pre_verify_committed_len + matched_segment_len])
+            == committed_token_ids[matched_segment_len]
+        ):
+            matched_segment_len += 1
 
-        if bonus_token_matches:
-            # if the bonus token matches, only need to push forward the committed prefix
+        if matched_segment_len == committed_segment_len:
+            # all committed_tokens match the drafter's output, simply advance the committed prefix
             state.verifier_committed_prefix_len = new_committed_len
             self._prune_draft_mamba_ckpts(state)
             return
 
-        # The verifier-selected bonus token replaces the drafter suffix starting at
-        # `bonus_token_pos`.
+        remaining_committed_token_ids = committed_token_ids[matched_segment_len:]
+        if len(remaining_committed_token_ids) > 1:
+            raise RuntimeError(
+                "VerifierCommitSegment committed_token_ids contain a multi-token "
+                "mismatched verifier segment. Split the segment before applying: "
+                f"request_id={segment.draft_key.request_id} "
+                f"src_verifier_rank={segment.draft_key.src_verifier_rank} "
+                f"pre_verify_committed_len={pre_verify_committed_len} "
+                f"matched_segment_len={matched_segment_len} "
+                f"committed_token_ids={committed_token_ids} "
+                f"draft_segment={req.output_ids[pre_verify_committed_len:new_committed_len]}"
+            )
+
+        committed_token_pos = pre_verify_committed_len + matched_segment_len
+        committed_token_id = int(remaining_committed_token_ids[0])
+        if committed_token_pos < current_committed_len:
+            raise RuntimeError(
+                "VerifierCommitSegment conflicts with the already committed "
+                "drafter prefix: "
+                f"request_id={segment.draft_key.request_id} "
+                f"src_verifier_rank={segment.draft_key.src_verifier_rank} "
+                f"committed_token_pos={committed_token_pos} "
+                f"current_committed_len={current_committed_len} "
+                f"committed_token_ids={committed_token_ids}"
+            )
+        if committed_token_pos >= output_len:
+            raise RuntimeError(
+                "VerifierCommitSegment cannot skip a non-materialized drafter "
+                "output gap. Keep the segment pending until the drafter "
+                "materializes the prefix: "
+                f"request_id={segment.draft_key.request_id} "
+                f"src_verifier_rank={segment.draft_key.src_verifier_rank} "
+                f"committed_token_pos={committed_token_pos} "
+                f"output_len={output_len} "
+                f"committed_token_ids={committed_token_ids}"
+            )
+
+        # The verifier-selected token replaces the drafter suffix starting at
+        # `committed_token_pos`.
         #
         # Positions here are in req.output_ids, not in the full prompt+output
         # sequence. The kept output range is [0, truncate_from), and the removed
         # output range is [truncate_from, len(req.output_ids)). In other words,
-        # `truncate_from` itself is removed. After the removal, `bonus_token_id`
+        # `truncate_from` itself is removed. After the removal, committed_token_id
         # is appended at exactly that position.
-        truncate_from = bonus_token_pos
+        truncate_from = committed_token_pos
 
         # Number of output tokens removed from the drafter suffix:
         # len(req.output_ids[truncate_from:]).
@@ -867,7 +908,7 @@ class SchedulerDecoupledSpecMixin:
             raise RuntimeError(
                 "Decoupled draft cannot truncate beyond materialized KV prefix: "
                 f"request_id={state.key.request_id} "
-                f"bonus_token_pos={bonus_token_pos} "
+                f"committed_token_pos={committed_token_pos} "
                 f"output_len={output_len} "
                 f"prompt_len={prompt_len} "
                 f"kv_truncate_from={kv_truncate_from} "
@@ -875,55 +916,55 @@ class SchedulerDecoupledSpecMixin:
                 f"kv_allocated_len={req.kv_allocated_len}"
             )
 
-        self._draft_mamba_ckpt_slot(state, bonus_token_pos, for_write=False)
+        # check the committed_token_pos's mamba ckpt exiests
+        self._draft_mamba_ckpt_slot(state, committed_token_pos, for_write=False)
 
-        if removed > 0:
-            if req.grammar is not None:
-                try:
-                    req.grammar.rollback(removed)
-                except Exception:
-                    logger.debug("Draft grammar rollback failed for req %s", req.rid)
-
-            if req.req_pool_idx is not None and not req.kv_committed_freed:
-                # Only free KV slots that are currently allocated for this req.
-                # `trimmed_end` is exclusive. The freed full-sequence KV range is
-                # [kv_truncate_from, trimmed_end). If kv_truncate_from ==
-                # trimmed_end, there is nothing to free.
-                trimmed_end = min(
-                    req.kv_allocated_len, prompt_len + len(req.output_ids)
-                )
-                if kv_truncate_from < trimmed_end:
-                    kv_truncations.append(
-                        DraftKVTruncation(
-                            req_pool_idx=int(req.req_pool_idx),
-                            kv_start=kv_truncate_from,
-                            kv_end=trimmed_end,
-                        )
-                    )
-                req.kv_committed_len = min(req.kv_committed_len, kv_truncate_from)
-                req.kv_allocated_len = min(req.kv_allocated_len, kv_truncate_from)
-                req.cache_protected_len = min(req.cache_protected_len, kv_truncate_from)
-
-            # Truncate per-output arrays with the same output-index interval:
-            # delete [truncate_from, old_output_len).
-            del req.output_ids[truncate_from:]
-            if req.return_logprob:
-                del req.output_token_logprobs_val[truncate_from:]
-                del req.output_token_logprobs_idx[truncate_from:]
-                del req.output_top_logprobs_val[truncate_from:]
-                del req.output_top_logprobs_idx[truncate_from:]
-                del req.output_token_ids_logprobs_val[truncate_from:]
-                del req.output_token_ids_logprobs_idx[truncate_from:]
-            if req.hidden_states:
-                del req.hidden_states[truncate_from:]
-
-        req.output_ids.append(bonus_token_id)
         if req.grammar is not None:
             try:
-                req.grammar.accept_token(bonus_token_id)
+                req.grammar.rollback(removed)
+            except Exception:
+                logger.debug("Draft grammar rollback failed for req %s", req.rid)
+
+        if req.req_pool_idx is not None and not req.kv_committed_freed:
+            # Only free KV slots that are currently allocated for this req.
+            # `trimmed_end` is exclusive. The freed full-sequence KV range is
+            # [kv_truncate_from, trimmed_end). If kv_truncate_from ==
+            # trimmed_end, there is nothing to free.
+            trimmed_end = min(
+                req.kv_allocated_len, prompt_len + len(req.output_ids)
+            )
+            if kv_truncate_from < trimmed_end:
+                kv_truncations.append(
+                    DraftKVTruncation(
+                        req_pool_idx=int(req.req_pool_idx),
+                        kv_start=kv_truncate_from,
+                        kv_end=trimmed_end,
+                    )
+                )
+            req.kv_committed_len = min(req.kv_committed_len, kv_truncate_from)
+            req.kv_allocated_len = min(req.kv_allocated_len, kv_truncate_from)
+            req.cache_protected_len = min(req.cache_protected_len, kv_truncate_from)
+
+        # Truncate per-output arrays with the same output-index interval:
+        # delete [truncate_from, old_output_len).
+        del req.output_ids[truncate_from:]
+        if req.return_logprob:
+            del req.output_token_logprobs_val[truncate_from:]
+            del req.output_token_logprobs_idx[truncate_from:]
+            del req.output_top_logprobs_val[truncate_from:]
+            del req.output_top_logprobs_idx[truncate_from:]
+            del req.output_token_ids_logprobs_val[truncate_from:]
+            del req.output_token_ids_logprobs_idx[truncate_from:]
+        if req.hidden_states:
+            del req.hidden_states[truncate_from:]
+
+        req.output_ids.append(committed_token_id)
+        if req.grammar is not None:
+            try:
+                req.grammar.accept_token(committed_token_id)
             except Exception:
                 logger.debug(
-                    "Draft grammar accept failed during bonus token update for req %s",
+                    "Draft grammar accept failed during verify commit for req %s",
                     req.rid,
                 )
         req.finished_reason = None
@@ -939,14 +980,14 @@ class SchedulerDecoupledSpecMixin:
                 f"request_id={state.key.request_id} "
                 f"expected_output_len={new_committed_len} "
                 f"actual_output_len={len(req.output_ids)} "
-                f"bonus_token_pos={bonus_token_pos}"
+                f"committed_token_pos={committed_token_pos}"
             )
-        if int(req.output_ids[-1]) != bonus_token_id:
+        if int(req.output_ids[-1]) != committed_token_id:
             raise RuntimeError(
-                "Decoupled draft verify commit failed to install bonus token: "
+                "Decoupled draft verify commit failed to install committed token: "
                 f"request_id={state.key.request_id} "
-                f"bonus_token_pos={bonus_token_pos} "
-                f"bonus_token_id={bonus_token_id} "
+                f"committed_token_pos={committed_token_pos} "
+                f"committed_token_id={committed_token_id} "
                 f"tail_token_id={int(req.output_ids[-1])}"
             )
 
@@ -979,9 +1020,9 @@ class SchedulerDecoupledSpecMixin:
                     f"batch_req_rid={batch.reqs[req_batch_idx].rid}"
                 )
             # Keep the in-flight decode batch consistent with the rewritten request
-            # state. This block is only needed when the verifier bonus token changed
-            # req.output_ids above: either an existing suffix was truncated and
-            # replaced, or the bonus token was appended at the current tail.
+            # state. This block is only needed when the verifier committed token
+            # changed req.output_ids above: either an existing suffix was truncated
+            # and replaced, or a committed token was appended at the current tail.
             #
             # Decode seq_len is the number of tokens **already present in KV** before the
             # next tail token is consumed. For a drafter request, output_ids[-1] is the
@@ -1045,7 +1086,6 @@ class SchedulerDecoupledSpecMixin:
                 batch.batch_is_full = False
         self.draft_sleeping_reqs.pop(state.key, None)
         self._release_draft_mamba_ckpt_slots(state)
-        self.draft_pending_verify_commit_keys.discard(state.key)
         self.draft_req_table.pop(state.key, None)
         release_kv_cache(req, self.tree_cache, is_insert=False)
 
@@ -1057,11 +1097,6 @@ class SchedulerDecoupledSpecMixin:
         Create and register a new drafter-side request from DraftSync.
         """
         state = self._get_or_create_draft_state(message.draft_key)
-        if state.pending_close is not None:
-            raise RuntimeError(
-                "Received DraftSync for a closed decoupled draft request: "
-                f"request_id={message.request_id}"
-            )
         if state.req is not None:
             raise RuntimeError(
                 "Received DraftSync for an existing decoupled draft request: "
@@ -1097,62 +1132,155 @@ class SchedulerDecoupledSpecMixin:
         state.verifier_committed_prefix_len = len(req.output_ids)
         return req
 
-    def _apply_pending_verify_commits(self: Scheduler) -> list[VerifyCommit]:
-        kv_truncations: list[DraftKVTruncation] = []
-        batch_metadata_updates: list[DraftBatchMetadataUpdate] = []
-        applied_commits: list[VerifyCommit] = []
-        pending_keys = self.draft_pending_verify_commit_keys
-        if not pending_keys:
-            return applied_commits
+    def _draft_commit_segment_consumable_len(
+        self: Scheduler,
+        segment: VerifierCommitSegment,
+        req: Req,
+        state: DraftReqState,
+    ) -> int:
+        pre_verify_committed_len = int(segment.pre_verify_committed_len)
+        current_committed_len = int(state.verifier_committed_prefix_len)
+        if pre_verify_committed_len != current_committed_len:
+            raise RuntimeError(
+                "Verifier commit segment does not match the drafter committed prefix: "
+                f"request_id={segment.draft_key.request_id} "
+                f"src_verifier_rank={segment.draft_key.src_verifier_rank} "
+                f"pre_verify_committed_len={pre_verify_committed_len} "
+                f"current_committed_len={current_committed_len}"
+            )
+        if not segment.committed_token_ids:
+            return 0
 
-        running_req_to_idx = {
-            id(req): req_batch_idx
-            for req_batch_idx, req in enumerate(self.running_batch.reqs)
-        }
-        for draft_key in list(pending_keys):
-            pending_keys.remove(draft_key)
-            state = self.draft_req_table[draft_key]
+        output_len = len(req.output_ids)
+        if pre_verify_committed_len > output_len:
+            raise RuntimeError(
+                "Verifier commit segment is ahead of the drafter committed prefix: "
+                f"request_id={segment.draft_key.request_id} "
+                f"src_verifier_rank={segment.draft_key.src_verifier_rank} "
+                f"pre_verify_committed_len={pre_verify_committed_len} "
+                f"output_len={output_len}"
+            )
+
+        if pre_verify_committed_len == output_len:
+            return 0
+
+        matched_len = 0
+        max_possible_match_len = min(
+            len(segment.committed_token_ids),
+            output_len - pre_verify_committed_len,
+        )
+        while (
+            matched_len < max_possible_match_len
+            and int(req.output_ids[pre_verify_committed_len + matched_len])
+            == int(segment.committed_token_ids[matched_len])
+        ):
+            matched_len += 1
+
+        if matched_len == len(segment.committed_token_ids):
+            return matched_len
+        if matched_len < max_possible_match_len:
+            # the first token that doesn't match the drafter's suffix is still considered consumable
+            return matched_len + 1
+        return matched_len
+
+    def _collect_ready_draft_controls(
+        self: Scheduler,
+        control_inbox: DraftControlInbox,
+    ) -> ReadyDraftControls:
+        def consumable_commit_len(segment: VerifierCommitSegment) -> int:
+            state = self.draft_req_table.get(segment.draft_key)
+            if state is None:
+                return 0
             req = state.req
             if (
                 req is None
                 or req.req_pool_idx is None
                 or req.kv_committed_freed
             ):
-                pending_keys.add(draft_key)
-                continue
+                return 0
 
-            while state.pending_verify_commits:
-                verify_commit = state.pending_verify_commits[0]
-                if int(verify_commit.bonus_token_pos) >= len(req.output_ids):
-                    # The draft request has not materialized the bonus token position.
-                    break
-                state.pending_verify_commits.popleft()
-                req_batch_idx = running_req_to_idx.get(id(req))
-                self.apply_verify_commit(
-                    req,
-                    verify_commit,
-                    req_batch_idx=req_batch_idx,
-                    kv_truncations=kv_truncations,
-                    batch_metadata_updates=batch_metadata_updates,
+            return self._draft_commit_segment_consumable_len(segment, req, state)
+
+        return control_inbox.extract_ready_controls_locked(consumable_commit_len)
+
+    def _apply_ready_verifier_commit_segments(
+        self: Scheduler,
+        ready_commit_segments: list[VerifierCommitSegment],
+    ) -> tuple[list[VerifierCommitSegment], int]:
+        kv_truncations: list[DraftKVTruncation] = []
+        batch_metadata_updates: list[DraftBatchMetadataUpdate] = []
+        applied_segments: list[VerifierCommitSegment] = []
+        commit_echo_batch = DraftTailStreamOutputBatch()
+        if not ready_commit_segments:
+            return applied_segments, 0
+
+        running_req_to_idx = {}
+        if self.running_batch is not None and not self.running_batch.is_empty():
+            running_req_to_idx = {
+                id(req): req_batch_idx
+                for req_batch_idx, req in enumerate(self.running_batch.reqs)
+        }
+
+        for segment in ready_commit_segments:
+            state = self.draft_req_table.get(segment.draft_key)
+            if state is None:
+                raise RuntimeError(
+                    "Ready verifier commit segment has no draft state: "
+                    f"draft_key={segment.draft_key}"
                 )
-                applied_commits.append(verify_commit)
+            req = state.req
+            if req is None:
+                raise RuntimeError(
+                    "Ready verifier commit segment has no draft request: "
+                    f"draft_key={segment.draft_key}"
+                )
 
-            if state.pending_verify_commits:
-                pending_keys.add(draft_key)
+            req_batch_idx = running_req_to_idx.get(id(req))
+            self.apply_verifier_commit_segment(
+                req,
+                segment,
+                req_batch_idx=req_batch_idx,
+                kv_truncations=kv_truncations,
+                batch_metadata_updates=batch_metadata_updates,
+            )
+            applied_segments.append(segment)
+            if self.is_draft_entry_rank():
+                if not segment.committed_token_ids:
+                    raise ValueError(
+                        "VerifierCommitSegment committed_token_ids must be "
+                        "non-empty before echoing applied segment: "
+                        f"request_id={segment.draft_key.request_id} "
+                        f"pre_verify_committed_len={segment.pre_verify_committed_len}"
+                    )
+                committed_token_pos = (
+                    int(segment.pre_verify_committed_len)
+                    + len(segment.committed_token_ids)
+                    - 1
+                )
+                # Echo the last applied committed token so verifier-side
+                # pending expected tokens can advance when no comparable
+                # draft-tail anchor was available in its buffer.
+                commit_echo_batch.outputs.append(
+                    DraftTailStreamOutput(
+                        src_drafter_rank=self.get_decoupled_spec_rank(),
+                        dst_verifier_rank=int(segment.draft_key.src_verifier_rank),
+                        request_id=segment.draft_key.request_id,
+                        base_committed_len=committed_token_pos,
+                        new_token_pos=committed_token_pos,
+                        new_token_id=int(segment.committed_token_ids[-1]),
+                    )
+                )
 
         self._flush_draft_kv_truncations(kv_truncations)
         self._flush_draft_batch_metadata_updates(batch_metadata_updates)
-        return applied_commits
+        if commit_echo_batch.outputs:
+            self._get_token_sync_thread().submit_draft_results(commit_echo_batch)
+        return applied_segments, len(commit_echo_batch.outputs)
 
     def _handle_draft_sync_message(
         self: Scheduler,
         message: DraftSync,
     ) -> Optional[Req]:
-        entry = self.draft_req_table.get(message.draft_key)
-        if entry is not None and entry.pending_close is not None:
-            self.draft_req_table.pop(message.draft_key, None)
-            return None
-
         req = self._create_draft_request(message)
         running_batch = self.running_batch
         if (
@@ -1163,97 +1291,77 @@ class SchedulerDecoupledSpecMixin:
             self._add_request_to_queue(req)
         return req
 
-    def _handle_draft_verify_commit_message(
-        self: Scheduler,
-        message: VerifyCommit,
-    ) -> None:
-        entry = self._get_or_create_draft_state(message.draft_key)
-        if entry.pending_close is not None:
-            return
-        entry.pending_verify_commits.append(message)
-        self.draft_pending_verify_commit_keys.add(message.draft_key)
-
-    def _handle_draft_close_message(self: Scheduler, message: DraftClose) -> None:
-        self.draft_pending_verify_commit_keys.discard(message.draft_key)
-        entry = self.draft_req_table.get(message.draft_key)
+    def _handle_draft_close_key(self: Scheduler, draft_key: DraftReqKey) -> None:
+        entry = self.draft_req_table.get(draft_key)
         if entry is None:
-            entry = self._get_or_create_draft_state(message.draft_key)
-            entry.pending_close = message
             return
 
-        entry.pending_verify_commits.clear()
         req = entry.req
         if req is not None:
             self.release_draft_request(req)
-        else:
-            entry.req = None
-            entry.is_sleeping = False
-            entry.pending_close = message
-            self.draft_sleeping_reqs.pop(message.draft_key, None)
+            return
+
+        raise RuntimeError(
+            "DraftClose found drafter state without a live request: "
+            f"draft_key={draft_key} is_sleeping={entry.is_sleeping}"
+        )
 
     @trace_speculative(SpecTraceEvent.DRAFTER_SYNC_CONTROL_MESSAGES)
     def sync_draft_requests(self: Scheduler) -> dict | None:
         """
         (called by decoupled drafter)
-        Drain all verifier-to-drafter control messages in arrival order.
-        DraftSync creates requests, VerifyCommit advances/truncates existing
-        requests when its bonus token has materialized, and DraftClose releases
-        drafter-side state.
+        Collect ready verifier-to-drafter controls in arrival order.
+        DraftSync creates requests, ready VerifierCommitSegment objects
+        advance/truncate existing requests, and DraftClose releases drafter-side
+        state.
         """
         if not self.spec_algorithm.is_decoupled_draft():
             return None
 
-        messages: list[DraftControlMessage] | None = None
+        ready_controls: ReadyDraftControls | None = None
         if self.is_draft_entry_rank():
-            messages = self._get_token_sync_thread().drain_control_messages()
+            ready_controls = (
+                self._get_token_sync_thread().collect_ready_draft_controls(
+                    self._collect_ready_draft_controls
+                )
+            )
 
-        messages = self._broadcast_draft_control_messages(messages)
+        ready_controls = self._broadcast_ready_draft_controls(ready_controls)
 
         num_sync = 0
-        num_commit = 0
+        num_commit = len(ready_controls.ready_commit_segments)
         num_close = 0
         num_created_reqs = 0
         num_applied_commit = 0
 
-        closed_keys: set[DraftReqKey] = set()
-        for message in messages:
-            draft_key = message.draft_key
-            if isinstance(message, DraftClose):
-                num_close += 1
-                closed_keys.add(draft_key)
-                self._handle_draft_close_message(message)
-                continue
+        closed_keys = ready_controls.close_keys
+        for draft_key in closed_keys:
+            num_close += 1
+            self._handle_draft_close_key(draft_key)
 
+        for message in ready_controls.sync_messages:
+            draft_key = message.draft_key
             if draft_key in closed_keys:
                 continue
+            num_sync += 1
+            req = self._handle_draft_sync_message(message)
+            if req is not None:
+                num_created_reqs += 1
 
-            if isinstance(message, DraftSync):
-                num_sync += 1
-                req = self._handle_draft_sync_message(message)
-                if req is not None:
-                    num_created_reqs += 1
-            elif isinstance(message, VerifyCommit):
-                num_commit += 1
-                self._handle_draft_verify_commit_message(message)
+        applied_segments, num_commit_echo = self._apply_ready_verifier_commit_segments(
+            ready_controls.ready_commit_segments
+        )
+        num_applied_commit += len(applied_segments)
 
-        # Apply ready commits after all control messages are tabled. This covers
-        # both newly queued commits and commits materialized by the previous
-        # prefill/decode result.
-        num_applied_commit += len(self._apply_pending_verify_commits())
-
-        if not messages and num_applied_commit == 0:
+        if ready_controls.is_empty() and num_applied_commit == 0:
             return None
         return {
-            "num_messages": len(messages),
             "num_sync": num_sync,
             "num_commit": num_commit,
             "num_close": num_close,
             "num_created_reqs": num_created_reqs,
             "num_applied_commit": num_applied_commit,
-            "num_pending_commit": sum(
-                len(self.draft_req_table[key].pending_verify_commits)
-                for key in self.draft_pending_verify_commit_keys
-            ),
+            "num_commit_echo": num_commit_echo,
             "num_sleeping_reqs": len(self.draft_sleeping_reqs),
         }
 
@@ -1690,7 +1798,7 @@ class SchedulerDecoupledSpecMixin:
         self,
         target_reqs: list[Req],
         snapshots: list[DraftTailSnapshot],
-    ) -> None:
+    ) -> int:
         """
         Bind one broadcast draft tail snapshot set to the local verifier batch.
 
@@ -1704,7 +1812,8 @@ class SchedulerDecoupledSpecMixin:
             snapshots: Broadcast per-request draft tail snapshots.
 
         Returns:
-            None.
+            The number of snapshots skipped because their confirmed prefix
+            lags behind the verifier request.
         """
         snapshot_by_rid: dict[str, DraftTailSnapshot] = {}
         for snapshot in snapshots:
@@ -1721,8 +1830,14 @@ class SchedulerDecoupledSpecMixin:
                 setattr(req, "draft_buffer", None)
                 setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
                 continue
+
             committed_len = int(snapshot.committed_len)
-            if committed_len != len(req.output_ids):
+            if committed_len < len(req.output_ids):
+                # the drafter has not caught up with the verifier req's committed output prefix
+                setattr(req, "draft_buffer", None)
+                setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
+                continue
+            if committed_len > len(req.output_ids):
                 raise RuntimeError(
                     "Decoupled verify draft tail snapshot is out of sync with "
                     "the verifier request: "
@@ -1735,6 +1850,12 @@ class SchedulerDecoupledSpecMixin:
                 "_decoupled_verify_snapshot_raw_tail_tokens",
                 list(snapshot.raw_tail_tokens),
             )
+        return sum(
+            1
+            for req in target_reqs
+            if snapshot_by_rid.get(req.rid) is not None
+            and int(snapshot_by_rid[req.rid].committed_len) < len(req.output_ids)
+        )
 
     @trace_speculative(SpecTraceEvent.VERIFIER_BUILD_SYNC_BATCH)
     def _sync_verify_requests(self, batch: ScheduleBatch) -> dict | None:
@@ -1846,7 +1967,9 @@ class SchedulerDecoupledSpecMixin:
             )
 
         synced_snapshots = self._broadcast_verify_snapshots(local_snapshots)
-        self._bind_verify_snapshots(target_reqs, synced_snapshots)
+        num_stale_snapshots = self._bind_verify_snapshots(
+            target_reqs, synced_snapshots
+        )
         snapshot_by_rid = {
             snapshot.request_id: snapshot for snapshot in synced_snapshots
         }
@@ -1861,8 +1984,12 @@ class SchedulerDecoupledSpecMixin:
                 int(getattr(snapshot_by_rid.get(req.rid), "raw_tail_len", 0))
                 for req in target_reqs
             ],
-            "committed_lens_by_req": [len(req.output_ids) for req in target_reqs],
+            "committed_lens_by_req": [
+                int(getattr(snapshot_by_rid.get(req.rid), "committed_len", 0))
+                for req in target_reqs
+            ],
             "output_lens_by_req": [len(req.output_ids) for req in target_reqs],
+            "num_stale_snapshots": num_stale_snapshots,
         }
 
     @trace_speculative(SpecTraceEvent.VERIFIER_BUILD_UPDATE_BATCH)
@@ -1876,7 +2003,7 @@ class SchedulerDecoupledSpecMixin:
         Called after verifier extend/decode results have updated request output
         ids and finish state. Only the entry rank owns DraftTailBuffer and emits
         control messages. Live synced requests emit VerifyCommit with the latest
-        committed prefix and bonus token. Finished or retracted synced requests
+        committed output segment. Finished or retracted synced requests
         emit DraftClose so the drafter can release its request state.
 
         Args:
@@ -1901,9 +2028,9 @@ class SchedulerDecoupledSpecMixin:
         close_messages: list[DraftClose] = []
         commit_pre_committed_lens: list[int] = []
         commit_draft_buffer_lens: list[int] = []
-        commit_accepted_tail_lens: list[int] = []
-        commit_bonus_token_ids: list[int] = []
-        commit_snapshot_candidate_token_ids: list[int] = []
+        commit_segment_lens: list[int] = []
+        commit_last_token_ids: list[int] = []
+        commit_committed_lens: list[int] = []
         commit_output_lens: list[int] = []
         close_output_lens: list[int] = []
         for req in batch.reqs:
@@ -1931,7 +2058,6 @@ class SchedulerDecoupledSpecMixin:
             if not req.output_ids:
                 continue
 
-            bonus_token_pos = len(req.output_ids) - 1
             pre_verify_committed_len = getattr(
                 req,
                 "_decoupled_verify_pre_committed_len",
@@ -1941,20 +2067,28 @@ class SchedulerDecoupledSpecMixin:
                 pre_verify_committed_len = draft_tail_buffer.get_committed_len(req.rid)
             if pre_verify_committed_len is None:
                 continue
+            pre_verify_committed_len = int(pre_verify_committed_len)
+            if pre_verify_committed_len > len(req.output_ids):
+                raise RuntimeError(
+                    "Verifier VerifyCommit pre-commit prefix is beyond the "
+                    "current output ids: "
+                    f"request_id={req.rid} "
+                    f"pre_verify_committed_len={pre_verify_committed_len} "
+                    f"output_len={len(req.output_ids)}"
+                )
+            if pre_verify_committed_len == len(req.output_ids):
+                # no tokens are generated during this forward(e.g. chunked prefill)
+                if hasattr(req, "_decoupled_verify_pre_committed_len"):
+                    delattr(req, "_decoupled_verify_pre_committed_len")
+                if hasattr(req, "_decoupled_verify_snapshot_raw_tail_tokens"):
+                    delattr(req, "_decoupled_verify_snapshot_raw_tail_tokens")
+                continue
 
-            bonus_token_id = int(req.output_ids[bonus_token_pos])
             draft_buffer = list(getattr(req, "draft_buffer", None) or [])
-            accepted_tail_len = max(
-                0, int(bonus_token_pos) - int(pre_verify_committed_len)
-            )
-            snapshot_raw_tail_tokens = list(
-                getattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", []) or []
-            )
-            snapshot_candidate_token_id = (
-                int(snapshot_raw_tail_tokens[accepted_tail_len])
-                if 0 <= accepted_tail_len < len(snapshot_raw_tail_tokens)
-                else -1
-            )
+            committed_token_ids = [
+                int(token_id)
+                for token_id in req.output_ids[pre_verify_committed_len:]
+            ]
 
             verify_commit_messages.append(
                 VerifyCommit(
@@ -1962,34 +2096,21 @@ class SchedulerDecoupledSpecMixin:
                     src_verifier_rank=self.get_decoupled_spec_rank(),
                     dst_drafter_rank=self.get_drafter_rank(req.rid),
                     pre_verify_committed_len=pre_verify_committed_len,
-                    bonus_token_pos=bonus_token_pos,
-                    bonus_token_id=bonus_token_id,
+                    committed_token_ids=committed_token_ids,
                 )
             )
-            commit_pre_committed_lens.append(int(pre_verify_committed_len))
+            commit_pre_committed_lens.append(pre_verify_committed_len)
             commit_draft_buffer_lens.append(len(draft_buffer))
-            commit_accepted_tail_lens.append(accepted_tail_len)
-            commit_bonus_token_ids.append(bonus_token_id)
-            commit_snapshot_candidate_token_ids.append(snapshot_candidate_token_id)
+            commit_segment_lens.append(len(committed_token_ids))
+            commit_last_token_ids.append(int(committed_token_ids[-1]))
+            commit_committed_lens.append(
+                pre_verify_committed_len + len(committed_token_ids)
+            )
             commit_output_lens.append(len(req.output_ids))
             if hasattr(req, "_decoupled_verify_pre_committed_len"):
                 delattr(req, "_decoupled_verify_pre_committed_len")
             if hasattr(req, "_decoupled_verify_snapshot_raw_tail_tokens"):
                 delattr(req, "_decoupled_verify_snapshot_raw_tail_tokens")
-        if verify_commit_messages:
-            # Applying a VerifyCommit needs the raw bonus-candidate anchor in
-            # DraftTailBuffer; without it `_apply_commit_locked` falls into the
-            # bonus_match=False branch and unconditionally advances
-            # `can_accept_prefix_len`, which causes any in-flight drafter
-            # stream outputs still based on the old committed prefix to be
-            # rejected as `stale_base` and silently dropped. Block here until
-            # each committed request has at least one tail token so the
-            # anchor-match decision is exact and consistent with the drafter,
-            # otherwise consistency is lost.
-            draft_tail_buffer.wait_for_draft_tokens(
-                [message.request_id for message in verify_commit_messages],
-                1,
-            )
         trace_payload = {
             "forward_mode": str(batch.forward_mode),
             "batch_size": len(batch.reqs),
@@ -2001,13 +2122,9 @@ class SchedulerDecoupledSpecMixin:
             "num_close": len(close_messages),
             "pre_committed_lens_by_req": commit_pre_committed_lens,
             "draft_buffer_lens_by_req": commit_draft_buffer_lens,
-            "accepted_tail_lens_by_req": commit_accepted_tail_lens,
-            "bonus_token_ids_by_req": commit_bonus_token_ids,
-            "snapshot_candidate_token_ids_by_req": commit_snapshot_candidate_token_ids,
-            "committed_lens_by_req": [
-                int(message.bonus_token_pos) + 1
-                for message in verify_commit_messages
-            ],
+            "committed_segment_lens_by_req": commit_segment_lens,
+            "last_committed_token_ids_by_req": commit_last_token_ids,
+            "committed_lens_by_req": commit_committed_lens,
             "commit_output_lens_by_req": commit_output_lens,
             "commit_dst_drafter_ranks": [
                 int(message.dst_drafter_rank) for message in verify_commit_messages
