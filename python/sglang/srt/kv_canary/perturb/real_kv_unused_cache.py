@@ -218,6 +218,12 @@ def _pick_sweep_slot_for_group(
     into SWA-pool space. The owning node is the radix tree node that holds
     the slot in its ``value`` tensor — used by the caller to inc_lock_ref
     the node so the slot can't be evicted/reallocated before sweep verifies.
+
+    swa_resident_only=True regardless of group: even for FULL-target on
+    SWARadixCache, we cannot inc_lock_ref a swa_tombstone node (the SWA
+    lock half of SWARadixCache.inc_lock_ref asserts non-tombstone). On
+    plain RadixCache the flag is a no-op (no tombstones), so a single
+    setting is safe for both backends.
     """
     if radix_cache is None:
         return None
@@ -225,7 +231,7 @@ def _pick_sweep_slot_for_group(
     walk_result = walk_radix_cache_for_canary(
         radix_cache=radix_cache,
         unlocked_only=True,
-        swa_resident_only=group.kind is PoolKind.SWA,
+        swa_resident_only=True,
         collect_owning_nodes=True,
     )
     raw_slots = walk_result.slot_indices.detach().to("cpu").tolist()
