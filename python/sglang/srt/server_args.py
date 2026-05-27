@@ -7167,6 +7167,13 @@ class ServerArgs:
         self.check_lora_server_args()
 
         # Check speculative decoding
+        if self.spec_trace_dir:
+            logger.warning(
+                "--spec-trace-dir enables speculative trace file writing, which "
+                "can contend for the Python GIL and may degrade scheduler "
+                "performance, especially for decoupled-spec drafter schedulers."
+            )
+
         if self.speculative_algorithm is not None:
             assert (
                 not self.enable_mixed_chunk
