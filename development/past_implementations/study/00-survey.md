@@ -170,39 +170,46 @@ flowchart LR
     classDef ext    fill:#f3e5f5,stroke:#6a1b9a,color:#4a148c,stroke-dasharray:3 3
 
     subgraph A ["A — DoubleSparse (research)"]
-        A1["calibration<br/>config/offline_calibration.py"]:::good
-        A2["JSON channel config<br/>config/*.json (13+ shipped)"]:::good
-        A3["label cache (GPU)<br/>models/model.py KVCache.k_label"]:::good
-        A4["sparse Triton kernel<br/>triton_kernels/sparse.py fwd_sparse_no_mask"]:::good
-        A5["[opt] CPU-pinned K,V<br/>offloading/model.py + DGL gather"]:::caveat
-        A1 --> A2 --> A3 --> A4
-        A2 -.-> A5 -.-> A4
+        direction TB
+        A1["calibration<br/>(offline_calibration.py)"]:::good
+        A2["JSON channel config<br/>config/*.json"]:::good
+        A3["label cache (GPU)<br/>KVCache.k_label"]:::good
+        A4["sparse Triton kernel<br/>fwd_sparse_no_mask"]:::good
+        A5["opt: CPU-pinned K,V<br/>DGL gather_pinned_tensor_rows"]:::caveat
+        A1 --> A2
+        A2 --> A3
+        A3 --> A4
+        A2 -.-> A5
+        A5 -.-> A4
     end
 
     subgraph B ["B — sglang fork (decode-only)"]
-        B1["external JSON config<br/>(reuses A's tool)"]:::ext
-        B2["DoubleSparseTokenToKVPool<br/>memory_pool.py:1972-2060<br/>k+v+label ALL GPU"]:::good
-        B3["3-stage Triton<br/>BGEMV → torch.topk (host) → sparse attn → reduce"]:::caveat
+        direction TB
+        B1["external JSON config<br/>reuses A's tool"]:::ext
+        B2["DoubleSparseTokenToKVPool<br/>k + v + label all GPU"]:::good
+        B3["3-stage Triton<br/>BGEMV → host topk → sparse attn"]:::caveat
         B4["DS-Offload<br/>NOT PORTED"]:::bad
-        B5["CUDA graphs<br/>DISABLED (model_runner.py:927-932)"]:::bad
-        B1 --> B2 --> B3
-        B2 -.x B4
-        B3 -.x B5
+        B5["CUDA graphs<br/>DISABLED (host topk forces sync)"]:::bad
+        B1 --> B2
+        B2 --> B3
     end
 
     subgraph C ["C — Twilight (framework)"]
-        C1["external JSON config<br/>(hardcoded /data/chaofan/...)"]:::ext
-        C2["selector<br/>DS or Quest or SparQ ...<br/>(internal r-channel quant)"]:::good
-        C3["weight_estimator<br/>(quantize full K → approx scores)<br/>NOT paper-DS"]:::caveat
-        C4["pruner<br/>top-p mask (CUDA TopPReturnMask)<br/>or threshold"]:::good
-        C5["mask = selector & pruner<br/>applied to DENSE attn (un-fused)"]:::caveat
-        C6["ftka kernels (raft_topk, sparse-GEMV)<br/>EXIST UPSTREAM but never imported"]:::bad
-        C1 --> C2 --> C3 --> C4 --> C5
-        C5 -.x C6
+        direction TB
+        C1["external JSON config<br/>hardcoded /data/chaofan/..."]:::ext
+        C2["selector<br/>DS / Quest / SparQ / ...<br/>r-channel quant 2-8b"]:::good
+        C3["weight_estimator<br/>quantize full K to 4b<br/>NOT paper-DS"]:::caveat
+        C4["pruner<br/>top-p or threshold"]:::good
+        C5["mask = selector AND pruner<br/>applied to DENSE attn"]:::caveat
+        C6["ftka kernels (raft_topk,<br/>sparse-GEMV) EXIST upstream<br/>but never imported"]:::bad
+        C1 --> C2
+        C2 --> C3
+        C3 --> C4
+        C4 --> C5
     end
 ```
 
-**Legend.** Green = paper-faithful & wired. Orange = present but with caveats (caveats noted in the node). Red = absent / disabled / orphaned. Purple-dashed = external dependency. **Headline observations:** A is the only repo that ships calibration AND end-to-end sparse compute AND optional offload; B implements the GPU-resident half and explicitly disables CUDA graphs because of host-side `torch.topk`; C never wires the ftka kernel library into its runtime path and applies its masks to a dense attention.
+**Legend.** Green = paper-faithful & wired. Orange = present with caveats (caveats are in the node label). Red = absent / disabled / orphaned (the node label is the explanation — those nodes are intentionally not connected because the thing they describe doesn't exist in the runtime path). Purple-dashed = external dependency. **Headline observations:** A is the only repo that ships calibration AND end-to-end sparse compute AND optional offload; B implements the GPU-resident half and explicitly disables CUDA graphs because of host-side `torch.topk`; C never wires the ftka kernel library into its runtime path and applies its masks to a dense attention.
 
 ---
 
