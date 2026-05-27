@@ -28,6 +28,7 @@ The first round closes the rotation. Subsequent ACs assume token-level.
 - `selector.py::retrieve_topk` return type: `(selected_token_indices: int32[bs, max_top_k_tokens], valid_lengths: int32[bs])`, sequence-ascending with `-1` padding.
 - `cuda_graph.py::DSGraphState`: static `selected_token_indices: int32[max_bs, max_top_k_tokens]`. Shape change only; same machinery.
 - `config.py`: `top_k` semantics now max **tokens** per request (matches sglang-last's `--ds-heavy-token-num`; same name kept). Default 2048.
+- `validator.py`: assert at boot that `DoubleSparsityConfig.top_k == get_dsa_index_topk(hf_config)` (the model's intrinsic top-k used by NSA's lightning indexer). Operator can override the assertion with `SGLANG_DS_ALLOW_TOPK_MISMATCH=1` for ablation runs, but the default refuses to start when DS would pick a different number of tokens than DSA does — this is what keeps the Phase B comparison apples-to-apples.
 
 Note: page_size=64 is **unchanged**. It is FlashMLA's KV layout requirement; selection granularity is orthogonal.
 
@@ -86,7 +87,7 @@ Re-run `bench_serving` at the same Option B operating point but with radix cache
 
 ## Acceptance Criteria
 
-- **AC-0 (architecture rotation):** Token-level signatures land. `python -c "from sglang.srt.layers.attention.double_sparsity import TokenLabelTable, retrieve_topk; ..."` works. The selector's `retrieve_topk` returns `(selected_token_indices: int32[bs, max_top_k_tokens], valid_lengths: int32[bs])`, sequence-ascending. `page_table_adapter.py` is < 150 LOC (down from 404). The renamed files preserve `__init__.py` re-exports.
+- **AC-0 (architecture rotation):** Token-level signatures land. `python -c "from sglang.srt.layers.attention.double_sparsity import TokenLabelTable, retrieve_topk; ..."` works. The selector's `retrieve_topk` returns `(selected_token_indices: int32[bs, max_top_k_tokens], valid_lengths: int32[bs])`, sequence-ascending. `page_table_adapter.py` is < 150 LOC (down from 404). The renamed files preserve `__init__.py` re-exports. **Validator boot-time assert:** `DoubleSparsityConfig.top_k == get_dsa_index_topk(hf_config)` (refuses to start on mismatch unless `SGLANG_DS_ALLOW_TOPK_MISMATCH=1`). Default config carries `top_k=2048`; expected to match V3.2's intrinsic top-k.
 
 - **AC-1 (M1):** Token-label cache slots transition from default to populated for newly written tokens within the same forward step. Verified by (a) a hardware-level test that runs a real forward pass and inspects the slots at the request's `out_cache_loc`, and (b) the M3 benchmark not crashing on selector reads.
 
@@ -228,3 +229,5 @@ CUDA graphs are ON by default in both (full-graph; piecewise off per `--disable-
 - If AC-1b probe **fails**: append `--chunked-prefill-size -1` to **both** launch commands. The asymmetry vs the cookbook default is intentional and recorded in the Loop 4 round summary. Explicit chunked-prefill support is then Loop 5 scope.
 
 Note: `top_k=2048` in the DS config is now **max tokens** (matches sglang-last's `--ds-heavy-token-num` semantics post-AC-0), not max pages. At page_size=64, that's at most 32 pages of FlashMLA `block_table` after `transform_index_page_table_decode` (in the worst case where each of the 2048 tokens lands in a distinct page — typically fewer pages because tokens cluster).
+
+The validator asserts `top_k == get_dsa_index_topk(hf_config)` at boot. For V3.2 this is expected to be 2048; if a future model has a different intrinsic top-k, the operator must update the config or set `SGLANG_DS_ALLOW_TOPK_MISMATCH=1` to acknowledge the asymmetry. This keeps the Phase B comparison apples-to-apples on selection size.
