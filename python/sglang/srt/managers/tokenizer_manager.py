@@ -172,7 +172,7 @@ def _parallel_sample_prefix_bootstrap_room(
 
 def _copy_disagg_bootstrap_fields(dst: Any, src: Any) -> None:
     for field in _DISAGG_BOOTSTRAP_FIELDS:
-        value = getattr(src, field)
+        value = getattr(src, field, None)
         if value is not None:
             setattr(dst, field, value)
 
