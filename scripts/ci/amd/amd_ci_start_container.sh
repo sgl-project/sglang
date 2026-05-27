@@ -390,6 +390,44 @@ else
         -w "  total=%{time_total}s speed=%{speed_download}B/s bytes=%{size_download} http=%{http_code} effective_url=%{url_effective}\n" \
         "$speed_url" 2>&1 || echo "  FAILED (timeout / connection error)"
 fi
+
+echo ""
+echo "Link MTU:"
+ip -o link show 2>/dev/null | awk -F': ' '{print "  " $2}' | head -10 || echo "  (no ip command)"
+
+echo ""
+echo "Path MTU to huggingface.co (tracepath):"
+if command -v tracepath >/dev/null 2>&1; then
+    tracepath -n huggingface.co 2>&1 | head -15 || true
+else
+    echo "  (tracepath not installed)"
+fi
+
+echo ""
+echo "Key TCP sysctls (host):"
+for k in \
+    net.ipv4.tcp_congestion_control \
+    net.core.default_qdisc \
+    net.core.rmem_max \
+    net.core.wmem_max \
+    net.ipv4.tcp_rmem \
+    net.ipv4.tcp_wmem \
+    net.ipv4.tcp_window_scaling \
+    net.ipv4.tcp_mtu_probing \
+    net.ipv4.tcp_timestamps; do
+    val=$(sysctl -n "$k" 2>/dev/null) && printf "  %-40s %s\n" "$k" "$val" || printf "  %-40s (unavailable)\n" "$k"
+done
+
+echo ""
+echo "Path / RTT to huggingface.co (mtr -rnzc 10, ~10s):"
+if command -v mtr >/dev/null 2>&1; then
+    mtr -rnzbc 10 --no-dns huggingface.co 2>&1 | head -30 || true
+elif command -v traceroute >/dev/null 2>&1; then
+    echo "  mtr not installed; using traceroute -n -w 2 (max 15 hops):"
+    traceroute -n -w 2 -m 15 huggingface.co 2>&1 | head -20 || true
+else
+    echo "  (neither mtr nor traceroute installed)"
+fi
 echo "=========================================="
 
 echo "Launching container: ci_sglang"
@@ -513,6 +551,44 @@ docker exec ci_sglang bash -lc '
     curl -sS -L -o /dev/null --range 0-10485759 --max-time 60 \
       -w "  total=%{time_total}s speed=%{speed_download}B/s bytes=%{size_download} http=%{http_code} effective_url=%{url_effective}\n" \
       "$speed_url" 2>&1 || echo "  FAILED (timeout / connection error)"
+  fi
+
+  echo ""
+  echo "Link MTU (container):"
+  ip -o link show 2>/dev/null | awk -F": " "{print \"  \" \$2}" | head -10 || echo "  (no ip command)"
+
+  echo ""
+  echo "Path MTU to huggingface.co (tracepath):"
+  if command -v tracepath >/dev/null 2>&1; then
+    tracepath -n huggingface.co 2>&1 | head -15 || true
+  else
+    echo "  (tracepath not installed)"
+  fi
+
+  echo ""
+  echo "Key TCP sysctls (container):"
+  for k in \
+    net.ipv4.tcp_congestion_control \
+    net.core.default_qdisc \
+    net.core.rmem_max \
+    net.core.wmem_max \
+    net.ipv4.tcp_rmem \
+    net.ipv4.tcp_wmem \
+    net.ipv4.tcp_window_scaling \
+    net.ipv4.tcp_mtu_probing \
+    net.ipv4.tcp_timestamps; do
+    val=$(sysctl -n "$k" 2>/dev/null) && printf "  %-40s %s\n" "$k" "$val" || printf "  %-40s (unavailable)\n" "$k"
+  done
+
+  echo ""
+  echo "Path / RTT to huggingface.co (mtr -rnzc 10, ~10s):"
+  if command -v mtr >/dev/null 2>&1; then
+    mtr -rnzbc 10 --no-dns huggingface.co 2>&1 | head -30 || true
+  elif command -v traceroute >/dev/null 2>&1; then
+    echo "  mtr not installed; using traceroute -n -w 2 (max 15 hops):"
+    traceroute -n -w 2 -m 15 huggingface.co 2>&1 | head -20 || true
+  else
+    echo "  (neither mtr nor traceroute installed)"
   fi
   echo "=========================================="
 '
