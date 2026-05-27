@@ -5751,6 +5751,227 @@ class TestAC7MHABypass(unittest.TestCase):
         self.assertEqual(len(write_calls), 0,
                          "_write_token_labels must NOT fire when use_double_sparsity=False")
 
+    def test_first_decode_after_short_prefill_selects_prefill_slots(self):
+        """End-to-end AC-7 proof: labels written during MHA prefill feed first decode selection.
+
+        Steps in order:
+        1. Allocate real TokenLabelTable + bind DoubleSparsitySelector with real ChannelMask.
+        2. Build fake DSA backend (NativeSparseAttnBackend) with enable_double_sparsity=True.
+        3. [MHA phase, use_mha=True] _select_topk_indices returns None (bypass fires).
+        4. _set_mla_kv_buffer writes labels for prefill slots via real _write_token_labels.
+        5. Assert table.written=True and signatures non-zero for prefill slots.
+        6. [Decode phase, use_mha=False] _select_topk_indices runs retrieve_topk for real.
+        7. Assert output contains at least one non-(-1) physical prefill slot.
+
+        Test FAILS if either the MHA label-write hook or the use_mha=False decode path is broken.
+        """
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            ChannelMask,
+            compute_content_sha256,
+        )
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+        from sglang.srt.layers.attention.dsa_backend import NativeSparseAttnBackend
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+        from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+        # Fixture dimensions (kept small for CPU execution speed)
+        num_heads = 2
+        kv_lora_rank = 8
+        nope_dim = 4       # K-noPE head dim; K_nope slice of kv_b_proj output per head
+        v_head_dim = 4     # V slice per head; head_width = nope_dim + v_head_dim = 8
+        label_dim = 2      # channels selected out of nope_dim=4 for the label
+        num_layers = 1
+        max_tokens = 16    # physical KV slot address space
+        page_size = 1
+        top_k = 4          # max_top_k for selector (>= T_prefill so all tokens can be selected)
+        T_prefill = 3      # tokens in the short dense prefill
+
+        # --- 1. Allocate real TokenLabelTable ---
+        table = allocate_token_label_table(
+            num_layers_local=num_layers,
+            max_tokens=max_tokens,
+            num_heads_local=num_heads,
+            label_dim=label_dim,
+            page_size=page_size,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+
+        # --- 2. Build ChannelMask: select channels [0, 1] for all layers/heads ---
+        # channel_selection[l, h, :] = [0, 1] → pick first two nope channels
+        channel_selection = torch.zeros(num_layers, num_heads, label_dim, dtype=torch.int32)
+        channel_selection[..., 1] = 1  # dim 0=channel 0, dim 1=channel 1
+        channel_weights = torch.ones(num_layers, num_heads, label_dim, dtype=torch.float32)
+        mask = ChannelMask(
+            channel_selection=channel_selection,
+            channel_weights=channel_weights,
+            schema_version="1",
+            dtype="bfloat16",
+            head_dim=nope_dim,
+            page_size=page_size,
+            label_dim=label_dim,
+            content_sha256=compute_content_sha256(channel_selection, channel_weights),
+        )
+
+        # --- 3. Bind DoubleSparsitySelector ---
+        sel_cfg = (
+            f'{{"top_k": {top_k}, "page_size": {page_size}, '
+            f'"channel_mask_path": "/tmp/cm.safetensors", "device_buffer_size": 4096}}'
+        )
+        selector = DoubleSparsitySelector(
+            config=parse_double_sparsity_config(sel_cfg),
+            num_local_heads=num_heads,
+            head_dim=nope_dim,
+            device=torch.device("cpu"),
+        )
+        selector.bind_runtime_data(table, mask)
+
+        # --- 4. Build fake DSA backend with real _write_token_labels ---
+        backend = object.__new__(NativeSparseAttnBackend)
+        backend.enable_double_sparsity = True
+        backend._ds_token_label_table = table
+        backend._ds_channel_selection = channel_selection   # [L, H, label_dim]
+        backend._ds_qk_nope_head_dim = nope_dim
+        backend.use_mha = True
+        # token_to_kv_pool is accessed by get_token_to_kv_pool() via ForwardContext;
+        # set a mock so _set_mla_kv_buffer's CUDA pool call is a no-op.
+        backend.token_to_kv_pool = MagicMock()
+
+        # kv_b_proj: maps k_latent [T, 8] → (output [T, 16],) per-head layout [K_nope(4)|V(4)]
+        # W[i, i] = 1 routes input channel i → head-0 K_nope col i (cols 0-3)
+        # W[i, nope_dim+v_head_dim+i] = 1 routes same to head-1 K_nope (cols 8-11)
+        proj_out_dim = num_heads * (nope_dim + v_head_dim)  # 2 * 8 = 16
+        W = torch.zeros(kv_lora_rank, proj_out_dim)
+        for i in range(nope_dim):
+            W[i, i] = 1.0                              # head 0 K_nope cols 0-3
+            W[i, nope_dim + v_head_dim + i] = 1.0     # head 1 K_nope cols 8-11
+
+        class _FakeProj:
+            def __call__(self, x):
+                return (x.float() @ W,)
+
+        attn_layer = SimpleNamespace(
+            layer_id=0,
+            kv_b_proj=_FakeProj(),
+            v_head_dim=v_head_dim,
+        )
+
+        # --- 5. Build DeepseekV2AttentionMLA with the real selector ---
+        attn = object.__new__(DeepseekV2AttentionMLA)
+        attn.use_double_sparsity = True
+        attn.double_sparsity_selector = selector
+        attn.kv_lora_rank = kv_lora_rank
+        attn.attn_mha = attn_layer  # provides kv_b_proj, layer_id, v_head_dim
+
+        # Physical KV slots: prefill gets 1, 2, 3; decode gets 4
+        prefill_cache_loc = torch.tensor([1, 2, 3], dtype=torch.int64)
+        decode_cache_loc = torch.tensor([4], dtype=torch.int64)
+
+        # req_to_token: 1 request, pool row 0; logical pos 0→slot 1, 1→slot 2, 2→slot 3
+        req_to_token = torch.full((1, max_tokens), -1, dtype=torch.int32)
+        req_to_token[0, 0] = 1
+        req_to_token[0, 1] = 2
+        req_to_token[0, 2] = 3
+
+        # ================================================================
+        # Phase 1: MHA prefill (use_mha=True)
+        # ================================================================
+        with forward_context(ForwardContext(attn_backend=backend)):
+            bypass_result = attn._select_topk_indices(
+                x=torch.zeros(1, 16, 128),
+                q_lora=torch.zeros(1, 16, kv_lora_rank),
+                positions=torch.zeros(1, dtype=torch.int32),
+                forward_batch=SimpleNamespace(
+                    req_pool_indices=torch.tensor([0], dtype=torch.int32),
+                    seq_lens=torch.tensor([T_prefill], dtype=torch.int32),
+                    sparse_mask=None,
+                    req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+                    out_cache_loc=prefill_cache_loc,
+                ),
+                layer_id=0,
+            )
+        self.assertIsNone(
+            bypass_result,
+            "use_mha=True must return None from _select_topk_indices (MHA bypass)"
+        )
+
+        # Write prefill labels via _set_mla_kv_buffer (the real MHA_ONE_SHOT path).
+        # k_latent: each prefill token has non-zero K_nope channel 0 for strong scoring.
+        k_latent = torch.zeros(T_prefill, 1, kv_lora_rank)
+        k_latent[0, 0, 0] = 5.0   # token 0: strong signal in nope channel 0
+        k_latent[1, 0, 0] = 2.0   # token 1: moderate signal
+        k_latent[2, 0, 0] = 1.0   # token 2: weak signal
+        kv_a = k_latent.squeeze(1)  # [T, kv_lora_rank] — what _set_mla_kv_buffer receives
+        k_pe = torch.zeros(T_prefill, 1, 2)
+        latent_cache = torch.zeros(T_prefill, 1, kv_lora_rank + 2)
+
+        with forward_context(ForwardContext(attn_backend=backend)):
+            attn._set_mla_kv_buffer(
+                latent_cache, kv_a, k_pe,
+                SimpleNamespace(out_cache_loc=prefill_cache_loc),
+            )
+
+        # Assert labels were written for all prefill slots
+        for t_idx in range(T_prefill):
+            slot = int(prefill_cache_loc[t_idx].item())
+            self.assertTrue(
+                table.written[0, slot].item(),
+                f"Prefill slot {slot} must have written=True after _set_mla_kv_buffer"
+            )
+        # Assert signatures non-zero at token 0's slot (strongest signal)
+        slot0 = int(prefill_cache_loc[0].item())  # physical slot 1
+        self.assertGreater(
+            table.signatures[0, slot0].abs().sum().item(),
+            0.0,
+            "Prefill slot must have non-zero signatures after _write_token_labels"
+        )
+
+        # ================================================================
+        # Phase 2: First decode step (use_mha=False)
+        # ================================================================
+        backend.use_mha = False
+
+        # Decode query: strong in nope channel 0 → scores positively against prefill slot 1
+        q_nope = torch.zeros(1, num_heads, nope_dim)
+        q_nope[0, :, 0] = 1.0  # both heads point at channel 0
+
+        with forward_context(ForwardContext(attn_backend=backend)):
+            decode_result = attn._select_topk_indices(
+                x=torch.zeros(1, 16, 128),
+                q_lora=torch.zeros(1, 16, kv_lora_rank),
+                positions=torch.zeros(1, dtype=torch.int32),
+                forward_batch=SimpleNamespace(
+                    req_pool_indices=torch.tensor([0], dtype=torch.int32),
+                    seq_lens=torch.tensor([T_prefill], dtype=torch.int32),
+                    sparse_mask=None,
+                    req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+                    out_cache_loc=decode_cache_loc,
+                ),
+                layer_id=0,
+                q_nope=q_nope,
+            )
+
+        self.assertIsNotNone(
+            decode_result,
+            "use_mha=False must run selection (not bypass)"
+        )
+        self.assertFalse(
+            (decode_result >= 0).sum().item() == 0,
+            "decode selection must return at least one valid (non-(-1)) physical slot"
+        )
+        selected_physical = decode_result[decode_result >= 0].tolist()
+        prefill_slots = {int(s) for s in prefill_cache_loc.tolist()}
+        self.assertTrue(
+            any(s in prefill_slots for s in selected_physical),
+            f"at least one selected slot must be a prefill slot {prefill_slots}, "
+            f"got {selected_physical}"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
