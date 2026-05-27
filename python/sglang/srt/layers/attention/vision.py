@@ -28,6 +28,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
     print_info_once,
+    use_intel_xpu_backend,
 )
 from sglang.srt.utils.multi_stream_utils import (
     maybe_execute_in_parallel,
@@ -57,6 +58,13 @@ if _is_musa:
 
 if _is_npu:
     import torch_npu
+
+
+if _is_xpu:
+    # Import XPU-optimized flash attention from sgl_kernel
+    from sgl_kernel.flash_attn import (
+        flash_attn_varlen_func,
+    )
 
 from sglang.srt.distributed import (
     split_tensor_along_last_dim,
@@ -385,6 +393,84 @@ class VisionTritonAttention(nn.Module):
                 is_causal=False,
                 sm_scale=softmax_scale,
             )
+
+        return output
+
+
+class VisionXPUFlashAttention(nn.Module):
+    """
+    Intel XPU-optimized flash attention for vision transformers
+    Uses sgl_kernel.flash_attn - XPU-native implementation with XMX optimization
+    """
+
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        if not _is_xpu:
+            raise Exception("VisionXPUFlashAttention is only available for Intel XPU")
+
+        super().__init__()
+
+        use_data_parallel = kwargs.get("use_data_parallel", False)
+        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
+
+        print_info_once("Using sgl_kernel flash attention for XPU (XMX-optimized)")
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor | SingletonCache | None,
+        bsz: int,
+        seq_len: int,
+        softmax_scale: Optional[float] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        XPU-optimized flash attention using sgl_kernel
+
+        Args:
+            q: [b * s, num_heads, head_dim]
+            k: [b * s, num_kv_heads, head_dim]
+            v: [b * s, num_kv_heads, head_dim]
+            cu_seqlens: cumulative sequence lengths [b+1]
+            bsz: batch size
+            seq_len: sequence length
+            softmax_scale: attention scale factor
+
+        Returns:
+            output: [b * s, num_heads, head_dim]
+        """
+
+        _, num_heads, head_dim = q.shape
+        scale = softmax_scale if softmax_scale is not None else (head_dim**-0.5)
+
+        # Resolve sequence lengths
+        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+
+        # Compute max sequence length from cu_seqlens
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]  # [b]
+        max_seqlen = seq_lens.max().item()
+
+        # Use sgl_kernel XPU-optimized flash attention
+        # This implementation uses Intel XMX units efficiently
+        output = flash_attn_varlen_func(
+            q=q,  # [total_tokens, num_heads, head_dim]
+            k=k,  # [total_tokens, num_kv_heads, head_dim]
+            v=v,  # [total_tokens, num_kv_heads, head_dim]
+            cu_seqlens_q=cu_seqlens,  # [b+1] cumulative sequence lengths
+            cu_seqlens_k=cu_seqlens,  # [b+1] same for K/V
+            max_seqlen_q=max_seqlen,  # maximum sequence length
+            max_seqlen_k=max_seqlen,
+            softmax_scale=scale,  # 1/sqrt(head_dim)
+            causal=False,  # Vision attention is non-causal
+            window_size=(-1, -1),  # No sliding window
+            softcap=0.0,  # No softcapping
+            num_splits=0,  # Auto-determine splits
+            return_softmax_lse=False,
+        )
 
         return output
 
@@ -800,6 +886,7 @@ QKV_BACKEND_IMPL = {
     "ascend_attn": VisionAscendAttention,
     "aiter_attn": VisionAiterAttention,
     "amx_attn": VisionAMXAttention,
+    "xpu_attn": VisionXPUFlashAttention,
 }
 
 
@@ -1030,7 +1117,7 @@ class VisionAttention(nn.Module):
         elif _is_cpu and _is_cpu_amx_available:
             backend = "amx_attn"
         elif _is_xpu:
-            backend = "triton_attn"
+            backend = "triton_attn" if not use_intel_xpu_backend() else "xpu_attn"
         else:
             backend = "sdpa"
         if backend == "fa3" and is_blackwell_supported():
