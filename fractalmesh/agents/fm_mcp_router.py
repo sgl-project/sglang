@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     108,
+        "agents":     110,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -222,6 +222,8 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "crm_engine":        7860,
             "cloud_storage":     7861,
             "search_engine":     7862,
+            "scheduler_pro":     7863,
+            "payments_hub":      7864,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -531,6 +533,8 @@ _INTENTS = {
     "crm_contact":             lambda a, k: {"action": "crm_contact_queued", "email": k.get("email", ""), "lifecycle_stage": k.get("lifecycle_stage", "lead"), "source": k.get("source", "mesh")},
     "storage_upload":          lambda a, k: {"action": "storage_upload_queued", "key": k.get("key", ""), "backend": k.get("backend", "auto")},
     "web_search":              lambda a, k: {"action": "web_search_queued", "query": k.get("query", ""), "backends": k.get("backends", "all"), "limit": k.get("limit", 10)},
+    "schedule_job":            lambda a, k: {"action": "schedule_job_queued", "name": k.get("name", ""), "schedule": k.get("schedule", ""), "job_type": k.get("job_type", "http")},
+    "charge_payment":          lambda a, k: {"action": "charge_payment_queued", "amount": k.get("amount", 0), "currency": k.get("currency", "AUD"), "gateway": k.get("gateway", "auto")},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
