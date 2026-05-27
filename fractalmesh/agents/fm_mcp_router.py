@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     139,
+        "agents":     143,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -253,6 +253,10 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "ab_testing":        7890,
             "geo_routing":       7891,
             "chatbot_engine":    7892,
+            "seo_engine":        7893,
+            "video_platform":    7894,
+            "gamification":      7895,
+            "contract_manager":  7896,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -592,6 +596,10 @@ _INTENTS = {
     "ab_assign":               lambda a, k: {"action": "ab_assign_queued", "exp_id": k.get("exp_id", ""), "user_id": k.get("user_id", "")},
     "geo_lookup":              lambda a, k: {"action": "geo_lookup_queued", "ip": k.get("ip", "")},
     "chatbot_message":         lambda a, k: {"action": "chatbot_message_queued", "persona_id": k.get("persona_id", ""), "message": k.get("message", ""), "conv_id": k.get("conv_id", "")},
+    "seo_analyse":             lambda a, k: {"action": "seo_analyse_queued", "url": k.get("url", "")},
+    "video_upload":            lambda a, k: {"action": "video_upload_queued", "channel_id": k.get("channel_id", ""), "title": k.get("title", "")},
+    "award_xp":                lambda a, k: {"action": "award_xp_queued", "player_id": k.get("player_id", ""), "event_type": k.get("event_type", ""), "value": k.get("value", 1)},
+    "contract_sign":           lambda a, k: {"action": "contract_sign_queued", "contract_id": k.get("contract_id", ""), "signer_email": k.get("signer_email", "")},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────

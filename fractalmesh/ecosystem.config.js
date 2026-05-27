@@ -1223,6 +1223,10 @@ module.exports = {
             ['fm-abtesting',      'fm_ab_testing',       '25M'],
             ['fm-geo',            'fm_geo_routing',      '25M'],
             ['fm-chatbot',        'fm_chatbot_engine',   '35M'],
+            ['fm-seo',            'fm_seo_engine',       '30M'],
+            ['fm-video',          'fm_video_platform',   '40M'],
+            ['fm-gamification',   'fm_gamification',     '25M'],
+            ['fm-contracts',      'fm_contract_manager', '25M'],
         ].map(([name, script, mem]) => ({
             name,
             script:            `agents/${script}.py`,
