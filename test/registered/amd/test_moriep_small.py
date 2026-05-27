@@ -123,7 +123,7 @@ class TestPureDP(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
+            num_questions=1319,
             max_new_tokens=512,
             parallel=128,
             host="http://127.0.0.1",
@@ -168,7 +168,7 @@ class TestMTP(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
+            num_questions=1319,
             max_new_tokens=512,
             parallel=128,
             host="http://127.0.0.1",
@@ -222,7 +222,7 @@ class TestNormal(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
+            num_questions=1319,
             max_new_tokens=512,
             parallel=128,
             host="http://127.0.0.1",
@@ -272,7 +272,7 @@ class TestLowLatency(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
+            num_questions=1319,
             max_new_tokens=512,
             parallel=128,
             host="http://127.0.0.1",
@@ -321,7 +321,7 @@ class TestTBOwithNormal(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
+            num_questions=1319,
             max_new_tokens=512,
             parallel=128,
             host="http://127.0.0.1",
@@ -372,7 +372,7 @@ class TestTBOwithLowLatency(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
+            num_questions=1319,
             max_new_tokens=512,
             parallel=128,
             host="http://127.0.0.1",
@@ -426,7 +426,7 @@ class TestMTPwithTBONormal(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
+            num_questions=1319,
             max_new_tokens=512,
             parallel=128,
             host="http://127.0.0.1",
@@ -489,7 +489,7 @@ class TestMTPwithTBOLowLatency(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
+            num_questions=1319,
             max_new_tokens=512,
             parallel=128,
             host="http://127.0.0.1",

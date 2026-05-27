@@ -105,7 +105,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
+            num_questions=1319,
             max_new_tokens=512,
             parallel=128,
             host=f"http://{self.base_host}",
@@ -306,7 +306,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
+            num_questions=1319,
             max_new_tokens=512,
             parallel=128,
             host=f"http://{self.base_host}",
@@ -418,7 +418,7 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
+            num_questions=1319,
             max_new_tokens=512,
             parallel=128,
             host=f"http://{self.base_host}",
