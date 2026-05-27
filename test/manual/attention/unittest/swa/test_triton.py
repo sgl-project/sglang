@@ -98,6 +98,7 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
                 sliding_window_size=4,
             ),
             1,
+            "eagle",
         ),
         (
             DenseAttentionCase(
@@ -112,6 +113,55 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
                 sliding_window_size=4,
             ),
             2,
+            "eagle",
+        ),
+        # Non-EAGLE chain spec kinds. The verify-path math under a
+        # sliding window is identical across kinds; only the draft
+        # tag in `_make_spec_verify_input` differs.
+        (
+            DenseAttentionCase(
+                name="runner_frozen_kv_mtp_verify_swa_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(3, 5),
+                extend_lens=(3, 3),
+                sliding_window_size=4,
+            ),
+            1,
+            "frozen_kv_mtp",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_dflash_verify_swa_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(3, 5),
+                extend_lens=(3, 3),
+                sliding_window_size=4,
+            ),
+            1,
+            "dflash",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_ngram_verify_swa_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(3, 5),
+                extend_lens=(3, 3),
+                sliding_window_size=4,
+            ),
+            1,
+            "ngram",
         ),
     )
     SPEC_VERIFY_CUDA_GRAPH_CASES = (
@@ -128,6 +178,7 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
                 sliding_window_size=4,
             ),
             2,
+            "eagle",
         ),
         # Above-window verify exercises the `min(seq_lens, window)`
         # clipping in the verify-path replay metadata builder.
@@ -144,6 +195,37 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
                 sliding_window_size=4,
             ),
             1,
+            "eagle",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_cuda_graph_dflash_verify_swa_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(3, 5),
+                extend_lens=(3, 3),
+                sliding_window_size=4,
+            ),
+            1,
+            "dflash",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_cuda_graph_ngram_verify_swa_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(3, 5),
+                extend_lens=(3, 3),
+                sliding_window_size=4,
+            ),
+            1,
+            "ngram",
         ),
     )
 
@@ -174,18 +256,30 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
                     )
 
     def test_runner_mode_spec_verify_cases(self):
-        for case, topk in self.SPEC_VERIFY_CASES:
-            with self.subTest(case=case.name, backend=case.backend, topk=topk):
-                run_dense_spec_verify_case(self, case, topk=topk, spec_kind="eagle")
+        for case, topk, spec_kind in self.SPEC_VERIFY_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                topk=topk,
+                spec_kind=spec_kind,
+            ):
+                run_dense_spec_verify_case(
+                    self, case, topk=topk, spec_kind=spec_kind
+                )
 
     def test_runner_mode_spec_verify_cuda_graph_cases(self):
-        for case, topk in self.SPEC_VERIFY_CUDA_GRAPH_CASES:
-            with self.subTest(case=case.name, backend=case.backend, topk=topk):
+        for case, topk, spec_kind in self.SPEC_VERIFY_CUDA_GRAPH_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                topk=topk,
+                spec_kind=spec_kind,
+            ):
                 run_dense_spec_verify_cuda_graph_case(
                     self,
                     case,
                     topk=topk,
-                    spec_kind="eagle",
+                    spec_kind=spec_kind,
                 )
 
 
