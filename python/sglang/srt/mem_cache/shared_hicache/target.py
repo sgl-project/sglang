@@ -1,18 +1,13 @@
 from __future__ import annotations
 
 import logging
-from concurrent.futures import Future
 from typing import Optional
 
 import numpy as np
 import torch
 
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.shared_hicache.control import (
-    is_indeterminate_direct_transfer_reason,
-)
 from sglang.srt.mem_cache.shared_hicache.source import ResolvedHostPage
-
 
 logger = logging.getLogger(__name__)
 
@@ -115,19 +110,6 @@ class SharedHiCacheTarget:
                 tokens=0,
                 current_tokens=0,
             )
-
-    def release_device_indices_after_fetch_done(
-        self, future: Future, device_indices: torch.Tensor, *, backend: str
-    ) -> None:
-        try:
-            pages, reason = future.result()
-        except Exception:
-            self.free_device_indices(device_indices)
-            return
-        if not pages and is_indeterminate_direct_transfer_reason(reason):
-            self.quarantine_device_indices(device_indices, reason, backend=backend)
-            return
-        self.free_device_indices(device_indices)
 
     def insert_device_pages(
         self,

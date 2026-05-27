@@ -783,6 +783,27 @@ class HiRadixCache(RadixCache):
                 # write to host if the node is not backuped
                 self.write_backup(node)
 
+    def _count_finished_write_through_acks(self):
+        finish_count = 0
+        for _, finish_event, _ in self.cache_controller.ack_write_queue:
+            if not finish_event.query():
+                break
+            finish_count += 1
+        return finish_count
+
+    def _drain_finished_write_through_acks(self, finish_count):
+        while finish_count > 0:
+            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
+            finish_event.synchronize()
+            for ack_id in ack_list:
+                backuped_node = self.ongoing_write_through.pop(ack_id)
+                # DMA confirmed -- block is now on host.
+                self._record_store_event(backuped_node, medium=StorageMedium.CPU)
+                self.dec_lock_ref(backuped_node)
+                if self.enable_storage:
+                    self.write_backup_storage(backuped_node)
+            finish_count -= 1
+
     def writing_check(self, write_back=False):
         if write_back:
             # blocking till all write back complete
@@ -802,23 +823,9 @@ class HiRadixCache(RadixCache):
             return
 
         if self.enable_shared_hicache:
-            finish_count = 0
-            for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                if not finish_event.query():
-                    break
-                finish_count += 1
-
-            while finish_count > 0:
-                _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-                finish_event.synchronize()
-                for ack_id in ack_list:
-                    backuped_node = self.ongoing_write_through.pop(ack_id)
-                    # DMA confirmed -- block is now on host.
-                    self._record_store_event(backuped_node, medium=StorageMedium.CPU)
-                    self.dec_lock_ref(backuped_node)
-                    if self.enable_storage:
-                        self.write_backup_storage(backuped_node)
-                finish_count -= 1
+            self._drain_finished_write_through_acks(
+                self._count_finished_write_through_acks()
+            )
             return
 
         if (
@@ -827,26 +834,12 @@ class HiRadixCache(RadixCache):
         ):
             return
 
-        finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-            if not finish_event.query():
-                break
-            finish_count += 1
+        finish_count = self._count_finished_write_through_acks()
         queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         self._all_reduce_attn_groups(queue_size, torch.distributed.ReduceOp.MIN)
 
         finish_count = int(queue_size.item())
-        while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
-                backuped_node = self.ongoing_write_through.pop(ack_id)
-                # DMA confirmed -- block is now on host.
-                self._record_store_event(backuped_node, medium=StorageMedium.CPU)
-                self.dec_lock_ref(backuped_node)
-                if self.enable_storage:
-                    self.write_backup_storage(backuped_node)
-            finish_count -= 1
+        self._drain_finished_write_through_acks(finish_count)
 
     def loading_check(self):
         finish_count = 0

@@ -632,11 +632,13 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
 
     def _wait_for_transfer(self, agent, handle) -> Optional[tuple[int, int, int, int]]:
         transfer_state = agent.transfer(handle)
-        while transfer_state != "DONE":
+        while True:
             if transfer_state == "ERR":
                 raise RuntimeError("NIXL direct KV transfer failed")
+            if transfer_state == "DONE":
+                break
+            time.sleep(0)
             transfer_state = agent.check_xfer_state(handle)
-            time.sleep(0.0001)
         telemetry = self._get_xfer_telemetry(agent, handle)
         release = getattr(agent, "release_xfer_handle", None)
         if callable(release):

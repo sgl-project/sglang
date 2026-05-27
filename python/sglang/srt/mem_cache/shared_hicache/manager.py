@@ -5,7 +5,6 @@ import logging
 import threading
 import time
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
@@ -21,6 +20,7 @@ from sglang.srt.mem_cache.shared_hicache.config import (
 from sglang.srt.mem_cache.shared_hicache.control import (
     SHARED_HICACHE_TRANSFER_DONE,
     SHARED_HICACHE_TRANSFER_REQUEST,
+    SharedHiCacheTargetTransferTracker,
     SharedHiCacheTransferHandle,
     is_indeterminate_direct_transfer_reason,
 )
@@ -32,25 +32,22 @@ from sglang.srt.mem_cache.shared_hicache.pending import (
     pending_wait_ms,
     transfer_bytes_for_pages,
 )
-from sglang.srt.mem_cache.shared_hicache.plan import (
-    SHARED_HICACHE_PLAN_VERSION,
-    SharedHiCachePlan,
-)
+from sglang.srt.mem_cache.shared_hicache.plan import SharedHiCachePlan
 from sglang.srt.mem_cache.shared_hicache.service import (
     SharedHiCacheSourceService,
-    endpoint_format_fields,
-    format_control_endpoint,
 )
-from sglang.srt.mem_cache.shared_hicache.source import (
-    execute_source_transfer_request,
-    parse_source_transfer_request,
+from sglang.srt.mem_cache.shared_hicache.source_queue import (
+    SharedHiCacheSourceTransferQueue,
 )
 from sglang.srt.mem_cache.shared_hicache.target import SharedHiCacheTarget
+from sglang.srt.mem_cache.shared_hicache.topology import (
+    SharedHiCacheTopology,
+    validate_shared_hicache_plan,
+)
 from sglang.srt.mem_cache.shared_hicache.transfer import (
     SharedHiCacheTransferBackend,
     make_shared_hicache_transfer_backend,
     scheduler_parallel_metadata,
-    shared_hicache_parallel_rejection,
 )
 
 if TYPE_CHECKING:
@@ -112,22 +109,14 @@ class SharedHiCacheManager:
         )
         self._target_transfer_capacity = threading.BoundedSemaphore(fetch_worker_limit)
         source_worker_limit = fetch_worker_limit
-        self._source_transfer_executor = ThreadPoolExecutor(
-            max_workers=source_worker_limit,
-            thread_name_prefix=f"shared_hicache-source-xfer-tp{self.tp_rank}",
-        )
-        self._source_transfer_capacity = threading.BoundedSemaphore(
-            max(8, fetch_worker_limit * 2)
-        )
-        self._source_transfer_lock = threading.Lock()
-        self._source_transfers: dict[str, Optional[Future]] = {}
-        self._target_transfer_lock = threading.Lock()
-        self._target_transfer_completions: dict[str, Mapping[str, Any]] = {}
-        self._active_target_transfers: set[str] = set()
         self._pending_fetches: dict[str, SharedHiCachePendingFetch] = {}
+        self.source_transfer_queue: Optional[SharedHiCacheSourceTransferQueue] = None
         self.target_cache = SharedHiCacheTarget(
             tree_cache=tree_cache,
             metrics_collector=metrics_collector,
+        )
+        self.target_transfer_tracker = SharedHiCacheTargetTransferTracker(
+            transfer_backend=direct_transfer,
         )
         self._finished_plan_keys: set[tuple[str, str]] = set()
         self._finished_plan_prefix_lens: dict[tuple[str, str], int] = {}
@@ -136,65 +125,40 @@ class SharedHiCacheManager:
         self._direct_transfer_shutdown_lock = threading.Lock()
 
         if self.endpoint is not None:
+            self.source_transfer_queue = SharedHiCacheSourceTransferQueue(
+                tree_cache=tree_cache,
+                worker_id=worker_id,
+                transfer_backend=direct_transfer,
+                worker_limit=source_worker_limit,
+                send_transfer_done=self._send_transfer_done,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                pp_size=self.pp_size,
+                attn_tp_size=self.attn_tp_size,
+                attn_cp_size=self.attn_cp_size,
+                attn_dp_size=self.attn_dp_size,
+            )
             self.source_service = SharedHiCacheSourceService(
                 endpoint=self.endpoint,
                 worker_id=self.worker_id,
                 handle_control_message=self._handle_control_message,
             )
             self.source_service.start()
-            self._prewarm_source_transfer_workers(source_worker_limit)
         atexit.register(self.shutdown)
 
     def _set_parallel_metadata(
         self,
         parallel_metadata: Optional[Mapping[str, int]],
     ) -> None:
-        metadata = {key: int(value) for key, value in (parallel_metadata or {}).items()}
-        self.tp_rank = int(metadata.get("tp_rank", 0))
-        self.tp_size = int(metadata.get("tp_size", 1))
-        self.pp_rank = int(metadata.get("pp_rank", 0))
-        self.pp_size = int(metadata.get("pp_size", 1))
-        self.attn_cp_rank = int(metadata.get("attn_cp_rank", 0))
-        self.attn_cp_size = int(metadata.get("attn_cp_size", 1))
-        self.attn_tp_rank = int(metadata.get("attn_tp_rank", self.tp_rank))
-        self.attn_tp_size = int(metadata.get("attn_tp_size", self.tp_size))
-        self.attn_dp_rank = int(metadata.get("attn_dp_rank", 0))
-        self.attn_dp_size = int(metadata.get("attn_dp_size", 1))
-        self.dp_rank = int(metadata.get("dp_rank", 0))
-        self.dp_size = int(metadata.get("dp_size", 1))
+        self.topology = SharedHiCacheTopology.from_mapping(parallel_metadata)
+        for key, value in self.topology.to_dict().items():
+            setattr(self, key, value)
 
     def _endpoint_format_values(self) -> dict[str, int]:
-        return {
-            "tp_rank": self.tp_rank,
-            "tp_size": self.tp_size,
-            "pp_rank": self.pp_rank,
-            "pp_size": self.pp_size,
-            "attn_cp_rank": self.attn_cp_rank,
-            "attn_cp_size": self.attn_cp_size,
-            "attn_tp_rank": self.attn_tp_rank,
-            "attn_tp_size": self.attn_tp_size,
-            "attn_dp_rank": self.attn_dp_rank,
-            "attn_dp_size": self.attn_dp_size,
-            "dp_rank": self.dp_rank,
-            "dp_size": self.dp_size,
-        }
+        return self.topology.endpoint_format_values()
 
     def _format_local_control_endpoint(self, endpoint_spec: object) -> Optional[str]:
-        endpoint = format_control_endpoint(
-            endpoint_spec,
-            self._endpoint_format_values(),
-        )
-        if endpoint is None:
-            return None
-        fields = endpoint_format_fields(endpoint_spec)
-        if self.tp_size > 1 and not fields.intersection({"tp_rank"}):
-            logger.warning(
-                "SharedHiCache source resolver endpoint must include {tp_rank} "
-                "when tp_size=%d; not starting source resolver for this rank",
-                self.tp_size,
-            )
-            return None
-        return endpoint
+        return self.topology.format_local_control_endpoint(endpoint_spec)
 
     @classmethod
     def from_scheduler(cls, scheduler) -> Optional["SharedHiCacheManager"]:
@@ -285,32 +249,6 @@ class SharedHiCacheManager:
             getattr(direct_transfer, "enabled", False)
         )
 
-    def _prewarm_source_transfer_workers(self, worker_limit: int) -> None:
-        direct_transfer = getattr(self, "direct_transfer", None)
-        prepare = getattr(direct_transfer, "prepare_source_worker", None)
-        if not self._direct_transfer_enabled() or not callable(prepare):
-            return
-        barrier = threading.Barrier(worker_limit) if int(worker_limit) > 1 else None
-
-        def _prepare() -> None:
-            if barrier is not None:
-                barrier.wait(timeout=30.0)
-            prepare()
-
-        futures = [
-            self._source_transfer_executor.submit(_prepare)
-            for _ in range(int(worker_limit))
-        ]
-        for future in futures:
-            try:
-                future.result(timeout=30.0)
-            except Exception:
-                logger.warning(
-                    "SharedHiCache source transfer worker prewarm failed",
-                    exc_info=True,
-                )
-                return
-
     def _try_acquire_fetch_worker(self) -> bool:
         semaphore = getattr(self, "_target_transfer_capacity", None)
         if semaphore is None:
@@ -397,47 +335,20 @@ class SharedHiCacheManager:
             logger.warning(
                 "Deferring direct transfer backend shutdown while SharedHiCache work is still pending"
             )
-            source_transfer_executor = getattr(self, "_source_transfer_executor", None)
-            if source_transfer_executor is not None:
-                source_transfer_executor.shutdown(wait=False, cancel_futures=True)
+            source_transfer_queue = getattr(self, "source_transfer_queue", None)
+            if source_transfer_queue is not None:
+                source_transfer_queue.shutdown(wait=False, cancel_futures=True)
             self._defer_direct_transfer_shutdown()
             return
 
-        source_transfer_executor = getattr(self, "_source_transfer_executor", None)
-        if source_transfer_executor is not None:
-            source_transfer_executor.shutdown(wait=False, cancel_futures=True)
+        source_transfer_queue = getattr(self, "source_transfer_queue", None)
+        if source_transfer_queue is not None:
+            source_transfer_queue.shutdown(wait=False, cancel_futures=True)
         self.target_cache.release_quarantined_device_indices()
         self._shutdown_direct_transfer_backend()
 
     def _candidate_endpoints_for_plan(self, plan: SharedHiCachePlan) -> list[str]:
-        endpoints: list[str] = []
-
-        def add(endpoint: Optional[str]) -> None:
-            if endpoint and endpoint not in endpoints:
-                endpoints.append(endpoint)
-
-        if plan.source_endpoint:
-            source_tp_rank = (
-                int(plan.source_tp_rank)
-                if plan.source_tp_rank is not None
-                else int(self.tp_rank)
-            )
-            target_tp_rank = (
-                int(plan.target_tp_rank)
-                if plan.target_tp_rank is not None
-                else int(self.tp_rank)
-            )
-            values = self._endpoint_format_values()
-            values.update(
-                {
-                    "source_tp_rank": source_tp_rank,
-                    "source_tp_size": int(plan.source_tp_size),
-                    "target_tp_rank": target_tp_rank,
-                    "target_tp_size": int(self.tp_size),
-                }
-            )
-            add(format_control_endpoint(plan.source_endpoint, values))
-        return endpoints
+        return self.topology.candidate_endpoints_for_plan(plan)
 
     def _send_control_message(self, endpoint: str, payload: Mapping[str, Any]) -> None:
         source_service = getattr(self, "source_service", None)
@@ -448,7 +359,17 @@ class SharedHiCacheManager:
     def _handle_control_message(self, payload: Mapping[str, Any]) -> None:
         kind = str(payload.get("kind") or "")
         if kind == SHARED_HICACHE_TRANSFER_REQUEST:
-            response = self._handle_source_transfer(payload)
+            source_transfer_queue = getattr(self, "source_transfer_queue", None)
+            if source_transfer_queue is None:
+                transfer_id = str(payload.get("transfer_id") or "")
+                response = {
+                    "ok": False,
+                    "reason": "source_transfer_queue_unavailable",
+                    "transfer_id": transfer_id,
+                    "transferred_blocks": 0,
+                }
+            else:
+                response = source_transfer_queue.handle(payload)
             if not response.get("accepted"):
                 target_endpoint = str(payload.get("target_control_endpoint") or "")
                 if target_endpoint:
@@ -474,148 +395,18 @@ class SharedHiCacheManager:
             )
 
     def _handle_target_transfer_done(self, payload: Mapping[str, Any]) -> None:
-        transfer_id = str(payload.get("transfer_id") or "")
-        if not transfer_id:
-            logger.warning("Ignoring SharedHiCache transfer_done without transfer_id")
-            return
-        with self._target_transfer_lock:
-            if transfer_id not in self._active_target_transfers:
-                return
-            self._target_transfer_completions[transfer_id] = dict(payload)
+        self.target_transfer_tracker.handle_done(payload)
 
     def _pop_target_transfer_completion(
         self, transfer_id: str
     ) -> Optional[Mapping[str, Any]]:
-        with self._target_transfer_lock:
-            return self._target_transfer_completions.pop(str(transfer_id), None)
+        return self.target_transfer_tracker.pop_completion(transfer_id)
 
     def _start_target_transfer(self, transfer_id: str) -> None:
-        with self._target_transfer_lock:
-            self._active_target_transfers.add(str(transfer_id))
+        self.target_transfer_tracker.start(transfer_id)
 
     def _finish_target_transfer(self, transfer_id: str) -> None:
-        transfer_id = str(transfer_id)
-        with self._target_transfer_lock:
-            self._active_target_transfers.discard(transfer_id)
-            self._target_transfer_completions.pop(transfer_id, None)
-        direct_transfer = getattr(self, "direct_transfer", None)
-        drop_notification = getattr(
-            direct_transfer, "drop_target_transfer_notification", None
-        )
-        if callable(drop_notification):
-            drop_notification(transfer_id)
-
-    def _handle_source_transfer(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
-        transfer_id = str(payload.get("transfer_id") or uuid.uuid4().hex)
-        target_endpoint = str(payload.get("target_control_endpoint") or "")
-        payload = dict(payload)
-        payload["transfer_id"] = transfer_id
-        request, error = parse_source_transfer_request(
-            payload=payload,
-            transfer_backend=self.direct_transfer,
-            tree_cache=getattr(self, "tree_cache", None),
-        )
-        if error is not None:
-            response = dict(error)
-            response.setdefault("ok", False)
-            response["transfer_id"] = transfer_id
-            response["transferred_blocks"] = 0
-            return response
-        assert request is not None
-
-        source_transfer_lock = getattr(self, "_source_transfer_lock", None)
-        source_transfers = getattr(self, "_source_transfers", None)
-        if source_transfer_lock is None or source_transfers is None:
-            return {
-                "ok": False,
-                "reason": "source_transfer_queue_unavailable",
-                "transfer_id": transfer_id,
-                "transferred_blocks": 0,
-            }
-        capacity = getattr(self, "_source_transfer_capacity", None)
-        if capacity is None or not capacity.acquire(blocking=False):
-            return {
-                "ok": False,
-                "reason": "source_transfer_queue_full",
-                "transfer_id": transfer_id,
-                "transferred_blocks": 0,
-                "block_size_tokens": self.tree_cache.page_size,
-            }
-        with source_transfer_lock:
-            if transfer_id in source_transfers:
-                capacity.release()
-                return {
-                    "ok": False,
-                    "reason": "duplicate_transfer_id",
-                    "transfer_id": transfer_id,
-                    "transferred_blocks": 0,
-                    "block_size_tokens": self.tree_cache.page_size,
-                }
-            source_transfers[transfer_id] = None
-        try:
-            future = self._source_transfer_executor.submit(
-                execute_source_transfer_request,
-                request=request,
-                transfer_backend=self.direct_transfer,
-                tree_cache=getattr(self, "tree_cache", None),
-                worker_id=getattr(self, "worker_id", None),
-                tp_rank=getattr(self, "tp_rank", 0),
-                tp_size=getattr(self, "tp_size", 1),
-                pp_size=getattr(self, "pp_size", 1),
-                attn_tp_size=getattr(self, "attn_tp_size", 1),
-                attn_cp_size=getattr(self, "attn_cp_size", 1),
-                attn_dp_size=getattr(self, "attn_dp_size", 1),
-            )
-        except Exception:
-            with source_transfer_lock:
-                if source_transfers.get(transfer_id) is None:
-                    source_transfers.pop(transfer_id, None)
-            capacity.release()
-            raise
-
-        def _complete_source_transfer(done_future: Future) -> None:
-            response: Mapping[str, Any]
-            try:
-                response = dict(done_future.result())
-            except Exception:
-                logger.exception(
-                    "SharedHiCache source transfer job failed transfer_id=%s",
-                    transfer_id,
-                )
-                response = {
-                    "ok": False,
-                    "reason": "source_transfer_exception",
-                    "transferred_blocks": 0,
-                    "block_size_tokens": self.tree_cache.page_size,
-                }
-            response = dict(response)
-            response["transfer_id"] = transfer_id
-            self._send_transfer_done(
-                target_endpoint or request.target_control_endpoint, response
-            )
-            try:
-                capacity.release()
-            except ValueError:
-                logger.debug(
-                    "SharedHiCache source transfer capacity release ignored",
-                    exc_info=True,
-                )
-            with source_transfer_lock:
-                if source_transfers.get(transfer_id) is done_future:
-                    source_transfers.pop(transfer_id, None)
-
-        with source_transfer_lock:
-            source_transfers[transfer_id] = future
-        future.add_done_callback(_complete_source_transfer)
-
-        return {
-            "ok": True,
-            "accepted": True,
-            "pending": True,
-            "reason": "accepted",
-            "transfer_id": transfer_id,
-            "block_size_tokens": self.tree_cache.page_size,
-        }
+        self.target_transfer_tracker.finish(transfer_id)
 
     def _max_cacheable_blocks(self, req: "Req") -> int:
         max_prefix_len = max(len(req.fill_ids) - 1, 0)
@@ -626,72 +417,23 @@ class SharedHiCacheManager:
         return max_prefix_len // self.tree_cache.page_size
 
     def _validate_plan(self, plan: SharedHiCachePlan) -> Optional[str]:
-        if self.worker_id is None:
-            return "missing_worker_id"
-        if plan.target_worker_id != self.worker_id:
-            return "wrong_target_worker"
-        rank_rejection = self._validate_target_rank(plan)
-        if rank_rejection is not None:
-            return rank_rejection
-        if plan.source_worker_id == plan.target_worker_id:
-            return "source_is_target"
-        if plan.plan_version != SHARED_HICACHE_PLAN_VERSION:
-            return "unsupported_plan_version"
-        if plan.is_expired():
-            return "plan_expired"
-        if not plan.is_shared_hicache():
-            return "unsupported_source_medium"
-        if plan.block_size_tokens != self.tree_cache.page_size:
-            return "incompatible_block_size"
-        return None
-
-    def _validate_target_rank(self, plan: SharedHiCachePlan) -> Optional[str]:
-        topology_rejection = shared_hicache_parallel_rejection(
-            pp_size=getattr(self, "pp_size", 1),
-            attn_cp_size=getattr(self, "attn_cp_size", 1),
-            attn_dp_size=getattr(self, "attn_dp_size", 1),
-            tp_size=getattr(self, "tp_size", 1),
-            attn_tp_size=getattr(self, "attn_tp_size", 1),
+        return validate_shared_hicache_plan(
+            plan,
+            worker_id=self.worker_id,
+            page_size=self.tree_cache.page_size,
+            topology=self.topology,
         )
-        if topology_rejection is not None:
-            return f"unsupported_target_topology:{topology_rejection}"
-
-        if plan.target_tp_size != self.tp_size:
-            return (
-                "wrong_target_tp_size:"
-                f"plan={plan.target_tp_size}:local={self.tp_size}"
-            )
-        if plan.source_tp_size != self.tp_size:
-            return (
-                "incompatible_source_tp_size:"
-                f"source={plan.source_tp_size}:target={self.tp_size}"
-            )
-        target_tp_rank = (
-            int(plan.target_tp_rank)
-            if plan.target_tp_rank is not None
-            else int(self.tp_rank)
-        )
-        if int(target_tp_rank) != self.tp_rank:
-            return "wrong_target_tp_rank:" f"plan={target_tp_rank}:local={self.tp_rank}"
-        source_tp_rank = plan.source_tp_rank
-        if source_tp_rank is not None and int(source_tp_rank) != self.tp_rank:
-            return "wrong_source_tp_rank:" f"plan={source_tp_rank}:local={self.tp_rank}"
-        return None
 
     def _plan_key(self, req: "Req", plan: SharedHiCachePlan) -> tuple[str, str]:
         return str(req.rid), plan.plan_id
 
     def has_pending(self) -> bool:
-        source_transfer_count = 0
-        source_transfer_lock = getattr(self, "_source_transfer_lock", None)
-        source_transfers = getattr(self, "_source_transfers", {})
-        if source_transfer_lock is not None:
-            with source_transfer_lock:
-                source_transfer_count = sum(
-                    1
-                    for future in source_transfers.values()
-                    if future is not None and not future.done()
-                )
+        source_transfer_queue = getattr(self, "source_transfer_queue", None)
+        source_transfer_count = (
+            source_transfer_queue.active_count()
+            if source_transfer_queue is not None
+            else 0
+        )
         source_service = getattr(self, "source_service", None)
         active_source_count = (
             source_service.active_count() if source_service is not None else 0

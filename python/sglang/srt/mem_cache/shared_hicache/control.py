@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlparse
@@ -206,3 +207,46 @@ class SharedHiCacheTransferHandle:
         if not callable(pop):
             return None
         return pop(self.transfer_id)
+
+
+class SharedHiCacheTargetTransferTracker:
+    """Tracks source completion messages for target-side direct transfers."""
+
+    def __init__(
+        self,
+        *,
+        transfer_backend: Optional[SharedHiCacheTransferBackend],
+    ):
+        self.transfer_backend = transfer_backend
+        self._lock = threading.Lock()
+        self._completions: dict[str, Mapping[str, Any]] = {}
+        self._active: set[str] = set()
+
+    def handle_done(self, payload: Mapping[str, Any]) -> None:
+        transfer_id = str(payload.get("transfer_id") or "")
+        if not transfer_id:
+            logger.warning("Ignoring SharedHiCache transfer_done without transfer_id")
+            return
+        with self._lock:
+            if transfer_id not in self._active:
+                return
+            self._completions[transfer_id] = dict(payload)
+
+    def pop_completion(self, transfer_id: str) -> Optional[Mapping[str, Any]]:
+        with self._lock:
+            return self._completions.pop(str(transfer_id), None)
+
+    def start(self, transfer_id: str) -> None:
+        with self._lock:
+            self._active.add(str(transfer_id))
+
+    def finish(self, transfer_id: str) -> None:
+        transfer_id = str(transfer_id)
+        with self._lock:
+            self._active.discard(transfer_id)
+            self._completions.pop(transfer_id, None)
+        drop_notification = getattr(
+            self.transfer_backend, "drop_target_transfer_notification", None
+        )
+        if callable(drop_notification):
+            drop_notification(transfer_id)
