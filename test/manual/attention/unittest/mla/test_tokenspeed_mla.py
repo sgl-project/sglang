@@ -17,16 +17,16 @@ from common.attention_methods.mla_attention import (
 
 # tokenspeed_mla is a CuTe DSL backend for Blackwell (SM100). It additionally
 # enforces:
-#   - data_type == torch.float8_e4m3fn (kv_cache_dtype=fp8_e4m3)
+#   - kv_cache_dtype == torch.float8_e4m3fn (kv_cache_dtype=fp8_e4m3)
 #   - page_size in {32, 64}
 # See python/sglang/srt/layers/attention/tokenspeed_mla_backend.py and
 # is_tokenspeed_mla_available() in python/sglang/srt/utils/common.py.
 #
-# The shared MLAAttentionCase fixture (common/attention_methods/mla_attention.py)
-# hard-codes kv_cache_dtype="auto" and aligns kv_cache_dtype with model dtype
-# (fp16/bf16). Wiring an FP8 KV cache requires fixture changes (separate
-# kv_cache_dtype plumbing on MockMLAModelRunner, FP8 KV pool setup, quantize/
-# dequantize parity in the reference path) that are out of scope here.
+# The shared MLAAttentionCase fixture now supports `fp8_kv_cache=True`:
+# `MockMLAModelRunner` decouples `kv_cache_dtype` from the model `dtype`
+# and routes K writes through the FP8 quantize path. The reference still
+# computes against BF16 K (independent of the cache bytes) and tolerates
+# FP8 quant noise via a looser tolerance.
 _MIN_SM = 100
 
 
@@ -43,16 +43,7 @@ def _supported() -> tuple[bool, str]:
             f"tokenspeed_mla requires SM {_MIN_SM // 10}.{_MIN_SM % 10}+ (Blackwell), "
             f"got SM {major}.{minor}",
         )
-    # Even with Blackwell + tokenspeed_mla, the backend rejects construction
-    # unless kv_cache_dtype=fp8_e4m3. The current shared MLA fixture does not
-    # support FP8 KV cache; flip this once that fixture variant lands.
-    return (
-        False,
-        "tokenspeed_mla requires FP8 KV cache fixture (not in scope): "
-        "shared MLAAttentionCase fixture hard-codes kv_cache_dtype=auto and "
-        "model dtype for the KV pool; add an fp8_e4m3 KV cache variant before "
-        "enabling.",
-    )
+    return True, ""
 
 
 _SUPPORTED, _SKIP_REASON = _supported()
@@ -83,7 +74,18 @@ class TestTokenspeedMLAAttentionBackendCorrectness(CustomTestCase):
     def test_projected_mla_attention_cases(self):
         for case in self.CASES:
             with self.subTest(case=case.name, backend=case.backend):
-                run_mla_attention_case(self, case, **MLA_SHAPE_KWARGS)
+                # Looser tolerance to absorb FP8 quant noise (the reference
+                # reads BF16 K independent of the FP8 cache, so per-element
+                # drift from the BF16->FP8 cast accumulates through the
+                # attention reduction).
+                run_mla_attention_case(
+                    self,
+                    case,
+                    fp8_kv_cache=True,
+                    atol=2e-1,
+                    rtol=2e-1,
+                    **MLA_SHAPE_KWARGS,
+                )
 
 
 if __name__ == "__main__":

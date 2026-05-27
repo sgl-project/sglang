@@ -208,11 +208,17 @@ class MockMLAModelRunner(ModelRunner):
         disable_cuda_graph: bool = True,
         disable_piecewise_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
+        fp8_kv_cache: bool = False,
     ):
         pool_batch_size = runner_batch_size or case.batch_size
         self.device = device
         self.dtype = dtype
-        self.kv_cache_dtype = dtype
+        # `kv_cache_dtype` is the dtype the *storage* uses. For FP8 KV
+        # cache (the production deployment dtype for tokenspeed_mla and
+        # some trtllm_mla configs), the pool stores quantized bytes
+        # while the model still projects K/V in bf16; `set_mla_kv_buffer`
+        # does the BF16->FP8 cast on the way in.
+        self.kv_cache_dtype = torch.float8_e4m3fn if fp8_kv_cache else dtype
         self.gpu_id = 0
         self.page_size = case.page_size
         self.model_config = model_config
@@ -241,7 +247,7 @@ class MockMLAModelRunner(ModelRunner):
             enable_mis=False,
             flashinfer_mla_disable_ragged=True,
             is_embedding=False,
-            kv_cache_dtype="auto",
+            kv_cache_dtype="fp8_e4m3" if fp8_kv_cache else "auto",
             max_running_requests=None,
             model_path=None,
             pp_size=1,
@@ -265,7 +271,7 @@ class MockMLAModelRunner(ModelRunner):
         self.token_to_kv_pool = MLATokenToKVPool(
             size=max_token_loc + case.page_size,
             page_size=case.page_size,
-            dtype=dtype,
+            dtype=self.kv_cache_dtype,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
             layer_num=1,
@@ -837,6 +843,7 @@ def build_mla_attention_fixture(
     disable_cuda_graph: bool = True,
     disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
+    fp8_kv_cache: bool = False,
 ) -> MLAAttentionFixture:
     seed = 3090 + len(case.name)
     torch.manual_seed(seed)
@@ -860,6 +867,7 @@ def build_mla_attention_fixture(
         disable_cuda_graph=disable_cuda_graph,
         disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
         runner_batch_size=runner_batch_size,
+        fp8_kv_cache=fp8_kv_cache,
     )
     try:
         backend = ATTENTION_BACKENDS[case.backend](runner)
@@ -1137,6 +1145,9 @@ def run_mla_attention_case(
     max_context_len: int = DEFAULT_MAX_CONTEXT_LEN,
     dtype: torch.dtype = DEFAULT_DTYPE,
     device: str = DEFAULT_DEVICE,
+    fp8_kv_cache: bool = False,
+    atol: float = MLA_ATOL,
+    rtol: float = MLA_RTOL,
 ):
     fixture = build_mla_attention_fixture(
         testcase,
@@ -1147,8 +1158,9 @@ def run_mla_attention_case(
         max_context_len=max_context_len,
         dtype=dtype,
         device=device,
+        fp8_kv_cache=fp8_kv_cache,
     )
     actual = run_mla_fixture_eager(fixture)
     expected = expected_mla_fixture_output(fixture)
 
-    torch.testing.assert_close(actual, expected, atol=MLA_ATOL, rtol=MLA_RTOL)
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
