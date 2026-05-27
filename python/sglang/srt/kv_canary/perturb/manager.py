@@ -40,13 +40,6 @@ class PerturbManager:
         self._warmup_gate = WarmupGate(
             config=config, outer_step_counter_getter=outer_step_counter_getter
         )
-        # Cross-call state for real_kv_unused_cache: tracks radix nodes
-        # pinned by past perturbations so they can be unpinned a couple of
-        # sweep cycles later (long enough for sweep to observe the
-        # corruption, short enough that idle pins don't leak).
-        self._real_kv_unused_cache_state = (
-            real_kv_unused_cache.PerturbRealKvUnusedCacheState()
-        )
 
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._radix_cache = radix_cache
@@ -101,7 +94,6 @@ class PerturbManager:
             sweep_interval=self._sweep_interval,
             outer_step_counter=self._outer_step_counter_getter(),
             warmup_gate=self._warmup_gate,
-            state=self._real_kv_unused_cache_state,
         )
 
     def perturb_real_kv_post_forward(

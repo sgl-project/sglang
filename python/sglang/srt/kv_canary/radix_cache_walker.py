@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -18,11 +18,6 @@ class RadixCacheWalkResult:
     slot_indices: torch.Tensor
     positions: torch.Tensor
     prev_slot_indices: torch.Tensor
-    # Parallel to slot_indices: the TreeNode that owns each emitted slot.
-    # Only populated when collect_owning_nodes=True; otherwise None.
-    # Used by perturbation paths that need to lock the radix node holding
-    # a picked slot so the slot survives eviction until sweep verifies it.
-    owning_nodes: Optional[List["TreeNode"]] = None
 
 
 def walk_radix_cache_for_canary(
@@ -30,7 +25,6 @@ def walk_radix_cache_for_canary(
     radix_cache: "BasePrefixCache",
     unlocked_only: bool = False,
     swa_resident_only: bool = False,
-    collect_owning_nodes: bool = False,
 ) -> RadixCacheWalkResult:
     """Walk the radix tree and emit flat (slot_indices, positions, prev_slot_indices) tensors.
 
@@ -48,9 +42,6 @@ def walk_radix_cache_for_canary(
     slot_buf: list[int] = []
     position_buf: list[int] = []
     prev_slot_buf: list[int] = []
-    owning_nodes_buf: Optional[list["TreeNode"]] = (
-        [] if collect_owning_nodes else None
-    )
 
     _walk_radix_subtree(
         node=radix_cache.root_node,
@@ -60,7 +51,6 @@ def walk_radix_cache_for_canary(
         slot_buf=slot_buf,
         position_buf=position_buf,
         prev_slot_buf=prev_slot_buf,
-        owning_nodes_buf=owning_nodes_buf,
         is_root=True,
         unlocked_only=unlocked_only,
         swa_resident_only=swa_resident_only,
@@ -73,7 +63,6 @@ def walk_radix_cache_for_canary(
         slot_indices=slot_tensor,
         positions=position_tensor,
         prev_slot_indices=prev_slot_tensor,
-        owning_nodes=owning_nodes_buf,
     )
 
 
@@ -86,7 +75,6 @@ def _walk_radix_subtree(
     slot_buf: list[int],
     position_buf: list[int],
     prev_slot_buf: list[int],
-    owning_nodes_buf: Optional[list["TreeNode"]],
     is_root: bool,
     unlocked_only: bool,
     swa_resident_only: bool,
@@ -115,8 +103,6 @@ def _walk_radix_subtree(
             slot_buf.append(slot)
             position_buf.append(depth + j)
             prev_slot_buf.append(prev)
-            if owning_nodes_buf is not None:
-                owning_nodes_buf.append(node)
         chain_last_slot = slot
 
     child_depth = depth + len(node_slots)
@@ -129,7 +115,6 @@ def _walk_radix_subtree(
             slot_buf=slot_buf,
             position_buf=position_buf,
             prev_slot_buf=prev_slot_buf,
-            owning_nodes_buf=owning_nodes_buf,
             is_root=False,
             unlocked_only=unlocked_only,
             swa_resident_only=swa_resident_only,
