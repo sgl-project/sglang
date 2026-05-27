@@ -693,6 +693,7 @@ __global__ void plan_c128_online_prefill_kernel(const OnlinePrefillStage1Params 
   const bool is_compress = idx < params.num_c;
   CompressPlan* const plan_ptr = is_compress ? &params.plan_c[idx] : &params.plan_w[idx - params.num_c];
   auto plan = *plan_ptr;
+  if (plan.is_invalid()) return;
   const auto batch_id = plan.read_page_0;
   const auto rid = params.req_pool_indices[batch_id];
   const int32_t position = static_cast<int32_t>(plan.seq_len - 1u);
@@ -715,7 +716,8 @@ inline OnlinePrefillPlan plan_online_prefill(
     const tvm::ffi::TensorView plan_w_pin,
     const tvm::ffi::TensorView plan_c_dev_,
     const tvm::ffi::TensorView plan_w_dev_,
-    const int32_t swa_page_size) {
+    const int32_t swa_page_size,
+    const bool use_cuda_graph) {
   auto B = SymbolicSize{"batch_size"};
   auto N = SymbolicSize{"num_q_tokens"};
   auto cpu = SymbolicDevice{};
@@ -784,6 +786,10 @@ inline OnlinePrefillPlan plan_online_prefill(
   }
 
   const auto [num_c, num_w] = _plan_prefill_partial(stage0_params);
+  const auto num_c_padded =
+      use_cuda_graph ? static_cast<uint32_t>(N.unwrap()) : num_c;
+  const auto num_w_padded =
+      use_cuda_graph ? static_cast<uint32_t>(N.unwrap()) : num_w;
 
   if (kGuard) {
     // Verify stage 0 wrote ONLY to the [0, num_c*16) and [0, num_w*16) prefix.
@@ -821,7 +827,19 @@ inline OnlinePrefillPlan plan_online_prefill(
   auto* const plan_c_dev_ptr = static_cast<CompressPlan*>(plan_c_dev_.data_ptr());
   auto* const plan_w_dev_ptr = static_cast<CompressPlan*>(plan_w_dev_.data_ptr());
 
-  if (const auto total = num_c + num_w) {
+  if (use_cuda_graph) {
+    const auto kInvalidPlan = CompressPlan::invalid();
+    auto* const plan_c_pin_ptr = static_cast<CompressPlan*>(plan_c_pin.data_ptr());
+    auto* const plan_w_pin_ptr = static_cast<CompressPlan*>(plan_w_pin.data_ptr());
+    for (const auto i : irange(num_c, num_c_padded)) {
+      plan_c_pin_ptr[i] = kInvalidPlan;
+    }
+    for (const auto i : irange(num_w, num_w_padded)) {
+      plan_w_pin_ptr[i] = kInvalidPlan;
+    }
+  }
+
+  if (const auto total = num_c_padded + num_w_padded) {
     const auto stream = LaunchKernel::resolve_device(device);
     // SGLANG_DEBUG_C128_ONLINE_SYNC_H2D=1 forces a synchronous H2D copy.
     static const bool kSyncH2D = []() {
@@ -842,8 +860,10 @@ inline OnlinePrefillPlan plan_online_prefill(
         RuntimeDeviceCheck(::cudaMemcpyAsync(dst, src, bytes, ::cudaMemcpyHostToDevice, stream));
       }
     };
-    if (num_c) copy_to_device(plan_c_dev_ptr, plan_c_pin.data_ptr(), num_c);
-    if (num_w) copy_to_device(plan_w_dev_ptr, plan_w_pin.data_ptr(), num_w);
+    if (num_c_padded)
+      copy_to_device(plan_c_dev_ptr, plan_c_pin.data_ptr(), num_c_padded);
+    if (num_w_padded)
+      copy_to_device(plan_w_dev_ptr, plan_w_pin.data_ptr(), num_w_padded);
 
     const auto stage1_params = OnlinePrefillStage1Params{
         .plan_c = plan_c_dev_ptr,
@@ -853,14 +873,14 @@ inline OnlinePrefillPlan plan_online_prefill(
         .full_to_swa = static_cast<const int64_t*>(full_to_swa.data_ptr()),
         .stride_r2t = req_to_token.stride(0),
         .swa_page_size = swa_page_size,
-        .num_c = num_c,
-        .num_w = num_w,
+        .num_c = num_c_padded,
+        .num_w = num_w_padded,
     };
     constexpr uint32_t kBlockSize = 128;
     const auto num_blocks = host::div_ceil(total, kBlockSize);
     LaunchKernel(num_blocks, kBlockSize, device)(plan_c128_online_prefill_kernel, stage1_params);
   }
-  return OnlinePrefillPlan{num_c, num_w};
+  return OnlinePrefillPlan{num_c_padded, num_w_padded};
 }
 
 }  // namespace host::compress
