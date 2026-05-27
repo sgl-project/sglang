@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     135,
+        "agents":     139,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -249,6 +249,10 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "loyalty_program":   7886,
             "content_delivery":  7887,
             "invoice_engine":    7888,
+            "webhook_manager":   7889,
+            "ab_testing":        7890,
+            "geo_routing":       7891,
+            "chatbot_engine":    7892,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -584,6 +588,10 @@ _INTENTS = {
     "loyalty_earn":            lambda a, k: {"action": "loyalty_earn_queued", "member_id": k.get("member_id", ""), "type": k.get("type", "purchase"), "order_value": k.get("order_value", 0)},
     "asset_upload":            lambda a, k: {"action": "asset_upload_queued", "filename": k.get("filename", ""), "folder": k.get("folder", "/")},
     "invoice_create":          lambda a, k: {"action": "invoice_create_queued", "client_id": k.get("client_id", ""), "items": k.get("items", [])},
+    "webhook_fire":            lambda a, k: {"action": "webhook_fire_queued", "event_type": k.get("event_type", ""), "payload": k.get("payload", {})},
+    "ab_assign":               lambda a, k: {"action": "ab_assign_queued", "exp_id": k.get("exp_id", ""), "user_id": k.get("user_id", "")},
+    "geo_lookup":              lambda a, k: {"action": "geo_lookup_queued", "ip": k.get("ip", "")},
+    "chatbot_message":         lambda a, k: {"action": "chatbot_message_queued", "persona_id": k.get("persona_id", ""), "message": k.get("message", ""), "conv_id": k.get("conv_id", "")},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────

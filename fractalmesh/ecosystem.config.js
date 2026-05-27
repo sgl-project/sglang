@@ -1219,6 +1219,10 @@ module.exports = {
             ['fm-loyalty',        'fm_loyalty_program',  '25M'],
             ['fm-cdn',            'fm_content_delivery', '35M'],
             ['fm-invoices',       'fm_invoice_engine',   '30M'],
+            ['fm-webhooks',       'fm_webhook_manager',  '25M'],
+            ['fm-abtesting',      'fm_ab_testing',       '25M'],
+            ['fm-geo',            'fm_geo_routing',      '25M'],
+            ['fm-chatbot',        'fm_chatbot_engine',   '35M'],
         ].map(([name, script, mem]) => ({
             name,
             script:            `agents/${script}.py`,

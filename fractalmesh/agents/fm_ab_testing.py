@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-fm_ab_testing.py — A/B Testing Engine (Port 7849)
-FractalMesh OMEGA Titan | Deterministic assignment, z-test significance, Claude-generated variants.
+fm_ab_testing.py — A/B Testing & Experimentation Platform (Port 7890)
+FractalMesh OMEGA Titan | Deterministic assignment, z-test significance, statistical analysis.
 All credentials sourced from ~/.secrets/fractal.env at runtime.
 Samuel James Hiotis | ABN 56 628 117 363
 """
@@ -9,34 +9,38 @@ import os
 import json
 import time
 import math
-import random
+import hmac
 import hashlib
+import secrets
 import sqlite3
+import statistics
+import threading
 import urllib.request
 import urllib.error
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# ── vault ──────────────────────────────────────────────────────────────────────
-_vault = Path(os.path.expanduser("~/.secrets/fractal.env"))
-if _vault.exists():
-    for _line in _vault.read_text().splitlines():
-        if "=" in _line and not _line.startswith("#"):
-            _k, _, _v = _line.partition("=")
-            os.environ.setdefault(_k.strip(), _v.strip().strip('"'))
+# ── vault loading (must be before any os.getenv calls) ────────────────────────
+_ENV_FILE = Path.home() / ".secrets" / "fractal.env"
+if _ENV_FILE.exists():
+    for line in _ENV_FILE.read_text().splitlines():
+        if "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"'))
 
 # ── config ─────────────────────────────────────────────────────────────────────
-PORT             = int(os.getenv("AB_TESTING_PORT", "7849"))
-ADMIN_SECRET     = os.getenv("ADMIN_SECRET", "")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+PORT         = int(os.getenv("AB_TESTING_PORT", "7890"))
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
 
-ROOT = Path(os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas")))
+ROOT = Path(os.path.expanduser("~/fmsaas"))
 DB   = ROOT / "database" / "sovereign.db"
 
 ROOT.mkdir(parents=True, exist_ok=True)
 DB.parent.mkdir(parents=True, exist_ok=True)
 
+
 # ── database ───────────────────────────────────────────────────────────────────
+
 def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB), timeout=15)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -49,157 +53,89 @@ def init_db():
     conn = get_db()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS experiments (
-            id              INTEGER PRIMARY KEY,
-            name            TEXT UNIQUE,
-            description     TEXT,
-            status          TEXT DEFAULT 'draft',
-            hypothesis      TEXT,
-            metric          TEXT,
-            winning_variant TEXT,
-            started_at      REAL,
-            ended_at        REAL,
-            created_at      REAL
+            id                  INTEGER PRIMARY KEY,
+            exp_id              TEXT UNIQUE,
+            name                TEXT,
+            description         TEXT,
+            status              TEXT DEFAULT 'draft',
+            hypothesis          TEXT,
+            metric              TEXT DEFAULT 'conversion_rate',
+            traffic_percentage  REAL DEFAULT 1.0,
+            min_sample_size     INTEGER DEFAULT 100,
+            confidence_level    REAL DEFAULT 0.95,
+            winner_variant      TEXT,
+            started_at          REAL,
+            ended_at            REAL,
+            created_at          REAL,
+            updated_at          REAL
         );
         CREATE TABLE IF NOT EXISTS variants (
-            id              INTEGER PRIMARY KEY,
-            experiment_id   INTEGER,
-            name            TEXT,
-            description     TEXT,
-            traffic_pct     REAL DEFAULT 50.0,
-            content         TEXT,
-            metadata        TEXT,
-            impressions     INTEGER DEFAULT 0,
-            conversions     INTEGER DEFAULT 0,
-            created_at      REAL
+            id          INTEGER PRIMARY KEY,
+            variant_id  TEXT UNIQUE,
+            exp_id      TEXT,
+            name        TEXT,
+            description TEXT,
+            weight      REAL DEFAULT 0.5,
+            config      TEXT DEFAULT '{}',
+            is_control  INTEGER DEFAULT 0,
+            impressions INTEGER DEFAULT 0,
+            conversions INTEGER DEFAULT 0,
+            revenue     REAL DEFAULT 0,
+            created_at  REAL
         );
         CREATE TABLE IF NOT EXISTS assignments (
-            id              INTEGER PRIMARY KEY,
-            experiment_id   INTEGER,
-            variant_id      INTEGER,
-            user_id         TEXT,
-            assigned_at     REAL
+            id          INTEGER PRIMARY KEY,
+            exp_id      TEXT,
+            user_id     TEXT,
+            variant_id  TEXT,
+            assigned_at REAL,
+            UNIQUE(exp_id, user_id)
         );
         CREATE TABLE IF NOT EXISTS events (
-            id              INTEGER PRIMARY KEY,
-            experiment_id   INTEGER,
-            variant_id      INTEGER,
-            user_id         TEXT,
-            event_type      TEXT,
-            value           REAL DEFAULT 1.0,
-            created_at      REAL
+            id          INTEGER PRIMARY KEY,
+            event_id    TEXT UNIQUE,
+            exp_id      TEXT,
+            variant_id  TEXT,
+            user_id     TEXT,
+            event_type  TEXT,
+            value       REAL DEFAULT 0,
+            metadata    TEXT,
+            created_at  REAL
         );
     """)
     conn.commit()
-    _seed_example(conn)
     conn.close()
 
 
-def _seed_example(conn: sqlite3.Connection):
-    """Seed a pricing_page_test experiment with two variants if not present."""
-    existing = conn.execute(
-        "SELECT id FROM experiments WHERE name='pricing_page_test'"
-    ).fetchone()
-    if existing:
-        return
+# ── statistical helpers ────────────────────────────────────────────────────────
 
-    now = time.time()
-    cur = conn.execute(
-        """INSERT INTO experiments (name, description, status, hypothesis, metric, created_at)
-           VALUES (?, ?, 'draft', ?, 'plan_upgrade', ?)""",
-        (
-            "pricing_page_test",
-            "Test whether showing monthly or annual pricing first increases upgrades",
-            "Showing annual pricing first will increase plan upgrades by 15%",
-            now,
-        ),
+def _norm_cdf(x: float) -> float:
+    """CDF of the standard normal distribution using the error function."""
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def _z_test(n_a: int, conv_a: int, n_b: int, conv_b: int):
+    """
+    Two-proportion z-test.
+    Returns (z_score, p_value) where p_value is a two-tailed probability.
+    """
+    p_a = conv_a / n_a if n_a > 0 else 0.0
+    p_b = conv_b / n_b if n_b > 0 else 0.0
+    p_pool = (conv_a + conv_b) / (n_a + n_b) if (n_a + n_b) > 0 else 0.0
+    se = (
+        math.sqrt(p_pool * (1 - p_pool) * (1 / n_a + 1 / n_b))
+        if (n_a > 0 and n_b > 0)
+        else 0.0
     )
-    exp_id = cur.lastrowid
-    conn.execute(
-        """INSERT INTO variants (experiment_id, name, description, traffic_pct,
-                                 content, metadata, created_at)
-           VALUES (?, 'monthly_first', 'Show monthly pricing tab by default', 50,
-                   'Monthly billing — cancel anytime', '{}', ?)""",
-        (exp_id, now),
-    )
-    conn.execute(
-        """INSERT INTO variants (experiment_id, name, description, traffic_pct,
-                                 content, metadata, created_at)
-           VALUES (?, 'annual_first', 'Show annual pricing tab by default (save badge)', 50,
-                   'Annual billing — save 20%', '{"badge":"Save 20%"}', ?)""",
-        (exp_id, now),
-    )
-    conn.commit()
+    z = (p_b - p_a) / se if se > 0 else 0.0
+    p_value = 2 * (1 - _norm_cdf(abs(z)))
+    return z, p_value
 
 
-# ── helpers ────────────────────────────────────────────────────────────────────
-
-def _check_auth(handler: "ABTestingHandler") -> bool:
-    """Return True if the request carries a valid admin secret."""
-    auth = handler.headers.get("Authorization", "")
-    secret = auth.replace("Bearer ", "").strip()
-    return bool(ADMIN_SECRET) and secret == ADMIN_SECRET
-
-
-def _assign_variant(experiment_id: int, user_id: str, variants: list) -> dict | None:
-    """Deterministically pick a variant for a user using MD5 hash bucket."""
-    if not variants:
-        return None
-    bucket = int(hashlib.md5(f"{experiment_id}:{user_id}".encode()).hexdigest(), 16) % 100
-    cumulative = 0.0
-    for v in variants:
-        cumulative += float(v["traffic_pct"])
-        if bucket < cumulative:
-            return v
-    return variants[-1]
-
-
-def _significance_test(v_a: dict, v_b: dict) -> dict:
-    """z-test between two variants; returns z_score, p_value label, significant, winner."""
-    n_a = max(1, int(v_a["impressions"]))
-    n_b = max(1, int(v_b["impressions"]))
-    c_a = int(v_a["conversions"])
-    c_b = int(v_b["conversions"])
-
-    rate_a = c_a / n_a
-    rate_b = c_b / n_b
-    pooled = (c_a + c_b) / max(1, n_a + n_b)
-    se = math.sqrt(pooled * (1 - pooled) * (1 / n_a + 1 / n_b))
-    z = (rate_a - rate_b) / max(se, 1e-10)
-
-    abs_z = abs(z)
-    if abs_z > 2.576:
-        p_value = "<0.01"
-        significance = "99%"
-        significant = True
-    elif abs_z > 1.96:
-        p_value = "<0.05"
-        significance = "95%"
-        significant = True
-    elif abs_z > 1.645:
-        p_value = "<0.10"
-        significance = "90%"
-        significant = True
-    else:
-        p_value = ">=0.10"
-        significance = "not significant"
-        significant = False
-
-    winner = v_a["name"] if rate_a >= rate_b else v_b["name"]
-    return {
-        "z_score": round(z, 4),
-        "p_value": p_value,
-        "significance": significance,
-        "significant": significant,
-        "winner": winner if significant else None,
-        "rate_a": round(rate_a, 6),
-        "rate_b": round(rate_b, 6),
-    }
-
-
-def _confidence_interval(variant: dict) -> dict:
-    """95% Wilson-like CI approximation."""
-    n = max(1, int(variant["impressions"]))
-    p = int(variant["conversions"]) / n
+def _confidence_interval_95(impressions: int, conversions: int) -> dict:
+    """Wilson score 95% confidence interval."""
+    n = max(1, impressions)
+    p = conversions / n
     z = 1.96
     margin = z * math.sqrt(p * (1 - p) / n)
     return {
@@ -208,32 +144,45 @@ def _confidence_interval(variant: dict) -> dict:
     }
 
 
-def _claude_generate(prompt: str, max_tokens: int = 500) -> str:
-    """Call Anthropic Messages API and return the assistant text."""
-    if not ANTHROPIC_API_KEY:
-        return ""
-    payload = json.dumps({
-        "model": "claude-3-5-haiku-20241022",
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}],
-    }).encode()
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=payload,
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
-            return data["content"][0]["text"].strip()
-    except Exception:
-        return ""
+def _lift_percent(rate_control: float, rate_variant: float) -> float:
+    """Percentage lift of variant over control."""
+    if rate_control <= 0:
+        return 0.0
+    return round((rate_variant - rate_control) / rate_control * 100, 4)
 
+
+# ── deterministic assignment ───────────────────────────────────────────────────
+
+def _assign_variant(exp_id: str, user_id: str, variants: list) -> dict | None:
+    """
+    Hash user+exp to get a stable bucket 0-99, then use cumulative weights to pick variant.
+    Variants are sorted by name for stability.
+    """
+    if not variants:
+        return None
+    h = int(hashlib.sha256(f"{exp_id}:{user_id}".encode()).hexdigest(), 16) % 100
+    cumulative = 0.0
+    for v in sorted(variants, key=lambda x: x["name"]):
+        cumulative += v["weight"] * 100
+        if h < cumulative:
+            return v
+    return variants[-1]
+
+
+# ── security helpers ───────────────────────────────────────────────────────────
+
+def _check_admin(handler: "ABTestingHandler") -> bool:
+    """Return True if the X-Admin-Secret header matches ADMIN_SECRET via constant-time comparison."""
+    if not ADMIN_SECRET:
+        return False
+    provided = handler.headers.get("X-Admin-Secret", "")
+    return hmac.compare_digest(
+        ADMIN_SECRET.encode("utf-8"),
+        provided.encode("utf-8"),
+    )
+
+
+# ── HTTP helpers ───────────────────────────────────────────────────────────────
 
 def _read_body(handler: "ABTestingHandler") -> dict:
     length = int(handler.headers.get("Content-Length", 0))
@@ -247,7 +196,7 @@ def _read_body(handler: "ABTestingHandler") -> dict:
 
 
 def _send(handler: "ABTestingHandler", code: int, body: dict):
-    payload = json.dumps(body).encode()
+    payload = json.dumps(body, default=str).encode()
     handler.send_response(code)
     handler.send_header("Content-Type", "application/json")
     handler.send_header("Content-Length", str(len(payload)))
@@ -255,630 +204,795 @@ def _send(handler: "ABTestingHandler", code: int, body: dict):
     handler.wfile.write(payload)
 
 
-def _variants_for(conn: sqlite3.Connection, experiment_id: int) -> list:
+def _get_query_params(path: str) -> dict:
+    """Parse query string from a path like /foo?a=1&b=2."""
+    if "?" not in path:
+        return {}
+    qs = path.split("?", 1)[1]
+    params = {}
+    for part in qs.split("&"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            params[k] = v
+    return params
+
+
+# ── experiment data helpers ────────────────────────────────────────────────────
+
+def _variants_for(conn: sqlite3.Connection, exp_id: str) -> list:
     rows = conn.execute(
-        "SELECT * FROM variants WHERE experiment_id=? ORDER BY id",
-        (experiment_id,),
+        "SELECT * FROM variants WHERE exp_id=? ORDER BY name",
+        (exp_id,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def _enrich_variant(v: dict) -> dict:
+    """Add conversion_rate and parsed config to a variant dict."""
+    n = max(1, int(v["impressions"]))
+    c = int(v["conversions"])
+    try:
+        cfg = json.loads(v.get("config") or "{}")
+    except Exception:
+        cfg = {}
+    return {
+        **v,
+        "config": cfg,
+        "conversion_rate": round(c / n, 6),
+        "confidence_interval": _confidence_interval_95(n, c),
+    }
+
+
+def _run_significance_analysis(conn: sqlite3.Connection, exp_id: str) -> dict:
+    """
+    Run pairwise z-test analysis across all variants.
+    Returns a results dict with per-variant stats, pairwise tests, and recommended winner.
+    """
+    exp = conn.execute(
+        "SELECT * FROM experiments WHERE exp_id=?", (exp_id,)
+    ).fetchone()
+    if not exp:
+        return {}
+
+    variants = _variants_for(conn, exp_id)
+    enriched = [_enrich_variant(v) for v in variants]
+
+    total_impressions = sum(int(v["impressions"]) for v in variants)
+    total_conversions = sum(int(v["conversions"]) for v in variants)
+    overall_rate = total_conversions / max(1, total_impressions)
+
+    # Find control variant
+    control = next((v for v in enriched if v.get("is_control")), None)
+
+    # Pairwise z-tests
+    pairwise = []
+    for i in range(len(variants)):
+        for j in range(i + 1, len(variants)):
+            va = variants[i]
+            vb = variants[j]
+            z, p_val = _z_test(
+                int(va["impressions"]), int(va["conversions"]),
+                int(vb["impressions"]), int(vb["conversions"]),
+            )
+            significant = p_val < (1 - float(exp["confidence_level"]))
+            pairwise.append({
+                "variant_a":   va["name"],
+                "variant_b":   vb["name"],
+                "z_score":     round(z, 6),
+                "p_value":     round(p_val, 6),
+                "significant": significant,
+                "confidence":  float(exp["confidence_level"]),
+            })
+
+    # Recommend winner: highest conversion rate among variants that beat control significantly,
+    # or highest overall if no control.
+    winner_name = None
+    winner_p_value = None
+    if control and len(enriched) > 1:
+        challengers = [v for v in enriched if not v.get("is_control")]
+        best_challenger = max(challengers, key=lambda x: x["conversion_rate"])
+        z, p_val = _z_test(
+            int(control["impressions"]), int(control["conversions"]),
+            int(best_challenger["impressions"]), int(best_challenger["conversions"]),
+        )
+        significant = p_val < (1 - float(exp["confidence_level"]))
+        if significant and best_challenger["conversion_rate"] > control["conversion_rate"]:
+            winner_name = best_challenger["name"]
+            winner_p_value = round(p_val, 6)
+        elif significant and control["conversion_rate"] > best_challenger["conversion_rate"]:
+            winner_name = control["name"]
+            winner_p_value = round(p_val, 6)
+    elif len(enriched) >= 2:
+        sorted_v = sorted(enriched, key=lambda x: x["conversion_rate"], reverse=True)
+        best = sorted_v[0]
+        second = sorted_v[1]
+        z, p_val = _z_test(
+            int(second["impressions"]), int(second["conversions"]),
+            int(best["impressions"]), int(best["conversions"]),
+        )
+        significant = p_val < (1 - float(exp["confidence_level"]))
+        if significant:
+            winner_name = best["name"]
+            winner_p_value = round(p_val, 6)
+
+    lift = 0.0
+    if winner_name and control and winner_name != control["name"]:
+        winner_v = next((v for v in enriched if v["name"] == winner_name), None)
+        if winner_v:
+            lift = _lift_percent(control["conversion_rate"], winner_v["conversion_rate"])
+
+    return {
+        "exp_id":                   exp_id,
+        "status":                   exp["status"],
+        "metric":                   exp["metric"],
+        "total_impressions":        total_impressions,
+        "total_conversions":        total_conversions,
+        "overall_conversion_rate":  round(overall_rate, 6),
+        "confidence_level":         float(exp["confidence_level"]),
+        "recommended_winner":       winner_name,
+        "winner_p_value":           winner_p_value,
+        "lift_percent":             lift,
+        "variants":                 enriched,
+        "pairwise_tests":           pairwise,
+    }
+
+
+# ── background analysis daemon ─────────────────────────────────────────────────
+
+def _analysis_daemon():
+    """
+    Daemon thread: every 3600 seconds, check running experiments that have reached
+    min_sample_size. Run z-test; if p_value < (1 - confidence_level) set winner_variant
+    and status='completed'.
+    """
+    while True:
+        time.sleep(3600)
+        try:
+            conn = get_db()
+            running = conn.execute(
+                "SELECT * FROM experiments WHERE status='running'"
+            ).fetchall()
+            for exp in running:
+                exp_id = exp["exp_id"]
+                variants = _variants_for(conn, exp_id)
+                total_impressions = sum(int(v["impressions"]) for v in variants)
+                if total_impressions < int(exp["min_sample_size"]):
+                    continue
+                # Run significance analysis
+                results = _run_significance_analysis(conn, exp_id)
+                winner_name = results.get("recommended_winner")
+                winner_p = results.get("winner_p_value")
+                if winner_name and winner_p is not None:
+                    threshold = 1.0 - float(exp["confidence_level"])
+                    if winner_p < threshold:
+                        now = time.time()
+                        conn.execute(
+                            """UPDATE experiments
+                               SET status='completed', winner_variant=?, ended_at=?, updated_at=?
+                               WHERE exp_id=?""",
+                            (winner_name, now, now, exp_id),
+                        )
+                        conn.commit()
+            conn.close()
+        except Exception:
+            pass
 
 
 # ── request handler ────────────────────────────────────────────────────────────
 
 class ABTestingHandler(BaseHTTPRequestHandler):
-    server_version = "FractalMesh-ABTesting/1.0"
+    server_version = "FractalMesh-ABTesting/2.0"
 
-    def log_message(self, fmt, *args):  # silence default stderr logs
+    def log_message(self, fmt, *args):  # suppress default stderr logging
         pass
 
     # ── routing ────────────────────────────────────────────────────────────────
 
     def do_GET(self):
-        path = self.path.split("?")[0].rstrip("/")
+        raw_path = self.path
+        path = raw_path.split("?")[0].rstrip("/")
+        parts = [p for p in path.split("/") if p]
 
+        # GET /health
         if path == "/health":
             return _send(self, 200, {
-                "status": "ok",
+                "status":  "ok",
                 "service": "fm-ab-testing",
-                "port": PORT,
+                "port":    PORT,
+                "db":      str(DB),
             })
 
+        # GET /experiments
         if path == "/experiments":
-            return self._list_experiments()
+            return self._list_experiments(raw_path)
 
-        if path == "/analytics":
-            return self._analytics()
+        # GET /experiments/{exp_id}
+        if len(parts) == 2 and parts[0] == "experiments":
+            return self._get_experiment(parts[1])
 
-        # /experiments/{id}
-        parts = path.split("/")
-        if len(parts) == 3 and parts[1] == "experiments" and parts[2].isdigit():
-            return self._get_experiment(int(parts[2]))
+        # GET /results/{exp_id}
+        if len(parts) == 2 and parts[0] == "results":
+            return self._get_results(parts[1])
 
-        # /experiments/{id}/results
-        if (len(parts) == 4 and parts[1] == "experiments"
-                and parts[2].isdigit() and parts[3] == "results"):
-            return self._experiment_results(int(parts[2]))
+        # GET /assignment/{exp_id}/{user_id}
+        if len(parts) == 3 and parts[0] == "assignment":
+            return self._get_or_create_assignment(parts[1], parts[2])
+
+        # GET /dashboard
+        if path == "/dashboard":
+            if not _check_admin(self):
+                return _send(self, 401, {"error": "unauthorized"})
+            return self._dashboard()
 
         _send(self, 404, {"error": "not found"})
 
     def do_POST(self):
         path = self.path.split("?")[0].rstrip("/")
+        parts = [p for p in path.split("/") if p]
 
-        if path == "/assign":
-            return self._assign()
-
-        if path == "/assign/multi":
-            return self._assign_multi()
-
-        if path == "/track":
-            return self._track()
-
-        if path == "/experiments/create":
-            if not _check_auth(self):
+        # POST /experiments
+        if path == "/experiments":
+            if not _check_admin(self):
                 return _send(self, 401, {"error": "unauthorized"})
             return self._create_experiment()
 
-        parts = path.split("/")
+        # POST /assign
+        if path == "/assign":
+            return self._assign()
 
-        # /experiments/{id}/variants/add
-        if (len(parts) == 5 and parts[1] == "experiments"
-                and parts[2].isdigit() and parts[3] == "variants" and parts[4] == "add"):
-            if not _check_auth(self):
-                return _send(self, 401, {"error": "unauthorized"})
-            return self._add_variant(int(parts[2]))
+        # POST /track
+        if path == "/track":
+            return self._track()
 
-        # /experiments/{id}/start
-        if (len(parts) == 4 and parts[1] == "experiments"
-                and parts[2].isdigit() and parts[3] == "start"):
-            if not _check_auth(self):
+        # POST /experiments/{exp_id}/variants
+        if (len(parts) == 3 and parts[0] == "experiments"
+                and parts[2] == "variants"):
+            if not _check_admin(self):
                 return _send(self, 401, {"error": "unauthorized"})
-            return self._start_experiment(int(parts[2]))
+            return self._add_variant(parts[1])
 
-        # /experiments/{id}/stop
-        if (len(parts) == 4 and parts[1] == "experiments"
-                and parts[2].isdigit() and parts[3] == "stop"):
-            if not _check_auth(self):
+        # POST /experiments/{exp_id}/start
+        if (len(parts) == 3 and parts[0] == "experiments"
+                and parts[2] == "start"):
+            if not _check_admin(self):
                 return _send(self, 401, {"error": "unauthorized"})
-            return self._stop_experiment(int(parts[2]))
+            return self._start_experiment(parts[1])
 
-        # /experiments/{id}/generate_variants
-        if (len(parts) == 4 and parts[1] == "experiments"
-                and parts[2].isdigit() and parts[3] == "generate_variants"):
-            if not _check_auth(self):
+        # POST /experiments/{exp_id}/stop
+        if (len(parts) == 3 and parts[0] == "experiments"
+                and parts[2] == "stop"):
+            if not _check_admin(self):
                 return _send(self, 401, {"error": "unauthorized"})
-            return self._generate_variants(int(parts[2]))
+            return self._stop_experiment(parts[1])
 
         _send(self, 404, {"error": "not found"})
 
-    # ── experiment endpoints ───────────────────────────────────────────────────
+    # ── experiment management ──────────────────────────────────────────────────
 
     def _create_experiment(self):
         body = _read_body(self)
-        name = body.get("name", "").strip()
+        name = str(body.get("name", "")).strip()
         if not name:
             return _send(self, 400, {"error": "name is required"})
-        description = body.get("description", "")
-        hypothesis  = body.get("hypothesis", "")
-        metric      = body.get("metric", "")
-        now = time.time()
+
+        description        = str(body.get("description", ""))
+        hypothesis         = str(body.get("hypothesis", ""))
+        metric             = str(body.get("metric", "conversion_rate"))
+        traffic_percentage = float(body.get("traffic_percentage", 1.0))
+        min_sample_size    = int(body.get("min_sample_size", 100))
+        confidence_level   = float(body.get("confidence_level", 0.95))
+
+        if not (0.0 < traffic_percentage <= 1.0):
+            return _send(self, 400, {"error": "traffic_percentage must be between 0 and 1"})
+        if not (0.0 < confidence_level < 1.0):
+            return _send(self, 400, {"error": "confidence_level must be between 0 and 1"})
+
+        now    = time.time()
+        exp_id = secrets.token_hex(8)
+
         try:
             conn = get_db()
-            cur = conn.execute(
-                """INSERT INTO experiments (name, description, status, hypothesis, metric, created_at)
-                   VALUES (?, ?, 'draft', ?, ?, ?)""",
-                (name, description, hypothesis, metric, now),
+            conn.execute(
+                """INSERT INTO experiments
+                   (exp_id, name, description, status, hypothesis, metric,
+                    traffic_percentage, min_sample_size, confidence_level,
+                    created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (exp_id, name, description, "draft", hypothesis, metric,
+                 traffic_percentage, min_sample_size, confidence_level,
+                 now, now),
             )
-            exp_id = cur.lastrowid
             conn.commit()
             conn.close()
-            return _send(self, 201, {"experiment_id": exp_id})
         except sqlite3.IntegrityError:
-            conn.close()
-            return _send(self, 409, {"error": f"experiment '{name}' already exists"})
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return _send(self, 409, {"error": "experiment already exists"})
 
-    def _add_variant(self, experiment_id: int):
-        body = _read_body(self)
-        name = body.get("name", "").strip()
-        if not name:
-            return _send(self, 400, {"error": "name is required"})
-        description = body.get("description", "")
-        traffic_pct = float(body.get("traffic_pct", 50.0))
-        content     = body.get("content", "")
-        metadata    = json.dumps(body.get("metadata", {}))
-        now = time.time()
+        return _send(self, 201, {
+            "exp_id":             exp_id,
+            "name":               name,
+            "status":             "draft",
+            "metric":             metric,
+            "traffic_percentage": traffic_percentage,
+            "min_sample_size":    min_sample_size,
+            "confidence_level":   confidence_level,
+            "created_at":         now,
+        })
+
+    def _list_experiments(self, raw_path: str):
+        params = _get_query_params(raw_path)
+        status_filter = params.get("status", "")
 
         conn = get_db()
+        if status_filter:
+            rows = conn.execute(
+                "SELECT * FROM experiments WHERE status=? ORDER BY created_at DESC",
+                (status_filter,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM experiments ORDER BY created_at DESC"
+            ).fetchall()
+        conn.close()
+
+        experiments = []
+        for r in rows:
+            experiments.append(dict(r))
+
+        return _send(self, 200, {
+            "experiments": experiments,
+            "count":       len(experiments),
+        })
+
+    def _get_experiment(self, exp_id: str):
+        conn = get_db()
         exp = conn.execute(
-            "SELECT id FROM experiments WHERE id=?", (experiment_id,)
+            "SELECT * FROM experiments WHERE exp_id=?", (exp_id,)
         ).fetchone()
         if not exp:
             conn.close()
             return _send(self, 404, {"error": "experiment not found"})
 
-        existing_pct = conn.execute(
-            "SELECT COALESCE(SUM(traffic_pct), 0) FROM variants WHERE experiment_id=?",
-            (experiment_id,),
-        ).fetchone()[0]
-        if existing_pct + traffic_pct > 100.0 + 0.01:
+        variants = _variants_for(conn, exp_id)
+        conn.close()
+
+        enriched = [_enrich_variant(v) for v in variants]
+        return _send(self, 200, {
+            "experiment": dict(exp),
+            "variants":   enriched,
+        })
+
+    def _add_variant(self, exp_id: str):
+        conn = get_db()
+        exp = conn.execute(
+            "SELECT * FROM experiments WHERE exp_id=?", (exp_id,)
+        ).fetchone()
+        if not exp:
+            conn.close()
+            return _send(self, 404, {"error": "experiment not found"})
+        if exp["status"] not in ("draft",):
             conn.close()
             return _send(self, 400, {
-                "error": f"traffic_pct total would exceed 100 ({existing_pct + traffic_pct:.1f})"
+                "error": f"cannot add variants to experiment in status '{exp['status']}'"
             })
 
-        cur = conn.execute(
-            """INSERT INTO variants (experiment_id, name, description, traffic_pct,
-                                     content, metadata, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (experiment_id, name, description, traffic_pct, content, metadata, now),
+        body       = _read_body(self)
+        name       = str(body.get("name", "")).strip()
+        if not name:
+            conn.close()
+            return _send(self, 400, {"error": "name is required"})
+
+        description = str(body.get("description", ""))
+        weight      = float(body.get("weight", 0.5))
+        config      = json.dumps(body.get("config", {}))
+        is_control  = int(bool(body.get("is_control", False)))
+        now         = time.time()
+        variant_id  = secrets.token_hex(8)
+
+        conn.execute(
+            """INSERT INTO variants
+               (variant_id, exp_id, name, description, weight, config, is_control, created_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (variant_id, exp_id, name, description, weight, config, is_control, now),
         )
-        variant_id = cur.lastrowid
         conn.commit()
         conn.close()
-        return _send(self, 201, {"variant_id": variant_id})
 
-    def _start_experiment(self, experiment_id: int):
+        return _send(self, 201, {
+            "variant_id": variant_id,
+            "exp_id":     exp_id,
+            "name":       name,
+            "weight":     weight,
+            "is_control": bool(is_control),
+            "created_at": now,
+        })
+
+    def _start_experiment(self, exp_id: str):
         conn = get_db()
         exp = conn.execute(
-            "SELECT * FROM experiments WHERE id=?", (experiment_id,)
+            "SELECT * FROM experiments WHERE exp_id=?", (exp_id,)
         ).fetchone()
         if not exp:
             conn.close()
             return _send(self, 404, {"error": "experiment not found"})
+        if exp["status"] != "draft":
+            conn.close()
+            return _send(self, 400, {
+                "error": f"experiment is already in status '{exp['status']}'"
+            })
 
-        variants = _variants_for(conn, experiment_id)
+        variants = _variants_for(conn, exp_id)
         if len(variants) < 2:
             conn.close()
             return _send(self, 400, {"error": "at least 2 variants required to start"})
 
-        total_pct = sum(float(v["traffic_pct"]) for v in variants)
-        if abs(total_pct - 100.0) > 1.0:
-            conn.close()
-            return _send(self, 400, {
-                "error": f"traffic_pct must sum to ~100 (currently {total_pct:.1f})"
-            })
-
+        now = time.time()
         conn.execute(
-            "UPDATE experiments SET status='running', started_at=? WHERE id=?",
-            (time.time(), experiment_id),
+            "UPDATE experiments SET status='running', started_at=?, updated_at=? WHERE exp_id=?",
+            (now, now, exp_id),
         )
         conn.commit()
         conn.close()
-        return _send(self, 200, {"started": True})
+        return _send(self, 200, {"exp_id": exp_id, "status": "running", "started_at": now})
 
-    def _stop_experiment(self, experiment_id: int):
+    def _stop_experiment(self, exp_id: str):
         conn = get_db()
         exp = conn.execute(
-            "SELECT * FROM experiments WHERE id=?", (experiment_id,)
+            "SELECT * FROM experiments WHERE exp_id=?", (exp_id,)
         ).fetchone()
         if not exp:
             conn.close()
             return _send(self, 404, {"error": "experiment not found"})
+        if exp["status"] not in ("running",):
+            conn.close()
+            return _send(self, 400, {
+                "error": f"experiment is not running (status: '{exp['status']}')"
+            })
 
-        variants = _variants_for(conn, experiment_id)
-        winner_name = None
-        confidence  = "not significant"
+        # Run significance analysis before stopping
+        results = _run_significance_analysis(conn, exp_id)
+        winner_name = results.get("recommended_winner")
 
-        if len(variants) >= 2:
-            # Find the best performer via pairwise comparison
-            best = variants[0]
-            for v in variants[1:]:
-                result = _significance_test(best, v)
-                if result["significant"]:
-                    rate_best = int(best["conversions"]) / max(1, int(best["impressions"]))
-                    rate_v    = int(v["conversions"]) / max(1, int(v["impressions"]))
-                    if rate_v > rate_best:
-                        best = v
-                    winner_name = best["name"]
-                    confidence  = result["significance"]
-
+        now = time.time()
         conn.execute(
-            """UPDATE experiments SET status='completed', ended_at=?, winning_variant=?
-               WHERE id=?""",
-            (time.time(), winner_name, experiment_id),
+            """UPDATE experiments
+               SET status='stopped', ended_at=?, updated_at=?, winner_variant=?
+               WHERE exp_id=?""",
+            (now, now, winner_name, exp_id),
         )
         conn.commit()
         conn.close()
+
         return _send(self, 200, {
-            "stopped": True,
-            "winner": winner_name,
-            "confidence": confidence,
+            "exp_id":  exp_id,
+            "status":  "stopped",
+            "ended_at": now,
+            "winner_variant": winner_name,
+            "analysis": results,
         })
 
-    # ── assignment endpoints ───────────────────────────────────────────────────
+    # ── assignment ─────────────────────────────────────────────────────────────
 
     def _assign(self):
-        body = _read_body(self)
-        experiment_id = body.get("experiment_id")
-        user_id       = str(body.get("user_id", "")).strip()
-        if experiment_id is None or not user_id:
-            return _send(self, 400, {"error": "experiment_id and user_id are required"})
-        experiment_id = int(experiment_id)
+        body   = _read_body(self)
+        exp_id = str(body.get("exp_id", "")).strip()
+        user_id = str(body.get("user_id", "")).strip()
+        if not exp_id or not user_id:
+            return _send(self, 400, {"error": "exp_id and user_id are required"})
 
         conn = get_db()
         exp = conn.execute(
-            "SELECT * FROM experiments WHERE id=? AND status='running'",
-            (experiment_id,),
+            "SELECT * FROM experiments WHERE exp_id=? AND status='running'",
+            (exp_id,),
         ).fetchone()
         if not exp:
             conn.close()
             return _send(self, 404, {"error": "running experiment not found"})
 
-        variants = _variants_for(conn, experiment_id)
+        variants = _variants_for(conn, exp_id)
         if not variants:
             conn.close()
             return _send(self, 400, {"error": "no variants configured"})
 
-        variant = _assign_variant(experiment_id, user_id, variants)
+        # Check traffic_percentage gating
+        traffic_h = int(
+            hashlib.sha256(f"traffic:{exp_id}:{user_id}".encode()).hexdigest(), 16
+        ) % 100
+        if traffic_h >= float(exp["traffic_percentage"]) * 100:
+            conn.close()
+            return _send(self, 200, {"assigned": False, "reason": "outside traffic percentage"})
+
+        variant = _assign_variant(exp_id, user_id, variants)
         if not variant:
             conn.close()
             return _send(self, 500, {"error": "could not assign variant"})
 
-        # Record if new assignment
+        # Upsert assignment; only increment impressions on first assignment
         existing = conn.execute(
-            "SELECT id FROM assignments WHERE experiment_id=? AND user_id=?",
-            (experiment_id, user_id),
+            "SELECT variant_id FROM assignments WHERE exp_id=? AND user_id=?",
+            (exp_id, user_id),
         ).fetchone()
+
         if not existing:
             conn.execute(
-                "INSERT INTO assignments (experiment_id, variant_id, user_id, assigned_at) VALUES (?,?,?,?)",
-                (experiment_id, variant["id"], user_id, time.time()),
+                """INSERT INTO assignments (exp_id, user_id, variant_id, assigned_at)
+                   VALUES (?,?,?,?)""",
+                (exp_id, user_id, variant["variant_id"], time.time()),
             )
             conn.execute(
-                "UPDATE variants SET impressions = impressions + 1 WHERE id=?",
-                (variant["id"],),
+                "UPDATE variants SET impressions = impressions + 1 WHERE variant_id=?",
+                (variant["variant_id"],),
             )
             conn.commit()
+        else:
+            # Return the previously assigned variant for consistency
+            assigned_vid = existing["variant_id"]
+            variant = dict(conn.execute(
+                "SELECT * FROM variants WHERE variant_id=?", (assigned_vid,)
+            ).fetchone())
 
         try:
-            metadata = json.loads(variant["metadata"] or "{}")
+            cfg = json.loads(variant.get("config") or "{}")
         except Exception:
-            metadata = {}
+            cfg = {}
 
         conn.close()
         return _send(self, 200, {
-            "variant_id":   variant["id"],
-            "variant_name": variant["name"],
-            "content":      variant["content"],
-            "metadata":     metadata,
+            "assigned":   True,
+            "exp_id":     exp_id,
+            "user_id":    user_id,
+            "variant_id": variant["variant_id"],
+            "name":       variant["name"],
+            "is_control": bool(variant.get("is_control")),
+            "config":     cfg,
         })
 
-    def _assign_multi(self):
-        body = _read_body(self)
-        user_id        = str(body.get("user_id", "")).strip()
-        experiment_ids = body.get("experiment_ids", [])
-        if not user_id or not experiment_ids:
-            return _send(self, 400, {"error": "user_id and experiment_ids are required"})
-
+    def _get_or_create_assignment(self, exp_id: str, user_id: str):
+        """GET /assignment/{exp_id}/{user_id} — return or create assignment."""
         conn = get_db()
-        assignments = []
-        now = time.time()
-        for exp_id in experiment_ids:
-            exp_id = int(exp_id)
-            exp = conn.execute(
-                "SELECT * FROM experiments WHERE id=? AND status='running'", (exp_id,)
-            ).fetchone()
-            if not exp:
-                continue
-            variants = _variants_for(conn, exp_id)
-            if not variants:
-                continue
-            variant = _assign_variant(exp_id, user_id, variants)
-            if not variant:
-                continue
-            existing = conn.execute(
-                "SELECT id FROM assignments WHERE experiment_id=? AND user_id=?",
-                (exp_id, user_id),
-            ).fetchone()
-            if not existing:
-                conn.execute(
-                    "INSERT INTO assignments (experiment_id, variant_id, user_id, assigned_at) VALUES (?,?,?,?)",
-                    (exp_id, variant["id"], user_id, now),
-                )
-                conn.execute(
-                    "UPDATE variants SET impressions = impressions + 1 WHERE id=?",
-                    (variant["id"],),
-                )
-            try:
-                metadata = json.loads(variant["metadata"] or "{}")
-            except Exception:
-                metadata = {}
-            assignments.append({
-                "experiment_id":   exp_id,
-                "experiment_name": exp["name"],
-                "variant_id":      variant["id"],
-                "variant":         variant["name"],
-                "content":         variant["content"],
-                "metadata":        metadata,
-            })
-        conn.commit()
-        conn.close()
-        return _send(self, 200, {"assignments": assignments})
+        exp = conn.execute(
+            "SELECT * FROM experiments WHERE exp_id=?", (exp_id,)
+        ).fetchone()
+        if not exp:
+            conn.close()
+            return _send(self, 404, {"error": "experiment not found"})
 
-    # ── tracking ───────────────────────────────────────────────────────────────
+        existing = conn.execute(
+            "SELECT * FROM assignments WHERE exp_id=? AND user_id=?",
+            (exp_id, user_id),
+        ).fetchone()
+
+        if existing:
+            variant = conn.execute(
+                "SELECT * FROM variants WHERE variant_id=?", (existing["variant_id"],)
+            ).fetchone()
+            conn.close()
+            if not variant:
+                return _send(self, 404, {"error": "assigned variant not found"})
+            try:
+                cfg = json.loads(variant["config"] or "{}")
+            except Exception:
+                cfg = {}
+            return _send(self, 200, {
+                "assigned":   True,
+                "exp_id":     exp_id,
+                "user_id":    user_id,
+                "variant_id": variant["variant_id"],
+                "name":       variant["name"],
+                "is_control": bool(variant["is_control"]),
+                "config":     cfg,
+                "assigned_at": existing["assigned_at"],
+            })
+
+        # No existing assignment — create if experiment is running
+        if exp["status"] != "running":
+            conn.close()
+            return _send(self, 400, {
+                "error": f"experiment is not running (status: '{exp['status']}')"
+            })
+
+        variants = _variants_for(conn, exp_id)
+        if not variants:
+            conn.close()
+            return _send(self, 400, {"error": "no variants configured"})
+
+        variant = _assign_variant(exp_id, user_id, variants)
+        if not variant:
+            conn.close()
+            return _send(self, 500, {"error": "could not assign variant"})
+
+        now = time.time()
+        try:
+            conn.execute(
+                """INSERT INTO assignments (exp_id, user_id, variant_id, assigned_at)
+                   VALUES (?,?,?,?)""",
+                (exp_id, user_id, variant["variant_id"], now),
+            )
+            conn.execute(
+                "UPDATE variants SET impressions = impressions + 1 WHERE variant_id=?",
+                (variant["variant_id"],),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            pass  # Race condition; assignment was just created by another thread
+
+        try:
+            cfg = json.loads(variant.get("config") or "{}")
+        except Exception:
+            cfg = {}
+
+        conn.close()
+        return _send(self, 200, {
+            "assigned":    True,
+            "exp_id":      exp_id,
+            "user_id":     user_id,
+            "variant_id":  variant["variant_id"],
+            "name":        variant["name"],
+            "is_control":  bool(variant.get("is_control")),
+            "config":      cfg,
+            "assigned_at": now,
+        })
+
+    # ── event tracking ─────────────────────────────────────────────────────────
 
     def _track(self):
-        body = _read_body(self)
-        experiment_id = body.get("experiment_id")
-        user_id       = str(body.get("user_id", "")).strip()
-        event_type    = str(body.get("event_type", "")).strip()
-        value         = float(body.get("value", 1.0))
-        if experiment_id is None or not user_id or not event_type:
-            return _send(self, 400, {"error": "experiment_id, user_id, event_type required"})
-        experiment_id = int(experiment_id)
+        body       = _read_body(self)
+        exp_id     = str(body.get("exp_id", "")).strip()
+        user_id    = str(body.get("user_id", "")).strip()
+        event_type = str(body.get("event_type", "")).strip()
+        value      = float(body.get("value", 0.0))
+        metadata   = json.dumps(body.get("metadata", {}))
+
+        if not exp_id or not user_id or not event_type:
+            return _send(self, 400, {"error": "exp_id, user_id, event_type are required"})
 
         conn = get_db()
-        # Find the variant this user is assigned to
         assignment = conn.execute(
-            "SELECT variant_id FROM assignments WHERE experiment_id=? AND user_id=?",
-            (experiment_id, user_id),
+            "SELECT variant_id FROM assignments WHERE exp_id=? AND user_id=?",
+            (exp_id, user_id),
         ).fetchone()
         if not assignment:
             conn.close()
-            return _send(self, 400, {"error": "user has no assignment for this experiment"})
+            return _send(self, 400, {"error": "no assignment found for this user/experiment"})
+
         variant_id = assignment["variant_id"]
+        event_id   = secrets.token_hex(12)
+        now        = time.time()
 
-        cur = conn.execute(
-            "INSERT INTO events (experiment_id, variant_id, user_id, event_type, value, created_at) VALUES (?,?,?,?,?,?)",
-            (experiment_id, variant_id, user_id, event_type, value, time.time()),
+        conn.execute(
+            """INSERT INTO events (event_id, exp_id, variant_id, user_id, event_type, value, metadata, created_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (event_id, exp_id, variant_id, user_id, event_type, value, metadata, now),
         )
-        event_id = cur.lastrowid
 
-        # Increment conversions on the variant
-        exp = conn.execute("SELECT metric FROM experiments WHERE id=?", (experiment_id,)).fetchone()
-        if exp and exp["metric"] == event_type:
+        # Increment conversions and revenue when event_type='conversion'
+        if event_type == "conversion":
             conn.execute(
-                "UPDATE variants SET conversions = conversions + 1 WHERE id=?",
-                (variant_id,),
+                """UPDATE variants
+                   SET conversions = conversions + 1,
+                       revenue = revenue + ?
+                   WHERE variant_id=?""",
+                (value, variant_id),
             )
 
         conn.commit()
         conn.close()
-        return _send(self, 200, {"tracked": True, "event_id": event_id})
 
-    # ── listing / detail ───────────────────────────────────────────────────────
-
-    def _list_experiments(self):
-        conn = get_db()
-        rows = conn.execute(
-            "SELECT e.*, (SELECT COUNT(*) FROM variants v WHERE v.experiment_id=e.id) AS variant_count FROM experiments e ORDER BY e.created_at DESC"
-        ).fetchall()
-        conn.close()
-        return _send(self, 200, {"experiments": [dict(r) for r in rows]})
-
-    def _get_experiment(self, experiment_id: int):
-        conn = get_db()
-        exp = conn.execute(
-            "SELECT * FROM experiments WHERE id=?", (experiment_id,)
-        ).fetchone()
-        if not exp:
-            conn.close()
-            return _send(self, 404, {"error": "experiment not found"})
-        variants = _variants_for(conn, experiment_id)
-        conn.close()
-        enriched_variants = []
-        for v in variants:
-            n = max(1, int(v["impressions"]))
-            c = int(v["conversions"])
-            try:
-                meta = json.loads(v["metadata"] or "{}")
-            except Exception:
-                meta = {}
-            enriched_variants.append({
-                **v,
-                "metadata": meta,
-                "conversion_rate": round(c / n, 6),
-            })
         return _send(self, 200, {
-            "experiment": dict(exp),
-            "variants":   enriched_variants,
+            "tracked":    True,
+            "event_id":   event_id,
+            "exp_id":     exp_id,
+            "variant_id": variant_id,
+            "event_type": event_type,
+            "value":      value,
+            "created_at": now,
         })
 
-    # ── results / analytics ────────────────────────────────────────────────────
+    # ── results ────────────────────────────────────────────────────────────────
 
-    def _experiment_results(self, experiment_id: int):
+    def _get_results(self, exp_id: str):
+        """GET /results/{exp_id} — full statistical analysis."""
         conn = get_db()
         exp = conn.execute(
-            "SELECT * FROM experiments WHERE id=?", (experiment_id,)
+            "SELECT * FROM experiments WHERE exp_id=?", (exp_id,)
         ).fetchone()
         if not exp:
             conn.close()
             return _send(self, 404, {"error": "experiment not found"})
 
-        variants = _variants_for(conn, experiment_id)
+        results = _run_significance_analysis(conn, exp_id)
+        conn.close()
+        return _send(self, 200, results)
+
+    # ── dashboard ──────────────────────────────────────────────────────────────
+
+    def _dashboard(self):
+        """GET /dashboard — admin: running experiments, total assignments, experiments with winners."""
+        conn = get_db()
+
+        running_exps = conn.execute(
+            "SELECT * FROM experiments WHERE status='running' ORDER BY started_at DESC"
+        ).fetchall()
+        running_exps_list = [dict(r) for r in running_exps]
+
+        total_assignments = conn.execute(
+            "SELECT COUNT(*) FROM assignments"
+        ).fetchone()[0]
+
+        experiments_with_winners = conn.execute(
+            """SELECT * FROM experiments
+               WHERE winner_variant IS NOT NULL AND winner_variant != ''
+               ORDER BY ended_at DESC"""
+        ).fetchall()
+        winners_list = [dict(r) for r in experiments_with_winners]
+
+        # Aggregate stats
+        total_experiments = conn.execute(
+            "SELECT COUNT(*) FROM experiments"
+        ).fetchone()[0]
+
+        completed_experiments = conn.execute(
+            "SELECT COUNT(*) FROM experiments WHERE status='completed'"
+        ).fetchone()[0]
+
+        stopped_experiments = conn.execute(
+            "SELECT COUNT(*) FROM experiments WHERE status='stopped'"
+        ).fetchone()[0]
+
+        draft_experiments = conn.execute(
+            "SELECT COUNT(*) FROM experiments WHERE status='draft'"
+        ).fetchone()[0]
+
+        total_impressions = conn.execute(
+            "SELECT COALESCE(SUM(impressions), 0) FROM variants"
+        ).fetchone()[0]
+
+        total_conversions = conn.execute(
+            "SELECT COALESCE(SUM(conversions), 0) FROM variants"
+        ).fetchone()[0]
+
+        total_revenue = conn.execute(
+            "SELECT COALESCE(SUM(revenue), 0.0) FROM variants"
+        ).fetchone()[0]
+
+        # Recent assignments (last 24h)
+        day_start = time.time() - 86400
+        recent_assignments = conn.execute(
+            "SELECT COUNT(*) FROM assignments WHERE assigned_at >= ?",
+            (day_start,),
+        ).fetchone()[0]
+
+        # Recent events (last 24h)
+        recent_events = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE created_at >= ?",
+            (day_start,),
+        ).fetchone()[0]
+
         conn.close()
 
-        total_impressions = sum(int(v["impressions"]) for v in variants)
-        total_conversions = sum(int(v["conversions"]) for v in variants)
         overall_rate = total_conversions / max(1, total_impressions)
 
-        results = []
-        for v in variants:
-            n = max(1, int(v["impressions"]))
-            c = int(v["conversions"])
-            rate = c / n
-            ci = _confidence_interval(v)
-            try:
-                meta = json.loads(v["metadata"] or "{}")
-            except Exception:
-                meta = {}
-            results.append({
-                "variant_id":        v["id"],
-                "name":              v["name"],
-                "impressions":       int(v["impressions"]),
-                "conversions":       c,
-                "conversion_rate":   round(rate, 6),
-                "confidence_interval": ci,
-                "traffic_pct":       float(v["traffic_pct"]),
-                "metadata":          meta,
-            })
-
-        # Pairwise significance tests
-        pairwise = []
-        for i in range(len(variants)):
-            for j in range(i + 1, len(variants)):
-                test = _significance_test(variants[i], variants[j])
-                pairwise.append({
-                    "variant_a": variants[i]["name"],
-                    "variant_b": variants[j]["name"],
-                    **test,
-                })
-
-        # Recommended winner: highest conversion rate among significant winners
-        winner = None
-        significance = "not significant"
-        lift_pct = 0.0
-        if len(results) >= 2:
-            sorted_r = sorted(results, key=lambda x: x["conversion_rate"], reverse=True)
-            best = sorted_r[0]
-            second = sorted_r[1]
-            test = _significance_test(
-                next(v for v in variants if v["id"] == best["variant_id"]),
-                next(v for v in variants if v["id"] == second["variant_id"]),
-            )
-            if test["significant"]:
-                winner      = best["name"]
-                significance = test["significance"]
-                base_rate    = second["conversion_rate"]
-                lift_pct     = round(
-                    (best["conversion_rate"] - base_rate) / max(base_rate, 1e-10) * 100, 2
-                )
-
         return _send(self, 200, {
-            "experiment_id": experiment_id,
-            "status":        exp["status"],
-            "metric":        exp["metric"],
-            "sample_size":   total_impressions,
-            "overall_conversion_rate": round(overall_rate, 6),
-            "significance":  significance,
-            "winner":        winner,
-            "lift_pct":      lift_pct,
-            "results":       results,
-            "pairwise_tests": pairwise,
-        })
-
-    def _analytics(self):
-        conn = get_db()
-        active_experiments = conn.execute(
-            "SELECT COUNT(*) FROM experiments WHERE status='running'"
-        ).fetchone()[0]
-
-        day_start = time.time() - 86400
-        total_assignments_today = conn.execute(
-            "SELECT COUNT(*) FROM assignments WHERE assigned_at >= ?", (day_start,)
-        ).fetchone()[0]
-
-        agg = conn.execute(
-            "SELECT COALESCE(SUM(impressions),0), COALESCE(SUM(conversions),0) FROM variants"
-        ).fetchone()
-        total_impressions = int(agg[0])
-        total_conversions = int(agg[1])
-        overall_conversion_rate = round(
-            total_conversions / max(1, total_impressions), 6
-        )
-
-        # Best performing experiment by conversion rate
-        best_exp = conn.execute(
-            """SELECT e.name, SUM(v.conversions)*1.0/MAX(SUM(v.impressions),1) AS cr
-               FROM experiments e JOIN variants v ON v.experiment_id=e.id
-               WHERE e.status='running'
-               GROUP BY e.id ORDER BY cr DESC LIMIT 1"""
-        ).fetchone()
-
-        conn.close()
-        return _send(self, 200, {
-            "active_experiments":      active_experiments,
-            "total_assignments_today": total_assignments_today,
-            "overall_conversion_rate": overall_conversion_rate,
-            "best_experiment":         best_exp["name"] if best_exp else None,
-        })
-
-    # ── variant generation via Claude ──────────────────────────────────────────
-
-    def _generate_variants(self, experiment_id: int):
-        body = _read_body(self)
-        base_content = body.get("base_content", "").strip()
-        goal         = body.get("goal", "increase_clicks").strip()
-        n_variants   = max(1, min(10, int(body.get("n_variants", 3))))
-
-        if not base_content:
-            return _send(self, 400, {"error": "base_content is required"})
-
-        conn = get_db()
-        exp = conn.execute(
-            "SELECT * FROM experiments WHERE id=?", (experiment_id,)
-        ).fetchone()
-        if not exp:
-            conn.close()
-            return _send(self, 404, {"error": "experiment not found"})
-
-        # Check available traffic headroom
-        existing_pct = conn.execute(
-            "SELECT COALESCE(SUM(traffic_pct), 0) FROM variants WHERE experiment_id=?",
-            (experiment_id,),
-        ).fetchone()[0]
-        available_pct = 100.0 - float(existing_pct)
-        per_variant_pct = round(available_pct / n_variants, 2)
-
-        prompt = (
-            f"You are a conversion rate optimization expert. "
-            f"Generate {n_variants} distinct A/B test variant copy alternatives for the following:\n\n"
-            f"Base content: {base_content}\n"
-            f"Goal: {goal}\n\n"
-            f"Return ONLY a JSON array of objects with keys 'name' (short slug), "
-            f"'content' (the variant copy), and 'description' (one sentence rationale). "
-            f"No markdown, no explanation, just the JSON array."
-        )
-
-        raw = _claude_generate(prompt, max_tokens=600)
-
-        # Parse Claude's response
-        generated = []
-        try:
-            # Strip any markdown code fences
-            cleaned = raw.strip()
-            if cleaned.startswith("```"):
-                cleaned = "\n".join(cleaned.split("\n")[1:])
-            if cleaned.endswith("```"):
-                cleaned = "\n".join(cleaned.split("\n")[:-1])
-            generated = json.loads(cleaned.strip())
-            if not isinstance(generated, list):
-                generated = []
-        except Exception:
-            # Fallback: create simple numbered variants
-            generated = [
-                {
-                    "name": f"variant_{i+1}",
-                    "content": f"{base_content} (variant {i+1})",
-                    "description": f"Auto-generated variant {i+1}",
-                }
-                for i in range(n_variants)
-            ]
-
-        now = time.time()
-        created_variants = []
-        for item in generated[:n_variants]:
-            name        = str(item.get("name", f"variant_{random.randint(1000,9999)}"))
-            content     = str(item.get("content", base_content))
-            description = str(item.get("description", ""))
-            cur = conn.execute(
-                """INSERT INTO variants (experiment_id, name, description, traffic_pct,
-                                         content, metadata, created_at)
-                   VALUES (?, ?, ?, ?, ?, '{}', ?)""",
-                (experiment_id, name, description, per_variant_pct, content, now),
-            )
-            created_variants.append({
-                "variant_id":  cur.lastrowid,
-                "name":        name,
-                "content":     content,
-                "description": description,
-                "traffic_pct": per_variant_pct,
-            })
-
-        conn.commit()
-        conn.close()
-        return _send(self, 201, {
-            "variants_created": len(created_variants),
-            "variants":         created_variants,
+            "summary": {
+                "total_experiments":      total_experiments,
+                "running_experiments":    len(running_exps_list),
+                "completed_experiments":  completed_experiments,
+                "stopped_experiments":    stopped_experiments,
+                "draft_experiments":      draft_experiments,
+                "total_assignments":      total_assignments,
+                "recent_assignments_24h": recent_assignments,
+                "recent_events_24h":      recent_events,
+                "total_impressions":      total_impressions,
+                "total_conversions":      total_conversions,
+                "overall_conversion_rate": round(overall_rate, 6),
+                "total_revenue":          round(float(total_revenue), 4),
+                "experiments_with_winners": len(winners_list),
+            },
+            "running_experiments":      running_exps_list,
+            "experiments_with_winners": winners_list,
         })
 
 
@@ -886,6 +1000,11 @@ class ABTestingHandler(BaseHTTPRequestHandler):
 
 def main():
     init_db()
+
+    # Start background analysis daemon
+    daemon = threading.Thread(target=_analysis_daemon, daemon=True, name="ab-analysis-daemon")
+    daemon.start()
+
     server = HTTPServer(("0.0.0.0", PORT), ABTestingHandler)
     print(f"[fm-ab-testing] Listening on port {PORT} | DB={DB}")
     try:
