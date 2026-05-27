@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from array import array
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List
 
@@ -71,11 +72,12 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         # Set fields
         self.input_ids = torch.tensor(
-            sum(input_ids, []), dtype=torch.int32, device=self.device
+            sum(input_ids, array("q")), dtype=torch.int32, device=self.device
         )
         self.req_pool_indices = torch.tensor(
             req_pool_indices, dtype=torch.int64, device=self.device
         )
+        self.req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
         self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         self.orig_seq_lens = torch.tensor(
@@ -173,20 +175,15 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 topk_index=topk_index,
                 hidden_states=hidden_states,
                 bonus_tokens=last_tokens_tensor,
-                new_seq_lens=self.seq_lens,
             )
-            # prepare_for_extend shifts batch.input_ids in place — keep it
-            # as the prefill prompt, not the [bs] last-token tensor.
-            spec_info.prepare_for_extend(self)
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
             if self.enable_overlap:
-                spec_info.future_indices = future_map.alloc_future_indices(
-                    len(self.seq_lens)
-                )
-                future_map.store_to_map_for_new_batch(
-                    spec_info.future_indices, spec_info
-                )
+                spec_info.future_indices = self.req_pool_indices
+                future_map.publish(spec_info.future_indices, self.seq_lens)
+                future_map.stash(spec_info.future_indices, spec_info)
             self.spec_info = spec_info
         else:
-            # Non-spec: input_ids feeds the next decode forward directly.
+            # Non-spec: positive last token feeds decode directly. No FutureMap
+            # bootstrap needed (SB self-maintains seq_lens; resolve_future is
+            # a no-op on positive input_ids).
             self.input_ids = last_tokens_tensor
