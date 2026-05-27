@@ -175,12 +175,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         # FIXME: If the engine is dead, raise an error
         # This is required for the streaming case
 
-        # ``tool_choice="required"`` only has a defined behaviour when the
-        # request carries at least one tool the server can actually execute.
-        # Today that means ``function`` (the rest of the Responses spec is
-        # accepted at the schema level but only routed through harmony or an
-        # attached tool_server, which can't honour ``required``). Reject the
-        # request rather than silently degrading to ``tool_choice="none"``.
+        # ``tool_choice="required"`` only works with ``function`` tools;
+        # reject the request instead of silently degrading to ``"none"``.
         if request.tool_choice == "required" and not any(
             tool.type == "function" for tool in (request.tools or [])
         ):
@@ -441,13 +437,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         prev_response: Optional[ResponsesResponse],
         tokenizer: Any,
     ):
-        """Errors propagate to ``create_responses``, which converts the
-        expected set (``ValueError`` / ``TypeError`` / ``RuntimeError`` /
-        ``jinja2.TemplateError``) into proper error responses. A previous
-        fallback to ad-hoc ``"{role}: {content}\\n"`` concatenation silently
-        degraded multimodal / tool / template output and is intentionally
-        gone.
-        """
+        # Errors propagate to ``create_responses`` which renders them as
+        # FastAPI error responses; no ad-hoc string concatenation fallback.
         messages = self._construct_input_messages(request, prev_response)
 
         chat_tools = self._response_tools_to_chat_tools(request)
@@ -641,12 +632,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             output_items.append(reasoning_item)
 
-        # Extract function tool calls from the assistant text. Mirrors the
-        # FunctionCallParser + JSON-array fallback paths in
-        # OpenAIServingChat._process_tool_calls so /v1/responses surfaces
-        # native tool-call output as ResponseFunctionToolCall items instead
-        # of leaking the raw markup (or the required JSON array) back to the
-        # client as plain text.
+        # Mirror OpenAIServingChat._process_tool_calls: native parser when
+        # available, JSON-array fallback when ``tool_choice="required"`` is
+        # constrained to a json_schema instead of structural_tag.
         chat_tools = self._response_tools_to_chat_tools(request)
         is_required = request.tool_choice == "required"
         tool_call_items: list[ResponseFunctionToolCall] = []
@@ -658,10 +646,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             and request.tool_choice != "none"
         ):
             parser = FunctionCallParser(chat_tools, self.tool_call_parser)
-            # For required tool_choice the model is constrained either to
-            # structural_tag (native markup) or to json_schema (JSON array);
-            # only invoke the native parser when the detector actually
-            # supports structural_tag, mirroring chat completions.
             should_try_native = (
                 not is_required or parser.detector.supports_structural_tag()
             )
@@ -683,10 +667,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                 except Exception as e:
                     logger.error("Tool call parsing error: %s", e)
 
-        # JSON-array fallback for required tool_choice when no native parser
-        # consumed the markup. The model is grammar-constrained to a JSON
-        # array of ``{"name": ..., "parameters": ...}`` objects, so a plain
-        # ``orjson.loads`` reconstructs the calls.
         if content and chat_tools and is_required and not parsed_via_native:
             try:
                 tool_call_data = orjson.loads(content)
@@ -713,9 +693,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             except Exception as e:
                 logger.error("Required tool JSON parse error: %s", e)
 
-        # Preserve model output order: any prose around the tool call is
-        # emitted before the tool-call items so a "I'll check the weather"
-        # prefix doesn't appear after the function_call item it introduced.
+        # Prose-then-tool-call order matches the SSE stream's emit order.
         if content:
             output_text = ResponseOutputText(
                 text=content,
@@ -937,13 +915,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             prev_msg = self.msg_store[prev_response.id]
             messages.extend(prev_msg)
 
-            # Add the previous output. Only assistant `message` items with
-            # `output_text` parts are replayed as plain assistant text;
-            # reasoning items, tool calls, and other non-message outputs are
-            # intentionally dropped from the chat-format history (see
-            # _output_message_text). Multi-turn tool-calling via
-            # previous_response_id therefore loses prior tool calls — a
-            # known gap, tracked separately.
+            # Only assistant ``output_text`` items are replayed; reasoning
+            # and tool-call items are dropped from the chat-format history.
             for output_item in prev_response.output:
                 assistant_text = self._output_message_text(output_item)
                 if assistant_text is None:
@@ -1600,14 +1573,10 @@ class OpenAIServingResponses(OpenAIServingChat):
         request_metadata: RequestResponseMetadata,
         created_time: Optional[int] = None,
     ) -> AsyncGenerator[str, None]:
-        """Stream a /v1/responses response as typed SSE events for non-harmony
-        models (Qwen, Llama, …). Mirrors the event schema emitted by
-        ``responses_stream_generator`` so OpenAI SDK clients (e.g.
-        ``openai.AsyncClient.responses.stream``) and Codex CLI can parse the
-        stream — see the OpenAI Responses streaming reference. Each chunk from
-        the tokenizer manager is run through the configured reasoning parser
-        and function-call parser; segments that fall out of either parser are
-        emitted as ``response.output_text.delta``.
+        """Stream a /v1/responses response as typed OpenAI SSE events for
+        non-harmony models. Each engine chunk is run through the reasoning
+        and function-call parsers; leftover text becomes
+        ``response.output_text.delta``.
         """
 
         created_time = created_time or int(time.time())
@@ -1650,12 +1619,8 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         chat_tools = self._response_tools_to_chat_tools(request)
         is_required = request.tool_choice == "required"
-        # Tool-call parser selection mirrors chat streaming:
-        #   * native parser when configured AND it supports structural_tag
-        #     (or tool_choice="auto" — auto always uses the native parser);
-        #   * JsonArrayParser when tool_choice="required" but the constraint
-        #     falls back to a json_schema array (no native structural_tag,
-        #     or no native parser at all).
+        # Mirror chat streaming's parser selection: native when configured
+        # and structural_tag-capable, JsonArrayParser otherwise for required.
         tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
         if chat_tools and request.tool_choice != "none":
             native_supports_structural_tag = False
@@ -1676,9 +1641,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                 request=request,
             )
 
-        # Per-item streaming state. ``current_output_index`` advances each time
-        # a new output item (reasoning / function_call / message) opens; items
-        # are emitted in the order they appear in the model output.
         current_output_index = -1
         reasoning_state = {
             "open": False,
@@ -1693,17 +1655,12 @@ class OpenAIServingResponses(OpenAIServingChat):
             "text": "",
         }
         tool_call_states: dict[int, dict[str, Any]] = {}
-        # Ordered record of every output item that has been closed during the
-        # stream. The terminal ``response.completed`` event and the stored
-        # response build their ``output`` list from this so the snapshot
-        # mirrors the on-the-wire event order — including text → tool →
-        # text interleaving and repeated reasoning / message segments — and
-        # nothing is lost when an item closes and a new one with the same
-        # role reopens.
+        # Items closed during the stream, in wire order; feeds the terminal
+        # ``response.completed`` event and the stored response so the
+        # snapshot matches what clients saw and survives repeated
+        # reasoning / message segments closing and reopening.
         emitted_items: list = []
 
-        # Track engine accounting so the terminal ``response.completed`` event
-        # carries usage that matches the non-stream code path.
         prompt_tokens = 0
         completion_tokens = 0
         cached_tokens = 0
@@ -1856,10 +1813,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         try:
             async for ctx in result_generator:
-                # ``_generate_with_builtin_tools`` wraps each engine chunk in
-                # the conversation context; for non-harmony, that context is
-                # ``SimpleContext`` which stashes the last raw chunk on
-                # ``last_output``.
+                # SimpleContext stashes the raw engine chunk on ``last_output``.
                 if isinstance(ctx, dict):
                     chunk = ctx
                 else:
@@ -1893,8 +1847,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                     reasoning_chunk = None
 
                 if reasoning_chunk:
-                    # Reasoning content must be flushed before any subsequent
-                    # text/tool-call content opens its own output item.
                     if message_state["open"]:
                         for ev in _close_message_item():
                             yield ev
@@ -1930,8 +1882,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                     continue
 
                 if isinstance(tool_parser, JsonArrayParser):
-                    # JsonArrayParser doesn't share FunctionCallParser's wrapper
-                    # signature; call its detector directly.
                     sp = tool_parser.parse_streaming_increment(delta, chat_tools)
                     normal_text, tool_calls = sp.normal_text or "", sp.calls
                 elif tool_parser is not None:
@@ -1939,11 +1889,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else:
                     normal_text, tool_calls = delta, []
 
-                # Emit text BEFORE tool calls so a prose prefix ("I'll check
-                # the weather…") stays in front of the function_call it
-                # introduces — both within a single parse step and across
-                # text→tool→text transitions. Any open tool-call items are
-                # finalized when prose resumes so the function_call's
+                # Prose flushed before tool calls to preserve text→tool order;
+                # any open tool-call item is finalized first so its
                 # ``output_item.done`` lands before the next message opens.
                 if normal_text:
                     if reasoning_state["open"]:
@@ -1999,9 +1946,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if not tool_calls:
                     continue
 
-                # Close any in-progress reasoning or message item before
-                # opening the function_call items so the event order stays
-                # valid in OpenAI's typed-SSE schema.
                 if reasoning_state["open"]:
                     for ev in _close_reasoning_item():
                         yield ev
@@ -2080,8 +2024,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             return
 
-        # Drain anything still open in stream order so emitted_items captures
-        # the trailing item and the SSE stream gets its closing events.
+        # Drain trailing open items so emitted_items captures them.
         for ev in _close_reasoning_item():
             yield ev
         for ev in _close_message_item():

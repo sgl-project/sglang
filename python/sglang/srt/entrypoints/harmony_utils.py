@@ -105,12 +105,8 @@ def get_developer_message(
             elif tool.type == "function":
                 function_tools.append(tool)
             else:
-                # ``ResponseTool.type`` accepts the full Responses spec
-                # (namespace / mcp / file_search / image_generation / …) so
-                # clients like Codex CLI can advertise them, but harmony only
-                # has prompt templates for the three built-ins above plus
-                # ``function``. Drop the rest silently — the request still
-                # runs, the tool just isn't surfaced to the model.
+                # No harmony prompt template for the remaining built-ins;
+                # drop them so the request still runs.
                 logger.debug(
                     "harmony: ignoring unsupported response tool type %r",
                     tool.type,

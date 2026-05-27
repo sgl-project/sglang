@@ -1233,11 +1233,10 @@ class ResponseReasoningParam(BaseModel):
     )
 
 
-# Built-in Responses API tool types accepted at the schema level. Only
-# ``function`` and the harmony-served ``web_search_preview`` / ``code_interpreter``
-# pair actually have execution paths today; the rest are accepted so clients
-# like Codex CLI (which advertises ``namespace_tools``) aren't rejected during
-# FastAPI validation, and surface as a clearer downstream error if invoked.
+# Schema-accepted Responses tool types. Only ``function``,
+# ``web_search`` / ``web_search_preview`` and ``code_interpreter`` are
+# wired to execution paths; the rest pass validation so clients that
+# advertise them aren't rejected.
 RESPONSE_TOOL_TYPES = Literal[
     "function",
     "web_search",
@@ -1261,8 +1260,7 @@ class ResponseTool(BaseModel):
     description: Optional[str] = None
     parameters: Optional[Dict[str, Any]] = None
     strict: bool = False
-    # ``namespace`` tools (Codex CLI ``namespace_tools``) wrap a list of inner
-    # tool schemas; keep the field permissive so we accept the payload.
+    # Inner schemas for ``namespace`` tools.
     tools: Optional[List[Dict[str, Any]]] = None
 
     @model_validator(mode="after")
@@ -1409,13 +1407,9 @@ class ResponsesRequest(BaseModel):
         else:
             max_tokens = default_max_tokens
 
-        # Reserve 2 tokens of headroom against context_len. The caller in
-        # serving_responses subtracts `num_reserved_tokens` (e.g. EAGLE spec
-        # slots) from `default_max_tokens` already, but the engine appends
-        # one or two special tokens (e.g. BOS/EOS, an extra GPT-OSS marker)
-        # on top of the rendered prompt + budget, so a tight max_tokens that
-        # exactly fills context_len can still trip the length check. The
-        # value was bumped from 1 to 2 to accommodate the GPT-OSS path.
+        # Headroom for the BOS/EOS / harmony marker the engine appends on top
+        # of the rendered prompt + budget; without it a tight max_tokens that
+        # exactly fills context_len trips the length check.
         max_tokens -= 2
 
         # Get parameters with defaults
