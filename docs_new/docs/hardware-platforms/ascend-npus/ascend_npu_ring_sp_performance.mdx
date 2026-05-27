@@ -1,0 +1,110 @@
+---
+title: "Ascend NPU Ring-SP Performance (Wan2.1-T2V-1.3B)"
+metatags:
+    description: "This page reports Ring-SP performance on Ascend NPU with torchnpu==2.10.0."
+---
+
+This page reports Ring-SP performance on Ascend NPU with `torch_npu==2.10.0`.
+
+- Baseline config: `ulysses=1, ring=1` (short: `u1r1`)
+- Ring-SP config: `ulysses=1, ring=2` (short: `u1r2`)
+
+## Benchmark Setup
+
+- Model: `Wan2.1-T2V-1.3B-Diffusers`
+- Prompt: `"a cat is playing piano"`
+- Framework command: `sglang generate`
+- Runtime: `torch_npu==2.10.0`
+
+## Generate Commands
+
+### Baseline (`u1r1`)
+
+```bash
+sglang generate --model-path /nas/disk1/Wan2.1-T2V-1.3B-Diffusers \
+    --prompt "a cat is playing piano" --num-gpus 1 --ring-degree 1 \
+    --save-output
+```
+
+### Ring-SP (`u1r2`)
+
+```bash
+sglang generate --model-path /nas/disk1/Wan2.1-T2V-1.3B-Diffusers \
+    --prompt "a cat is playing piano" --num-gpus 2 --ring-degree 2 \
+    --save-output
+```
+
+## Benchmarks
+
+Benchmark Disclaimer
+
+These numbers are from one fixed setup and one prompt case. Actual performance may vary by model settings, environment, and workload.
+
+### Stage Time Breakdown
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Stage / Metric</th>
+      <th><code>u1r2</code> (s)</th>
+      <th><code>u1r1</code> baseline (s)</th>
+      <th>Speedup</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>InputValidation</td>
+      <td>0.0003</td>
+      <td>0.0002</td>
+      <td>0.67x</td>
+    </tr>
+    <tr>
+      <td>TextEncoding</td>
+      <td>3.5936</td>
+      <td>3.5820</td>
+      <td>1.00x</td>
+    </tr>
+    <tr>
+      <td>LatentPreparation</td>
+      <td>0.0007</td>
+      <td>0.0055</td>
+      <td>7.86x</td>
+    </tr>
+    <tr>
+      <td>TimestepPreparation</td>
+      <td>0.0008</td>
+      <td>0.0007</td>
+      <td>0.88x</td>
+    </tr>
+    <tr>
+      <td>Denoising</td>
+      <td>121.2788</td>
+      <td>239.2580</td>
+      <td>1.97x</td>
+    </tr>
+    <tr>
+      <td>Decoding</td>
+      <td>13.8685</td>
+      <td>16.4969</td>
+      <td>1.19x</td>
+    </tr>
+    <tr>
+      <td><strong>Total (Pixel data generated)</strong></td>
+      <td><strong>141.86</strong></td>
+      <td><strong>266.50</strong></td>
+      <td><strong>1.88x</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+## Summary
+
+- With `torch_npu==2.10.0`, Ring-SP (`u1r2`) runs successfully on NPU for this case.
+- End-to-end generation time improves from `266.50s` to `141.86s` (`1.88x`).
+- The main gain comes from `DenoisingStage` (`1.97x`), while decoding also improves (`1.19x`).

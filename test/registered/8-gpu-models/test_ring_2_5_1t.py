@@ -5,8 +5,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-# register_cuda_ci(est_time=1000, suite="nightly-8-gpu-common", nightly=True)
-register_cuda_ci(est_time=1000, suite="stage-c-test-8-gpu-h200")
+register_cuda_ci(est_time=510, suite="nightly-8-gpu-common", nightly=True)
 
 RING_2_5_1T_MODEL_PATH = "inclusionAI/Ring-2.5-1T"
 
@@ -24,6 +23,8 @@ class TestRing2_5_1T(unittest.TestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
             "--watchdog-timeout",
+            "1800",
+            "--soft-watchdog-timeout",
             "1800",
         ]
 

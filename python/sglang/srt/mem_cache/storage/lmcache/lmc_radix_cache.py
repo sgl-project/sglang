@@ -194,7 +194,7 @@ class LMCRadixCache(RadixCache):
             new_node.key = key[start:end]
             new_node.value = token_slots[:fetched]
             new_node.parent = last_node
-            last_node.children[self.get_child_key_fn(new_node.key)] = new_node
+            last_node.children[new_node.key.child_key(self.page_size)] = new_node
             last_node = new_node
 
             value = torch.cat([value, token_slots[:fetched]])
@@ -207,6 +207,7 @@ class LMCRadixCache(RadixCache):
                 device_indices=value,
                 last_device_node=last_node,
                 last_host_node=last_node,
+                best_match_node=last_node,
             )
 
         return base_res

@@ -69,6 +69,8 @@ DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 # VL test models
 DEFAULT_MODEL_NAME_FOR_TEST_VL_PP = "Qwen/Qwen3-VL-2B-Thinking"
 DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP = "zai-org/GLM-4.1V-9B-Thinking"
+DEFAULT_MODEL_NAME_FOR_TEST_GEMMA4_PP = "google/gemma-4-26B-A4B-it"
+DEFAULT_MODEL_NAME_FOR_TEST_GEMMA4_PLE_PP = "google/gemma-4-E4B-it"
 
 # NVFP4 models
 DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST = "nvidia/DeepSeek-V3-0324-FP4"
@@ -106,6 +108,10 @@ DEFAULT_DRAFT_MODEL_EAGLE = "lmsys/sglang-EAGLE-llama2-chat-7B"
 # EAGLE3 model
 DEFAULT_TARGET_MODEL_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_DRAFT_MODEL_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
+
+# DFLASH model
+DEFAULT_TARGET_MODEL_DFLASH = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_DRAFT_MODEL_DFLASH = "z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat"
 
 # EAGLE2 with DP-Attention models
 DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN = "Qwen/Qwen3-30B-A3B"
@@ -568,6 +574,41 @@ def popen_with_error_check(command: list[str]):
     return process
 
 
+def start_subprocess_fail_fast_watcher(
+    named_procs: list[tuple[str, subprocess.Popen]],
+) -> threading.Event:
+    """Abort the test runner the moment any watched subprocess exits non-zero.
+
+    Caller must `.set()` the returned Event before intentional teardown."""
+    stop = threading.Event()
+
+    def watcher():
+        while not stop.is_set():
+            for name, proc in named_procs:
+                rc = proc.poll() if proc else None
+                if rc is None or rc == 0:
+                    continue
+                if stop.is_set():
+                    return
+                sys.stderr.write(
+                    f"[FIXTURE FAIL-FAST] {name} (pid={proc.pid}) exited "
+                    f"rc={rc}; aborting.\n"
+                )
+                sys.stderr.flush()
+                for _, sib in named_procs:
+                    if sib and sib is not proc:
+                        try:
+                            kill_process_tree(sib.pid, wait_timeout=10)
+                        except Exception:
+                            pass
+                # POSIX: signal N -> 128+N (os._exit masks negatives via & 0xff).
+                os._exit(rc if rc >= 0 else 128 + (-rc))
+            time.sleep(0.1)
+
+    threading.Thread(target=watcher, daemon=True, name="SubprocFailFastWatcher").start()
+    return stop
+
+
 def _try_enable_offline_mode_if_cache_complete(
     model_name_or_path: str, env: dict, other_args: Optional[list[str]] = None
 ) -> Optional[str]:
@@ -1012,6 +1053,12 @@ def popen_launch_pd_server(
 
     print(f"command={' '.join(command)}")
 
+    # Merge with os.environ so caller-supplied env adds to (not replaces)
+    # PATH / PYTHONPATH / HF_HOME / etc. When env is None, Popen inherits
+    # parent's environment automatically.
+    if env is not None:
+        env = {**os.environ, **env}
+
     process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
     return process
@@ -1125,12 +1172,26 @@ def run_bench_serving(
         other_args=other_server_args,
     )
 
+    # Resolve tokenizer to local snapshot path when available, so the benchmark
+    # client's AutoTokenizer.from_pretrained uses the local path directly instead
+    # of calling the HF Hub API (which can stall for minutes in CI).
+    bench_tokenizer = tokenizer
+    if bench_tokenizer is None:
+        try:
+            from sglang.srt.utils import find_local_repo_dir
+
+            local_dir = find_local_repo_dir(model, revision=None)
+            if local_dir and os.path.isdir(local_dir):
+                bench_tokenizer = local_dir
+        except Exception:
+            pass
+
     # Run benchmark
     args = get_benchmark_args(
         base_url=base_url,
         dataset_name=dataset_name,
         dataset_path=dataset_path,
-        tokenizer=tokenizer,
+        tokenizer=bench_tokenizer,
         num_prompts=num_prompts,
         random_input_len=random_input_len,
         random_output_len=random_output_len,

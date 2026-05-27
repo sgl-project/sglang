@@ -14,11 +14,6 @@ on:
         description: 'Specific commit SHA to build (leave empty for latest)'
         required: false
         type: string
-      cuda_version:
-        description: 'CUDA version (e.g., 129 or 130)'
-        required: false
-        default: '129'
-        type: string
 
 concurrency:
   group: release-pypi-nightly-${{ github.ref }}
@@ -47,6 +42,11 @@ jobs:
       - name: Install build dependencies
         run: |
           pip install build wheel setuptools setuptools-scm
+
+      # Needed by setuptools-rust to build the bundled native gRPC extension
+      # (rust/sglang-grpc) when `python -m build` builds the sglang wheel.
+      - name: Install protoc
+        run: sudo bash scripts/ci/utils/install_protoc.sh
 
       - name: Build wheel
         id: build
@@ -107,6 +107,15 @@ jobs:
     needs: build-nightly-wheel
     runs-on: ubuntu-latest
     environment: 'prod'
+    strategy:
+      fail-fast: false
+      # The wheel is CUDA-agnostic and built once — we just register the same
+      # artifact under cu129/sglang/ and cu130/sglang/ wheel indexes so users
+      # can install via either --extra-index-url. Serialize because both matrix
+      # runs clone and push to the same sgl-whl branch.
+      max-parallel: 1
+      matrix:
+        cuda_version: ['129', '130']
     steps:
       - uses: actions/checkout@v4
 
@@ -155,12 +164,12 @@ jobs:
           python3 scripts/update_nightly_whl_index.py \
             --commit-hash ${{ needs.build-nightly-wheel.outputs.commit_hash }} \
             --nightly-version ${{ needs.build-nightly-wheel.outputs.nightly_version }} \
-            --cuda-version ${{ inputs.cuda_version || '129' }} \
+            --cuda-version ${{ matrix.cuda_version }} \
             --build-date ${{ needs.build-nightly-wheel.outputs.build_date }}
 
       - name: Push wheel index
         run: |
           cd sgl-whl
           git add -A
-          git diff --staged --quiet || git commit -m "Update nightly wheel index for commit ${{ needs.build-nightly-wheel.outputs.commit_hash }}"
+          git diff --staged --quiet || git commit -m "Update cu${{ matrix.cuda_version }} nightly wheel index for commit ${{ needs.build-nightly-wheel.outputs.commit_hash }}"
           git push
