@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import mlx.core as mx
+
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)

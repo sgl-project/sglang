@@ -18,12 +18,12 @@ import logging
 import time
 from dataclasses import dataclass
 
+import mlx.core as mx
 import psutil
+from mlx.utils import tree_flatten
 from mlx_lm import load as mlx_lm_load
 from mlx_lm.utils import quantize_model as mlx_lm_quantize_model
 
-import mlx.core as mx
-from mlx.utils import tree_flatten
 from sglang.srt.hardware_backend.mlx.aot import (
     MLX_AOT_KERNEL_REGISTRY,
     MlxAOTKernelSet,

@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+
 from sglang.srt.hardware_backend.mlx.aot import (
     MlxAOTKernelContext,
     MlxAOTKernelSet,
