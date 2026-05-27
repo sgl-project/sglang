@@ -5384,5 +5384,271 @@ class TestAC3RangeMask(unittest.TestCase):
         self.assertGreater(len(row1_phys), 0, "req-1 produced no valid physical picks")
 
 
+class TestAC2LiveWiring(unittest.TestCase):
+    """AC-2: verify the production invalidation hook in _select_topk_indices.
+
+    The tests here exercise the _run() closure wiring in deepseek_v2.py
+    (lines 2087-2093) rather than calling invalidate_token_label_slots
+    directly.  Deleting those lines must cause test_production_hook_*
+    to fail.
+    """
+
+    def _make_attn_real(self):
+        from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+        attn = object.__new__(DeepseekV2AttentionMLA)
+        attn.use_double_sparsity = True
+        attn.double_sparsity_selector = DoubleSparsitySelector(
+            config=parse_double_sparsity_config(_valid_payload()),
+            num_local_heads=16,
+            head_dim=128,
+            device=torch.device("cpu"),
+        )
+        attn.double_sparsity_selector.IS_PLACEHOLDER = False
+        attn.indexer = MagicMock()
+        return attn
+
+    def test_production_hook_invalidates_before_retrieve_topk(self):
+        """The _run() closure must clear written[layer_id, cache_loc] before
+        calling retrieve_topk.  This test FAILS if lines 2087-2093 of
+        deepseek_v2.py are removed.
+        """
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+
+        attn = self._make_attn_real()
+
+        table = allocate_token_label_table(
+            num_layers_local=1,
+            max_tokens=32,
+            num_heads_local=16,
+            label_dim=16,
+            page_size=16,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        table.written[0, 7] = True  # stale slot — must be cleared before selection
+        attn.double_sparsity_selector.token_label_table = table
+
+        # Spy: record whether written[0, 7] is still True when retrieve_topk fires.
+        written_state_at_call: list = []
+        max_top_k = attn.double_sparsity_selector.max_top_k
+        sel = torch.full((1, max_top_k), -1, dtype=torch.int32)
+        sel[0, 0] = 0
+        vl = torch.tensor([1], dtype=torch.int32)
+
+        def spy_retrieve_topk(**kwargs):
+            written_state_at_call.append(bool(table.written[0, 7].item()))
+            return sel, vl
+
+        attn.double_sparsity_selector.retrieve_topk = MagicMock(
+            side_effect=spy_retrieve_topk
+        )
+
+        req_to_token = (
+            torch.arange(256, dtype=torch.int32).unsqueeze(0).expand(1, -1).contiguous()
+        )
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=torch.tensor([128], dtype=torch.int32),
+            sparse_mask=None,
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            out_cache_loc=torch.tensor([7], dtype=torch.int64),
+            attn_backend=None,
+        )
+
+        attn._select_topk_indices(
+            x=torch.zeros(1, 16, 128),
+            q_lora=torch.zeros(1, 16, 128),
+            positions=torch.zeros(1, dtype=torch.int32),
+            forward_batch=forward_batch,
+            layer_id=0,
+        )
+
+        self.assertEqual(
+            len(written_state_at_call), 1,
+            "retrieve_topk spy was never called — hook did not fire"
+        )
+        self.assertFalse(
+            written_state_at_call[0],
+            "written[0, 7] was True when retrieve_topk was called — "
+            "invalidation hook did NOT fire before selection "
+            "(check lines 2087-2093 of deepseek_v2.py)"
+        )
+
+    def test_after_hook_written_is_restored_by_label_write(self):
+        """After invalidation, a subsequent token_label_write restores written=True."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            invalidate_token_label_slots,
+            token_label_write,
+        )
+
+        table = allocate_token_label_table(
+            num_layers_local=1,
+            max_tokens=32,
+            num_heads_local=16,
+            label_dim=16,
+            page_size=16,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        table.written[0, 7] = True
+        cache_loc = torch.tensor([7], dtype=torch.int64)
+
+        # Invalidate (simulates the _run() pre-selection step)
+        invalidate_token_label_slots(table.written, 0, cache_loc)
+        self.assertFalse(table.written[0, 7].item(), "invalidation must set written=False")
+
+        # Write new label (simulates dsa_backend._write_token_labels)
+        channel_sel = torch.zeros(16, 16, dtype=torch.int32)
+        k_nope = torch.ones(1, 16, 16)
+        token_label_write(
+            table.signatures, table.written,
+            layer_id=0, cache_loc=cache_loc, k_nope=k_nope,
+            channel_selection_layer=channel_sel,
+        )
+        self.assertTrue(table.written[0, 7].item(), "label write must restore written=True")
+
+
+class TestAC7MHABypass(unittest.TestCase):
+    """AC-7: short-seq MHA bypass in _select_topk_indices.
+
+    When the DSA backend is in dense MHA mode (use_mha=True), DS selection
+    must be skipped (returns None) so that stale or unwritten labels are not
+    scored.  The label write path is independent and unaffected.
+    """
+
+    def _make_attn_real(self):
+        from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+        attn = object.__new__(DeepseekV2AttentionMLA)
+        attn.use_double_sparsity = True
+        attn.double_sparsity_selector = DoubleSparsitySelector(
+            config=parse_double_sparsity_config(_valid_payload()),
+            num_local_heads=16,
+            head_dim=128,
+            device=torch.device("cpu"),
+        )
+        attn.double_sparsity_selector.IS_PLACEHOLDER = False
+        attn.indexer = MagicMock()
+        return attn
+
+    def test_mha_bypass_returns_none_and_skips_retrieve_topk(self):
+        """use_mha=True → _select_topk_indices returns None, retrieve_topk not called."""
+        attn = self._make_attn_real()
+        attn.double_sparsity_selector.retrieve_topk = MagicMock()
+
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=torch.tensor([64], dtype=torch.int32),
+            sparse_mask=None,
+            req_to_token_pool=None,
+            out_cache_loc=None,
+            attn_backend=SimpleNamespace(use_mha=True),
+        )
+
+        result = attn._select_topk_indices(
+            x=torch.zeros(1, 16, 128),
+            q_lora=torch.zeros(1, 16, 128),
+            positions=torch.zeros(1, dtype=torch.int32),
+            forward_batch=forward_batch,
+            layer_id=0,
+        )
+
+        self.assertIsNone(result, "MHA bypass must return None (no indices)")
+        attn.double_sparsity_selector.retrieve_topk.assert_not_called()
+
+    def test_no_bypass_when_use_mha_false(self):
+        """use_mha=False → _select_topk_indices calls retrieve_topk normally."""
+        attn = self._make_attn_real()
+        max_top_k = attn.double_sparsity_selector.max_top_k
+        sel = torch.full((1, max_top_k), -1, dtype=torch.int32)
+        sel[0, 0] = 0
+        vl = torch.tensor([1], dtype=torch.int32)
+        attn.double_sparsity_selector.retrieve_topk = MagicMock(return_value=(sel, vl))
+
+        req_to_token = (
+            torch.arange(256, dtype=torch.int32).unsqueeze(0).expand(1, -1).contiguous()
+        )
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=torch.tensor([128], dtype=torch.int32),
+            sparse_mask=None,
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            out_cache_loc=None,
+            attn_backend=SimpleNamespace(use_mha=False),
+        )
+
+        result = attn._select_topk_indices(
+            x=torch.zeros(1, 16, 128),
+            q_lora=torch.zeros(1, 16, 128),
+            positions=torch.zeros(1, dtype=torch.int32),
+            forward_batch=forward_batch,
+            layer_id=0,
+        )
+
+        attn.double_sparsity_selector.retrieve_topk.assert_called_once()
+        self.assertIsNotNone(result, "Non-MHA DS path must return topk indices tensor")
+
+    def test_bypass_when_no_attn_backend(self):
+        """attn_backend=None → use_mha defaults False → retrieve_topk IS called."""
+        attn = self._make_attn_real()
+        max_top_k = attn.double_sparsity_selector.max_top_k
+        sel = torch.full((1, max_top_k), -1, dtype=torch.int32)
+        sel[0, 0] = 0
+        vl = torch.tensor([1], dtype=torch.int32)
+        attn.double_sparsity_selector.retrieve_topk = MagicMock(return_value=(sel, vl))
+
+        req_to_token = (
+            torch.arange(256, dtype=torch.int32).unsqueeze(0).expand(1, -1).contiguous()
+        )
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=torch.tensor([128], dtype=torch.int32),
+            sparse_mask=None,
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            out_cache_loc=None,
+            attn_backend=None,  # no backend attached
+        )
+
+        result = attn._select_topk_indices(
+            x=torch.zeros(1, 16, 128),
+            q_lora=torch.zeros(1, 16, 128),
+            positions=torch.zeros(1, dtype=torch.int32),
+            forward_batch=forward_batch,
+            layer_id=0,
+        )
+
+        attn.double_sparsity_selector.retrieve_topk.assert_called_once()
+        self.assertIsNotNone(result)
+
+    def test_mha_bypass_does_not_affect_nsa_path(self):
+        """use_double_sparsity=False: MHA flag on backend is irrelevant — NSA indexer called."""
+        from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+        attn = object.__new__(DeepseekV2AttentionMLA)
+        attn.use_double_sparsity = False
+        attn.indexer = MagicMock(return_value=torch.tensor([0, 1], dtype=torch.int32))
+
+        forward_batch = SimpleNamespace(
+            attn_backend=SimpleNamespace(use_mha=True),
+        )
+
+        result = attn._select_topk_indices(
+            x=torch.zeros(1, 16, 128),
+            q_lora=torch.zeros(1, 16, 128),
+            positions=torch.zeros(1, dtype=torch.int32),
+            forward_batch=forward_batch,
+            layer_id=0,
+        )
+
+        attn.indexer.assert_called_once()
+        self.assertTrue(torch.equal(result, torch.tensor([0, 1], dtype=torch.int32)))
+
+
 if __name__ == "__main__":
     unittest.main()

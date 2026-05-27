@@ -2068,6 +2068,16 @@ class DeepseekV2AttentionMLA(
                 assert_real_selector_or_placeholder_allowed,
             )
 
+            # AC-7: skip sparse selection during short-seq MHA-mode prefill.
+            # When the DSA backend dispatches to dense MHA (use_mha=True), the
+            # KV slots for this step are not yet written to the label table at
+            # selection time. The label write in dsa_backend._write_token_labels
+            # fires unconditionally (before the use_mha branch); only scoring
+            # is skipped here so decode steps can call retrieve_topk normally.
+            _attn_backend = getattr(forward_batch, "attn_backend", None)
+            if getattr(_attn_backend, "use_mha", False):
+                return None
+
             req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
             req_to_token = (
                 req_to_token_pool.req_to_token
