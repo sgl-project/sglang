@@ -258,6 +258,11 @@ class DeepseekV2MLP(nn.Module):
                 "Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self.use_fused_clamp_act_mul = (
+            _is_hip and envs.SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL.get()
+        )
+        self._fused_clamp_fp8_checked = False
+        self._fused_clamp_use_fp8 = False
 
     def forward(
         self,
@@ -319,8 +324,41 @@ class DeepseekV2MLP(nn.Module):
                 down_output,
             )
             return down_output
+
+        if self.use_fused_clamp_act_mul and self.swiglu_limit is not None:
+            from aiter.ops.triton.fusions.fused_clamp_act_mul import (
+                fused_clamp_act_mul,
+            )
+
+            if not self._fused_clamp_fp8_checked:
+                from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+                qm = getattr(self.down_proj, "quant_method", None)
+                self._fused_clamp_use_fp8 = (
+                    isinstance(qm, Fp8LinearMethod) and qm.block_quant
+                )
+                self._fused_clamp_fp8_checked = True
+
+            if self._fused_clamp_use_fp8:
+                from aiter import dtypes
+
+                x_fp8, x_scale = fused_clamp_act_mul(
+                    gate_up,
+                    swiglu_limit=self.swiglu_limit,
+                    activation="silu",
+                    dtype_quant=dtypes.fp8,
+                    transpose_scale=False,
+                )
+                x = (x_fp8, x_scale)
+            else:
+                x = fused_clamp_act_mul(
+                    gate_up,
+                    swiglu_limit=self.swiglu_limit,
+                    activation="silu",
+                )
+
         # Fallback: fused silu+clamp kernel (still faster than unfused)
-        if self.swiglu_limit is not None:
+        elif self.swiglu_limit is not None:
             M, N = gate_up.shape
             x = gate_up.new_empty((M, N // 2))
             silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
@@ -802,8 +840,11 @@ class DeepseekV2MoE(nn.Module):
                 **topk_kwargs,
             )
             final_hidden_states = self.experts(hidden_states, topk_output)
-            if not (_is_cuda or _is_musa) or isinstance(
-                self.experts.quant_method, KTEPWrapperMethod
+            if (
+                not _is_cuda
+                and not _is_musa
+                and not _use_aiter
+                or isinstance(self.experts.quant_method, KTEPWrapperMethod)
             ):
                 final_hidden_states *= self.routed_scaling_factor
 
@@ -2568,7 +2609,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
-                    extend_lens=forward_batch.extend_seq_lens_cpu,
+                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
         elif self.mla_enable_prefill_cp:
             if can_cp_split(len_input_ids, self.cp_size, forward_batch):
@@ -2577,7 +2618,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
-                    extend_lens=forward_batch.extend_seq_lens_cpu,
+                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
