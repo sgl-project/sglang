@@ -575,6 +575,32 @@ class TestSharedHiCache(unittest.TestCase):
             "wrong_target_tp_rank:plan=0:local=1",
         )
 
+    def test_manager_accepts_rank_generic_same_shape_tp_plan(self):
+        manager = _make_manager()
+        manager._set_parallel_metadata(
+            {
+                "tp_rank": 1,
+                "tp_size": 2,
+                "pp_rank": 0,
+                "pp_size": 1,
+                "attn_cp_rank": 0,
+                "attn_cp_size": 1,
+                "attn_tp_rank": 1,
+                "attn_tp_size": 2,
+                "attn_dp_rank": 0,
+                "attn_dp_size": 1,
+            }
+        )
+        plan = SharedHiCachePlan.from_dict(
+            _make_plan([11], source_tp_size=2, target_tp_size=2)
+        )
+
+        self.assertIsNone(manager._validate_plan(plan))
+        self.assertEqual(
+            manager._candidate_endpoints_for_plan(plan),
+            ["tcp://127.0.0.1:39007"],
+        )
+
     def test_source_transfer_immediate_completion_does_not_leave_future(self):
         class ImmediateExecutor:
             def submit(self, fn, **kwargs):
@@ -747,6 +773,47 @@ class TestSharedHiCache(unittest.TestCase):
 
         self.assertFalse(response["ok"])
         self.assertIn("wrong_source_tp_rank_for_target", response["reason"])
+
+    def test_source_transfer_accepts_rank_generic_same_shape_tp_plan(self):
+        plan = SharedHiCachePlan.from_dict(
+            _make_plan([11], source_tp_size=2, target_tp_size=2)
+        )
+        request, error = parse_source_transfer_request(
+            payload={
+                "transfer_id": "transfer-1",
+                "target_control_endpoint": "tcp://127.0.0.1:49999",
+                "plan": plan.to_dict(),
+                "start_block": 0,
+                "max_blocks": 1,
+                "target_session_id": "target-session",
+                "transfer_backend": "nixl",
+                "target_metadata": {
+                    "backend": "nixl",
+                    "session_id": "target-session",
+                    "tp_rank": 1,
+                    "tp_size": 2,
+                },
+                "target_kv_ptrs": [1],
+                "target_kv_item_lens": [64],
+                "target_page_indices": [0],
+            },
+            transfer_backend=FakeDirectTransfer(),
+            tree_cache=FakeTree(),
+        )
+        self.assertIsNone(error)
+
+        response = execute_source_transfer_request(
+            request=request,
+            transfer_backend=FakeDirectTransfer(),
+            tree_cache=FakeTree(),
+            worker_id=7,
+            tp_rank=1,
+            tp_size=2,
+            attn_tp_size=2,
+        )
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["reason"], "hicache_host_lookup_unavailable")
 
     def test_nixl_backend_registers_source_and_transfers_pages(self):
         page_size = 2

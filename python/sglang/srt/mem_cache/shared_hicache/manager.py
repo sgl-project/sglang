@@ -664,18 +664,15 @@ class SharedHiCacheManager:
                 "incompatible_source_tp_size:"
                 f"source={plan.source_tp_size}:target={self.tp_size}"
             )
-        target_tp_rank = plan.target_tp_rank
-        if target_tp_rank is None:
-            if self.tp_size > 1:
-                return "missing_target_tp_rank"
-            target_tp_rank = 0
+        target_tp_rank = (
+            int(plan.target_tp_rank)
+            if plan.target_tp_rank is not None
+            else int(self.tp_rank)
+        )
         if int(target_tp_rank) != self.tp_rank:
             return "wrong_target_tp_rank:" f"plan={target_tp_rank}:local={self.tp_rank}"
         source_tp_rank = plan.source_tp_rank
-        if source_tp_rank is None:
-            if self.tp_size > 1:
-                return "missing_source_tp_rank"
-        elif int(source_tp_rank) != self.tp_rank:
+        if source_tp_rank is not None and int(source_tp_rank) != self.tp_rank:
             return "wrong_source_tp_rank:" f"plan={source_tp_rank}:local={self.tp_rank}"
         return None
 

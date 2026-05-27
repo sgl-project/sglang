@@ -308,11 +308,11 @@ def _source_rank_rejection(
         return (
             "wrong_source_tp_size:" f"plan={plan.source_tp_size}:local={local_tp_size}"
         )
-    source_tp_rank = plan.source_tp_rank
-    if source_tp_rank is None:
-        if local_tp_size > 1:
-            return "missing_source_tp_rank"
-        source_tp_rank = 0
+    source_tp_rank = (
+        int(plan.source_tp_rank)
+        if plan.source_tp_rank is not None
+        else local_tp_rank
+    )
     if int(source_tp_rank) != local_tp_rank:
         return "wrong_source_tp_rank:" f"plan={source_tp_rank}:local={local_tp_rank}"
     if target_tp_size is None:
@@ -331,11 +331,11 @@ def _source_rank_rejection(
             "wrong_target_tp_size:"
             f"plan={plan.target_tp_size}:target={target_tp_size}"
         )
-    plan_target_tp_rank = plan.target_tp_rank
-    if plan_target_tp_rank is None:
-        if target_tp_size > 1:
-            return "missing_plan_target_tp_rank"
-        plan_target_tp_rank = 0
+    plan_target_tp_rank = (
+        int(plan.target_tp_rank)
+        if plan.target_tp_rank is not None
+        else target_tp_rank
+    )
     if int(plan_target_tp_rank) != target_tp_rank:
         return (
             "wrong_target_tp_rank:"
