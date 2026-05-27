@@ -1143,6 +1143,9 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
+    # Number of indexer layers, set when indexer_topk is non-empty
+    indexer_topk_num_layers: Optional[int] = None
+
 
 @dataclass
 class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
@@ -1208,6 +1211,9 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
+
+    # Number of indexer layers, set when indexer_topk is non-empty
+    indexer_topk_num_layers: Optional[int] = None
 
 
 @dataclass
