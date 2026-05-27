@@ -90,6 +90,7 @@ class MooncakeStoreConfig:
     local_hostname: str
     metadata_server: str
     global_segment_size: int
+    local_buffer_size: int
     protocol: str
     device_name: str
     master_server_address: str
@@ -133,6 +134,9 @@ class MooncakeStoreConfig:
                 config.get(
                     "global_segment_size", envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.default
                 )
+            ),
+            local_buffer_size=_parse_global_segment_size(
+                config.get("local_buffer_size", envs.MOONCAKE_LOCAL_BUFFER_SIZE.default)
             ),
             protocol=config.get("protocol", envs.MOONCAKE_PROTOCOL.default),
             device_name=config.get("device_name", envs.MOONCAKE_DEVICE.default),
@@ -187,6 +191,9 @@ class MooncakeStoreConfig:
             global_segment_size=_parse_global_segment_size(
                 envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.get()
             ),
+            local_buffer_size=_parse_global_segment_size(
+                envs.MOONCAKE_LOCAL_BUFFER_SIZE.get()
+            ),
             protocol=envs.MOONCAKE_PROTOCOL.get(),
             device_name=envs.MOONCAKE_DEVICE.get(),
             master_server_address=envs.MOONCAKE_MASTER.get(),
@@ -219,6 +226,11 @@ class MooncakeStoreConfig:
             global_segment_size=_parse_global_segment_size(
                 extra_config.get(
                     "global_segment_size", envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.default
+                )
+            ),
+            local_buffer_size=_parse_global_segment_size(
+                extra_config.get(
+                    "local_buffer_size", envs.MOONCAKE_LOCAL_BUFFER_SIZE.default
                 )
             ),
             protocol=extra_config.get("protocol", envs.MOONCAKE_PROTOCOL.default),
@@ -405,7 +417,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 required_bytes = self._standalone_required_bytes(mem_pool)
                 ret_code = self.store.setup_dummy(
                     required_bytes,
-                    DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                    self.config.local_buffer_size,
                     self.config.client_server_address,
                 )
             else:
@@ -453,7 +465,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                             client_hostname,
                             self.config.metadata_server,
                             per_tp_global_segment_size,
-                            DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                            self.config.local_buffer_size,
                             self.config.protocol,
                             device_name,
                             self.config.master_server_address,
