@@ -38,6 +38,10 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
     model_forward_maybe_tbo,
 )
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context as get_pcg_forward_context,
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
     get_dsa_index_head_dim,
@@ -103,7 +107,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     CombineInput,
     DispatchOutput,
 )
-from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -206,6 +210,76 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
+
+_enable_pcg_dsv2_dual_stream = (
+    _is_cuda and envs.SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM.get()
+)
+
+
+if _is_cuda:
+
+    @register_custom_op(out_shape="hidden_states")
+    def dsv2_flashinfer_moe_dual_stream_pcg(
+        hidden_states: torch.Tensor,
+        layer_id: int,
+        should_allreduce_fusion: bool,
+        use_reduce_scatter: bool,
+    ) -> torch.Tensor:
+        forward_context = get_pcg_forward_context()
+        assert forward_context is not None
+        assert forward_context.moe_fusions is not None
+
+        moe_fusion = forward_context.moe_fusions[layer_id]
+        assert moe_fusion is not None
+        assert moe_fusion.alt_stream is not None
+        assert moe_fusion.num_fused_shared_experts == 0
+        assert not moe_fusion._enable_a2a_moe
+        assert not moe_fusion._fuse_shared_experts_inside_sbo
+        assert not getattr(moe_fusion, "is_hash", False)
+        assert hasattr(moe_fusion, "shared_experts")
+        assert get_moe_runner_backend().is_flashinfer_trtllm()
+        assert moe_fusion.experts.use_flashinfer_trtllm_moe
+        assert not get_global_server_args().enable_eplb
+
+        current_stream = torch.cuda.current_stream()
+        alt_stream = moe_fusion.alt_stream
+        alt_stream.wait_stream(current_stream)
+
+        shared_output = moe_fusion._forward_shared_experts(hidden_states)
+        with torch.cuda.stream(alt_stream):
+            router_logits = moe_fusion.gate(hidden_states)
+            topk_output = BypassedTopKOutput(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                topk_config=moe_fusion.topk.topk_config,
+            )
+            final_hidden_states = moe_fusion.experts.forward_impl(
+                hidden_states, topk_output
+            )
+            if not (_is_cuda or _is_musa) or isinstance(
+                moe_fusion.experts.quant_method, KTEPWrapperMethod
+            ):
+                final_hidden_states *= moe_fusion.routed_scaling_factor
+
+        current_stream.wait_stream(alt_stream)
+        final_hidden_states.record_stream(current_stream)
+
+        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+            moe_fusion.experts,
+            final_hidden_states,
+            None if moe_fusion._shared_expert_tp1 else shared_output,
+            moe_fusion.routed_scaling_factor,
+        )
+
+        if moe_fusion.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
+        ):
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        if moe_fusion._shared_expert_tp1:
+            final_hidden_states += shared_output
+        return final_hidden_states
 
 
 class DeepseekV2MLP(nn.Module):
@@ -771,16 +845,36 @@ class DeepseekV2MoE(nn.Module):
             )
 
         if not self._enable_a2a_moe:
+            server_args = get_global_server_args()
             if (
+                _enable_pcg_dsv2_dual_stream
+                and is_in_piecewise_cuda_graph()
+                and get_moe_runner_backend().is_flashinfer_trtllm()
+                and self.alt_stream is not None
+                and self.num_fused_shared_experts == 0
+                and hidden_states.shape[0] > 0
+                and hasattr(self, "shared_experts")
+                and self.experts.use_flashinfer_trtllm_moe
+                and not self._fuse_shared_experts_inside_sbo
+                and not getattr(self, "is_hash", False)
+                and not server_args.enable_eplb
+            ):
+                return dsv2_flashinfer_moe_dual_stream_pcg(
+                    hidden_states,
+                    self.layer_id,
+                    should_allreduce_fusion,
+                    use_reduce_scatter,
+                )
+            elif (
                 self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
                 and not (
-                    get_global_server_args().enable_torch_compile
+                    server_args.enable_torch_compile
                     and hidden_states.shape[0]
-                    <= get_global_server_args().torch_compile_max_bs
-                    * (get_global_server_args().speculative_num_draft_tokens or 1)
+                    <= server_args.torch_compile_max_bs
+                    * (server_args.speculative_num_draft_tokens or 1)
                 )
             ):
                 return self.forward_normal_dual_stream(

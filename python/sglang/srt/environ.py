@@ -476,6 +476,7 @@ class Envs:
     )
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSA_EAGER_FUSION = EnvBool(False)
+    SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
 
     # sgl-kernel
