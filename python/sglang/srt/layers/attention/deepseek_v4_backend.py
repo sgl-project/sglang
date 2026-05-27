@@ -1143,7 +1143,7 @@ class DeepseekV4AttnBackend(
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens.to(torch.int32)
         seq_lens_cpu = forward_batch.seq_lens_cpu
-       assert self.req_to_token_pool.req_to_token is self.req_to_token
+        assert self.req_to_token_pool.req_to_token is self.req_to_token
 
         assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
         assert seq_lens_cpu is not None
@@ -1695,7 +1695,6 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
                     speculative_num_steps=self.speculative_num_steps,
                 )
             )
-    
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata(forward_batch)
@@ -1725,6 +1724,7 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
     ):
         if self.speculative_num_steps == 1:
             return
+        
         self.attn_backends[0]._replay_forward_batch = forward_batch
         self.attn_backends[0].init_forward_metadata_replay_cuda_graph(
             bs=bs,
