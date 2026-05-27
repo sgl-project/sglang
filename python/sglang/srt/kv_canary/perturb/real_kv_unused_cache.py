@@ -35,7 +35,10 @@ from sglang.srt.kv_canary.perturb.utils import (
 from sglang.srt.kv_canary.radix_cache_walker import walk_radix_cache_for_canary
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+    from sglang.srt.mem_cache.base_prefix_cache import (
+        BasePrefixCache,
+        DecLockRefParams,
+    )
     from sglang.srt.mem_cache.radix_cache import TreeNode
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -55,6 +58,12 @@ class _PinnedNode:
 
     node: "TreeNode"
     radix_cache: "BasePrefixCache"
+    # Caller-supplied params to round-trip an SWA lock back through
+    # dec_lock_ref. SWARadixCache.inc_lock_ref returns swa_uuid_for_lock /
+    # swa_uuid_for_host_lock / skip_lock_node_ids which dec_lock_ref needs
+    # to release only what we acquired. For plain RadixCache this is just
+    # an empty params object.
+    dec_params: "DecLockRefParams"
     expire_step: int
 
 
@@ -146,13 +155,16 @@ def run(
 
     # Pin the owning radix node so the picked slot cannot be evicted (and
     # therefore cannot be reallocated by the next forward) before sweep
-    # observes the corruption.
+    # observes the corruption. SWARadixCache returns swa_uuid_for_lock /
+    # related fields that must be replayed back through dec_lock_ref to
+    # release only what we acquired, so capture them now.
     assert radix_cache is not None  # _pick_sweep_slot_for_group needs it
-    radix_cache.inc_lock_ref(owning_node)
+    inc_result = radix_cache.inc_lock_ref(owning_node)
     state.pending.append(
         _PinnedNode(
             node=owning_node,
             radix_cache=radix_cache,
+            dec_params=inc_result.to_dec_params(),
             expire_step=outer_step_counter + _PIN_SWEEP_CYCLES * sweep_interval,
         )
     )
@@ -181,7 +193,7 @@ def _unpin_expired(
     for entry in state.pending:
         if outer_step_counter >= entry.expire_step:
             try:
-                entry.radix_cache.dec_lock_ref(entry.node)
+                entry.radix_cache.dec_lock_ref(entry.node, entry.dec_params)
             except Exception:
                 # Best-effort cleanup. Don't let a stale node lifetime kill
                 # the scheduler — log and drop it.
