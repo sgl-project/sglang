@@ -1904,15 +1904,10 @@ def _execute_server_warmup(server_args: ServerArgs):
 
     model_info = res.json()
 
-    # Construct a warmup request
-    is_vlm = bool(model_info.get("has_image_understanding", False))
-    # TODO(MLX): Qwen3.5 advertises VLM capability, but MLX currently serves
-    # text-only generation. The image warmup path reaches Qwen3-VL fast image
-    # processing and fails on Apple Silicon with "Torch not compiled with CUDA
-    # enabled". Keep /model_info truthful and only force text warmup here.
-    mlx_text_only_warmup = is_vlm and use_mlx()
+    # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
+    is_vlm = bool(model_info.get("has_image_understanding", False)) and not use_mlx()
     if model_info["is_generation"]:
-        if is_vlm and not mlx_text_only_warmup and not server_args.skip_tokenizer_init:
+        if is_vlm and not server_args.skip_tokenizer_init:
             request_name = "/v1/chat/completions"
         else:
             request_name = "/generate"
@@ -1932,7 +1927,6 @@ def _execute_server_warmup(server_args: ServerArgs):
             json_data["input_ids"] = json_data["input_ids"][0]
     elif (
         is_vlm
-        and not mlx_text_only_warmup
         and server_args.disaggregation_mode == "null"
         and model_info["is_generation"]
     ):
