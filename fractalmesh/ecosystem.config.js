@@ -1201,6 +1201,7 @@ module.exports = {
             ['fm-subscription',   'fm_subscription_engine','35M'],
             ['fm-api-marketplace','fm_api_marketplace', '30M'],
             ['fm-task-queue',     'fm_task_queue',      '30M'],
+            ['fm-knowledge-base', 'fm_knowledge_base',  '30M'],
         ].map(([name, script, mem]) => ({
             name,
             script:            `agents/${script}.py`,
