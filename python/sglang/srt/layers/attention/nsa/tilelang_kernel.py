@@ -1343,6 +1343,11 @@ def tilelang_sparse_fwd(
     dim = q.shape[2]
     tail_dim = dim - d_v
     topk = indices.shape[-1]
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "[FlyDSL-DBG] tilelang_sparse_fwd called: q=%s kv=%s indices=%s d_v=%d tail_dim=%d kv_dtype=%s flydsl_mode=%s",
+        q.shape, kv.shape, indices.shape, d_v, tail_dim, kv.dtype, os.environ.get("SGLANG_FLYDSL_PREFILL", "auto")
+    )
     assert topk == 2048
 
     if _is_hip:
