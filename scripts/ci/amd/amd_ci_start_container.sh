@@ -304,3 +304,14 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
 # root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so
 # setuptools-scm / vcs_versioning can resolve the package version.
 docker exec ci_sglang git config --global --add safe.directory /sglang-checkout
+
+# In-container runner-perf snapshot. Mirrors the host-side snapshot already
+# emitted by ensure_vram_clear.sh, but tagged `[runner-perf-diag:container]`
+# so the two vantage points can be diffed in the same job log. Catches
+# (1) the Docker bridge-network amplification of the host TCP-tuning gap,
+# (2) whether the /sgl-data bind-mount actually made it inside the
+#     container (PR #26260 found it MISSING on at least one host).
+# Best-effort; never fatal.
+docker exec -e CONTEXT=container ci_sglang \
+    bash /sglang-checkout/scripts/ci/amd/diagnose_runner_perf.sh \
+    || true

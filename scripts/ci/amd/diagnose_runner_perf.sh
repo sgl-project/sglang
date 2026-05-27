@@ -17,7 +17,14 @@
 
 set +e
 
-DIAG_TAG="[runner-perf-diag]"
+# CONTEXT distinguishes whether this snapshot is from the host (default,
+# invoked from ensure_vram_clear.sh before any container exists) or from
+# inside the CI container (invoked from amd_ci_start_container.sh via
+# `docker exec -e CONTEXT=container ci_sglang ...`). Same script, two
+# vantage points, so we can diff bridge-network / mount / TCP-stack
+# behaviour without duplicating the metric set.
+CONTEXT="${CONTEXT:-host}"
+DIAG_TAG="[runner-perf-diag:${CONTEXT}]"
 
 section() {
     printf '\n%s === %s ===\n' "$DIAG_TAG" "$*"
@@ -43,9 +50,20 @@ LANG=C lscpu 2>/dev/null \
 kv loadavg "$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo unknown)"
 
 section "memory"
-free -m 2>/dev/null \
-    | awk 'NR==2 {printf "%s mem_total_mb=%s mem_used_mb=%s mem_free_mb=%s mem_available_mb=%s\n", "'"$DIAG_TAG"'", $2, $3, $4, $7}' \
-    || true
+# Fall back to /proc/meminfo when `free` is not installed (some slim
+# container images strip procps-ng).
+if command -v free >/dev/null 2>&1; then
+    free -m 2>/dev/null \
+        | awk 'NR==2 {printf "%s mem_total_mb=%s mem_used_mb=%s mem_free_mb=%s mem_available_mb=%s\n", "'"$DIAG_TAG"'", $2, $3, $4, $7}' \
+        || true
+elif [ -r /proc/meminfo ]; then
+    awk -v tag="$DIAG_TAG" '
+        /^MemTotal:/     {total=$2}
+        /^MemFree:/      {free=$2}
+        /^MemAvailable:/ {avail=$2}
+        END {printf "%s mem_total_mb=%d mem_free_mb=%d mem_available_mb=%d\n", tag, total/1024, free/1024, avail/1024}
+    ' /proc/meminfo
+fi
 
 section "disk capacity"
 for mp in /home/runner /home/runner/sglang-data /tmp /var/lib/docker; do
@@ -117,7 +135,17 @@ for k in \
     net.ipv4.tcp_window_scaling \
     net.ipv4.tcp_mtu_probing \
     net.ipv4.tcp_timestamps; do
-    v=$(sysctl -n "$k" 2>/dev/null || echo unavailable)
+    # Prefer reading /proc/sys directly so this works in container images
+    # that strip the `sysctl` binary (procps-ng), and skip the binary
+    # fork-exec when we can.
+    proc_path="/proc/sys/$(echo "$k" | tr . /)"
+    if [ -r "$proc_path" ]; then
+        v=$(cat "$proc_path" 2>/dev/null)
+    elif command -v sysctl >/dev/null 2>&1; then
+        v=$(sysctl -n "$k" 2>/dev/null || echo unavailable)
+    else
+        v=unavailable
+    fi
     # Collapse tabs/multiple spaces so the kv= block stays single-line.
     v=$(printf '%s' "$v" | tr '\t' ' ' | tr -s ' ')
     kv "$k" "$v"
@@ -151,15 +179,38 @@ if command -v docker >/dev/null 2>&1; then
 fi
 
 section "hf cache"
-HF_CACHE_HOST=/home/runner/sglang-data/hf-cache
-if [ -d "$HF_CACHE_HOST" ]; then
+# On the host the HF cache lives at /home/runner/sglang-data/hf-cache; inside
+# the container the same backing store is bind-mounted at /sgl-data/hf-cache
+# (see -e HF_HOME=/sgl-data/hf-cache in amd_ci_start_container.sh). Probe
+# both so the host snapshot tells us if the runner has the bind-mount
+# populated, and the container snapshot tells us if the mount actually
+# made it inside (PR #26260 saw it MISSING in-container — that's a
+# separate failure mode from the TCP-tuning gap).
+if [ "$CONTEXT" = "container" ]; then
+    HF_CACHE_PATH=/sgl-data/hf-cache
+else
+    HF_CACHE_PATH=/home/runner/sglang-data/hf-cache
+fi
+if [ -d "$HF_CACHE_PATH" ]; then
     # `du` over a multi-TB HF cache is expensive; use --max-depth=0 and bound
     # with timeout so a slow disk doesn't blow the diagnostic budget.
-    size=$(timeout 15 du -sBM --max-depth=0 "$HF_CACHE_HOST" 2>/dev/null | awk '{print $1}')
-    kv hf_cache_path "$HF_CACHE_HOST"
+    size=$(timeout 15 du -sBM --max-depth=0 "$HF_CACHE_PATH" 2>/dev/null | awk '{print $1}')
+    kv hf_cache_path "$HF_CACHE_PATH"
     kv hf_cache_size "${size:-timeout}"
 else
-    kv hf_cache_path "missing"
+    kv hf_cache_path "$HF_CACHE_PATH (missing)"
+fi
+# Also check the /sgl-data bind-mount root from inside the container so we
+# notice if amd_ci_start_container.sh's CACHE_VOLUME logic dropped it
+# (which #26260 observed: "WARNING: /sgl-data does NOT exist inside
+# container ⇒ HF / MIOPEN cache paths will fail or be created in
+# container layer").
+if [ "$CONTEXT" = "container" ]; then
+    if [ -d /sgl-data ]; then
+        kv sgl_data_mount "present"
+    else
+        kv sgl_data_mount "MISSING (cache writes will hit container layer, not bind-mount)"
+    fi
 fi
 
 printf '\n%s === diagnostics done ===\n' "$DIAG_TAG"
