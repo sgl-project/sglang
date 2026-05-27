@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     116,
+        "agents":     117,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -230,6 +230,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "support_desk":      7868,
             "subscription_engine":7869,
             "api_marketplace":   7870,
+            "task_queue":        7872,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -547,6 +548,7 @@ _INTENTS = {
     "support_ticket":          lambda a, k: {"action": "support_ticket_queued", "customer_email": k.get("customer_email", ""), "subject": k.get("subject", ""), "body": k.get("body", "")},
     "subscribe":               lambda a, k: {"action": "subscribe_queued", "customer_email": k.get("customer_email", ""), "plan_id": k.get("plan_id", "starter"), "billing_cycle": k.get("billing_cycle", "monthly")},
     "api_key_validate":        lambda a, k: {"action": "api_key_validate_queued", "api_key": k.get("api_key", "")},
+    "task_enqueue":            lambda a, k: {"action": "task_enqueue_queued", "queue_name": k.get("queue_name", "default"), "task_type": k.get("task_type", "http"), "payload": k.get("payload", {})},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
