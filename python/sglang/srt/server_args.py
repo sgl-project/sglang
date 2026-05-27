@@ -3814,38 +3814,27 @@ class ServerArgs:
                 f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, Qwen2Audio, Qwen2.5Omni, Kimi, MiMoV2."
             )
 
-    def _validate_ib_devices(self, device_str: str) -> Optional[str]:
+    def _validate_ib_devices(self, device_str: Optional[str]) -> Optional[str]:
         """
         Validate IB devices before passing to mooncake.
 
         Args:
-            device_str: Comma-separated IB device names (e.g., "mlx5_0,mlx5_1")
+            device_str: Comma-separated IB device names (e.g., "mlx5_0,mlx5_1"),
+                a JSON mapping string, or a path to a JSON mapping file.
 
         Returns:
-            Normalized comma-separated string of validated device names, or None if input is None.
+            Normalized comma-separated string of validated device names, the original
+            JSON mapping/path, or None if input is None.
         """
         if device_str is None:
             logger.warning(
                 "No IB devices specified for Mooncake backend, falling back to auto discovery."
             )
             return None
-
-        # Strip whitespace from device names
-        devices = [d.strip() for d in device_str.split(",") if d.strip()]
-        if len(devices) == 0:
+        device_str = device_str.strip()
+        if len(device_str) == 0:
             raise ValueError("No valid IB devices specified")
 
-        # Deduplicate while preserving order
-        unique_devices = list(dict.fromkeys(devices))
-        if len(unique_devices) != len(devices):
-            logger.warning(
-                "Duplicate IB devices specified: %s. Deduplicating to: %s",
-                device_str,
-                ",".join(unique_devices),
-            )
-            devices = unique_devices
-
-        # Get available IB devices from sysfs
         ib_sysfs_path = "/sys/class/infiniband"
         if not os.path.isdir(ib_sysfs_path):
             raise RuntimeError(
@@ -3857,13 +3846,66 @@ class ServerArgs:
         if len(available_devices) == 0:
             raise RuntimeError(f"No IB devices found in {ib_sysfs_path}")
 
-        # Check for invalid devices
-        invalid_devices = [d for d in devices if d not in available_devices]
-        if len(invalid_devices) != 0:
-            raise ValueError(
-                f"Invalid IB devices specified: {invalid_devices}. "
-                f"Available devices: {sorted(available_devices)}"
+        def validate_device_list(devices: List[str], *, context: str = "") -> List[str]:
+            if len(devices) == 0:
+                raise ValueError(f"No valid IB devices specified{context}")
+
+            invalid_devices = [d for d in devices if d not in available_devices]
+            if len(invalid_devices) != 0:
+                raise ValueError(
+                    f"Invalid IB devices specified{context}: {invalid_devices}. "
+                    f"Available devices: {sorted(available_devices)}"
+                )
+            return devices
+
+        def validate_json_mapping(mapping: Any) -> None:
+            if not isinstance(mapping, dict) or len(mapping) == 0:
+                raise ValueError("IB device JSON config must be a non-empty object")
+
+            for gpu_key, ib_devices in mapping.items():
+                valid_gpu_key = isinstance(gpu_key, int) or (
+                    isinstance(gpu_key, str) and gpu_key.isdigit()
+                )
+                if not valid_gpu_key or not isinstance(ib_devices, str):
+                    raise ValueError(
+                        "IB device JSON config must map GPU ids to comma-separated "
+                        "IB device strings, e.g. {'0': 'mlx5_0,mlx5_1'}"
+                    )
+
+                devices = [d.strip() for d in ib_devices.split(",") if d.strip()]
+                validate_device_list(devices, context=f" for GPU {gpu_key}")
+
+        if os.path.isfile(device_str):
+            try:
+                with open(device_str, "r") as f:
+                    validate_json_mapping(json.load(f))
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"Failed to parse IB device JSON config {device_str}: {e}"
+                ) from e
+            return device_str
+
+        if device_str.endswith(".json"):
+            raise RuntimeError(f"IB device JSON config file not found: {device_str}")
+
+        if device_str.startswith("{"):
+            try:
+                validate_json_mapping(json.loads(device_str))
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Failed to parse IB device JSON config: {e}") from e
+            return device_str
+
+        devices = [d.strip() for d in device_str.split(",") if d.strip()]
+        devices = validate_device_list(devices)
+
+        unique_devices = list(dict.fromkeys(devices))
+        if len(unique_devices) != len(devices):
+            logger.warning(
+                "Duplicate IB devices specified: %s. Deduplicating to: %s",
+                device_str,
+                ",".join(unique_devices),
             )
+            devices = unique_devices
 
         return ",".join(devices)
 
