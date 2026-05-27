@@ -46,6 +46,8 @@ class TestLoadBackDurationMetric(CustomTestCase):
             ongoing_load_back={1: object(), 2: object()},
             dec_lock_ref=MagicMock(),
             metrics_collector=MagicMock(),
+            pp_rank=0,
+            _all_reduce=MagicMock(),
         )
 
         HiRadixCache.loading_check(stub)
@@ -54,10 +56,39 @@ class TestLoadBackDurationMetric(CustomTestCase):
             1024
         )
         stub.metrics_collector.observe_load_back_duration.assert_called_once()
-        (observed,), _ = (
-            stub.metrics_collector.observe_load_back_duration.call_args
-        )
+        (observed,), _ = stub.metrics_collector.observe_load_back_duration.call_args
         self.assertGreater(observed, 0.0)
+        self.assertEqual(stub.cache_controller.ack_load_queue, [])
+
+    def test_loading_check_fallback_when_timing_unsupported(self):
+        """On backends without enable_timing, count tokens but skip duration."""
+        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+
+        finish = torch.cuda.Event()
+        finish.record()
+        torch.cuda.synchronize()
+
+        ack = self.cc.HiCacheAck(
+            start_event=None,
+            finish_event=finish,
+            node_ids=[7],
+            num_tokens=512,
+        )
+        stub = SimpleNamespace(
+            cache_controller=SimpleNamespace(ack_load_queue=[ack]),
+            ongoing_load_back={7: object()},
+            dec_lock_ref=MagicMock(),
+            metrics_collector=MagicMock(),
+            pp_rank=0,
+            _all_reduce=MagicMock(),
+        )
+
+        HiRadixCache.loading_check(stub)
+
+        stub.metrics_collector.increment_load_back_num_tokens.assert_called_once_with(
+            512
+        )
+        stub.metrics_collector.observe_load_back_duration.assert_not_called()
         self.assertEqual(stub.cache_controller.ack_load_queue, [])
 
 
