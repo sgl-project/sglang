@@ -457,8 +457,9 @@ def flydsl_nsa_prefill(
 
     total_tokens, h_q, head_dim = q.shape
     topk = indices.shape[1]
-    assert q.dtype   == torch.float8_e4m3fn
-    assert kv.dtype  == q.dtype
+    _fp8_types = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    assert q.dtype in _fp8_types, f"q must be fp8, got {q.dtype}"
+    assert kv.dtype == q.dtype, f"kv dtype {kv.dtype} != q dtype {q.dtype}"
     assert indices.dtype == torch.int32
 
     out    = torch.empty((total_tokens, h_q, head_dim), dtype=torch.bfloat16, device=q.device)

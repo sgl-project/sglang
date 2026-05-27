@@ -1388,10 +1388,12 @@ def tilelang_sparse_fwd(
                     if _flydsl_mode == "1" or _flydsl_available():
                         indices_2d = indices.squeeze(1)  # [total_tokens, topk]
                         kv_2d = kv.squeeze(1)            # [num_pages, head_dim]
+                        # FlyDSL kernel requires fp8 Q; cast from bf16 if needed.
+                        q_fp8 = q.to(kv_2d.dtype) if q.dtype != kv_2d.dtype else q
                         import logging
-                        logging.getLogger(__name__).warning("[FlyDSL] dispatching kernel q=%s kv=%s", q.shape, kv_2d.shape)
+                        logging.getLogger(__name__).warning("[FlyDSL] dispatching kernel q=%s kv=%s q_dtype=%s", q.shape, kv_2d.shape, q_fp8.dtype)
                         return flydsl_nsa_prefill(
-                            q=q,
+                            q=q_fp8,
                             kv=kv_2d,
                             indices=indices_2d,
                             sm_scale=sm_scale,
