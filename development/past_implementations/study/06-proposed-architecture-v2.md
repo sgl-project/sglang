@@ -2,7 +2,7 @@
 
 **Status:** as-built design synthesized from `development/loop{1,2,3}/` + the in-tree DS package at `python/sglang/srt/layers/attention/double_sparsity/`, **plus the minimal-viable roadmap to a DSv3.2 deployment that matches/beats the default DSA + radix-cache + CUDA-graph baseline** (§9–§11).
 
-**v2 changes vs v1:** added §9 (MVP roadmap, Phases A/B/C), §10 (calibration recipe — reused from references), §11 (kernel-fusion roadmap — deferred until MVP works). The relaxed performance target lives in §9.2.
+**v2 changes vs v1:** added §9 (MVP roadmap, Phases A/B/C), §10 (calibration recipe — reused from references), §11 (kernel-fusion roadmap — deferred until MVP works), §12 (deferred items + ongoing issues bucketed must-address / should-address / defer). The relaxed performance target lives in §9.2.
 
 **Audience:** anyone reviewing the design or picking up the standalone-DS branch (`dev/double-sparsity-standalone`).
 
@@ -486,3 +486,95 @@ Phase C fires if and only if **at conc=64**:
 If the bottleneck is *not* in the DS code path (e.g. it's FlashMLA itself, the all-reduce, or radix-cache eviction), Phase C does not fire — that becomes a different conversation.
 
 The profile-first discipline avoids the sglang-last failure mode where the DS kernels were ported eagerly *before* the host-sync problem (the actual perf killer per §2 G1) was understood.
+
+---
+
+## 12. What is still deferred + ongoing issues (and whether MVP must address them)
+
+This section enumerates everything the previous loops explicitly deferred plus everything that is currently a known issue in the in-tree code at `dev/double-sparsity-standalone @ e32ec2b4b`. Each item is classified into one of three buckets:
+
+- 🛑 **Must address in MVP** — blocks any V3.2 DS deployment from working at all.
+- ⚠ **Should address in MVP** — would surface as silent bugs at deployment scale; cheap to fix while we're here.
+- 🟰 **Defer past MVP** — downstream feature or optimization; not a blocker.
+
+### 12.1 Deferred from Loop 1 (refined_plan_v3.md scope decisions)
+
+| # | Item | Bucket | Why |
+|---|------|--------|-----|
+| 1.1 | **GLM-5.1 support** | 🟰 Defer | Deferred client requirement; schema already shaped for it (`channel_mask.py` is dtype/length-agnostic). Capability check stays V3.2-specific (DEC-10) until GLM-5.1 ships its indexer interface. |
+| 1.2 | **128K ISL workload** | 🟰 Defer | Deferred client requirement; no length-dependent fields in the artifact schema. Memory budget at 1M context already documented in §3.3 — 128K is well inside it. |
+| 1.3 | **nvfp4 / mxfp4 weights** | 🟰 Defer | Deferred client requirement. Channel mask is dtype-agnostic (FP8 path validated; FP4 needs new dequant kernel). |
+| 1.4 | **DP Attention** | 🟰 Defer | Newly added to `development/CLIENT_SLOS.md` as deferred item 4. No DS-specific code change needed; the selector's TP rank-sync (DEC-9) generalizes — but DP changes the all-reduce group topology, so an explicit test is owed before declaring support. |
+| 1.5 | **Twilight / top-p selection** | 🟰 Defer | AC-11 ABI explicitly rejects `selection_mode` / `top_p`. Downstream task — separate plan, separate ABI design. |
+| 1.6 | **"Extensions" engine knob** | 🟰 Defer | Downstream framework feature. Not blocked by DS shape; DS would be a consumer once the knob exists. |
+| 1.7 | **PD-Disagg / HiCache integration** | 🟰 Defer | Downstream; no customer ask on DS yet. The HiSparse mutex (DEC-8) explicitly *prevents* HiSparse coexistence at runtime — DS-on-PD-Disagg without HiSparse remains an open shape question. |
+| 1.8 | **DS-Offload (paper §DS-Offload)** | 🟰 Defer | CPU pinned K,V + double-buffer prefetch. Signature-table lifecycle hooks (`on_assign/free/evict/reuse`) are shaped to admit it later; not implemented. |
+| 1.9 | **DEC-2 radix-cache default flip** | ⚠ Should address | Loop 1 left this as an explicit operator decision: flip `_double_sparsity_radix_fixture_passed = True` *after* Phase 5 M3-B hardware run passes. Without this flip, the baseline comparison in §9.5 B5 cannot turn radix cache on under DS — which would break the apples-to-apples requirement (baseline uses radix). **Required for Phase B.** |
+
+### 12.2 Deferred from Loop 2 (R9 retro — explicit non-goals carried forward)
+
+These were in Loop 2's R9 summary and got copied verbatim into the Loop 3 draft non-goals list:
+
+| # | Item | Bucket | Why |
+|---|------|--------|-----|
+| 2.1 | **AC-8 captured-path zero-allocation** — Triton kernel for value-domain assertions | 🟰 Defer | Today's `assert_no_alloc_in_region` is a host-side allocator counter (`cuda_graph.py:191-221`). It detects `torch.empty` but not direct `cudaMalloc` from inside Triton. Loop 2 acknowledged this gap as acceptable because the kernels are reviewed for in-region allocation at merge time. **Not blocking** unless a Phase C Triton port introduces a direct `cudaMalloc`. |
+| 2.2 | **AC-8 wrapper / multi-step backend metadata fixup** | 🟰 Defer | Multi-step decode (overlap scheduling) integration. Adds new metadata mutation paths that the static-buffer contract has to absorb. Not blocking the first DSv3.2 deployment (V3.2 doesn't use overlap-scheduling by default per Loop 1 setup). |
+| 2.3 | **M3-B perturbation negative** (fixture redesign) | 🟰 Defer | The synthetic CI M3-B fixture only proves *positive* cold/warm equivalence on a shape-only probe. A perturbation negative (deliberately mutate the channel mask between cold and warm; the test should fail) is needed for confidence. Not blocking — it's a test gap, not a runtime gap. |
+| 2.4 | **Real two-rank TP divergence test** (multi-process harness) | 🛑 **Must address** | This one is *important.* AC-7 today is single-rank; a synthetic two-rank fixture exists in unit tests but a real multi-process harness has never been wired. **At TP=8 we cannot ship without verifying rank-bit-equal `selected_indices`** — divergence would produce silently wrong attention output at scale. **Required for Phase A6 before any quality call is trusted.** |
+| 2.5 | **`transform_index_page_table_decode_fast` 2048 hard-assert** | ⚠ Should address | Loop 2 left this as a "review caught it but not gated by test." If a request exceeds `max_top_k=2048`, the fast-path may produce wrong page tables silently. Add a `tl.device_assert` (Phase A2 work, cheap) so the failure mode is loud. |
+| 2.6 | **Operator phases 2–3** (real calibration / benchmark / M3-B hardware) | 🛑 **Must address** | Loop 2 explicitly punted these as "operator-phase 2/3" work; that operator phase **is exactly Phase A of the MVP roadmap (§9.3)**. They are now blocker, not deferred. |
+
+### 12.3 Loop 3 hard scope (= Phase A of the MVP roadmap)
+
+Listed for completeness — all three are 🛑 **must address in MVP**. They are restated here so the deferred-list reader doesn't have to flip back to §9.
+
+- **M1** — Hook `page_signature_write` into NSA backend's `set_mla_kv_buffer` sites (§9.3 A1). Without this, `valid_mask` is all-False; every DS forward picks against zero signatures → garbage output.
+- **M2** — Build per-request `sparse_mask` and attach to `ForwardBatch` (§9.3 A2). Without this, selection can pick pages owned by other requests in the same batch.
+- **M3** — End-to-end `bench_serving` run on V3.2 FP8 (§9.3 A6). The done criterion for the loop; Loop 3 draft's single-sentence done definition.
+
+### 12.4 Ongoing issues in the current code state (commit `e32ec2b4b`)
+
+These are not "deferred" in the loop-plan sense — they are current code-state issues that need triage as part of executing the MVP roadmap.
+
+| # | Issue | Where | Bucket | Notes |
+|---|-------|-------|--------|-------|
+| 4.1 | **`page_signature_write` is never called from a live KV-write site** | `python/sglang/srt/layers/attention/nsa_backend.py` — `set_mla_kv_buffer` call sites have no DS hook today (verified: `grep` returns zero hits for `page_signature_write` in that file) | 🛑 Must address | Same as Loop 3 M1. Mentioned twice because it is the load-bearing gap. |
+| 4.2 | **Selector boots in placeholder mode when channel mask is misconfigured** | `double_sparsity/selector.py:60-72` `IS_PLACEHOLDER=True` flips to `False` only when `_bind_double_sparsity_runtime_data` (`deepseek_v2.py:1832`) succeeds | ⚠ Should address | `bind_runtime_data` IS wired at per-layer init (`deepseek_v2.py:1541`), but it requires `server_args._double_sparsity_channel_mask` to be pre-populated by the validator. If the validator order is wrong or path is missing, every layer crashes loudly at init. Verify on Phase A4 boot that boot logs show "bind_runtime_data completed" for every DS-enabled layer (RUNBOOK Phase 2 already documents this check). |
+| 4.3 | **`compute_page_scores` is a torch reference, not Triton** | `double_sparsity/selection_kernel.py:488` torch reference, multi-dim contractions in CPython | 🟰 Defer (Phase C) | Captures fine under CUDA graphs because buffers are static and ops are PyTorch primitives (no Python-level branching on tensor values). But the wall-clock cost may be material — that's the Phase B5 question. |
+| 4.4 | **`page_signature_write` is a torch reference, not Triton** | `double_sparsity/page_signature_write.py:498` | 🟰 Defer (Phase C) | Same story as 4.3. Phase B profile will say whether porting this matters before `compute_page_scores`. |
+| 4.5 | **Hardware-level CUDA-graph capture has never run at conc=64** | `cuda_graph.py:109-188` `capture_decode_step` only exercised on synthetic shapes in unit tests | 🛑 Must address (Phase B2) | The capture machinery passes synthetic shape tests, but no one has captured against a real V3.2 conc=64 batch yet. This is the AC-6 positive test from Loop 1 that's still owed. |
+| 4.6 | **Two-rank TP harness still synthetic** | Restated from 2.4 above | 🛑 Must address | The DEC-9 `all_reduce(SUM)` path is unit-tested in single-process simulation only. Multi-process two-rank test is the canonical TP correctness check. |
+| 4.7 | **M3-B is synthetic CI only; never run on hardware** | `test_double_sparsity_unit.py::test_ds_m3b_synthetic_ci_hook` is shape-only | ⚠ Should address (Phase B3) | Hardware run is RUNBOOK Phase 5; required before DEC-2 default flip (gates radix cache under DS). |
+| 4.8 | **`SGLANG_DS_RADIX_OVERRIDE` env var remains** | `validator.py` (separate concern from the removed `SGLANG_DS_ALLOW_*` gates per Loop 2 task 11 deliberation) | 🟰 Defer | Loop 2 explicitly kept this in place. Operator override knob for testing; not a runtime path concern. |
+| 4.9 | **`skip_topk` gate fix lives in `forward_absorb_prepare`, not the helper** | `models/deepseek_common/attention_forward_methods/forward_mla.py:245-277` — gate is `or not self.skip_topk or prev_topk_indices is None`, which mirrors Loop 2 R0's `skip_topk` fix | ✅ Already addressed | Loop 2 closed this. Listed here so the reader doesn't think it's still open. |
+| 4.10 | **DS branch return type uses unified `page_table_1` Tensor** | `deepseek_v2.py:2060` and the Loop 2 task 2 work | ✅ Already addressed | Loop 2 closed the typed-union vs unified-shape design question (Design C resolution). Listed here for the same reason as 4.9. |
+
+### 12.5 Carry-forward lessons from Loop 2 retro (operating guidance, not code work)
+
+These are not code items — they are operating-process bookkeeping that the MVP execution must observe:
+
+| Lesson | What it says | When it bites |
+|--------|--------------|---------------|
+| **BL-20260520-read-fields-before-abort-mutation** | Capture batch-wide cursor spans BEFORE invoking abort helpers — `set_finish_with_abort` rewrites `req.origin_input_ids = [0]`. | If a DS error in mid-decode triggers per-request abort (the `error_containment` path), and the surrounding code reads `req.origin_input_ids` *after* abort, it reads `[0]` not the original. Could bite us during Phase A6 if any prompt hits a DS error mid-decode. |
+| **BL-20260520-symbol-vs-test-fixture-drift** | Test fixtures must reference live dataclass field names (`forward_batch.rids` not `req_ids`; verify with `dataclasses.fields(ForwardBatch)`). | Only affects test correctness, not runtime. Mention it because Phase A5 (quality smoke) and Phase B6 (NIAH/MMLU) both touch `ForwardBatch` and could drift if a field is renamed upstream. |
+| **2-vs-6 budget mismatch (Loop 2 retro)** | If 2 consecutive rounds open more gaps than they close, **stop the loop manually** with `/humanize:cancel-rlcr-loop` and reassess scope. Don't wait for the circuit breaker. | Phase A is small (6 items, ~5 days). If we hit Day 3 with only A1 closed and three new gaps open, that's the cancel signal — exactly the failure mode Loop 2 hit at R9. |
+
+### 12.6 Summary — what must be in the MVP
+
+Filtering the above to the 🛑 **must address** items:
+
+1. **M1** — `page_signature_write` hook (12.4 #4.1 = Loop 3 M1).
+2. **M2** — `sparse_mask` on `ForwardBatch` (Loop 3 M2).
+3. **M3** — end-to-end V3.2 FP8 `bench_serving` run (Loop 3 M3).
+4. **Real V3.2 calibration** (12.2 #2.6 — operator phases 2-3 now in scope).
+5. **Two-rank TP multi-process harness** (12.2 #2.4 / 12.4 #4.6) — non-negotiable at TP=8.
+6. **Hardware CUDA-graph capture at conc=64** (12.4 #4.5) — AC-6 positive test on real hardware.
+
+And the ⚠ **should address** items, cheap to include while we're here:
+
+7. **DEC-2 flip** after Phase 5 (12.1 #1.9) — gates radix cache in the baseline comparison.
+8. **Placeholder-mode boot trip-wire** (12.4 #4.2) — verify boot logs match RUNBOOK Phase 2 expectations.
+9. **`transform_index_page_table_decode_fast` device assert at `max_top_k=2048`** (12.2 #2.5) — make silent overflow loud.
+10. **M3-B hardware run** (12.4 #4.7) — gates #7.
+
+Everything else (Triton ports, AC-8 device-assert kernel, M3-B perturbation negative, GLM-5.1, 128K, FP4, DP Attention, Twilight pruner, CPU offload, PD-Disagg, Extensions) is **defer past MVP** unless Phase B evidence elevates an item.
