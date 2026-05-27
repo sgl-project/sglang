@@ -22,11 +22,13 @@ logger = init_logger(__name__)
 
 SUITES = {
     "1-gpu-musa": [
-        "musa/test_server_a_musa.py",
-        "musa/test_server_b_musa.py",
+        "musa/test_server_1_gpu_musa.py",
+    ],
+    "1-gpu-musa-nightly": [
+        "musa/test_server_1_gpu_musa_nightly.py",
     ],
     "2-gpu-musa": [
-        "musa/test_server_2_gpu_a_musa.py",
+        "musa/test_server_2_gpu_musa.py",
     ],
 }
 
