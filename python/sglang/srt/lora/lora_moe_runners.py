@@ -39,6 +39,53 @@ _is_xpu = is_xpu()
 if _is_cuda or _is_hip or _is_xpu:
     from sglang.jit_kernel.moe_lora_align import moe_lora_align_block_size
 
+if _is_cuda or _is_hip:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _compute_token_lora_mapping_kernel(
+        seg_indptr_ptr,  # int32 [num_reqs + 1]
+        req_to_lora_ptr,  # int32 [num_reqs]
+        output_ptr,  # int32 [num_tokens]
+        num_reqs,
+        num_tokens,
+        MAX_ITERS: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """Fused mapping: per-token binary-search into seg_indptr, then gather req_to_lora.
+
+        Replaces 3 torch kernels (arange + searchsorted + gather) with one launch.
+        Each program handles BLOCK_SIZE tokens; binary search is unrolled to
+        MAX_ITERS = ceil(log2(num_reqs + 1)) steps.
+        """
+        pid = tl.program_id(0)
+        offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        valid = offs < num_tokens
+        token_pos = offs.to(tl.int32)
+
+        lo = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+        hi = tl.full([BLOCK_SIZE], num_reqs, dtype=tl.int32)
+
+        for _ in range(MAX_ITERS):
+            mid = (lo + hi) // 2
+            # Mirror torch.searchsorted(..., right=True): find first idx where
+            # seg_indptr[idx+1] > token_pos. Clamp mid to last valid slot for safety.
+            safe_mid = tl.minimum(mid, num_reqs - 1)
+            seg_end = tl.load(
+                seg_indptr_ptr + safe_mid + 1, mask=valid, other=num_tokens
+            ).to(tl.int32)
+            go_right = seg_end <= token_pos
+            lo = tl.where(go_right, mid + 1, lo)
+            hi = tl.where(go_right, hi, mid)
+
+        req_idx = lo
+        in_range = valid & (req_idx < num_reqs)
+        lora_id = tl.load(req_to_lora_ptr + req_idx, mask=in_range, other=-1).to(
+            tl.int32
+        )
+        tl.store(output_ptr + offs, lora_id, mask=valid)
+
 
 def _get_moe_lora_block_config(max_lora_rank: int) -> dict:
     """Compute rank-aware block sizes for MoE LoRA kernels.
@@ -207,8 +254,37 @@ def _compute_token_lora_mapping(
     lora_info: LoRAInfo,
 ) -> torch.Tensor:
     """Map each token to its LoRA adapter index (-1 for no LoRA)."""
+    num_tokens = hidden_states.shape[0]
+    if num_tokens == 0:
+        return torch.empty(0, dtype=torch.int32, device=hidden_states.device)
+
+    if (_is_cuda or _is_hip) and hidden_states.is_cuda:
+        num_reqs = lora_info.req_to_lora.shape[0]
+        if num_reqs == 0:
+            return torch.full(
+                (num_tokens,), -1, dtype=torch.int32, device=hidden_states.device
+            )
+
+        output = torch.empty(
+            (num_tokens,), dtype=torch.int32, device=hidden_states.device
+        )
+        BLOCK_SIZE = 256
+        # Unroll depth: ceil(log2(num_reqs + 1)); +1 covers the half-open upper bound.
+        max_iters = max(1, (num_reqs + 1).bit_length())
+        grid = (triton.cdiv(num_tokens, BLOCK_SIZE),)
+        _compute_token_lora_mapping_kernel[grid](
+            lora_info.seg_indptr,
+            lora_info.req_to_lora,
+            output,
+            num_reqs,
+            num_tokens,
+            MAX_ITERS=max_iters,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        return output
+
     token_positions = torch.arange(
-        hidden_states.shape[0], device=hidden_states.device, dtype=torch.int32
+        num_tokens, device=hidden_states.device, dtype=torch.int32
     )
     req_indices = torch.searchsorted(
         lora_info.seg_indptr[1:].to(torch.int32),
