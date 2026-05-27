@@ -392,10 +392,19 @@ class EagleDraftWorker(BaseDraftWorker):
             self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
         )
 
-        # Under the no-verify-sync path seq_lens_sum is None; the kernel only
-        # consults it when there is no preallocated mask buffer to size against.
-        if batch.seq_lens_sum is None and tree_mask_buf is None:
-            batch.seq_lens_sum = batch.seq_lens.sum().item()
+        # build_tree_kernel uses seq_lens_sum only to SIZE the (non-preallocated)
+        # tree mask buffer. The kernel writes -- and verify attn reads -- ragged
+        # offsets computed from the GPU seq_lens tensor, so an over-sized buffer is
+        # correct: the extra tail is filled but never indexed. On the no-verify-sync
+        # path seq_lens_sum is None, so use a static host upper bound
+        # (sum(seq_lens) <= bs * max_context_len) instead of a per-iter
+        # seq_lens.sum().item() D2H sync.
+        seq_lens_sum = batch.seq_lens_sum
+        if seq_lens_sum is None and tree_mask_buf is None:
+            max_context_len = (
+                self.target_worker.model_runner.attn_backend.max_context_len
+            )
+            seq_lens_sum = batch.seq_lens.shape[0] * max_context_len
 
         (
             tree_mask,
@@ -410,7 +419,7 @@ class EagleDraftWorker(BaseDraftWorker):
             top_scores_index,
             draft_tokens,
             batch.seq_lens,
-            batch.seq_lens_sum or 0,
+            seq_lens_sum or 0,
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
