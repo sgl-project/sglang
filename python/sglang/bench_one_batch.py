@@ -954,19 +954,19 @@ def main(server_args, bench_args):
     else:
         workers = []
         for tp_rank in range(local_rank_start, local_rank_end):
-            with maybe_reindex_device_id(tp_rank - local_rank_start) as gpu_id:
-                proc = multiprocessing.Process(
-                    target=work_func,
-                    args=(
-                        server_args,
-                        port_args,
-                        bench_args,
-                        gpu_id,
-                        tp_rank,
-                    ),
-                )
-                proc.start()
-                workers.append(proc)
+            gpu_id = tp_rank - local_rank_start
+            proc = multiprocessing.Process(
+                target=work_func,
+                args=(
+                    server_args,
+                    port_args,
+                    bench_args,
+                    gpu_id,
+                    tp_rank,
+                ),
+            )
+            proc.start()
+            workers.append(proc)
 
         for proc in workers:
             proc.join()
