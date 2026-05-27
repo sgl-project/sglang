@@ -4943,5 +4943,234 @@ class TestAC1CallSites(unittest.TestCase):
         self.assertFalse(table.written[0, 10].item(), "slot 10 written despite save_kv_cache=False")
 
 
+class TestAC2Lifetime(unittest.TestCase):
+    """AC-2: token label table lifetime and slot budget invariants.
+
+    Covers:
+      - boot-time GB/rank log format
+      - table sized kv_pool.size + kv_pool.page_size (last slot writable)
+      - stale-slot overwrite overwrites completely (no accumulation)
+      - label visible immediately after write (no phantom state)
+    """
+
+    def _make_table(self, max_tokens, page_size=64, num_layers=2,
+                    num_heads=4, label_dim=8):
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+        return allocate_token_label_table(
+            num_layers_local=num_layers,
+            max_tokens=max_tokens,
+            num_heads_local=num_heads,
+            label_dim=label_dim,
+            page_size=page_size,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+
+    def test_boot_log_emits_gb_per_rank(self):
+        """allocate_token_label_table must emit a GB/rank INFO line."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+        with self.assertLogs(
+            "sglang.srt.layers.attention.double_sparsity.token_label_table",
+            level="INFO",
+        ) as log_ctx:
+            allocate_token_label_table(
+                num_layers_local=1, max_tokens=256, num_heads_local=2,
+                label_dim=4, page_size=64, dtype=torch.float32,
+                device=torch.device("cpu"),
+            )
+        joined = " ".join(log_ctx.output)
+        self.assertIn("token_label_table:", joined)
+        self.assertIn("GB/rank", joined)
+        # Dimension fields must be present so operators can audit sizing.
+        self.assertIn("L=1", joined)
+        self.assertIn("T=256", joined)
+        self.assertIn("H=2", joined)
+        self.assertIn("D=4", joined)
+
+    def test_slot_budget_covers_all_physical_kv_slots(self):
+        """Table sized kv_pool.size + kv_pool.page_size; last slot must be writable."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
+        )
+        kv_pool_size = 128
+        page_size = 64
+        max_tokens = kv_pool_size + page_size  # = 192
+
+        table = self._make_table(max_tokens, page_size=page_size)
+        last_slot = max_tokens - 1
+        cache_loc = torch.tensor([last_slot], dtype=torch.int64)
+        # label_dim=8 from _make_table; nope_dim must be >= 1 (channel_sel selects idx 0)
+        k_nope = torch.ones(1, 4, 8)
+        channel_sel = torch.zeros(4, 8, dtype=torch.int32)  # select channel 0
+        token_label_write(
+            table.signatures, table.written,
+            layer_id=0, cache_loc=cache_loc, k_nope=k_nope,
+            channel_selection_layer=channel_sel,
+        )
+        self.assertTrue(
+            bool(table.written[0, last_slot].item()),
+            f"last slot {last_slot} not written; table may be under-sized",
+        )
+        self.assertEqual(table.max_tokens, max_tokens)
+
+    def test_stale_slot_overwrite_replaces_prior_label(self):
+        """Writing a new label to a slot overwrites — does NOT accumulate."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
+        )
+        table = self._make_table(max_tokens=32)
+        slot = 7
+        cache_loc = torch.tensor([slot], dtype=torch.int64)
+        channel_sel = torch.zeros(4, 8, dtype=torch.int32)
+
+        k_first = torch.ones(1, 4, 8)
+        token_label_write(
+            table.signatures, table.written,
+            layer_id=0, cache_loc=cache_loc, k_nope=k_first,
+            channel_selection_layer=channel_sel,
+        )
+        self.assertTrue((table.signatures[0, slot] == 1.0).all().item())
+
+        k_second = torch.full((1, 4, 8), 2.0)
+        token_label_write(
+            table.signatures, table.written,
+            layer_id=0, cache_loc=cache_loc, k_nope=k_second,
+            channel_selection_layer=channel_sel,
+        )
+        label = table.signatures[0, slot]
+        self.assertTrue(
+            (label == 2.0).all().item(),
+            "stale-slot write did not overwrite; possible accumulation bug",
+        )
+        self.assertFalse(
+            (label == 1.0).any().item(),
+            "old label still present after overwrite",
+        )
+
+    def test_label_visible_immediately_after_write(self):
+        """Label written in one call is readable before any subsequent write — no phantom state."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
+        )
+        table = self._make_table(max_tokens=32)
+        slot = 3
+        cache_loc = torch.tensor([slot], dtype=torch.int64)
+        channel_sel = torch.zeros(4, 8, dtype=torch.int32)
+        sentinel = torch.full((1, 4, 8), 42.0)
+
+        token_label_write(
+            table.signatures, table.written,
+            layer_id=0, cache_loc=cache_loc, k_nope=sentinel,
+            channel_selection_layer=channel_sel,
+        )
+        label = table.signatures[0, slot]
+        self.assertTrue(
+            (label == 42.0).all().item(),
+            f"label not visible immediately after write; got {label}",
+        )
+        self.assertTrue(
+            bool(table.written[0, slot].item()),
+            "written flag not set after first write",
+        )
+
+
+class TestAC3RangeMask(unittest.TestCase):
+    """AC-3: per-request token range ownership prevents cross-request picks.
+
+    Positive: per_request_valid confines each request's top-K to its own slots.
+    Negative: without the mask, high-score foreign slots dominate — confirms
+              the mask is load-bearing.
+    """
+
+    def _make_scorer_inputs(self, bs=2, max_tokens=20, num_heads=2,
+                             label_dim=4, head_dim=8):
+        num_layers = 1
+        signatures = torch.zeros(num_layers, max_tokens, num_heads, label_dim)
+        written = torch.ones(num_layers, max_tokens, dtype=torch.bool)
+        channel_selection = torch.zeros(num_layers, num_heads, label_dim,
+                                        dtype=torch.int32)
+        channel_weights = torch.ones(num_layers, num_heads, label_dim,
+                                     dtype=torch.float32)
+        queries = torch.ones(bs, num_heads, head_dim)
+        return signatures, written, channel_selection, channel_weights, queries
+
+    def test_multi_request_picks_within_own_range_with_mask(self):
+        """per_request_valid confines each request's picks to its own slot range."""
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            retrieve_topk_via_labels,
+        )
+        bs, max_tokens, top_k = 2, 20, 5
+        sigs, written, ch_sel, ch_wts, queries = self._make_scorer_inputs(
+            bs=bs, max_tokens=max_tokens,
+        )
+        # Craft scores adversarially: req-1's slots (10..19) would outscore req-0's
+        # if there were no mask.
+        sigs[0, 10:20] = 1000.0
+        sigs[0, 0:10] = -1000.0
+
+        per_request_valid = torch.zeros(bs, max_tokens, dtype=torch.bool)
+        per_request_valid[0, 0:10] = True   # req-0 may only pick from 0..9
+        per_request_valid[1, 10:20] = True  # req-1 may only pick from 10..19
+
+        indices, lengths = retrieve_topk_via_labels(
+            queries=queries,
+            token_signatures=sigs,
+            written=written,
+            channel_selection=ch_sel,
+            channel_weights=ch_wts,
+            layer_id=0,
+            max_top_k=top_k,
+            per_request_valid=per_request_valid,
+        )
+        row0 = [int(v) for v in indices[0].tolist() if v >= 0]
+        row1 = [int(v) for v in indices[1].tolist() if v >= 0]
+        self.assertTrue(
+            all(s < 10 for s in row0),
+            f"req-0 picked from outside its range [0,10): {row0}",
+        )
+        self.assertTrue(
+            all(s >= 10 for s in row1),
+            f"req-1 picked from outside its range [10,20): {row1}",
+        )
+        self.assertGreater(lengths[0].item(), 0, "req-0 produced no valid picks")
+        self.assertGreater(lengths[1].item(), 0, "req-1 produced no valid picks")
+
+    def test_without_mask_cross_request_contamination_occurs(self):
+        """Without per_request_valid, high-score foreign slots dominate — mask is load-bearing."""
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            retrieve_topk_via_labels,
+        )
+        bs, max_tokens, top_k = 2, 20, 5
+        sigs, written, ch_sel, ch_wts, queries = self._make_scorer_inputs(
+            bs=bs, max_tokens=max_tokens,
+        )
+        # Slots 10..19 have extremely high scores for all queries.
+        # Without a mask, req-0 (logical owner of 0..9) will pick from 10..19.
+        sigs[0, 10:20] = 1000.0
+        sigs[0, 0:10] = 0.0
+        # queries=1.0 from _make_scorer_inputs → positive dot products with sigs=1000.
+
+        indices, _ = retrieve_topk_via_labels(
+            queries=queries,
+            token_signatures=sigs,
+            written=written,
+            channel_selection=ch_sel,
+            channel_weights=ch_wts,
+            layer_id=0,
+            max_top_k=top_k,
+            per_request_valid=None,  # no ownership mask — should contaminate
+        )
+        row0 = [int(v) for v in indices[0].tolist() if v >= 0]
+        # Without the mask req-0 picks from the high-score region 10..19.
+        self.assertTrue(
+            any(s >= 10 for s in row0),
+            f"expected cross-request contamination without mask, but row0={row0}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
