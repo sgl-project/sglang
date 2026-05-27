@@ -34,18 +34,6 @@ class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
             "SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB": "0.1",
             "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": str(cls.target_group),
             "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
-            # The violation ring is fill-once (writes past ring_capacity are
-            # dropped on the CUDA side). In SWA mode the SWA-side sweep emits
-            # ~1k verify_chain_hash violations within the first second
-            # (signature: expected_aux=0, i.e. prev_slot canary fields read as
-            # all-zero). Root cause is not yet understood — separately
-            # tracked; see project notes. Without bumping the ring those
-            # background violations saturate the default 1024-entry ring
-            # before the FULL-side perturb's real_kv_hash mismatch can
-            # record, so the assertion below sees nothing. 64K is large
-            # enough to outlast the background flood for the duration of
-            # this test.
-            "SGLANG_KV_CANARY_RING_CAPACITY": "65536",
         }
         super().setUpClass()
 
@@ -58,12 +46,8 @@ class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
         # Step 2: second batch drives more forward passes so the sweep cadence fires
         # while the orphan slots are still cached.
         self.send_parallel_requests(n=8)
-        # Accept either fail_reason: the SWA-side sweep verifier runs both
-        # chain-hash and real-kv-hash checks against the same corruption, and
-        # which check fires first is a race. Both legitimately detect this
-        # perturbation; either reaching the violation log is success.
         self.assert_sweep_violation_reported(
-            fail_reason=("verify_real_kv_hash", "verify_chain_hash"),
+            fail_reason="verify_real_kv_hash",
             target_group=self.target_group,
             flush_wait_seconds=5.0,
         )

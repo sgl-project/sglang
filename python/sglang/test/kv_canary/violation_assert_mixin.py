@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import Literal, Optional, Union
+from typing import Literal, Optional
 
 from sglang.srt.kv_canary.perturb.config import TargetGroupKind
 from sglang.test.kv_canary.violation_log_utils import (
@@ -19,7 +19,7 @@ class CanaryViolationAssertMixin:
     def assert_per_forward_violation_reported(
         self,
         *,
-        fail_reason: Union[str, tuple[str, ...]],
+        fail_reason: str,
         target_group: Optional[TargetGroupKind] = None,
         side: _Side = None,
         flush_wait_seconds: float = 2.0,
@@ -35,7 +35,7 @@ class CanaryViolationAssertMixin:
     def assert_sweep_violation_reported(
         self,
         *,
-        fail_reason: Union[str, tuple[str, ...]],
+        fail_reason: str,
         target_group: TargetGroupKind,
         side: _Side = None,
         flush_wait_seconds: float = 2.0,
@@ -52,7 +52,7 @@ class CanaryViolationAssertMixin:
     def assert_any_launch_tag_violation_reported(
         self,
         *,
-        fail_reason: Union[str, tuple[str, ...]],
+        fail_reason: str,
         side: _Side = None,
         flush_wait_seconds: float = 3.0,
         max_retries: int = 10,
@@ -76,7 +76,7 @@ class CanaryViolationAssertMixin:
         self,
         *,
         launch_tag_patterns: tuple[str, ...],
-        fail_reason: Union[str, tuple[str, ...]],
+        fail_reason: str,
         side: _Side = None,
         flush_wait_seconds: float = 2.0,
         max_retries: int = 1,
@@ -120,7 +120,7 @@ class CanaryViolationAssertMixin:
         self,
         *,
         launch_tag_patterns: tuple[str, ...],
-        fail_reason: Union[str, tuple[str, ...]],
+        fail_reason: str,
         side: _Side = None,
     ) -> None:
         log_text = self._captured_log_text(side)
