@@ -32,6 +32,8 @@ export SGLANG_OPT_FUSE_WQA_WKV=true
 
 export AITER_BF16_FP8_MOE_BOUND=1
 
+export SGLANG_FLYDSL_PREFILL=1
+
 MODEL=/root/hf_home/hub/models--deepseek-ai--DeepSeek-V4-Pro/snapshots/89d501aed998d33fa4f4702102ec1bb2331e10f6
 
 python3 -m sglang.launch_server \
@@ -42,6 +44,7 @@ python3 -m sglang.launch_server \
     --max-running-request 256 \
     --page-size 256 \
     --chunked-prefill-size 8192 \
+    --mem-fraction-static 0.88 \
     --port 8000 \
     --disable-shared-experts-fusion \
     --tool-call-parser deepseekv4 \
