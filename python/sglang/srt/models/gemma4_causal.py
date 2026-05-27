@@ -17,6 +17,8 @@ import re
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
+import triton
+import triton.language as tl
 from torch import nn
 from transformers import (
     Gemma4TextConfig,
@@ -59,6 +61,73 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
+
+
+@triton.jit
+def _gemma4_topk_softmax_scale_kernel(
+    gating_ptr,
+    scale_ptr,
+    weights_ptr,
+    ids_ptr,
+    stride_gm: tl.constexpr,
+    stride_wm: tl.constexpr,
+    num_experts: tl.constexpr,
+    topk: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_E)
+    mask = offs < num_experts
+    logits = tl.load(
+        gating_ptr + pid * stride_gm + offs, mask=mask, other=-float("inf")
+    ).to(tl.float32)
+
+    selected = tl.full((BLOCK_E,), False, dtype=tl.int1)
+    top1_logit = tl.full((), -float("inf"), dtype=tl.float32)
+    sum_top_exp = tl.full((), 0.0, dtype=tl.float32)
+
+    for i in range(topk):
+        candidate = tl.where(selected, -float("inf"), logits)
+        top_id = tl.argmax(candidate, axis=0)
+        top_logit = tl.max(candidate, axis=0)
+        tl.store(ids_ptr + pid * stride_wm + i, top_id)
+        if i == 0:
+            top1_logit = top_logit
+        sum_top_exp += tl.exp(top_logit - top1_logit)
+        selected = selected | (offs == top_id)
+
+    for i in range(topk):
+        top_id = tl.load(ids_ptr + pid * stride_wm + i)
+        top_logit = tl.load(gating_ptr + pid * stride_gm + top_id).to(tl.float32)
+        scale = tl.load(scale_ptr + top_id).to(tl.float32)
+        weight = tl.exp(top_logit - top1_logit) / sum_top_exp * scale
+        tl.store(weights_ptr + pid * stride_wm + i, weight)
+
+
+def gemma4_topk_softmax_scale(
+    gating_output: torch.Tensor,
+    per_expert_scale: torch.Tensor,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_tokens, num_experts = gating_output.shape
+    topk_weights = torch.empty(
+        (num_tokens, topk), dtype=torch.float32, device=gating_output.device
+    )
+    topk_ids = torch.empty(
+        (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+    )
+    _gemma4_topk_softmax_scale_kernel[(num_tokens,)](
+        gating_output,
+        per_expert_scale,
+        topk_weights,
+        topk_ids,
+        gating_output.stride(0),
+        topk_weights.stride(0),
+        num_experts=num_experts,
+        topk=topk,
+        BLOCK_E=triton.next_power_of_2(num_experts),
+    )
+    return topk_weights, topk_ids
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -218,17 +287,21 @@ class Gemma4MoE(nn.Module):
             topk: int,
             renormalize: bool,  # always True for Gemma4; softmax identity only holds when renormalizing
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            # softmax(all)[topk] / sum(softmax(all)[topk]) = softmax(topk_logits),
-            # so we softmax only the top-k logits (fewer kernel launches).
-            topk_logits, topk_ids = torch.topk(gating_output, k=topk, dim=-1)
-            topk_weights = torch.nn.functional.softmax(topk_logits, dim=-1)
+            if gating_output.is_cuda and topk <= 8:
+                return gemma4_topk_softmax_scale(
+                    gating_output,
+                    per_expert_scale,
+                    topk,
+                )
 
-            # Fold per_expert_scale into routing weights
-            topk_weights = topk_weights * per_expert_scale[topk_ids].to(
-                topk_weights.dtype
+            logits = gating_output.float()
+            _, topk_ids = torch.topk(logits, k=topk, dim=-1)
+            topk_logits = logits.gather(1, topk_ids)
+            topk_weights = torch.nn.functional.softmax(
+                topk_logits, dim=-1, dtype=torch.float32
             )
-
-            return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+            topk_weights = topk_weights * per_expert_scale[topk_ids].to(torch.float32)
+            return topk_weights, topk_ids.to(torch.int32)
 
         self.topk = TopK(
             top_k=config.top_k_experts,
