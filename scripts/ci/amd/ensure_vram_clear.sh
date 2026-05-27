@@ -169,6 +169,14 @@ ensure_vram_clear() {
     echo "========================"
     echo "Running in ROCm mode"
 
+    # Runner-perf snapshot: network/disk/CPU/GPU clocks captured BEFORE any
+    # GPU manipulation in this job. Used to triage the mi300-vs-mi325
+    # wall-clock gap observed in pr-test-amd.yml (e.g. run 26452774262 vs
+    # 26468467018 on the same commit/image). Best-effort; never fatal.
+    if [ -x "$SCRIPT_DIR/diagnose_runner_perf.sh" ]; then
+        bash "$SCRIPT_DIR/diagnose_runner_perf.sh" || true
+    fi
+
     # Always stop the well-known CI container first (best-effort).
     echo "Stopping any existing ci_sglang container..."
     docker stop ci_sglang 2>/dev/null || true
