@@ -305,6 +305,56 @@ class TestTritonDenseAttentionBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_dense_attention_case(self, case)
 
+    # Layout-robustness: re-run a representative extend + decode under
+    # non-tidy `(req_to_token, out_cache_loc)` mappings. The fixture's
+    # default contiguous layout uses
+    # `_token_loc(req_idx, pos) = page_size + req_idx * max_ctx + pos`,
+    # which is affine in `pos` — it hides any backend bug that assumes
+    # `out_cache_loc` is monotonic within a request, or that a request's
+    # pages occupy a contiguous physical range. Production allocators
+    # routinely produce non-tidy `out_cache_loc` after fragmentation,
+    # so these layouts catch a class of metadata-derivation bugs the
+    # default layout doesn't exercise. The reference doesn't change —
+    # it computes attention from projected Q/K/V directly without
+    # reading the cache.
+    LAYOUT_ROBUSTNESS_CASES = (
+        DenseAttentionCase(
+            name="layout_extend_two_request_ragged",
+            backend="triton",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=12,
+            num_kv_heads=12,
+            page_size=16,
+            prefix_lens=(8, 16),
+            extend_lens=(8, 16),
+        ),
+        DenseAttentionCase(
+            name="layout_decode_page_boundary",
+            backend="triton",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=12,
+            num_kv_heads=12,
+            page_size=16,
+            prefix_lens=(15, 16, 17),
+        ),
+    )
+
+    def test_layout_robustness_cases(self):
+        for case in self.LAYOUT_ROBUSTNESS_CASES:
+            for layout in (
+                "shuffled_pages",
+                "interleaved_pages",
+                "non_monotonic_extend",
+            ):
+                if (
+                    layout == "non_monotonic_extend"
+                    and case.forward_mode.is_decode()
+                ):
+                    # decode has no extend tokens to scatter
+                    continue
+                with self.subTest(case=case.name, layout=layout):
+                    run_dense_attention_case(self, case, loc_layout=layout)
+
     def test_runner_mode_cuda_graph_decode_cases(self):
         for case in self.CUDA_GRAPH_CASES:
             with self.subTest(case=case.name, backend=case.backend):

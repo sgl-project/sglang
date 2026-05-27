@@ -536,7 +536,128 @@ class DenseAttentionFixture:
 
 
 def _token_loc(req_idx: int, pos: int, *, page_size: int, max_context_len: int) -> int:
+    """Default contiguous loc mapping: each request gets a contiguous block of
+    `max_context_len` slots starting at slot `page_size + req_idx * max_context_len`.
+
+    See `make_loc_fn(layout=...)` for non-tidy variants that catch backend
+    bugs in page-table derivation from non-contiguous `out_cache_loc` /
+    `req_to_token`.
+    """
     return page_size + req_idx * max_context_len + pos
+
+
+def make_loc_fn(
+    layout: str,
+    *,
+    batch_size: int,
+    seq_lens: tuple[int, ...],
+    prefix_lens: tuple[int, ...],
+    page_size: int,
+    max_context_len: int,
+    seed: int = 0,
+):
+    """Build a `(req_idx, pos) -> physical_cache_loc` callable for non-tidy
+    layouts that stress the backend's `(req_to_token, out_cache_loc)`
+    interpretation.
+
+    Layouts:
+    - ``contiguous``: default tidy mapping (`_token_loc`).
+    - ``shuffled_pages``: within each request, page order is randomly
+      permuted. The set of physical pages is unchanged; only the
+      mapping (logical_page -> physical_page) is. Catches backends that
+      assume `req_to_token[req_idx, pos]` increases monotonically with
+      `pos`.
+    - ``interleaved_pages``: pages from different requests are interleaved
+      in physical-slot order. With `bs=2`, req 0's pages land on physical
+      pages [0, 2, 4, ...] and req 1's on [1, 3, 5, ...]. Catches
+      backends assuming a request's pages occupy a contiguous physical
+      range.
+    - ``non_monotonic_extend``: prefix uses contiguous layout; the
+      extend tokens for a request scatter to slots in a non-monotonic
+      order, which is what fragmented allocators can produce in
+      production. Catches backends assuming `out_cache_loc[i+1] ==
+      out_cache_loc[i] + 1` within an extend.
+
+    All non-contiguous layouts produce a bijection over the same set
+    of physical slots used by the contiguous baseline, so the test
+    pool size stays unchanged.
+    """
+    if layout == "contiguous":
+        def loc_fn(req_idx: int, pos: int) -> int:
+            return _token_loc(
+                req_idx, pos, page_size=page_size, max_context_len=max_context_len
+            )
+        return loc_fn
+
+    import random
+
+    rng = random.Random(seed)
+
+    # Each layout precomputes a per-request mapping `pos -> slot_offset_within_request`.
+    # Final loc = page_size + req_idx * max_context_len + slot_offset.
+    # For interleaved we additionally rewrite the per-request base.
+    per_req_mapping: list[dict[int, int]] = []
+    per_req_base: list[int] = []
+
+    pages_per_req = max(1, max_context_len // page_size)
+
+    if layout == "shuffled_pages":
+        for req_idx in range(batch_size):
+            page_perm = list(range(pages_per_req))
+            random.Random(seed + 17 * (req_idx + 1)).shuffle(page_perm)
+            mapping = {}
+            for pos in range(seq_lens[req_idx]):
+                logical_page = pos // page_size
+                pos_within = pos % page_size
+                physical_page = page_perm[logical_page % pages_per_req]
+                mapping[pos] = physical_page * page_size + pos_within
+            per_req_mapping.append(mapping)
+            per_req_base.append(req_idx * max_context_len)
+
+    elif layout == "interleaved_pages":
+        # Global physical page assignment: with bs=B, request r's logical
+        # page p maps to physical page (p * B + r). All requests share the
+        # same global pool [0, total_pages * page_size).
+        # Total pages allocated = max(pages_per_req * batch_size,
+        #                            sum(ceil(seq_len/page_size)))
+        for req_idx in range(batch_size):
+            mapping = {}
+            for pos in range(seq_lens[req_idx]):
+                logical_page = pos // page_size
+                pos_within = pos % page_size
+                physical_page = logical_page * batch_size + req_idx
+                mapping[pos] = physical_page * page_size + pos_within
+            per_req_mapping.append(mapping)
+            per_req_base.append(0)  # no per-request offset; pages are global
+
+    elif layout == "non_monotonic_extend":
+        # Prefix tokens stay contiguous; extend tokens (positions
+        # >= prefix_lens[req_idx]) are scattered within the request's
+        # block via a fixed permutation. The set of slots is unchanged.
+        for req_idx in range(batch_size):
+            prefix_len = prefix_lens[req_idx]
+            extend_len = seq_lens[req_idx] - prefix_len
+            mapping = {}
+            for pos in range(prefix_len):
+                mapping[pos] = pos
+            extend_perm = list(range(extend_len))
+            random.Random(seed + 31 * (req_idx + 1)).shuffle(extend_perm)
+            for offset in range(extend_len):
+                # original extend position is prefix_len + offset
+                # remapped position within the request's block:
+                # prefix_len + extend_perm[offset]
+                mapping[prefix_len + offset] = prefix_len + extend_perm[offset]
+            per_req_mapping.append(mapping)
+            per_req_base.append(req_idx * max_context_len)
+
+    else:
+        raise ValueError(f"unknown loc layout: {layout!r}")
+
+    def loc_fn(req_idx: int, pos: int) -> int:
+        within = per_req_mapping[req_idx][pos]
+        return page_size + per_req_base[req_idx] + within
+
+    return loc_fn
 
 
 def _make_forward_batch(
@@ -545,6 +666,7 @@ def _make_forward_batch(
     *,
     max_context_len: int,
     device: str,
+    loc_fn=None,
 ) -> ForwardBatch:
     seq_lens = case.seq_lens
     input_lens = case.input_lens
@@ -552,37 +674,27 @@ def _make_forward_batch(
     out_cache_locs: List[int] = []
     positions: List[int] = []
 
-    for req_idx, seq_len in enumerate(seq_lens):
-        for pos in range(seq_len):
-            runner.req_to_token_pool.req_to_token[req_idx, pos] = _token_loc(
+    if loc_fn is None:
+        def loc_fn(req_idx: int, pos: int) -> int:
+            return _token_loc(
                 req_idx,
                 pos,
                 page_size=case.page_size,
                 max_context_len=max_context_len,
             )
 
+    for req_idx, seq_len in enumerate(seq_lens):
+        for pos in range(seq_len):
+            runner.req_to_token_pool.req_to_token[req_idx, pos] = loc_fn(req_idx, pos)
+
         if case.forward_mode.is_decode():
             positions.append(seq_len - 1)
-            out_cache_locs.append(
-                _token_loc(
-                    req_idx,
-                    seq_len - 1,
-                    page_size=case.page_size,
-                    max_context_len=max_context_len,
-                )
-            )
+            out_cache_locs.append(loc_fn(req_idx, seq_len - 1))
         else:
             prefix_len = case.prefix_lens[req_idx]
             for offset in range(input_lens[req_idx]):
                 positions.append(prefix_len + offset)
-                out_cache_locs.append(
-                    _token_loc(
-                        req_idx,
-                        prefix_len + offset,
-                        page_size=case.page_size,
-                        max_context_len=max_context_len,
-                    )
-                )
+                out_cache_locs.append(loc_fn(req_idx, prefix_len + offset))
 
     batch = ForwardBatch(
         forward_mode=case.forward_mode,
@@ -755,7 +867,17 @@ def _populate_prefix_kv(
     prefix_hidden: list[torch.Tensor],
     *,
     max_context_len: int,
+    loc_fn=None,
 ):
+    if loc_fn is None:
+        def loc_fn(req_idx: int, pos: int) -> int:
+            return _token_loc(
+                req_idx,
+                pos,
+                page_size=case.page_size,
+                max_context_len=max_context_len,
+            )
+
     locs = []
     keys = []
     values = []
@@ -766,14 +888,7 @@ def _populate_prefix_kv(
         keys.append(k.view(-1, case.num_kv_heads, module.head_dim))
         values.append(v.view(-1, case.num_kv_heads, module.head_dim))
         for pos in range(prefix.shape[0]):
-            locs.append(
-                _token_loc(
-                    req_idx,
-                    pos,
-                    page_size=case.page_size,
-                    max_context_len=max_context_len,
-                )
-            )
+            locs.append(loc_fn(req_idx, pos))
 
     if not locs:
         return
@@ -799,6 +914,7 @@ def build_dense_attention_fixture(
     disable_cuda_graph: bool = True,
     disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
+    loc_layout: str = "contiguous",
 ) -> DenseAttentionFixture:
     seed = 2026 + len(case.name) + case.num_kv_heads
     torch.manual_seed(seed)
@@ -856,11 +972,21 @@ def build_dense_attention_fixture(
         dtype=dtype,
         device=device,
     )
+    loc_fn = make_loc_fn(
+        loc_layout,
+        batch_size=case.batch_size,
+        seq_lens=case.seq_lens,
+        prefix_lens=case.prefix_lens,
+        page_size=case.page_size,
+        max_context_len=max_context_len,
+        seed=seed,
+    )
     forward_batch = _make_forward_batch(
         case,
         runner,
         max_context_len=max_context_len,
         device=device,
+        loc_fn=loc_fn,
     )
     _populate_prefix_kv(
         actual_module,
@@ -868,6 +994,7 @@ def build_dense_attention_fixture(
         runner,
         prefix_hidden,
         max_context_len=max_context_len,
+        loc_fn=loc_fn,
     )
 
     return DenseAttentionFixture(
@@ -1088,6 +1215,7 @@ def run_dense_attention_case(
     max_context_len: int = DEFAULT_MAX_CONTEXT_LEN,
     dtype: torch.dtype = DEFAULT_DTYPE,
     device: str = DEFAULT_DEVICE,
+    loc_layout: str = "contiguous",
 ):
     fixture = build_dense_attention_fixture(
         testcase,
@@ -1097,6 +1225,7 @@ def run_dense_attention_case(
         max_context_len=max_context_len,
         dtype=dtype,
         device=device,
+        loc_layout=loc_layout,
     )
     actual = run_dense_fixture_eager(fixture)
     expected = expected_dense_fixture_output(fixture)
