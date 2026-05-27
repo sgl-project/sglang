@@ -63,6 +63,9 @@ default parameters when initializing and generating videos.
    difference is transformer depth and width, picked up from
    `transformer/config.json` at load time. A single checkpoint serves T2V,
    I2V (`--image-path`), and T2I (`--num-frames 1`).
+   The checkpoints also support Video-to-Video (V2V), sound, and action
+   modalities, but sglang does not yet expose these — support is planned
+   for a follow-up release.
 
 ### Image Generation Models
 
