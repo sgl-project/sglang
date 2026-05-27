@@ -6,6 +6,17 @@
 # node, 8-way TP, page=64. Mutually exclusive with --enable-hisparse at
 # startup (per DEC-8).
 #
+# Locked Option B operating point (plan §13 / DEC-1) — these flags MUST
+# agree across this script and development/serve_native_nsa.sh so that
+# the AC-8 / AC-9 / AC-11 comparison only differs by DS enablement and
+# the AC-10 radix-cache gate:
+#   --kv-cache-dtype fp8_e4m3
+#   --dsa-prefill-backend flashmla_kv
+#   --dsa-decode-backend  flashmla_kv
+#   --disable-overlap-schedule
+#   --disable-piecewise-cuda-graph
+#   --page-size 64
+#
 # DEV-ONLY launcher. The DS startup validator refuses --enable-double-sparsity
 # The page-table adapter is now in place; production deployments boot
 # without any DS dev-override environment variable. The previous
@@ -47,6 +58,10 @@ exec python3 -m sglang.launch_server \
   --tp-size "${TP_SIZE}" \
   --kv-cache-dtype "${KV_CACHE_DTYPE}" \
   --page-size "${PAGE_SIZE}" \
+  --dsa-prefill-backend flashmla_kv \
+  --dsa-decode-backend flashmla_kv \
+  --disable-overlap-schedule \
+  --disable-piecewise-cuda-graph \
   --enable-double-sparsity \
   --double-sparsity-config "${DS_CONFIG}" \
   --disable-radix-cache \

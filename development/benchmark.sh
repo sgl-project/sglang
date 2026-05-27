@@ -4,16 +4,26 @@
 # MODE=double_sparsity (default) tags output files for the DS column of the
 # two-column comparison report. Pair with development/benchmark_baseline.sh
 # (MODE=native_nsa) on the same hardware and workload to populate both
-# columns. The downstream two-column report is wired in task15 once a real
-# DS run is feasible; until then this script only emits the DS rows.
+# columns. Outputs land in development/results/ next to the comparator
+# (benchmark_compare.py) and AC-9/AC-11 artifact dir.
 #
 # Server must already be running on PORT (default 30000) with Double
 # Sparsity enabled — see development/serve_double_sparsity.sh for the
 # exact server invocation.
+#
+# Per AC-8 / AC-9 the locked sweep is concurrency 16 / 32 / 64 (was conc=64
+# only). Override CONCURRENCIES to narrow if you only need a quick smoke.
+# Each run emits a `.meta.json` sidecar alongside the JSONL with the
+# commit SHA, server args (from /get_server_info), seed,
+# chunked-prefill setting, and timestamp so the AC-11 comparator can
+# verify both columns share the same operating point.
 set -euo pipefail
 
 PORT="${PORT:-30000}"
+HOST="${HOST:-127.0.0.1}"
 MODE="${MODE:-double_sparsity}"
+RESULTS_DIR="${RESULTS_DIR:-$(pwd)/development/results}"
+mkdir -p "${RESULTS_DIR}"
 
 # ISL = sys + q = 2253 + 1843 = 4096; cache_hit = 2253/4096 ≈ 0.550
 SYS_LEN=2253
@@ -25,14 +35,22 @@ NUM_GROUPS=1
 # Per-concurrency seeds, mirroring the reference sweep pattern.
 declare -A SEEDS=( [16]=213 [32]=431 [64]=31234 )
 
-# Default sweep: conc 64 only. Override by setting CONCURRENCIES,
-# e.g. CONCURRENCIES="16 32 64".
-CONCURRENCIES="${CONCURRENCIES:-64}"
+# Default sweep: AC-8 / AC-9 plan-locked conc 16 / 32 / 64.
+# Override CONCURRENCIES (space-separated) for a narrower sweep.
+CONCURRENCIES="${CONCURRENCIES:-16 32 64}"
+
+COMMIT_SHA="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 
 for CONCURRENCY in ${CONCURRENCIES}; do
   SEED="${SEEDS[$CONCURRENCY]}"
-  OUTPUT_FILE="${MODE}_gsp_isl4096_osl512_c${CONCURRENCY}.jsonl"
+  OUTPUT_FILE="${RESULTS_DIR}/${MODE}_gsp_isl4096_osl512_c${CONCURRENCY}.jsonl"
+  META_FILE="${OUTPUT_FILE}.meta.json"
   echo ">>> mode=${MODE} concurrency=${CONCURRENCY} num_prompts=${NUM_PROMPTS} groups=${NUM_GROUPS}x${NUM_PROMPTS} seed=${SEED} output=${OUTPUT_FILE}"
+
+  # Capture server args for the AC-11 comparator (best-effort; absent on
+  # CI / non-server environments — the .meta.json field will be null).
+  SERVER_ARGS_JSON="$(curl -s --max-time 5 "http://${HOST}:${PORT}/get_server_info" || echo '{}')"
+  TIMESTAMP_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   python3 -m sglang.bench_serving \
     --backend sglang \
@@ -49,4 +67,20 @@ for CONCURRENCY in ${CONCURRENCIES}; do
     --max-concurrency "${CONCURRENCY}" \
     --output-file "${OUTPUT_FILE}" \
     --output-details
+
+  python3 - <<PYEOF > "${META_FILE}"
+import json
+print(json.dumps({
+    "commit_sha": "${COMMIT_SHA}",
+    "mode": "${MODE}",
+    "concurrency": ${CONCURRENCY},
+    "seed": ${SEED},
+    "num_prompts": ${NUM_PROMPTS},
+    "isl_total_tokens": $(( SYS_LEN + Q_LEN )),
+    "osl_tokens": ${OUT_LEN},
+    "timestamp_utc": "${TIMESTAMP_UTC}",
+    "server_args": ${SERVER_ARGS_JSON},
+}, indent=2))
+PYEOF
+  echo "    sidecar          = ${META_FILE}"
 done

@@ -8,6 +8,20 @@
 #
 # Double Sparsity is intentionally NOT enabled here — the baseline runs
 # unmodified NSA selection so the comparison row pair is honest.
+#
+# Locked Option B operating point (plan §13 / DEC-1) — same locked flags as
+# development/serve_double_sparsity.sh, so the AC-8 / AC-9 / AC-11
+# comparison only differs by DS enablement and the AC-10 radix-cache gate:
+#   --kv-cache-dtype fp8_e4m3
+#   --dsa-prefill-backend flashmla_kv
+#   --dsa-decode-backend  flashmla_kv
+#   --disable-overlap-schedule
+#   --disable-piecewise-cuda-graph
+#   --page-size 64
+# NOTE: this script does NOT pass --disable-radix-cache. Per plan §13 the
+# DSA baseline runs with radix cache ON so any DS TPS gap vs DSA reflects
+# the DS configuration alone, not the radix gate that DS still has to
+# clear (AC-10).
 
 set -euo pipefail
 
@@ -35,5 +49,9 @@ exec python3 -m sglang.launch_server \
   --tp-size "${TP_SIZE}" \
   --kv-cache-dtype "${KV_CACHE_DTYPE}" \
   --page-size "${PAGE_SIZE}" \
+  --dsa-prefill-backend flashmla_kv \
+  --dsa-decode-backend flashmla_kv \
+  --disable-overlap-schedule \
+  --disable-piecewise-cuda-graph \
   --trust-remote-code \
   2>&1 | tee "${LOG_FILE}"
