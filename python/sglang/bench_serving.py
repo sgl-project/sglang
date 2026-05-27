@@ -1009,6 +1009,8 @@ def calculate_metrics(
                             outputs[i].text_chunks[k], add_special_tokens=False
                         )
                     )
+                    if num_tokens == 0:
+                        continue
                     adjusted_itl = itl / num_tokens
                     retokenized_itls.extend([adjusted_itl] * num_tokens)
             else:
