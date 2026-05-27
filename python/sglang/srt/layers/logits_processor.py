@@ -65,7 +65,6 @@ from sglang.srt.utils.common import (
 
 logger = logging.getLogger(__name__)
 
-_is_pin_memory_available = is_pin_memory_available()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 
@@ -627,8 +626,13 @@ class LogitsProcessor(nn.Module):
             pin_memory=is_pin_memory_available(),
         ).to(device, non_blocking=True)
         if logits_metadata.temp_scaled_logprobs:
+            logits_metadata.temperature = torch.repeat_interleave(
                 logits_metadata.temperature.view(-1),
                 pruned_lens,
+            ).view(-1, 1)
+        if logits_metadata.top_p_normalized_logprobs:
+            logits_metadata.top_p = torch.repeat_interleave(
+                logits_metadata.top_p,
                 pruned_lens,
             )
 
