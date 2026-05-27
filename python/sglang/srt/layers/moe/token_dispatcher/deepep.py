@@ -521,10 +521,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             topk_ids = topk_ids.new_full((1, _nk), -1)
             topk_weights = topk_weights.new_zeros((1, _nk))
             if isinstance(x, tuple):
-                x = tuple(
-                    t.new_zeros((1, t.size(1) if t.dim() > 1 else 1))
-                    for t in x
-                )
+                x = tuple(t.new_zeros((1, t.size(1) if t.dim() > 1 else 1)) for t in x)
             else:
                 x = x.new_zeros((1, x.size(1) if x.dim() > 1 else 1))
         (
@@ -601,7 +598,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         event.current_stream_wait() if self.async_finish else ()
         self.handle = None
         self.src2dst = None
-        if getattr(self, '_empty_pad', False):
+        if getattr(self, "_empty_pad", False):
             hidden_states = hidden_states[:0]
             self._empty_pad = False
         return hidden_states
@@ -777,7 +774,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         if overlap_args is not None:
             self.device_module.current_stream().wait_stream(overlap_args.stream)
 
-        if getattr(self, '_ll_empty_pad', False):
+        if getattr(self, "_ll_empty_pad", False):
             hidden_states = hidden_states[:0]
             self._ll_empty_pad = False
 
