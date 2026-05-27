@@ -909,6 +909,109 @@ class TestAC11EndToEnd(unittest.TestCase):
                     )
                     self.assertEqual(self._ac11_main(dsa, ds), 2)
 
+    # ---- Round 34: side identity + per-epoch num_prompts ----------
+
+    def test_side_identity_dsa_with_ds_flag_refused(self):
+        """A DSA-baseline sidecar that declares ``enable_double_sparsity
+        =True`` is structurally wrong — DSA must run with DS OFF."""
+        with tempfile.TemporaryDirectory() as tmp:
+            # DSA side carries DS flags (should refuse).
+            dsa_sa = _option_b_sa(enable_ds=True)
+            dsa = self._make_trials(
+                tmp, "dsa", 64, [100, 100, 100], [10, 10, 10],
+                sidecar_overrides={
+                    "server_args": dsa_sa,
+                    # mode still says native_nsa from the helper, but
+                    # the DS flags trip the refusal first.
+                },
+            )
+            ds = self._make_trials(tmp, "ds", 64, [100, 100, 100], [10, 10, 10])
+            self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_side_identity_ds_missing_enable_flag_refused(self):
+        """A DS-on sidecar that omits ``enable_double_sparsity`` is
+        impossible — it would mean the server was launched WITHOUT
+        --enable-double-sparsity."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10])
+            # DS side with mode=double_sparsity but no enable flag.
+            ds_sa = _option_b_sa()  # no enable_ds → no DS flags
+            ds = self._make_trials(
+                tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                sidecar_overrides={"server_args": ds_sa},
+            )
+            self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_side_identity_ds_missing_config_refused(self):
+        """A DS-on sidecar with empty ``double_sparsity_config`` is
+        also impossible — DS needs the mask artifact path."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10])
+            # enable=True but config="" → refuse
+            ds_sa = _option_b_sa(enable_ds=True, double_sparsity_config="")
+            ds = self._make_trials(
+                tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                sidecar_overrides={"server_args": ds_sa},
+            )
+            self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_side_identity_both_sides_native_refused(self):
+        """Codex's reproducer: 3 DSA files + 3 fake-DS files whose
+        sidecars all declare ``mode='native_nsa'`` and lack the DS
+        flags. Without the identity gate the comparator exits 0;
+        with it, exit 2 — the DS column is not actually DS-on."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(
+                tmp, "dsa", 64, [100, 100, 100], [10, 10, 10],
+            )
+            # `_make_trials(label="ds", ...)` picks
+            # mode="double_sparsity" by default; override BOTH the
+            # mode field AND the server_args to imitate Codex's
+            # reproducer where the operator forgot to launch DS-on.
+            ds = self._make_trials(
+                tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                sidecar_overrides={
+                    "mode": "native_nsa",
+                    "server_args": _option_b_sa(),
+                },
+            )
+            self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_side_identity_mode_field_mismatch_refused(self):
+        """DSA-baseline sidecar copy-pasted from a DS run still says
+        ``mode='double_sparsity'`` — identity gate must catch it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(
+                tmp, "dsa", 64, [100, 100, 100], [10, 10, 10],
+                sidecar_overrides={"mode": "double_sparsity"},
+            )
+            ds = self._make_trials(tmp, "ds", 64, [100, 100, 100], [10, 10, 10])
+            self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_jsonl_num_prompts_per_epoch_matches_sidecar(self):
+        """A legitimate multi-epoch artifact emits JSONL
+        ``num_prompts=<per-epoch>`` (matching the sidecar) and a
+        separate ``measured_num_prompts=<per-epoch * measured_epochs>``.
+        The comparator must accept it even when ``measured_epochs > 1``.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            # Both sides report measured_epochs=2; num_prompts=320 in
+            # JSONL matches sidecar; measured_num_prompts is the total.
+            extra = {
+                "measured_epochs": 2,
+                "measured_num_prompts": 320 * 2,
+                # `num_prompts` defaults to 320 in the fixture summary.
+            }
+            dsa = self._make_trials(
+                tmp, "dsa", 64, [100, 100, 100], [10, 10, 10],
+                extra_summary=extra,
+            )
+            ds = self._make_trials(
+                tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                extra_summary=extra,
+            )
+            self.assertEqual(self._ac11_main(dsa, ds), 0)
+
     def test_chunked_prefill_size_unknown_string_allowed_when_consistent(self):
         """``_bench_meta_writer.py`` falls back to the string
         ``"unknown"`` when ``/server_info`` doesn't expose

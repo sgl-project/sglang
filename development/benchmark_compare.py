@@ -94,8 +94,8 @@ class RunContext:
 
 
 def _filename_concurrency(path: str) -> Optional[int]:
-    # Round 31's 3-trial sweep appends ``_t<N>`` between the concurrency
-    # tag and the ``.jsonl`` extension (e.g. ``_c64_t2.jsonl``); accept
+    # The 3-trial sweep appends ``_t<N>`` between the concurrency tag
+    # and the ``.jsonl`` extension (e.g. ``_c64_t2.jsonl``); accept
     # both that form and the legacy ``_c64.jsonl`` form.
     m = re.search(r"_c(\d+)(?:_t\d+)?\.jsonl$", path)
     if m:
@@ -346,9 +346,9 @@ def _group_by_concurrency(paths: List[str]) -> Dict[int, List[str]]:
     `_c<N>.jsonl` as a last resort.
 
     Raises ``ValueError`` when a file is missing, contains malformed JSON,
-    or has no resolvable concurrency. Round 30's earlier version
-    swallowed parse errors and let `_run_ac11_mode` re-trip them as
-    uncaught tracebacks.
+    or has no resolvable concurrency. An earlier version swallowed
+    parse errors and let `_run_ac11_mode` re-trip them as uncaught
+    tracebacks.
     """
     by_conc: Dict[int, List[str]] = {}
     for p in paths:
@@ -461,9 +461,9 @@ _DS_ONLY_SERVER_ARG_KEYS = frozenset({
 
 
 # The AC-11 comparator must compare every stable ``ServerArgs`` launch
-# field across DSA and DS — Codex Round 32 review showed that a hand-
-# curated 12-key whitelist silently dropped `disable_cuda_graph` /
-# `trust_remote_code` / `dtype` / `max_total_tokens` mismatches. Derive
+# field across DSA and DS — a hand-curated whitelist silently drops
+# launch-flag mismatches such as ``disable_cuda_graph`` /
+# ``trust_remote_code`` / ``dtype`` / ``max_total_tokens``. Derive
 # the full set from ``dataclasses.fields(ServerArgs)`` so any new
 # launch flag added to sglang is automatically protected.
 #
@@ -519,10 +519,10 @@ def _sidecar_path(result_path: str) -> str:
 def _require_sidecar_fields(meta: Dict, *, side: str, path: str) -> None:
     """Refuse sidecars missing reproducibility / workload fields.
 
-    Codex Round 31 review caught the comparator treating ``None == None``
-    as "agreement" when both sidecars omitted the same field. Enforcing
-    presence + well-typedness inside the meta reader makes every later
-    cross-side / per-side comparison work on real values.
+    Treating ``None == None`` as "agreement" when both sidecars omit
+    the same field is unsafe; enforcing presence + well-typedness
+    inside the meta reader makes every later cross-side / per-side
+    comparison work on real values.
     """
     seed = meta.get("seed")
     if not isinstance(seed, int) or isinstance(seed, bool):
@@ -642,6 +642,74 @@ def _require_option_b_locked_fields(
         )
 
 
+def _validate_ac11_side_identity(
+    meta: Dict, *, expected_side: str, path: str,
+) -> None:
+    """Refuse sidecars whose declared side identity does not match the
+    expected column.
+
+    Because ``_normalize_ac11_server_args`` strips the DS-enablement
+    pair from cross-side comparison (those are the ONLY sanctioned
+    differences), the comparator must separately prove that the DSA
+    column is actually DSA-on and the DS column is actually DS-on.
+    Otherwise two columns of native-NSA artifacts pass the gate with
+    no DS measurement performed.
+
+    For ``expected_side="DSA"`` the sidecar must declare
+    ``mode="native_nsa"`` and must NOT carry the DS-enablement flags.
+    For ``expected_side="DS"`` the sidecar must declare
+    ``mode="double_sparsity"``, set
+    ``server_args.enable_double_sparsity is True``, and supply a
+    non-empty ``server_args.double_sparsity_config``.
+    """
+    if expected_side not in ("DSA", "DS"):
+        raise ValueError(
+            f"_validate_ac11_side_identity: unknown expected_side="
+            f"{expected_side!r}."
+        )
+    mode = meta.get("mode")
+    sa = meta.get("server_args") or {}
+    enable = sa.get("enable_double_sparsity") if isinstance(sa, dict) else None
+    config = sa.get("double_sparsity_config") if isinstance(sa, dict) else None
+
+    if expected_side == "DSA":
+        if mode != "native_nsa":
+            raise ValueError(
+                f"AC-11 DSA trial {path}: sidecar mode={mode!r} but "
+                "expected 'native_nsa' for the DSA baseline column."
+            )
+        if enable:
+            raise ValueError(
+                f"AC-11 DSA trial {path}: sidecar declares "
+                "enable_double_sparsity=True; the DSA baseline column "
+                "must run with Double Sparsity OFF."
+            )
+        if isinstance(config, str) and config:
+            raise ValueError(
+                f"AC-11 DSA trial {path}: sidecar carries "
+                f"double_sparsity_config={config!r}; the DSA baseline "
+                "must not load a DS mask."
+            )
+    else:  # expected_side == "DS"
+        if mode != "double_sparsity":
+            raise ValueError(
+                f"AC-11 DS trial {path}: sidecar mode={mode!r} but "
+                "expected 'double_sparsity' for the DS-on column."
+            )
+        if enable is not True:
+            raise ValueError(
+                f"AC-11 DS trial {path}: sidecar declares "
+                f"enable_double_sparsity={enable!r}; the DS-on column "
+                "must launch with --enable-double-sparsity."
+            )
+        if not isinstance(config, str) or not config:
+            raise ValueError(
+                f"AC-11 DS trial {path}: sidecar "
+                f"double_sparsity_config={config!r} is empty/missing; "
+                "the DS-on column must point at the DS mask artifact."
+            )
+
+
 def _validate_trial_metrics(metrics: RunMetrics, *, side: str, path: str) -> None:
     """Refuse trials that lack the metrics the AC-11 gates need."""
     if metrics.output_tps_p50 is None:
@@ -681,7 +749,8 @@ def _validate_jsonl_workload_matches_sidecar(
     The sidecar is written from env vars before/after the bench run; the
     JSONL is the canonical record of what actually executed. If they
     disagree, the sidecar is lying about the workload that ran and
-    Round 31's per-side / cross-side agreement checks would be wrong.
+    every later per-side / cross-side workload-agreement check is
+    wrong.
     """
     pairs = (
         ("num_prompts", metrics.num_prompts, meta.get("num_prompts")),
@@ -707,7 +776,7 @@ def _validate_jsonl_duration(
 ) -> None:
     """Refuse trials whose bench_serving wall-clock is below the AC-11 floor.
 
-    Codex Round 31 review caught the comparator trusting the sidecar's
+    Trusting only the sidecar's
     ``measurement_window_seconds`` field even when the JSONL ``duration``
     reported only a few seconds (operator forgot to size ``num_prompts``
     for the requested window). bench_serving's ``duration`` is the
@@ -1000,6 +1069,7 @@ def _run_ac11_mode(args) -> int:
                 _validate_jsonl_duration(m, side="DS", path=p)
             for meta, p, m in zip(dsa_metas, dsa_by_conc[conc], dsa_trials):
                 _validate_meta_floors(meta, side="DSA", path=p)
+                _validate_ac11_side_identity(meta, expected_side="DSA", path=p)
                 if meta.get("concurrency") != conc:
                     raise ValueError(
                         f"AC-11 DSA trial {p}: sidecar "
@@ -1015,6 +1085,7 @@ def _run_ac11_mode(args) -> int:
                 )
             for meta, p, m in zip(ds_metas, ds_by_conc[conc], ds_trials):
                 _validate_meta_floors(meta, side="DS", path=p)
+                _validate_ac11_side_identity(meta, expected_side="DS", path=p)
                 if meta.get("concurrency") != conc:
                     raise ValueError(
                         f"AC-11 DS trial {p}: sidecar "

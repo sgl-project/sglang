@@ -1247,8 +1247,8 @@ async def benchmark(
         async with semaphore:
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
-    # Round 33 (AC-11): seconds-based warmup + measurement-window driver.
-    # The dispatch logic for one full pass over `input_requests` lives in
+    # Seconds-based warmup + measurement-window driver. The dispatch
+    # logic for one full pass over `input_requests` lives in
     # `_dispatch_workload_once` below so both phases can reuse it. The
     # legacy count-based warmup + single-pass measured run is preserved
     # untouched when `--warmup-seconds` and `--measurement-window-seconds`
@@ -1356,8 +1356,8 @@ async def benchmark(
             if profile_output.success:
                 print("Profiler started")
 
-    # Round 33 (AC-11): one full pass over `input_requests`. Reused by
-    # both the seconds-based warmup loop (outputs discarded) and the
+    # One full pass over `input_requests`. Reused by both the
+    # seconds-based warmup loop (outputs discarded) and the
     # seconds-based measurement-window loop (outputs accumulated).
     async def _dispatch_workload_once(
         *, with_pbar: bool,
@@ -1450,13 +1450,13 @@ async def benchmark(
             pbar.close()
         return epoch_outputs, time.perf_counter() - epoch_start
 
-    # Round 33: seconds-based warmup (optional). Runs full epochs until
+    # Seconds-based warmup (optional). Runs full epochs until
     # `warmup_seconds` is reached, discards outputs, and resets the
     # random + numpy seeds before the measured phase so warmup does not
     # perturb the measured request-arrival process.
     if warmup_seconds > 0:
         print(
-            f"AC-11 time-based warmup: running full epochs until "
+            f"Time-based warmup: running full epochs until "
             f">= {warmup_seconds:.1f}s elapsed (request-count warmup "
             "was already run above)."
         )
@@ -1467,7 +1467,7 @@ async def benchmark(
             wu_epochs += 1
         wu_elapsed = time.perf_counter() - wu_start
         print(
-            f"AC-11 warmup ran {wu_epochs} epoch(s) over {wu_elapsed:.1f}s. "
+            f"Warmup ran {wu_epochs} epoch(s) over {wu_elapsed:.1f}s. "
             "Re-seeding random/np.random before measured phase."
         )
         random.seed(args.seed)
@@ -1476,11 +1476,11 @@ async def benchmark(
     # Run all requests
     benchmark_start_time = time.perf_counter()
     if measurement_window_s > 0:
-        # Round 33: seconds-based measurement window. Accumulate outputs
-        # across full epochs until `measurement_window_seconds` is met.
+        # Seconds-based measurement window. Accumulate outputs across
+        # full epochs until `measurement_window_seconds` is met;
         # `benchmark_duration` is the accumulated measured wall-clock.
         print(
-            f"AC-11 time-based measurement: running full epochs until "
+            f"Time-based measurement: running full epochs until "
             f"accumulated wall-clock >= {measurement_window_s:.1f}s."
         )
         outputs: List[RequestFuncOutput] = []
@@ -1522,8 +1522,8 @@ async def benchmark(
                 if profile_output.success:
                     print("Profiler stopped")
 
-    # Round 33: pbar is owned per-epoch by `_dispatch_workload_once`, so
-    # nothing to close here.
+    # pbar is owned per-epoch by `_dispatch_workload_once`, so nothing
+    # to close here.
 
     if "sglang" in backend:
         server_info = requests.get(
@@ -1547,18 +1547,29 @@ async def benchmark(
     else:
         accept_length = None
 
-    # Compute metrics and print results
-    # Round 33: in seconds-based measurement-window mode `duration` is
-    # the accumulated measured wall-clock across all epochs, not the
-    # outer wall-clock (which would include profiler-start / server_info
-    # overhead between epochs).
+    # Compute metrics and print results. In seconds-based
+    # measurement-window mode `duration` is the accumulated measured
+    # wall-clock across all epochs, not the outer wall-clock (which
+    # would include profiler-start / server_info overhead between
+    # epochs).
     benchmark_duration = (
         benchmark_duration_override
         if benchmark_duration_override is not None
         else time.perf_counter() - benchmark_start_time
     )
+    # Repeat the per-epoch input row list `measured_epochs` times so
+    # `calculate_metrics` can index `input_requests[i]` for every
+    # accumulated output. The workload is deterministic per epoch (the
+    # seed is reset between warmup and measured phases), so replicating
+    # the row list mirrors the dispatch order.
+    if is_multi_turn:
+        metrics_input_requests = None
+    elif measured_epochs > 1:
+        metrics_input_requests = input_requests * measured_epochs
+    else:
+        metrics_input_requests = input_requests
     metrics, output_lens = calculate_metrics(
-        input_requests=None if is_multi_turn else input_requests,
+        input_requests=metrics_input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
@@ -1679,12 +1690,19 @@ async def benchmark(
         and metrics.mean_itl_ms is not None
         and metrics.output_throughput is not None
     ):
-        # Round 33 (AC-11): derive an effective workload triple
-        # (num_prompts, input_len, output_len) that survives both
-        # `random` / `random-ids` / `image` (which use args.random_input_len)
-        # and `generated-shared-prefix` (which uses gsp_* knobs). The
-        # comparator side requires these fields to cross-check the
-        # sidecar's claim of what ran.
+        # Derive an effective workload triple (num_prompts, input_len,
+        # output_len) that survives both `random` / `random-ids` /
+        # `image` (which use args.random_input_len) and
+        # `generated-shared-prefix` (which uses gsp_* knobs). The
+        # downstream comparator cross-checks these against the sidecar
+        # workload metadata.
+        #
+        # `num_prompts` is the PER-EPOCH workload shape so it matches
+        # the sidecar (which is generated from the per-epoch
+        # NUM_PROMPTS env var). The total measured request count
+        # across a multi-epoch measurement window goes into the
+        # separate `measured_num_prompts` field; `completed` is the
+        # number of successful outputs.
         if args.dataset_name == "generated-shared-prefix":
             effective_input_len = int(
                 getattr(args, "gsp_system_prompt_len", 0)
@@ -1696,9 +1714,8 @@ async def benchmark(
         else:
             effective_input_len = int(args.random_input_len or 0)
             effective_output_len = int(args.random_output_len or 0)
-        effective_num_prompts = int(
-            getattr(args, "num_prompts", 0) * measured_epochs
-        )
+        per_epoch_num_prompts = int(getattr(args, "num_prompts", 0))
+        measured_num_prompts_total = per_epoch_num_prompts * measured_epochs
         result = {
             # Arguments
             "tag": getattr(args, "tag", None),
@@ -1710,13 +1727,15 @@ async def benchmark(
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
             "random_range_ratio": args.random_range_ratio,
-            # AC-11 workload triple (canonical record of what ran).
-            "num_prompts": effective_num_prompts,
+            # Workload triple (canonical record of what ran each
+            # epoch). Per-epoch so it matches the sidecar.
+            "num_prompts": per_epoch_num_prompts,
             "input_len": effective_input_len,
             "output_len": effective_output_len,
             "warmup_seconds": warmup_seconds,
             "measurement_window_seconds": measurement_window_s,
             "measured_epochs": measured_epochs,
+            "measured_num_prompts": measured_num_prompts_total,
             # Information
             "server_info": server_info,
             # Results
@@ -2412,20 +2431,21 @@ if __name__ == "__main__":
         default=1,
         help="Number of warmup requests to run before the benchmark",
     )
-    # Round 33 (AC-11): seconds-based warmup + measurement-window driver.
-    # When set, the benchmark runs full workload epochs over
-    # `--input-file` / `--num-prompts` until the elapsed wall-clock
-    # crosses the threshold (warmup outputs discarded; measurement
-    # outputs accumulated). Default 0 keeps legacy single-pass behavior.
+    # Seconds-based warmup + measurement-window driver. When set, the
+    # benchmark runs full workload epochs over `--input-file` /
+    # `--num-prompts` until the elapsed wall-clock crosses the
+    # threshold (warmup outputs discarded; measurement outputs
+    # accumulated). Default 0 keeps legacy single-pass behavior.
     parser.add_argument(
         "--warmup-seconds",
         type=float,
         default=0.0,
         help=(
-            "Round 33 (AC-11): if > 0, run full workload epochs until "
-            "this many seconds elapsed before the measured phase. "
-            "Outputs are discarded; random/np.random seeds are reset "
-            "before the first measured epoch."
+            "If > 0, run full workload epochs until this many seconds "
+            "have elapsed before the measured phase begins. Outputs "
+            "are discarded; random/np.random seeds are reset before "
+            "the first measured epoch so warmup does not perturb the "
+            "measured request-arrival process."
         ),
     )
     parser.add_argument(
@@ -2433,10 +2453,10 @@ if __name__ == "__main__":
         type=float,
         default=0.0,
         help=(
-            "Round 33 (AC-11): if > 0, accumulate measured outputs "
-            "across full workload epochs until this many seconds of "
-            "wall-clock have elapsed. `duration` in the JSONL is the "
-            "accumulated measured time."
+            "If > 0, accumulate measured outputs across full workload "
+            "epochs until this many seconds of wall-clock have "
+            "elapsed. `duration` in the JSONL is the accumulated "
+            "measured time."
         ),
     )
     parser.add_argument(

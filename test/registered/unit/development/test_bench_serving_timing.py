@@ -462,5 +462,152 @@ class TestBenchServingJSONLWorkloadFields(unittest.TestCase):
             bs.ASYNC_REQUEST_FUNCS.pop("test_backend", None)
 
 
+class TestBenchServingMultiEpochRealMetrics(unittest.TestCase):
+    """Regression for the Round 33 multi-epoch crash.
+
+    When ``measurement_window_seconds > 0`` and the workload needs more
+    than one epoch, `calculate_metrics` must receive an `input_requests`
+    list whose length matches `len(outputs)` — Round 33 passed the
+    single-epoch list, so any 2+ epoch run raised
+    ``IndexError: list index out of range``.
+
+    These tests drive bench_serving WITHOUT monkeypatching
+    `calculate_metrics`, so the real metric path is exercised.
+    """
+
+    def setUp(self):
+        self.bs = _load_bs()
+
+    def _drive(self, *, num_input_rows, window_s):
+        bs = self.bs
+        args = SimpleNamespace(
+            backend="sglang",
+            dataset_name="generated-shared-prefix",
+            num_prompts=num_input_rows,
+            random_input_len=0,
+            random_output_len=0,
+            sharegpt_output_len=None,
+            random_range_ratio=1.0,
+            plot_throughput=False,
+            output_file=None,
+            output_details=False,
+            tag=None,
+            seed=1,
+            tokenize_prompt=False,
+            warmup_requests=0,
+            warmup_seconds=0.0,
+            measurement_window_seconds=window_s,
+            mooncake_num_rounds=1,
+            gsp_system_prompt_len=2048,
+            gsp_question_len=2048,
+            gsp_output_len=512,
+        )
+        bs.args = args
+
+        async def fake(*, request_func_input, pbar=None):
+            await asyncio.sleep(0.002)
+            out = bs.RequestFuncOutput()
+            out.success = True
+            out.prompt_len = request_func_input.prompt_len
+            out.output_len = request_func_input.output_len
+            out.latency = 0.005
+            out.ttft = 0.002
+            out.itl = [0.001, 0.001, 0.001]
+            out.generated_text = "ok"
+            out.error = ""
+            return out
+
+        bs.ASYNC_REQUEST_FUNCS["test_backend"] = fake
+
+        # Real tokenizer.encode would tokenize "ok"; use a small mock
+        # that returns a fixed token list per call so calculate_metrics
+        # can run end-to-end.
+        tokenizer = mock.MagicMock()
+        tokenizer.encode = lambda text, add_special_tokens=False: [1, 2]
+
+        input_requests = []
+        for i in range(num_input_rows):
+            row = bs.DatasetRow(
+                prompt=f"prompt-{i}",
+                prompt_len=8,
+                output_len=4,
+                image_data=None,
+            )
+            row.timestamp = 0.0
+            row.routing_key = None
+            row.extra_request_body = {}
+            input_requests.append(row)
+
+        async def _noop_profile(*a, **kw):
+            return SimpleNamespace(success=True)
+
+        class _NoopResp:
+            status_code = 200
+            def json(self): return {}
+
+        sink_holder = {}
+        real_open = open
+
+        def _fake_open(path, mode="r", *a, **kw):
+            if "w" in mode or "a" in mode:
+                import io
+                sink = io.StringIO()
+                sink.close = lambda: None  # type: ignore[assignment]
+                sink_holder["sink"] = sink
+                return sink
+            return real_open(path, mode, *a, **kw)
+
+        try:
+            with mock.patch.object(bs.requests, "post", lambda *a, **kw: _NoopResp()), \
+                 mock.patch.object(bs.requests, "get", lambda *a, **kw: _NoopResp()), \
+                 mock.patch.object(bs, "async_request_profile", _noop_profile), \
+                 mock.patch.object(bs.time, "sleep", lambda s: None), \
+                 mock.patch("builtins.open", _fake_open):
+                async def _run():
+                    await bs.benchmark(
+                        backend="test_backend",
+                        api_url="http://stub/",
+                        base_url="http://stub",
+                        model_id="stub-model",
+                        tokenizer=tokenizer,
+                        input_requests=input_requests,
+                        request_rate=float("inf"),
+                        max_concurrency=4,
+                        disable_tqdm=True,
+                        lora_names=[],
+                        lora_request_distribution=None,
+                        lora_zipf_alpha=None,
+                        extra_request_body={},
+                        profile=False,
+                        warmup_requests=0,
+                    )
+                asyncio.run(_run())
+            sink = sink_holder["sink"]
+            import json as _json
+            row = _json.loads(sink.getvalue().strip().splitlines()[-1])
+            return row
+        finally:
+            bs.ASYNC_REQUEST_FUNCS.pop("test_backend", None)
+
+    def test_multi_epoch_real_metrics_path_no_index_error(self):
+        # 2 input rows, 30ms window. Each epoch is ~2-5ms, so 2+ epochs
+        # are needed. The real `calculate_metrics` is exercised — it
+        # would IndexError on Round 33's code.
+        row = self._drive(num_input_rows=2, window_s=0.03)
+        self.assertGreaterEqual(row["measured_epochs"], 2)
+        # `completed` must equal the accumulated output count.
+        self.assertEqual(row["completed"], 2 * row["measured_epochs"])
+
+    def test_multi_epoch_jsonl_consistency(self):
+        row = self._drive(num_input_rows=2, window_s=0.03)
+        # `num_prompts` is per-epoch; `measured_num_prompts` is total.
+        self.assertEqual(row["num_prompts"], 2)
+        self.assertEqual(
+            row["measured_num_prompts"],
+            row["num_prompts"] * row["measured_epochs"],
+        )
+        self.assertGreaterEqual(row["duration"], 0.03)
+
+
 if __name__ == "__main__":
     unittest.main()
