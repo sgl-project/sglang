@@ -75,6 +75,50 @@ def _make_metadata(rebalanced: bool = False):
 
 
 @pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="This test requires CUDA",
+)
+def test_dispatch_probability_matches_torch_reference():
+    """The fused CUDA `dispatch_probability` and the pure-torch reference
+    must produce identical outputs for the same ``random_vals``. Single-rank,
+    runs on any CUDA GPU."""
+    from sglang.jit_kernel.lplb.cuda_solver import (
+        dispatch_probability,
+        dispatch_probability_torch_reference,
+    )
+
+    torch.manual_seed(0)
+    device = torch.device("cuda:0")
+    num_logical, max_copies, num_tokens, topk = 8, 3, 64, 4
+
+    # Random LP-style probabilities (some rows zeroed to exercise the fallback).
+    log2phy_prob = torch.rand(num_logical, max_copies, device=device)
+    log2phy_prob[0] = 0  # force fallback row
+    log2phy_map = torch.full(
+        (num_logical, max_copies), -1, dtype=torch.int32, device=device
+    )
+    for i in range(num_logical):
+        log2phy_map[i, 0] = i  # primary replica
+        log2phy_map[i, 1] = num_logical + (i % 4)  # one redundant
+        # leave last slot at -1 to exercise the masked-replica path
+
+    topk_ids = torch.randint(
+        0, num_logical, (num_tokens, topk), dtype=torch.int32, device=device
+    )
+    random_vals = torch.rand(num_tokens * topk, device=device, dtype=torch.float32)
+
+    cuda_out = dispatch_probability(topk_ids, log2phy_prob, log2phy_map, random_vals)
+    torch_out = dispatch_probability_torch_reference(
+        topk_ids, log2phy_prob, log2phy_map, random_vals
+    )
+
+    assert torch.equal(cuda_out, torch_out), (
+        f"dispatch_probability disagrees with torch reference: "
+        f"{(cuda_out != torch_out).sum().item()}/{cuda_out.numel()} mismatches"
+    )
+
+
+@pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < NUM_GPUS,
     reason=f"This test requires at least {NUM_GPUS} CUDA devices",
 )
