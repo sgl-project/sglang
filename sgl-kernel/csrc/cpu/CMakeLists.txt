@@ -115,7 +115,7 @@ if("$ENV{SGLANG_CPU_FP8_CVT_FTZ}" STREQUAL "1")
     add_compile_definitions(SGLANG_CPU_FP8_CVT_FTZ)
 endif()
 
-if(${MY_ARCH_DIR} STREQUAL "x86_64")
+if(MY_ARCH_DIR STREQUAL "x86_64")
     add_compile_options(
         -O3
         -Wno-unknown-pragmas
