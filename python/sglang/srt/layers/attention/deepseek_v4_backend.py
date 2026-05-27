@@ -1216,47 +1216,18 @@ class DeepseekV4AttnBackend(
         extend_start_loc: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if (
-            envs.SGLANG_BCG_VECTORIZE_PREFILL_EXPAND.get()
-            and seq_lens_tensor is not None
+            seq_lens_tensor is not None
             and extend_seq_lens_tensor is not None
             and extend_start_loc is not None
         ):
-            repeats = extend_seq_lens_tensor.to(torch.int64)
-            req_pool_indices_repeated = torch.repeat_interleave(
-                req_pool_indices, repeats, output_size=num_tokens
+            return self._expand_prefill_casually_vectorized(
+                num_tokens=num_tokens,
+                seq_lens=seq_lens_tensor,
+                extend_seq_lens=extend_seq_lens_tensor,
+                extend_start_loc=extend_start_loc,
+                req_pool_indices=req_pool_indices,
+                padded_num_tokens=padded_num_tokens,
             )
-
-            start_positions = (
-                seq_lens_tensor.to(torch.int32)
-                - extend_seq_lens_tensor.to(torch.int32)
-                + 1
-            )
-            start_positions_repeated = torch.repeat_interleave(
-                start_positions, repeats, output_size=num_tokens
-            )
-            start_locs_repeated = torch.repeat_interleave(
-                extend_start_loc.to(torch.int32), repeats, output_size=num_tokens
-            )
-            token_offsets = (
-                torch.arange(num_tokens, **self.cuda_int32_kwargs) - start_locs_repeated
-            )
-            seq_lens_casual = start_positions_repeated + token_offsets
-
-            if padded_num_tokens is not None and padded_num_tokens > num_tokens:
-                pad_size = padded_num_tokens - num_tokens
-                seq_lens_casual = torch.nn.functional.pad(
-                    seq_lens_casual,
-                    (0, pad_size),
-                    value=1,
-                )
-                req_pool_indices_repeated = torch.cat(
-                    (
-                        req_pool_indices_repeated,
-                        req_pool_indices_repeated[-1:].expand(pad_size),
-                    )
-                )
-
-            return seq_lens_casual, req_pool_indices_repeated
 
         seq_lens_casual = torch.empty(num_tokens, **self.cuda_int32_kwargs)
         idx_to_req_repeated = torch.empty(num_tokens, **self.cuda_int32_kwargs)
@@ -1281,6 +1252,48 @@ class DeepseekV4AttnBackend(
                 req_pool_indices_repeated,
                 (0, pad_size),
                 value=req_pool_indices_repeated[-1].item(),
+            )
+
+        return seq_lens_casual, req_pool_indices_repeated
+
+    def _expand_prefill_casually_vectorized(
+        self,
+        num_tokens: int,
+        seq_lens: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        extend_start_loc: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        padded_num_tokens: Optional[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        repeats = extend_seq_lens.to(torch.int64)
+        req_pool_indices_repeated = torch.repeat_interleave(
+            req_pool_indices, repeats, output_size=num_tokens
+        )
+
+        start_positions = seq_lens.to(torch.int32) - extend_seq_lens.to(torch.int32) + 1
+        start_positions_repeated = torch.repeat_interleave(
+            start_positions, repeats, output_size=num_tokens
+        )
+        start_locs_repeated = torch.repeat_interleave(
+            extend_start_loc.to(torch.int32), repeats, output_size=num_tokens
+        )
+        token_offsets = (
+            torch.arange(num_tokens, **self.cuda_int32_kwargs) - start_locs_repeated
+        )
+        seq_lens_casual = start_positions_repeated + token_offsets
+
+        if padded_num_tokens is not None and padded_num_tokens > num_tokens:
+            pad_size = padded_num_tokens - num_tokens
+            seq_lens_casual = torch.nn.functional.pad(
+                seq_lens_casual,
+                (0, pad_size),
+                value=1,
+            )
+            req_pool_indices_repeated = torch.cat(
+                (
+                    req_pool_indices_repeated,
+                    req_pool_indices_repeated[-1:].expand(pad_size),
+                )
             )
 
         return seq_lens_casual, req_pool_indices_repeated
