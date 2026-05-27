@@ -288,11 +288,14 @@ class Envs:
     # by splitting prefill into layer groups and transferring each group
     # incrementally. Only effective in PD disaggregation prefill mode.
     SGLANG_PIPELINED_KV_TRANSFER = EnvBool(False)
-    SGLANG_PIPELINE_GROUP_SIZE = EnvInt(10)
+    # Optional fixed group_size override. When not set, the adaptive formula
+    # below computes group_size automatically based on prompt length.
+    SGLANG_PIPELINE_GROUP_SIZE = EnvInt(0)
     SGLANG_PIPELINE_MIN_TOKENS = EnvInt(3072)
     # Adaptive iteration bounds for the pipeline formula:
     # target_iters = clamp(MAX - t*(MAX-MIN), MIN, MAX) where
-    # t = (avg_tokens - MIN_TOKENS) / (MIN_TOKENS * 2).
+    # t = (avg_tokens - MIN_TOKENS) / (SAT_TOKENS - MIN_TOKENS),
+    # SAT_TOKENS = MIN_TOKENS * 3 (saturation point).
     # MAX_ITERS: more groups for short prompts (reduces exposed T/N or C/N).
     # MIN_ITERS: fewer groups for long prompts (compute already hides transfer).
     SGLANG_PIPELINE_MAX_ITERS = EnvInt(10)
