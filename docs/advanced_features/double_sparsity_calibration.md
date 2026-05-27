@@ -13,7 +13,8 @@ This guide documents how to produce a channel mask file for the standalone Doubl
 | Input | Purpose | Default |
 |-------|---------|---------|
 | `--model` | HuggingFace ID or local path to the model | required |
-| `--dtype` | `fp8_e4m3` or `bfloat16` — must match `--kv-cache-dtype` at serving time | required |
+| `--dtype` | Model loading dtype for the forward pass (`bfloat16` for calibration stability) | required |
+| `--kv-cache-dtype` | Dtype written into mask metadata — must match `--kv-cache-dtype` at serving time | same as `--dtype` |
 | `--output` | Path to write the channel mask `safetensors` file | required |
 | `--label-dim` | Width of the compressed projection (selector buffer) | 16 |
 | `--page-size` | Must match serving `--page-size` | 64 |
@@ -31,6 +32,7 @@ For DeepSeek-V3.2 on the H200 cluster (per DEC-1; see also `development/serve_na
 python -m sglang.srt.layers.attention.double_sparsity.calibrate \
     --model /cluster-storage/models/deepseek-ai/DeepSeek-V3.2 \
     --dtype bfloat16 \
+    --kv-cache-dtype fp8_e4m3 \
     --tp 1 \
     --output /models/dsv32-fp8-channel-mask.safetensors \
     --label-dim 16 \
@@ -40,6 +42,8 @@ python -m sglang.srt.layers.attention.double_sparsity.calibrate \
     --seed 42 \
     -v
 ```
+
+`--dtype bfloat16` loads the model in bf16 for calibration stability. `--kv-cache-dtype fp8_e4m3` writes the serving dtype into the mask metadata; it must match the `--kv-cache-dtype` flag of the Option-B DS server (default `fp8_e4m3`). The startup validator rejects a mask whose metadata dtype differs from the server's KV cache dtype.
 
 **Expected wall clock**: 30–90 minutes on 1× H200 with the model loaded in bf16 mode. The script is single-process (`--tp` is informational); calibrate on a single rank then deploy to TP=8/16 at serving time. The validator does NOT carry TP world size in the artifact — DEC-9's per-rank reduction handles cross-rank consistency.
 

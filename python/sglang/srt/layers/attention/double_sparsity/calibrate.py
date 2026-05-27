@@ -12,11 +12,12 @@ blocks of 512 tokens each. ``--dataset`` overrides with a path to an external
 newline-delimited corpus. ``--allow-synthetic`` enables a small NIAH-shaped
 synthetic fallback reserved for CI and developer smoke tests only.
 
-Production recipe (DeepSeek-V3.2 on H200 cluster):
+Production recipe (DeepSeek-V3.2 on H200 cluster, FP8 serving):
 
     python -m sglang.srt.layers.attention.double_sparsity.calibrate \\
         --model /cluster-storage/models/deepseek-ai/DeepSeek-V3.2 \\
         --dtype bfloat16 \\
+        --kv-cache-dtype fp8_e4m3 \\
         --tp 1 \\
         --output /models/dsv32-fp8-channel-mask.safetensors \\
         --label-dim 16 \\
@@ -24,6 +25,10 @@ Production recipe (DeepSeek-V3.2 on H200 cluster):
         --num-samples 256 \\
         --block-size 512 \\
         --seed 42
+
+``--dtype`` is the model loading dtype (bf16 for calibration stability).
+``--kv-cache-dtype`` is what goes into the mask metadata; it must match
+``--kv-cache-dtype`` at serving time (``fp8_e4m3`` for the Option-B path).
 
 CI runs with ``--allow-synthetic`` against a tiny fixture (no network, <1 min).
 """
@@ -280,9 +285,24 @@ def _collect_channel_importance(
         getattr(config, "hidden_size", 0) // max(num_heads, 1)
     )
     k_head_dim = qk_nope_head_dim if qk_nope_head_dim > 0 else head_dim
-    # For MLA, Q_nope occupies the first qk_nope_head_dim columns per head;
-    # the remaining (head_dim - qk_nope_head_dim) columns are Q_RoPE.
-    qk_rope_head_dim = (head_dim - qk_nope_head_dim) if qk_nope_head_dim > 0 else 0
+    # For MLA (DeepSeek), read qk_rope_head_dim directly from config when present.
+    # Deriving from head_dim - qk_nope_head_dim is wrong when head_dim is itself
+    # derived from hidden_size // num_heads (e.g. V3.2: 7168//128=56, not 128+64=192).
+    _cfg_rope = int(getattr(config, "qk_rope_head_dim", 0))
+    if _cfg_rope > 0:
+        qk_rope_head_dim = _cfg_rope
+    elif qk_nope_head_dim > 0:
+        qk_rope_head_dim = head_dim - qk_nope_head_dim
+        if qk_rope_head_dim <= 0:
+            raise RuntimeError(
+                f"Cannot derive qk_rope_head_dim for MLA config at {model_path!r}: "
+                f"head_dim={head_dim} - qk_nope_head_dim={qk_nope_head_dim} = "
+                f"{qk_rope_head_dim}. Ensure the config has an explicit "
+                "'qk_rope_head_dim' field or pass --head-dim with the correct "
+                "total per-head dimension."
+            )
+    else:
+        qk_rope_head_dim = 0
     if num_layers <= 0 or num_heads <= 0 or k_head_dim <= 0:
         raise RuntimeError(
             f"Could not derive calibration shape from {model_path!r}: "
@@ -491,6 +511,15 @@ def calibrate(args: argparse.Namespace) -> str:
         raise ValueError(
             f"--dtype must be one of {_SUPPORTED_DTYPES}, got {args.dtype!r}."
         )
+    # --kv-cache-dtype controls what goes into the mask metadata (must match the
+    # serving --kv-cache-dtype).  When omitted it defaults to --dtype for backward
+    # compatibility, but they are semantically distinct: --dtype is the model-load
+    # forward dtype; --kv-cache-dtype is the runtime serving dtype.
+    mask_dtype: str = getattr(args, "kv_cache_dtype", None) or args.dtype
+    if mask_dtype not in _SUPPORTED_DTYPES:
+        raise ValueError(
+            f"--kv-cache-dtype must be one of {_SUPPORTED_DTYPES}, got {mask_dtype!r}."
+        )
     if args.label_dim <= 0:
         raise ValueError(f"--label-dim must be positive, got {args.label_dim}.")
     if args.page_size <= 0:
@@ -556,7 +585,7 @@ def calibrate(args: argparse.Namespace) -> str:
         args.output,
         channel_selection,
         selected_weights,
-        dtype=args.dtype,
+        dtype=mask_dtype,
         head_dim=head_dim_arg,
         page_size=args.page_size,
         label_dim=args.label_dim,
@@ -584,7 +613,20 @@ def _make_parser() -> argparse.ArgumentParser:
         "--dtype",
         required=True,
         choices=_SUPPORTED_DTYPES,
-        help="kv_cache_dtype the channel mask is calibrated for.",
+        help=(
+            "Model loading dtype for the calibration forward pass. "
+            "Use 'bfloat16' for stability even when serving in FP8."
+        ),
+    )
+    p.add_argument(
+        "--kv-cache-dtype",
+        default=None,
+        choices=_SUPPORTED_DTYPES,
+        help=(
+            "KV-cache dtype written into the mask metadata; must match "
+            "--kv-cache-dtype at serving time. Defaults to --dtype when omitted. "
+            "For FP8 serving, pass --dtype bfloat16 --kv-cache-dtype fp8_e4m3."
+        ),
     )
     p.add_argument(
         "--tp",

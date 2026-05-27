@@ -2048,6 +2048,132 @@ class TestCalibrateMethod1(unittest.TestCase):
             f"Got {block_ids[511]}; docs were merely truncated if this fails.",
         )
 
+    def test_dsv32_real_config_shape_q_hook_fires(self):
+        """V3.2 config has qk_rope_head_dim=4 but no head_dim field.
+
+        hidden_size // num_heads = 32 // 4 = 8, not qk_nope + qk_rope = 12.
+        The old code derived qk_rope_head_dim = 8 - 8 = 0 (or negative in prod),
+        setting full_mla_q_width=None and silently skipping every Q hook.
+        The fix reads config.qk_rope_head_dim directly; this test proves Method 1
+        Q/K importance is accumulated correctly for this config shape.
+        """
+        import tempfile
+        import torch.nn as nn
+        from unittest.mock import patch as _patch
+
+        from sglang.srt.layers.attention.double_sparsity.calibrate import (
+            _collect_channel_importance,
+        )
+
+        num_heads = 4
+        qk_nope = 8
+        qk_rope = 4
+        v_head_dim_val = 4
+        T = 3
+
+        # Config with explicit qk_rope_head_dim, no head_dim.
+        # hidden_size // num_heads = 32 // 4 = 8 ≠ qk_nope + qk_rope = 12.
+        cfg = SimpleNamespace(
+            num_hidden_layers=1,
+            num_attention_heads=num_heads,
+            qk_nope_head_dim=qk_nope,
+            qk_rope_head_dim=qk_rope,
+            v_head_dim=v_head_dim_val,
+            hidden_size=32,
+            # intentionally no head_dim attribute
+        )
+
+        k_full = num_heads * (qk_nope + v_head_dim_val)   # 4*(8+4)=48
+        q_full = num_heads * (qk_nope + qk_rope)           # 4*(8+4)=48
+        rng = torch.Generator().manual_seed(42)
+        k_out = torch.rand(T, k_full, generator=rng)
+        q_out = torch.rand(T, q_full, generator=rng)
+
+        k_nope_ref = k_out.float().reshape(T, num_heads, qk_nope + v_head_dim_val)[..., :qk_nope].contiguous()
+        q_nope_ref = q_out.float().reshape(T, num_heads, qk_nope + qk_rope)[..., :qk_nope].contiguous()
+        expected_imp = (q_nope_ref * k_nope_ref).abs().mean(dim=0)
+
+        class _FixedOut(nn.Module):
+            def __init__(self, out):
+                super().__init__()
+                self._out = out
+            def forward(self, x):
+                return (self._out,)
+
+        class _FakeAttn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.kv_b_proj = _FixedOut(k_out)
+                self.q_b_proj = _FixedOut(q_out)
+            def forward(self, x):
+                self.kv_b_proj(x)
+                self.q_b_proj(x)
+
+        class _FakeLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = _FakeAttn()
+            def forward(self, x):
+                self.self_attn(x)
+
+        class _FakeInner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([_FakeLayer()])
+            def forward(self, x):
+                for layer in self.layers:
+                    layer(x)
+
+        class _FakeTopModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = _FakeInner()
+            def forward(self, **_kwargs):
+                self.model(torch.zeros(1))
+            @property
+            def device(self):
+                return torch.device("cpu")
+
+        fake_tok = MagicMock(
+            return_value=MagicMock(
+                to=lambda *_a, **_k: {"input_ids": torch.zeros(1, 4, dtype=torch.long)}
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with _patch("transformers.AutoConfig") as mc, \
+                 _patch("transformers.AutoModelForCausalLM") as mm, \
+                 _patch("transformers.AutoTokenizer") as mt:
+                mc.from_pretrained.return_value = cfg
+                mm.from_pretrained.return_value = _FakeTopModel()
+                mt.from_pretrained.return_value = fake_tok
+
+                importance, _ = _collect_channel_importance(
+                    model_path=tmpdir,
+                    dtype="bfloat16",
+                    tp=1,
+                    num_layers_hint=None,
+                    num_heads_hint=None,
+                    head_dim_hint=None,
+                    prompts=["hello world"],
+                    allow_synthetic=False,
+                )
+
+        actual = importance[0].cpu()
+        self.assertEqual(
+            tuple(actual.shape), (num_heads, qk_nope),
+            "importance shape must be [H, qk_nope_head_dim]",
+        )
+        self.assertTrue(
+            actual.isfinite().all(),
+            f"V3.2 config shape produced non-finite importance:\n{actual}",
+        )
+        self.assertTrue(
+            torch.allclose(actual, expected_imp, atol=1e-5),
+            f"Method 1 importance mismatch with V3.2 config shape (no head_dim field).\n"
+            f"Expected:\n{expected_imp}\nGot:\n{actual}",
+        )
+
     def test_512d_channel_index_rejected(self):
         """load_channel_mask must reject channel indices >= head_dim=128."""
         import tempfile
