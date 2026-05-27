@@ -54,7 +54,11 @@ def _find_match(*, source_lines: list[str], match_lines: list[str]) -> int:
     """Find the start index of match_lines in source_lines (strip-compared).
 
     Returns the index of the first matching line.
-    Raises PatchApplicationError if not found or found multiple times.
+    Raises PatchApplicationError if not found or found multiple times. The
+    not-found path includes a diagnostic dump that shows where the first
+    match line appears in the source (if anywhere), so callers can see the
+    exact context that broke the match — e.g. whether a refactor inserted
+    an extra line between the two pinned lines.
     """
     stripped_source: list[str] = [line.strip() for line in source_lines]
     stripped_match: list[str] = [line.strip() for line in match_lines]
@@ -67,8 +71,7 @@ def _find_match(*, source_lines: list[str], match_lines: list[str]) -> int:
     ]
 
     if len(found_indices) == 0:
-        preview: str = "\n".join(match_lines)
-        raise PatchApplicationError(f"match text not found in source:\n{preview}")
+        raise PatchApplicationError(_not_found_diagnostic(stripped_source, stripped_match))
     if len(found_indices) > 1:
         preview = "\n".join(match_lines)
         raise PatchApplicationError(
@@ -76,6 +79,47 @@ def _find_match(*, source_lines: list[str], match_lines: list[str]) -> int:
         )
 
     return found_indices[0]
+
+
+def _not_found_diagnostic(stripped_source: list[str], stripped_match: list[str]) -> str:
+    """Build an actionable not-found error message.
+
+    Includes:
+      - the match text (what we were searching for, as stripped),
+      - source length in lines,
+      - up to 8 candidate windows where the FIRST stripped match line
+        appears in source (with ±2 lines of context), so we can see at a
+        glance whether the surrounding code differs from what the patch
+        expects.
+    """
+    preview = "\n".join(stripped_match)
+    lines = [f"match text not found in source:\n{preview}", "", f"source_len={len(stripped_source)} lines"]
+
+    if not stripped_match:
+        return "\n".join(lines)
+    first_match_line = stripped_match[0]
+    hits = [
+        i for i, line in enumerate(stripped_source) if line == first_match_line
+    ]
+    if not hits:
+        lines.append(
+            f"first match line {first_match_line!r} does NOT appear anywhere in source"
+        )
+        return "\n".join(lines)
+
+    lines.append(
+        f"first match line {first_match_line!r} appears {len(hits)} time(s); showing up to 8 windows with context:"
+    )
+    for i in hits[:8]:
+        lo = max(0, i - 2)
+        hi = min(len(stripped_source), i + len(stripped_match) + 2)
+        block: list[str] = []
+        for j in range(lo, hi):
+            marker = ">" if lo + (j - lo) >= i and (j - i) < len(stripped_match) else " "
+            block.append(f"{marker} {j:4d}: {stripped_source[j]}")
+        lines.append("--")
+        lines.extend(block)
+    return "\n".join(lines)
 
 
 def _realign_replacement(
