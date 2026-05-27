@@ -426,6 +426,19 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         self.tp_size = (
             1 if use_data_parallel else get_tensor_model_parallel_world_size()
         )
+
+        # Enable torch.compile for vision MLP only (BF16 optimization)
+        # Note: Cannot compile full blocks due to XPU device properties incompatibility
+        if get_global_server_args().enable_torch_compile and self.device.type == "xpu":
+            logger.info(
+                "Compiling vision encoder MLPs with torch.compile for BF16 optimization"
+            )
+            for idx, blk in enumerate(self.blocks):
+                # Only compile the MLP part, not the attention
+                blk.mlp = torch.compile(
+                    blk.mlp, mode="max-autotune", fullgraph=False, disable=False
+                )
+
         self.graph_runners = graph_runners_dict[self.device.type](self)
 
     @property
