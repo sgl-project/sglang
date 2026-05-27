@@ -4,6 +4,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     PipelineConfig,
     SlidingTileAttnConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
     DiffusersGenericPipelineConfig,
 )
@@ -43,6 +44,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 
 __all__ = [
+    "Cosmos3Config",
     "DiffusersGenericPipelineConfig",
     "HeliosDistilledConfig",
     "HeliosMidConfig",
