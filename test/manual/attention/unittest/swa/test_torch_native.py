@@ -95,6 +95,44 @@ class TestTorchNativeSWAAttentionBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_dense_attention_case(self, case)
 
+    # Layout-robustness. See dense/test_triton.py for the rationale.
+    # torch_native SWA gathers K/V via cache locs without page-table
+    # arithmetic, so it's robust to all non-tidy layouts.
+    LAYOUT_ROBUSTNESS_CASES = (
+        DenseAttentionCase(
+            name="layout_swa_extend_within_window",
+            backend="torch_native",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=8,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(8, 16),
+            extend_lens=(8, 16),
+            sliding_window_size=12,
+        ),
+        DenseAttentionCase(
+            name="layout_swa_decode_page_boundary",
+            backend="torch_native",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=8,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(15, 16, 17),
+            sliding_window_size=12,
+        ),
+    )
+
+    def test_layout_robustness_cases(self):
+        for case in self.LAYOUT_ROBUSTNESS_CASES:
+            for layout in ("interleaved_pages", "non_monotonic_extend"):
+                if (
+                    layout == "non_monotonic_extend"
+                    and case.forward_mode.is_decode()
+                ):
+                    continue
+                with self.subTest(case=case.name, layout=layout):
+                    run_dense_attention_case(self, case, loc_layout=layout)
+
 
 if __name__ == "__main__":
     unittest.main()

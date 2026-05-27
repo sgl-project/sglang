@@ -561,12 +561,18 @@ def make_loc_fn(
     interpretation.
 
     Layouts:
-    - ``contiguous``: default tidy mapping (`_token_loc`).
-    - ``shuffled_pages``: within each request, page order is randomly
-      permuted. The set of physical pages is unchanged; only the
-      mapping (logical_page -> physical_page) is. Catches backends that
-      assume `req_to_token[req_idx, pos]` increases monotonically with
-      `pos`.
+    - ``contiguous``: the original tidy mapping (`_token_loc`).
+      Each request's pages occupy a contiguous physical-slot range.
+      Kept as a baseline for regression tests; production rarely
+      produces this exact layout.
+    - ``shuffled_pages`` (DEFAULT): within each request, page order is
+      randomly permuted. The set of physical pages is unchanged; only
+      the mapping (logical_page -> physical_page) is. Catches backends
+      that assume `req_to_token[req_idx, pos]` increases monotonically
+      with `pos`. Picked as the default because (a) it's
+      production-realistic — allocator fragmentation can produce
+      non-monotonic per-request page assignments — and (b) all backends
+      currently pass it, so no existing tests break by enabling it.
     - ``interleaved_pages``: pages from different requests are interleaved
       in physical-slot order. With `bs=2`, req 0's pages land on physical
       pages [0, 2, 4, ...] and req 1's on [1, 3, 5, ...]. Catches
@@ -914,7 +920,7 @@ def build_dense_attention_fixture(
     disable_cuda_graph: bool = True,
     disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
-    loc_layout: str = "contiguous",
+    loc_layout: str = "shuffled_pages",
 ) -> DenseAttentionFixture:
     seed = 2026 + len(case.name) + case.num_kv_heads
     torch.manual_seed(seed)
@@ -1215,7 +1221,7 @@ def run_dense_attention_case(
     max_context_len: int = DEFAULT_MAX_CONTEXT_LEN,
     dtype: torch.dtype = DEFAULT_DTYPE,
     device: str = DEFAULT_DEVICE,
-    loc_layout: str = "contiguous",
+    loc_layout: str = "shuffled_pages",
 ):
     fixture = build_dense_attention_fixture(
         testcase,

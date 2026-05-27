@@ -391,8 +391,8 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
 
     def test_layout_robustness_cases(self):
         for case in self.LAYOUT_ROBUSTNESS_CASES:
+            # shuffled_pages is the default and already covered.
             for layout in (
-                "shuffled_pages",
                 "interleaved_pages",
                 "non_monotonic_extend",
             ):

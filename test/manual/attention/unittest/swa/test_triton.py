@@ -249,6 +249,46 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_dense_attention_case(self, case)
 
+    # Layout-robustness. See dense/test_triton.py for full rationale.
+    # The default `shuffled_pages` layout is already exercised by
+    # test_projected_swa_attention_cases; this method opts into the
+    # more aggressive interleaved_pages + non_monotonic_extend on a
+    # representative SWA extend + decode case.
+    LAYOUT_ROBUSTNESS_CASES = (
+        DenseAttentionCase(
+            name="layout_swa_extend_within_window",
+            backend="triton",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=8,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(8, 16),
+            extend_lens=(8, 16),
+            sliding_window_size=12,
+        ),
+        DenseAttentionCase(
+            name="layout_swa_decode_page_boundary",
+            backend="triton",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=8,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(15, 16, 17),
+            sliding_window_size=12,
+        ),
+    )
+
+    def test_layout_robustness_cases(self):
+        for case in self.LAYOUT_ROBUSTNESS_CASES:
+            for layout in ("interleaved_pages", "non_monotonic_extend"):
+                if (
+                    layout == "non_monotonic_extend"
+                    and case.forward_mode.is_decode()
+                ):
+                    continue
+                with self.subTest(case=case.name, layout=layout):
+                    run_dense_attention_case(self, case, loc_layout=layout)
+
     def test_runner_mode_cuda_graph_decode_cases(self):
         for case in self.CUDA_GRAPH_CASES:
             with self.subTest(case=case.name, backend=case.backend):

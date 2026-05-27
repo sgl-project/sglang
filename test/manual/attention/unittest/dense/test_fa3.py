@@ -315,6 +315,68 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
         ),
     )
 
+    # Layout-robustness: catches backend bugs in page-table derivation
+    # from non-tidy (req_to_token, out_cache_loc) mappings. See
+    # dense/test_triton.py for the full rationale. FA3 passes
+    # shuffled_pages and interleaved_pages but FAILS on
+    # non_monotonic_extend for EXTEND — FA3's prefill metadata appears
+    # to assume out_cache_loc is monotonic within an extend, so when
+    # the test scatters extend-token slots inside a request the kernel
+    # reads stale K from the wrong physical positions. Documented as a
+    # known production limitation that fragmented allocator state
+    # could surface.
+    LAYOUT_ROBUSTNESS_CASES = (
+        DenseAttentionCase(
+            name="layout_extend_two_request_ragged",
+            backend="fa3",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=12,
+            num_kv_heads=12,
+            page_size=16,
+            prefix_lens=(8, 16),
+            extend_lens=(8, 16),
+        ),
+        DenseAttentionCase(
+            name="layout_decode_page_boundary",
+            backend="fa3",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=12,
+            num_kv_heads=12,
+            page_size=16,
+            prefix_lens=(15, 16, 17),
+        ),
+    )
+    LAYOUT_KNOWN_FAILURES = {
+        ("layout_extend_two_request_ragged", "non_monotonic_extend"): (
+            "FA3 prefill metadata assumes out_cache_loc is monotonic "
+            "within an extend; a fragmented allocator could trip this."
+        ),
+    }
+
+    def test_layout_robustness_cases(self):
+        for case in self.LAYOUT_ROBUSTNESS_CASES:
+            # shuffled_pages is the default and already covered.
+            for layout in (
+                "interleaved_pages",
+                "non_monotonic_extend",
+            ):
+                if (
+                    layout == "non_monotonic_extend"
+                    and case.forward_mode.is_decode()
+                ):
+                    continue
+                reason = self.LAYOUT_KNOWN_FAILURES.get((case.name, layout))
+                with self.subTest(case=case.name, layout=layout):
+                    if reason is not None:
+                        self.skipTest(reason)
+                    run_dense_attention_case(
+                        self,
+                        case,
+                        head_dim=self.HEAD_DIM,
+                        hidden_size=self.HIDDEN_SIZE,
+                        loc_layout=layout,
+                    )
+
     def test_projected_dense_attention_cases(self):
         for case in self.CASES:
             with self.subTest(case=case.name, backend=case.backend):

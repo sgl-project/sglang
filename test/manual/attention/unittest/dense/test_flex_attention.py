@@ -54,6 +54,46 @@ class TestFlexDenseAttentionBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_dense_attention_case(self, case)
 
+    # Layout-robustness. See dense/test_triton.py for full rationale.
+    # Flex attention uses PyTorch flex_attention which builds the mask
+    # from logical positions, so it's robust to all non-tidy layouts.
+    LAYOUT_ROBUSTNESS_CASES = (
+        DenseAttentionCase(
+            name="layout_extend_two_request_ragged",
+            backend="flex_attention",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=12,
+            num_kv_heads=12,
+            page_size=16,
+            prefix_lens=(8, 16),
+            extend_lens=(8, 16),
+        ),
+        DenseAttentionCase(
+            name="layout_decode_page_boundary",
+            backend="flex_attention",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=12,
+            num_kv_heads=12,
+            page_size=16,
+            prefix_lens=(15, 16, 17),
+        ),
+    )
+
+    def test_layout_robustness_cases(self):
+        for case in self.LAYOUT_ROBUSTNESS_CASES:
+            # shuffled_pages is the default and already covered.
+            for layout in (
+                "interleaved_pages",
+                "non_monotonic_extend",
+            ):
+                if (
+                    layout == "non_monotonic_extend"
+                    and case.forward_mode.is_decode()
+                ):
+                    continue
+                with self.subTest(case=case.name, layout=layout):
+                    run_dense_attention_case(self, case, loc_layout=layout)
+
     def test_runner_mode_split_op_extend_cases(self):
         for case, static_num_tokens in self.SPLIT_OP_CASES:
             for breakable in (False, True):

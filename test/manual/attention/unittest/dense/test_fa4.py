@@ -315,6 +315,62 @@ class TestFA4DenseAttentionBackendCorrectness(CustomTestCase):
         ),
     )
 
+    # Layout-robustness. See dense/test_triton.py for full rationale and
+    # dense/test_fa3.py for the FA-family non_monotonic_extend known
+    # failure. FA4 inherits FA3's prefill metadata convention and shows
+    # the same divergence on scattered extend-token slots.
+    LAYOUT_ROBUSTNESS_CASES = (
+        DenseAttentionCase(
+            name="layout_extend_two_request_ragged",
+            backend="fa4",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=12,
+            num_kv_heads=12,
+            page_size=16,
+            prefix_lens=(8, 16),
+            extend_lens=(8, 16),
+        ),
+        DenseAttentionCase(
+            name="layout_decode_page_boundary",
+            backend="fa4",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=12,
+            num_kv_heads=12,
+            page_size=16,
+            prefix_lens=(15, 16, 17),
+        ),
+    )
+    LAYOUT_KNOWN_FAILURES = {
+        ("layout_extend_two_request_ragged", "non_monotonic_extend"): (
+            "FA4 inherits FA3's prefill metadata assumption that "
+            "out_cache_loc is monotonic within an extend."
+        ),
+    }
+
+    def test_layout_robustness_cases(self):
+        for case in self.LAYOUT_ROBUSTNESS_CASES:
+            # shuffled_pages is the default and already covered.
+            for layout in (
+                "interleaved_pages",
+                "non_monotonic_extend",
+            ):
+                if (
+                    layout == "non_monotonic_extend"
+                    and case.forward_mode.is_decode()
+                ):
+                    continue
+                reason = self.LAYOUT_KNOWN_FAILURES.get((case.name, layout))
+                with self.subTest(case=case.name, layout=layout):
+                    if reason is not None:
+                        self.skipTest(reason)
+                    run_dense_attention_case(
+                        self,
+                        case,
+                        head_dim=self.HEAD_DIM,
+                        hidden_size=self.HIDDEN_SIZE,
+                        loc_layout=layout,
+                    )
+
     def test_projected_dense_attention_cases(self):
         for case in self.CASES:
             with self.subTest(case=case.name, backend=case.backend):

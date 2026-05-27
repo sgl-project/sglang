@@ -69,6 +69,46 @@ class TestTorchNativeDenseAttentionBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_dense_attention_case(self, case)
 
+    # Layout-robustness. See dense/test_triton.py for full rationale.
+    # torch_native uses PyTorch SDPA on per-token-loc K/V gathered from
+    # the cache, so all non-tidy layouts pass.
+    LAYOUT_ROBUSTNESS_CASES = (
+        DenseAttentionCase(
+            name="layout_extend_two_request_ragged",
+            backend="torch_native",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=12,
+            num_kv_heads=12,
+            page_size=16,
+            prefix_lens=(8, 16),
+            extend_lens=(8, 16),
+        ),
+        DenseAttentionCase(
+            name="layout_decode_page_boundary",
+            backend="torch_native",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=12,
+            num_kv_heads=12,
+            page_size=16,
+            prefix_lens=(15, 16, 17),
+        ),
+    )
+
+    def test_layout_robustness_cases(self):
+        for case in self.LAYOUT_ROBUSTNESS_CASES:
+            # shuffled_pages is the default and already covered.
+            for layout in (
+                "interleaved_pages",
+                "non_monotonic_extend",
+            ):
+                if (
+                    layout == "non_monotonic_extend"
+                    and case.forward_mode.is_decode()
+                ):
+                    continue
+                with self.subTest(case=case.name, layout=layout):
+                    run_dense_attention_case(self, case, loc_layout=layout)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -341,8 +341,11 @@ class TestTritonDenseAttentionBackendCorrectness(CustomTestCase):
 
     def test_layout_robustness_cases(self):
         for case in self.LAYOUT_ROBUSTNESS_CASES:
+            # shuffled_pages is the default for all tests now, so it's
+            # already covered by `test_projected_dense_attention_cases`.
+            # The opt-in matrix here exercises the more aggressive
+            # interleaved_pages + non_monotonic_extend layouts.
             for layout in (
-                "shuffled_pages",
                 "interleaved_pages",
                 "non_monotonic_extend",
             ):
