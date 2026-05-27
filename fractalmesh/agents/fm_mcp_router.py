@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     99,
+        "agents":     102,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -213,6 +213,9 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "notifier":          7851,
             "watchdog":          7852,
             "sovereign_memory":  7853,
+            "stripe_gateway":    7854,
+            "trading_engine":    7855,
+            "analytics_hub":     7856,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -513,6 +516,9 @@ _INTENTS = {
     "notify":                  lambda a, k: {"action": "notify_queued", "channel": k.get("channel", "telegram"), "message": k.get("message", ""), "level": k.get("level", "info")},
     "watchdog_check":          lambda a, k: {"action": "watchdog_check_queued", "agent": k.get("agent", ""), "force": k.get("force", False)},
     "memory_recall":           lambda a, k: {"action": "memory_recall_queued", "query": k.get("query", ""), "category": k.get("category", ""), "limit": k.get("limit", 10)},
+    "stripe_charge":           lambda a, k: {"action": "stripe_charge_queued", "amount": k.get("amount", 0), "currency": k.get("currency", "aud"), "customer_email": k.get("customer_email", "")},
+    "trade_signal":            lambda a, k: {"action": "trade_signal_queued", "symbol": k.get("symbol", "BTC"), "side": k.get("side", "buy"), "strategy": k.get("strategy", "rsi")},
+    "kpi_record":              lambda a, k: {"action": "kpi_record_queued", "metric_name": k.get("metric_name", ""), "metric_value": k.get("metric_value", 0)},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────

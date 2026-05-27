@@ -1183,6 +1183,9 @@ module.exports = {
             ['fm-notifier',       'fm_notifier',       '25M'],
             ['fm-watchdog',       'fm_watchdog',       '25M'],
             ['fm-sovereign-memory','fm_sovereign_memory','30M'],
+            ['fm-stripe-gateway', 'fm_stripe_gateway',  '30M'],
+            ['fm-trading-engine', 'fm_trading_engine',  '35M'],
+            ['fm-analytics-hub',  'fm_analytics_hub',   '35M'],
         ].map(([name, script, mem]) => ({
             name,
             script:            `agents/${script}.py`,
