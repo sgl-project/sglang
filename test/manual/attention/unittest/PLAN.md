@@ -358,6 +358,21 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Renamed and split `common/runner_modes/eagle_draft_runner.py` along
+  the speculative-forward-mode axis to match the existing
+  `speculative_target_verify_runner.py` /
+  `speculative_draft_extend_runner.py` convention:
+  - `eagle_draft_runner.py` → `speculative_draft_runner.py`. Holds
+    only DRAFT (decode multi-step) production-runner integration plus
+    shared infra (`EagleDraftRunnerSettings`, `_seeded_rng`,
+    `_configure_runner_for_eagle_draft`, etc.).
+  - All DRAFT_EXTEND production-runner code (`_EagleDraftExtendForward`,
+    `_DSAEagleDraftExtendForward`, the per-backend
+    `_make_*_draft_extend_*` helpers, and the corresponding
+    `run_*_eagle_draft_extend_cuda_graph_runner_case` /
+    `run_*_eagle_draft_extend_v2_cuda_graph_runner_case` entry points)
+    moved to `speculative_draft_extend_runner.py`.
+  Mechanical update across 9 test files.
 - Added DSA EAGLE production draft-extend CUDA-graph runner
   integration. Mirrors the draft-decode runner but with three
   draft-extend-specific bits: multi-query-per-request hidden_states,
