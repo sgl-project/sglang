@@ -117,7 +117,7 @@ class EmbeddingCacheController:
         tp_group=None,
         all_rank_get=False,
         enable_eviction: bool = True,
-        max_eviction_batch: int = 10,
+        max_eviction_batch: int = 100,
     ):
         self.tp_world_size = tp_size
         self.tp_group = tp_group
