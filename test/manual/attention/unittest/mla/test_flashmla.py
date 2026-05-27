@@ -21,11 +21,11 @@ from common.runner_modes.cuda_graph_decode_runner import (
     _init_cuda_graph_replay_metadata,
     run_mla_cuda_graph_decode_case,
 )
-from common.runner_modes.speculative_draft_runner import (
-    run_mla_eagle_draft_cuda_graph_runner_case,
-)
 from common.runner_modes.speculative_draft_extend_runner import (
     run_mla_eagle_draft_extend_case,
+)
+from common.runner_modes.speculative_draft_runner import (
+    run_mla_eagle_draft_cuda_graph_runner_case,
 )
 from common.runner_modes.speculative_target_verify_runner import (
     _make_eagle_verify_input,
@@ -45,6 +45,21 @@ MLA_SHAPE_KWARGS = dict(
 # FlashMLA's KV cache is paginated with PAGE_SIZE=64
 # (see `python/sglang/srt/layers/attention/flashmla_backend.py`).
 FLASHMLA_PAGE_SIZE = 64
+
+# FlashMLABackend.forward_decode and forward_target_verify require SM90a
+# (Hopper architecture — H100/H200).  On Blackwell (SM10.x) those paths
+# raise "Dense decode MLA is only supported on SM90a architecture".
+# EXTEND falls through to the FlashInferMLAAttnBackend parent and works
+# on any SM >= 9.
+_DECODE_REQUIRES_SM90A = (
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] >= 10
+)
+_DECODE_SKIP_REASON = (
+    "FlashMLA decode/target-verify requires SM90a (Hopper); "
+    f"got SM{torch.cuda.get_device_capability()[0]}.x"
+    if _DECODE_REQUIRES_SM90A and torch.cuda.is_available()
+    else "CUDA unavailable"
+)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -209,6 +224,8 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
     def test_tiny_deepseek_mla_attention_cases(self):
         for case in self.CASES:
             with self.subTest(case=case.name, backend=case.backend):
+                if case.forward_mode == ForwardMode.DECODE and _DECODE_REQUIRES_SM90A:
+                    self.skipTest(_DECODE_SKIP_REASON)
                 run_mla_attention_case(self, case, **MLA_SHAPE_KWARGS)
 
     # Layout-robustness. See dense/test_triton.py for the full
@@ -267,6 +284,7 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
                         self, case, loc_layout=layout, **MLA_SHAPE_KWARGS
                     )
 
+    @unittest.skipIf(_DECODE_REQUIRES_SM90A, _DECODE_SKIP_REASON)
     def test_runner_mode_cuda_graph_decode_cases(self):
         for case in self.CUDA_GRAPH_CASES:
             with self.subTest(case=case.name, backend=case.backend):
@@ -289,6 +307,7 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
                         **MLA_SHAPE_KWARGS,
                     )
 
+    @unittest.skipIf(_DECODE_REQUIRES_SM90A, _DECODE_SKIP_REASON)
     def test_runner_mode_eagle_verify_cases(self):
         for case, topk in self.EAGLE_VERIFY_CASES:
             with self.subTest(case=case.name, backend=case.backend, topk=topk):
@@ -299,6 +318,7 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
                     **MLA_SHAPE_KWARGS,
                 )
 
+    @unittest.skipIf(_DECODE_REQUIRES_SM90A, _DECODE_SKIP_REASON)
     def test_runner_mode_eagle_verify_cuda_graph_cases(self):
         for case, topk in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:
             with self.subTest(case=case.name, backend=case.backend, topk=topk):
@@ -314,6 +334,7 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_mla_eagle_draft_extend_case(self, case, **MLA_SHAPE_KWARGS)
 
+    @unittest.skipIf(_DECODE_REQUIRES_SM90A, _DECODE_SKIP_REASON)
     def test_runner_mode_eagle_draft_cuda_graph_runner_cases(self):
         for case, topk, num_draft_tokens in self.EAGLE_DRAFT_RUNNER_CASES:
             with self.subTest(case=case.name, backend=case.backend, topk=topk):
@@ -347,9 +368,7 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
         bs = len(prefix_lens)
         per_row_seq_lens = [p + num_draft_tokens for p in prefix_lens]
         max_seqlen_pad = triton.cdiv(max(per_row_seq_lens), FLASHMLA_PAGE_SIZE)
-        per_row_valid = [
-            triton.cdiv(s, FLASHMLA_PAGE_SIZE) for s in per_row_seq_lens
-        ]
+        per_row_valid = [triton.cdiv(s, FLASHMLA_PAGE_SIZE) for s in per_row_seq_lens]
         return bs, max_seqlen_pad, per_row_valid
 
     def _build_target_verify_metadata_fixture(self, case):

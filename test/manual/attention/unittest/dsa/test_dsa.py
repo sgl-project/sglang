@@ -11,8 +11,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from common.attention_methods.dsa_attention import (
     DSA_DECODE_IMPL_VARIANTS,
-    DSA_FP8_COMPATIBLE_DECODE_IMPLS,
-    DSA_FP8_COMPATIBLE_PREFILL_IMPLS,
     DSA_PAGE_SIZE,
     DSA_PREFILL_IMPL_VARIANTS,
     DSAAttentionCase,
@@ -32,11 +30,11 @@ from common.attention_methods.dsa_attention import (
 from common.runner_modes.cuda_graph_decode_runner import (
     run_dsa_sparse_cuda_graph_decode_case,
 )
-from common.runner_modes.speculative_draft_runner import (
-    run_dsa_eagle_draft_cuda_graph_runner_case,
-)
 from common.runner_modes.speculative_draft_extend_runner import (
     run_dsa_eagle_draft_extend_cuda_graph_runner_case,
+)
+from common.runner_modes.speculative_draft_runner import (
+    run_dsa_eagle_draft_cuda_graph_runner_case,
 )
 
 
@@ -57,7 +55,9 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
     def test_mha_one_shot_dense_fallback_cases(self):
         for case in self.CASES:
             with self.subTest(case=case.name, backend=case.backend):
-                run_dsa_attention_case(self, case)
+                # GB300 (SM10.x) kernel requires 128-dim query/value;
+                # use head_dim=128 rather than the generic DEFAULT_HEAD_DIM=16.
+                run_dsa_attention_case(self, case, head_dim=128)
 
     def test_sparse_topk_cases(self):
         for case in self.SPARSE_CASES:
@@ -101,9 +101,7 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
 
     def test_sparse_non_trailing_index_cases(self):
         for case, pattern in self.NON_TRAILING_INDEX_CASES:
-            with self.subTest(
-                case=case.name, backend=case.backend, pattern=pattern
-            ):
+            with self.subTest(case=case.name, backend=case.backend, pattern=pattern):
                 run_dsa_sparse_attention_case(self, case, index_pattern=pattern)
 
     # CG decode replay via the sparse `flashmla_kv` path (cached MLA latent
@@ -275,9 +273,7 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
                     if impl == "flashmla_sparse"
                     else self.FP8_PREFILL_PAGED_CASE
                 )
-                run_dsa_sparse_fp8_prefill_case(
-                    self, case, dsa_prefill_backend=impl
-                )
+                run_dsa_sparse_fp8_prefill_case(self, case, dsa_prefill_backend=impl)
 
     def test_sparse_fp8_decode_cases(self):
         for impl in DSA_DECODE_IMPL_VARIANTS:

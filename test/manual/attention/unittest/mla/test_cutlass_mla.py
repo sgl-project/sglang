@@ -14,9 +14,12 @@ from common.attention_methods.mla_attention import (
     run_mla_attention_case,
 )
 
-# Cutlass MLA requires Blackwell (SM 10.0). PAGE_SIZE is fixed to 128 in the
-# backend (see python/sglang/srt/layers/attention/cutlass_mla_backend.py).
-_MIN_SM = 100
+# Cutlass MLA requires exactly Blackwell SM 10.0. The sgl-kernel
+# `cutlass_mla_decode` checks `sm_version == 100` (major*10+minor), so
+# SM 10.3 (GB300) reports sm_version=103 and is rejected by the kernel.
+# PAGE_SIZE is fixed to 128 in the backend.
+_REQUIRED_SM_MAJOR = 10
+_REQUIRED_SM_MINOR = 0
 
 MLA_SHAPE_KWARGS = dict(
     kv_lora_rank=512,
@@ -30,12 +33,11 @@ def _supported() -> tuple[bool, str]:
     if not torch.cuda.is_available():
         return False, "CUDA is required"
     major, minor = torch.cuda.get_device_capability()
-    sm = major * 10 + minor
-    if sm < _MIN_SM:
+    if major != _REQUIRED_SM_MAJOR or minor != _REQUIRED_SM_MINOR:
         return (
             False,
-            f"cutlass_mla requires SM {_MIN_SM // 10}.{_MIN_SM % 10}+, "
-            f"got SM {major}.{minor}",
+            f"cutlass_mla requires exactly SM {_REQUIRED_SM_MAJOR}.{_REQUIRED_SM_MINOR} "
+            f"(B200 Blackwell); got SM {major}.{minor}",
         )
     return True, ""
 

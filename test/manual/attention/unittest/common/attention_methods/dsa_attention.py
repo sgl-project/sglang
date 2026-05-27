@@ -1045,6 +1045,7 @@ def run_dsa_sparse_attention_case(
 # whether the fixture's specific shape (topk, dtype, num_heads) matches the
 # impl's accepted inputs — that is documented at the per-impl call site.
 
+
 # Hardware/SDK availability for each DSA implementation variant.
 # Values are `(supported: bool, reason: str)` — `reason` is shown in
 # `skipTest` when `supported=False`.
@@ -1059,7 +1060,7 @@ def dsa_impl_capability(impl: str) -> tuple[bool, str]:
 
     from sglang.srt.utils import is_hip
 
-    major, _ = _torch.cuda.get_device_capability()
+    major, minor = _torch.cuda.get_device_capability()
 
     if impl == "flashmla_sparse" or impl == "flashmla_kv":
         try:
@@ -1080,8 +1081,10 @@ def dsa_impl_capability(impl: str) -> tuple[bool, str]:
             )
         except ImportError as exc:
             return False, f"sglang.jit_kernel.flash_attention unavailable: {exc}"
-        if major < 9:
-            return False, f"fa3 requires SM>=9.0, got SM{major}.x"
+        # sgl-kernel flash_attn is compiled for SM9.x (Hopper) only;
+        # it raises NotImplementedError on Blackwell (SM10.x+).
+        if major < 9 or major >= 10:
+            return False, f"fa3 requires SM9.x (Hopper), got SM{major}.x"
         return True, ""
 
     if impl == "tilelang":
@@ -1097,9 +1100,16 @@ def dsa_impl_capability(impl: str) -> tuple[bool, str]:
         return True, ""
 
     if impl == "trtllm":
-        # TRT-LLM Gen FMHA / MLA require Blackwell (SM100+).
-        if major < 10:
-            return False, f"trtllm requires SM>=10.0 (Blackwell), got SM{major}.x"
+        # TRT-LLM Gen FMHA / MLA require Blackwell SM10.0 (B200 NVL).
+        # SM10.3 (GB300) raises "Missing TRTLLM-GEN kernel" at runtime because
+        # the kernel binary in the container isn't compiled for sm_103.
+        # Require exactly SM10.0 (same constraint as cutlass_mla) until the
+        # container ships sm_103-compiled TRTLLM-GEN kernels.
+        if major != 10 or minor != 0:
+            return (
+                False,
+                f"trtllm requires SM10.0 (Blackwell B200), got SM{major}.{minor}",
+            )
         try:
             import flashinfer  # noqa: F401
         except ImportError as exc:
@@ -1256,9 +1266,7 @@ def run_dsa_sparse_tilelang_prefill_case(
     if not supported:
         testcase.skipTest(f"DSA tilelang impl not supported: {reason}")
     if not case.forward_mode.is_extend_without_speculative():
-        raise ValueError(
-            "run_dsa_sparse_tilelang_prefill_case expects an EXTEND case."
-        )
+        raise ValueError("run_dsa_sparse_tilelang_prefill_case expects an EXTEND case.")
     run_dsa_sparse_attention_case(
         testcase,
         case,
@@ -1276,9 +1284,7 @@ def run_dsa_sparse_tilelang_decode_case(
     if not supported:
         testcase.skipTest(f"DSA tilelang impl not supported: {reason}")
     if not case.forward_mode.is_decode():
-        raise ValueError(
-            "run_dsa_sparse_tilelang_decode_case expects a DECODE case."
-        )
+        raise ValueError("run_dsa_sparse_tilelang_decode_case expects a DECODE case.")
     run_dsa_sparse_attention_case(
         testcase,
         case,
@@ -1307,9 +1313,7 @@ def run_dsa_sparse_fp8_prefill_case(
             f"read FP8 K directly; others require BF16 K)."
         )
     if not case.forward_mode.is_extend_without_speculative():
-        raise ValueError(
-            "run_dsa_sparse_fp8_prefill_case expects an EXTEND case."
-        )
+        raise ValueError("run_dsa_sparse_fp8_prefill_case expects an EXTEND case.")
     run_dsa_sparse_attention_case(
         testcase,
         case,
@@ -1335,9 +1339,7 @@ def run_dsa_sparse_fp8_decode_case(
             f"cache (only `flashmla_kv` / `flashmla_auto` read FP8 K directly)."
         )
     if not case.forward_mode.is_decode():
-        raise ValueError(
-            "run_dsa_sparse_fp8_decode_case expects a DECODE case."
-        )
+        raise ValueError("run_dsa_sparse_fp8_decode_case expects a DECODE case.")
     run_dsa_sparse_attention_case(
         testcase,
         case,
@@ -1358,9 +1360,7 @@ def run_dsa_sparse_cuda_graph_decode_impl_variant_case(
     """
     supported, reason = dsa_impl_capability(impl)
     if not supported:
-        testcase.skipTest(
-            f"DSA CG decode impl `{impl}` not supported: {reason}"
-        )
+        testcase.skipTest(f"DSA CG decode impl `{impl}` not supported: {reason}")
     if impl == "tilelang":
         testcase.skipTest(
             "DSA tilelang decode requires topk=2048; the shared sparse fixture "
@@ -1757,8 +1757,6 @@ def _clone_dsa_sparse_cache(fixture: DSASparseAttentionFixture):
     return kv_buf.clone()
 
 
-def _restore_dsa_sparse_cache(
-    fixture: DSASparseAttentionFixture, state
-) -> None:
+def _restore_dsa_sparse_cache(fixture: DSASparseAttentionFixture, state) -> None:
     layer_id = fixture.actual_module.attn.layer_id
     fixture.runner.token_to_kv_pool.get_key_buffer(layer_id).copy_(state)
