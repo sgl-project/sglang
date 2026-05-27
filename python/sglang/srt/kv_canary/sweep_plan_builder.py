@@ -62,13 +62,9 @@ def _swa_translate(
     indices: torch.Tensor,
     lut: torch.Tensor,
 ) -> torch.Tensor:
-    # SWAKVPool.full_to_swa_index_mapping uses 0 as the SWA-evicted / unmapped
-    # sentinel (zero-init, free_swa writes 0, allocator filters with >0). The
-    # value 0 also matches kTokenToKvSlotPadding on the kernel side -- so an
-    # evicted index translates to the canonical "no real slot" sentinel and
-    # the verify kernel takes care of it: slot==padding skips the whole row;
-    # prev_slot==padding skips just the chain hash check (current slot's
-    # position and real_kv are still verified).
+    # 0 is both SWAKVPool's evicted-sentinel and the kernel's kTokenToKvSlotPadding,
+    # so evicted indices propagate as the canonical "no real slot" value and the
+    # verify kernel handles them.
     if indices.numel() == 0:
         return indices
     lut_dev = lut.to(indices.device).to(torch.int64)
