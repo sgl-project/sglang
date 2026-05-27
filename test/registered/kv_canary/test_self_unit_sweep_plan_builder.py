@@ -90,7 +90,9 @@ class TestSelfUnitSweepPlanBuilder(CustomTestCase):
         num_valid = int(out.verify_num_valid.item())
         self.assertEqual(num_valid, 3)
         self.assertEqual(out.verify_slot_indices[:num_valid].tolist(), [500, 0, 502])
-        self.assertEqual(out.verify_prev_slot_indices[:num_valid].tolist(), [-1, 500, 0])
+        self.assertEqual(
+            out.verify_prev_slot_indices[:num_valid].tolist(), [-1, 500, 0]
+        )
         self.assertEqual(out.verify_expected_positions[:num_valid].tolist(), [0, 1, 2])
 
 
