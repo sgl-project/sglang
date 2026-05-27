@@ -2,7 +2,7 @@ import time
 import threading
 import unittest
 from array import array
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -22,6 +22,10 @@ from sglang.srt.mem_cache.shared_hicache.plan import (
 )
 from sglang.srt.mem_cache.shared_hicache.scheduler_mixin import (
     SharedHiCacheSchedulerMixin,
+)
+from sglang.srt.mem_cache.shared_hicache.service import (
+    _decode_control_payload,
+    _encode_control_payload,
 )
 from sglang.srt.mem_cache.shared_hicache.source import (
     ResolvedHostPage,
@@ -158,6 +162,7 @@ class FakeDirectTransfer(SharedHiCacheTransferBackend):
             target_kv_item_lens=[64],
         )
         self.calls = []
+        self.dropped_notifications = []
 
     @property
     def enabled(self):
@@ -165,6 +170,9 @@ class FakeDirectTransfer(SharedHiCacheTransferBackend):
 
     def transfer_pages(self, **kwargs):
         self.calls.append(kwargs)
+
+    def drop_target_transfer_notification(self, transfer_id):
+        self.dropped_notifications.append(str(transfer_id))
 
 
 class FakeNixlAgent:
@@ -327,6 +335,7 @@ def _make_manager(tree=None):
     manager._source_transfers = {}
     manager._target_transfer_lock = threading.Lock()
     manager._target_transfer_completions = {}
+    manager._active_target_transfers = set()
     manager._target_transfer_capacity = None
     manager._pending_fetches = {}
     manager._finished_plan_keys = set()
@@ -354,6 +363,19 @@ def _make_req(plan):
 
 
 class TestSharedHiCache(unittest.TestCase):
+    def test_control_payload_uses_json_bytes(self):
+        payload = {
+            "kind": "shared_hicache_transfer_request",
+            "transfer_id": "transfer-1",
+            "target_page_indices": [1, 2],
+        }
+
+        encoded = _encode_control_payload(payload)
+
+        self.assertIsInstance(encoded, bytes)
+        self.assertNotIn(b"\x80", encoded[:1])
+        self.assertEqual(_decode_control_payload([encoded]), payload)
+
     def test_plan_uses_canonical_schema_only(self):
         plan = SharedHiCachePlan.from_dict(
             _make_plan([11], source_tp_rank=0, source_tp_size=1)
@@ -522,6 +544,86 @@ class TestSharedHiCache(unittest.TestCase):
                     wait=False, cancel_futures=True
                 )
 
+    def test_manager_rejects_wrong_target_tp_rank(self):
+        manager = _make_manager()
+        manager._set_parallel_metadata(
+            {
+                "tp_rank": 1,
+                "tp_size": 2,
+                "pp_rank": 0,
+                "pp_size": 1,
+                "attn_cp_rank": 0,
+                "attn_cp_size": 1,
+                "attn_tp_rank": 1,
+                "attn_tp_size": 2,
+                "attn_dp_rank": 0,
+                "attn_dp_size": 1,
+            }
+        )
+        plan = SharedHiCachePlan.from_dict(
+            _make_plan(
+                [11],
+                source_tp_rank=0,
+                source_tp_size=2,
+                target_tp_rank=0,
+                target_tp_size=2,
+            )
+        )
+
+        self.assertEqual(
+            manager._validate_plan(plan),
+            "wrong_target_tp_rank:plan=0:local=1",
+        )
+
+    def test_source_transfer_immediate_completion_does_not_leave_future(self):
+        class ImmediateExecutor:
+            def submit(self, fn, **kwargs):
+                future = Future()
+                future.set_result(
+                    {
+                        "ok": False,
+                        "reason": "missing_first_block",
+                        "transferred_blocks": 0,
+                        "block_size_tokens": 2,
+                    }
+                )
+                return future
+
+        manager = _make_manager()
+        manager._source_transfer_executor.shutdown(wait=False, cancel_futures=True)
+        manager._source_transfer_executor = ImmediateExecutor()
+        manager.source_service = SimpleNamespace(
+            send=lambda _endpoint, _payload: None,
+        )
+        plan = SharedHiCachePlan.from_dict(
+            _make_plan([11], source_worker_id=manager.worker_id)
+        )
+        payload = {
+            "kind": "shared_hicache_transfer_request",
+            "transfer_id": "transfer-1",
+            "target_control_endpoint": "tcp://127.0.0.1:49999",
+            "plan": plan.to_dict(),
+            "start_block": 0,
+            "max_blocks": 1,
+            "target_session_id": "target-session",
+            "transfer_backend": "nixl",
+            "target_metadata": {
+                "backend": "nixl",
+                "session_id": "target-session",
+                "tp_rank": 0,
+                "tp_size": 1,
+            },
+            "target_kv_ptrs": [1],
+            "target_kv_item_lens": [64],
+            "target_page_indices": [0],
+        }
+
+        response = manager._handle_source_transfer(payload)
+
+        self.assertTrue(response["accepted"])
+        with manager._source_transfer_lock:
+            self.assertNotIn("transfer-1", manager._source_transfers)
+
     def test_manager_source_transfer_submit_returns_before_transfer_completes(self):
         tree = FakeTree()
         manager = _make_manager(tree)
@@ -601,7 +703,13 @@ class TestSharedHiCache(unittest.TestCase):
 
     def test_source_transfer_rejects_wrong_tp_rank_metadata(self):
         plan = SharedHiCachePlan.from_dict(
-            _make_plan([11], source_tp_size=2, target_tp_size=2)
+            _make_plan(
+                [11],
+                source_tp_rank=0,
+                source_tp_size=2,
+                target_tp_rank=1,
+                target_tp_size=2,
+            )
         )
         request, error = parse_source_transfer_request(
             payload={
@@ -634,6 +742,7 @@ class TestSharedHiCache(unittest.TestCase):
             worker_id=7,
             tp_rank=0,
             tp_size=2,
+            attn_tp_size=2,
         )
 
         self.assertFalse(response["ok"])
@@ -750,6 +859,18 @@ class TestSharedHiCache(unittest.TestCase):
             (3, "partial"),
         )
         self.assertIsNone(target_backend.pop_target_transfer_notification("transfer-1"))
+
+        target_backend.drop_target_transfer_notification("transfer-2")
+        target_agent.notifications = {
+            "source-agent": [
+                build_shared_hicache_transfer_notification(
+                    transfer_id="transfer-2",
+                    transferred_blocks=1,
+                    reason="ok",
+                ).encode("utf-8")
+            ]
+        }
+        self.assertIsNone(target_backend.pop_target_transfer_notification("transfer-2"))
 
     def test_nixl_backend_uses_per_thread_source_agents_for_concurrent_transfers(self):
         page_size = 2

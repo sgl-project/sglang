@@ -36,9 +36,8 @@ class SharedHiCacheSchedulerMixin:
             capacity = min(capacity, max(0, int(prefill_max_requests)))
 
         if capacity <= 0:
-            if (
-                getattr(self, "chunked_req", None) is None
-                and not getattr(self, "enable_priority_preemption", False)
+            if getattr(self, "chunked_req", None) is None and not getattr(
+                self, "enable_priority_preemption", False
             ):
                 return []
             capacity = 1
@@ -55,8 +54,8 @@ class SharedHiCacheSchedulerMixin:
             req.shared_hicache_max_prefix_len = None
 
         local_has_plan = [shared_hicache_manager.has_reuse_plan(req) for req in reqs]
-        any_rank_has_plan, all_ranks_have_plan = (
-            self._sync_shared_hicache_bool_batch(local_has_plan)
+        any_rank_has_plan, all_ranks_have_plan = self._sync_shared_hicache_bool_batch(
+            local_has_plan
         )
 
         local_reqs: list[tuple["Req", int]] = []
@@ -161,17 +160,15 @@ class SharedHiCacheSchedulerMixin:
     ) -> tuple[list[bool], list[bool]]:
         if not values:
             return [], []
-        group_size = self.ps.tp_size
+        group_size, group = self._shared_hicache_sync_group()
         if group_size <= 1:
             return list(values), list(values)
 
-        flags = torch.tensor(
-            [1 if value else 0 for value in values], dtype=torch.int32
-        )
+        flags = torch.tensor([1 if value else 0 for value in values], dtype=torch.int32)
         torch.distributed.all_reduce(
             flags,
             op=torch.distributed.ReduceOp.SUM,
-            group=self.tp_cpu_group,
+            group=group,
         )
         counts = [int(count) for count in flags.tolist()]
         return (
@@ -182,7 +179,7 @@ class SharedHiCacheSchedulerMixin:
     def _sync_shared_hicache_int_min_batch(self, values: list[int]) -> list[int]:
         if not values:
             return []
-        group_size = self.ps.tp_size
+        group_size, group = self._shared_hicache_sync_group()
         if group_size <= 1:
             return [int(value) for value in values]
 
@@ -190,9 +187,17 @@ class SharedHiCacheSchedulerMixin:
         torch.distributed.all_reduce(
             tensor,
             op=torch.distributed.ReduceOp.MIN,
-            group=self.tp_cpu_group,
+            group=group,
         )
         return [int(value) for value in tensor.tolist()]
+
+    def _shared_hicache_sync_group(self):
+        ps = getattr(self, "ps", None)
+        group_size = int(getattr(ps, "attn_tp_size", getattr(ps, "tp_size", 1)))
+        group = getattr(self, "attn_tp_cpu_group", None)
+        if group is None:
+            group = getattr(self, "tp_cpu_group", None)
+        return group_size, group
 
     def _init_next_round_input_with_shared_hicache_tp_sync(self, req: "Req") -> None:
         req.init_next_round_input(self.tree_cache)

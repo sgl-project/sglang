@@ -109,6 +109,9 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_DETOKENIZER_MAX_STATES` | Maximum states for detokenizer | Default value based on system |
 | `SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK` | Enable checks for memory imbalance across Tensor Parallel ranks | `true` |
 | `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` | Configure the custom memory pool type for Mooncake. Supports `NVLINK`, `BAREX`, `INTRA_NODE_NVLINK`. If set to `true`, it defaults to `NVLINK`. | `None` |
+| `SGLANG_SHARED_HICACHE_FETCH_WORKERS` | Number of concurrent target-side Shared HiCache transfer requests per scheduler. | `4` |
+| `SGLANG_SHARED_HICACHE_TRANSFER_PARALLELISM` | NIXL transfer parallelism for Shared HiCache source and target agents. If unset, uses the Shared HiCache default. | `None` |
+| `SGLANG_SHARED_HICACHE_NIXL_TELEMETRY` | Enable NIXL transfer telemetry logging for Shared HiCache. | `false` |
 
 ## Model-Specific Options
 

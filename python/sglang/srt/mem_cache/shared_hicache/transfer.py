@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
@@ -102,7 +103,7 @@ def _parallel_value(scheduler, name: str, default: int) -> int:
 
 
 def scheduler_parallel_metadata(scheduler) -> dict[str, int]:
-    """Return the TP/PP/CP rank metadata needed for same-shape direct reuse."""
+    """Return rank metadata needed for same-shape direct reuse."""
 
     return {
         "tp_rank": _parallel_value(scheduler, "tp_rank", 0),
@@ -117,20 +118,46 @@ def scheduler_parallel_metadata(scheduler) -> dict[str, int]:
         "attn_cp_size": _parallel_value(
             scheduler, "attn_cp_size", _server_arg(scheduler, "attn_cp_size", 1)
         ),
+        "attn_tp_rank": _parallel_value(scheduler, "attn_tp_rank", 0),
+        "attn_tp_size": _parallel_value(
+            scheduler, "attn_tp_size", _server_arg(scheduler, "tp_size", 1)
+        ),
+        "attn_dp_rank": _parallel_value(scheduler, "attn_dp_rank", 0),
+        "attn_dp_size": _parallel_value(
+            scheduler, "attn_dp_size", _server_arg(scheduler, "dp_size", 1)
+        ),
+        "dp_rank": _parallel_value(scheduler, "dp_rank", 0),
+        "dp_size": _parallel_value(
+            scheduler, "dp_size", _server_arg(scheduler, "dp_size", 1)
+        ),
     }
 
 
 def shared_hicache_parallel_rejection(
-    *, pp_size: int, attn_cp_size: int
+    *,
+    pp_size: int,
+    attn_cp_size: int,
+    attn_dp_size: int = 1,
+    tp_size: Optional[int] = None,
+    attn_tp_size: Optional[int] = None,
 ) -> Optional[str]:
     unsupported = []
     if pp_size != 1:
         unsupported.append(f"pp_size={pp_size}")
     if attn_cp_size != 1:
         unsupported.append(f"attn_cp_size={attn_cp_size}")
+    if attn_dp_size != 1:
+        unsupported.append(f"attn_dp_size={attn_dp_size}")
+    if (
+        tp_size is not None
+        and attn_tp_size is not None
+        and int(tp_size) != int(attn_tp_size)
+    ):
+        unsupported.append(f"tp_size={tp_size}:attn_tp_size={attn_tp_size}")
     if unsupported:
         return (
-            "SharedHiCache direct transfer supports same-shape TP, but PP/CP "
+            "SharedHiCache direct transfer supports same-shape attention TP, but "
+            "PP/CP/attention-DP "
             f"are deferred; got {', '.join(unsupported)}"
         )
     return None
@@ -140,6 +167,13 @@ def _direct_topology_rejection(scheduler) -> Optional[str]:
     return shared_hicache_parallel_rejection(
         pp_size=_server_arg(scheduler, "pp_size", 1),
         attn_cp_size=_server_arg(scheduler, "attn_cp_size", 1),
+        attn_dp_size=_parallel_value(
+            scheduler, "attn_dp_size", _server_arg(scheduler, "dp_size", 1)
+        ),
+        tp_size=_server_arg(scheduler, "tp_size", 1),
+        attn_tp_size=_parallel_value(
+            scheduler, "attn_tp_size", _server_arg(scheduler, "tp_size", 1)
+        ),
     )
 
 
@@ -265,7 +299,9 @@ def _source_host_tensors(tree_cache) -> list[torch.Tensor]:
     elif hasattr(host_pool, "data_refs"):
         refs = host_pool.data_refs
     else:
-        raise RuntimeError("Unsupported HiCache host pool for SharedHiCache direct transfer")
+        raise RuntimeError(
+            "Unsupported HiCache host pool for SharedHiCache direct transfer"
+        )
     return list(refs)
 
 
@@ -389,6 +425,8 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         self._source_worker_lock = threading.Lock()
         self._target_notification_lock = threading.Lock()
         self._target_notifications: dict[str, tuple[int, str]] = {}
+        self._retired_target_notifications: set[str] = set()
+        self._retired_target_notification_order: deque[str] = deque()
         self._gpu_id = int(gpu_id)
         if transfer_parallelism is None:
             transfer_parallelism = default_shared_hicache_transfer_parallelism()
@@ -509,13 +547,13 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             )
             return
         if not hasattr(host_pool, "kv_buffer"):
-            logger.info("SharedHiCache NIXL direct transfer disabled: no host kv_buffer")
+            logger.info(
+                "SharedHiCache NIXL direct transfer disabled: no host kv_buffer"
+            )
             return
         try:
             _, source_kv_item_lens = _source_host_buf_infos(self.tree_cache)
-            _validate_kv_item_lens_match(
-                source_kv_item_lens, self.target_kv_item_lens
-            )
+            _validate_kv_item_lens_match(source_kv_item_lens, self.target_kv_item_lens)
         except RuntimeError as err:
             logger.info("SharedHiCache NIXL direct transfer disabled: %s", err)
             return
@@ -539,9 +577,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             "DRAM",
         )
         if not source_descs:
-            raise RuntimeError(
-                "SharedHiCache NIXL source host registration failed"
-            )
+            raise RuntimeError("SharedHiCache NIXL source host registration failed")
         logger.info(
             "SharedHiCache NIXL source transfer worker enabled agent=%s backend=%s "
             "thread=%d parallelism=%d",
@@ -594,9 +630,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             state.remote_agents.add(target_agent_name)
         return target_agent_name, int(target_metadata.get("gpu_id", 0))
 
-    def _wait_for_transfer(
-        self, agent, handle
-    ) -> Optional[tuple[int, int, int, int]]:
+    def _wait_for_transfer(self, agent, handle) -> Optional[tuple[int, int, int, int]]:
         transfer_state = agent.transfer(handle)
         while transfer_state != "DONE":
             if transfer_state == "ERR":
@@ -628,6 +662,8 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
                 if parsed is None:
                     continue
                 transfer_id, transferred_blocks, reason = parsed
+                if transfer_id in self._retired_target_notifications:
+                    continue
                 self._target_notifications[transfer_id] = (
                     transferred_blocks,
                     reason,
@@ -640,9 +676,18 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             self._drain_target_notifications_locked()
             return self._target_notifications.pop(str(transfer_id), None)
 
-    def _get_xfer_telemetry(
-        self, agent, handle
-    ) -> Optional[tuple[int, int, int, int]]:
+    def drop_target_transfer_notification(self, transfer_id: str) -> None:
+        transfer_id = str(transfer_id)
+        with self._target_notification_lock:
+            self._target_notifications.pop(transfer_id, None)
+            if transfer_id not in self._retired_target_notifications:
+                self._retired_target_notifications.add(transfer_id)
+                self._retired_target_notification_order.append(transfer_id)
+            while len(self._retired_target_notification_order) > 4096:
+                expired = self._retired_target_notification_order.popleft()
+                self._retired_target_notifications.discard(expired)
+
+    def _get_xfer_telemetry(self, agent, handle) -> Optional[tuple[int, int, int, int]]:
         if not self._capture_telemetry:
             return None
         get_telemetry = getattr(agent, "get_xfer_telemetry", None)
@@ -657,7 +702,9 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
                 int(getattr(telemetry, "descCount")),
             )
         except Exception:
-            logger.debug("SharedHiCache NIXL transfer telemetry unavailable", exc_info=True)
+            logger.debug(
+                "SharedHiCache NIXL transfer telemetry unavailable", exc_info=True
+            )
             return None
 
     def _source_host_buf_infos(self) -> tuple[list[int], list[int]]:
@@ -752,16 +799,23 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         self._source_registered_ptrs = []
         self._source_pool_ready = False
         self._source_worker_states = {}
+        self._target_notifications = {}
+        self._retired_target_notifications = set()
+        self._retired_target_notification_order = deque()
         self._target_registered = False
 
 
-def make_shared_hicache_transfer_backend(scheduler) -> Optional[SharedHiCacheTransferBackend]:
+def make_shared_hicache_transfer_backend(
+    scheduler,
+) -> Optional[SharedHiCacheTransferBackend]:
     backend = shared_hicache_transfer_backend_name(scheduler.server_args)
     topology_rejection = _direct_topology_rejection(scheduler)
     if topology_rejection is not None:
         if backend == "nixl":
             raise RuntimeError(topology_rejection)
-        logger.warning("SharedHiCache direct transfer unavailable: %s", topology_rejection)
+        logger.warning(
+            "SharedHiCache direct transfer unavailable: %s", topology_rejection
+        )
         return None
 
     if backend == "nixl":

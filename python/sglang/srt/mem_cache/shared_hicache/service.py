@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from string import Formatter
@@ -12,6 +13,21 @@ from sglang.srt.mem_cache.shared_hicache.plan import normalize_endpoint
 from sglang.srt.utils.network import config_socket
 
 logger = logging.getLogger(__name__)
+
+
+def _encode_control_payload(payload: Mapping[str, Any]) -> bytes:
+    return json.dumps(dict(payload), separators=(",", ":")).encode("utf-8")
+
+
+def _decode_control_payload(frames: list[bytes]) -> Mapping[str, Any]:
+    if len(frames) != 1:
+        raise ValueError(
+            f"expected one Shared HiCache control frame, got {len(frames)}"
+        )
+    payload = json.loads(frames[0].decode("utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError("Shared HiCache control payload must be a JSON object")
+    return payload
 
 
 def endpoint_format_fields(endpoint_spec: object) -> set[str]:
@@ -98,7 +114,7 @@ class SharedHiCacheSourceService:
                 config_socket(socket, zmq.PUSH)
                 socket.connect(endpoint)
                 self._send_sockets[endpoint] = socket
-            socket.send_pyobj(dict(payload))
+            socket.send_multipart([_encode_control_payload(payload)])
 
     def active_count(self) -> int:
         with self._activity_lock:
@@ -158,11 +174,10 @@ class SharedHiCacheSourceService:
             with self._activity_lock:
                 self._active_ops += 1
             try:
-                payload = socket.recv_pyobj()
-                if not isinstance(payload, Mapping):
-                    logger.warning("Ignoring malformed Shared HiCache ZMQ payload")
-                    continue
+                payload = _decode_control_payload(socket.recv_multipart())
                 self.handle_control_message(payload)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                logger.warning("Ignoring malformed Shared HiCache ZMQ payload")
             except zmq.ZMQError:
                 if not self._shutdown.is_set():
                     logger.debug("Shared HiCache ZMQ receive failed", exc_info=True)

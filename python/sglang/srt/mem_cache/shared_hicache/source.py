@@ -148,7 +148,9 @@ def resolve_host_page_locations(
     tp_rank: int = 0,
     tp_size: int = 1,
     pp_size: int = 1,
+    attn_tp_size: int = 1,
     attn_cp_size: int = 1,
+    attn_dp_size: int = 1,
     target_tp_rank: Optional[int] = None,
     target_tp_size: Optional[int] = None,
 ) -> tuple[list[ResolvedHostPageLocation], str, list[TreeNode]]:
@@ -161,7 +163,9 @@ def resolve_host_page_locations(
         tp_rank=tp_rank,
         tp_size=tp_size,
         pp_size=pp_size,
+        attn_tp_size=attn_tp_size,
         attn_cp_size=attn_cp_size,
+        attn_dp_size=attn_dp_size,
         target_tp_rank=target_tp_rank,
         target_tp_size=target_tp_size,
     )
@@ -282,13 +286,18 @@ def _source_rank_rejection(
     tp_rank: int,
     tp_size: int,
     pp_size: int,
+    attn_tp_size: int,
     attn_cp_size: int,
+    attn_dp_size: int,
     target_tp_rank: Optional[int],
     target_tp_size: Optional[int],
 ) -> Optional[str]:
     topology_rejection = shared_hicache_parallel_rejection(
         pp_size=int(pp_size),
         attn_cp_size=int(attn_cp_size),
+        attn_dp_size=int(attn_dp_size),
+        tp_size=int(tp_size),
+        attn_tp_size=int(attn_tp_size),
     )
     if topology_rejection is not None:
         return f"unsupported_source_topology:{topology_rejection}"
@@ -299,6 +308,13 @@ def _source_rank_rejection(
         return (
             "wrong_source_tp_size:" f"plan={plan.source_tp_size}:local={local_tp_size}"
         )
+    source_tp_rank = plan.source_tp_rank
+    if source_tp_rank is None:
+        if local_tp_size > 1:
+            return "missing_source_tp_rank"
+        source_tp_rank = 0
+    if int(source_tp_rank) != local_tp_rank:
+        return "wrong_source_tp_rank:" f"plan={source_tp_rank}:local={local_tp_rank}"
     if target_tp_size is None:
         if local_tp_size > 1:
             return "missing_target_tp_size"
@@ -314,6 +330,16 @@ def _source_rank_rejection(
         return (
             "wrong_target_tp_size:"
             f"plan={plan.target_tp_size}:target={target_tp_size}"
+        )
+    plan_target_tp_rank = plan.target_tp_rank
+    if plan_target_tp_rank is None:
+        if target_tp_size > 1:
+            return "missing_plan_target_tp_rank"
+        plan_target_tp_rank = 0
+    if int(plan_target_tp_rank) != target_tp_rank:
+        return (
+            "wrong_target_tp_rank:"
+            f"plan={plan_target_tp_rank}:target={target_tp_rank}"
         )
     if target_tp_size != local_tp_size:
         return "incompatible_tp_size:" f"source={local_tp_size}:target={target_tp_size}"
@@ -510,7 +536,9 @@ def execute_source_transfer_request(
     tp_rank: int = 0,
     tp_size: int = 1,
     pp_size: int = 1,
+    attn_tp_size: int = 1,
     attn_cp_size: int = 1,
+    attn_dp_size: int = 1,
 ) -> Mapping[str, Any]:
     total_start = time.perf_counter()
     resolve_start = total_start
@@ -523,7 +551,9 @@ def execute_source_transfer_request(
         tp_rank=tp_rank,
         tp_size=tp_size,
         pp_size=pp_size,
+        attn_tp_size=attn_tp_size,
         attn_cp_size=attn_cp_size,
+        attn_dp_size=attn_dp_size,
         target_tp_rank=request.target_tp_rank,
         target_tp_size=request.target_tp_size,
     )
