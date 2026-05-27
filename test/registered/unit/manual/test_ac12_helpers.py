@@ -442,6 +442,44 @@ class TestAC12HarnessHelpers(unittest.TestCase):
             )
             self.assertEqual(len(ex_capped), 3)
 
+    def test_load_mmlu_examples_works_without_pandas(self):
+        """Round 28 review bug: the harness had `try: import pandas /
+        self.skipTest()`. Round 29 dropped pandas — verify the loader
+        runs under monkeypatched pandas import failure."""
+        import builtins
+        import sys
+        import tempfile
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "pandas" or name.startswith("pandas."):
+                raise ImportError(f"simulated absence of {name}")
+            return real_import(name, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dev_dir = os.path.join(tmp, "dev")
+            test_dir = os.path.join(tmp, "test")
+            self._make_subject(dev_dir, test_dir, "csv_only",
+                               dev_rows=5, test_rows=2)
+
+            # Block pandas — both as already-imported and as a fresh import.
+            pandas_was = sys.modules.pop("pandas", None)
+            try:
+                builtins.__import__ = fake_import
+                try:
+                    examples, totals = self._h._load_mmlu_examples(
+                        dev_dir, test_dir, max_examples=10,
+                    )
+                finally:
+                    builtins.__import__ = real_import
+            finally:
+                if pandas_was is not None:
+                    sys.modules["pandas"] = pandas_was
+
+            self.assertEqual(len(examples), 2)
+            self.assertIn("csv_only", totals)
+
     def test_load_mmlu_examples_explicit_subjects_filter(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
@@ -457,6 +495,99 @@ class TestAC12HarnessHelpers(unittest.TestCase):
             self.assertEqual(len(examples), 4)
             self.assertIn("beta", totals)
             self.assertNotIn("alpha", totals)
+
+    # ---- Round 29: harness-level subjects-filter integration ----------
+
+    def test_mmlu_5shot_subjects_filter_does_not_crash(self):
+        """Round 28 review bug: `AC12_MMLU_SUBJECTS=beta` raised
+        `NameError: name 'subjects' is not defined` because the
+        artifact recorder referenced the pre-rename variable name.
+
+        Drives the full `test_mmlu_5shot` harness path end-to-end:
+        builds a tiny valid CSV tree with a `beta` subject, sets the
+        env override, mocks ``_generate`` to return the gold answer
+        (so the gate passes), captures the ``_record_artifact``
+        payload, asserts no NameError and that the recorded
+        ``subjects`` field is ``["beta"]``.
+        """
+        import sys
+        import tempfile
+        import unittest as _ut
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dev_dir = os.path.join(tmp, "dev")
+            test_dir = os.path.join(tmp, "test")
+            # Build alpha + beta subjects; only beta is selected via env.
+            self._make_subject(dev_dir, test_dir, "alpha",
+                               dev_rows=5, test_rows=2)
+            self._make_subject(dev_dir, test_dir, "beta",
+                               dev_rows=5, test_rows=3)
+
+            # Mock _generate to return the gold answer for every prompt
+            # so the gate assertion passes. The gold is in row[5];
+            # _make_subject populates it as "A".
+            def fake_generate(url, prompt, *, max_new_tokens=4):
+                return "A"
+
+            captured: List[Dict[str, Any]] = []
+
+            def fake_record(payload, *, suffix):
+                captured.append({"payload": payload, "suffix": suffix})
+
+            env_overrides = {
+                "DS_BASE_URL": "http://127.0.0.1:1",
+                "DSA_BASE_URL": "http://127.0.0.1:2",
+                "AC12_MMLU_DATA_DIR": tmp,
+                "AC12_MMLU_SUBJECTS": "beta",
+                "AC12_MMLU_NUM_EXAMPLES": "10",
+            }
+
+            # The @unittest.skipUnless decorator on the class freezes
+            # the env check at import time. Temporarily clear the
+            # cached skip so the test body actually runs under our
+            # patched env. We restore the originals in `finally` so
+            # this regression doesn't pollute other registered tests.
+            cls = self._h.TestDoubleSparsityV32Quality
+            orig_skip = cls.__dict__.get("__unittest_skip__", False)
+            orig_why = cls.__dict__.get("__unittest_skip_why__", "")
+            cls.__unittest_skip__ = False
+            cls.__unittest_skip_why__ = ""
+            try:
+                with patch.dict(os.environ, env_overrides), \
+                     patch.object(self._h, "_generate", fake_generate), \
+                     patch.object(self._h, "_record_artifact", fake_record):
+                    suite = _ut.TestSuite([cls("test_mmlu_5shot")])
+                    runner = _ut.TextTestRunner(
+                        stream=open(os.devnull, "w"), verbosity=0,
+                    )
+                    result = runner.run(suite)
+            finally:
+                cls.__unittest_skip__ = orig_skip
+                cls.__unittest_skip_why__ = orig_why
+
+            # No errors and no failures — the AC-12 gate path completed
+            # without NameError + the model's mock gold answers passed
+            # the |DSA - DS| <= 1.0 pp check (both 100%, delta 0).
+            self.assertEqual(
+                len(result.errors), 0,
+                f"unexpected errors: {result.errors}",
+            )
+            self.assertEqual(
+                len(result.failures), 0,
+                f"unexpected failures: {result.failures}",
+            )
+
+            # Recorder captured the MMLU artifact with subjects == ["beta"].
+            mmlu_payloads = [
+                c for c in captured if c["suffix"] == "mmlu_5shot"
+            ]
+            self.assertEqual(len(mmlu_payloads), 1)
+            payload = mmlu_payloads[0]["payload"]
+            self.assertEqual(payload["subjects"], ["beta"])
+            # Only beta was evaluated; alpha must not appear.
+            self.assertIn("beta", payload["dsa_per_subject"])
+            self.assertNotIn("alpha", payload["dsa_per_subject"])
 
     def test_ensure_mmlu_data_dir_raises_when_archive_missing_subdirs(self):
         """Tar with no data/dev or data/test must fail loudly."""

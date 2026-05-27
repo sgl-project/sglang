@@ -326,7 +326,13 @@ def _load_mmlu_examples(
     Raises ``ValueError`` if the dataset cannot be loaded, with a
     message naming the resolved directories and the missing piece.
     """
-    import pandas as pd
+    import csv as _csv
+
+    def _read_csv_rows(path: str) -> List[List[str]]:
+        # stdlib only — Round 28's pandas dependency caused a silent
+        # SkipTest path inside the AC-12 gate when pandas was missing.
+        with open(path, "r", newline="", encoding="utf-8") as fh:
+            return [row for row in _csv.reader(fh)]
 
     if not os.path.isdir(test_dir):
         raise ValueError(
@@ -370,20 +376,19 @@ def _load_mmlu_examples(
             )
             continue
         try:
-            dev_df = pd.read_csv(dev_path, header=None)
-            test_df = pd.read_csv(test_path, header=None)
+            dev_rows_all = _read_csv_rows(dev_path)
+            test_rows_all = _read_csv_rows(test_path)
         except Exception as exc:
             rejected_subjects.append(f"{subject} (CSV read failed: {exc})")
             continue
-        if dev_df.shape[0] < 5:
+        if len(dev_rows_all) < 5:
             rejected_subjects.append(
-                f"{subject} (only {dev_df.shape[0]} dev rows, need 5)"
+                f"{subject} (only {len(dev_rows_all)} dev rows, need 5)"
             )
             continue
-        dev_rows = dev_df.iloc[:5].values.tolist()
+        dev_rows = dev_rows_all[:5]
         kept = 0
-        for i in range(test_df.shape[0]):
-            row = test_df.iloc[i].tolist()
+        for row in test_rows_all:
             if len(row) < 6:
                 continue
             examples.append(
@@ -623,12 +628,13 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
         ``max_new_tokens=4`` (need room for the model's tokenizer to emit
         the answer letter even when wrapped in punctuation or a space);
         first stripped A-D character in the response is the prediction.
+
+        Round 29 dropped the prior `import pandas as pd` /
+        `self.skipTest(...)` guard: that silently bypassed the AC-12
+        gate when pandas was unavailable but servers were configured.
+        `_load_mmlu_examples` now uses stdlib `csv` and never imports
+        pandas.
         """
-        try:
-            import pandas as pd
-        except ImportError:
-            self.skipTest("pandas required for MMLU 5-shot harness")
-            return
 
         # Discover the MMLU CSV directories (test + dev). Operator can
         # override via AC12_MMLU_DATA_DIR; default is the standard
@@ -668,6 +674,11 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
             subjects_arg = [
                 s.strip() for s in env_subjects.split(",") if s.strip()
             ]
+        # Normalize for the artifact recorder so we never depend on an
+        # undefined `subjects` name (Round 28 review NameError fix).
+        subjects_for_artifact = (
+            subjects_arg if subjects_arg is not None else "all"
+        )
         max_examples = _env_int("AC12_MMLU_NUM_EXAMPLES", 200)
 
         # Build the example list via the validated loader. The Round
@@ -720,7 +731,7 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
         delta_pp = dsa_result["score_pct"] - ds_result["score_pct"]
         _record_artifact(
             {
-                "subjects": subjects if env_subjects.lower() != "all" else "all",
+                "subjects": subjects_for_artifact,
                 "num_examples_evaluated": len(examples),
                 "dsa_score_pct": dsa_result["score_pct"],
                 "ds_score_pct": ds_result["score_pct"],
