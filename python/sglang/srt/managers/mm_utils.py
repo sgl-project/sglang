@@ -722,6 +722,7 @@ def _get_chunked_prefill_embedding(
         max_batch = envs.SGLANG_MM_GLOBAL_CACHE_MAX_BATCH.get()
         exist_timeout = envs.SGLANG_MM_GLOBAL_CACHE_EXIST_TIMEOUT.get()
         prefetch_timeout_per_item = envs.SGLANG_MM_GLOBAL_CACHE_PREFETCH_TIMEOUT.get()
+        prefetch_max_timeout = envs.SGLANG_MM_GLOBAL_CACHE_PREFETCH_MAX_TIMEOUT.get()
 
         # Limit batch size to avoid long blocking
         if len(all_l1_miss_items) > max_batch:
@@ -795,7 +796,7 @@ def _get_chunked_prefill_embedding(
 
                 start_wait = time.time()
                 prefetch_timeout = min(
-                    1.0, len(global_hit_hashes) * prefetch_timeout_per_item
+                    prefetch_max_timeout, len(global_hit_hashes) * prefetch_timeout_per_item
                 )
                 while not mm_global_cache_controller.check_prefetch_progress(req_id):
                     if time.time() - start_wait > prefetch_timeout:

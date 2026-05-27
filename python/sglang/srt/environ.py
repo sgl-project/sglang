@@ -545,8 +545,10 @@ class Envs:
     SGLANG_MM_GLOBAL_CACHE_MAX_BATCH = EnvInt(32)
     # Timeout for checking existence in global cache (seconds)
     SGLANG_MM_GLOBAL_CACHE_EXIST_TIMEOUT = EnvFloat(0.5)
-    # Timeout for prefetching from global cache (seconds per item, max 1s)
+    # Timeout for prefetching from global cache (seconds per item)
     SGLANG_MM_GLOBAL_CACHE_PREFETCH_TIMEOUT = EnvFloat(0.5)
+    # Max total prefetch timeout in seconds (caps per-item * count)
+    SGLANG_MM_GLOBAL_CACHE_PREFETCH_MAX_TIMEOUT = EnvFloat(1.0)
 
 
     # VLM Item CUDA IPC Transport
