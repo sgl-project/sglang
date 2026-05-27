@@ -56,6 +56,11 @@ class TestTritonMLAAttentionBackendCorrectness(CustomTestCase):
             32,
         ),
     )
+    # Spec verify covers EAGLE chain + tree plus the non-EAGLE chain
+    # spec kinds (frozen_kv_mtp, dflash, ngram). FlashInfer MLA and
+    # FlashMLA only support EAGLE — their forward_extend reads
+    # EAGLE-specific spec_info attrs and trips a CUDA illegal-memory
+    # access on the other kinds — so this matrix is Triton-only.
     EAGLE_VERIFY_CASES = (
         (
             MLAAttentionCase(
@@ -68,6 +73,46 @@ class TestTritonMLAAttentionBackendCorrectness(CustomTestCase):
                 extend_lens=(3, 3),
             ),
             1,
+            "eagle",
+        ),
+        (
+            MLAAttentionCase(
+                name="runner_frozen_kv_mtp_verify_mla_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "frozen_kv_mtp",
+        ),
+        (
+            MLAAttentionCase(
+                name="runner_dflash_verify_mla_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "dflash",
+        ),
+        (
+            MLAAttentionCase(
+                name="runner_ngram_verify_mla_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "ngram",
         ),
     )
     EAGLE_VERIFY_CUDA_GRAPH_CASES = (
@@ -82,6 +127,46 @@ class TestTritonMLAAttentionBackendCorrectness(CustomTestCase):
                 extend_lens=(3, 3),
             ),
             2,
+            "eagle",
+        ),
+        (
+            MLAAttentionCase(
+                name="runner_cuda_graph_frozen_kv_mtp_verify_mla_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "frozen_kv_mtp",
+        ),
+        (
+            MLAAttentionCase(
+                name="runner_cuda_graph_dflash_verify_mla_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "dflash",
+        ),
+        (
+            MLAAttentionCase(
+                name="runner_cuda_graph_ngram_verify_mla_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "ngram",
         ),
     )
     DRAFT_EXTEND_V2_CUDA_GRAPH_CASES = (
@@ -160,14 +245,28 @@ class TestTritonMLAAttentionBackendCorrectness(CustomTestCase):
                     )
 
     def test_runner_mode_eagle_verify_cases(self):
-        for case, topk in self.EAGLE_VERIFY_CASES:
-            with self.subTest(case=case.name, backend=case.backend, topk=topk):
-                run_mla_eagle_verify_case(self, case, topk=topk)
+        for case, topk, spec_kind in self.EAGLE_VERIFY_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                topk=topk,
+                spec_kind=spec_kind,
+            ):
+                run_mla_eagle_verify_case(
+                    self, case, topk=topk, spec_kind=spec_kind
+                )
 
     def test_runner_mode_eagle_verify_cuda_graph_cases(self):
-        for case, topk in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:
-            with self.subTest(case=case.name, backend=case.backend, topk=topk):
-                run_mla_eagle_verify_cuda_graph_case(self, case, topk=topk)
+        for case, topk, spec_kind in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                topk=topk,
+                spec_kind=spec_kind,
+            ):
+                run_mla_eagle_verify_cuda_graph_case(
+                    self, case, topk=topk, spec_kind=spec_kind
+                )
 
     def test_runner_mode_eagle_draft_extend_v2_cuda_graph_cases(self):
         for case in self.DRAFT_EXTEND_V2_CUDA_GRAPH_CASES:

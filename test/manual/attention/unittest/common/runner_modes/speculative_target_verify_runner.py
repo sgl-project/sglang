@@ -695,6 +695,7 @@ def run_mla_eagle_verify_case(
     case: MLAAttentionCase,
     *,
     topk: int,
+    spec_kind: SpecVerifyKind = "eagle",
     kv_lora_rank: int = DEFAULT_KV_LORA_RANK,
     qk_rope_head_dim: int = DEFAULT_QK_ROPE_HEAD_DIM,
     hidden_size: int = MLA_DEFAULT_HIDDEN_SIZE,
@@ -714,11 +715,12 @@ def run_mla_eagle_verify_case(
     )
     _prepare_target_verify_batch(fixture.forward_batch, case, device)
     masks_by_req, _ = _make_custom_masks(case, topk=topk, device=device)
-    fixture.forward_batch.spec_info = _make_eagle_verify_input(
+    fixture.forward_batch.spec_info = _make_spec_verify_input(
         case,
         fixture.forward_batch,
         topk=topk,
         device=device,
+        spec_kind=spec_kind,
     )
     inputs = mla_fixture_inputs(fixture)
     expected = mla_attention_reference_with_custom_mask(
@@ -741,6 +743,7 @@ def run_mla_eagle_verify_cuda_graph_case(
     case: MLAAttentionCase,
     *,
     topk: int,
+    spec_kind: SpecVerifyKind = "eagle",
     kv_lora_rank: int = DEFAULT_KV_LORA_RANK,
     qk_rope_head_dim: int = DEFAULT_QK_ROPE_HEAD_DIM,
     hidden_size: int = MLA_DEFAULT_HIDDEN_SIZE,
@@ -753,7 +756,7 @@ def run_mla_eagle_verify_cuda_graph_case(
         testcase,
         case,
         topk=topk,
-        spec_kind="eagle",
+        spec_kind=spec_kind,
         build_fixture=build_mla_attention_fixture,
         make_case_with_prefix_lens=make_mla_case_with_prefix_lens,
         make_forward_batch=_make_mla_forward_batch,
