@@ -37,7 +37,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, round_up
+from sglang.srt.utils import add_prefix, get_compiler_backend, round_up
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +189,7 @@ def _prepare_rotary_cos_sin(
     return cos, sin
 
 
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def _minimax_rope_applier(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -203,13 +204,16 @@ def _minimax_rope_applier(
     cos, sin = position_embeddings
     rot_dim = cos.shape[-1]
 
-    q_rot, q_pass = q[..., :rot_dim], q[..., rot_dim:]
-    k_rot, k_pass = k[..., :rot_dim], k[..., rot_dim:]
-    q_rot = (q_rot.float() * cos) + (rotate_half(q_rot.float()) * sin)
-    k_rot = (k_rot.float() * cos) + (rotate_half(k_rot.float()) * sin)
+    q_rot = q[..., :rot_dim].float()
+    q_pass = q[..., rot_dim:]
+    k_rot = k[..., :rot_dim].float()
+    k_pass = k[..., rot_dim:]
 
-    q = torch.cat((q_rot.to(q.dtype), q_pass), dim=-1)
-    k = torch.cat((k_rot.to(k.dtype), k_pass), dim=-1)
+    q_rot = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_rot = (k_rot * cos) + (rotate_half(k_rot) * sin)
+
+    q = torch.cat((q_rot.to(q_pass.dtype), q_pass), dim=-1)
+    k = torch.cat((k_rot.to(k_pass.dtype), k_pass), dim=-1)
     return q, k
 
 
