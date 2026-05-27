@@ -808,13 +808,11 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert resp.status_code == 200, f"merge_lora_weights failed: {resp.text}"
 
         logger.info("[LoRA E2E] Verifying generation after re-merge for %s", case.id)
-        rid_after_merge, content_after_merge = self._run_generation_with_server_watchdog(
-            ctx, case.id, generate_fn, client
+        rid_after_merge, content_after_merge = (
+            self._run_generation_with_server_watchdog(ctx, case.id, generate_fn, client)
         )
         assert rid_after_merge is not None, "Generation after merge failed"
-        self._validate_lora_consistency(
-            case, content_after_merge, "merge_lora_weights"
-        )
+        self._validate_lora_consistency(case, content_after_merge, "merge_lora_weights")
         logger.info("[LoRA E2E] Generation after merge succeeded")
 
         # Test 3: set_lora (re-set the same adapter) - API should succeed and generation should work
@@ -915,9 +913,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             case.id,
         )
         rid_switched_back, content_switched_back = (
-            self._run_generation_with_server_watchdog(
-                ctx, case.id, generate_fn, client
-            )
+            self._run_generation_with_server_watchdog(ctx, case.id, generate_fn, client)
         )
         assert rid_switched_back is not None, "Generation after switching back failed"
         self._validate_lora_consistency(
