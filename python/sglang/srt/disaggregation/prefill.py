@@ -476,14 +476,21 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return 0
 
-        min_tokens = envs.SGLANG_PIPELINE_MIN_TOKENS.get()
+        # If user explicitly set group_size, it takes priority over all heuristics.
+        if envs.SGLANG_PIPELINE_GROUP_SIZE.is_set():
+            return envs.SGLANG_PIPELINE_GROUP_SIZE.get()
+
+        num_layers = self.model_config.num_hidden_layers
+
+        # Models with very few layers gain nothing from pipelining — the per-group
+        # overhead (event sync, queue enqueue, RDMA doorbell) outweighs any overlap.
+        if num_layers <= 4:
+            return 0
+
+        min_tokens = max(1, envs.SGLANG_PIPELINE_MIN_TOKENS.get())  # guard div-by-zero
         avg_tokens = sum(req.extend_input_len for req in batch.reqs) // len(batch.reqs)
         if avg_tokens < min_tokens:
             return 0
-
-        # If user explicitly set group_size, respect it (backward compatible)
-        if envs.SGLANG_PIPELINE_GROUP_SIZE.is_set():
-            return envs.SGLANG_PIPELINE_GROUP_SIZE.get()
 
         # Adaptive group_size via continuous formula:
         #   target_iters = clamp(MAX - t*(MAX-MIN), MIN, MAX)
@@ -505,7 +512,6 @@ class SchedulerDisaggregationPrefillMixin:
         t = min(1.0, max(0.0, (avg_tokens - min_tokens) / (sat_tokens - min_tokens)))
         target_iters = max(min_iters, round(max_iters - t * (max_iters - min_iters)))
 
-        num_layers = self.model_config.num_hidden_layers
         return max(1, num_layers // target_iters)
 
     @torch.no_grad()
