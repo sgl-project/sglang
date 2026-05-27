@@ -212,7 +212,7 @@ MINIMAX_M2_5_W8A8_MODEL_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
 )
 MINIMAX_M2_5_EAGLE3_MODEL_PATH = os.path.join(
-    MODEL_WEIGHTS_DIR, "Eco-Tech/MiniMax-M2.5-eagle3"
+    MODEL_WEIGHTS_DIR, "sgl-npu/MiniMax-M2.5-eagel-model-0318"
 )
 EAGLE3_LLAMA3_1_INSTRUCT_8B_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "sglang-EAGLE3-LLaMA3.1-Instruct-8B"

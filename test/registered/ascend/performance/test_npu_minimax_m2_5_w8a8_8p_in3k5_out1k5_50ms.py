@@ -12,9 +12,8 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=3600,
-    suite="",
+    suite="nightly-16-npu-a3",
     nightly=True,
-    disabled="performance testcase",
 )
 
 MINIMAX_M2_5_HIGH_THROUGHPUT_ENVS = {
