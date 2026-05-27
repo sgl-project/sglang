@@ -51,14 +51,16 @@ class TestServerArgsIBDeviceValidation(unittest.TestCase):
 
         with patch(
             "sglang.srt.server_args.os.path.isdir",
-            side_effect=lambda path: True
-            if path == "/sys/class/infiniband"
-            else real_isdir(path),
+            side_effect=lambda path: (
+                True if path == "/sys/class/infiniband" else real_isdir(path)
+            ),
         ), patch(
             "sglang.srt.server_args.os.listdir",
-            side_effect=lambda path: available_devices
-            if path == "/sys/class/infiniband"
-            else real_listdir(path),
+            side_effect=lambda path: (
+                available_devices
+                if path == "/sys/class/infiniband"
+                else real_listdir(path)
+            ),
         ):
             return ServerArgs._validate_ib_devices(server_args, device_str)
 
