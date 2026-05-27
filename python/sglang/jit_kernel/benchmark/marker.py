@@ -1,4 +1,5 @@
 import itertools
+import math
 import os
 from collections import OrderedDict
 from typing import (
@@ -26,6 +27,14 @@ Metric: TypeAlias = 'float | Literal["avg"]'
 
 TYPE_LIST = (bool, int, float, str, torch.dtype, torch.device, None.__class__)
 DISABLE_LOG_BANDWIDTH = os.environ.get("SGLANG_KERNEL_DISABLE_LOG_BANDWIDTH") == "1"
+
+
+class BenchSkip(Exception):
+    pass
+
+
+def skip(reason: str):
+    raise BenchSkip(reason)
 
 
 @cache_once
@@ -218,6 +227,8 @@ class Benchmark(Generic[F]):
             return max(len(str(s)) + 2, min_width)
 
         def format_latency(r: float) -> str:
+            if math.isnan(r):
+                return "N/A"
             length = len(str(int(r)))
             if length < 5:
                 return f"{r:.4f}"
@@ -226,6 +237,8 @@ class Benchmark(Generic[F]):
             return f"{r:.{digits}f}"
 
         def format_bandwidth(b: float) -> str:
+            if math.isnan(b):
+                return "N/A"
             return f"{b:.2f}"
 
         results: List[List[float]] = []
@@ -238,7 +251,13 @@ class Benchmark(Generic[F]):
             for config in itertools.product(*benchmark_configs.values()):
                 config_dict = dict(zip(benchmark_configs.keys(), config))
                 config_dict.update({self.line_arg: system})
-                result = self.benchmark_fn(**config_dict)
+                try:
+                    result = self.benchmark_fn(**config_dict)
+                except BenchSkip:
+                    system_list.append(float("nan"))
+                    if not DISABLE_LOG_BANDWIDTH:
+                        bandwidth_list.append(float("nan"))
+                    continue
                 system_list.append(result.times[0] / self.unit_scale)
                 if not DISABLE_LOG_BANDWIDTH and result.memory_footprint is not None:
                     should_log_bandwidth = True
@@ -268,8 +287,13 @@ class Benchmark(Generic[F]):
             print(arg, end="")
             counter += len(arg)
 
+        total_width = id_width + sum(args_widths) + 3 + sum(system_widths)
+        if should_log_bandwidth:
+            total_width += 3 + sum(bandwidth_widths)
+
+        print("=" * total_width)
         counter = 0
-        # id, args... , system0, system1, ...
+        # id, args... | system0, system1, ... | bw0, bw1, ...
         _print(" " * id_width)
         for key, width in zip(benchmark_configs.keys(), args_widths):
             _print(f"{key:>{width}}")
@@ -291,11 +315,12 @@ class Benchmark(Generic[F]):
             _print(" | ")
             for system_result, width in zip(results, system_widths):
                 _print(f"{format_latency(system_result[id]):>{width}}")
-            _print(" | ")
             if should_log_bandwidth:
+                _print(" | ")
                 for bandwidth_result, width in zip(bandwidth_results, bandwidth_widths):
                     _print(f"{format_bandwidth(bandwidth_result[id]):>{width}}")
             print()
+        print("=" * total_width)
 
 
 def benchmark(line_arg: str, line_vals: List[str], *, unit: str = "us"):
