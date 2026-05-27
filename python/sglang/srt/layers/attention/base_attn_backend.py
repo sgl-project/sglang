@@ -18,6 +18,12 @@ if TYPE_CHECKING:
 class AttentionBackend(ABC):
     """The base class of attention backends"""
 
+    # When False, the overlap scheduler skips producing seq_lens_cpu /
+    # seq_lens_sum (and their D2H sync) for this backend. Default True keeps
+    # legacy backends that read these on the CPU correct; opt out only after
+    # verifying the backend's metadata / replay path never reads them.
+    needs_cpu_seq_lens: bool = True
+
     @abstractmethod
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""

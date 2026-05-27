@@ -88,11 +88,15 @@ class FutureMap:
         device: torch.device,
         spec_algo: SpeculativeAlgorithm,
         req_to_token_pool: ReqToTokenPool,
+        needs_cpu_seq_lens: bool = True,
     ):
         # Bufs indexed by req_pool_idx; slot 0 mirrors KV padding row so
         # CUDA-graph padded batches (req_pool_idx == 0) are harmless.
         self.device = device
         self.spec_algo = spec_algo
+        # OR over the spec_v2 forward backends: when all opt out, resolve skips
+        # the seq_lens_cpu D2H and downstream takes the GPU-only path.
+        self.needs_cpu_seq_lens = needs_cpu_seq_lens
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
 
         self.output_tokens_buf = (
@@ -205,6 +209,13 @@ class FutureMap:
         if self.publish_ready is not None:
             self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
+
+        if not self.needs_cpu_seq_lens:
+            # GPU gather above is kept (SB.seq_lens must advance each verify);
+            # skip the .cpu() D2H. Downstream takes the GPU-only path.
+            batch.seq_lens_cpu = None
+            batch.seq_lens_sum = None
+            return
 
         if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
             batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA

@@ -1142,9 +1142,15 @@ class Scheduler(
             self.future_map = None
             return
 
+        needs_cpu_seq_lens = (
+            getattr(self.draft_worker, "needs_cpu_seq_lens", True)
+            if self.draft_worker is not None
+            else self.tp_worker.model_runner.attn_backend.needs_cpu_seq_lens
+        )
         self.future_map = self.spec_algorithm.create_future_map(
             self.device,
             self.req_to_token_pool,
+            needs_cpu_seq_lens=needs_cpu_seq_lens,
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0

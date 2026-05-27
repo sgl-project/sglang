@@ -392,6 +392,11 @@ class EagleDraftWorker(BaseDraftWorker):
             self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
         )
 
+        # Under the no-verify-sync path seq_lens_sum is None; the kernel only
+        # consults it when there is no preallocated mask buffer to size against.
+        if batch.seq_lens_sum is None and tree_mask_buf is None:
+            batch.seq_lens_sum = batch.seq_lens.sum().item()
+
         (
             tree_mask,
             position,
@@ -405,7 +410,7 @@ class EagleDraftWorker(BaseDraftWorker):
             top_scores_index,
             draft_tokens,
             batch.seq_lens,
-            batch.seq_lens_sum,
+            batch.seq_lens_sum or 0,
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
@@ -779,6 +784,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     )
                 )
                 self.adaptive_controller.init_states()
+
+    @property
+    def needs_cpu_seq_lens(self) -> bool:
+        # OR over every backend a spec_v2 forward touches; the overlap scheduler
+        # only skips the seq_lens_cpu produce when all of them opt out.
+        backends = (
+            self._target_worker.model_runner.attn_backend,
+            self._draft_worker.draft_attn_backend,
+            self._draft_worker.draft_extend_attn_backend,
+        )
+        return any(
+            getattr(b, "needs_cpu_seq_lens", True) for b in backends if b is not None
+        )
 
     @property
     def target_worker(self):
