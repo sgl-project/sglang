@@ -477,6 +477,39 @@ docker exec ci_sglang bash -lc '
 '
 
 docker exec ci_sglang bash -lc '
+  # EXPERIMENT: Override TCP sysctl inside privileged container to match MI325 baseline.
+  # MI300 host inherits CUBIC + 6MB rmem -> ~20 MB/s on HF CDN.
+  # MI325 host already uses BBR + 16MB rmem -> ~76 MB/s on the same destination.
+  # This override only affects container-initiated TCP connections (HF / pip downloads).
+  # docker pull runs in host network namespace and is NOT affected by this.
+
+  apply_sysctl() {
+    local key="$1"
+    local val="$2"
+    local before after
+    before=$(sysctl -n "$key" 2>/dev/null || echo "(unavailable)")
+    if sysctl -w "${key}=${val}" >/dev/null 2>&1; then
+      after=$(sysctl -n "$key" 2>/dev/null || echo "(unavailable)")
+      printf "  %-40s before=%-25s after=%s\n" "$key" "$before" "$after"
+    else
+      printf "  %-40s FAILED to set (was=%s; target=%s)\n" "$key" "$before" "$val"
+    fi
+  }
+
+  echo "=========================================="
+  echo "Apply TCP sysctl override (privileged container)"
+  echo "=========================================="
+  apply_sysctl net.ipv4.tcp_congestion_control bbr
+  apply_sysctl net.core.default_qdisc fq
+  apply_sysctl net.core.rmem_max 67108864
+  apply_sysctl net.core.wmem_max 67108864
+  apply_sysctl net.ipv4.tcp_rmem "4096 87380 67108864"
+  apply_sysctl net.ipv4.tcp_wmem "4096 87380 67108864"
+  apply_sysctl net.ipv4.tcp_mtu_probing 1
+  echo "=========================================="
+'
+
+docker exec ci_sglang bash -lc '
   echo "=========================================="
   echo "In-container /sgl-data mount diagnostics"
   echo "=========================================="
