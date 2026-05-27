@@ -69,19 +69,19 @@ for CONCURRENCY in ${CONCURRENCIES}; do
     --output-file "${OUTPUT_FILE}" \
     --output-details
 
-  python3 - <<PYEOF > "${META_FILE}"
-import json
-print(json.dumps({
-    "commit_sha": "${COMMIT_SHA}",
-    "mode": "${MODE}",
-    "concurrency": ${CONCURRENCY},
-    "seed": ${SEED},
-    "num_prompts": ${NUM_PROMPTS},
-    "isl_total_tokens": $(( SYS_LEN + Q_LEN )),
-    "osl_tokens": ${OUT_LEN},
-    "timestamp_utc": "${TIMESTAMP_UTC}",
-    "server_args": ${SERVER_ARGS_JSON},
-}, indent=2))
-PYEOF
+  # Same env-var-data approach as benchmark.sh — see comment there.
+  COMMIT_SHA="${COMMIT_SHA}" \
+  MODE="${MODE}" \
+  CONCURRENCY="${CONCURRENCY}" \
+  SEED="${SEED}" \
+  NUM_PROMPTS="${NUM_PROMPTS}" \
+  ISL_TOTAL_TOKENS="$(( SYS_LEN + Q_LEN ))" \
+  OSL_TOKENS="${OUT_LEN}" \
+  TIMESTAMP_UTC="${TIMESTAMP_UTC}" \
+  SERVER_ARGS_JSON="${SERVER_ARGS_JSON}" \
+  TRIAL_ID="${TRIAL_ID:-1}" \
+  WARMUP_REQUESTS="${WARMUP_REQUESTS:-}" \
+  MEASUREMENT_WINDOW_S="${MEASUREMENT_WINDOW_S:-}" \
+  python3 "$(dirname "$0")/_bench_meta_writer.py" > "${META_FILE}"
   echo "    sidecar          = ${META_FILE}"
 done

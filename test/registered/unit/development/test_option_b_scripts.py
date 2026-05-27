@@ -123,19 +123,37 @@ class TestOptionBBenchmarkSweeps(unittest.TestCase):
         text = _non_comment_lines(DS_BENCH)
         self.assertIn(".meta.json", text,
                       "benchmark.sh must emit a .meta.json sidecar.")
-        self.assertIn("commit_sha", text,
-                      "benchmark.sh sidecar must record commit_sha.")
-        self.assertIn("server_args", text,
-                      "benchmark.sh sidecar must record server_args.")
 
     def test_dsa_bench_emits_meta_sidecar(self):
         text = _non_comment_lines(DSA_BENCH)
         self.assertIn(".meta.json", text,
                       "benchmark_baseline.sh must emit a .meta.json sidecar.")
-        self.assertIn("commit_sha", text,
-                      "benchmark_baseline.sh sidecar must record commit_sha.")
-        self.assertIn("server_args", text,
-                      "benchmark_baseline.sh sidecar must record server_args.")
+
+    def test_ds_bench_uses_meta_writer_helper(self):
+        """The Round 23 inline heredoc spliced JSON as Python source and
+        crashed on real `/get_server_info` `true`/`false`/`null`. Round 24
+        extracted the writer into `_bench_meta_writer.py`. Lock that here
+        so a future refactor can't reintroduce the heredoc bug."""
+        text = _non_comment_lines(DS_BENCH)
+        self.assertIn("_bench_meta_writer.py", text,
+                      "benchmark.sh must invoke development/_bench_meta_writer.py.")
+        # Forbid the unsafe inline heredoc pattern.
+        self.assertNotIn("PYEOF", text,
+                         "benchmark.sh must not splice JSON via inline heredoc.")
+        self.assertNotIn('server_args": ${SERVER_ARGS_JSON', text,
+                         "benchmark.sh must not interpolate JSON as Python source.")
+        # SERVER_ARGS_JSON must be passed as ENV var to the helper, not
+        # spliced into source.
+        self.assertIn('SERVER_ARGS_JSON="${SERVER_ARGS_JSON}"', text,
+                      "benchmark.sh must pass SERVER_ARGS_JSON via env var.")
+
+    def test_dsa_bench_uses_meta_writer_helper(self):
+        text = _non_comment_lines(DSA_BENCH)
+        self.assertIn("_bench_meta_writer.py", text,
+                      "benchmark_baseline.sh must invoke development/_bench_meta_writer.py.")
+        self.assertNotIn("PYEOF", text)
+        self.assertNotIn('server_args": ${SERVER_ARGS_JSON', text)
+        self.assertIn('SERVER_ARGS_JSON="${SERVER_ARGS_JSON}"', text)
 
 
 class TestOptionBScriptsSyntax(unittest.TestCase):
