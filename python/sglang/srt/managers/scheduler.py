@@ -1040,11 +1040,23 @@ class Scheduler(
         self._engine_paused = False
 
     def _activate(self, req: Req) -> None:
-        """Mark req as entering active lifecycle (initial admission).
+        """Mark req as entering active lifecycle.
 
-        Caller must ensure req.rid is not already in active_reqs (chunked-resume
-        re-admit is filtered at the call site). See refactor plan §C1.
+        Gated: only sync-mode non-DLLM reqs enter active_reqs. Disagg
+        PREFILL/DECODE reqs are owned by their respective queues
+        (disagg_*_queue); DLLM reqs are owned by dllm_manager.staging_queue.
+        See plan §2 Scope (Q1=(c)) and audit §1 总览.
+
+        Without this gate, _activate would enroll disagg PREFILL / DLLM
+        admits (they share _get_new_batch_prefill_raw with sync mode) into
+        active_reqs, but their finish paths don't call _deactivate, leading
+        to memory leak + abort_all crash on the active-segment stashed-
+        chunked assert (C6).
         """
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            return
+        if req.is_dllm():
+            return
         assert req.rid not in self.active_reqs, f"already active: {req.rid}"
         self.active_reqs[req.rid] = req
 
@@ -1122,11 +1134,13 @@ class Scheduler(
             self.chunked_prefill_size = None
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
-        # Chunked-resume tracking is now per-req (Req.has_pending_chunk +
-        # pending_middle_outputs counter); the scheduler no longer holds a global pointer.
-        # Stage A stashes any waiting_queue req with has_pending_chunk; cache
-        # impls bound row reads by kv_committed_len so a stash after
-        # init_next_round_input is safe without the old gate.
+        # Chunked-resume tracking: per-Req (has_pending_chunk +
+        # pending_middle_outputs). After the C1-C7 refactor, chunked-resume
+        # reqs live exclusively in `active_reqs` (not waiting_queue); Stage A
+        # iterates `chunked_reqs()` derived from active_reqs. The inline
+        # chunked admission block at the top of `_get_new_batch_prefill_raw`
+        # re-admits them each iter. See agent-drafts/
+        # 2026-05-25-waiting-queue-refactor-plan.md.
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
@@ -2502,8 +2516,9 @@ class Scheduler(
             # Defensive exclude_chunked_req: the merge step above already
             # drops chunked-resume reqs from last_batch, so running_batch
             # shouldn't normally hold one. Keep the flag set so any leak in
-            # that invariant doesn't survive here; the dropped req still
-            # has its waiting_queue retention to re-admit next iter.
+            # that invariant doesn't survive here; the dropped req remains
+            # in active_reqs (post-C4) and is re-admitted next iter via the
+            # inline chunked admission block in _get_new_batch_prefill_raw.
             self.running_batch.filter_batch(
                 exclude_chunked_req=True,
                 exclude_in_flight_other_mb=self._in_flight_other_mb_rids(),
@@ -3537,6 +3552,7 @@ class Scheduler(
             self.last_batch = None
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
+            self.active_reqs.clear()  # audit: keep parallel to req_to_token_pool reset (C8)
             self.token_to_kv_pool_allocator.clear()
             self.grammar_manager.clear()
             self.metrics_reporter.reset_metrics()
