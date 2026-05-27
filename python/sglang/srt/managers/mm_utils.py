@@ -680,7 +680,8 @@ def _check_l2_global_cache(
         overflow_items = []
         overflow_counts = []
 
-    check_hashes = [item.hash for item in items_to_check]
+    # Convert hashes to strings (L2 cache expects string keys for Mooncake)
+    check_hashes = [str(item.hash) for item in items_to_check]
     try:
 
         def check_global_cache():
@@ -704,7 +705,8 @@ def _check_l2_global_cache(
 
         for i, item in enumerate(items_to_check):
             if exist_mask[i]:
-                global_hit_hashes.append(item.hash)
+                # Convert hash to string (hash is computed as int in data_hash/tensor_hash)
+                global_hit_hashes.append(str(item.hash))
                 global_hit_items.append((item, all_l1_miss_token_counts[i]))
             else:
                 l2_check_miss.append((item, all_l1_miss_token_counts[i]))
@@ -889,7 +891,8 @@ def _write_back_l2_cache(locally_encoded: list) -> None:
     if _mm_global_cache_executor is None:
         return
 
-    hashes_to_insert = [item.hash for item, _ in locally_encoded]
+    # Convert hashes to strings (L2 cache expects string keys for Mooncake)
+    hashes_to_insert = [str(item.hash) for item, _ in locally_encoded]
     embeddings_to_insert = [emb for _, emb in locally_encoded]
 
     def _background_insert():
