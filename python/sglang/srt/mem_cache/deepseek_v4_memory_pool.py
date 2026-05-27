@@ -6,14 +6,14 @@ from typing import List, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.deepseek_v4 import fused_k_norm_rope_flashmla, fused_store_cache
+from sglang.jit_kernel.dsv4 import fused_k_norm_rope_flashmla, fused_store_cache
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa import index_buf_accessor
 from sglang.srt.layers.attention.dsv4 import (
     index_buf_accessor as dsv4_index_buf_accessor,
 )
 from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
-from sglang.srt.layers.attention.nsa import index_buf_accessor
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
@@ -35,8 +35,7 @@ def get_compress_state_ring_size(
     # 128-slot ring buffer of raw tokens, so ring_size collapses to 1. Online
     # is incompatible with speculative decode for now.
     if compress_ratio == 128 and ONLINE_C128:
-        if is_speculative and not envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
-            raise AssertionError("online c128 does not support MTP")
+        assert not is_speculative, "online c128 does not support MTP"
         return 1
     if is_speculative:
         return 16 if compress_ratio == 4 else 256
@@ -471,8 +470,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             enable_memory_saver,
         )
 
+        indexer_size = (
+            self.c4_logical_size
+            if (not _is_hip or envs.SGLANG_OPT_USE_COMPRESSOR_V2.get())
+            else c4_size
+        )
         self.c4_indexer_kv_pool = DeepSeekV4IndexerPool(
-            self.c4_logical_size if not _is_hip else c4_size,
+            indexer_size,
             c4_page_size,
             dtype,
             indexer_head_dim,
@@ -493,6 +497,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
+        self.cached_loc = None  # mapping replaced; discard any cached translation
+
+    def invalidate_loc_cache(self) -> None:
+        self.cached_loc = None
 
     def get_ring_size(self, compress_ratio: int) -> int:
         server_args = get_global_server_args()
@@ -503,13 +511,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.full_to_swa_index_mapping is not None
 
         return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
-
-    def set_swa_loc(self, loc: torch.Tensor) -> None:
-        # No-op: SWAKVPool's set_swa_loc precomputes SWA-translated loc once per
-        # forward batch for set_kv_buffer to read via self.swa_loc. DSV4 has its
-        # own equivalent cache via `_should_cache_swa + cached_loc` (in
-        # set_swa_key_buffer_radix_fused), so we ignore main's precomputed loc.
-        pass
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
@@ -563,9 +564,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.indexer_compress_state_pools: List[Optional[CompressStatePool]] = [
             None
         ] * total_L
-        self.temp_online_compress_state_pools: List[Optional[CompressStatePool]] = [
-            None
-        ] * total_L
 
         for idx in range(self._stage_start, self._stage_end):
             ratio = self.compression_ratios[idx]
@@ -585,24 +583,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 enable_memory_saver=enable_memory_saver,
                 ratio=ratio,
                 online=(ratio == 128 and ONLINE_C128),
+                swa_page_size=self.swa_page_size,
             )
-
-            if (
-                ratio == 128
-                and ONLINE_C128
-                and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
-            ):
-                self.temp_online_compress_state_pools[idx] = CompressStatePool(
-                    size=size,
-                    ring_size=1,
-                    overlap=False,
-                    head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
-                    dtype=self.state_dtype,
-                    device=self.device,
-                    enable_memory_saver=enable_memory_saver,
-                    ratio=ratio,
-                    online=True,
-                )
 
             if ratio == 4:
                 self.indexer_compress_state_pools[idx] = CompressStatePool(
@@ -657,14 +639,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert (
             compress_state_pool is not None
         ), "Only c4/c128 layers have attention states."
-        return compress_state_pool
-    
-    def get_temp_attention_compress_states(self, layer_id: int) -> CompressStatePool:
-        self.wait_layer_transfer(layer_id)
-        compress_state_pool = self.temp_online_compress_state_pools[layer_id]
-        assert (
-            compress_state_pool is not None
-        ), "Only experimental online c128 layers have temp attention states."
         return compress_state_pool
 
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
