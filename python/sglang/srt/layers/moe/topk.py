@@ -510,7 +510,26 @@ class TopK(MultiPlatformOp):
             layer_id=self.layer_id,
         )
 
-    def empty_topk_output(self, device: torch.device) -> TopKOutput:
+    def empty_topk_output(
+        self, device: torch.device, *, layer_id: Optional[int] = None
+    ) -> TopKOutput:
+        """Return an empty topk output for a rank with zero tokens this forward.
+
+        When ``layer_id`` is provided and the active dispatch algorithm is LP,
+        also calls ``LPLBSolver.solve(empty)`` so that this rank participates
+        in the EP all-reduce. Without this, an empty rank would skip the
+        collective and deadlock under DP-attention.
+        """
+        if layer_id is not None:
+            info = ExpertLocationDispatchInfo.init_new(layer_id=layer_id)
+            if info is not None and info.lplb_solver is not None:
+                info.lplb_solver.solve(
+                    torch.empty(
+                        (0, self.topk_config.top_k),
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                )
         topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
