@@ -13,8 +13,6 @@ register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
 
 
 class _PerturbRealKvUsedBase(CanaryE2EBase):
-    __test__ = False  # pytest convention; unittest skip is in setUpClass below.
-
     kv_canary_mode = CanaryMode.LOG
     extra_server_args = ("--kv-canary-real-data", "partial")
 
@@ -45,15 +43,11 @@ class _PerturbRealKvUsedBase(CanaryE2EBase):
 
 
 class TestPerturbRealKvUsedMhaFull(_PerturbRealKvUsedBase):
-    __test__ = True
-
     model_mode = "mha"
     target_group = TargetGroupKind.FULL
 
 
 class TestPerturbRealKvUsedSwaFull(_PerturbRealKvUsedBase):
-    __test__ = True
-
     model_mode = "swa"
     target_group = TargetGroupKind.FULL
     extra_server_args = (
@@ -63,8 +57,6 @@ class TestPerturbRealKvUsedSwaFull(_PerturbRealKvUsedBase):
 
 
 class TestPerturbRealKvUsedSwaSwa(_PerturbRealKvUsedBase):
-    __test__ = True
-
     model_mode = "swa"
     target_group = TargetGroupKind.SWA
     extra_server_args = (

@@ -11,8 +11,6 @@ register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
 
 
 class _PerturbReqToTokenBase(CanaryE2EBase):
-    __test__ = False  # pytest convention; unittest skip is in setUpClass below.
-
     kv_canary_mode = CanaryMode.LOG
     extra_env = {
         "SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB": "0.1",
@@ -40,14 +38,10 @@ class _PerturbReqToTokenBase(CanaryE2EBase):
 
 
 class TestPerturbReqToTokenMha(_PerturbReqToTokenBase):
-    __test__ = True
-
     model_mode = "mha"
 
 
 class TestPerturbReqToTokenSwa(_PerturbReqToTokenBase):
-    __test__ = True
-
     model_mode = "swa"
     extra_server_args = SWA_POOL_SERVER_ARGS
 

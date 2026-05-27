@@ -28,8 +28,6 @@ _EAGLE_CHUNKED_SERVER_ARGS = (
 
 
 class _EagleChunkedRotationBase(CanaryE2EBase):
-    __test__ = False  # pytest must not collect the abstract base (revert_pr is unset)
-
     model_mode = "mha"
     kv_canary_mode = CanaryMode.LOG
     extra_server_args = _EAGLE_CHUNKED_SERVER_ARGS
@@ -73,14 +71,12 @@ class _EagleChunkedRotationBase(CanaryE2EBase):
 class TestEagleChunkedRotationRegression(_EagleChunkedRotationBase):
     """Revert PR #26329 fix; expect canary to fire a write_token violation."""
 
-    __test__ = True  # re-enable collection (base sets __test__ = False, inherited)
     revert_pr = True
 
 
 class TestEagleChunkedRotationClean(_EagleChunkedRotationBase):
     """With the PR #26329 fix in place, the same request runs clean."""
 
-    __test__ = True  # re-enable collection (base sets __test__ = False, inherited)
     revert_pr = False
 
 
