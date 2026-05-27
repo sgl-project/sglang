@@ -91,28 +91,116 @@ class TestFA4DenseAttentionBackendCorrectness(CustomTestCase):
     # EAGLE chain verify (topk=1) — tree (topk=2) drifts ~0.16 vs the bf16
     # HF reference at the kernel level (not a CG mechanic) so it stays
     # deferred. See PLAN.md "Latest verification".
+    #
+    # The non-EAGLE spec kinds (frozen_kv_mtp, dflash, ngram) are also
+    # chain-only on FA; they pass the same shape through
+    # `_make_spec_verify_input` with a different `spec_kind` tag.
     SPEC_VERIFY_CHAIN_CASES = (
-        DenseAttentionCase(
-            name="runner_fa4_eagle_verify_chain",
-            backend="fa4",
-            forward_mode=ForwardMode.TARGET_VERIFY,
-            num_heads=4,
-            num_kv_heads=4,
-            page_size=16,
-            prefix_lens=(4, 7),
-            extend_lens=(3, 3),
+        (
+            DenseAttentionCase(
+                name="runner_fa4_eagle_verify_chain",
+                backend="fa4",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            "eagle",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_fa4_frozen_kv_mtp_verify_chain",
+                backend="fa4",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            "frozen_kv_mtp",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_fa4_dflash_verify_chain",
+                backend="fa4",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            "dflash",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_fa4_ngram_verify_chain",
+                backend="fa4",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            "ngram",
         ),
     )
     SPEC_VERIFY_CHAIN_CUDA_GRAPH_CASES = (
-        DenseAttentionCase(
-            name="runner_cuda_graph_fa4_eagle_verify_chain",
-            backend="fa4",
-            forward_mode=ForwardMode.TARGET_VERIFY,
-            num_heads=4,
-            num_kv_heads=4,
-            page_size=16,
-            prefix_lens=(4, 7),
-            extend_lens=(3, 3),
+        (
+            DenseAttentionCase(
+                name="runner_cuda_graph_fa4_eagle_verify_chain",
+                backend="fa4",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            "eagle",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_cuda_graph_fa4_frozen_kv_mtp_verify_chain",
+                backend="fa4",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            "frozen_kv_mtp",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_cuda_graph_fa4_dflash_verify_chain",
+                backend="fa4",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            "dflash",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_cuda_graph_fa4_ngram_verify_chain",
+                backend="fa4",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            "ngram",
         ),
     )
     EAGLE_DRAFT_EXTEND_RUNNER_CASES = (
@@ -284,25 +372,29 @@ class TestFA4DenseAttentionBackendCorrectness(CustomTestCase):
                 )
 
     def test_runner_mode_spec_verify_cases(self):
-        for case in self.SPEC_VERIFY_CHAIN_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
+        for case, spec_kind in self.SPEC_VERIFY_CHAIN_CASES:
+            with self.subTest(
+                case=case.name, backend=case.backend, spec_kind=spec_kind
+            ):
                 run_dense_spec_verify_case(
                     self,
                     case,
                     topk=1,
-                    spec_kind="eagle",
+                    spec_kind=spec_kind,
                     head_dim=self.HEAD_DIM,
                     hidden_size=self.HIDDEN_SIZE,
                 )
 
     def test_runner_mode_spec_verify_cuda_graph_cases(self):
-        for case in self.SPEC_VERIFY_CHAIN_CUDA_GRAPH_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
+        for case, spec_kind in self.SPEC_VERIFY_CHAIN_CUDA_GRAPH_CASES:
+            with self.subTest(
+                case=case.name, backend=case.backend, spec_kind=spec_kind
+            ):
                 run_dense_spec_verify_cuda_graph_case(
                     self,
                     case,
                     topk=1,
-                    spec_kind="eagle",
+                    spec_kind=spec_kind,
                     head_dim=self.HEAD_DIM,
                     hidden_size=self.HIDDEN_SIZE,
                 )
