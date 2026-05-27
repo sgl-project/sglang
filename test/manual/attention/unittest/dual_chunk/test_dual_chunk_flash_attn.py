@@ -96,6 +96,61 @@ class TestDualChunkFlashAttentionBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_dual_chunk_cuda_graph_decode_case(self, case)
 
+    # Layout-robustness. See dense/test_triton.py for the rationale.
+    # dual_chunk_flash_attn EXTEND fails on non_monotonic_extend with
+    # ~67% mismatch and max abs diff ~1.1. The dual-chunk prefill path
+    # uses `cu_seqlens_*` indexing into a contiguous K layout
+    # (see `_dual_chunk_flash_attn_prefill_func` in
+    # dual_chunk_flashattention_backend.py:834+), which assumes K for
+    # the new extend tokens is laid out contiguously in
+    # `[begin, end)` slot order. Scattering extend-token slots within a
+    # request breaks that contiguity. Documented as a known production
+    # limitation.
+    LAYOUT_ROBUSTNESS_CASES = (
+        DualChunkAttentionCase(
+            name="layout_dual_chunk_extend_two_request",
+            backend="dual_chunk_flash_attn",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(0, 0),
+            extend_lens=(16, 32),
+        ),
+        DualChunkAttentionCase(
+            name="layout_dual_chunk_decode_page_boundary",
+            backend="dual_chunk_flash_attn",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(14, 15, 16),
+        ),
+    )
+    LAYOUT_KNOWN_FAILURES = {
+        ("layout_dual_chunk_extend_two_request", "non_monotonic_extend"): (
+            "dual_chunk_flash_attn prefill uses cu_seqlens_* indexing "
+            "into contiguous K slots within an extend "
+            "(`_dual_chunk_flash_attn_prefill_func` in "
+            "dual_chunk_flashattention_backend.py:834+); scattered "
+            "extend-token slots break that contiguity."
+        ),
+    }
+
+    def test_layout_robustness_cases(self):
+        for case in self.LAYOUT_ROBUSTNESS_CASES:
+            for layout in ("interleaved_pages", "non_monotonic_extend"):
+                if (
+                    layout == "non_monotonic_extend"
+                    and case.forward_mode.is_decode()
+                ):
+                    continue
+                reason = self.LAYOUT_KNOWN_FAILURES.get((case.name, layout))
+                with self.subTest(case=case.name, layout=layout):
+                    if reason is not None:
+                        self.skipTest(reason)
+                    run_dual_chunk_attention_case(self, case, loc_layout=layout)
+
 
 if __name__ == "__main__":
     unittest.main()

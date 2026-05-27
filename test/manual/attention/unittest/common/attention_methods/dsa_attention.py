@@ -585,6 +585,7 @@ def build_dsa_attention_fixture(
     runner_batch_size: int | None = None,
     dsa_prefill_backend: str = "flashmla_auto",
     dsa_decode_backend: str = "flashmla_kv",
+    loc_layout: str = "shuffled_pages",
 ) -> DSAAttentionFixture:
     max_context_len = max(max_context_len, max(case.seq_lens))
     if max_context_len % case.page_size:
@@ -646,11 +647,22 @@ def build_dsa_attention_fixture(
         dtype=dtype,
         device=device,
     )
+    from .dense_attention import make_loc_fn as _dense_make_loc_fn
+    loc_fn = _dense_make_loc_fn(
+        loc_layout,
+        batch_size=case.batch_size,
+        seq_lens=case.seq_lens,
+        prefix_lens=case.prefix_lens,
+        page_size=case.page_size,
+        max_context_len=max_context_len,
+        seed=seed,
+    )
     forward_batch = _make_forward_batch(
         case,
         runner,
         max_context_len=max_context_len,
         device=device,
+        loc_fn=loc_fn,
     )
     return DSAAttentionFixture(
         case=case,
@@ -725,7 +737,17 @@ def _populate_dsa_sparse_prefix_kv(
     prefix_hidden: list[torch.Tensor],
     *,
     max_context_len: int,
+    loc_fn=None,
 ):
+    if loc_fn is None:
+        def loc_fn(req_idx: int, pos: int) -> int:
+            return _token_loc(
+                req_idx,
+                pos,
+                page_size=case.page_size,
+                max_context_len=max_context_len,
+            )
+
     locs = []
     k_nope_parts = []
     k_rope_parts = []
@@ -736,14 +758,7 @@ def _populate_dsa_sparse_prefix_kv(
         k_nope_parts.append(k_nope.view(-1, 1, module.qk_nope_head_dim))
         k_rope_parts.append(k_rope)
         for pos in range(prefix.shape[0]):
-            locs.append(
-                _token_loc(
-                    req_idx,
-                    pos,
-                    page_size=case.page_size,
-                    max_context_len=max_context_len,
-                )
-            )
+            locs.append(loc_fn(req_idx, pos))
 
     if not locs:
         return
@@ -772,6 +787,7 @@ def build_dsa_sparse_attention_fixture(
     fp8_kv_cache: bool = False,
     index_topk: int = DSA_SPARSE_INDEX_TOPK,
     index_pattern: str = "trailing",
+    loc_layout: str = "shuffled_pages",
 ) -> DSASparseAttentionFixture:
     max_context_len = max(max_context_len, max(case.seq_lens))
     if max_context_len % case.page_size:
@@ -832,11 +848,22 @@ def build_dsa_sparse_attention_fixture(
         dtype=dtype,
         device=device,
     )
+    from .dense_attention import make_loc_fn as _dense_make_loc_fn
+    loc_fn = _dense_make_loc_fn(
+        loc_layout,
+        batch_size=case.batch_size,
+        seq_lens=case.seq_lens,
+        prefix_lens=case.prefix_lens,
+        page_size=case.page_size,
+        max_context_len=max_context_len,
+        seed=seed,
+    )
     forward_batch = _make_forward_batch(
         case,
         runner,
         max_context_len=max_context_len,
         device=device,
+        loc_fn=loc_fn,
     )
     _populate_dsa_sparse_prefix_kv(
         actual_module,
@@ -844,6 +871,7 @@ def build_dsa_sparse_attention_fixture(
         runner,
         prefix_hidden,
         max_context_len=max_context_len,
+        loc_fn=loc_fn,
     )
     topk_rows = _make_dsa_sparse_topk_rows(
         case, index_topk=index_topk, pattern=index_pattern
@@ -976,6 +1004,7 @@ def run_dsa_attention_case(
     max_context_len: int = DSA_PAGE_SIZE,
     dtype: torch.dtype = torch.bfloat16,
     device: str = DEFAULT_DEVICE,
+    loc_layout: str = "shuffled_pages",
 ) -> None:
     fixture = build_dsa_attention_fixture(
         testcase,
@@ -985,6 +1014,7 @@ def run_dsa_attention_case(
         max_context_len=max_context_len,
         dtype=dtype,
         device=device,
+        loc_layout=loc_layout,
     )
     actual = run_dsa_fixture_eager(fixture, testcase)
     expected = expected_dsa_fixture_output(fixture)
@@ -1004,6 +1034,7 @@ def run_dsa_sparse_attention_case(
     fp8_kv_cache: bool = False,
     index_topk: int = DSA_SPARSE_INDEX_TOPK,
     index_pattern: str = "trailing",
+    loc_layout: str = "shuffled_pages",
 ) -> None:
     fixture = build_dsa_sparse_attention_fixture(
         testcase,
@@ -1017,6 +1048,7 @@ def run_dsa_sparse_attention_case(
         fp8_kv_cache=fp8_kv_cache,
         index_topk=index_topk,
         index_pattern=index_pattern,
+        loc_layout=loc_layout,
     )
     actual = run_dsa_sparse_fixture_eager(fixture, testcase)
     expected = expected_dsa_sparse_fixture_output(fixture)

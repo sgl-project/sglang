@@ -104,6 +104,52 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend, pattern=pattern):
                 run_dsa_sparse_attention_case(self, case, index_pattern=pattern)
 
+    # Layout-robustness. See dense/test_triton.py for the rationale.
+    # shuffled_pages is the default for all DSA tests via
+    # build_dsa_attention_fixture / build_dsa_sparse_attention_fixture;
+    # this method opts into the more aggressive interleaved_pages +
+    # non_monotonic_extend layouts on representative dense fallback and
+    # sparse top-k cases.
+    LAYOUT_DENSE_CASES = (
+        DSAAttentionCase(
+            name="layout_dsa_dense_fallback_two_request",
+            backend="dsa",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=DSA_PAGE_SIZE,
+            prefix_lens=(0, 32),
+            extend_lens=(32, 16),
+        ),
+    )
+    LAYOUT_SPARSE_CASES = (
+        DSAAttentionCase(
+            name="layout_dsa_sparse_decode_long_prefix",
+            backend="dsa",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=1,
+            page_size=DSA_PAGE_SIZE,
+            prefix_lens=(2048,),
+        ),
+    )
+
+    def test_layout_robustness_dense_cases(self):
+        for case in self.LAYOUT_DENSE_CASES:
+            for layout in ("interleaved_pages", "non_monotonic_extend"):
+                with self.subTest(case=case.name, layout=layout):
+                    run_dsa_attention_case(
+                        self, case, head_dim=128, loc_layout=layout
+                    )
+
+    def test_layout_robustness_sparse_cases(self):
+        for case in self.LAYOUT_SPARSE_CASES:
+            for layout in ("interleaved_pages",):
+                with self.subTest(case=case.name, layout=layout):
+                    run_dsa_sparse_attention_case(
+                        self, case, loc_layout=layout
+                    )
+
     # CG decode replay via the sparse `flashmla_kv` path (cached MLA latent
     # KV, written by `_populate_dsa_sparse_prefix_kv` at fixture build).
     # Unlike the MHA_ONE_SHOT dense fallback (where K is passed inline as

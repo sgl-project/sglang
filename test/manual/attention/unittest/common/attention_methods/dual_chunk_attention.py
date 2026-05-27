@@ -574,6 +574,7 @@ def build_dual_chunk_attention_fixture(
     disable_cuda_graph: bool = True,
     disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
+    loc_layout: str = "shuffled_pages",
 ) -> DualChunkAttentionFixture:
     max_context_len = max(max_context_len, max(case.seq_lens))
     if max_context_len % case.page_size:
@@ -636,11 +637,22 @@ def build_dual_chunk_attention_fixture(
         dtype=dtype,
         device=device,
     )
+    from .dense_attention import make_loc_fn as _dense_make_loc_fn
+    loc_fn = _dense_make_loc_fn(
+        loc_layout,
+        batch_size=case.batch_size,
+        seq_lens=case.seq_lens,
+        prefix_lens=case.prefix_lens,
+        page_size=case.page_size,
+        max_context_len=max_context_len,
+        seed=seed,
+    )
     forward_batch = _make_forward_batch(
         case,
         runner,
         max_context_len=max_context_len,
         device=device,
+        loc_fn=loc_fn,
     )
     _set_orig_seq_lens(forward_batch, case)
     _populate_prefix_kv(
@@ -649,6 +661,7 @@ def build_dual_chunk_attention_fixture(
         runner,
         prefix_hidden,
         max_context_len=max_context_len,
+        loc_fn=loc_fn,
     )
 
     return DualChunkAttentionFixture(
@@ -788,6 +801,7 @@ def run_dual_chunk_attention_case(
     max_context_len: int = DEFAULT_MAX_CONTEXT_LEN,
     dtype: torch.dtype = DEFAULT_DTYPE,
     device: str = DEFAULT_DEVICE,
+    loc_layout: str = "shuffled_pages",
 ) -> None:
     fixture = build_dual_chunk_attention_fixture(
         testcase,
@@ -797,6 +811,7 @@ def run_dual_chunk_attention_case(
         max_context_len=max_context_len,
         dtype=dtype,
         device=device,
+        loc_layout=loc_layout,
     )
     actual = run_dual_chunk_fixture_eager(fixture)
     expected = expected_dual_chunk_fixture_output(fixture)
