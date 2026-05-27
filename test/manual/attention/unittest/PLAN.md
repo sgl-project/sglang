@@ -117,12 +117,16 @@ Implemented:
   exercises the absorb-MLA cached-KV path with distinct capture/replay metadata
   and input tensors.
 - Phase 4 production draft-runner integration now uses the same adapter-based
-  runner lifecycle as draft-extend and target-verify graph replay. The shared
-  `common/runner_modes/eagle_draft_runner.py` helper owns production
-  `EAGLEDraftCudaGraphRunner`, `EAGLEDraftExtendCudaGraphRunner`, and
-  `FrozenKVMTPCudaGraphRunner` capture/replay, while attention-method wrappers
-  provide fixture/input/state callbacks. Dense `triton` and `flashinfer` cover
-  EAGLE draft decode for chain (`topk=1`) and tree (`topk=2`) layouts. MLA
+  runner lifecycle as draft-extend and target-verify graph replay. Two shared
+  helpers split the work by speculative forward mode:
+  `common/runner_modes/speculative_draft_runner.py` owns
+  `EAGLEDraftCudaGraphRunner` and `FrozenKVMTPCudaGraphRunner` capture/replay
+  (DRAFT decode multi-step), while
+  `common/runner_modes/speculative_draft_extend_runner.py` owns
+  `EAGLEDraftExtendCudaGraphRunner` capture/replay (DRAFT_EXTEND and
+  DRAFT_EXTEND_V2). Attention-method wrappers provide fixture/input/state
+  callbacks. Dense `triton` and `flashinfer` cover EAGLE draft decode for chain
+  (`topk=1`) and tree (`topk=2`) layouts. MLA
   `triton`, `flashinfer`, and `flashmla` cover EAGLE draft decode on absorb-MLA
   fixtures. Dense `flashinfer` covers production EAGLE `DRAFT_EXTEND` and
   Frozen-KV MTP draft decode; dense `triton` covers production EAGLE
@@ -310,15 +314,18 @@ Implemented:
   supplies the recurrent-cache snapshot and restore hooks from the runner side.
 - Speculative runner helpers are split by speculative forward mode:
   `common/runner_modes/speculative_target_verify_runner.py` owns
-  `TARGET_VERIFY` custom-mask/retrieve-index metadata and verify graph replay,
-  while `common/runner_modes/speculative_draft_extend_runner.py` owns
+  `TARGET_VERIFY` custom-mask/retrieve-index metadata and verify graph replay;
+  `common/runner_modes/speculative_draft_runner.py` owns DRAFT (decode
+  multi-step) production-runner integration plus shared infra
+  (`EagleDraftRunnerSettings`, seeded RNG, capture/replay configuration);
+  `common/runner_modes/speculative_draft_extend_runner.py` owns
   `DRAFT_EXTEND`/`DRAFT_EXTEND_V2` accepted-token metadata and draft graph
   replay. Their CUDA graph capture/replay lifecycle is de-duplicated in
   `common/runner_modes/speculative_cuda_graph_runner.py`, following the
   adapter-based shape of `cuda_graph_decode_runner.py`. There is no root-level
   speculative runner shim; in-tree tests import the runner-mode modules directly.
 - Production EAGLE draft graph-runner coverage follows the same adapter pattern:
-  `common/runner_modes/eagle_draft_runner.py` owns the fixed-capture-batch
+  `common/runner_modes/speculative_draft_runner.py` owns the fixed-capture-batch
   `EAGLEDraftCudaGraphRunner` lifecycle, and attention-method callbacks provide
   module construction, draft inputs, replay-state setup, forward-batch
   construction, and output comparison.
@@ -342,7 +349,7 @@ Current status:
   loading a real draft model and a real `TpModelWorker` target, which is
   outside the fast-running module-level fixture pattern used by Phase 2/3/4a.
   The production speculative graph runner contracts those workers depend on
-  are already covered by `common/runner_modes/eagle_draft_runner.py`,
+  are already covered by `common/runner_modes/speculative_draft_runner.py`,
   `speculative_target_verify_runner.py`, and
   `speculative_draft_extend_runner.py` using mock model runners. Worker-level
   metadata/forward integration should land as registered (not unit) tests in
@@ -1195,6 +1202,7 @@ test/manual/attention/unittest/
       split_op_runner.py
       speculative_cuda_graph_runner.py
       speculative_draft_extend_runner.py
+      speculative_draft_runner.py
       speculative_target_verify_runner.py
   dense/
     test_fa3.py

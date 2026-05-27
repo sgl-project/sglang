@@ -276,7 +276,7 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
         run_dsa_sparse_tilelang_decode_case(self, self.TILELANG_DECODE_CASE)
 
     # EAGLE production draft CUDA-graph runner integration. Wires DSA
-    # through `eagle_draft_runner.py`'s shared
+    # through `speculative_draft_runner.py`'s shared
     # `EagleDraftCudaGraphRunnerAdapter` (same lifecycle as DSV4 /
     # dense / MLA). DSA's chain-only constraint comes from the
     # synthesized topk_indices path — tree draft needs parent-indices
