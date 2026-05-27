@@ -211,6 +211,62 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_mla_attention_case(self, case, **MLA_SHAPE_KWARGS)
 
+    # Layout-robustness. See dense/test_triton.py for the full
+    # rationale. FlashMLA crashes on both EXTEND layouts (illegal
+    # memory access) and on DECODE with interleaved_pages (shape
+    # mismatch). Documented as LAYOUT_KNOWN_FAILURES.
+    LAYOUT_ROBUSTNESS_CASES = (
+        MLAAttentionCase(
+            name="layout_mla_extend_prefix_exact_page",
+            backend="flashmla",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            page_size=64,
+            prefix_lens=(64,),
+            extend_lens=(2,),
+        ),
+        MLAAttentionCase(
+            name="layout_mla_decode_page_boundary",
+            backend="flashmla",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            page_size=64,
+            prefix_lens=(62, 63, 64),
+        ),
+    )
+    LAYOUT_KNOWN_FAILURES = {
+        ("layout_mla_extend_prefix_exact_page", "interleaved_pages"): (
+            "FlashMLA extend path raises CUDA illegal memory access on "
+            "interleaved-page layouts; the kernel assumes a tidy "
+            "page-table layout."
+        ),
+        ("layout_mla_extend_prefix_exact_page", "non_monotonic_extend"): (
+            "FlashMLA extend path raises CUDA illegal memory access on "
+            "non-monotonic out_cache_loc within an extend."
+        ),
+        ("layout_mla_decode_page_boundary", "interleaved_pages"): (
+            "FlashMLA decode path raises a shape mismatch "
+            "(`shape '[-1, 64, 1, 32]' is invalid for input of size N`) "
+            "on interleaved-page layouts."
+        ),
+    }
+
+    def test_layout_robustness_cases(self):
+        for case in self.LAYOUT_ROBUSTNESS_CASES:
+            for layout in ("interleaved_pages", "non_monotonic_extend"):
+                if (
+                    layout == "non_monotonic_extend"
+                    and case.forward_mode.is_decode()
+                ):
+                    continue
+                reason = self.LAYOUT_KNOWN_FAILURES.get((case.name, layout))
+                with self.subTest(case=case.name, layout=layout):
+                    if reason is not None:
+                        self.skipTest(reason)
+                    run_mla_attention_case(
+                        self, case, loc_layout=layout, **MLA_SHAPE_KWARGS
+                    )
+
     def test_runner_mode_cuda_graph_decode_cases(self):
         for case in self.CUDA_GRAPH_CASES:
             with self.subTest(case=case.name, backend=case.backend):

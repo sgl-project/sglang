@@ -617,6 +617,7 @@ def _make_forward_batch(
     *,
     max_context_len: int,
     device: str,
+    loc_fn=None,
 ) -> ForwardBatch:
     seq_lens = case.seq_lens
     input_lens = case.input_lens
@@ -624,37 +625,27 @@ def _make_forward_batch(
     out_cache_locs: List[int] = []
     positions: List[int] = []
 
-    for req_idx, seq_len in enumerate(seq_lens):
-        for pos in range(seq_len):
-            runner.req_to_token_pool.req_to_token[req_idx, pos] = _token_loc(
+    if loc_fn is None:
+        def loc_fn(req_idx: int, pos: int) -> int:
+            return _token_loc(
                 req_idx,
                 pos,
                 page_size=case.page_size,
                 max_context_len=max_context_len,
             )
 
+    for req_idx, seq_len in enumerate(seq_lens):
+        for pos in range(seq_len):
+            runner.req_to_token_pool.req_to_token[req_idx, pos] = loc_fn(req_idx, pos)
+
         if case.forward_mode.is_decode():
             positions.append(seq_len - 1)
-            out_cache_locs.append(
-                _token_loc(
-                    req_idx,
-                    seq_len - 1,
-                    page_size=case.page_size,
-                    max_context_len=max_context_len,
-                )
-            )
+            out_cache_locs.append(loc_fn(req_idx, seq_len - 1))
         else:
             prefix_len = case.prefix_lens[req_idx]
             for offset in range(input_lens[req_idx]):
                 positions.append(prefix_len + offset)
-                out_cache_locs.append(
-                    _token_loc(
-                        req_idx,
-                        prefix_len + offset,
-                        page_size=case.page_size,
-                        max_context_len=max_context_len,
-                    )
-                )
+                out_cache_locs.append(loc_fn(req_idx, prefix_len + offset))
 
     batch = ForwardBatch(
         forward_mode=case.forward_mode,
@@ -781,7 +772,17 @@ def _populate_prefix_kv(
     prefix_hidden: list[torch.Tensor],
     *,
     max_context_len: int,
+    loc_fn=None,
 ):
+    if loc_fn is None:
+        def loc_fn(req_idx: int, pos: int) -> int:
+            return _token_loc(
+                req_idx,
+                pos,
+                page_size=case.page_size,
+                max_context_len=max_context_len,
+            )
+
     locs = []
     keys = []
     ropes = []
@@ -792,14 +793,7 @@ def _populate_prefix_kv(
         keys.append(k)
         ropes.append(k_rope)
         for pos in range(prefix.shape[0]):
-            locs.append(
-                _token_loc(
-                    req_idx,
-                    pos,
-                    page_size=case.page_size,
-                    max_context_len=max_context_len,
-                )
-            )
+            locs.append(loc_fn(req_idx, pos))
 
     if not locs:
         return
@@ -844,6 +838,7 @@ def build_mla_attention_fixture(
     disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
     fp8_kv_cache: bool = False,
+    loc_layout: str = "shuffled_pages",
 ) -> MLAAttentionFixture:
     seed = 3090 + len(case.name)
     torch.manual_seed(seed)
@@ -901,11 +896,22 @@ def build_mla_attention_fixture(
         dtype=dtype,
         device=device,
     )
+    from .dense_attention import make_loc_fn as _dense_make_loc_fn
+    loc_fn = _dense_make_loc_fn(
+        loc_layout,
+        batch_size=case.batch_size,
+        seq_lens=case.seq_lens,
+        prefix_lens=case.prefix_lens,
+        page_size=case.page_size,
+        max_context_len=max_context_len,
+        seed=seed,
+    )
     forward_batch = _make_forward_batch(
         case,
         runner,
         max_context_len=max_context_len,
         device=device,
+        loc_fn=loc_fn,
     )
     _populate_prefix_kv(
         actual_module,
@@ -914,6 +920,7 @@ def build_mla_attention_fixture(
         backend,
         prefix_hidden,
         max_context_len=max_context_len,
+        loc_fn=loc_fn,
     )
 
     return MLAAttentionFixture(
@@ -1148,6 +1155,7 @@ def run_mla_attention_case(
     fp8_kv_cache: bool = False,
     atol: float = MLA_ATOL,
     rtol: float = MLA_RTOL,
+    loc_layout: str = "shuffled_pages",
 ):
     fixture = build_mla_attention_fixture(
         testcase,
@@ -1159,6 +1167,7 @@ def run_mla_attention_case(
         dtype=dtype,
         device=device,
         fp8_kv_cache=fp8_kv_cache,
+        loc_layout=loc_layout,
     )
     actual = run_mla_fixture_eager(fixture)
     expected = expected_mla_fixture_output(fixture)

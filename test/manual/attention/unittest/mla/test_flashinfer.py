@@ -144,6 +144,68 @@ class TestFlashInferMLAAttentionBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_mla_attention_case(self, case, **MLA_SHAPE_KWARGS)
 
+    # Layout-robustness. See dense/test_triton.py for the full
+    # rationale. FlashInfer MLA crashes with
+    # `AcceleratorError: an illegal memory access was encountered`
+    # on both EXTEND under interleaved_pages and non_monotonic_extend,
+    # and crashes with `CUBLAS_STATUS_EXECUTION_FAILED` on DECODE under
+    # interleaved_pages. The crashes happen inside FlashInfer's MLA
+    # paged-prefill / paged-decode metadata; the kernel assumes a
+    # tidy page-table layout that the non-tidy variants violate.
+    # Documented as LAYOUT_KNOWN_FAILURES so the test method records
+    # the production-side cause for future readers.
+    LAYOUT_ROBUSTNESS_CASES = (
+        MLAAttentionCase(
+            name="layout_mla_extend_prefix_exact_page",
+            backend="flashinfer",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            page_size=16,
+            prefix_lens=(16,),
+            extend_lens=(2,),
+        ),
+        MLAAttentionCase(
+            name="layout_mla_decode_page_boundary",
+            backend="flashinfer",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            page_size=16,
+            prefix_lens=(14, 15, 16),
+        ),
+    )
+    LAYOUT_KNOWN_FAILURES = {
+        ("layout_mla_extend_prefix_exact_page", "interleaved_pages"): (
+            "FlashInfer MLA paged-prefill metadata assumes a tidy "
+            "page-table layout; interleaved pages trip an illegal "
+            "memory access inside the kernel."
+        ),
+        ("layout_mla_extend_prefix_exact_page", "non_monotonic_extend"): (
+            "FlashInfer MLA paged-prefill metadata assumes monotonic "
+            "out_cache_loc within an extend; scattered extend slots "
+            "trip an illegal memory access."
+        ),
+        ("layout_mla_decode_page_boundary", "interleaved_pages"): (
+            "FlashInfer MLA paged-decode metadata raises "
+            "CUBLAS_STATUS_EXECUTION_FAILED on interleaved-page layouts."
+        ),
+    }
+
+    def test_layout_robustness_cases(self):
+        for case in self.LAYOUT_ROBUSTNESS_CASES:
+            for layout in ("interleaved_pages", "non_monotonic_extend"):
+                if (
+                    layout == "non_monotonic_extend"
+                    and case.forward_mode.is_decode()
+                ):
+                    continue
+                reason = self.LAYOUT_KNOWN_FAILURES.get((case.name, layout))
+                with self.subTest(case=case.name, layout=layout):
+                    if reason is not None:
+                        self.skipTest(reason)
+                    run_mla_attention_case(
+                        self, case, loc_layout=layout, **MLA_SHAPE_KWARGS
+                    )
+
     def test_runner_mode_cuda_graph_decode_cases(self):
         for case in self.CUDA_GRAPH_CASES:
             with self.subTest(case=case.name, backend=case.backend):
