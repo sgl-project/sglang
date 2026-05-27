@@ -1993,7 +1993,6 @@ class DeepseekV2AttentionMLA(
         seq_lens = getattr(forward_batch, "seq_lens", None)
         if seq_lens is None:
             return
-        page_size = int(self.double_sparsity_selector.page_size)
         bs = int(valid_lengths.shape[0])
         # CPU copy: this side-channel is a host-side scalar publication,
         # not a hot-path tensor; one .tolist() per layer per batch.
@@ -2008,15 +2007,16 @@ class DeepseekV2AttentionMLA(
                 selector_id=f"layer{layer_id}",
             )
 
+        # After the AC-0 token-level rotation the selector emits TOKEN
+        # positions, not pages — so the sparsity denominator is the
+        # sequence length in tokens, not (seq_len + page_size - 1) // page_size.
         records: List[Optional[Dict[str, Any]]] = []
         for b in range(bs):
-            selected = int(vl_cpu[b])
-            total_pages = max(
-                1, (int(sl_cpu[b]) + page_size - 1) // page_size
-            )
+            selected_tokens = int(vl_cpu[b])
+            total_tokens = max(1, int(sl_cpu[b]))
             stats = SimpleNamespace(
-                sparsity_rate=float(1.0 - selected / total_pages),
-                selected_pages=selected,
+                sparsity_rate=float(1.0 - selected_tokens / total_tokens),
+                selected_tokens=selected_tokens,
                 dense_fallback=0,
             )
             records.append(meta_info_for_request(stats))
@@ -2326,7 +2326,7 @@ class DeepseekV2AttentionMLA(
                     records.append(
                         {
                             "sparsity_rate": 0.0,
-                            "selected_pages": 0,
+                            "selected_tokens": 0,
                             "dense_fallback": 1,
                             "error_class": error_cls,
                             "error_message": error_message,

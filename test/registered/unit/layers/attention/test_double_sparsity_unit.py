@@ -1185,8 +1185,8 @@ class TestRealSelectorMetricsCaptureSkip(unittest.TestCase):
                 layer_id=0, max_top_k=4,
             )
         # Counters must NOT have advanced — the emit was gated.
-        if "selected_pages_count" in m._metric_objs:
-            cnt = m._metric_objs["selected_pages_count"]._value.get()
+        if "selected_tokens_count" in m._metric_objs:
+            cnt = m._metric_objs["selected_tokens_count"]._value.get()
             self.assertEqual(cnt, 0,
                              "metric emit must be skipped during capture")
         # Sanity: call again WITHOUT mocking; counters should now move.
@@ -1198,7 +1198,7 @@ class TestRealSelectorMetricsCaptureSkip(unittest.TestCase):
             channel_weights=channel_weights,
             layer_id=0, max_top_k=4,
         )
-        cnt = m._metric_objs["selected_pages_count"]._value.get()
+        cnt = m._metric_objs["selected_tokens_count"]._value.get()
         self.assertEqual(cnt, 1)
         m.reset_for_testing()
 
@@ -1320,8 +1320,8 @@ class TestRealSelectorMetrics(unittest.TestCase):
                             "selector should have produced at least one valid page")
         # One selection call → count incremented by 1; sum incremented by the
         # total selected pages across the batch.
-        cnt = m._metric_objs["selected_pages_count"]._value.get()
-        sps = m._metric_objs["selected_pages_sum"]._value.get()
+        cnt = m._metric_objs["selected_tokens_count"]._value.get()
+        sps = m._metric_objs["selected_tokens_sum"]._value.get()
         self.assertEqual(cnt, 1)
         self.assertEqual(sps, expected_selected)
         m.reset_for_testing()
@@ -2788,23 +2788,23 @@ class TestMetrics(unittest.TestCase):
     def test_meta_info_shape(self):
         from sglang.srt.layers.attention.double_sparsity import metrics as m
         stats = m.DoubleSparsityRequestStats(
-            sparsity_rate=0.0625, selected_pages=128, dense_fallback=0
+            sparsity_rate=0.0625, selected_tokens=128, dense_fallback=0
         )
         info = m.meta_info_for_request(stats)
-        self.assertEqual(set(info.keys()), {"sparsity_rate", "selected_pages", "dense_fallback"})
+        self.assertEqual(set(info.keys()), {"sparsity_rate", "selected_tokens", "dense_fallback"})
         self.assertAlmostEqual(info["sparsity_rate"], 0.0625)
-        self.assertEqual(info["selected_pages"], 128)
+        self.assertEqual(info["selected_tokens"], 128)
         self.assertEqual(info["dense_fallback"], 0)
 
     def test_record_selection_increments_counters(self):
         from sglang.srt.layers.attention.double_sparsity import metrics as m
         m.reset_for_testing()
-        m.record_selection(selected_pages=10, total_valid_pages=100)
-        m.record_selection(selected_pages=20, total_valid_pages=100)
+        m.record_selection(selected_tokens=10, total_valid_tokens=100)
+        m.record_selection(selected_tokens=20, total_valid_tokens=100)
         # Best-effort: if prometheus_client unavailable, metrics are no-ops.
-        if "selected_pages_sum" in m._metric_objs:
-            sps = m._metric_objs["selected_pages_sum"]._value.get()
-            cnt = m._metric_objs["selected_pages_count"]._value.get()
+        if "selected_tokens_sum" in m._metric_objs:
+            sps = m._metric_objs["selected_tokens_sum"]._value.get()
+            cnt = m._metric_objs["selected_tokens_count"]._value.get()
             self.assertEqual(sps, 30)
             self.assertEqual(cnt, 2)
 
@@ -2822,7 +2822,7 @@ class TestMetrics(unittest.TestCase):
         # First registration cycle.
         m.reset_for_testing()
         m.mark_channel_mask_valid(True)
-        m.record_selection(selected_pages=5, total_valid_pages=10)
+        m.record_selection(selected_tokens=5, total_valid_tokens=10)
         self.assertTrue(m._metrics_registered)
         # Reset, then re-register. The second registration must not raise.
         m.reset_for_testing()
@@ -2830,7 +2830,7 @@ class TestMetrics(unittest.TestCase):
         # If reset didn't unregister, this re-registration raises
         # "Duplicated timeseries" during the next Gauge/Counter construction.
         m.mark_channel_mask_valid(False)
-        m.record_selection(selected_pages=7, total_valid_pages=10)
+        m.record_selection(selected_tokens=7, total_valid_tokens=10)
         self.assertTrue(m._metrics_registered)
         # Clean up so other tests do not see this state.
         m.reset_for_testing()
@@ -3911,14 +3911,14 @@ class TestCustomizedInfoIntegration(unittest.TestCase):
         )
 
         stats = DoubleSparsityRequestStats(
-            sparsity_rate=0.05, selected_pages=64, dense_fallback=0
+            sparsity_rate=0.05, selected_tokens=64, dense_fallback=0
         )
         payload = customized_info_for_request(stats)
         self.assertEqual(
-            set(payload.keys()), {"sparsity_rate", "selected_pages", "dense_fallback"}
+            set(payload.keys()), {"sparsity_rate", "selected_tokens", "dense_fallback"}
         )
         self.assertAlmostEqual(payload["sparsity_rate"], 0.05)
-        self.assertEqual(payload["selected_pages"], 64)
+        self.assertEqual(payload["selected_tokens"], 64)
         self.assertEqual(payload["dense_fallback"], 0)
 
 
@@ -4238,8 +4238,8 @@ class TestDoubleSparsityRequestSummary(unittest.TestCase):
         bs = 2
         per_request_summary = {
             "double_sparsity": [
-                {"sparsity_rate": 0.7, "selected_pages": 12, "dense_fallback": 0},
-                {"sparsity_rate": 0.5, "selected_pages": 8, "dense_fallback": 1},
+                {"sparsity_rate": 0.7, "selected_tokens": 12, "dense_fallback": 0},
+                {"sparsity_rate": 0.5, "selected_tokens": 8, "dense_fallback": 1},
             ],
         }
         # Verify the field exists on BatchTokenIDOutput (dataclass attribute).
@@ -4978,6 +4978,52 @@ class TestR5Coverage(unittest.TestCase):
         msg = "\n".join(cm_log.output)
         self.assertIn("live-rid-7", msg)
 
+    def test_publish_ds_request_summary_uses_token_denominator(self):
+        """After the AC-0 token-level rotation, `_publish_ds_request_summary`
+        must publish `selected_tokens` (not `selected_pages`) and use the
+        sequence length in tokens as the sparsity denominator.
+
+        Regression for the page-vs-token unit mix-up Codex flagged in
+        the Round 20 review.
+        """
+        attn = TestSelectTopkIndicesHookBranch()._make_attn(use_ds=True)
+        attn.double_sparsity_selector.IS_PLACEHOLDER = False
+
+        # bs=2 with different sequence lengths to exercise per-row math.
+        # selected: 30 of 100 tokens (row 0), 5 of 256 tokens (row 1).
+        forward_batch = SimpleNamespace(
+            seq_lens=torch.tensor([100, 256], dtype=torch.int32),
+            batch_size=2,
+        )
+        selected_indices = torch.zeros((2, 64), dtype=torch.int32)
+        valid_lengths = torch.tensor([30, 5], dtype=torch.int32)
+
+        attn._publish_ds_request_summary(
+            forward_batch=forward_batch,
+            selected_indices=selected_indices,
+            valid_lengths=valid_lengths,
+            error_count=0,
+            layer_id=0,
+        )
+        summary = forward_batch.ds_per_request_summary["double_sparsity"]
+        self.assertEqual(len(summary), 2)
+
+        # Row 0: token-denominator math, NOT page-denominator
+        # ((100 + 63) // 64) == 2 pages would give sparsity 1 - 30/2 = -14.
+        row0 = summary[0]
+        self.assertIn("selected_tokens", row0)
+        self.assertNotIn(
+            "selected_pages", row0,
+            "old page-named field must be gone after AC-0 rotation",
+        )
+        self.assertEqual(row0["selected_tokens"], 30)
+        self.assertAlmostEqual(row0["sparsity_rate"], 1.0 - 30 / 100)
+
+        # Row 1: 5 selected of 256 tokens.
+        row1 = summary[1]
+        self.assertEqual(row1["selected_tokens"], 5)
+        self.assertAlmostEqual(row1["sparsity_rate"], 1.0 - 5 / 256)
+
     def test_multi_tokenizer_preserves_per_request_summary_shape(self):
         """Splitting a parent BatchTokenIDOutput for a child tokenizer
         preserves the `{key: [single_summary_dict]}` shape so the
@@ -4990,15 +5036,15 @@ class TestR5Coverage(unittest.TestCase):
         parent = SimpleNamespace(
             per_request_summary={
                 "double_sparsity": [
-                    {"sparsity_rate": 0.7, "selected_pages": 12, "dense_fallback": 0},
+                    {"sparsity_rate": 0.7, "selected_tokens": 12, "dense_fallback": 0},
                     None,
-                    {"sparsity_rate": 0.5, "selected_pages": 8, "dense_fallback": 1},
+                    {"sparsity_rate": 0.5, "selected_tokens": 8, "dense_fallback": 1},
                 ]
             }
         )
         # Child 0 (rich): single-element list with the dict.
         c0 = _extract_per_request_summary_by_index(parent, 0)
-        self.assertEqual(c0, {"double_sparsity": [{"sparsity_rate": 0.7, "selected_pages": 12, "dense_fallback": 0}]})
+        self.assertEqual(c0, {"double_sparsity": [{"sparsity_rate": 0.7, "selected_tokens": 12, "dense_fallback": 0}]})
         # Child 1 (no DS summary): list with [None].
         c1 = _extract_per_request_summary_by_index(parent, 1)
         self.assertEqual(c1, {"double_sparsity": [None]})
@@ -5101,7 +5147,7 @@ class TestR6Coverage(unittest.TestCase):
                 "double_sparsity": [
                     {
                         "sparsity_rate": 0.0,
-                        "selected_pages": 0,
+                        "selected_tokens": 0,
                         "dense_fallback": 1,
                         "error_class": "DSAdapterError",
                         "error_message": "row 0: out of range",
@@ -5149,7 +5195,7 @@ class TestR6Coverage(unittest.TestCase):
                 "double_sparsity": [
                     {
                         "sparsity_rate": 0.7,
-                        "selected_pages": 12,
+                        "selected_tokens": 12,
                         "dense_fallback": 0,
                     }
                 ]
@@ -5161,7 +5207,7 @@ class TestR6Coverage(unittest.TestCase):
         self.assertEqual(abort_calls, [])
         self.assertEqual(
             req.per_request_summary["double_sparsity"],
-            {"sparsity_rate": 0.7, "selected_pages": 12, "dense_fallback": 0},
+            {"sparsity_rate": 0.7, "selected_tokens": 12, "dense_fallback": 0},
         )
 
     def test_nsametadata_has_ds_topk_indices_out_field(self):
@@ -5407,7 +5453,7 @@ class TestR7Coverage(unittest.TestCase):
                 "double_sparsity": [
                     {
                         "sparsity_rate": 0.0,
-                        "selected_pages": 0,
+                        "selected_tokens": 0,
                         "dense_fallback": 1,
                         "error_class": "DSAdapterError",
                         "error_message": "row 0",
@@ -5441,7 +5487,7 @@ class TestR7Coverage(unittest.TestCase):
         logits_output = SimpleNamespace(
             per_request_summary={
                 "double_sparsity": [
-                    {"sparsity_rate": 0.7, "selected_pages": 12, "dense_fallback": 0}
+                    {"sparsity_rate": 0.7, "selected_tokens": 12, "dense_fallback": 0}
                 ]
             }
         )

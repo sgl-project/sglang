@@ -11,18 +11,20 @@ Surfaces:
 * ``sglang_double_sparsity_dense_fallback_total`` — Counter; ``0`` in
   healthy runs. Fault-injection paths in tests can drive this without
   introducing a production fallback.
-* ``sglang_double_sparsity_selected_pages_sum`` — Counter accumulating the
-  count of pages selected across batches; pair with ``_count`` for the per-
-  batch average.
-* ``sglang_double_sparsity_selected_pages_count`` — Counter incrementing
+* ``sglang_double_sparsity_selected_tokens_sum`` — Counter accumulating the
+  count of tokens selected across batches; pair with ``_count`` for the per-
+  batch average. (After the AC-0 token-level rotation; the older
+  ``selected_pages_*`` names were misleading because the unit is tokens.)
+* ``sglang_double_sparsity_selected_tokens_count`` — Counter incrementing
   once per (request, layer, step) selection call.
 * ``sglang_double_sparsity_sparsity_rate`` — Histogram of selected /
-  total-valid page ratios. Sampled per call.
+  total-valid token ratios. Sampled per call.
 
 Per-request fields surfaced via :func:`meta_info_for_request`:
 
 * ``sparsity_rate``: float in ``[0, 1]``
-* ``selected_pages``: int, count of distinct pages used
+* ``selected_tokens``: int, count of selected tokens (was named
+  ``selected_pages`` pre-AC-0; renamed after the token-level rotation).
 * ``dense_fallback``: ``0`` healthy, ``1`` on fault-injected fallback
 """
 
@@ -73,17 +75,17 @@ def _try_register() -> None:
             f"{_METRIC_PREFIX}_dense_fallback_total",
             "Number of decode steps that fell back to dense attention. 0 in healthy runs.",
         )
-        _metric_objs["selected_pages_sum"] = Counter(
-            f"{_METRIC_PREFIX}_selected_pages_sum",
-            "Total count of pages selected across all DS top-K calls.",
+        _metric_objs["selected_tokens_sum"] = Counter(
+            f"{_METRIC_PREFIX}_selected_tokens_sum",
+            "Total count of tokens selected across all DS top-K calls.",
         )
-        _metric_objs["selected_pages_count"] = Counter(
-            f"{_METRIC_PREFIX}_selected_pages_count",
+        _metric_objs["selected_tokens_count"] = Counter(
+            f"{_METRIC_PREFIX}_selected_tokens_count",
             "Number of DS top-K selection calls.",
         )
         _metric_objs["sparsity_rate"] = Histogram(
             f"{_METRIC_PREFIX}_sparsity_rate",
-            "Selected-pages / total-valid-pages ratio per DS top-K call.",
+            "Selected-tokens / total-valid-tokens ratio per DS top-K call.",
             buckets=(0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9, 1.0),
         )
         _metrics_registered = True
@@ -105,32 +107,34 @@ def increment_dense_fallback(n: int = 1) -> None:
 
 def record_selection(
     *,
-    selected_pages: int,
-    total_valid_pages: int,
+    selected_tokens: int,
+    total_valid_tokens: int,
 ) -> None:
     """Record one DS top-K selection call.
 
-    ``selected_pages`` is the number of non-padding entries in ``selected_indices``;
-    ``total_valid_pages`` is the number of currently-valid pages in the request's
-    KV window. ``sparsity_rate`` is the ratio.
+    ``selected_tokens`` is the number of non-padding entries in
+    ``selected_indices`` (which after the AC-0 rotation carries token
+    positions, not page indices). ``total_valid_tokens`` is the number
+    of currently-valid tokens in the request's KV window.
+    ``sparsity_rate`` is the ratio.
     """
 
     _try_register()
-    sps = _metric_objs.get("selected_pages_sum")
-    cnt = _metric_objs.get("selected_pages_count")
+    sps = _metric_objs.get("selected_tokens_sum")
+    cnt = _metric_objs.get("selected_tokens_count")
     rate = _metric_objs.get("sparsity_rate")
     if sps is not None:
-        sps.inc(int(selected_pages))
+        sps.inc(int(selected_tokens))
     if cnt is not None:
         cnt.inc(1)
-    if rate is not None and total_valid_pages > 0:
-        rate.observe(float(selected_pages) / float(total_valid_pages))
+    if rate is not None and total_valid_tokens > 0:
+        rate.observe(float(selected_tokens) / float(total_valid_tokens))
 
 
 @dataclass
 class DoubleSparsityRequestStats:
     sparsity_rate: float
-    selected_pages: int
+    selected_tokens: int
     dense_fallback: int = 0
 
 
@@ -143,7 +147,7 @@ def meta_info_for_request(stats: DoubleSparsityRequestStats) -> Dict[str, Any]:
 
     return {
         "sparsity_rate": float(stats.sparsity_rate),
-        "selected_pages": int(stats.selected_pages),
+        "selected_tokens": int(stats.selected_tokens),
         "dense_fallback": int(stats.dense_fallback),
     }
 

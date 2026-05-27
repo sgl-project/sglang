@@ -582,8 +582,8 @@ def retrieve_topk_via_labels(
         else:
             total_valid_tokens = int(valid_lengths.shape[0]) * int(scores.shape[-1])
         _metrics.record_selection(
-            selected_pages=selected_tokens,
-            total_valid_pages=total_valid_tokens,
+            selected_tokens=selected_tokens,
+            total_valid_tokens=total_valid_tokens,
         )
     return indices, valid_lengths
 
