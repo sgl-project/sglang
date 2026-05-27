@@ -174,6 +174,61 @@ def make_dsv4_cases(backend: str) -> tuple[DSV4AttentionCase, ...]:
             page_size=DSV4_PAGE_SIZE,
             prefix_lens=(160,),
         ),
+        # seq_len exactly equal to the SWA window (128). Boundary case for
+        # the `kv_start = max(0, query_pos - SWA_WINDOW + 1)` slice — the
+        # backend's `get_swa_page_indices` must hand back exactly
+        # SWA_WINDOW keys per query and the reference's trailing-window
+        # slice must agree token-for-token.
+        DSV4AttentionCase(
+            name="dsv4_swa_extend_seq_len_eq_window",
+            prefix_lens=(96,),
+            extend_lens=(32,),
+            **common,
+        ),
+        # seq_len one token below the page boundary (page_size=256). Forces
+        # the page-table indexing into the last slot of a single page.
+        DSV4AttentionCase(
+            name="dsv4_swa_extend_seq_below_page",
+            prefix_lens=(254,),
+            extend_lens=(1,),
+            **common,
+        ),
+        # seq_len exactly on the page boundary (256). The dispatcher must
+        # treat this as a single fully-used page rather than allocating a
+        # spurious next page.
+        DSV4AttentionCase(
+            name="dsv4_swa_extend_seq_at_page",
+            prefix_lens=(255,),
+            extend_lens=(1,),
+            **common,
+        ),
+        # seq_len one token above the page boundary (257). Crosses into the
+        # next page so `get_swa_page_indices` must stitch indices from two
+        # consecutive pages while the SWA window still slides over the
+        # trailing 128 keys.
+        DSV4AttentionCase(
+            name="dsv4_swa_extend_seq_above_page",
+            prefix_lens=(256,),
+            extend_lens=(1,),
+            **common,
+        ),
+        # Prefix length exactly equal to one page. EXTEND opens the next
+        # page on the first extend token, exercising the page-aligned
+        # prefix branch.
+        DSV4AttentionCase(
+            name="dsv4_swa_extend_prefix_exact_page",
+            prefix_lens=(DSV4_PAGE_SIZE,),
+            extend_lens=(4,),
+            **common,
+        ),
+        # prefix + extend exactly equals one page (the page-aligned-total
+        # branch — total seq_len lands on the boundary without crossing).
+        DSV4AttentionCase(
+            name="dsv4_swa_extend_total_exact_page",
+            prefix_lens=(DSV4_PAGE_SIZE - 16,),
+            extend_lens=(16,),
+            **common,
+        ),
     )
 
 
@@ -591,14 +646,20 @@ def build_dsv4_attention_fixture(
     runner_batch_size: int | None = None,
     compression_ratios: list[int] = None,
 ) -> DSV4AttentionFixture:
-    max_seq = max(case.seq_lens)
     # SWA-only (compress_ratio=0) is the SGLang path that handles the
     # last-`SWA_WINDOW`-tokens slice for *all* sequence lengths. seq_len >
     # SWA_WINDOW just means the SWA mask truncates the oldest tokens; the
     # backend's `get_swa_page_indices` and the fixture's reference both pick
     # the same trailing window so this works without enabling C4/C128.
-    # The pool capacity (`swa_size`) and `max_context_len` are sized in
-    # `build_dsv4_attention_fixture` so the full KV fits.
+    # Auto-scale `max_context_len` so per-page-boundary cases (seq_len near
+    # or above `DSV4_PAGE_SIZE=256`) fit in `req_to_token`. The default
+    # `max_context_len=256` covers the common in-window cases; longer cases
+    # bump the per-req capacity and round up to the page boundary.
+    max_seq = max(case.seq_lens)
+    if max_seq > max_context_len:
+        max_context_len = (
+            (max_seq + case.page_size - 1) // case.page_size
+        ) * case.page_size
     if compression_ratios is None:
         compression_ratios = [case.compress_ratio]
     seed = 7100 + len(case.name)

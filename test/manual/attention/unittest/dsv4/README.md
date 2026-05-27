@@ -20,7 +20,7 @@ Columns are runner modes; rows are `compress_ratio` modes of the single
 
 | `compress_ratio` | Eager Phase 2 | CG decode | PCG extend | BCG extend | Verify eager | Verify CG | DE eager | DE CG | DE-V2 CG | EAGLE-draft runner | EAGLE-DE runner | FKVMTP runner |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `0` (SWA-only) | ✓ EXTEND no-prefix / prefix-within-window / nonzero `attn_sink` / above-window EXTEND + DECODE within-window / multi-request / above-window | ✓ DECODE within-window + multi-request | — | — | ✓ EAGLE chain (topk=1) `prefix_lens=(64,96)` | ✓ EAGLE chain CG `prefix_lens=(64,96)` | ✓ EAGLE ragged-accept | ✓ EAGLE uniform `extend_lens=(4,4)` | — | ✓ chain `prefix_lens=(32,64)`, `num_steps=3` (`DeepseekV4MultiStepBackend` capture/replay vs. per-step-init eager) | ✓ uniform `extend_lens=(4,4)`, `prefix_lens=(64,96)` (production `EAGLEDraftExtendCudaGraphRunner` through `_create_dsv4_prefill_backend`; uses loose `DSV4_GRAPH_ATOL=1e-1` and skips strict `topk_index` exact-match to absorb CG accumulation drift) | — |
+| `0` (SWA-only) | ✓ EXTEND no-prefix / prefix-within-window / nonzero `attn_sink` / above-window / seq_len==SWA_WINDOW / seq_len below-page / seq_len at-page / seq_len above-page / prefix-exact-page / total-exact-page + DECODE within-window / multi-request / above-window | ✓ DECODE within-window + multi-request | — | — | ✓ EAGLE chain (topk=1) `prefix_lens=(64,96)` | ✓ EAGLE chain CG `prefix_lens=(64,96)` | ✓ EAGLE ragged-accept | ✓ EAGLE uniform `extend_lens=(4,4)` | — | ✓ chain `prefix_lens=(32,64)`, `num_steps=3` (`DeepseekV4MultiStepBackend` capture/replay vs. per-step-init eager) | ✓ uniform `extend_lens=(4,4)`, `prefix_lens=(64,96)` (production `EAGLEDraftExtendCudaGraphRunner` through `_create_dsv4_prefill_backend`; uses loose `DSV4_GRAPH_ATOL=1e-1` and skips strict `topk_index` exact-match to absorb CG accumulation drift) | — |
 | `4` (C4) | ✓ EXTEND `prefix_lens=(64,)`, `extend_lens=(16,)` + DECODE `prefix_lens=(64,)` (extra K cache written directly via `set_extra_key_buffer`; `c4_sparse_page_indices` seeded manually because indexer is bypassed) | ✓ DECODE `prefix_lens=(64,)` | — | — | ✓ EAGLE chain (topk=1) `prefix_lens=(64,96)` | ✓ EAGLE chain CG `prefix_lens=(64,96)` | production-unreachable: draft layer is SWA-only | production-unreachable: draft layer is SWA-only | — | — | — | — |
 | `128` (C128) | ✓ EXTEND `prefix_lens=(128,)`, `extend_lens=(16,)` + DECODE `prefix_lens=(128,)` | ✓ DECODE `prefix_lens=(128,)` | — | — | ✓ EAGLE chain (topk=1) `prefix_lens=(128,160)` | ✓ EAGLE chain CG `prefix_lens=(128,160)` | production-unreachable: draft layer is SWA-only | production-unreachable: draft layer is SWA-only | — | — | — | — |
 
@@ -31,7 +31,14 @@ Columns are runner modes; rows are `compress_ratio` modes of the single
 - DeepSeek-V4 shape metadata: `qk_nope_head_dim=448`, `qk_rope_head_dim=64`,
   `kv_lora_rank=448`, `head_dim=512`.
 - `page_size=256` (the DSV4 backend asserts this exactly —
-  `deepseek_v4_backend.py:355`, `dsv4/metadata.py:134`).
+  `deepseek_v4_backend.py:355`, `dsv4/metadata.py:134`). Per-page-boundary
+  coverage uses this hardcoded page size: `seq_len=255` (one below page),
+  `seq_len=256` (exactly one page), `seq_len=257` (one above page),
+  `prefix_lens=256+extend_lens=4` (prefix equals one page), and
+  `prefix_lens=240+extend_lens=16` (prefix + extend exactly equals one
+  page). `seq_len=128` covers the SWA-window-boundary `seq_len ==
+  SWA_WINDOW` case. The fixture auto-scales `max_context_len` for the
+  larger sequences so `req_to_token` has room.
 - Packed FP8 nope + BF16 rope SWA cache layout (584 bytes/token) comes from
   `DeepSeekV4TokenToKVPool`.
 - SWA window = 128 (`SWA_WINDOW` constant in `deepseek_v4_backend.py:67`).

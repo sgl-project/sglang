@@ -78,6 +78,29 @@ def make_dsa_dense_fallback_cases(backend: str) -> tuple[DSAAttentionCase, ...]:
             extend_lens=(DSA_PAGE_SIZE,),
             **common,
         ),
+        # Zero-prefix extend with seq_len exactly one token below the page
+        # boundary. Paired with `_no_prefix_exact_page` (seq_len == page) and
+        # `_cross_page_boundary` (seq_len == page + 1), this exercises the
+        # three-way `< page`, `== page`, `> page` partition required by
+        # PLAN.md's "Required input cases" list while staying under the
+        # MHA_ONE_SHOT KV threshold (2048).
+        DSAAttentionCase(
+            name="dsa_mha_one_shot_no_prefix_seq_below_page",
+            prefix_lens=(0,),
+            extend_lens=(DSA_PAGE_SIZE - 1,),
+            **common,
+        ),
+        # Ragged batch whose three requests span below / exactly at / above
+        # the page boundary in a single forward. The dense-fallback K-write
+        # walks the full per-request KV concatenation, so the page-aligned
+        # request must allocate a fresh page without spilling into the next
+        # request's page table.
+        DSAAttentionCase(
+            name="dsa_mha_one_shot_ragged_below_at_above_page",
+            prefix_lens=(0, 0, 0),
+            extend_lens=(DSA_PAGE_SIZE - 1, DSA_PAGE_SIZE, DSA_PAGE_SIZE + 1),
+            **common,
+        ),
         DSAAttentionCase(
             name="dsa_mha_one_shot_prefix_ragged",
             prefix_lens=(3, 8),

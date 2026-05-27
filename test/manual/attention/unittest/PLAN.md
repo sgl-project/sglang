@@ -1923,6 +1923,20 @@ Required input cases:
 - SWA with `seq_len < window_size`, `seq_len == window_size`, and
   `seq_len > window_size`.
 
+Method-specific page-size and boundary scaling:
+- Methods that hard-pin `page_size` (DSA CUDA at 64, DSV4 at 256) treat
+  "page size 1" as production-unsupported and document the assertion site
+  in the per-method `README.md`. The page-boundary cases still apply, but
+  the boundary lengths scale to the pinned page size (e.g. DSV4 uses
+  255/256/257 to land on the page boundary; DSA CUDA uses 63/64/65).
+- Sparse / compressed methods (DSA sparse top-k, DSV4 C4 / C128, dual-chunk
+  vertical+slash) gate the "page size 1" and some short-sequence cases
+  through additional method-specific thresholds (e.g. DSA `MHA_ONE_SHOT`
+  switches to dense fallback when `max_kv_len <=
+  SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD=2048`; dual-chunk gates
+  sparse on `current_orig_seq_len > sparse_attention_threshold`). Each
+  per-method README documents which cases this blocks and why.
+
 Invalid combinations are `skipIf`-guarded through the capability helper.
 
 Optional dispatch-path cases:

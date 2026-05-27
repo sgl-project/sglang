@@ -15,7 +15,7 @@ Columns are runner modes; rows are the two DSA sub-paths exercised through the
 
 | DSA sub-path | Eager Phase 2 | CG decode | PCG extend | BCG extend | Verify eager | Verify CG | DE eager | DE CG | DE-V2 CG | EAGLE-draft runner | EAGLE-DE runner | FKVMTP runner |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `dsa` MHA_ONE_SHOT dense prefill fallback | ✓ 6 dense-fallback extend layouts: no-prefix ragged, no-prefix exact-page, prefix ragged, cross-page-boundary, prefix-exact-page, total-exact-page | deferred: graph metadata parity not scoped | blocked: K-slice mismatch | blocked | — | — | — | — | — | — | — | — |
+| `dsa` MHA_ONE_SHOT dense prefill fallback | ✓ 8 dense-fallback extend layouts: no-prefix ragged, no-prefix exact-page, no-prefix seq-below-page, prefix ragged, cross-page-boundary, prefix-exact-page, total-exact-page, ragged below/at/above page | deferred: graph metadata parity not scoped | blocked: K-slice mismatch | blocked | — | — | — | — | — | — | — | — |
 | `dsa` sparse top-k (`flashmla_sparse` prefill + `flashmla_kv` decode) | ✓ 7 sparse top-k layouts: long-prefix bsz=1 prefill, long-prefix multi-token prefill, multi-request long-prefix prefill, decode with bsz=2 trailing-topk, decode with sub-topk prefix padding, ragged 3-request decode, long-prefix decode | ✓ flashmla_kv + FP8 flashmla_kv | — | — | ✓ TARGET_VERIFY eager | — | ✓ DRAFT_EXTEND eager | — | ✓ DRAFT_EXTEND_V2 eager | — | — | — |
 
 ## Implementation Variant Matrix (`--dsa-prefill-backend` / `--dsa-decode-backend`)
@@ -38,8 +38,14 @@ hardware/SDK. The variant tests live in `test_dsa.py` as
 ## Input And Config Coverage
 
 - DSA page-size-64 extend and decode batches.
-- Dense fallback: no-prefix ragged, no-prefix exact-page, prefix ragged,
-  cross-page-boundary, prefix-exact-page, total-exact-page.
+- Dense fallback: no-prefix ragged, no-prefix exact-page, no-prefix
+  seq-below-page (seq_len=63), prefix ragged, cross-page-boundary
+  (seq_len=65), prefix-exact-page, total-exact-page, and a ragged batch
+  whose three requests span below / exactly at / above the page boundary
+  (seq_lens=63/64/65). Together these cover the PLAN.md "Required input
+  cases" page-boundary partition (seq_len < page, == page, > page). Page
+  size 1 is `blocked` here — DSA's CUDA indexer hard-asserts
+  `page_size == 64` (`dsa/dsa_indexer.py:550, 727, 946, 1095`).
 - Sparse top-k: uses `qk_nope=512`, `qk_rope=64`, and `topk=128` to match local
   FlashMLA kernel constraints.
 - Sparse prefill spans single-request, multi-token extend, and multi-request
