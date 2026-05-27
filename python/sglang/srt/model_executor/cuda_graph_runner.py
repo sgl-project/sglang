@@ -1286,7 +1286,6 @@ class CudaGraphRunner:
         # FIXME: implicit channel for backends (dsv4) that need forward_batch
         # in replay metadata prep. Should become a real param on the interface.
         attn_backend._replay_forward_batch = forward_batch
-        attn_backend._replay_num_decodes = raw_bs
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             buffers.req_pool_indices[:bs],
@@ -1298,7 +1297,6 @@ class CudaGraphRunner:
             seq_lens_cpu=buffers.seq_lens_cpu[:bs],
         )
         attn_backend._replay_forward_batch = None
-        attn_backend._replay_num_decodes = None
 
         # Store fields
         self.raw_bs = raw_bs

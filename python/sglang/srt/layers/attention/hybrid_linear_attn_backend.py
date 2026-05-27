@@ -804,7 +804,14 @@ class HybridLinearAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        replay_num_decodes = getattr(self, "_replay_num_decodes", None)
+        # Real (pre-graph-padding) decode count = forward_batch.batch_size;
+        # cuda_graph_runner stashes the forward_batch on _replay_forward_batch.
+        replay_forward_batch = getattr(self, "_replay_forward_batch", None)
+        replay_num_decodes = (
+            replay_forward_batch.batch_size
+            if replay_forward_batch is not None
+            else None
+        )
         for attn_backend in self.attn_backend_list:
             attn_backend._replay_num_decodes = replay_num_decodes
             attn_backend.init_forward_metadata_replay_cuda_graph(
