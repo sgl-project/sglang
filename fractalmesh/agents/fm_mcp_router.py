@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     112,
+        "agents":     114,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -226,6 +226,8 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "payments_hub":      7864,
             "ai_assistant":      7865,
             "blockchain_bridge": 7866,
+            "email_campaign":    7867,
+            "support_desk":      7868,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -539,6 +541,8 @@ _INTENTS = {
     "charge_payment":          lambda a, k: {"action": "charge_payment_queued", "amount": k.get("amount", 0), "currency": k.get("currency", "AUD"), "gateway": k.get("gateway", "auto")},
     "ai_chat":                 lambda a, k: {"action": "ai_chat_queued", "message": k.get("message", ""), "model": k.get("model", "claude-sonnet-4-6"), "thread_id": k.get("thread_id", "")},
     "wallet_watch":            lambda a, k: {"action": "wallet_watch_queued", "address": k.get("address", ""), "label": k.get("label", ""), "chain": k.get("chain", "eth")},
+    "campaign_send":           lambda a, k: {"action": "campaign_send_queued", "campaign_id": k.get("campaign_id", 0), "scheduled_at": k.get("scheduled_at", "")},
+    "support_ticket":          lambda a, k: {"action": "support_ticket_queued", "customer_email": k.get("customer_email", ""), "subject": k.get("subject", ""), "body": k.get("body", "")},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
