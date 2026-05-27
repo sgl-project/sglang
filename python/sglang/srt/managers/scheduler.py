@@ -154,6 +154,10 @@ from sglang.srt.managers.min_free_slots_delayer import (
     MinFreeSlotsDelayer,
     resolve_min_free_slots,
 )
+from sglang.srt.managers.mm_utils import (
+    ShmPointerMMData,
+    materialize_shm_in_mm_inputs,
+)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import (
     RelayPayload,
@@ -984,6 +988,11 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+
+        # -- Pipelined mm processing state (used by overlap_disagg_prefill) --
+        self._skip_recv_shm_flush: bool = False
+        self._pending_shm_unlinks: List[str] = []
+        self._shm_unlink_generations: deque = deque()
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1977,6 +1986,94 @@ class Scheduler(
             req.origin_input_ids = req.origin_input_ids[:prefix_len] + padded_input_ids
         return True
 
+    # ── Pipelined mm processing helpers (overlap_disagg_prefill) ──────────
+
+    def _flush_pending_shm_unlinks(self):
+        if self._pending_shm_unlinks:
+            for name in self._pending_shm_unlinks:
+                ShmPointerMMData.unlink_shm(name)
+            self._pending_shm_unlinks.clear()
+
+    def _rotate_shm_generation(self):
+        """Move pending SHM names into the generation queue."""
+        if self._pending_shm_unlinks:
+            self._shm_unlink_generations.append(list(self._pending_shm_unlinks))
+            self._pending_shm_unlinks.clear()
+
+    def _flush_oldest_shm_generation(self):
+        """Unlink the oldest SHM generation if we have >= 2 queued.
+
+        Must be called after a cross-rank sync point (e.g. Gloo broadcast)
+        to ensure all TP ranks have finished reading those SHM blocks.
+        """
+        if len(self._shm_unlink_generations) >= 2:
+            old_names = self._shm_unlink_generations.popleft()
+            for name in old_names:
+                ShmPointerMMData.unlink_shm(name)
+
+    def _extract_mm_inputs(self, recv_reqs):
+        """Extract mm_inputs from recv_reqs for background processing."""
+        mm_req_indices = []
+        mm_inputs_list = []
+        for i, req in enumerate(recv_reqs):
+            if (
+                isinstance(req, TokenizedGenerateReqInput)
+                and getattr(req, "mm_inputs", None) is not None
+            ):
+                mm_req_indices.append(i)
+                mm_inputs_list.append(req.mm_inputs)
+        return mm_req_indices, mm_inputs_list
+
+    def _batch_process_mm_inputs_bg(self, mm_inputs_list):
+        """Background thread: convert raw mm_inputs and unwrap SHM.
+
+        Runs in a ThreadPoolExecutor. No Gloo calls — only CPU work whose
+        GIL is released during tensor clone(). SHM names to unlink are
+        returned to the main thread to avoid mutating shared scheduler
+        state from the bg thread.
+        """
+        results = []
+        all_shm_names: List[str] = []
+        is_entry_rank = self.ps.tp_rank == 0
+        for raw_mm in mm_inputs_list:
+            if raw_mm is None:
+                results.append(None)
+                continue
+            mm = MultimodalInputs.from_processor_output(raw_mm)
+            shm_names = materialize_shm_in_mm_inputs(mm)
+            if is_entry_rank and shm_names:
+                all_shm_names.extend(shm_names)
+            results.append(mm)
+        return results, all_shm_names
+
+    def _submit_mm_processing(self, executor, recv_reqs):
+        """Submit mm_inputs to the background thread pool."""
+        mm_req_indices, mm_inputs_list = self._extract_mm_inputs(recv_reqs)
+        if mm_inputs_list:
+            mm_future = executor.submit(
+                self._batch_process_mm_inputs_bg, mm_inputs_list
+            )
+        else:
+            mm_future = None
+            mm_req_indices = None
+        return mm_future, mm_req_indices
+
+    def _collect_mm_results_and_dispatch(self, recv_reqs, mm_future, mm_indices):
+        """Wait for bg mm thread, attach results to requests, then dispatch.
+
+        SHM names collected by the bg thread are appended to
+        ``_pending_shm_unlinks`` here on the main thread — keeping all
+        mutation of that list single-threaded.
+        """
+        if mm_future is not None:
+            mm_results, shm_names = mm_future.result()
+            for idx, result in zip(mm_indices, mm_results):
+                recv_reqs[idx]._bg_mm_result = result
+            if shm_names:
+                self._pending_shm_unlinks.extend(shm_names)
+        self._rotate_shm_generation()
+        self.process_input_requests(recv_reqs)
+
     def _maybe_compute_mrope_positions(self, req) -> None:
         """Compute M-RoPE positions when they are missing (e.g. gRPC preprocessed path)."""
         if self._mm_processor is None:
@@ -2168,7 +2265,10 @@ class Scheduler(
                 return
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
-            image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
+            # Use pre-processed result from pipelined bg thread if available.
+            image_inputs = getattr(recv_req, "_bg_mm_result", None)
+            if image_inputs is None:
+                image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
 
             SessionController.adjust_mm_offsets(recv_req, req, image_inputs)
 

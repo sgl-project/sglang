@@ -1245,7 +1245,7 @@ def tensor_hash(tensor_list) -> int:
 def hash_feature(f):
     if isinstance(f, list):
         if len(f) > 0 and isinstance(f[0], ShmPointerMMData):
-            return tensor_hash([x.tensor for x in f])
+            return tensor_hash([x.read_tensor() for x in f])
         if len(f) > 0 and isinstance(f[0], torch.Tensor):
             return tensor_hash(f)
         return data_hash(tuple(flatten_nested_list(f)))
@@ -1263,7 +1263,7 @@ def hash_feature(f):
     elif isinstance(f, ShmPointerMMData):
         if f.precomputed_hash is not None:
             return f.precomputed_hash
-        return tensor_hash([f.tensor])
+        return tensor_hash([f.read_tensor()])
     return data_hash(f)
 
 
@@ -1688,11 +1688,55 @@ class ShmPointerMMData:
             self._shm_handle = None
         return tensor
 
+    def read_tensor(self) -> torch.Tensor:
+        """Clone tensor from SHM without unlinking the block."""
+        return self.tensor.clone()
+
+    @staticmethod
+    def unlink_shm(shm_name: str):
+        """Unlink a SHM block by name. Safe to call if already unlinked."""
+        try:
+            shm = shared_memory.SharedMemory(name=shm_name)
+            shm.close()
+            shm.unlink()
+        except FileNotFoundError:
+            pass
+
     def __del__(self):
         # Only close; never unlink. Unlinking is materialize()'s job.
         if getattr(self, "_shm_handle", None) is not None:
             self._shm_handle.close()
             self._shm_handle = None
+
+
+def materialize_shm_in_mm_inputs(
+    mm_input: Optional["MultimodalInputs"],
+) -> List[str]:
+    """Replace ShmPointerMMData references with real tensors (in-place).
+
+    Returns the list of shm_name strings so the caller can defer unlinking
+    until all readers have finished.
+    """
+    if mm_input is None:
+        return []
+    shm_names: List[str] = []
+    for item in mm_input.mm_items:
+        for field in ("feature", "precomputed_embeddings"):
+            val = getattr(item, field, None)
+            if isinstance(val, ShmPointerMMData):
+                shm_names.append(val.shm_name)
+                setattr(item, field, val.read_tensor())
+            elif isinstance(val, (list, tuple)):
+                materialized = []
+                for elem in val:
+                    if isinstance(elem, ShmPointerMMData):
+                        shm_names.append(elem.shm_name)
+                        materialized.append(elem.read_tensor())
+                    else:
+                        materialized.append(elem)
+                # Preserve the original container type (e.g. tuple).
+                setattr(item, field, type(val)(materialized))
+    return shm_names
 
 
 def _get_is_default_transport():

@@ -501,13 +501,49 @@ class SchedulerDisaggregationPrefillMixin:
 
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
+        """Pipelined disagg-prefill event loop.
+
+        Overlaps heavy mm_inputs processing (from_processor_output + SHM
+        clone) in a background thread with GPU forward on the main thread.
+        The bg thread has NO Gloo calls, only CPU work whose GIL is released
+        during clone().
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
         self.result_queue = deque()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
+        mm_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mm_proc")
+
+        # Disable SHM barrier+unwrap in recv_requests; the bg thread handles
+        # SHM lifecycle via generation-based deferred unlink.
+        self._skip_recv_shm_flush = True
+        self.request_receiver.skip_shm_flush = True
+
+        # Pipeline state from previous iteration
+        prev_recv_reqs = None
+        prev_mm_future = None
+        prev_mm_indices = None
+
         while True:
-            # Receive requests
+            # ── 1. Collect bg mm results and dispatch previous requests ──
+            if prev_recv_reqs is not None:
+                self._collect_mm_results_and_dispatch(
+                    prev_recv_reqs, prev_mm_future, prev_mm_indices
+                )
+                prev_recv_reqs = None
+
+            # ── 2. Recv new requests (Gloo broadcast syncs all ranks) ──
             recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
+            self._flush_oldest_shm_generation()
+
+            # ── 3. Submit mm_inputs processing to bg thread ──
+            prev_mm_future, prev_mm_indices = self._submit_mm_processing(
+                mm_executor, recv_reqs
+            )
+            prev_recv_reqs = recv_reqs
+
+            # ── 4. Schedule (from requests dispatched in step 1) ──
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
@@ -516,31 +552,25 @@ class SchedulerDisaggregationPrefillMixin:
 
             self._apply_war_barrier()
 
-            # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
             self.cur_batch = batch
 
-            # Launch the current batch
+            # ── 5. GPU forward (bg thread runs concurrently) ──
+            batch_result = None
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
-            else:
-                batch_result = None
 
-            # Process the last batch
+            # ── 6. Process last batch result ──
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
-                # When the server is idle, do self-check and re-init some states
                 self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
-
-            # Run sample of the current batch
-            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result)
 
             # Update last_batch
