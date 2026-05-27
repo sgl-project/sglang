@@ -358,6 +358,22 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Added Mamba2 EAGLE chain verify (eager + CG) coverage. Three pieces:
+  1. `ProjectedMamba2Attention.forward` sets
+     `use_triton_causal_conv=True` for TARGET_VERIFY / DRAFT_EXTEND so
+     `MambaMixer2.forward` accepts spec_info.
+  2. `MockMamba2ModelRunner.__init__` auto-derives
+     `speculative_num_draft_tokens` from `case.extend_lens` and threads
+     it into `HybridReqToTokenPool` so the pool allocates the
+     `SpeculativeState.intermediate_ssm` / `intermediate_conv_window`
+     buffers Mamba2's spec-decoding path requires.
+  3. New `expected_mamba2_verify_output_from_inputs` reuses the
+     existing EXTEND-style `_pure_torch_mamba2_reference` (Mamba2's
+     SSM kernel ignores tree masks and processes draft tokens
+     linearly, so chain verify matches the extend reference within
+     ~0.008 max diff).
+  Tree verify (topk>1) is structurally unsupported — same pattern as
+  Lightning. Documented at the runner and reference.
 - Enabled `trtllm_mha` CUDA-graph decode replay coverage. Previously
   documented as "the shared CUDA-graph decode helper currently
   mismatches on replay"; the FlashInfer TRT-LLM Gen FMHA decode
@@ -1017,6 +1033,9 @@ Latest verification:
 - `python test/manual/attention/unittest/gdn/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_flashinfer.py -v`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
+  - Ran 148 tests in 36.493s (21 skipped) after adding Mamba2 EAGLE
+    chain verify (eager + CG): 2 new test methods, 0 regressions.
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
   - Ran 146 tests in 37.164s (21 skipped) after:
     1. MLA Triton tree-verify eager + EAGLE chain CG;
