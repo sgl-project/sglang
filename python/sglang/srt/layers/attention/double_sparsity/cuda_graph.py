@@ -115,12 +115,18 @@ def capture_decode_step(
     req_pool_indices: torch.Tensor,
     sparse_mask: torch.Tensor,
     seq_lens: torch.Tensor,
+    req_to_token: Optional[torch.Tensor] = None,
 ) -> Callable[[], Tuple[torch.Tensor, torch.Tensor]]:
     """Capture one ``retrieve_topk`` call and return a replayable closure.
 
     The captured region writes into the pre-allocated ``state`` buffers.
     Replay reuses the same buffers; the returned closure returns the same
     tensors so callers can read updated values.
+
+    ``req_to_token`` must be provided for the logical-domain selection path
+    (production TP operation). Without it the selector falls back to the
+    physical-domain path, which produces the wrong top-K during graph replay
+    when physical slots differ across TP ranks.
 
     On non-CUDA devices the function returns an eager closure that does no
     capture; this keeps unit tests portable.
@@ -139,6 +145,7 @@ def capture_decode_step(
                 req_pool_indices=req_pool_indices,
                 sparse_mask=sparse_mask,
                 seq_lens=seq_lens,
+                req_to_token=req_to_token,
             )
             bs = out_idx.shape[0]
             mtk = out_idx.shape[1]
@@ -160,6 +167,7 @@ def capture_decode_step(
             req_pool_indices=req_pool_indices,
             sparse_mask=sparse_mask,
             seq_lens=seq_lens,
+            req_to_token=req_to_token,
         )
         bs = out_idx.shape[0]
         mtk = out_idx.shape[1]
@@ -175,6 +183,7 @@ def capture_decode_step(
             req_pool_indices=req_pool_indices,
             sparse_mask=sparse_mask,
             seq_lens=seq_lens,
+            req_to_token=req_to_token,
         )
         bs = out_idx.shape[0]
         mtk = out_idx.shape[1]

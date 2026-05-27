@@ -2874,6 +2874,162 @@ class TestCUDAGraphCapture(unittest.TestCase):
         self.assertTrue(torch.equal(idx1, idx2))
         self.assertTrue(torch.equal(lens1, lens2))
 
+    def _make_bound_selector_with_known_sigs(self):
+        """Return (selector, req_to_token) for req_to_token logical-domain tests.
+
+        Physical sigs at slots 0..3: [9.0, 8.0, 1.0, 2.0].
+        req_to_token = [[2, 3, 0, 1]] maps:
+          logical 0 → physical 2 → 1.0
+          logical 1 → physical 3 → 2.0
+          logical 2 → physical 0 → 9.0
+          logical 3 → physical 1 → 8.0
+        Top-2 logical positions: [2, 3] (scores 9.0, 8.0).
+        """
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import ChannelMask
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+        L, T, H, Ld, hd = 1, 4, 1, 1, 1
+        cfg_str = (
+            '{"top_k": 2, "page_size": 64, '
+            '"channel_mask_path": "/tmp/x.safetensors", "device_buffer_size": 4096}'
+        )
+        cfg = parse_double_sparsity_config(cfg_str)
+        sel = DoubleSparsitySelector(
+            config=cfg, num_local_heads=H, head_dim=hd, device=torch.device("cpu"),
+        )
+        table = allocate_token_label_table(
+            num_layers_local=L, max_tokens=T, num_heads_local=H, label_dim=Ld,
+            page_size=64, dtype=torch.float32, device=torch.device("cpu"),
+        )
+        # Physical slot sigs: [9.0, 8.0, 1.0, 2.0]
+        table.signatures[0, :, 0, 0] = torch.tensor([9.0, 8.0, 1.0, 2.0])
+        table.written[0, :] = True
+        mask = ChannelMask(
+            channel_selection=torch.zeros(L, H, Ld, dtype=torch.int32),
+            channel_weights=torch.ones(L, H, Ld, dtype=torch.float32),
+            schema_version="1", dtype="fp8_e4m3", head_dim=hd, page_size=64,
+            label_dim=Ld, content_sha256="test",
+        )
+        sel.bind_runtime_data(table, mask)
+        req_to_token = torch.tensor([[2, 3, 0, 1]], dtype=torch.int32)
+        return sel, req_to_token
+
+    def test_req_to_token_threads_to_logical_domain(self):
+        """capture_decode_step with req_to_token selects logical positions, not physical."""
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            allocate_graph_state, capture_decode_step,
+        )
+        sel, req_to_token = self._make_bound_selector_with_known_sigs()
+        state = allocate_graph_state(max_bs=1, max_top_k=2, device=torch.device("cpu"))
+        # query value = 1.0 so score = sig value directly
+        queries = torch.ones(1, 1, 1, dtype=torch.float32)
+        replay = capture_decode_step(
+            sel, state=state,
+            queries=queries, layer_id=0,
+            req_pool_indices=torch.zeros(1, dtype=torch.int32),
+            sparse_mask=torch.ones(1, 4, dtype=torch.int32),
+            seq_lens=torch.tensor([4], dtype=torch.int32),
+            req_to_token=req_to_token,
+        )
+        idx, lens = replay()
+        # Expected: logical positions [2, 3] (9.0 and 8.0 via req_to_token mapping)
+        self.assertEqual(int(lens[0].item()), 2)
+        selected = idx[0, :2]
+        self.assertTrue(
+            torch.equal(selected, torch.tensor([2, 3], dtype=torch.int32)),
+            f"expected logical [2, 3], got {selected.tolist()}",
+        )
+
+    def test_eager_replay_output_matches_direct_call(self):
+        """State buffers after replay are bit-equal to a direct retrieve_topk call."""
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            allocate_graph_state, capture_decode_step,
+        )
+        sel, req_to_token = self._make_bound_selector_with_known_sigs()
+        state = allocate_graph_state(max_bs=1, max_top_k=2, device=torch.device("cpu"))
+        queries = torch.ones(1, 1, 1, dtype=torch.float32)
+        req_pool = torch.zeros(1, dtype=torch.int32)
+        sparse_mask = torch.ones(1, 4, dtype=torch.int32)
+        seq_lens = torch.tensor([4], dtype=torch.int32)
+
+        replay = capture_decode_step(
+            sel, state=state,
+            queries=queries, layer_id=0,
+            req_pool_indices=req_pool,
+            sparse_mask=sparse_mask,
+            seq_lens=seq_lens,
+            req_to_token=req_to_token,
+        )
+        idx_replay, len_replay = replay()
+
+        # Direct call must produce the same result.
+        idx_direct, len_direct = sel.retrieve_topk(
+            queries=queries, layer_id=0,
+            req_pool_indices=req_pool,
+            sparse_mask=sparse_mask,
+            seq_lens=seq_lens,
+            req_to_token=req_to_token,
+        )
+        self.assertTrue(
+            torch.equal(idx_replay[:1, :2], idx_direct),
+            f"replay {idx_replay[:1,:2].tolist()} != direct {idx_direct.tolist()}",
+        )
+        self.assertTrue(torch.equal(len_replay[:1], len_direct))
+
+    def test_eager_replay_100_steps_stable(self):
+        """Calling the replay closure 100 times produces identical output each time."""
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            allocate_graph_state, capture_decode_step,
+        )
+        cfg = parse_double_sparsity_config(_valid_payload())
+        sel = DoubleSparsitySelector(
+            config=cfg, num_local_heads=2, head_dim=64, device=torch.device("cpu"),
+        )
+        state = allocate_graph_state(max_bs=1, max_top_k=2048, device=torch.device("cpu"))
+        queries = torch.randn(1, 2, 64)
+        replay = capture_decode_step(
+            sel, state=state,
+            queries=queries, layer_id=0,
+            req_pool_indices=torch.zeros(1, dtype=torch.int32),
+            sparse_mask=torch.ones(1, 100, dtype=torch.int32),
+            seq_lens=torch.tensor([100], dtype=torch.int32),
+        )
+        idx_ref, len_ref = replay()
+        idx_ref = idx_ref.clone()
+        len_ref = len_ref.clone()
+        for _ in range(99):
+            idx_i, len_i = replay()
+            self.assertTrue(torch.equal(idx_i, idx_ref))
+            self.assertTrue(torch.equal(len_i, len_ref))
+
+    def test_alloc_detector_raises_on_cuda_alloc_in_region(self):
+        """assert_no_alloc_in_region raises RuntimeError when CUDA alloc happens inside."""
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            assert_no_alloc_in_region,
+        )
+        if not torch.cuda.is_available():
+            # No-op on CPU; the detector is only active on CUDA.
+            with assert_no_alloc_in_region("cpu-no-op"):
+                _ = torch.empty(1)
+            return
+        with self.assertRaises(RuntimeError):
+            with assert_no_alloc_in_region("test-region"):
+                _ = torch.empty(1, device="cuda")
+
+    def test_alloc_detector_silent_when_prealloc_before_region(self):
+        """No RuntimeError when all allocations happen before entering the region."""
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            assert_no_alloc_in_region,
+        )
+        if torch.cuda.is_available():
+            buf = torch.empty(16, device="cuda")  # preallocated outside
+            with assert_no_alloc_in_region("prealloc-test"):
+                buf.fill_(0)  # writes only — no new allocation
+        else:
+            with assert_no_alloc_in_region("cpu-noop"):
+                _ = torch.empty(4)  # no-op on CPU; no error expected
+
 
 _CUDA_AVAILABLE = torch.cuda.is_available()
 
