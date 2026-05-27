@@ -64,7 +64,7 @@ def benchmark(head_dim: int, GQA: int, num_kv_heads: int, batch_size: int, impl:
     k = create_random(batch_size, num_kv_heads, head_dim)
     q_weight = create_random(head_dim)
     k_weight = create_random(head_dim)
-    return marker.bench_one_function(
+    return marker.do_bench(
         FN_MAP[impl],
         input_args=(q, k, q_weight, k_weight),
         memory_output=(q, k),  # inplace write to q, k

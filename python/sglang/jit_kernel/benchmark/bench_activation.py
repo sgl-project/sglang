@@ -47,7 +47,7 @@ def benchmark(op_name: str, dim: int, batch_size: int, impl: str):
     x = create_random(batch_size, dim * 2)
     aot_op, jit_op, torch_op = OPS[op_name]
     fn = {"aot": aot_op, "jit": jit_op, "torch": torch_op}[impl]
-    return marker.bench_one_function(fn, input_args=(x,))
+    return marker.do_bench(fn, input_args=(x,))
 
 
 def _make_expert_ids(num_tokens: int, skip_ratio: float) -> torch.Tensor:
@@ -77,7 +77,7 @@ def benchmark_filter(
     # NOTE: get the unmasked part from `experts_ids`
     real_skip_ratio = (expert_ids == -1).sum().item() / batch_size
     effective_bytes = int(x.nbytes * (1 - real_skip_ratio) * 1.5)
-    return marker.bench_one_function(
+    return marker.do_bench(
         jit_fn,
         input_args=(x,),
         input_kwargs=extra_kwargs,

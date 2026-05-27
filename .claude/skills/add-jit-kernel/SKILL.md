@@ -523,7 +523,7 @@ Benchmarks use the project's own `marker` framework (in `python/sglang/jit_kerne
 
 - **`@marker.mark_benchmark(line_arg, line_vals, *, unit="us")`** — outermost decorator. Declares the column axis: each value in `line_vals` becomes a result column, and `line_arg` is the parameter name passed into the benchmark function. `unit` is one of `"us" | "ms" | "s"`.
 - **`@marker.mark_args(name, vals)`** — stackable decorator that adds a row axis. Each `@mark_args` adds one parameter that the benchmark is swept over (Cartesian product across all `mark_args`). Decorators are applied bottom-up, but the printed table preserves natural reading order regardless.
-- **`marker.bench_one_function(fn, *, input_args=(), input_kwargs={}, ...)`** — runs `fn` under CUDA graph (default) or a naive loop, returns a `BenchResult`. Key knobs:
+- **`marker.do_bench(fn, *, input_args=(), input_kwargs={}, ...)`** — runs `fn` under CUDA graph (default) or a naive loop, returns a `BenchResult`. Key knobs:
   - `memory_args`: pass `"all"` to derive memory footprint from all input args/kwargs, or pass an explicit tuple of tensors (e.g. `(k, v, indices)`) when only some are read/written. When set, the framework prints a `GB/s` column per system.
   - `graph_clone_args` / `graph_clone_kwargs`: which inputs to clone per CUDA-graph iteration to defeat L2 cache reuse. Defaults to `"all"` — pass an iterable of indices/keys to limit to the *read* args (writes don't need cloning).
   - `use_cuda_graph=False` for kernels that can't be captured.
@@ -567,7 +567,7 @@ FN_MAP = {
 def benchmark(size: int, impl: str):
     src = create_random(size)
     factor = 2.0
-    return marker.bench_one_function(
+    return marker.do_bench(
         FN_MAP[impl],
         input_args=(src, factor),
         # `src` is read-only -> clone it per iter to avoid L2 reuse; factor is a scalar.
@@ -609,7 +609,7 @@ cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-1-gpu-
 - **`No CI registry found in ...` from `run_suite.py`**: add a module-level `register_cuda_ci(...)` with literal `est_time` and `suite` (and optional `nightly=True`); starred args and non-literal values break AST collection
 - **JIT compilation fails**: ensure the `.cuh` file is under `python/sglang/jit_kernel/csrc/`; reduce template argument combinations
 - **CUDA crash / illegal memory access**: `CUDA_LAUNCH_BLOCKING=1`; `compute-sanitizer --tool memcheck python ...`
-- **Unstable benchmark results**: `marker.bench_one_function` uses CUDA-graph-based timing by default; set `use_cuda_graph=False` only if the kernel can't be captured. Make sure `graph_clone_args` covers every *read* tensor — reusing a single buffer keeps it L2-hot and skews results
+- **Unstable benchmark results**: `marker.do_bench` uses CUDA-graph-based timing by default; set `use_cuda_graph=False` only if the kernel can't be captured. Make sure `graph_clone_args` covers every *read* tensor — reusing a single buffer keeps it L2-hot and skews results
 - **Missing GB/s column**: set `memory_args=` (either `"all"` or an explicit tuple of touched tensors). Check that `SGLANG_KERNEL_DISABLE_LOG_BANDWIDTH` is not `1`
 
 ---
@@ -633,7 +633,7 @@ cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-1-gpu-
 - `python/sglang/jit_kernel/csrc/add_constant.cuh` — minimal runnable reference
 - `python/sglang/jit_kernel/csrc/elementwise/rmsnorm.cuh` — real example using `TensorMatcher` + `LaunchKernel` + `tile::Memory`
 - `python/sglang/jit_kernel/csrc/elementwise/qknorm.cuh` — real example using `runtime::get_blocks_per_sm` + persistent kernel pattern
-- `python/sglang/jit_kernel/benchmark/marker.py` — `mark_benchmark`, `mark_args`, `bench_one_function`, `BenchResult`
+- `python/sglang/jit_kernel/benchmark/marker.py` — `mark_benchmark`, `mark_args`, `do_bench`, `BenchResult`
 - `python/sglang/jit_kernel/benchmark/utils.py` — `create_random` / `create_empty` / `get_benchmark_range` helpers and `DEFAULT_DTYPE` / `DEFAULT_DEVICE`
 - `python/sglang/jit_kernel/benchmark/bench_qknorm.py` — real example: multi-axis `mark_args` + `memory_args="all"`
 - `python/sglang/jit_kernel/benchmark/bench_store_cache.py` — real example: scoped `memory_args` + selective `graph_clone_args`

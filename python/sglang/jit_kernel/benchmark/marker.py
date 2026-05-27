@@ -1,7 +1,7 @@
+import inspect
 import itertools
 import math
 import os
-from collections import OrderedDict
 from typing import (
     Any,
     Callable,
@@ -23,10 +23,22 @@ from sglang.jit_kernel.utils import cache_once
 from sglang.utils import is_in_ci
 
 F = TypeVar("F", bound=Callable[..., "BenchResult"])
-Metric: TypeAlias = 'float | Literal["avg"]'
-
+Metric: TypeAlias = "float | Literal['avg']"
+BENCH_CONFIG: TypeAlias = "List[Tuple[Tuple[str, ...], List[Tuple[Any, ...]]]]"
+UNIT_SCALE = {"us": 1e-6, "ms": 1e-3, "s": 1.0}
 TYPE_LIST = (bool, int, float, str, torch.dtype, torch.device, None.__class__)
 DISABLE_LOG_BANDWIDTH = os.environ.get("SGLANG_KERNEL_DISABLE_LOG_BANDWIDTH") == "1"
+
+
+__all__ = [
+    "BenchResult",
+    "BenchSkip",
+    "Benchmark",
+    "benchmark",
+    "parametrize",
+    "do_bench",
+    "skip",
+]
 
 
 class BenchSkip(Exception):
@@ -38,30 +50,30 @@ def skip(reason: str):
 
 
 @cache_once
-def _get_stream(device_id: int) -> torch.cuda.Stream:
+def _get_benchmark_stream(device_id: int) -> torch.cuda.Stream:
     return torch.cuda.Stream(device=device_id)
 
 
-def _clone(in_: Any) -> Any:
+def _clone_recursive(in_: Any) -> Any:
     if isinstance(in_, torch.Tensor):
         return in_.clone()
     elif isinstance(in_, (list, tuple)):
-        return type(in_)(_clone(x) for x in in_)
+        return type(in_)(_clone_recursive(x) for x in in_)
     elif isinstance(in_, dict):
-        return {k: _clone(v) for k, v in in_.items()}
+        return {k: _clone_recursive(v) for k, v in in_.items()}
     elif isinstance(in_, TYPE_LIST):
         return in_
     # NOTE: avoid silent error
     raise ValueError(f"unsupported type: {type(in_)}")
 
 
-def _get_nbytes(in_: Any) -> int:
+def _get_nbytes_recursive(in_: Any) -> int:
     if isinstance(in_, torch.Tensor):
         return in_.nbytes
     elif isinstance(in_, (list, tuple)):
-        return sum(_get_nbytes(x) for x in in_)
+        return sum(_get_nbytes_recursive(x) for x in in_)
     elif isinstance(in_, dict):
-        return sum(_get_nbytes(v) for v in in_.values())
+        return sum(_get_nbytes_recursive(v) for v in in_.values())
     elif isinstance(in_, TYPE_LIST):
         return 0
     # NOTE: avoid silent error
@@ -87,7 +99,227 @@ class BenchResult(NamedTuple):
     memory_footprint: Optional[int]
 
 
-def bench_one_function(
+class Table:
+    """Aligned text table with `|` section separators and `=`/`-` rules."""
+
+    SEP = " | "
+
+    def __init__(self) -> None:
+        self._headers: List[str] = []
+        self._mins: List[int] = []
+        self._pads: List[int] = []
+        self._aligns: List[str] = []
+        self._seps: set = set()
+        self._rows: List[List[str]] = []
+
+    @staticmethod
+    def format_latency(r: float) -> str:
+        if math.isnan(r):
+            return "N/A"
+        length = len(str(int(r)))
+        if length < 5:
+            return f"{r:.4f}"
+        # decrease number of the digits
+        digits = max(0, 4 - (length - 5))
+        return f"{r:.{digits}f}"
+
+    @staticmethod
+    def format_bandwidth(b: float) -> str:
+        if math.isnan(b):
+            return "N/A"
+        return f"{b:.2f}"
+
+    def col(
+        self,
+        header: str = "",
+        *,
+        min_width: int = 10,
+        pad: int = 2,
+        align: str = ">",
+    ) -> None:
+        self._headers.append(header)
+        self._mins.append(min_width)
+        self._pads.append(pad)
+        self._aligns.append(align)
+
+    def sep(self) -> None:
+        self._seps.add(len(self._headers))
+
+    def row(self, *cells: Any) -> None:
+        assert len(cells) == len(self._headers)
+        self._rows.append([str(c) for c in cells])
+
+    def print(self) -> None:
+        widths = [
+            max(max(len(c) + p for c in [h, *(r[i] for r in self._rows)]), mw)
+            for i, (h, mw, p) in enumerate(zip(self._headers, self._mins, self._pads))
+        ]
+        total = sum(widths) + len(self.SEP) * len(self._seps)
+
+        def fmt(cells: List[str]) -> str:
+            parts: List[str] = []
+            for i, (cell, w, a) in enumerate(zip(cells, widths, self._aligns)):
+                if i in self._seps:
+                    parts.append(self.SEP)
+                parts.append(f"{cell:{a}{w}}")
+            return "".join(parts)
+
+        print("=" * total)
+        print(fmt(self._headers))
+        print("-" * total)
+        for r in self._rows:
+            print(fmt(r))
+        print("=" * total)
+
+
+class Benchmark(Generic[F]):
+    def __init__(self, fn: F, line_arg: str, line_vals: List[Any], *, unit: str):
+        assert unit in UNIT_SCALE and len(set(line_vals)) == len(line_vals) > 0
+        self._fn = fn
+        self._line_arg = line_arg
+        self._line_vals = line_vals
+        self._unit = unit
+        self._configs: BENCH_CONFIG = []
+        self._fn_params = inspect.signature(fn).parameters
+        self._unit_scale = UNIT_SCALE[unit]
+        assert line_arg in self._fn_params, (
+            f"line_arg {line_arg!r} is not a parameter of {fn.__name__}; "
+            f"available: {list(self._fn_params)}"
+        )
+        self._seen_args = {line_arg}
+
+    def add_config(self, names: Tuple[str, ...], vals: List[Tuple[Any, ...]]) -> None:
+        """Prepend a parametrize axis. Validates that names are real parameters
+        of the benchmark fn, and rejects duplicates / collisions with line_arg."""
+        assert len(names) > 0, "parametrize: must provide at least one name"
+        for name in names:
+            assert name in self._fn_params, (
+                f"parametrize name {name!r} is not a parameter of "
+                f"{self._fn.__name__}; available: {list(self._fn_params)}"
+            )
+            assert (
+                name not in self._seen_args
+            ), f"parametrize name {name!r} is already used"
+            self._seen_args.add(name)
+        self._configs.insert(0, (names, vals))
+
+    def _collect_results(self) -> Tuple[List[List[float]], List[List[float]], bool]:
+        axis_names = [n for n, _ in self._configs]
+        axis_vals = [v for _, v in self._configs]
+        results: List[List[float]] = []
+        bandwidth_results: List[List[float]] = []
+        should_log_bandwidth = False
+        for system in self._line_vals:
+            latencies: List[float] = []
+            bandwidths: List[float] = []
+            for combo in itertools.product(*axis_vals):
+                kwargs: Dict[str, Any] = {self._line_arg: system}
+                for names, values in zip(axis_names, combo):
+                    kwargs.update(zip(names, values))
+                try:
+                    result = self._fn(**kwargs)
+                except BenchSkip:
+                    latencies.append(float("nan"))
+                    if not DISABLE_LOG_BANDWIDTH:
+                        bandwidths.append(float("nan"))
+                    continue
+                latencies.append(result.times[0] / self._unit_scale)
+                if not DISABLE_LOG_BANDWIDTH and result.memory_footprint is not None:
+                    should_log_bandwidth = True
+                    bandwidths.append(
+                        result.memory_footprint / (1024**3) / result.times[0]
+                    )
+            results.append(latencies)
+            bandwidth_results.append(bandwidths)
+        return results, bandwidth_results, should_log_bandwidth
+
+    def run(self) -> None:
+        # Pre-check: every required fn param must be covered.
+        flat_names = [n for names, _ in self._configs for n in names]
+        kinds = (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+        missing = {
+            n
+            for n, p in self._fn_params.items()
+            if p.default is inspect.Parameter.empty and p.kind in kinds
+        } - (set(flat_names) | {self._line_arg})
+        assert not missing, (
+            f"parameters not parametrized for {self._fn.__name__}: "
+            f"{sorted(missing)}"
+        )
+
+        results, bandwidths, should_log_bw = self._collect_results()
+
+        table = Table()
+        table.col(min_width=0, pad=0, align="<")  # id column (tight, left-aligned)
+        for name in flat_names:
+            table.col(name)
+        table.sep()
+        for system in self._line_vals:
+            table.col(f"{system}({self._unit})", min_width=15)
+        if should_log_bw:
+            table.sep()
+            for system in self._line_vals:
+                table.col(f"{system}(GB/s)", min_width=15)
+
+        axis_vals = [v for _, v in self._configs]
+        for row_id, combo in enumerate(itertools.product(*axis_vals)):
+            cells: List[Any] = [row_id]
+            cells.extend(v for vt in combo for v in vt)
+            cells.extend(table.format_latency(r[row_id]) for r in results)
+            if should_log_bw:
+                cells.extend(table.format_bandwidth(r[row_id]) for r in bandwidths)
+            table.row(*cells)
+
+        table.print()
+
+
+def benchmark(line_arg: str, line_vals: List[Any], *, unit: str = "us"):
+    def decorator(fn: F) -> Benchmark[F]:
+        return Benchmark(fn, line_arg, line_vals, unit=unit)
+
+    return decorator
+
+
+def parametrize(names: str, vals: List[Any], ci_vals: Optional[List[Any]] = None):
+    """Add a parametrize axis. Pytest-style:
+
+    - Single name:   `parametrize("dim", [1024, 4096])`
+    - Multiple names (correlated):
+                     `parametrize("h,d", [(1, 64), (2, 128)])`
+
+    For multi-name axes, each value must be a tuple/list of matching length.
+    """
+    name_tuple = tuple(n.strip() for n in names.split(","))
+    assert all(name_tuple), f"parametrize: empty name in {names!r}"
+    arity = len(name_tuple)
+
+    def _normalize(vs: List[Any]) -> List[Tuple[Any, ...]]:
+        if arity == 1:
+            return [(v,) for v in vs]
+        out: List[Tuple[Any, ...]] = []
+        for v in vs:
+            assert isinstance(
+                v, (tuple, list)
+            ), f"parametrize: multi-name values must be tuples, got {v!r}"
+            t = tuple(v)
+            assert (
+                len(t) == arity
+            ), f"parametrize: each value must have length {arity}, got {t!r}"
+            out.append(t)
+        return out
+
+    def decorator(bench: Benchmark[F]) -> Benchmark[F]:
+        chosen = ci_vals if (ci_vals is not None and is_in_ci()) else vals
+        bench.add_config(name_tuple, _normalize(chosen))
+        return bench
+
+    return decorator
+
+
+def do_bench(
     fn: Callable,
     *,
     input_args: Tuple[Any, ...] = (),
@@ -133,7 +365,7 @@ def bench_one_function(
     # first warmup the function
     device_id = torch.cuda.current_device()
     if stream is None:
-        stream = _get_stream(device_id)
+        stream = _get_benchmark_stream(device_id)
     old_current_stream = torch.cuda.current_stream(device_id)
     result: List[float] = []
     with torch.cuda.device(device_id), torch.cuda.stream(stream):
@@ -160,11 +392,15 @@ def bench_one_function(
             # NOTE: we rotate the buffer here to avoid L2 cache effect
             for i in range(1, rep_count):
                 input_args_list[i] = tuple(
-                    _clone(input_args[j]) if j in graph_clone_args else input_args[j]
+                    (
+                        _clone_recursive(input_args[j])
+                        if j in graph_clone_args
+                        else input_args[j]
+                    )
                     for j in range(len(input_args))
                 )
                 input_kwargs_list[i] = dict(
-                    (k, (_clone(v) if k in graph_clone_kwargs else v))
+                    (k, (_clone_recursive(v) if k in graph_clone_kwargs else v))
                     for k, v in input_kwargs.items()
                 )
             with torch.cuda.graph(graph, stream=stream):
@@ -204,138 +440,8 @@ def bench_one_function(
         if memory_output == "out":
             memory_output = fn(*input_args, **input_kwargs)
         memory_footprint = extra_memory_footprint
-        memory_footprint += _get_nbytes(extra_memory_args)
-        memory_footprint += _get_nbytes(memory_args)
-        memory_footprint += _get_nbytes(memory_output)
+        memory_footprint += _get_nbytes_recursive(extra_memory_args)
+        memory_footprint += _get_nbytes_recursive(memory_args)
+        memory_footprint += _get_nbytes_recursive(memory_output)
 
     return BenchResult(metrics, result, memory_footprint)
-
-
-class Benchmark(Generic[F]):
-    def __init__(self, fn: F, line_arg: str, line_vals: List[str], *, unit: str):
-        self.benchmark_fn = fn
-        self.benchmark_configs: dict[str, List[Any]] = OrderedDict()
-        self.line_arg = line_arg
-        self.line_vals = line_vals
-        assert unit in ("us", "ms", "s")
-        UNIT_SCALE = {"us": 1e-6, "ms": 1e-3, "s": 1.0}
-        self.unit = unit
-        self.unit_scale = UNIT_SCALE[unit]
-
-    def run(self) -> None:
-        def get_width(s: Any, min_width: int = 10) -> int:
-            return max(len(str(s)) + 2, min_width)
-
-        def format_latency(r: float) -> str:
-            if math.isnan(r):
-                return "N/A"
-            length = len(str(int(r)))
-            if length < 5:
-                return f"{r:.4f}"
-            # decrease number of the digits
-            digits = max(0, 4 - (length - 5))
-            return f"{r:.{digits}f}"
-
-        def format_bandwidth(b: float) -> str:
-            if math.isnan(b):
-                return "N/A"
-            return f"{b:.2f}"
-
-        results: List[List[float]] = []
-        bandwidth_results: List[List[float]] = []
-        benchmark_configs = OrderedDict(reversed(self.benchmark_configs.items()))
-        should_log_bandwidth = False
-        for system in self.line_vals:
-            system_list = []
-            bandwidth_list = []
-            for config in itertools.product(*benchmark_configs.values()):
-                config_dict = dict(zip(benchmark_configs.keys(), config))
-                config_dict.update({self.line_arg: system})
-                try:
-                    result = self.benchmark_fn(**config_dict)
-                except BenchSkip:
-                    system_list.append(float("nan"))
-                    if not DISABLE_LOG_BANDWIDTH:
-                        bandwidth_list.append(float("nan"))
-                    continue
-                system_list.append(result.times[0] / self.unit_scale)
-                if not DISABLE_LOG_BANDWIDTH and result.memory_footprint is not None:
-                    should_log_bandwidth = True
-                    memory_giga_bytes = result.memory_footprint / (1024**3)
-                    bandwidth = memory_giga_bytes / result.times[0]
-                    bandwidth_list.append(bandwidth)
-            results.append(system_list)
-            bandwidth_results.append(bandwidth_list)
-
-        num_ids = len(results[0])
-        id_width = len(str(num_ids - 1))
-        args_widths = [
-            max(get_width(v) for v in [key] + vals)
-            for key, vals in benchmark_configs.items()
-        ]
-        system_widths = [
-            get_width(f"{system}({self.unit})", 15) for system in self.line_vals
-        ]
-        bandwidth_widths: List[int] = []
-        if should_log_bandwidth:
-            bandwidth_widths = [
-                get_width(f"{system}(GB/s)", 15) for system in self.line_vals
-            ]
-
-        def _print(arg: str = "") -> None:
-            nonlocal counter
-            print(arg, end="")
-            counter += len(arg)
-
-        total_width = id_width + sum(args_widths) + 3 + sum(system_widths)
-        if should_log_bandwidth:
-            total_width += 3 + sum(bandwidth_widths)
-
-        print("=" * total_width)
-        counter = 0
-        # id, args... | system0, system1, ... | bw0, bw1, ...
-        _print(" " * id_width)
-        for key, width in zip(benchmark_configs.keys(), args_widths):
-            _print(f"{key:>{width}}")
-        _print(" | ")
-        for system, width in zip(self.line_vals, system_widths):
-            system_name = f"{system}({self.unit})"
-            _print(f"{system_name:>{width}}")
-        if should_log_bandwidth:
-            _print(" | ")
-            for system, width in zip(self.line_vals, bandwidth_widths):
-                system_name = f"{system}(GB/s)"
-                _print(f"{system_name:>{width}}")
-        print()
-        print("-" * counter)
-        for id, config in enumerate(itertools.product(*benchmark_configs.values())):
-            _print(f"{id:<{id_width}}")
-            for arg, width in zip(config, args_widths):
-                _print(f"{str(arg):>{width}}")
-            _print(" | ")
-            for system_result, width in zip(results, system_widths):
-                _print(f"{format_latency(system_result[id]):>{width}}")
-            if should_log_bandwidth:
-                _print(" | ")
-                for bandwidth_result, width in zip(bandwidth_results, bandwidth_widths):
-                    _print(f"{format_bandwidth(bandwidth_result[id]):>{width}}")
-            print()
-        print("=" * total_width)
-
-
-def benchmark(line_arg: str, line_vals: List[str], *, unit: str = "us"):
-    def decorator(fn: F) -> Benchmark[F]:
-        return Benchmark(fn, line_arg, line_vals, unit=unit)
-
-    return decorator
-
-
-def parametrize(name: str, vals: List[Any], ci_vals: Optional[List[Any]] = None):
-    def decorator(bench: Benchmark[F]) -> Benchmark[F]:
-        if ci_vals is not None and is_in_ci():
-            bench.benchmark_configs[name] = ci_vals
-        else:
-            bench.benchmark_configs[name] = vals
-        return bench
-
-    return decorator

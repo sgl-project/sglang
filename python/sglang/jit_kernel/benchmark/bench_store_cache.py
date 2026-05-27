@@ -60,7 +60,7 @@ def benchmark(batch_size: int, item_size: int, impl: str):
     v = create_random(batch_size, item_size)
     v_cache = create_empty(CACHE_SIZE, item_size)
     indices = torch.randperm(CACHE_SIZE, device=DEFAULT_DEVICE)[:batch_size]
-    return marker.bench_one_function(
+    return marker.do_bench(
         FN_MAP[impl],
         input_args=(k, v, k_cache, v_cache, indices),
         graph_clone_args=(0, 1, 4),  # not need to clone cache, which is large
