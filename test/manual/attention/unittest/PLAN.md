@@ -177,20 +177,29 @@ Implemented:
   focused FlashMLA follow-up.
 - Cutlass MLA, TRT-LLM MLA, and Tokenspeed MLA now each have a
   capability-gated test file under `mla/` (`test_cutlass_mla.py`,
-  `test_trtllm_mla.py`, `test_tokenspeed_mla.py`). Each gate is one
-  `_supported()` helper at module import. On this environment (H200, SM 9.0)
-  all three skip cleanly with explicit reasons:
+  `test_trtllm_mla.py`, `test_tokenspeed_mla.py`) with representative Phase 2
+  input-config coverage. Each gate is one `_supported()` helper at module
+  import. On this environment (H200, SM 9.0) all three skip cleanly with
+  explicit reasons:
   - `cutlass_mla`: skips on `SM < 100`; cutlass MLA decode requires Blackwell
     (compute capability 10.0). Uses `page_size=128` to match the backend's
-    hard-coded PAGE_SIZE.
+    hard-coded PAGE_SIZE. Phase 2 covers DECODE only (the backend overrides
+    only `forward_decode`; EXTEND falls through to FlashInferMLAAttnBackend):
+    page-boundary, bsz=1 nonzero prefix, above-page, and multi-page decode.
   - `trtllm_mla`: skips on `major != 12`; the FlashInfer XQA MLA path requires
-    SM 12.0a / 12.1a. Mirrors `is_sm120_supported`'s major check.
-  - `tokenspeed_mla`: skips combining `find_spec("tokenspeed_mla") is None`,
-    `SM < 100`, and an explicit "FP8 KV-cache fixture not in scope" final skip.
-    The current `MockMLAModelRunner` forces `kv_cache_dtype=model_dtype` so the
-    fp8_e4m3 variant needs a fixture extension before the final skip can be
-    removed. Enabling requires only flipping one constant per file once the
-    matching hardware/fixture is available.
+    SM 12.0a / 12.1a. Mirrors `is_sm120_supported`'s major check. Phase 2
+    covers both allowed page sizes 32 and 64 (server_args.py:2790-2794) with
+    EXTEND (zero-prefix exact/below/above page, prefix-exact, cross-page,
+    ragged) plus DECODE (page-boundary, bsz=1 nonzero prefix).
+  - `tokenspeed_mla`: skips combining `find_spec("tokenspeed_mla") is None`
+    and `SM < 100`. FP8 KV cache (`fp8_e4m3` only, server_args.py:2814-2818)
+    is now wired through `MockMLAModelRunner(fp8_kv_cache=True)` — K writes
+    route through `set_mla_kv_buffer`'s BF16→FP8 cast while the reference
+    keeps reading BF16 K, so per-element drift from the cast is absorbed by
+    a per-case `atol=0.2` override. Phase 2 covers both allowed page sizes
+    32 and 64 (server_args.py:2809-2813) with EXTEND (zero-prefix
+    exact/below/above page, prefix-exact, cross-page, ragged) plus DECODE
+    (page-boundary, bsz=1 nonzero prefix).
 - `dual_chunk_flash_attn` is modeled as its own attention method fixture rather
   than a dense backend swap. The backend expects a packed five-way query
   projection (`query`, `succ`, `inter`, and critical variants), so
@@ -356,15 +365,39 @@ Current status:
   a follow-up because they need real model load and meaningful runtime.
 
 Deferred follow-ups:
-- Expand Phase 2 to additional attention methods/backends with method-specific
-  fixtures rather than forcing them through the dense harness. Priority candidates:
-  hardware-gated MLA kernels (`cutlass_mla`, `trtllm_mla`/`tokenspeed_mla` where
-  hardware and KV dtype support them), dual-chunk sparse pruning layouts,
-  additional DSA index layouts, and DSV4-style methods.
+- Hardware-gated MLA Phase 2 (`cutlass_mla`, `trtllm_mla`, `tokenspeed_mla`)
+  now has representative input-config coverage in unit tests that skip cleanly
+  on non-Blackwell. Remaining hardware-gated work is purely a matter of
+  running the existing files on the matching SM.
+- Dual-chunk sub-context-window sparse pruning needs an independent sparse
+  reference that diverges from the dense all-column reference. The current
+  fixture only covers "all-column" sparse where the dense reference is
+  exact. This is a new reference implementation, not additional cases.
+- DSA HiSparse coordinator path (`set_dsa_prefill_impl`'s `use_mha=False`
+  branch when `hisparse_coordinator is not None`) and non-trailing index
+  layouts beyond the trailing-topk row builder both need a representative
+  production index-construction path identified before fixtures can match
+  it without diverging from the kernel semantics.
 - Keep additional backend expansion deferred until representative Phase 3 and
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Expanded Phase 2 input-config coverage for the three hardware-gated MLA
+  backends. Tests stay skipIf-gated on this H200/SM9.0 box, but the case
+  lists now match the rest of the MLA suite's input-shape edge coverage:
+  - `cutlass_mla` (page_size=128, DECODE only): page-boundary, bsz=1 nonzero
+    prefix, above-page, multi-page. EXTEND falls through to the FlashInfer
+    MLA parent on this backend (cutlass overrides only `forward_decode`).
+  - `trtllm_mla` (page_size ∈ {32, 64}): 8 EXTEND layouts + 3 DECODE
+    layouts spanning zero-prefix exact/below/above page, prefix-exact,
+    cross-page, ragged, page-boundary decode, bsz=1 nonzero prefix.
+  - `tokenspeed_mla` (page_size ∈ {32, 64}, FP8 KV cache): mirrors the
+    trtllm_mla matrix with `fp8_kv_cache=True` and `atol=0.2` to absorb
+    BF16→FP8 K-cast drift through the attention reduction.
+- `python -m py_compile test/manual/attention/unittest/mla/test_cutlass_mla.py test/manual/attention/unittest/mla/test_trtllm_mla.py test/manual/attention/unittest/mla/test_tokenspeed_mla.py`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
+  - Ran 154 tests in 195.950s (21 skipped). All three hardware-gated MLA
+    suites skip on this box with explicit reasons.
 - Renamed and split `common/runner_modes/eagle_draft_runner.py` along
   the speculative-forward-mode axis to match the existing
   `speculative_target_verify_runner.py` /

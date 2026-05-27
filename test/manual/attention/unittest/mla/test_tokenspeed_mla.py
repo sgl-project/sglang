@@ -59,15 +59,107 @@ MLA_SHAPE_KWARGS = dict(
 
 @unittest.skipIf(not _SUPPORTED, _SKIP_REASON)
 class TestTokenspeedMLAAttentionBackendCorrectness(CustomTestCase):
+    # tokenspeed_mla allows page_size in {32, 64} (server_args.py:2809-2813)
+    # and requires kv_cache_dtype==fp8_e4m3 (server_args.py:2814-2818).
+    # Cover both page sizes, with extend + decode + ragged + page-boundary.
     CASES = (
+        # ----- page_size=64 -----
         MLAAttentionCase(
-            name="mla_extend_zero_prefix_exact_tokenspeed_page",
+            name="mla_extend_tokenspeed_zero_prefix_exact_page_64",
             backend="tokenspeed_mla",
             forward_mode=ForwardMode.EXTEND,
             num_heads=4,
             page_size=64,
             prefix_lens=(0,),
             extend_lens=(64,),
+        ),
+        MLAAttentionCase(
+            name="mla_extend_tokenspeed_zero_prefix_below_page_64",
+            backend="tokenspeed_mla",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            page_size=64,
+            prefix_lens=(0,),
+            extend_lens=(63,),
+        ),
+        MLAAttentionCase(
+            name="mla_extend_tokenspeed_zero_prefix_above_page_64",
+            backend="tokenspeed_mla",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            page_size=64,
+            prefix_lens=(0,),
+            extend_lens=(65,),
+        ),
+        MLAAttentionCase(
+            name="mla_extend_tokenspeed_prefix_exact_page_64",
+            backend="tokenspeed_mla",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            page_size=64,
+            prefix_lens=(64,),
+            extend_lens=(4,),
+        ),
+        MLAAttentionCase(
+            name="mla_extend_tokenspeed_cross_page_boundary_64",
+            backend="tokenspeed_mla",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            page_size=64,
+            prefix_lens=(63,),
+            extend_lens=(2,),
+        ),
+        MLAAttentionCase(
+            name="mla_extend_tokenspeed_ragged_page_boundary_64",
+            backend="tokenspeed_mla",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            page_size=64,
+            prefix_lens=(0, 32, 64),
+            extend_lens=(63, 32, 1),
+        ),
+        MLAAttentionCase(
+            name="mla_decode_tokenspeed_page_boundary_64",
+            backend="tokenspeed_mla",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            page_size=64,
+            prefix_lens=(62, 63, 64),
+        ),
+        MLAAttentionCase(
+            name="mla_decode_tokenspeed_bsz1_nonzero_prefix_64",
+            backend="tokenspeed_mla",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            page_size=64,
+            prefix_lens=(31,),
+        ),
+        # ----- page_size=32 -----
+        MLAAttentionCase(
+            name="mla_extend_tokenspeed_zero_prefix_exact_page_32",
+            backend="tokenspeed_mla",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            page_size=32,
+            prefix_lens=(0,),
+            extend_lens=(32,),
+        ),
+        MLAAttentionCase(
+            name="mla_extend_tokenspeed_cross_page_boundary_32",
+            backend="tokenspeed_mla",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            page_size=32,
+            prefix_lens=(31,),
+            extend_lens=(2,),
+        ),
+        MLAAttentionCase(
+            name="mla_decode_tokenspeed_page_boundary_32",
+            backend="tokenspeed_mla",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            page_size=32,
+            prefix_lens=(30, 31, 32),
         ),
     )
 

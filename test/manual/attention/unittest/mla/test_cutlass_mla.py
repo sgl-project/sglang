@@ -48,7 +48,8 @@ class TestCutlassMLAAttentionBackendCorrectness(CustomTestCase):
     # CutlassMLABackend only overrides `forward_decode`; EXTEND falls through
     # to the FlashInferMLAAttnBackend parent and bypasses cutlass code
     # entirely. Use DECODE so the test actually exercises the cutlass kernel
-    # on Blackwell.
+    # on Blackwell. Page size is fixed to PAGE_SIZE=128 (server_args.py
+    # forces this for cutlass_mla).
     CASES = (
         MLAAttentionCase(
             name="mla_decode_cutlass_page_boundary",
@@ -57,6 +58,30 @@ class TestCutlassMLAAttentionBackendCorrectness(CustomTestCase):
             num_heads=4,
             page_size=128,
             prefix_lens=(126, 127, 128),
+        ),
+        MLAAttentionCase(
+            name="mla_decode_cutlass_bsz1_nonzero_prefix",
+            backend="cutlass_mla",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            page_size=128,
+            prefix_lens=(63,),
+        ),
+        MLAAttentionCase(
+            name="mla_decode_cutlass_above_page",
+            backend="cutlass_mla",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            page_size=128,
+            prefix_lens=(128, 129, 130),
+        ),
+        MLAAttentionCase(
+            name="mla_decode_cutlass_multi_page",
+            backend="cutlass_mla",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            page_size=128,
+            prefix_lens=(127, 200, 255),
         ),
     )
 
