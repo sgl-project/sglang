@@ -649,7 +649,7 @@ class Indexer(MultiPlatformOp):
                 clean_logits=False,
             )
         else:
-            q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
+            q_fp8 = q_fp8.unsqueeze(1)
             logits = deep_gemm.fp8_paged_mqa_logits(
                 q_fp8[:q_offset],
                 kv_cache_fp8,
