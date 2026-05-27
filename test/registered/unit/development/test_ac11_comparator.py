@@ -46,13 +46,21 @@ def _write_bench_jsonl(
     input_len: int = 4096,
     output_len: int = 512,
     extra: dict = None,
+    sidecar: bool = True,
+    sidecar_overrides: dict = None,
+    mode: str = "double_sparsity",
+    tp_size: int = 8,
+    gpu_id: str = "0",
+    page_size: int = 64,
+    disable_radix_cache: bool = True,
 ) -> None:
-    """Build a minimal bench_serving JSONL with the metrics under test."""
-    # bench_serving's per_request TPS comes from output_lens / sum(itls).
-    # Choose ITL = output_len / (concurrency * tps_p50) so the derived
-    # TPS lands exactly on `tps_p50`.
-    # Simpler: bypass the derived path by emitting the legacy
-    # `output_throughput_p50` field directly. The reader honors it.
+    """Build a minimal bench_serving JSONL with the metrics under test.
+
+    When ``sidecar=True`` (default), also writes a valid AC-11 ``.meta.json``
+    sidecar with the timing floors satisfied. Tests that exercise the
+    validation gauntlet either suppress the sidecar (``sidecar=False``) or
+    pass ``sidecar_overrides`` to inject specific bad fields.
+    """
     summary = {
         "max_concurrency": concurrency,
         "num_prompts": num_prompts,
@@ -69,16 +77,47 @@ def _write_bench_jsonl(
         "total_tokens_mean": 4096.0,
         "dense_fallback_total": 0,
         "server_info": {
-            "gpu_id": "0",
-            "tp_size": 8,
-            "page_size": 64,
-            "disable_radix_cache": True,
+            "gpu_id": gpu_id,
+            "tp_size": tp_size,
+            "page_size": page_size,
+            "disable_radix_cache": disable_radix_cache,
         },
     }
     if extra:
         summary.update(extra)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(json.dumps(summary) + "\n")
+
+    if sidecar:
+        sa = {
+            "tp_size": tp_size,
+            "page_size": page_size,
+            "chunked_prefill_size": 8192,
+        }
+        if mode == "double_sparsity":
+            sa["enable_double_sparsity"] = True
+            sa["double_sparsity_config"] = "/tmp/x.safetensors"
+            sa["disable_radix_cache"] = True
+        meta = {
+            "commit_sha": "abc123",
+            "mode": mode,
+            "concurrency": concurrency,
+            "seed": 213,
+            "num_prompts": num_prompts,
+            "isl_total_tokens": input_len,
+            "osl_tokens": output_len,
+            "timestamp_utc": "2026-05-27T12:00:00Z",
+            "chunked_prefill_size": 8192,
+            "warmup_seconds": 120.0,
+            "measurement_window_seconds": 600.0,
+            "trial_id": "1",
+            "server_args": sa,
+            "server_args_error": None,
+        }
+        if sidecar_overrides:
+            meta.update(sidecar_overrides)
+        with open(path + ".meta.json", "w", encoding="utf-8") as fh:
+            json.dump(meta, fh)
 
 
 class TestMedianHelper(unittest.TestCase):
@@ -249,11 +288,24 @@ class TestEvaluateAC11Gates(unittest.TestCase):
 
 class TestAC11EndToEnd(unittest.TestCase):
 
-    def _make_trials(self, tmp, label, conc, tps_values, ttft_values):
+    def _make_trials(self, tmp, label, conc, tps_values, ttft_values, *,
+                     sidecar=True, sidecar_overrides=None, disable_radix=None):
         paths = []
+        is_dsa = label.startswith("dsa") or label.startswith("native")
+        mode = "native_nsa" if is_dsa else "double_sparsity"
+        # DSA baseline runs with radix ON; DS runs with radix OFF (AC-10
+        # gap). The comparator allows this via _DS_ONLY_SERVER_ARG_KEYS.
+        if disable_radix is None:
+            disable_radix = (mode == "double_sparsity")
         for i, (tps, ttft) in enumerate(zip(tps_values, ttft_values)):
             p = os.path.join(tmp, f"{label}_c{conc}_t{i}.jsonl")
-            _write_bench_jsonl(p, concurrency=conc, tps_p50=tps, ttft_p99_s=ttft)
+            _write_bench_jsonl(
+                p, concurrency=conc, tps_p50=tps, ttft_p99_s=ttft,
+                mode=mode,
+                disable_radix_cache=disable_radix,
+                sidecar=sidecar,
+                sidecar_overrides=sidecar_overrides,
+            )
             paths.append(p)
         return paths
 
@@ -346,6 +398,199 @@ class TestAC11EndToEnd(unittest.TestCase):
                 "--ac11-ds-results", *ds,
             ])
             self.assertEqual(code, 2)
+
+    # ---- Round 31: validation gauntlet refusals -----------------------
+
+    def _ac11_main(self, dsa: List[str], ds: List[str], *, extra=None) -> int:
+        """Run main() with stdout suppressed. Returns the exit code."""
+        args = [
+            "--ac11",
+            "--ac11-baseline-results", *dsa,
+            "--ac11-ds-results", *ds,
+        ]
+        if extra:
+            args.extend(extra)
+        buf = io.StringIO()
+        orig = sys.stdout
+        sys.stdout = buf
+        try:
+            return bc.main(args)
+        finally:
+            sys.stdout = orig
+
+    def test_missing_sidecar_exit_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10])
+            # DS side without sidecars.
+            ds = self._make_trials(tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                                    sidecar=False)
+            self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_malformed_sidecar_exit_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10])
+            ds = self._make_trials(tmp, "ds", 64, [100, 100, 100], [10, 10, 10])
+            # Corrupt the first DS sidecar.
+            with open(ds[0] + ".meta.json", "w") as fh:
+                fh.write("{not json")
+            self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_sidecar_server_args_error_exit_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10])
+            ds = self._make_trials(
+                tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                sidecar_overrides={"server_args_error": "simulated"},
+            )
+            self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_short_warmup_exit_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10])
+            ds = self._make_trials(
+                tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                sidecar_overrides={"warmup_seconds": 30.0},  # < 120
+            )
+            self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_short_measurement_window_exit_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10])
+            ds = self._make_trials(
+                tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                sidecar_overrides={"measurement_window_seconds": 60.0},
+            )
+            self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_seed_mismatch_within_side_exit_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # Manually build a side where one trial's seed differs.
+            dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10])
+            ds_paths = []
+            for i, seed in enumerate([213, 999, 213]):
+                p = os.path.join(tmp, f"ds_c64_t{i}.jsonl")
+                _write_bench_jsonl(
+                    p, concurrency=64, tps_p50=100, ttft_p99_s=10,
+                    sidecar_overrides={"seed": seed}, mode="double_sparsity",
+                )
+                ds_paths.append(p)
+            self.assertEqual(self._ac11_main(dsa, ds_paths), 2)
+
+    def test_seed_mismatch_across_sides_exit_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10],
+                                    sidecar_overrides={"seed": 1000})
+            ds = self._make_trials(tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                                   sidecar_overrides={"seed": 2000})
+            self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_commit_sha_mismatch_across_sides_exit_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10],
+                                    sidecar_overrides={"commit_sha": "v1"})
+            ds = self._make_trials(tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                                   sidecar_overrides={"commit_sha": "v2"})
+            self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_chunked_prefill_size_mismatch_exit_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10],
+                                    sidecar_overrides={"chunked_prefill_size": 4096})
+            ds = self._make_trials(tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                                   sidecar_overrides={"chunked_prefill_size": 8192})
+            self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_workload_num_prompts_mismatch_exit_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa_paths = []
+            ds_paths = []
+            for i in range(3):
+                p = os.path.join(tmp, f"dsa_c64_t{i}.jsonl")
+                _write_bench_jsonl(p, concurrency=64, tps_p50=100, ttft_p99_s=10,
+                                   num_prompts=320, mode="native_nsa",
+                                   disable_radix_cache=False)
+                dsa_paths.append(p)
+                p2 = os.path.join(tmp, f"ds_c64_t{i}.jsonl")
+                _write_bench_jsonl(p2, concurrency=64, tps_p50=100, ttft_p99_s=10,
+                                   num_prompts=160,  # DS differs
+                                   mode="double_sparsity")
+                ds_paths.append(p2)
+            self.assertEqual(self._ac11_main(dsa_paths, ds_paths), 2)
+
+    def test_server_args_mismatch_tp_size_exit_2(self):
+        """TP size differs between DSA and DS — not in the DS-only allowlist."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10])
+            # DS with tp_size=1 (DSA is 8) — should refuse.
+            ds_paths = []
+            for i in range(3):
+                p = os.path.join(tmp, f"ds_c64_t{i}.jsonl")
+                _write_bench_jsonl(
+                    p, concurrency=64, tps_p50=100, ttft_p99_s=10,
+                    tp_size=1, mode="double_sparsity",
+                )
+                ds_paths.append(p)
+            self.assertEqual(self._ac11_main(dsa, ds_paths), 2)
+
+    def test_allowed_ds_only_differences_still_pass(self):
+        """DS has enable_double_sparsity + disable_radix_cache; DSA doesn't.
+        Both are in _DS_ONLY_SERVER_ARG_KEYS so the comparator must PASS."""
+        with tempfile.TemporaryDirectory() as tmp:
+            # _make_trials with default mode logic: DSA → native_nsa (no DS
+            # flags, radix on), DS → double_sparsity (DS flags, radix off).
+            dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10])
+            ds = self._make_trials(tmp, "ds", 64, [100, 100, 100], [10, 10, 10])
+            self.assertEqual(self._ac11_main(dsa, ds), 0)
+
+    def test_missing_tps_metric_exit_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10])
+            # Build DS trials with no `output_throughput_p50` field.
+            ds_paths = []
+            for i in range(3):
+                p = os.path.join(tmp, f"ds_c64_t{i}.jsonl")
+                with open(p, "w") as fh:
+                    fh.write(json.dumps({
+                        "max_concurrency": 64, "num_prompts": 320,
+                        "input_len": 4096, "output_len": 512,
+                        # Missing output_throughput_p50 + p99_ttft_ms.
+                        "median_ttft_ms": 5000.0,
+                        "server_info": {"gpu_id": "0", "tp_size": 8,
+                                         "page_size": 64, "disable_radix_cache": True},
+                    }) + "\n")
+                # Valid sidecar so the failure is the metric absence.
+                meta = {
+                    "commit_sha": "abc123", "mode": "double_sparsity",
+                    "concurrency": 64, "seed": 213, "num_prompts": 320,
+                    "isl_total_tokens": 4096, "osl_tokens": 512,
+                    "timestamp_utc": "2026-05-27T12:00:00Z",
+                    "chunked_prefill_size": 8192,
+                    "warmup_seconds": 120.0, "measurement_window_seconds": 600.0,
+                    "trial_id": str(i), "server_args": {"tp_size": 8, "page_size": 64,
+                                                          "chunked_prefill_size": 8192,
+                                                          "enable_double_sparsity": True,
+                                                          "double_sparsity_config": "/tmp/x.safetensors",
+                                                          "disable_radix_cache": True},
+                    "server_args_error": None,
+                }
+                with open(p + ".meta.json", "w") as fh:
+                    json.dump(meta, fh)
+                ds_paths.append(p)
+            self.assertEqual(self._ac11_main(dsa, ds_paths), 2)
+
+    def test_malformed_jsonl_exits_2_not_traceback(self):
+        """Round 30 review counter-evidence: malformed *_c64.jsonl raised
+        an uncaught JSONDecodeError. Round 31 must report clean exit 2."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10])
+            # Build three "DS" trial files but with malformed JSON.
+            ds_paths = []
+            for i in range(3):
+                p = os.path.join(tmp, f"ds_c64_t{i}.jsonl")
+                with open(p, "w") as fh:
+                    fh.write("not-json-at-all\n")
+                ds_paths.append(p)
+            self.assertEqual(self._ac11_main(dsa, ds_paths), 2)
 
     def test_legacy_mode_still_works(self):
         """The single-trial AC-7/AC-8 report path must still work after Round 30."""

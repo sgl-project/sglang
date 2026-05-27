@@ -104,6 +104,7 @@ def build_meta() -> Dict[str, Any]:
         "chunked_prefill_size": chunked_prefill,
         # AC-11 reproducibility fields.
         "warmup_requests": _opt_int("WARMUP_REQUESTS"),
+        "warmup_seconds": _opt_float("WARMUP_SECONDS"),
         "measurement_window_seconds": _opt_float("MEASUREMENT_WINDOW_S"),
         "trial_id": os.environ.get("TRIAL_ID", "1"),
         "server_args": server_args,

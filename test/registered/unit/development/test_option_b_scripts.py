@@ -129,6 +129,36 @@ class TestOptionBBenchmarkSweeps(unittest.TestCase):
         self.assertIn(".meta.json", text,
                       "benchmark_baseline.sh must emit a .meta.json sidecar.")
 
+    # ---- Round 31: AC-11 3-trial loop + timing env ------------------
+
+    def test_ds_bench_has_three_trial_loop(self):
+        text = _non_comment_lines(DS_BENCH)
+        self.assertIn('TRIALS="${TRIALS:-3}"', text,
+                      "benchmark.sh must default TRIALS=3 for AC-11 sweep.")
+        self.assertIn('for TRIAL_ID in $(seq 1 "${TRIALS}")', text,
+                      "benchmark.sh must iterate trial_id from 1 to TRIALS.")
+        # Output filename must include _t${TRIAL_ID}.
+        self.assertIn('_c${CONCURRENCY}_t${TRIAL_ID}.jsonl', text,
+                      "benchmark.sh trial outputs must include _t${TRIAL_ID} suffix.")
+
+    def test_dsa_bench_has_three_trial_loop(self):
+        text = _non_comment_lines(DSA_BENCH)
+        self.assertIn('TRIALS="${TRIALS:-3}"', text)
+        self.assertIn('for TRIAL_ID in $(seq 1 "${TRIALS}")', text)
+        self.assertIn('_c${CONCURRENCY}_t${TRIAL_ID}.jsonl', text)
+
+    def test_ds_bench_defaults_warmup_and_window(self):
+        text = _non_comment_lines(DS_BENCH)
+        self.assertIn('WARMUP_SECONDS="${WARMUP_SECONDS:-120}"', text,
+                      "benchmark.sh must default WARMUP_SECONDS=120 per AC-11.")
+        self.assertIn('MEASUREMENT_WINDOW_S="${MEASUREMENT_WINDOW_S:-600}"', text,
+                      "benchmark.sh must default MEASUREMENT_WINDOW_S=600 per AC-11.")
+
+    def test_dsa_bench_defaults_warmup_and_window(self):
+        text = _non_comment_lines(DSA_BENCH)
+        self.assertIn('WARMUP_SECONDS="${WARMUP_SECONDS:-120}"', text)
+        self.assertIn('MEASUREMENT_WINDOW_S="${MEASUREMENT_WINDOW_S:-600}"', text)
+
     def test_ds_bench_uses_meta_writer_helper(self):
         """The Round 23 inline heredoc spliced JSON as Python source and
         crashed on real `/get_server_info` `true`/`false`/`null`. Round 24

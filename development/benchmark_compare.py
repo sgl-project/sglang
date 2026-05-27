@@ -333,16 +333,32 @@ def _group_by_concurrency(paths: List[str]) -> Dict[int, List[str]]:
 
     Resolution order matches `_read_bench_jsonl`: per-row `max_concurrency`
     or `concurrency` (preferred — survives renames), then filename suffix
-    `_c<N>.jsonl` as a last resort. Raises ValueError when any path has no
-    resolvable concurrency.
+    `_c<N>.jsonl` as a last resort.
+
+    Raises ``ValueError`` when a file is missing, contains malformed JSON,
+    or has no resolvable concurrency. Round 30's earlier version
+    swallowed parse errors and let `_run_ac11_mode` re-trip them as
+    uncaught tracebacks.
     """
     by_conc: Dict[int, List[str]] = {}
     for p in paths:
-        # Try the file's row data first.
+        if not os.path.isfile(p):
+            raise ValueError(f"AC-11 group: missing input file {p!r}.")
+        # Try the file's row data first. Only fall back to filename when
+        # the JSONL parsed cleanly but the parsed context lacks concurrency.
         try:
             ctx, _m = _read_bench_jsonl(p)
             conc = ctx.concurrency
-        except Exception:
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"AC-11 group: {p!r} is malformed JSONL ({exc}); refusing "
+                "to publish."
+            ) from exc
+        except ValueError:
+            # Empty file or shape-violation from _read_bench_jsonl — refuse.
+            raise
+        if conc is None:
+            # Last-resort filename fallback.
             conc = _filename_concurrency(p)
         if conc is None:
             raise ValueError(
@@ -416,6 +432,152 @@ def _evaluate_ac11_gates(
     result["ttft_pass"] = ttft_pass
     result["reason"] = "; ".join(reasons) if reasons else ""
     return result
+
+
+# AC-11 reproducibility floors per plan §AC-11 (fixed seed, 120s warmup,
+# 600s measurement).
+AC11_MIN_WARMUP_SECONDS = 120.0
+AC11_MIN_MEASUREMENT_WINDOW_SECONDS = 600.0
+
+# Server-args keys that legitimately differ between DSA and DS, so the
+# comparator must NOT refuse on them when checking per-concurrency
+# operating-point agreement.
+_DS_ONLY_SERVER_ARG_KEYS = frozenset({
+    "enable_double_sparsity",
+    "double_sparsity_config",
+    "disable_radix_cache",  # AC-10 will remove this gap; for now allow it.
+})
+
+
+def _sidecar_path(result_path: str) -> str:
+    """Return the path of the ``.meta.json`` sidecar for a bench JSONL."""
+    return result_path + ".meta.json"
+
+
+def _read_ac11_meta(result_path: str) -> Dict:
+    """Read + parse the ``.meta.json`` sidecar for one bench JSONL.
+
+    Raises ``ValueError`` (string-stable subclass of the standard exception
+    hierarchy) when the sidecar is missing, unparseable, or non-object —
+    so ``_run_ac11_mode`` can convert that into clean exit 2 + log.
+    """
+    sp = _sidecar_path(result_path)
+    if not os.path.isfile(sp):
+        raise ValueError(
+            f"AC-11 sidecar missing: expected {sp}; the trial's `.meta.json` "
+            "is required for reproducibility + apples-to-apples checks."
+        )
+    try:
+        with open(sp, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"AC-11 sidecar {sp}: malformed JSON ({exc})."
+        ) from exc
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"AC-11 sidecar {sp}: top-level value must be an object, got "
+            f"{type(data).__name__}."
+        )
+    if data.get("server_args_error"):
+        raise ValueError(
+            f"AC-11 sidecar {sp}: server_args_error={data['server_args_error']!r} "
+            "— refuse to publish until the source server_info was captured cleanly."
+        )
+    return data
+
+
+def _normalize_ac11_server_args(meta: Dict) -> Dict:
+    """Drop DS-only / fault-injection keys from `meta["server_args"]`.
+
+    The comparator must allow DS to differ from DSA only on the
+    intentional DS-enablement flags. All OTHER server args (TP size,
+    page size, dtype, etc.) MUST agree across the two sides.
+    """
+    sa = meta.get("server_args") or {}
+    if not isinstance(sa, dict):
+        return {}
+    out = {
+        k: v for k, v in sa.items()
+        if k not in _DS_ONLY_SERVER_ARG_KEYS
+        and not k.startswith("SGLANG_DS_FAULT_INJECT_")
+    }
+    return out
+
+
+def _validate_trial_metrics(metrics: RunMetrics, *, side: str, path: str) -> None:
+    """Refuse trials that lack the metrics the AC-11 gates need."""
+    if metrics.output_tps_p50 is None:
+        raise ValueError(
+            f"AC-11 trial {side}={path}: missing output_tps_p50 metric "
+            "(needed for TPS gate)."
+        )
+    if metrics.ttft_p99_s is None:
+        raise ValueError(
+            f"AC-11 trial {side}={path}: missing ttft_p99_s metric "
+            "(needed for TTFT gate)."
+        )
+
+
+def _validate_meta_floors(meta: Dict, *, side: str, path: str) -> None:
+    """Refuse trials whose sidecar doesn't meet the AC-11 timing floors."""
+    warmup = meta.get("warmup_seconds")
+    if not isinstance(warmup, (int, float)) or warmup < AC11_MIN_WARMUP_SECONDS:
+        raise ValueError(
+            f"AC-11 trial {side}={path}: warmup_seconds={warmup!r} does not "
+            f"meet the AC-11 minimum of {AC11_MIN_WARMUP_SECONDS}s."
+        )
+    win = meta.get("measurement_window_seconds")
+    if not isinstance(win, (int, float)) or win < AC11_MIN_MEASUREMENT_WINDOW_SECONDS:
+        raise ValueError(
+            f"AC-11 trial {side}={path}: measurement_window_seconds={win!r} "
+            f"does not meet the AC-11 minimum of "
+            f"{AC11_MIN_MEASUREMENT_WINDOW_SECONDS}s."
+        )
+
+
+def _validate_per_side_agreement(metas: List[Dict], paths: List[str], *, side: str) -> None:
+    """All trials within one side must share seed/commit/chunked/server-args."""
+    if not metas:
+        return
+    first = metas[0]
+    first_norm = _normalize_ac11_server_args(first)
+    for m, p in zip(metas[1:], paths[1:]):
+        for field in ("seed", "commit_sha", "chunked_prefill_size",
+                      "num_prompts", "isl_total_tokens", "osl_tokens"):
+            if m.get(field) != first.get(field):
+                raise ValueError(
+                    f"AC-11 {side}: trial {p} {field}={m.get(field)!r} "
+                    f"disagrees with first trial {paths[0]} "
+                    f"{field}={first.get(field)!r}."
+                )
+        if _normalize_ac11_server_args(m) != first_norm:
+            raise ValueError(
+                f"AC-11 {side}: trial {p} normalized server_args disagrees "
+                f"with first trial {paths[0]}."
+            )
+
+
+def _validate_cross_side_agreement(
+    dsa_meta: Dict, ds_meta: Dict, *, conc: int,
+) -> None:
+    """One DSA trial vs one DS trial must agree on seed / commit / workload /
+    normalized server args. Hardware (gpu/tp/page/radix) is checked
+    separately via _match_or_refuse on the JSONL contexts."""
+    for field in ("seed", "commit_sha", "chunked_prefill_size",
+                  "num_prompts", "isl_total_tokens", "osl_tokens"):
+        if dsa_meta.get(field) != ds_meta.get(field):
+            raise ValueError(
+                f"AC-11 conc={conc}: DSA {field}={dsa_meta.get(field)!r} "
+                f"disagrees with DS {field}={ds_meta.get(field)!r} — refuse "
+                "to publish apples-vs-oranges comparator."
+            )
+    if _normalize_ac11_server_args(dsa_meta) != _normalize_ac11_server_args(ds_meta):
+        raise ValueError(
+            f"AC-11 conc={conc}: normalized server_args differ between DSA "
+            "and DS. The comparator only allows DS to differ from DSA on "
+            f"{sorted(_DS_ONLY_SERVER_ARG_KEYS)} or SGLANG_DS_FAULT_INJECT_*."
+        )
 
 
 def _render_ac11_markdown(
@@ -603,9 +765,64 @@ def _run_ac11_mode(args) -> int:
 
     by_conc: Dict[int, Dict[str, object]] = {}
     any_fail = False
+
+    def _read_pair(p: str) -> Tuple[RunContext, RunMetrics, Dict]:
+        ctx, m = _read_bench_jsonl(p)
+        meta = _read_ac11_meta(p)
+        return ctx, m, meta
+
     for conc in sorted(dsa_by_conc.keys()):
-        dsa_trials = [_read_bench_jsonl(p)[1] for p in dsa_by_conc[conc]]
-        ds_trials = [_read_bench_jsonl(p)[1] for p in ds_by_conc[conc]]
+        # Wrap the heavy read pass so any parse/refusal raises become
+        # exit-2 with a clean log, not tracebacks.
+        try:
+            dsa_rows = [_read_pair(p) for p in dsa_by_conc[conc]]
+            ds_rows = [_read_pair(p) for p in ds_by_conc[conc]]
+        except (ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
+            logger.error("AC-11 input refusal at conc=%d: %s", conc, exc)
+            return 2
+
+        dsa_ctxs = [row[0] for row in dsa_rows]
+        dsa_trials = [row[1] for row in dsa_rows]
+        dsa_metas = [row[2] for row in dsa_rows]
+        ds_ctxs = [row[0] for row in ds_rows]
+        ds_trials = [row[1] for row in ds_rows]
+        ds_metas = [row[2] for row in ds_rows]
+
+        try:
+            # Per-trial: required metrics + timing floors.
+            for m, p in zip(dsa_trials, dsa_by_conc[conc]):
+                _validate_trial_metrics(m, side="DSA", path=p)
+            for m, p in zip(ds_trials, ds_by_conc[conc]):
+                _validate_trial_metrics(m, side="DS", path=p)
+            for meta, p in zip(dsa_metas, dsa_by_conc[conc]):
+                _validate_meta_floors(meta, side="DSA", path=p)
+            for meta, p in zip(ds_metas, ds_by_conc[conc]):
+                _validate_meta_floors(meta, side="DS", path=p)
+            # Per-side trial-set agreement.
+            _validate_per_side_agreement(dsa_metas, dsa_by_conc[conc], side="DSA")
+            _validate_per_side_agreement(ds_metas, ds_by_conc[conc], side="DS")
+            # Cross-side agreement (workload, seed, commit, server_args mod
+            # DS-only keys). Compare first trial of each side — within-side
+            # agreement was already enforced above.
+            _validate_cross_side_agreement(dsa_metas[0], ds_metas[0], conc=conc)
+            # Hardware match (gpu/tp/page/radix/concurrency) via existing
+            # AC-7 helper. Allow gpu mismatch only if user requested it.
+            hw_reasons = _match_or_refuse(
+                dsa_ctxs[0], ds_ctxs[0],
+                allow_gpu_mismatch=bool(getattr(args, "allow_gpu_mismatch", False)),
+            )
+            # disable_radix_cache is allowed to differ until AC-10; drop
+            # only that mismatch reason if present.
+            hw_reasons = [r for r in hw_reasons if "disable_radix_cache" not in r]
+            if hw_reasons:
+                raise ValueError(
+                    f"AC-11 conc={conc}: hardware/operating-point mismatch — "
+                    + "; ".join(hw_reasons)
+                )
+        except ValueError as exc:
+            logger.error("AC-11 input refusal at conc=%d: %s", conc, exc)
+            return 2
+
         try:
             dsa_median = _median_metrics(dsa_trials)
             ds_median = _median_metrics(ds_trials)

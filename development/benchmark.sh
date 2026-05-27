@@ -39,50 +39,59 @@ declare -A SEEDS=( [16]=213 [32]=431 [64]=31234 )
 # Override CONCURRENCIES (space-separated) for a narrower sweep.
 CONCURRENCIES="${CONCURRENCIES:-16 32 64}"
 
+# AC-11 spec: >= 3 independent trials per concurrency, fixed seed family,
+# 120s warmup, 600s measurement window. TRIALS=3 is the minimum the
+# comparator accepts; operators can override for additional headroom.
+TRIALS="${TRIALS:-3}"
+WARMUP_SECONDS="${WARMUP_SECONDS:-120}"
+MEASUREMENT_WINDOW_S="${MEASUREMENT_WINDOW_S:-600}"
+
 COMMIT_SHA="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 
 for CONCURRENCY in ${CONCURRENCIES}; do
   SEED="${SEEDS[$CONCURRENCY]}"
-  OUTPUT_FILE="${RESULTS_DIR}/${MODE}_gsp_isl4096_osl512_c${CONCURRENCY}.jsonl"
-  META_FILE="${OUTPUT_FILE}.meta.json"
-  echo ">>> mode=${MODE} concurrency=${CONCURRENCY} num_prompts=${NUM_PROMPTS} groups=${NUM_GROUPS}x${NUM_PROMPTS} seed=${SEED} output=${OUTPUT_FILE}"
+  for TRIAL_ID in $(seq 1 "${TRIALS}"); do
+    OUTPUT_FILE="${RESULTS_DIR}/${MODE}_gsp_isl4096_osl512_c${CONCURRENCY}_t${TRIAL_ID}.jsonl"
+    META_FILE="${OUTPUT_FILE}.meta.json"
+    echo ">>> mode=${MODE} concurrency=${CONCURRENCY} trial=${TRIAL_ID}/${TRIALS} num_prompts=${NUM_PROMPTS} seed=${SEED} output=${OUTPUT_FILE}"
 
-  # Capture server args for the AC-11 comparator (best-effort; absent on
-  # CI / non-server environments — the .meta.json field will be null).
-  SERVER_ARGS_JSON="$(curl -s --max-time 5 "http://${HOST}:${PORT}/get_server_info" || echo '{}')"
-  TIMESTAMP_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    # Capture server args for the AC-11 comparator (best-effort; absent on
+    # CI / non-server environments — the .meta.json field will be null).
+    SERVER_ARGS_JSON="$(curl -s --max-time 5 "http://${HOST}:${PORT}/get_server_info" || echo '{}')"
+    TIMESTAMP_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-  python3 -m sglang.bench_serving \
-    --backend sglang \
-    --port "${PORT}" \
-    --seed "${SEED}" \
-    --dataset-name generated-shared-prefix \
-    --gsp-num-groups "${NUM_GROUPS}" \
-    --gsp-prompts-per-group "${NUM_PROMPTS}" \
-    --gsp-system-prompt-len "${SYS_LEN}" \
-    --gsp-question-len "${Q_LEN}" \
-    --gsp-output-len "${OUT_LEN}" \
-    --gsp-range-ratio 1.0 \
-    --num-prompts "${NUM_PROMPTS}" \
-    --max-concurrency "${CONCURRENCY}" \
-    --output-file "${OUTPUT_FILE}" \
-    --output-details
+    python3 -m sglang.bench_serving \
+      --backend sglang \
+      --port "${PORT}" \
+      --seed "${SEED}" \
+      --dataset-name generated-shared-prefix \
+      --gsp-num-groups "${NUM_GROUPS}" \
+      --gsp-prompts-per-group "${NUM_PROMPTS}" \
+      --gsp-system-prompt-len "${SYS_LEN}" \
+      --gsp-question-len "${Q_LEN}" \
+      --gsp-output-len "${OUT_LEN}" \
+      --gsp-range-ratio 1.0 \
+      --num-prompts "${NUM_PROMPTS}" \
+      --max-concurrency "${CONCURRENCY}" \
+      --output-file "${OUTPUT_FILE}" \
+      --output-details
 
-  # Pass /get_server_info JSON as env-var DATA, not Python source. The
-  # Round 23 heredoc spliced it as source code and crashed on JSON
-  # `true`/`false`/`null` (not valid Python identifiers).
-  COMMIT_SHA="${COMMIT_SHA}" \
-  MODE="${MODE}" \
-  CONCURRENCY="${CONCURRENCY}" \
-  SEED="${SEED}" \
-  NUM_PROMPTS="${NUM_PROMPTS}" \
-  ISL_TOTAL_TOKENS="$(( SYS_LEN + Q_LEN ))" \
-  OSL_TOKENS="${OUT_LEN}" \
-  TIMESTAMP_UTC="${TIMESTAMP_UTC}" \
-  SERVER_ARGS_JSON="${SERVER_ARGS_JSON}" \
-  TRIAL_ID="${TRIAL_ID:-1}" \
-  WARMUP_REQUESTS="${WARMUP_REQUESTS:-}" \
-  MEASUREMENT_WINDOW_S="${MEASUREMENT_WINDOW_S:-}" \
-  python3 "$(dirname "$0")/_bench_meta_writer.py" > "${META_FILE}"
-  echo "    sidecar          = ${META_FILE}"
+    # Pass /get_server_info JSON as env-var DATA, not Python source. The
+    # Round 23 heredoc spliced it as source code and crashed on JSON
+    # `true`/`false`/`null` (not valid Python identifiers).
+    COMMIT_SHA="${COMMIT_SHA}" \
+    MODE="${MODE}" \
+    CONCURRENCY="${CONCURRENCY}" \
+    SEED="${SEED}" \
+    NUM_PROMPTS="${NUM_PROMPTS}" \
+    ISL_TOTAL_TOKENS="$(( SYS_LEN + Q_LEN ))" \
+    OSL_TOKENS="${OUT_LEN}" \
+    TIMESTAMP_UTC="${TIMESTAMP_UTC}" \
+    SERVER_ARGS_JSON="${SERVER_ARGS_JSON}" \
+    TRIAL_ID="${TRIAL_ID}" \
+    WARMUP_SECONDS="${WARMUP_SECONDS}" \
+    MEASUREMENT_WINDOW_S="${MEASUREMENT_WINDOW_S}" \
+    python3 "$(dirname "$0")/_bench_meta_writer.py" > "${META_FILE}"
+    echo "    sidecar          = ${META_FILE}"
+  done
 done
