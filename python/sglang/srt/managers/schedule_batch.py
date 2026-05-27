@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.common import (
+    ceil_align,
+    flatten_arrays_to_int64_tensor,
+    is_pin_memory_available,
+)
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,11 +39,11 @@ import copy
 import dataclasses
 import logging
 import re
+from array import array
 from concurrent.futures import Future
 from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
-from itertools import chain
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -64,7 +68,6 @@ from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationM
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
@@ -252,6 +255,8 @@ class MultimodalDataItem:
 
     # the raw features returned by processor, e.g. pixel_values or audio_features
     feature: Union[torch.Tensor, np.ndarray] = None
+    # CPU reference kept during GPU encoding, used to skip GPU->CPU copy on offload
+    _cpu_feature: Optional[torch.Tensor] = None
     # the precomputed embeddings, passed as final encoder embeddings
     # One and only one of the feature and precomputed_embeddings will be empty
     precomputed_embeddings: Optional[Union[torch.Tensor, np.ndarray]] = None
@@ -341,18 +346,23 @@ class MultimodalDataItem:
         ret.validate()
         return ret
 
-    def reconstruct(self):
-        if not isinstance(self.feature, CudaIpcTensorTransportProxy):
-            return
+    def has_cuda_ipc_proxy(self):
+        return (
+            isinstance(self.feature, CudaIpcTensorTransportProxy)
+            or isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy)
+            or any(
+                isinstance(value, CudaIpcTensorTransportProxy)
+                for value in self.model_specific_data.values()
+            )
+        )
 
-        reconstruct_device = torch.cuda.current_device()
+    def reconstruct(self, target_device: int):
+        """materialize cuda ipc proxy tensors in-place on target_device"""
         if isinstance(self.feature, CudaIpcTensorTransportProxy):
-            self.feature = self.feature.reconstruct_on_target_device(reconstruct_device)
+            self.feature = self.feature.reconstruct_on_target_device(target_device)
         if isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy):
             self.precomputed_embeddings = (
-                self.precomputed_embeddings.reconstruct_on_target_device(
-                    reconstruct_device
-                )
+                self.precomputed_embeddings.reconstruct_on_target_device(target_device)
             )
         for extra_key in self.model_specific_data:
             if isinstance(
@@ -360,21 +370,23 @@ class MultimodalDataItem:
             ):
                 extra_data = self.model_specific_data[
                     extra_key
-                ].reconstruct_on_target_device(reconstruct_device)
+                ].reconstruct_on_target_device(target_device)
                 self.model_specific_data[extra_key] = extra_data
 
 
 @dataclasses.dataclass
 class MultimodalProcessorOutput:
-    """Raw output from multimodal processors, before pad/hash computation.
+    """Raw output from multimodal processors before scheduler-side preparation (pad, hash).
 
     This is the typed replacement for the dict previously returned by
-    ``BaseMultimodalProcessor.process_mm_data_async``.  Unlike
-    ``MultimodalInputs``, items here do NOT carry pad_value or hash yet.
+    ``BaseMultimodalProcessor.process_mm_data_async``.  Preprocessed inputs may
+    already carry ``pad_value`` and ``hash`` to avoid hashing the same tensor once
+    per scheduler TP rank.
     """
 
     mm_items: List[MultimodalDataItem]
     input_ids: Optional[List[int]] = None
+    padded_input_ids: Optional[List[int]] = None
 
     # image
     im_token_id: Optional[int] = None
@@ -408,6 +420,7 @@ class MultimodalProcessorOutput:
         return MultimodalProcessorOutput(
             mm_items=d["mm_items"],
             input_ids=d.get("input_ids"),
+            padded_input_ids=d.get("padded_input_ids"),
             im_token_id=d.get("im_token_id"),
             im_start_id=d.get("im_start_id"),
             im_end_id=d.get("im_end_id"),
@@ -424,6 +437,26 @@ class MultimodalProcessorOutput:
             visible_frame_counts=d.get("visible_frame_counts"),
         )
 
+    @staticmethod
+    def build_padded_input_ids(input_ids, mm_items: List[MultimodalDataItem]):
+        """pad the input_ids with mm_items if it's not already padded"""
+        if input_ids is None or not mm_items:
+            return None
+
+        for item in mm_items:
+            if item.pad_value is None or item.offsets is None:
+                return None
+
+        if isinstance(input_ids, torch.Tensor):
+            padded_input_ids = input_ids.flatten().tolist()
+        else:
+            padded_input_ids = list(input_ids)
+
+        for item in mm_items:
+            for start, end in item.offsets:
+                padded_input_ids[start : end + 1] = [item.pad_value] * (end - start + 1)
+        return padded_input_ids
+
 
 @dataclasses.dataclass
 class MultimodalInputs:
@@ -431,6 +464,7 @@ class MultimodalInputs:
 
     # items of data
     mm_items: List[MultimodalDataItem]
+    padded_input_ids: Optional[List[int]] = None
     image_pad_len: Optional[list] = None
     num_image_tokens: Optional[int] = None
 
@@ -467,15 +501,16 @@ class MultimodalInputs:
     @staticmethod
     def from_processor_output(obj: "MultimodalProcessorOutput"):
         mm_items = obj.mm_items
+        assert isinstance(mm_items, list)
+        mm_items = [item for item in mm_items if item.is_valid()]
+
+        # try reconstructing from cuda-ipc
+        reconstruct_device = None
         for mm_item in mm_items:
-            mm_item.reconstruct()
-
-        ret = MultimodalInputs(
-            mm_items=mm_items,
-        )
-
-        assert isinstance(ret.mm_items, list)
-        ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
+            if mm_item.has_cuda_ipc_proxy():
+                if reconstruct_device is None:
+                    reconstruct_device = torch.cuda.current_device()
+                mm_item.reconstruct(reconstruct_device)
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             # Multi-modal feature hashing optimization:
@@ -492,19 +527,23 @@ class MultimodalInputs:
             if not is_feature_buffer_initialized():
                 init_feature_buffer(device)
             reset_buffer_offset()
-            for item in ret.mm_items:
+            for item in mm_items:
                 if item.feature is not None:
                     if isinstance(item.feature, torch.Tensor):
                         item.feature = try_add_to_buffer(item.feature)
 
-        for item in ret.mm_items:
+        for item in mm_items:
             item.set_pad_value()
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
-            for item in ret.mm_items:
+            for item in mm_items:
                 if item.feature is not None:
                     item.feature = item.feature.to("cpu", non_blocking=True)
 
+        mm_inputs = MultimodalInputs(
+            mm_items=mm_items,
+            padded_input_ids=obj.padded_input_ids,
+        )
         optional_args = [
             "mrope_positions",
             "mrope_position_delta",
@@ -524,9 +563,9 @@ class MultimodalInputs:
         for arg in optional_args:
             val = getattr(obj, arg, None)
             if val is not None:
-                setattr(ret, arg, val)
+                setattr(mm_inputs, arg, val)
 
-        return ret
+        return mm_inputs
 
     def contains_image_inputs(self) -> bool:
         return any(item.is_image() for item in self.mm_items)
@@ -609,14 +648,14 @@ class Req(ReqDllmMixin):
         self,
         rid: str,
         origin_input_text: str,
-        origin_input_ids: List[int],
+        origin_input_ids: array[int],
         sampling_params: SamplingParams,
         return_logprob: bool = False,
         top_logprobs_num: int = 0,
         dllm_config: Optional[DllmConfig] = None,
         token_ids_logprob: List[int] = None,
         stream: bool = False,
-        origin_input_ids_unpadded: Optional[Tuple[int]] = None,
+        origin_input_ids_unpadded: Optional[array[int]] = None,
         lora_id: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         positional_embed_overrides: Optional[PositionalEmbeds] = None,
@@ -650,16 +689,17 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
+        self.origin_input_ids = array("q", origin_input_ids)
         self.origin_input_ids_unpadded = (
-            origin_input_ids_unpadded
+            array("q", origin_input_ids_unpadded)
             if origin_input_ids_unpadded
-            else origin_input_ids  # Before image padding
-        )
-        self.origin_input_ids = origin_input_ids
+            else self.origin_input_ids
+        )  # Before image padding
         # Each decode stage's output ids
-        self.output_ids = []
+        self.output_ids = array("q")
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
-        self.fill_ids = []
+        self.fill_ids = array("q")
+
         self.session = session
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
@@ -946,7 +986,7 @@ class Req(ReqDllmMixin):
         return self.sampling_params.max_new_tokens == 0 and spec_alg is None
 
     @property
-    def output_ids_through_stop(self) -> List[int]:
+    def output_ids_through_stop(self) -> array[int]:
         """Get the output ids through the stop condition. Stop position is included."""
         if self.finished_len is not None:
             return self.output_ids[: self.finished_len]
@@ -1035,7 +1075,7 @@ class Req(ReqDllmMixin):
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
         if self.positional_embed_overrides is not None:
-            token_ids_to_match = []
+            token_ids_to_match = array("q")
 
         if tree_cache is not None:
             if cow_mamba is None:
@@ -1303,7 +1343,7 @@ class Req(ReqDllmMixin):
         # Therefore, we discard the generated output_ids and restart prefill and generation
         # to ensure shape consistency in KV cache.
         if self.input_embeds is not None:
-            self.output_ids = []
+            self.output_ids = array("q")
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -1368,7 +1408,9 @@ class Req(ReqDllmMixin):
             logger.error(f"{error_msg}, {self.rid=}")
         self.multimodal_inputs = None
         self.grammar = None
-        self.origin_input_ids = [0]  # set it to one token to skip the long prefill
+        self.origin_input_ids = array(
+            "q", [0]
+        )  # set it to one token to skip the long prefill
         self.return_logprob = False
         self.logprob_start_len = -1
         self.to_finish = FINISH_ABORT(
@@ -1446,6 +1488,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For chunked prefill in PP
     chunked_req: Optional[Req] = None
+    contains_last_prefill_chunk: bool = True
 
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -1461,6 +1504,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
+    # CPU mirror of req_pool_indices; schedule-path only, stale in spec draft window
+    req_pool_indices_cpu: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
 
@@ -1627,7 +1672,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_dllm(self):
         return self.dllm_config is not None
 
-    def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
+    def prepare_encoder_info_extend(
+        self, input_ids: List[array[int]], seq_lens: List[int]
+    ):
         _pin = is_pin_memory_available(self.device)
         self.encoder_lens_cpu = []
         self.encoder_cached = []
@@ -1676,9 +1723,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             pt += req.extend_input_len
 
         # Reassign
-        self.input_ids = torch.tensor(
-            sum(input_ids, []), dtype=torch.int64, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
+        self.input_ids = flatten_arrays_to_int64_tensor(input_ids, self.device, _pin)
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
             self.device, non_blocking=True
         )
@@ -1781,9 +1826,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ]
 
         _pin = is_pin_memory_available(self.device)
-        input_ids_tensor = torch.tensor(
-            list(chain.from_iterable(input_ids)), dtype=torch.int64, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
+        input_ids_tensor = flatten_arrays_to_int64_tensor(input_ids, self.device, _pin)
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
             self.device, non_blocking=True
         )
@@ -1806,7 +1849,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens
 
         # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, _ = alloc_for_extend(self)
+        out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
+            self
+        )
 
         # Set fields
         input_embeds = []
@@ -1965,6 +2010,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.input_ids = input_ids_tensor
         self.req_pool_indices = req_pool_indices_tensor
+        self.req_pool_indices_cpu = req_pool_indices_cpu
         self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
         self.input_embeds = (
@@ -2049,18 +2095,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         req: Req,
     ) -> "_MambaRadixCacheV2TrackEntry":
+        mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+
         def _force_track_h(i: int) -> int:
-            assert i % FLA_CHUNK_SIZE == 0
+            assert i % mamba_cache_chunk_size == 0
             # There are 3 cases for mamba_track_seqlen passed to mamba_track_seqlens_cpu:
-            # 1) aligned with FLA_CHUNK_SIZE-> retrieve from last_recurrent_state
+            # 1) aligned with mamba_cache_chunk_size-> retrieve from last_recurrent_state
             #    a) is the last position -> retrieve from last_recurrent_state
             #    b) is NOT the last position -> retrieve from h
-            # 2) unaligned with FLA_CHUNK_SIZE -> retrieve from h
+            # 2) unaligned with mamba_cache_chunk_size -> retrieve from h
             # Currently, the math calculation only supports case 1a and 2. So for 1b, we need to add 1
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
-        mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
         mask = req.extend_input_len >= mamba_cache_chunk_size
         track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
         mamba_track_seqlen = -1
@@ -2082,13 +2129,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 * mamba_cache_chunk_size
             )
 
-            # mamba_track_fla_chunk_aligned is the aligned seqlen based on FLA_CHUNK_SIZE
+            # mamba_track_fla_chunk_aligned is the aligned seqlen based on mamba_cache_chunk_size
             # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which can be true when
-            # page_size > FLA_CHUNK_SIZE, we need to force the math calculation to retrieve the correct mamba state from h
+            # page_size > mamba_cache_chunk_size, we need to force the math calculation to retrieve the correct mamba state from h
             # by _force_track_h()
             mamba_track_fla_chunk_aligned = (
                 len(req.prefix_indices)
-                + (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
+                + (req.extend_input_len // mamba_cache_chunk_size)
+                * mamba_cache_chunk_size
             )
             if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
                 # We want to track mamba_track_seqlen_aligned, and it's not the last position,
@@ -2336,6 +2384,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
         self.req_pool_indices = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.req_pool_indices_cpu = torch.empty(0, dtype=torch.int64)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -2409,14 +2458,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
 
-        # Update seq_lens after allocation
         if self.enable_overlap:
-            # Do not use in-place operations in the overlap mode
+            # New-tensor avoids racing model_worker_batch refs queued for
+            # overlap forward.
             self.seq_lens = self.seq_lens + 1
             self.seq_lens_cpu = self.seq_lens_cpu + 1
             self.orig_seq_lens = self.orig_seq_lens + 1
         else:
-            # A faster in-place version
             self.seq_lens.add_(1)
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
@@ -2429,6 +2477,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.out_cache_loc,
                 self.req_pool_indices,
                 self.seq_lens_cpu,
+                self.req_pool_indices_cpu,
             )
 
         if get_global_server_args().enable_mamba_extra_buffer():
@@ -2488,6 +2537,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
+        self.req_pool_indices_cpu = self.req_pool_indices_cpu[keep_indices]
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
@@ -2539,6 +2589,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.encoder_lens_cpu.extend(other.encoder_lens_cpu)
         self.req_pool_indices = torch.cat(
             [self.req_pool_indices, other.req_pool_indices]
+        )
+        self.req_pool_indices_cpu = torch.cat(
+            [self.req_pool_indices_cpu, other.req_pool_indices_cpu]
         )
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
