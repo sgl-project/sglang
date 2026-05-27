@@ -433,17 +433,6 @@ class AscendAttnBackend(AttentionBackend):
                         torch.flatten(req_prefix_block_tables),
                     )
                 )
-        bs = forward_batch.req_pool_indices.shape[0]
-        if (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-            or forward_batch.forward_mode.is_draft_extend()
-        ):
-            self.forward_metadata.actual_seq_qlen_list = [
-                self.speculative_num_draft_tokens * (i + 1) for i in range(bs)
-            ]
-        else:
-            self.forward_metadata.actual_seq_qlen_list = []
 
         self.graph_mode = False
 
@@ -509,7 +498,6 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=seq_lens.device,
             )
-            metadata.actual_seq_qlen_list = metadata.actual_seq_lengths_q.cpu().tolist()
         else:
             metadata.actual_seq_lengths_q = torch.tensor(
                 [1 + i * 1 for i in range(bs)],
@@ -603,15 +591,6 @@ class AscendAttnBackend(AttentionBackend):
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
-
-        if (
-            forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend_v2()
-            or forward_mode.is_draft_extend()
-        ):
-            metadata.actual_seq_qlen_list = [
-                self.speculative_num_draft_tokens * (i + 1) for i in range(bs)
-            ]
 
         self.forward_metadata = metadata
 
@@ -1085,19 +1064,6 @@ class AscendAttnBackend(AttentionBackend):
                     block_tables = self.forward_metadata.block_tables_swa
                 else:
                     block_tables = self.forward_metadata.block_tables
-                # attn_out = attention_sinks_prefill_triton(
-                #     q,
-                #     k_cache,
-                #     v_cache,
-                #     sinks,
-                #     self.forward_metadata.extend_seq_lens,
-                #     block_tables,
-                #     self.forward_metadata.seq_lens,
-                #     layer.scaling,
-                #     layer.sliding_window_size,
-                #     layer.tp_q_head_num,
-                #     layer.tp_k_head_num,
-                # )
                 k_cache = (
                     forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
                     .view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
@@ -1149,7 +1115,7 @@ class AscendAttnBackend(AttentionBackend):
                     pre_tokens=(
                         layer.sliding_window_size
                         if layer.sliding_window_size != -1
-                        else 2147483647
+                        else FULL_ATTENTION_WINDOW
                     ),
                     next_tokens=0,
                     atten_mask=self.fia_mask.to(torch.int8),
@@ -1769,7 +1735,9 @@ class AscendAttnBackend(AttentionBackend):
             ).view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
             query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
 
-            orig_q_len = query.shape[0]
+            if not self.graph_mode:
+                num_token_padding = query.shape[0]
+                query = query[: forward_batch.num_token_non_padded_cpu]
 
             if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
@@ -1778,21 +1746,19 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
 
-            max_bs = self.forward_metadata.block_tables.shape[0]
-            actual_seq_lengths_kv = actual_seq_lengths_kv[:max_bs]
-
-            if forward_batch.forward_mode.is_draft_extend():
+            if (
+                forward_batch.forward_mode.is_draft_extend()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            ):
                 actual_seq_lengths = (
                     np.array(forward_batch.extend_seq_lens_cpu).cumsum().tolist()
-                )[:max_bs]
+                )
             else:
-                actual_seq_lengths = self.forward_metadata.actual_seq_qlen_list[:max_bs]
-
-            target_T = actual_seq_lengths[-1]
-            query = query[:target_T]
-
-            actual_seq_lengths += [0] * (max_bs - len(actual_seq_lengths))
-            actual_seq_lengths_kv += [0] * (max_bs - len(actual_seq_lengths_kv))
+                actual_seq_lengths = np.arange(
+                    self.speculative_num_draft_tokens,
+                    self.speculative_num_draft_tokens + query.shape[0],
+                    self.speculative_num_draft_tokens,
+                )
 
             is_swa_layer = layer.sliding_window_size != -1
             if (
@@ -1825,16 +1791,18 @@ class AscendAttnBackend(AttentionBackend):
                 learnable_sink=sinks,
             )
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-            if attn_output.shape[0] < orig_q_len:
+            if (
+                not self.graph_mode
+                and forward_batch.num_token_non_padded_cpu != num_token_padding
+            ):
                 attn_output = torch.cat(
                     [
                         attn_output,
                         attn_output.new_zeros(
-                            orig_q_len - attn_output.shape[0],
+                            num_token_padding - forward_batch.num_token_non_padded_cpu,
                             *attn_output.shape[1:],
                         ),
                     ],
-                    dim=0,
                 )
             return attn_output
         else:
@@ -1969,19 +1937,6 @@ class AscendAttnBackend(AttentionBackend):
                 block_tables = self.forward_metadata.block_tables_swa
             else:
                 block_tables = self.forward_metadata.block_tables
-            # attn_out = attention_sinks_triton(
-            #     q,
-            #     k_cache,
-            #     v_cache,
-            #     sinks,
-            #     block_tables,
-            #     self.forward_metadata.seq_lens,
-            #     layer.scaling,
-            #     layer.sliding_window_size,
-            #     layer.tp_q_head_num,
-            #     layer.tp_k_head_num,
-            # )
-            # return attn_out
             k_cache = (
                 forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 .view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
@@ -2025,7 +1980,7 @@ class AscendAttnBackend(AttentionBackend):
                 pre_tokens=(
                     layer.sliding_window_size
                     if layer.sliding_window_size != -1
-                    else 2147483647
+                    else FULL_ATTENTION_WINDOW
                 ),
                 next_tokens=0,
                 atten_mask=self.fia_mask.to(torch.int8),
