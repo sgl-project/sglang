@@ -171,122 +171,94 @@ def init_db() -> None:
     print(f"[{AGENT_NAME}] DB initialised at {DB_PATH}", flush=True)
 
 
+def _seed_insert_course(con: sqlite3.Connection, now: float, slug: str, title: str,
+                        desc: str, price: float, level: str, category: str,
+                        dur: int) -> int:
+    con.execute(
+        """INSERT INTO courses
+           (slug, title, description, instructor, price, currency, level,
+            category, status, duration_minutes, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (slug, title, desc, "FractalMesh Team", price, "AUD", level,
+         category, "published", dur, now, now),
+    )
+    return con.execute("SELECT id FROM courses WHERE slug=?", (slug,)).fetchone()["id"]
+
+
+def _seed_insert_module(con: sqlite3.Connection, now: float, course_id: int,
+                        title: str, desc: str, oidx: int) -> int:
+    con.execute(
+        "INSERT INTO modules (course_id, title, description, order_index, created_at) VALUES (?,?,?,?,?)",
+        (course_id, title, desc, oidx, now),
+    )
+    return con.execute(
+        "SELECT id FROM modules WHERE course_id=? AND order_index=?", (course_id, oidx)
+    ).fetchone()["id"]
+
+
+def _seed_insert_lessons(con: sqlite3.Connection, now: float, module_id: int,
+                         lessons: list) -> None:
+    for title, content, dur, oidx, preview in lessons:
+        con.execute(
+            """INSERT INTO lessons
+               (module_id, title, content, video_url, duration_minutes,
+                lesson_type, order_index, is_preview, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (module_id, title, content, "", dur, "video", oidx, preview, now),
+        )
+
+
 def seed_courses() -> None:
     """Seed starter courses if the courses table is empty."""
     con = _db()
     try:
-        row = con.execute("SELECT COUNT(*) FROM courses").fetchone()
-        if row[0] > 0:
+        if con.execute("SELECT COUNT(*) FROM courses").fetchone()[0] > 0:
             return
-
         now = time.time()
 
-        # ------------------------------------------------------------------
         # Course 1: FractalMesh Developer Bootcamp
-        # ------------------------------------------------------------------
-        slug1 = "fractalmesh-developer-bootcamp"
-        con.execute(
-            """INSERT INTO courses
-               (slug, title, description, instructor, price, currency, level,
-                category, status, duration_minutes, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                slug1,
-                "FractalMesh Developer Bootcamp",
-                "Master the FractalMesh OMEGA Titan platform from scratch. "
-                "Learn to build, deploy, and manage autonomous AI agents.",
-                "FractalMesh Team",
-                199.0, "AUD", "intermediate",
-                "development", "published", 100, now, now,
-            ),
+        cid1 = _seed_insert_course(
+            con, now, "fractalmesh-developer-bootcamp",
+            "FractalMesh Developer Bootcamp",
+            "Master the FractalMesh OMEGA Titan platform from scratch. "
+            "Learn to build, deploy, and manage autonomous AI agents.",
+            199.0, "intermediate", "development", 100,
         )
-        cid1 = con.execute("SELECT id FROM courses WHERE slug=?", (slug1,)).fetchone()["id"]
+        mid1a = _seed_insert_module(con, now, cid1, "Getting Started",
+                                    "Set up your FractalMesh development environment.", 1)
+        _seed_insert_lessons(con, now, mid1a, [
+            ("Platform Overview",
+             "Welcome to FractalMesh. Walk through the overall OMEGA Titan architecture.", 10, 1, 1),
+            ("Installation & Setup",
+             "Step-by-step installation of all FractalMesh dependencies on Linux and macOS.", 15, 2, 0),
+            ("Your First Agent",
+             "Build and run your very first autonomous FractalMesh agent end-to-end.", 20, 3, 0),
+        ])
+        mid1b = _seed_insert_module(con, now, cid1, "Core Agents",
+                                    "Deep-dive into the most important FractalMesh agents.", 2)
+        _seed_insert_lessons(con, now, mid1b, [
+            ("MCP Router Deep-Dive",
+             "Understand the MCP Router's routing logic, middleware hooks, and fault tolerance.", 30, 1, 0),
+            ("Database Layer",
+             "Explore the sovereign SQLite WAL database pattern used across all agents.", 25, 2, 0),
+        ])
 
-        # Module 1
-        con.execute(
-            "INSERT INTO modules (course_id, title, description, order_index, created_at) VALUES (?,?,?,?,?)",
-            (cid1, "Getting Started", "Set up your FractalMesh development environment.", 1, now),
-        )
-        mid1a = con.execute("SELECT id FROM modules WHERE course_id=? AND order_index=1", (cid1,)).fetchone()["id"]
-
-        lessons_m1 = [
-            ("Platform Overview", "Welcome to FractalMesh. In this lesson we walk through the overall architecture of OMEGA Titan.", "", 10, "video", 1, 1),
-            ("Installation & Setup", "Step-by-step installation of all FractalMesh dependencies on Linux and macOS.", "", 15, "video", 2, 0),
-            ("Your First Agent", "Build and run your very first autonomous FractalMesh agent end-to-end.", "", 20, "video", 3, 0),
-        ]
-        for title, content, video_url, dur, ltype, oidx, preview in lessons_m1:
-            con.execute(
-                """INSERT INTO lessons
-                   (module_id, title, content, video_url, duration_minutes,
-                    lesson_type, order_index, is_preview, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
-                (mid1a, title, content, video_url, dur, ltype, oidx, preview, now),
-            )
-
-        # Module 2
-        con.execute(
-            "INSERT INTO modules (course_id, title, description, order_index, created_at) VALUES (?,?,?,?,?)",
-            (cid1, "Core Agents", "Deep-dive into the most important FractalMesh agents.", 2, now),
-        )
-        mid1b = con.execute("SELECT id FROM modules WHERE course_id=? AND order_index=2", (cid1,)).fetchone()["id"]
-
-        lessons_m2 = [
-            ("MCP Router Deep-Dive", "Understand the MCP Router's routing logic, middleware hooks, and fault tolerance.", "", 30, "video", 1, 0),
-            ("Database Layer", "Explore the sovereign SQLite WAL database pattern used across all agents.", "", 25, "video", 2, 0),
-        ]
-        for title, content, video_url, dur, ltype, oidx, preview in lessons_m2:
-            con.execute(
-                """INSERT INTO lessons
-                   (module_id, title, content, video_url, duration_minutes,
-                    lesson_type, order_index, is_preview, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
-                (mid1b, title, content, video_url, dur, ltype, oidx, preview, now),
-            )
-
-        # Update duration
-        con.execute(
-            "UPDATE courses SET duration_minutes=100 WHERE id=?", (cid1,)
-        )
-
-        # ------------------------------------------------------------------
         # Course 2: AI Automation Fundamentals
-        # ------------------------------------------------------------------
-        slug2 = "ai-automation-fundamentals"
-        con.execute(
-            """INSERT INTO courses
-               (slug, title, description, instructor, price, currency, level,
-                category, status, duration_minutes, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                slug2,
-                "AI Automation Fundamentals",
-                "Learn the core principles of AI-driven automation. "
-                "Perfect for beginners looking to leverage AI in their workflows.",
-                "FractalMesh Team",
-                99.0, "AUD", "beginner",
-                "ai", "published", 25, now, now,
-            ),
+        cid2 = _seed_insert_course(
+            con, now, "ai-automation-fundamentals",
+            "AI Automation Fundamentals",
+            "Learn the core principles of AI-driven automation. "
+            "Perfect for beginners looking to leverage AI in their workflows.",
+            99.0, "beginner", "ai", 25,
         )
-        cid2 = con.execute("SELECT id FROM courses WHERE slug=?", (slug2,)).fetchone()["id"]
-
-        con.execute(
-            "INSERT INTO modules (course_id, title, description, order_index, created_at) VALUES (?,?,?,?,?)",
-            (cid2, "Introduction", "Your first steps into AI Automation.", 1, now),
-        )
-        mid2a = con.execute("SELECT id FROM modules WHERE course_id=? AND order_index=1", (cid2,)).fetchone()["id"]
-
-        lessons_intro = [
-            ("What is AI Automation?", "Demystify AI automation: definitions, categories, and real-world examples.", "", 10, "video", 1, 1),
-            ("Use Cases & Applications", "Survey the landscape of AI automation use cases across industries.", "", 15, "video", 2, 0),
-        ]
-        for title, content, video_url, dur, ltype, oidx, preview in lessons_intro:
-            con.execute(
-                """INSERT INTO lessons
-                   (module_id, title, content, video_url, duration_minutes,
-                    lesson_type, order_index, is_preview, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
-                (mid2a, title, content, video_url, dur, ltype, oidx, preview, now),
-            )
+        mid2a = _seed_insert_module(con, now, cid2, "Introduction",
+                                    "Your first steps into AI Automation.", 1)
+        _seed_insert_lessons(con, now, mid2a, [
+            ("What is AI Automation?",
+             "Demystify AI automation: definitions, categories, and real-world examples.", 10, 1, 1),
+            ("Use Cases & Applications",
+             "Survey the landscape of AI automation use cases across industries.", 15, 2, 0),
+        ])
 
         con.commit()
         print(f"[{AGENT_NAME}] Seeded starter courses.", flush=True)
@@ -567,120 +539,53 @@ class CoursePlatformHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Admin-Secret")
         self.end_headers()
 
-    def do_GET(self):
+    def _route(self, method: str):
         parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path.rstrip("/")
+        p = parsed.path.rstrip("/")
         qs = urllib.parse.parse_qs(parsed.query)
+        parts = p.split("/")          # ['', segment, ...]
 
-        # /health
-        if path == "/health":
-            self._handle_health()
+        if method == "GET":
+            if p == "/health":
+                self._handle_health(); return
+            if p == "/courses":
+                self._handle_list_courses(qs); return
+            if p == "/students":
+                (_is_admin(self) and self._handle_list_students()) or _err(self, 403, "Forbidden"); return
+            if p == "/analytics":
+                (_is_admin(self) and self._handle_analytics()) or _err(self, 403, "Forbidden"); return
+            if p.startswith("/courses/") and len(parts) == 3:
+                self._handle_get_course(parts[2]); return
+            if p.startswith("/courses/") and p.endswith("/reviews") and len(parts) == 4:
+                self._handle_get_reviews(parts[2]); return
+            if p.startswith("/enrollments/") and len(parts) == 3:
+                self._handle_get_enrollment(parts[2]); return
+            if p.startswith("/enrollments/") and "/lessons/" in p and len(parts) == 5:
+                self._handle_get_lesson(parts[2], parts[4]); return
+            if p.startswith("/enrollments/") and p.endswith("/certificate") and len(parts) == 4:
+                self._handle_get_certificate(parts[2]); return
 
-        # /courses
-        elif path == "/courses":
-            self._handle_list_courses(qs)
+        elif method == "POST":
+            if p == "/courses":
+                (_is_admin(self) and self._handle_create_course()) or _err(self, 403, "Forbidden"); return
+            if p.startswith("/courses/") and p.endswith("/publish") and len(parts) == 4:
+                (_is_admin(self) and self._handle_publish_course(parts[2])) or _err(self, 403, "Forbidden"); return
+            if p.startswith("/courses/") and p.endswith("/enroll/free"):
+                self._handle_enroll(parts[2], free=True); return
+            if p.startswith("/courses/") and p.endswith("/enroll") and len(parts) == 4:
+                self._handle_enroll(parts[2], free=False); return
+            if p.startswith("/courses/") and p.endswith("/reviews") and len(parts) == 4:
+                self._handle_post_review(parts[2]); return
+            if p.startswith("/enrollments/") and p.endswith("/complete") and len(parts) == 6:
+                self._handle_complete_lesson(parts[2], parts[4]); return
 
-        # /courses/{slug}
-        elif path.startswith("/courses/") and path.count("/") == 2:
-            slug = path.split("/")[2]
-            if not slug:
-                _err(self, 400, "Missing slug")
-            else:
-                self._handle_get_course(slug)
+        _err(self, 404, "Not found")
 
-        # /courses/{slug}/reviews
-        elif path.startswith("/courses/") and path.endswith("/reviews"):
-            parts = path.split("/")
-            if len(parts) == 4:
-                self._handle_get_reviews(parts[2])
-            else:
-                _err(self, 404, "Not found")
-
-        # /enrollments/{enrollment_id}
-        elif path.startswith("/enrollments/") and path.count("/") == 2:
-            eid = path.split("/")[2]
-            self._handle_get_enrollment(eid)
-
-        # /enrollments/{enrollment_id}/lessons/{lesson_id}
-        elif path.startswith("/enrollments/") and "/lessons/" in path and not path.endswith("/complete"):
-            parts = path.split("/")
-            if len(parts) == 5 and parts[3] == "lessons":
-                self._handle_get_lesson(parts[2], parts[4])
-            else:
-                _err(self, 404, "Not found")
-
-        # /enrollments/{enrollment_id}/certificate
-        elif path.startswith("/enrollments/") and path.endswith("/certificate"):
-            parts = path.split("/")
-            if len(parts) == 4:
-                self._handle_get_certificate(parts[2])
-            else:
-                _err(self, 404, "Not found")
-
-        # /students  (admin)
-        elif path == "/students":
-            if not _is_admin(self):
-                _err(self, 403, "Forbidden")
-            else:
-                self._handle_list_students()
-
-        # /analytics  (admin)
-        elif path == "/analytics":
-            if not _is_admin(self):
-                _err(self, 403, "Forbidden")
-            else:
-                self._handle_analytics()
-
-        else:
-            _err(self, 404, "Not found")
+    def do_GET(self):
+        self._route("GET")
 
     def do_POST(self):
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path.rstrip("/")
-
-        # POST /courses  (admin)
-        if path == "/courses":
-            if not _is_admin(self):
-                _err(self, 403, "Forbidden")
-            else:
-                self._handle_create_course()
-
-        # POST /courses/{slug}/publish  (admin)
-        elif path.startswith("/courses/") and path.endswith("/publish"):
-            if not _is_admin(self):
-                _err(self, 403, "Forbidden")
-            else:
-                slug = path.split("/")[2]
-                self._handle_publish_course(slug)
-
-        # POST /courses/{slug}/enroll/free
-        elif path.startswith("/courses/") and path.endswith("/enroll/free"):
-            slug = path.split("/")[2]
-            self._handle_free_enroll(slug)
-
-        # POST /courses/{slug}/enroll
-        elif path.startswith("/courses/") and path.endswith("/enroll"):
-            slug = path.split("/")[2]
-            self._handle_enroll(slug)
-
-        # POST /courses/{slug}/reviews
-        elif path.startswith("/courses/") and path.endswith("/reviews"):
-            parts = path.split("/")
-            if len(parts) == 4:
-                self._handle_post_review(parts[2])
-            else:
-                _err(self, 404, "Not found")
-
-        # POST /enrollments/{enrollment_id}/lessons/{lesson_id}/complete
-        elif path.startswith("/enrollments/") and path.endswith("/complete"):
-            parts = path.split("/")
-            if len(parts) == 6 and parts[3] == "lessons":
-                self._handle_complete_lesson(parts[2], parts[4])
-            else:
-                _err(self, 404, "Not found")
-
-        else:
-            _err(self, 404, "Not found")
+        self._route("POST")
 
     # -----------------------------------------------------------------------
     # GET handlers
@@ -988,52 +893,44 @@ class CoursePlatformHandler(BaseHTTPRequestHandler):
     # POST handlers
     # -----------------------------------------------------------------------
 
-    def _handle_enroll(self, slug: str):
+    def _handle_enroll(self, slug: str, free: bool = False):
         body = _read_json(self)
         student_email = body.get("student_email", "").strip()
         student_name  = body.get("student_name", "").strip()
         payment_method_id = body.get("payment_method_id", "").strip()
 
         if not student_email or not student_name:
-            _err(self, 400, "student_email and student_name are required")
-            return
-        if not payment_method_id:
-            _err(self, 400, "payment_method_id is required")
-            return
+            _err(self, 400, "student_email and student_name are required"); return
+        if not free and not payment_method_id:
+            _err(self, 400, "payment_method_id is required"); return
 
         con = _db()
         try:
             course = _course_by_slug(slug, con)
             if not course:
-                _err(self, 404, "Course not found")
-                return
+                _err(self, 404, "Course not found"); return
             if course["status"] != "published":
-                _err(self, 400, "Course is not published")
-                return
-            if course["price"] == 0:
-                _err(self, 400, "This is a free course. Use /enroll/free")
-                return
-
-            # Check duplicate enrollment
-            existing = con.execute(
+                _err(self, 400, "Course is not published"); return
+            if free and course["price"] > 0:
+                _err(self, 400, "This course requires payment. Use /enroll"); return
+            if not free and course["price"] == 0:
+                _err(self, 400, "This is a free course. Use /enroll/free"); return
+            if con.execute(
                 "SELECT id FROM enrollments WHERE course_id=? AND student_email=? AND status='active'",
                 (course["id"], student_email),
-            ).fetchone()
-            if existing:
-                _err(self, 409, "Already enrolled")
-                return
+            ).fetchone():
+                _err(self, 409, "Already enrolled"); return
 
-            # Stripe PaymentIntent
-            try:
-                pi = stripe_create_payment_intent(
-                    course["price"],
-                    f"Enrolment: {course['title']}",
-                    payment_method_id,
-                    {"course_slug": slug, "student_email": student_email},
-                )
-            except RuntimeError as exc:
-                _err(self, 402, f"Payment failed: {exc}")
-                return
+            pi_id = pi_secret = pi_status = ""
+            if not free:
+                try:
+                    pi = stripe_create_payment_intent(
+                        course["price"], f"Enrolment: {course['title']}",
+                        payment_method_id, {"course_slug": slug, "student_email": student_email},
+                    )
+                    pi_id, pi_secret, pi_status = pi.get("id",""), pi.get("client_secret",""), pi.get("status","")
+                except RuntimeError as exc:
+                    _err(self, 402, f"Payment failed: {exc}"); return
 
             enrollment_id = f"ENR-{secrets.token_hex(8).upper()}"
             now = time.time()
@@ -1043,77 +940,20 @@ class CoursePlatformHandler(BaseHTTPRequestHandler):
                     stripe_payment_id, amount_paid, status, enrolled_at)
                    VALUES (?,?,?,?,?,?,?,?)""",
                 (enrollment_id, course["id"], student_email, student_name,
-                 pi.get("id", ""), course["price"], "active", now),
+                 pi_id, 0.0 if free else course["price"], "active", now),
             )
-            con.execute(
-                "UPDATE courses SET student_count=student_count+1, updated_at=? WHERE id=?",
-                (now, course["id"]),
-            )
+            con.execute("UPDATE courses SET student_count=student_count+1, updated_at=? WHERE id=?",
+                        (now, course["id"]))
             con.commit()
         finally:
             con.close()
 
         send_welcome_email(student_name, student_email, course["title"], enrollment_id)
-        _send_json(self, 201, {
-            "enrollment_id": enrollment_id,
-            "client_secret": pi.get("client_secret", ""),
-            "status": pi.get("status", ""),
-            "message": f"Enrolled in {course['title']}",
-        })
-
-    def _handle_free_enroll(self, slug: str):
-        body = _read_json(self)
-        student_email = body.get("student_email", "").strip()
-        student_name  = body.get("student_name", "").strip()
-
-        if not student_email or not student_name:
-            _err(self, 400, "student_email and student_name are required")
-            return
-
-        con = _db()
-        try:
-            course = _course_by_slug(slug, con)
-            if not course:
-                _err(self, 404, "Course not found")
-                return
-            if course["status"] != "published":
-                _err(self, 400, "Course is not published")
-                return
-            if course["price"] > 0:
-                _err(self, 400, "This course requires payment. Use /enroll")
-                return
-
-            existing = con.execute(
-                "SELECT id FROM enrollments WHERE course_id=? AND student_email=? AND status='active'",
-                (course["id"], student_email),
-            ).fetchone()
-            if existing:
-                _err(self, 409, "Already enrolled")
-                return
-
-            enrollment_id = f"ENR-{secrets.token_hex(8).upper()}"
-            now = time.time()
-            con.execute(
-                """INSERT INTO enrollments
-                   (enrollment_id, course_id, student_email, student_name,
-                    stripe_payment_id, amount_paid, status, enrolled_at)
-                   VALUES (?,?,?,?,?,?,?,?)""",
-                (enrollment_id, course["id"], student_email, student_name,
-                 "", 0.0, "active", now),
-            )
-            con.execute(
-                "UPDATE courses SET student_count=student_count+1, updated_at=? WHERE id=?",
-                (now, course["id"]),
-            )
-            con.commit()
-        finally:
-            con.close()
-
-        send_welcome_email(student_name, student_email, course["title"], enrollment_id)
-        _send_json(self, 201, {
-            "enrollment_id": enrollment_id,
-            "message": f"Enrolled in {course['title']} (free)",
-        })
+        resp: dict = {"enrollment_id": enrollment_id,
+                      "message": f"Enrolled in {course['title']}" + (" (free)" if free else "")}
+        if not free:
+            resp.update({"client_secret": pi_secret, "status": pi_status})
+        _send_json(self, 201, resp)
 
     def _handle_complete_lesson(self, enrollment_id: str, lesson_id: str):
         body = _read_json(self)

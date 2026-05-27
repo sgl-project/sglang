@@ -1211,6 +1211,10 @@ module.exports = {
             ['fm-referral',       'fm_referral_engine', '25M'],
             ['fm-pos',            'fm_pos_system',      '35M'],
             ['fm-courses',        'fm_course_platform', '35M'],
+            ['fm-podcast',        'fm_podcast_engine',  '30M'],
+            ['fm-marketplace',    'fm_marketplace',     '30M'],
+            ['fm-events',         'fm_events_manager',  '30M'],
+            ['fm-feedback',       'fm_feedback_engine', '25M'],
         ].map(([name, script, mem]) => ({
             name,
             script:            `agents/${script}.py`,

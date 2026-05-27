@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     127,
+        "agents":     131,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -241,6 +241,10 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "referral_engine":   7878,
             "pos_system":        7879,
             "course_platform":   7880,
+            "podcast_engine":    7881,
+            "marketplace":       7882,
+            "events_manager":    7883,
+            "feedback_engine":   7884,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -568,6 +572,10 @@ _INTENTS = {
     "referral_convert":        lambda a, k: {"action": "referral_convert_queued", "link_code": k.get("link_code", ""), "order_value": k.get("order_value", 0), "order_ref": k.get("order_ref", "")},
     "pos_checkout":            lambda a, k: {"action": "pos_checkout_queued", "cart_id": k.get("cart_id", ""), "payment_method": k.get("payment_method", "stripe")},
     "course_enroll":           lambda a, k: {"action": "course_enroll_queued", "course_slug": k.get("course_slug", ""), "student_email": k.get("student_email", "")},
+    "podcast_episode":         lambda a, k: {"action": "podcast_episode_queued", "episode_id": k.get("episode_id", ""), "operation": k.get("operation", "publish")},
+    "marketplace_purchase":    lambda a, k: {"action": "marketplace_purchase_queued", "listing_id": k.get("listing_id", ""), "buyer_email": k.get("buyer_email", "")},
+    "event_ticket":            lambda a, k: {"action": "event_ticket_queued", "event_id": k.get("event_id", ""), "ticket_type_id": k.get("ticket_type_id", 0), "attendee_email": k.get("attendee_email", "")},
+    "nps_submit":              lambda a, k: {"action": "nps_submit_queued", "score": k.get("score", 0), "comment": k.get("comment", ""), "customer_email": k.get("customer_email", "")},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
