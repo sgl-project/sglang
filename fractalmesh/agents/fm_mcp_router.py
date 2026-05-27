@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     143,
+        "agents":     147,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -257,6 +257,10 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "video_platform":    7894,
             "gamification":      7895,
             "contract_manager":  7896,
+            "hr_manager":        7897,
+            "budget_tracker":    7898,
+            "project_manager":   7899,
+            "landing_pages":     7900,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -600,6 +604,10 @@ _INTENTS = {
     "video_upload":            lambda a, k: {"action": "video_upload_queued", "channel_id": k.get("channel_id", ""), "title": k.get("title", "")},
     "award_xp":                lambda a, k: {"action": "award_xp_queued", "player_id": k.get("player_id", ""), "event_type": k.get("event_type", ""), "value": k.get("value", 1)},
     "contract_sign":           lambda a, k: {"action": "contract_sign_queued", "contract_id": k.get("contract_id", ""), "signer_email": k.get("signer_email", "")},
+    "hr_onboard":              lambda a, k: {"action": "hr_onboard_queued", "email": k.get("email", ""), "department": k.get("department", "")},
+    "budget_record":           lambda a, k: {"action": "budget_record_queued", "category": k.get("category", ""), "amount": k.get("amount", 0), "type": k.get("type", "expense")},
+    "task_create":             lambda a, k: {"action": "task_create_queued", "project_id": k.get("project_id", ""), "title": k.get("title", "")},
+    "lead_capture":            lambda a, k: {"action": "lead_capture_queued", "email": k.get("email", ""), "page_id": k.get("page_id", "")},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────

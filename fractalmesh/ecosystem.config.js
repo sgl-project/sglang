@@ -1227,6 +1227,10 @@ module.exports = {
             ['fm-video',          'fm_video_platform',   '40M'],
             ['fm-gamification',   'fm_gamification',     '25M'],
             ['fm-contracts',      'fm_contract_manager', '25M'],
+            ['fm-hr',             'fm_hr_manager',       '25M'],
+            ['fm-budget',         'fm_budget_tracker',   '25M'],
+            ['fm-projects',       'fm_project_manager',  '30M'],
+            ['fm-landing',        'fm_landing_pages',    '25M'],
         ].map(([name, script, mem]) => ({
             name,
             script:            `agents/${script}.py`,
