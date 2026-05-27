@@ -68,7 +68,6 @@ from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationM
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
@@ -690,10 +689,12 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
-        self.origin_input_ids_unpadded = array(
-            "q", origin_input_ids_unpadded or origin_input_ids
-        )  # Before image padding
         self.origin_input_ids = array("q", origin_input_ids)
+        self.origin_input_ids_unpadded = (
+            array("q", origin_input_ids_unpadded)
+            if origin_input_ids_unpadded
+            else self.origin_input_ids
+        )  # Before image padding
         # Each decode stage's output ids
         self.output_ids = array("q")
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
@@ -1487,6 +1488,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For chunked prefill in PP
     chunked_req: Optional[Req] = None
+    contains_last_prefill_chunk: bool = True
 
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -1502,6 +1504,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
+    # CPU mirror of req_pool_indices; schedule-path only, stale in spec draft window
+    req_pool_indices_cpu: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
 
@@ -1845,7 +1849,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens
 
         # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, _ = alloc_for_extend(self)
+        out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
+            self
+        )
 
         # Set fields
         input_embeds = []
@@ -2004,6 +2010,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.input_ids = input_ids_tensor
         self.req_pool_indices = req_pool_indices_tensor
+        self.req_pool_indices_cpu = req_pool_indices_cpu
         self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
         self.input_embeds = (
@@ -2088,18 +2095,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         req: Req,
     ) -> "_MambaRadixCacheV2TrackEntry":
+        mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+
         def _force_track_h(i: int) -> int:
-            assert i % FLA_CHUNK_SIZE == 0
+            assert i % mamba_cache_chunk_size == 0
             # There are 3 cases for mamba_track_seqlen passed to mamba_track_seqlens_cpu:
-            # 1) aligned with FLA_CHUNK_SIZE-> retrieve from last_recurrent_state
+            # 1) aligned with mamba_cache_chunk_size-> retrieve from last_recurrent_state
             #    a) is the last position -> retrieve from last_recurrent_state
             #    b) is NOT the last position -> retrieve from h
-            # 2) unaligned with FLA_CHUNK_SIZE -> retrieve from h
+            # 2) unaligned with mamba_cache_chunk_size -> retrieve from h
             # Currently, the math calculation only supports case 1a and 2. So for 1b, we need to add 1
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
-        mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
         mask = req.extend_input_len >= mamba_cache_chunk_size
         track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
         mamba_track_seqlen = -1
@@ -2121,13 +2129,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 * mamba_cache_chunk_size
             )
 
-            # mamba_track_fla_chunk_aligned is the aligned seqlen based on FLA_CHUNK_SIZE
+            # mamba_track_fla_chunk_aligned is the aligned seqlen based on mamba_cache_chunk_size
             # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which can be true when
-            # page_size > FLA_CHUNK_SIZE, we need to force the math calculation to retrieve the correct mamba state from h
+            # page_size > mamba_cache_chunk_size, we need to force the math calculation to retrieve the correct mamba state from h
             # by _force_track_h()
             mamba_track_fla_chunk_aligned = (
                 len(req.prefix_indices)
-                + (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
+                + (req.extend_input_len // mamba_cache_chunk_size)
+                * mamba_cache_chunk_size
             )
             if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
                 # We want to track mamba_track_seqlen_aligned, and it's not the last position,
@@ -2375,6 +2384,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
         self.req_pool_indices = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.req_pool_indices_cpu = torch.empty(0, dtype=torch.int64)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -2467,6 +2477,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.out_cache_loc,
                 self.req_pool_indices,
                 self.seq_lens_cpu,
+                self.req_pool_indices_cpu,
             )
 
         if get_global_server_args().enable_mamba_extra_buffer():
@@ -2526,6 +2537,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
+        self.req_pool_indices_cpu = self.req_pool_indices_cpu[keep_indices]
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
@@ -2577,6 +2589,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.encoder_lens_cpu.extend(other.encoder_lens_cpu)
         self.req_pool_indices = torch.cat(
             [self.req_pool_indices, other.req_pool_indices]
+        )
+        self.req_pool_indices_cpu = torch.cat(
+            [self.req_pool_indices_cpu, other.req_pool_indices_cpu]
         )
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
