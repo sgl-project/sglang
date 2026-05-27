@@ -585,10 +585,6 @@ class GemmaRMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        needs_reshape = x.dim() != 2 and residual is None
-        if needs_reshape:
-            original_shape = x.shape
-            x = x.contiguous().reshape(-1, original_shape[-1])
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
@@ -597,8 +593,6 @@ class GemmaRMSNorm(MultiPlatformOp):
             )
             return x, residual
         out = gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
-        if needs_reshape:
-            out = out.reshape(original_shape)
         return out
 
     def forward_native(
