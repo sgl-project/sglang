@@ -1621,8 +1621,7 @@ class SchedulerDisaggregationDecodeMixin:
             if self._engine_paused:
                 continue
 
-            # WAR barrier: this iter's schedule writes to shared GPU buffers
-            # (alloc / retract free_swa) wait for the previous forward's reads.
+            # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
             self.schedule_stream.wait_stream(self.forward_stream)
 
             # Get the next batch to run
