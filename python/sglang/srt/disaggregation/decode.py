@@ -293,6 +293,7 @@ class DecodeRequest:
     prefix_match: Optional[DecodePrefixMatch] = None
     hicache_restored_kv_indices: Optional[torch.Tensor] = None
     hicache_restored_node: Any = None
+    hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
 
     @property
@@ -561,10 +562,14 @@ class DecodePreallocQueue:
         )
 
     def _start_hicache_prefetch(
-        self, req: Req, prefix_match: DecodePrefixMatch
+        self, req: Req, prefix_match: Optional[DecodePrefixMatch]
     ) -> None:
         """Issue L3 storage prefetch after admission succeeds."""
-        if prefix_match.l3_storage_hit_length <= 0 or prefix_match.last_host_node is None:
+        if (
+            prefix_match is None
+            or prefix_match.l3_storage_hit_length <= 0
+            or prefix_match.last_host_node is None
+        ):
             return
         node = prefix_match.last_host_node
         matched_len = prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
@@ -1526,64 +1531,103 @@ class DecodeTransferQueue:
             self.tree_cache.dec_lock_ref(decode_req.hicache_restored_node)
             decode_req.hicache_restored_node = None
 
-    def _process_hicache_local_restore(self, decode_req: DecodeRequest) -> None:
-        """Drive the HiCache L3->L2 prefetch + L2->L1 load_back pipeline."""
-        # Already terminal (READY / FAILED) or no-op resolved earlier.
-        if decode_req.hicache_restore_status != HiCacheRestoreResult.PENDING:
+    def _try_hicache_queue_load_back(self, dr: DecodeRequest) -> bool:
+        """Queue one L2->L1 load_back op for ``dr``; True iff a DMA was queued.
+
+        On success, ``dr.hicache_restored_node`` and ``hicache_restored_kv_indices``
+        are populated, and an inc_lock_ref is held until commit/abort.
+        Trivial cases (all-on-device / no needed coverage) auto-flip to READY.
+        Failback paths flip to FAILED.
+        """
+        pm = dr.prefix_match
+
+        # Wait for L3 -> L2 prefetch to drain (skip when no L3 hit).
+        if pm.l3_storage_hit_length > 0:
+            if not self.tree_cache.check_prefetch_progress(dr.req.rid):
+                return False
+            self.tree_cache.pop_prefetch_loaded_tokens(dr.req.rid)
+
+        # Re-match: req.last_node / prefix_indices updated to current device state.
+        rematch = match_prefix_for_req(
+            self.tree_cache,
+            dr.req,
+            dr.req.origin_input_ids,
+            cow_mamba=False,
+            include_req=True,
+        )
+        new_indices, restored_node = self.tree_cache.init_load_back(
+            InitLoadBackParams(
+                best_match_node=rematch.best_match_node,
+                host_hit_length=rematch.host_hit_length,
+                req=dr.req,
+            )
+        )
+        # Failback: total coverage < required prefix means device alloc likely failed.
+        if len(rematch.device_indices) + len(new_indices) < pm.decode_prefix_len:
+            dr.hicache_restore_status = HiCacheRestoreResult.FAILED
+            return False
+
+        dr.hicache_restored_kv_indices = torch.cat(
+            [rematch.device_indices[pm.l1_prefix_len:], new_indices]
+        )
+        dr.hicache_restored_node = restored_node
+        self.tree_cache.inc_lock_ref(restored_node)
+
+        if len(new_indices) == 0:
+            # Whole prefix already on device; no DMA needed.
+            dr.hicache_restore_status = HiCacheRestoreResult.READY
+            return False
+        return True
+
+    def _process_hicache_local_restores(
+        self, decode_reqs: List[DecodeRequest]
+    ) -> None:
+        if not hasattr(self.tree_cache, "is_load_back_event_done"):
             return
 
-        prefix_match = decode_req.prefix_match
-        if prefix_match is None or not prefix_match.needs_local_restore:
-            decode_req.hicache_restore_status = HiCacheRestoreResult.READY
-            return
+        # Filter once: keep only PENDING reqs that still need restore work;
+        # trivially-done reqs (no prefix_match / nothing to restore) flip to READY.
+        active: List[DecodeRequest] = []
+        for dr in decode_reqs:
+            if dr.hicache_restore_status != HiCacheRestoreResult.PENDING:
+                continue
+            pm = dr.prefix_match
+            if pm is None or not pm.needs_local_restore:
+                dr.hicache_restore_status = HiCacheRestoreResult.READY
+                continue
+            active.append(dr)
 
-        # Phase 1: wait for L3 -> L2 prefetch to drain (skip when no L3 hit).
-        if decode_req.hicache_restored_node is None and prefix_match.l3_storage_hit_length > 0:
-            if not self.tree_cache.check_prefetch_progress(decode_req.req.rid):
-                return
-            self.tree_cache.pop_prefetch_loaded_tokens(decode_req.req.rid)
+        # Phase A: advance in-flight DMAs to READY.
+        for dr in active:
+            if dr.hicache_restored_node is not None and self.tree_cache.is_load_back_event_done(
+                dr.hicache_load_consumer_index
+            ):
+                dr.hicache_restore_status = HiCacheRestoreResult.READY
 
-        # Phase 2: kick off L2 -> L1 load_back exactly once.
-        if decode_req.hicache_restored_node is None:
-            if self.tree_cache.ongoing_load_back:
-                return
-
-            # Re-match: req.last_node / prefix_indices updated to current device state.
-            rematch = match_prefix_for_req(
-                self.tree_cache,
-                decode_req.req,
-                decode_req.req.origin_input_ids,
-                cow_mamba=False,
-                include_req=True,
-            )
-            new_indices, restored_node = self.tree_cache.init_load_back(
-                InitLoadBackParams(
-                    best_match_node=rematch.best_match_node,
-                    host_hit_length=rematch.host_hit_length,
-                    req=decode_req.req,
-                )
-            )
-            # Failback: if total coverage < required prefix, device alloc likely failed.
-            if len(rematch.device_indices) + len(new_indices) < prefix_match.decode_prefix_len:
-                decode_req.hicache_restore_status = HiCacheRestoreResult.FAILED
-                return
-
-            decode_req.hicache_restored_kv_indices = torch.cat([
-                rematch.device_indices[prefix_match.l1_prefix_len:],
-                new_indices,
-            ])
-            decode_req.hicache_restored_node = restored_node
-            self.tree_cache.inc_lock_ref(restored_node)
-            self.tree_cache.ready_to_load_host_cache()
-
-        # Phase 3: wait for this request's load_back to drain.
-        if (
-            decode_req.hicache_restored_node is not None
-            and decode_req.hicache_restored_node.id in self.tree_cache.ongoing_load_back
+        # Phase B: queue new load_back ops if the next slot is free.
+        # The (producer_index + 1) check ensures we never overwrite a still-in-flight slot:
+        # if a previous req holds that slot and isn't done, its event won't be signaled.
+        counter = self.tree_cache.cache_controller.layer_done_counter
+        if not self.tree_cache.is_load_back_event_done(
+            (counter.producer_index + 1) % counter.num_counters
         ):
             return
+        queued = [
+            dr
+            for dr in active
+            if dr.hicache_restored_node is None and self._try_hicache_queue_load_back(dr)
+        ]
+        if not queued:
+            return
 
-        decode_req.hicache_restore_status = HiCacheRestoreResult.READY
+        # Phase C: kick off merged DMA, bind consumer_index for Phase A polling next tick.
+        consumer_index = self.tree_cache.ready_to_load_host_cache()
+        if consumer_index < 0:
+            for dr in queued:
+                dr.hicache_restore_status = HiCacheRestoreResult.READY
+            return
+        for dr in queued:
+            dr.hicache_load_consumer_index = consumer_index
 
     def _commit_hicache_local_restore_to_req(self, decode_req: DecodeRequest) -> None:
         prefix_match = decode_req.prefix_match
@@ -1723,11 +1767,18 @@ class DecodeTransferQueue:
 
         transferred_reqs = []
         indices_to_remove = set()
+        restore_decode_reqs = [
+            decode_req
+            for decode_req, poll in zip(self.queue, polls)
+            if (rids_to_check is None or decode_req.req.rid in rids_to_check)
+            and poll != KVPoll.Failed
+        ]
+        self._process_hicache_local_restores(restore_decode_reqs)
+
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
-            self._process_hicache_local_restore(decode_req)
             hicache_restore_status = decode_req.hicache_restore_status
             if poll == KVPoll.Failed or hicache_restore_status == HiCacheRestoreResult.FAILED:
                 error_message = (
@@ -1948,19 +1999,13 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
-                # Decode-radix path: do NOT re-match prefix here.
-                # `pop_preallocated` already took a tree snapshot and used it
-                # to (1) pre-allocate KV, (2) choose delta pages for transfer,
-                # and (3) set cache_protected_len/last_node for correct frees.
-                # Re-matching now can observe a newer tree (other reqs may have
-                # inserted the same prefix) and overwrite cache_protected_len,
-                # making `cache_unfinished_req` free the wrong range (leak).
-                # Non-radix decode keeps the original behavior.
-                tree_cache = (
-                    None
-                    if self.server_args.disaggregation_decode_enable_radix_cache
-                    else self.tree_cache
-                )
+                # Decode-radix path: new requests already matched in
+                # `pop_preallocated`. Retracted requests reset `last_node`,
+                # so re-match only when that state is missing.
+                if self.server_args.disaggregation_decode_enable_radix_cache:
+                    tree_cache = self.tree_cache if req.last_node is None else None
+                else:
+                    tree_cache = self.tree_cache
                 req.init_next_round_input(tree_cache)
                 # Truncate fill_ids to kv_committed_len so cache_unfinished_req
                 # only sees committed KV (fill_ids includes one uncommitted token).

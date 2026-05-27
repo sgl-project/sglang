@@ -812,6 +812,26 @@ class HiRadixCache(RadixCache):
         # ACK until all events are processed
         del self.cache_controller.ack_load_queue[:finish_count]
 
+    def is_load_back_event_done(self, consumer_index: int) -> bool:
+        """Return True only after all CPxTP ranks finish a load-back event."""
+        if consumer_index < 0:
+            return True
+
+        finish_event = self.cache_controller.layer_done_counter.events[
+            consumer_index
+        ].finish_event
+        is_done = torch.tensor(
+            int(finish_event.query()),
+            dtype=torch.int,
+            device="cpu",
+        )
+        self._all_reduce_attn_groups(is_done, torch.distributed.ReduceOp.MIN)
+        if not bool(is_done.item()):
+            return False
+
+        self.loading_check()
+        return True
+
     def evictable_size(self):
         return self.evictable_size_
 
@@ -1104,16 +1124,6 @@ class HiRadixCache(RadixCache):
         )
         storage_hit_count = storage_hit_count_tensor.item()
         storage_hit_count = storage_hit_count - (storage_hit_count % self.page_size)
-        logger.info(
-            "HiCache storage hit query: node_id=%s, query_tokens=%s, "
-            "aligned_tokens=%s, hit_tokens=%s, hit_pages=%s, prefix_keys=%s",
-            last_host_node.id,
-            len(new_input_tokens),
-            len(prefetch_key),
-            storage_hit_count,
-            storage_hit_count // self.page_size,
-            len(prefix_keys) if prefix_keys else 0,
-        )
         return storage_hit_count
 
     def ready_to_load_host_cache(self) -> int:
@@ -1348,15 +1358,6 @@ class HiRadixCache(RadixCache):
                 last_host_node.release_host()
                 # no sufficient host memory for prefetch
                 return
-        logger.info(
-            "HiCache storage prefetch issued: req=%s, node_id=%s, tokens=%s, "
-            "pages=%s,prefix_keys=%s",
-            req_id,
-            last_host_node.id,
-            prefetch_length,
-            prefetch_length // self.page_size,
-            len(prefix_keys) if prefix_keys else 0,
-        )
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,
