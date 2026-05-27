@@ -259,10 +259,16 @@ class _BaseWarmupExecutor:
                 + num_groups * max_m * n * 2
             ) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_MASKED:
+            e8m0_only = os.getenv("DG_W4_SCALE_B_E8M0_ONLY", "0") != "0"
+            rhs_scale_bytes = 0 if e8m0_only else 4
+            if os.getenv("DG_W4_SCALE_B_BF16", "1") != "0" and not e8m0_only:
+                rhs_scale_bytes += 2
+            if os.getenv("DG_W4_SCALE_B_E8M0", "1") != "0" or e8m0_only:
+                rhs_scale_bytes += 1
             return (
                 num_groups * max_m * k
                 + num_groups * n * ceil_div(k, 2)
-                + num_groups * n * ceil_div(k, 32) * 4
+                + num_groups * n * ceil_div(k, 32) * rhs_scale_bytes
                 + num_groups * 4
                 + num_groups * max_m * n * 2
             ) / _GB
@@ -376,23 +382,81 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
 
 class _GroupedMaskedFp8Fp4WarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.max_m = max_m
+        self.n = n
+        self.k = k
+        self.num_groups = num_groups
         self.lhs_q, self.lhs_s = _empty_token_fp8((num_groups, max_m, k))
         self.rhs_q = torch.empty(
             (num_groups, n, ceil_div(k, 2)), device="cuda", dtype=torch.int8
         )
-        self.rhs_s = torch.empty(
-            (num_groups, n, ceil_div(k, 32)), device="cuda", dtype=torch.float32
-        )
+        rhs_s_k = ceil_div(k, 32)
+        self.e8m0_only = os.getenv("DG_W4_SCALE_B_E8M0_ONLY", "0") != "0"
+        self.rhs_s = None
+        if not self.e8m0_only:
+            self.rhs_s = torch.empty(
+                (num_groups, n, rhs_s_k), device="cuda", dtype=torch.float32
+            )
+        self.rhs_s_bf16 = None
+        if os.getenv("DG_W4_SCALE_B_BF16", "1") != "0" and not self.e8m0_only:
+            tma_aligned_n = ceil_div(n, 8) * 8
+            self.rhs_s_bf16 = torch.empty_strided(
+                (num_groups, n, rhs_s_k),
+                (tma_aligned_n * rhs_s_k, 1, tma_aligned_n),
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+        self.rhs_s_e8m0 = None
+        if os.getenv("DG_W4_SCALE_B_E8M0", "1") != "0" or self.e8m0_only:
+            tma_aligned_n = ceil_div(n, 16) * 16
+            self.rhs_s_e8m0 = torch.empty_strided(
+                (num_groups, n, rhs_s_k),
+                (tma_aligned_n * rhs_s_k, 1, tma_aligned_n),
+                device="cuda",
+                dtype=torch.uint8,
+            )
         self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
         self.out = torch.empty(
             (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
         )
 
-
     def execute(self, m):
+        rhs_s = self.rhs_s
+        scale_b_fast_path = False
+        if (
+            os.getenv("DG_W4_K32_QUAD_SCALE_B_PREFETCH", "0") == "0"
+            and os.getenv("DG_W4_SCALE_B_POW2_PROMOTE", "0") == "0"
+        ):
+            block_m_override = int(os.getenv("DG_W4_BLOCK_M_OVERRIDE", "0")) or None
+            block_n_override = int(os.getenv("DG_W4_BLOCK_N_OVERRIDE", "0")) or None
+            bm32_skew_fast_path = (
+                os.getenv("DG_W4_PATHB_FUSE_DECODE", "0") == "0"
+                and os.getenv("DG_W4_PATHB_FAST_PATH", "1") != "0"
+                and os.getenv("DG_W4_PATHB_BM64", "0") == "0"
+                and (block_m_override is None or block_m_override == 32)
+                and (
+                    block_n_override is None
+                    or block_n_override in (128, 256)
+                )
+                and self.max_m >= 1024
+                and self.num_groups == 32
+                and self.n in (4096, 7168)
+                and self.k in (2048, 4096, 7168)
+            )
+            scale_b_fast_path = m <= 16 or bm32_skew_fast_path
+        if self.rhs_s_e8m0 is not None and scale_b_fast_path:
+            rhs_s = self.rhs_s_e8m0
+        elif self.rhs_s_bf16 is not None and scale_b_fast_path:
+            rhs_s = self.rhs_s_bf16
+        elif self.e8m0_only:
+            # Precompile walks many synthetic M values. In E8M0-only mode, skip
+            # synthetic shapes that would need the removed FP32 fallback; real
+            # runtime calls are still guarded in deep_gemm.py and will fail
+            # loudly if they cannot use the E8M0 fast path.
+            return
         deep_gemm.m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma(
             (self.lhs_q, self.lhs_s),
-            (self.rhs_q, self.rhs_s),
+            (self.rhs_q, rhs_s),
             self.out,
             masked_m=self.masked_m,
             expected_m=m,
