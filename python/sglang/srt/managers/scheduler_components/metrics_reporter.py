@@ -126,6 +126,11 @@ class SchedulerMetricsReporter:
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
         self.stats = SchedulerStats()
+        # Set by the active path (report_prefill_stats / report_decode_stats)
+        # whenever it emits a log_stats. The first idle iteration after that
+        # flushes the gauge bypassing the 30 s throttle so the post-finish
+        # drop to 0 is visible to Prometheus scrapers immediately.
+        self._idle_flush_pending = False
         self._graph_backend_label = {
             "cpu": "cpu graph",
             "npu": "npu graph",
@@ -657,6 +662,7 @@ class SchedulerMetricsReporter:
             self._update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
+            self._idle_flush_pending = True
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
 
@@ -875,6 +881,7 @@ class SchedulerMetricsReporter:
             self._update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
+            self._idle_flush_pending = True
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
 
@@ -1042,10 +1049,22 @@ class SchedulerMetricsReporter:
             self.fwd_occupancy = float("nan")
 
     def _maybe_log_idle_metrics(self):
-        """Collect and log metrics every 30 seconds during idle."""
+        """Collect and log metrics on entry to idle, then every 30 s during idle.
+
+        The active path (report_prefill_stats / report_decode_stats) logs
+        ``num_running_reqs = len(batch.reqs)`` *before* finished requests are
+        filtered out by ``get_next_batch_to_run``. Without a transition flush
+        the gauge sits at the last batch size for up to 30 s after the server
+        becomes idle, which trips clients that poll in-flight counters to
+        detect server idleness. ``_idle_flush_pending`` is set by the active
+        path on every emit, so the first idle iteration after active work
+        bypasses the throttle; subsequent idle iterations throttle as before.
+        """
+        if not self.current_scheduler_metrics_enabled:
+            return
         if (
-            not self.current_scheduler_metrics_enabled
-            or time.perf_counter() <= self.metrics_collector.last_log_time + 30
+            not self._idle_flush_pending
+            and time.perf_counter() <= self.metrics_collector.last_log_time + 30
         ):
             return
 
@@ -1083,3 +1102,4 @@ class SchedulerMetricsReporter:
                 self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
             )
         self.metrics_collector.log_stats(self.stats)
+        self._idle_flush_pending = False
