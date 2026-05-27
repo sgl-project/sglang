@@ -148,3 +148,9 @@ def test_varlen_path_zeros_masked_rows(dtype, shape):
     invalid = ~mask
     if invalid.any():
         assert (out_varlen[invalid] == 0).all(), "masked rows must be zero-filled"
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

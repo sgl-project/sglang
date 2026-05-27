@@ -185,3 +185,9 @@ def test_empty_valid_set_handled():
     out_padded = fused_scatter_to_padded(q_unpad, inv_indices, bs, s)
     assert out_padded.shape == (bs, s, num_heads, head_dim)
     assert out_padded.abs().max().item() == 0.0
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
