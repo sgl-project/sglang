@@ -33,6 +33,7 @@ def prepare_wan_ti2v_latents(
     vae: object,
     latents: torch.Tensor,
     target_dtype: torch.dtype,
+    vae_dtype: torch.dtype,
     batch: Req,
     server_args: ServerArgs,
 ) -> tuple[int, torch.Tensor, list[torch.Tensor]]:
@@ -43,10 +44,10 @@ def prepare_wan_ti2v_latents(
     assert batch.image_latent is None, "TI2V task should not have image latents"
     assert vae is not None, "VAE is not provided for TI2V task"
 
-    vae = vae.to(batch.condition_image.device)
-    z = vae.encode(batch.condition_image).mean.float()
-    if getattr(vae, "device", None) != "cpu" and server_args.vae_cpu_offload:
-        vae = vae.to("cpu")
+    condition_image = batch.condition_image.to(
+        device=get_local_torch_device(), dtype=vae_dtype
+    )
+    z = vae.encode(condition_image).mean.float()
 
     if hasattr(vae, "shift_factor") and vae.shift_factor is not None:
         if isinstance(vae.shift_factor, torch.Tensor):

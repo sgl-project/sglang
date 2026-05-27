@@ -19,7 +19,16 @@ from sglang.srt.layers.attention.fla.utils import (
     SUPPRESS_LEVEL,
     autocast_custom_fwd,
     input_guard,
+    is_intel,
 )
+
+if is_intel:
+    from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_delta_h import (
+        chunk_gated_delta_rule_fwd_h,
+    )
+    from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_fwd import (
+        chunk_gated_delta_rule_fwd_intra,
+    )
 
 CHUNK_SIZE = 64
 

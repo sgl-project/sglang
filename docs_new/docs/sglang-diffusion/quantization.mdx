@@ -76,7 +76,7 @@ backend.
       <td><code>modelopt-fp8</code></td>
       <td>Converted ModelOpt FP8 transformer directory or repo with <code>config.json</code></td>
       <td><code>--transformer-path</code></td>
-      <td>FLUX.1, FLUX.2, Wan2.2</td>
+      <td>FLUX.1, FLUX.2, Wan2.2, HunyuanVideo, Qwen Image, Qwen Image Edit</td>
       <td>None</td>
       <td>Serialized config stays <code>quant_method=modelopt</code> with <code>quant_algo=FP8</code>; <code>dit_layerwise_offload</code> is supported and <code>dit_cpu_offload</code> stays disabled</td>
     </tr>
@@ -102,22 +102,23 @@ backend.
       <td><code>--model-path</code></td>
       <td>Wan2.2 family</td>
       <td>None</td>
-      <td>Currently only compatible with the Ascend NPU family and supports both <code>w8a8</code> and <code>w4a4</code></td>
+      <td>Currently only compatible with the Ascend NPU family and supports <code>mxfp8</code>, <code>mxfp4</code>, <code>w8a8</code>, and <code>w4a4</code></td>
     </tr>
   </tbody>
 </table>
 
 ## Validated ModelOpt Checkpoints
 
-This section is the canonical support matrix for the six diffusion ModelOpt
-checkpoints currently wired up in SGLang docs and B200 CI coverage.
+This section is the canonical support matrix for the nine diffusion ModelOpt
+checkpoints currently wired up in SGLang docs and validation coverage.
 
 Published checkpoints keep the serialized quantization config as
 `quant_method=modelopt`; the FP8 vs NVFP4 split below is a documentation label
 derived from `quant_algo`.
 
-Five of the six repos live under `BBuf/*`. The FLUX.2 NVFP4 entry keeps the
-official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
+Six of the nine repos live under `lmsys/*`. The Wan2.2 entries use NVIDIA's
+official full Diffusers repos, and the FLUX.2 NVFP4 entry keeps the official
+`black-forest-labs/FLUX.2-dev-NVFP4` repo.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -143,7 +144,7 @@ official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
       <td><code>FP8</code></td>
       <td><code>black-forest-labs/FLUX.1-dev</code></td>
       <td><code>--transformer-path</code></td>
-      <td><code>BBuf/flux1-dev-modelopt-fp8-sglang-transformer</code></td>
+      <td><code>lmsys/flux1-dev-modelopt-fp8-sglang-transformer</code></td>
       <td>single-transformer override, deterministic latent/image comparison, H100 benchmark, torch-profiler trace</td>
       <td>SGLang converter keeps a validated BF16 fallback set for modulation and FF projection layers; use <code>--model-id FLUX.1-dev</code> for local mirrors</td>
     </tr>
@@ -151,23 +152,47 @@ official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
       <td><code>FP8</code></td>
       <td><code>black-forest-labs/FLUX.2-dev</code></td>
       <td><code>--transformer-path</code></td>
-      <td><code>BBuf/flux2-dev-modelopt-fp8-sglang-transformer</code></td>
+      <td><code>lmsys/flux2-dev-modelopt-fp8-sglang-transformer</code></td>
       <td>single-transformer override load and generation path</td>
       <td>published SGLang-ready transformer override</td>
     </tr>
     <tr>
       <td><code>FP8</code></td>
       <td><code>Wan-AI/Wan2.2-T2V-A14B-Diffusers</code></td>
+      <td><code>--model-path</code></td>
+      <td><code>nvidia/Wan2.2-T2V-A14B-Diffusers-FP8</code></td>
+      <td>full Diffusers repo with ModelOpt FP8 Wan2.2 components</td>
+      <td>validated through direct <code>--model-path</code> loading</td>
+    </tr>
+    <tr>
+      <td><code>FP8</code></td>
+      <td><code>hunyuanvideo-community/HunyuanVideo</code></td>
       <td><code>--transformer-path</code></td>
-      <td><code>BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer</code></td>
-      <td>primary <code>transformer</code> quantized, <code>transformer_2</code> kept BF16</td>
-      <td>primary-transformer-only path; keep <code>transformer_2</code> on the base checkpoint, and do not describe this as dual-transformer full-model FP8 unless that path is validated separately</td>
+      <td><code>lmsys/hunyuanvideo-modelopt-fp8-sglang-transformer</code></td>
+      <td>single-transformer override, BF16-vs-FP8 video comparison, H100 benchmark, torch-profiler trace</td>
+      <td>HunyuanVideo uses different ModelOpt/diffusers and SGLang runtime module names; the converter maps those names before writing FP8 scale tensors and BF16 fallback ignores</td>
+    </tr>
+    <tr>
+      <td><code>FP8</code></td>
+      <td><code>Qwen/Qwen-Image</code></td>
+      <td><code>--transformer-path</code></td>
+      <td><code>lmsys/qwen-image-modelopt-fp8-sglang-transformer</code></td>
+      <td>single-transformer override, BF16-vs-FP8 image comparison, H100 benchmark, torch-profiler trace</td>
+      <td>shares the Qwen Image FP8 fallback preset; keep <code>img_in</code>, <code>txt_in</code>, timestep embedder, <code>norm_out.linear</code>, <code>proj_out</code>, <code>img_mod</code>/<code>txt_mod</code>, and <code>img_mlp.net.2</code> in BF16</td>
+    </tr>
+    <tr>
+      <td><code>FP8</code></td>
+      <td><code>Qwen/Qwen-Image-Edit-2511</code></td>
+      <td><code>--transformer-path</code></td>
+      <td><code>lmsys/qwen-image-edit-modelopt-fp8-sglang-transformer</code></td>
+      <td>TI2I edit path, BF16-vs-FP8 image comparison, H100 benchmark</td>
+      <td>shares <code>QwenImageTransformer2DModel</code> with Qwen Image and uses the same Qwen Image FP8 fallback preset</td>
     </tr>
     <tr>
       <td><code>NVFP4</code></td>
       <td><code>black-forest-labs/FLUX.1-dev</code></td>
       <td><code>--transformer-path</code></td>
-      <td><code>BBuf/flux1-dev-modelopt-nvfp4-sglang-transformer</code></td>
+      <td><code>lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer</code></td>
       <td>mixed BF16+NVFP4 transformer override, correctness validation, 4x RTX 5090 benchmark, torch-profiler trace</td>
       <td>use <code>build_modelopt_nvfp4_transformer.py</code>; validated builder keeps selected FLUX.1 modules in BF16 and sets <code>swap_weight_nibbles=false</code></td>
     </tr>
@@ -182,38 +207,64 @@ official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
     <tr>
       <td><code>NVFP4</code></td>
       <td><code>Wan-AI/Wan2.2-T2V-A14B-Diffusers</code></td>
-      <td><code>--transformer-path</code></td>
-      <td><code>BBuf/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer</code></td>
-      <td>primary <code>transformer</code> quantized with ModelOpt NVFP4, <code>transformer_2</code> kept BF16</td>
-      <td>primary-transformer-only path; keep <code>transformer_2</code> on the base checkpoint, and current B200/Blackwell bring-up uses <code>SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn</code></td>
+      <td><code>--model-path</code></td>
+      <td><code>nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4</code></td>
+      <td>full Diffusers repo with ModelOpt NVFP4 Wan2.2 components</td>
+      <td>default FP4 GEMM backend is <code>flashinfer_trtllm</code></td>
     </tr>
   </tbody>
 </table>
 
-These six checkpoints are also the intended case set for the B200 diffusion CI
-job (`multimodal-gen-test-1-b200`).
+The FP8 rows run in the regular H100 1-GPU diffusion CI shard; the NVFP4 rows
+run in the B200 diffusion CI shard (`multimodal-gen-test-1-b200`).
 
 ## ModelOpt FP8
 
 ### Usage Examples
 
-Converted ModelOpt FP8 checkpoints should be loaded as transformer component
-overrides. If the repo or local directory already contains `config.json`, use
-`--transformer-path`.
+Converted ModelOpt FP8 transformer repos should be loaded as transformer
+component overrides. If the repo or local directory already contains
+`config.json`, use `--transformer-path`. Full Diffusers repos such as the
+NVIDIA Wan2.2 FP8 checkpoint can be passed directly with `--model-path`.
 
 ```bash
 sglang generate \
   --model-path black-forest-labs/FLUX.2-dev \
-  --transformer-path BBuf/flux2-dev-modelopt-fp8-sglang-transformer \
+  --transformer-path lmsys/flux2-dev-modelopt-fp8-sglang-transformer \
   --prompt "A Logo With Bold Large Text: SGL Diffusion" \
   --save-output
 ```
 
 ```bash
 sglang generate \
-  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-  --transformer-path BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer \
+  --model-path nvidia/Wan2.2-T2V-A14B-Diffusers-FP8 \
   --prompt "a fox walking through neon rain" \
+  --save-output
+```
+
+```bash
+sglang generate \
+  --model-path hunyuanvideo-community/HunyuanVideo \
+  --transformer-path lmsys/hunyuanvideo-modelopt-fp8-sglang-transformer \
+  --height 544 --width 960 --num-frames 17 \
+  --prompt "A cinematic shot of a red sports car driving through rain at night" \
+  --save-output
+```
+
+```bash
+sglang generate \
+  --model-path Qwen/Qwen-Image \
+  --transformer-path lmsys/qwen-image-modelopt-fp8-sglang-transformer \
+  --prompt "A tiny astronaut reading a book under a glass greenhouse" \
+  --save-output
+```
+
+```bash
+sglang generate \
+  --model-path Qwen/Qwen-Image-Edit-2511 \
+  --transformer-path lmsys/qwen-image-edit-modelopt-fp8-sglang-transformer \
+  --image-path /path/to/input.png \
+  --prompt "Turn the scene into a warm watercolor illustration" \
   --save-output
 ```
 
@@ -247,7 +298,7 @@ For mixed ModelOpt NVFP4 transformer overrides that already contain
 ```bash
 sglang generate \
   --model-path black-forest-labs/FLUX.1-dev \
-  --transformer-path BBuf/flux1-dev-modelopt-nvfp4-sglang-transformer \
+  --transformer-path lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer \
   --prompt "A Logo With Bold Large Text: SGL Diffusion" \
   --save-output
 ```
@@ -273,14 +324,11 @@ sglang generate \
   --save-output
 ```
 
-For a dual-transformer Wan2.2 export where only the primary `transformer`
-was quantized:
+For Wan2.2 NVFP4:
 
 ```bash
-SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn \
 sglang generate \
-  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-  --transformer-path BBuf/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer \
+  --model-path nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4 \
   --prompt "a fox walking through neon rain" \
   --save-output
 ```
@@ -295,20 +343,15 @@ sglang generate \
   primary `--transformer-path` override targets only `transformer`. Use a
   per-component override such as `--transformer-2-path` only when you
   intentionally want a non-default `transformer_2`.
-- On Blackwell, the validated Wan2.2 ModelOpt NVFP4 path currently prefers
-  FlashInfer FP4 GEMM via
-  `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn`.
-- This environment-variable override is a current workaround for NVFP4 cases
-  where the default sglang JIT/CUTLASS `sm100` path rejects a large-M shape at
-  `can_implement()`. The intended long-term fix is to add a validated CUTLASS
-  fallback for those shapes rather than rely on the override.
+- On Blackwell, the diffusion ModelOpt NVFP4 path defaults to FlashInfer
+  TensorRT-LLM FP4 GEMM (`flashinfer_trtllm`).
 - Direct `--model-path` loading is a compatibility path for FLUX.2 NVFP4-style
   repos or local directories.
 - If `--transformer-weights-path` is provided explicitly, it takes precedence
   over the compatibility `--model-path` flow.
 - For local directories, SGLang first looks for `*-mixed.safetensors`, then
   falls back to loading from the directory.
-- To force the generic diffusion ModelOpt FP4 path onto a specific FlashInfer
+- To force the diffusion ModelOpt FP4 path onto a different FlashInfer
   backend, set `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND`. Supported values
   include `flashinfer_cudnn`, `flashinfer_cutlass`, and `flashinfer_trtllm`.
 - On disk, the quantization config stays `quant_method=modelopt` with
@@ -522,16 +565,19 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
 
     For msmodelslim checkpoints, it's enough to specify only ```--model-path```, the detection of quantization occurs automatically for each layer using parsing of      `quant_model_description.json` config.
 
-    In the case of `Wan2.2` only `Diffusers` weights storage format are supported, whereas modelslim saves the quantized model in the original `Wan2.2` format,
-    for conversion in use `python/sglang/multimodal_gen/tools/wan_repack.py` script:
+    In the case of `Wan2.2` only `Diffusers` weights storage format are supported, whereas modelslim saves the quantized model in the original `Wan2.2` format.
+    For conversion, use the one-step `wan_repack.py` script:
 
     ```bash
     python wan_repack.py \
-      --input-path {path_to_quantized_model} \
+      --model-type Wan2.2-TI2V-5B \
+      --original-model-path {path_to_original_diffusers_model} \
+      --quant-path {path_to_quantized_model} \
       --output-path {path_to_converted_model}
     ```
 
-    After that, please copy all files from original `Diffusers` checkpoint (instead of `transformer`/`tranfsormer_2` folders)
+    Supported `--model-type` values: `Wan2.2-TI2V-5B` (single-transformer), `Wan2.2-T2V-A14B` and `Wan2.2-I2V-A14B` (Cascade dual-transformer).
+    The script automatically handles: copying the base model, converting quantized weights to Diffusers format, and restoring `config.json`.
 
 - **Usage Example**
 
@@ -548,4 +594,79 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     - [x]  ```W4A4_DYNAMIC``` linear with online quantization of activations
     - [x]  ```W8A8``` linear with offline quantization of activations
     - [x]  ```W8A8_DYNAMIC``` linear with online quantization of activations
-    - [ ]  ```mxfp8``` linear in progress
+    - [x]  ```W8A8_MXFP8``` linear with offline quantization (msmodelslim pre-quantized weights)
+    - [x]  ```mxfp8``` linear with online quantization (`--quantization mxfp8`)
+    - [x]  ```W4A4_MXFP4``` / ```W4A4_MXFP4_DUALSCALE``` linear with offline quantization (msmodelslim pre-quantized weights)
+    - [x]  ```mxfp4_npu``` linear with online quantization (`--quantization mxfp4_npu`)
+
+## MXFP8 Online Quantization
+
+For online MXFP8 quantization, load the original FP16/BF16 model and add `--quantization mxfp8`.
+Weights are quantized at load time via `npu_dynamic_mx_quant`, and activations are quantized per-token
+during inference with `npu_quant_matmul` (block_size=32).
+
+```bash
+sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --quantization mxfp8 \
+  --prompt "a fox walking through neon rain" \
+  --save-output
+```
+
+> **Hardware requirement:** Ascend A5 series or newer. `npu_dynamic_mx_quant` is not available on A2/A3.
+
+## MXFP8 Offline Quantization (msmodelslim)
+
+Pre-quantized MXFP8 weights exported by msmodelslim are auto-detected via `quant_model_description.json`
+(`W8A8_MXFP8` scheme). Use `wan_repack.py` to convert the quantized weights to Diffusers format,
+then load the converted model with `--model-path`:
+
+```bash
+sglang generate \
+  --model-path Eco-Tech/Wan2.2-T2V-A14B-Diffusers-mxfp8 \
+  --prompt "a beautiful sunset" \
+  --save-output
+```
+
+## MXFP4 Online Quantization
+
+For online MXFP4 quantization on Ascend NPU, load the original FP16/BF16 model and add
+`--quantization mxfp4_npu`. The `mxfp4_npu` key is used for Ascend because `mxfp4`
+is reserved for the ROCm/aiter backend.
+
+Weights are quantized at load time via `npu_dynamic_dual_level_mx_quant`, and activations
+are quantized per-token during inference before `npu_dual_level_quant_matmul`. MXFP4 uses
+dual-level block scales with an L1 block size of 32 and an L0 block size of 512.
+
+```bash
+sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --quantization mxfp4_npu \
+  --prompt "a fox walking through neon rain" \
+  --save-output
+```
+
+> **Hardware requirement:** Ascend A5 series or newer. `npu_dynamic_dual_level_mx_quant`
+> and `npu_dual_level_quant_matmul` are not available on A2/A3.
+>
+> **Note:** Online MXFP4 weight quantization is experimental. The offline msmodelslim
+> flow uses pre-quantized weights and may produce different numerical results.
+
+## MXFP4 Offline Quantization (msmodelslim)
+
+Pre-quantized MXFP4 weights exported by msmodelslim are auto-detected via
+`quant_model_description.json` (`W4A4_MXFP4` / `W4A4_MXFP4_DUALSCALE` scheme).
+Use `wan_repack.py` to convert the quantized weights to Diffusers format, then load
+the converted model with `--model-path`:
+
+```bash
+sglang generate \
+  --model-path {path_to_converted_mxfp4_model} \
+  --prompt "a beautiful sunset" \
+  --save-output
+```
+
+The offline MXFP4 checkpoint stores weights in an FP8 container and includes dual-level
+scales (`weight_scale`, `weight_dual_scale`). If exported with smooth quantization,
+`mul_scale` is loaded and applied before activation quantization to keep activations
+aligned with the calibrated weights.

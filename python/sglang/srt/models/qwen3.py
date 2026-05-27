@@ -23,6 +23,7 @@ from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -64,6 +65,7 @@ class Qwen3Attention(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         layer_id: int = 0,
+        start_layer: int = 0,
         rope_theta: float = 1000000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         head_dim: Optional[int] = None,
@@ -76,6 +78,7 @@ class Qwen3Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
+        self.start_layer = start_layer
         self.tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         attn_tp_rank = get_attention_tp_rank()
@@ -181,7 +184,7 @@ class Qwen3Attention(nn.Module):
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
 
-        if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
+        if self.attn.layer_id == self.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
         q, k, v = split_qkv_rmsnorm_rope(
             qkv,
@@ -212,7 +215,7 @@ class Qwen3Attention(nn.Module):
 
         qkv_3d = qkv.view(num_tokens, -1, self.head_dim)
 
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = get_token_to_kv_pool()
         k_cache, v_cache = token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
         slot_mapping = forward_batch.out_cache_loc
 
@@ -310,6 +313,7 @@ class Qwen3DecoderLayer(nn.Module):
         self,
         config: Qwen3Config,
         layer_id: int = 0,
+        start_layer: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
@@ -333,6 +337,7 @@ class Qwen3DecoderLayer(nn.Module):
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             layer_id=layer_id,
+            start_layer=start_layer,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             head_dim=head_dim,
@@ -419,7 +424,7 @@ class Qwen3DecoderLayer(nn.Module):
                 else None
             ),
         )
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
         hidden_states, residual = self.layer_communicator.postprocess_layer(
