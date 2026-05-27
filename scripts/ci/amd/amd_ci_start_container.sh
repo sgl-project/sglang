@@ -370,6 +370,8 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   "${IMAGE}"
 
 docker exec ci_sglang bash -lc '
+  # EXPERIMENT: temporarily ENABLE NUMA balancing to A/B-test its impact on AMD CI flakiness.
+  # Revert this block to "echo 0" once the experiment is done.
   numa_balancing_path=/proc/sys/kernel/numa_balancing
 
   if [[ ! -r "${numa_balancing_path}" ]]; then
@@ -377,21 +379,23 @@ docker exec ci_sglang bash -lc '
     exit 0
   fi
 
-  echo "kernel.numa_balancing=$(cat "${numa_balancing_path}")"
+  echo "[EXPERIMENT] kernel.numa_balancing=$(cat "${numa_balancing_path}") (before)"
 
-  if [[ "$(cat "${numa_balancing_path}")" != "0" ]]; then
+  if [[ "$(cat "${numa_balancing_path}")" != "1" ]]; then
     if [[ -w "${numa_balancing_path}" ]]; then
-      if echo 0 > "${numa_balancing_path}"; then
-        echo "Disabled kernel.numa_balancing for AMD CI"
+      if echo 1 > "${numa_balancing_path}"; then
+        echo "[EXPERIMENT] ENABLED kernel.numa_balancing for AMD CI (was off; explicit A/B test)"
       else
-        echo "WARNING: failed to disable kernel.numa_balancing" >&2
+        echo "WARNING: failed to enable kernel.numa_balancing" >&2
       fi
     else
-      echo "WARNING: ${numa_balancing_path} is not writable; unable to disable NUMA balancing" >&2
+      echo "WARNING: ${numa_balancing_path} is not writable; unable to enable NUMA balancing" >&2
     fi
+  else
+    echo "[EXPERIMENT] kernel.numa_balancing already 1; nothing to do"
   fi
 
-  echo "kernel.numa_balancing=$(cat "${numa_balancing_path}")"
+  echo "[EXPERIMENT] kernel.numa_balancing=$(cat "${numa_balancing_path}") (after)"
 '
 
 docker exec ci_sglang bash -lc '

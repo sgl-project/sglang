@@ -289,8 +289,7 @@ jobs:
   # =============================================== primary ====================================================
 
   stage-a-test-1-gpu-small-amd:
-    # TODO(yctseng): temporarily pinned to mi325 while debugging MI300 cache mount; revert to mi300 default once /sgl-data persistence is fixed.
-    name: ${{ format('stage-a-test-1-gpu-small-amd (linux-{0}-1gpu-sglang)', inputs.runner_arch || 'mi325') }}
+    name: ${{ format('stage-a-test-1-gpu-small-amd (linux-{0}-1gpu-sglang)', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
     needs: [check-changes, call-gate]
     if: |
       always() && !cancelled() &&
@@ -302,7 +301,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
