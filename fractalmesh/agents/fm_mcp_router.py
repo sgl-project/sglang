@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     123,
+        "agents":     124,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -237,6 +237,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "auth_manager":      7875,
             "file_processor":    7876,
             "price_monitor":     7877,
+            "ai_assistant":      7865,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],

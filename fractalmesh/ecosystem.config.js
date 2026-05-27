@@ -1207,6 +1207,7 @@ module.exports = {
             ['fm-auth-manager',   'fm_auth_manager',    '30M'],
             ['fm-file-processor', 'fm_file_processor',  '30M'],
             ['fm-price-monitor',  'fm_price_monitor',   '25M'],
+            ['fm-ai-assistant',   'fm_ai_assistant',    '35M'],
         ].map(([name, script, mem]) => ({
             name,
             script:            `agents/${script}.py`,
