@@ -4598,5 +4598,350 @@ class TestAC1HookUnit(unittest.TestCase):
         torch.testing.assert_close(sigs[1], torch.tensor([5.0, 6.0, 7.0, 8.0]))
 
 
+class TestAC1CallSites(unittest.TestCase):
+    """Verify that the production _write_token_labels call sites fire correctly.
+
+    These tests exercise the actual forward_extend, forward_decode, and
+    _forward_trtllm paths with save_kv_cache=True to ensure a future
+    removal of a production hook call would be caught.
+    """
+
+    def _make_table_and_proj(self, T, num_heads, nope_dim, v_head_dim, kv_lora_rank, label_dim, max_tokens=64):
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import allocate_token_label_table
+
+        table = allocate_token_label_table(
+            num_layers_local=1,
+            max_tokens=max_tokens,
+            num_heads_local=num_heads,
+            label_dim=label_dim,
+            page_size=64,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        channel_sel = torch.arange(label_dim, dtype=torch.int32)
+        channel_sel_all = channel_sel.view(1, 1, label_dim).expand(1, num_heads, -1).contiguous()
+
+        W = torch.randn(kv_lora_rank, num_heads * (nope_dim + v_head_dim))
+
+        class _FakeProj:
+            def __call__(self, x):
+                return (x @ W,)
+
+        return table, channel_sel_all, _FakeProj()
+
+    def _make_backend(self, table, channel_sel_all, nope_dim, kv_lora_rank):
+        from sglang.srt.layers.attention.dsa_backend import NativeSparseAttnBackend
+
+        backend = object.__new__(NativeSparseAttnBackend)
+        backend.enable_double_sparsity = True
+        backend._ds_token_label_table = table
+        backend._ds_channel_selection = channel_sel_all
+        backend._ds_qk_nope_head_dim = nope_dim
+        backend.hisparse_coordinator = None
+        return backend
+
+    def test_forward_extend_writes_token_labels(self):
+        """forward_extend with save_kv_cache=True populates the label table."""
+        from sglang.srt.layers.attention.dsa_backend import NativeSparseAttnBackend
+        from unittest.mock import MagicMock
+
+        T, num_heads, nope_dim, v_head_dim, kv_lora_rank, label_dim = 2, 2, 4, 4, 8, 2
+        cache_loc = torch.tensor([5, 10], dtype=torch.int64)
+
+        table, channel_sel_all, fake_proj = self._make_table_and_proj(
+            T, num_heads, nope_dim, v_head_dim, kv_lora_rank, label_dim
+        )
+        backend = self._make_backend(table, channel_sel_all, nope_dim, kv_lora_rank)
+
+        head_dim = 16
+        # use_mha=True routes to _forward_standard_mha after the KV-write block
+        backend.use_mha = True
+        backend.dsa_prefill_impl = "flashmla_kv"
+        backend.dsa_decode_impl = "flashmla_kv"
+        backend.forward_metadata = SimpleNamespace()
+        # Patch the MHA kernel call — it fires after the label write we're testing
+        backend._forward_standard_mha = MagicMock(
+            return_value=torch.zeros(T, num_heads * v_head_dim)
+        )
+
+        kv_pool = SimpleNamespace(
+            set_mla_kv_buffer=lambda *a, **kw: None,
+            get_key_buffer=lambda lid: torch.zeros(64, kv_lora_rank),
+        )
+        backend.token_to_kv_pool = kv_pool
+
+        layer = SimpleNamespace(
+            layer_id=0,
+            is_cross_attention=False,
+            kv_b_proj=fake_proj,
+            v_head_dim=v_head_dim,
+            tp_q_head_num=num_heads,
+            tp_k_head_num=num_heads,
+            tp_v_head_num=num_heads,
+            head_dim=head_dim,
+            scaling=1.0,
+            logit_cap=0.0,
+        )
+        forward_batch = SimpleNamespace(
+            out_cache_loc=cache_loc,
+            encoder_out_cache_loc=None,
+            forward_mode=SimpleNamespace(
+                is_target_verify=lambda: False,
+                is_draft_extend=lambda include_v2=False: False,
+            ),
+        )
+
+        q = torch.randn(T, num_heads * head_dim)
+        k = torch.randn(T, 1, kv_lora_rank)
+        v = torch.randn(T, 1, kv_lora_rank)
+
+        backend.forward_extend(q=q, k=k, v=v, layer=layer, forward_batch=forward_batch, save_kv_cache=True)
+
+        # Label table must be populated at the two cache_loc slots
+        self.assertTrue(table.written[0, 5].item(), "slot 5 not written by forward_extend")
+        self.assertTrue(table.written[0, 10].item(), "slot 10 not written by forward_extend")
+        self.assertGreater(table.signatures[0, 5].abs().sum().item(), 0.0)
+        self.assertGreater(table.signatures[0, 10].abs().sum().item(), 0.0)
+
+    def test_forward_decode_writes_token_labels(self):
+        """forward_decode with save_kv_cache=True populates the label table."""
+        from sglang.srt.layers.attention.dsa_backend import NativeSparseAttnBackend
+        from unittest.mock import MagicMock
+
+        T, num_heads, nope_dim, v_head_dim, kv_lora_rank, label_dim = 2, 2, 4, 4, 8, 2
+        cache_loc = torch.tensor([7, 15], dtype=torch.int64)
+
+        table, channel_sel_all, fake_proj = self._make_table_and_proj(
+            T, num_heads, nope_dim, v_head_dim, kv_lora_rank, label_dim
+        )
+        backend = self._make_backend(table, channel_sel_all, nope_dim, kv_lora_rank)
+
+        head_dim = nope_dim + v_head_dim  # 8: q is [T, num_heads * head_dim]
+        backend.use_mha = False
+        backend.dsa_decode_impl = "flashmla_kv"
+        backend.forward_metadata = SimpleNamespace()
+        backend._forward_flashmla_kv = MagicMock(
+            return_value=torch.zeros(T, num_heads * v_head_dim)
+        )
+
+        kv_pool = SimpleNamespace(
+            set_mla_kv_buffer=lambda *a, **kw: None,
+            get_key_buffer=lambda lid: torch.zeros(64, kv_lora_rank),
+        )
+        backend.token_to_kv_pool = kv_pool
+
+        layer = SimpleNamespace(
+            layer_id=0,
+            is_cross_attention=False,
+            kv_b_proj=fake_proj,
+            v_head_dim=v_head_dim,
+            tp_q_head_num=num_heads,
+            head_dim=head_dim,
+            scaling=1.0,
+            logit_cap=0.0,
+        )
+        forward_batch = SimpleNamespace(
+            out_cache_loc=cache_loc,
+            encoder_out_cache_loc=None,
+        )
+
+        q = torch.randn(T, num_heads * head_dim)
+        k = torch.randn(T, 1, kv_lora_rank)
+        v = torch.randn(T, 1, kv_lora_rank)
+
+        from unittest.mock import patch as mock_patch
+
+        # SGLANG_DSA_FUSE_TOPK=1 → page_table_1 = topk_indices, skipping
+        # transform_index_page_table_decode which requires real metadata.
+        with mock_patch.dict(os.environ, {"SGLANG_DSA_FUSE_TOPK": "1"}):
+            backend.forward_decode(
+                q=q, k=k, v=v, layer=layer, forward_batch=forward_batch, save_kv_cache=True
+            )
+
+        self.assertTrue(table.written[0, 7].item(), "slot 7 not written by forward_decode")
+        self.assertTrue(table.written[0, 15].item(), "slot 15 not written by forward_decode")
+        self.assertGreater(table.signatures[0, 7].abs().sum().item(), 0.0)
+        self.assertGreater(table.signatures[0, 15].abs().sum().item(), 0.0)
+
+    def test_trtllm_hook_receives_pre_quantized_k(self):
+        """_forward_trtllm passes the pre-FP8-quantized latent k to _write_token_labels.
+
+        With kv_cache_dtype=fp8_e4m3fn, mla_quantize_and_rope_for_fp8 overwrites k
+        with FP8 data. k_for_labels must be saved before that overwrite so the hook
+        receives the original float latent key for projection, not FP8 cache bytes.
+        """
+        from sglang.srt.layers.attention.dsa_backend import NativeSparseAttnBackend
+        from unittest.mock import patch as mock_patch, MagicMock
+
+        T, num_heads, nope_dim, v_head_dim = 2, 2, 4, 4
+        kv_lora_rank, qk_rope_head_dim, label_dim = 8, 4, 2
+        max_topk, real_page_size = 16, 1
+        kv_cache_dim = kv_lora_rank + qk_rope_head_dim
+
+        cache_loc = torch.tensor([3, 8], dtype=torch.int64)
+        table, channel_sel_all, fake_proj = self._make_table_and_proj(
+            T, num_heads, nope_dim, v_head_dim, kv_lora_rank, label_dim
+        )
+        backend = self._make_backend(table, channel_sel_all, nope_dim, kv_lora_rank)
+        backend.kv_cache_dtype = torch.float8_e4m3fn
+        backend.kv_lora_rank = kv_lora_rank
+        backend.qk_nope_head_dim = nope_dim
+        backend.qk_rope_head_dim = qk_rope_head_dim
+        backend.real_page_size = real_page_size
+        backend.kv_cache_dim = kv_cache_dim
+        backend.dsa_index_topk = max_topk
+        backend.workspace_buffer = torch.zeros(1)
+        backend.forward_metadata = SimpleNamespace(
+            cache_seqlens_int32=torch.ones(T, dtype=torch.int32),
+            max_seq_len_k=16,
+            page_table_1=None,
+        )
+        backend.token_to_kv_pool = SimpleNamespace(
+            set_mla_kv_buffer=lambda *a, **kw: None,
+            get_key_buffer=lambda lid: torch.zeros(T * real_page_size * kv_cache_dim),
+        )
+
+        head_dim = nope_dim + qk_rope_head_dim  # q_all head dim
+        layer = SimpleNamespace(
+            layer_id=0,
+            is_cross_attention=False,
+            kv_b_proj=fake_proj,
+            v_head_dim=v_head_dim,
+            tp_q_head_num=num_heads,
+            head_dim=head_dim,
+            scaling=1.0,
+            logit_cap=0.0,
+            k_scale_float=None,
+        )
+        forward_batch = SimpleNamespace(
+            out_cache_loc=cache_loc,
+            encoder_out_cache_loc=None,
+            positions=torch.zeros(T, dtype=torch.int64),
+        )
+
+        k_latent = torch.ones(T, 1, kv_lora_rank)  # original float latent k
+        q_inp = torch.randn(T, num_heads * nope_dim)
+        q_rope_inp = torch.randn(T, num_heads * qk_rope_head_dim)
+        k_rope_inp = torch.randn(T, 1, qk_rope_head_dim)
+        cos_sin_cache = torch.zeros(1, head_dim)
+        topk_indices = torch.zeros((T, max_topk), dtype=torch.int32)
+
+        # FP8 quantize mock: returns fp8 k to simulate the overwrite; k_for_labels must
+        # be captured before this returns.
+        def fake_fp8_quantize(q, q_rope, k_sq, k_rope_sq, positions, cos_sin, is_neox, kv_rank, rope_dim):
+            q_out = torch.randn(T, num_heads * head_dim)  # merged FP8 q (float for CPU)
+            k_fp8 = torch.zeros(T, kv_lora_rank, dtype=torch.float8_e4m3fn)
+            k_rope_out = k_rope_sq  # unchanged
+            return q_out, k_fp8, k_rope_out
+
+        captured_k = []
+
+        def spy_write(layer_arg, cache_loc_arg, k_arg):
+            captured_k.append(k_arg.clone())
+            # Still call the real method to populate the table
+            NativeSparseAttnBackend._write_token_labels(backend, layer_arg, cache_loc_arg, k_arg)
+
+        with (
+            mock_patch(
+                "sglang.srt.layers.attention.dsa_backend.mla_quantize_and_rope_for_fp8",
+                side_effect=fake_fp8_quantize,
+            ),
+            mock_patch(
+                "flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla",
+                return_value=torch.zeros(T, 1, num_heads, v_head_dim),
+            ),
+            mock_patch.dict(os.environ, {"SGLANG_DSA_FUSE_TOPK": "1"}),
+        ):
+            backend._write_token_labels = spy_write
+            backend._forward_trtllm(
+                q=q_inp,
+                k=k_latent,
+                v=None,
+                layer=layer,
+                forward_batch=forward_batch,
+                seq_lens=None,
+                save_kv_cache=True,
+                q_rope=q_rope_inp,
+                k_rope=k_rope_inp,
+                topk_indices=topk_indices,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=False,
+                llama_4_scaling=None,
+            )
+
+        self.assertEqual(len(captured_k), 1, "hook must fire exactly once")
+        k_received = captured_k[0]
+        # The hook must receive the original float latent k, not the FP8-quantized output
+        self.assertNotEqual(
+            k_received.dtype,
+            torch.float8_e4m3fn,
+            "hook received FP8 k — k_for_labels was not saved before quantize",
+        )
+        # k_for_labels == k_latent (all-ones) — not the fp8 zeros from the mock
+        self.assertTrue(
+            (k_received == 1.0).all().item(),
+            f"hook received wrong k values: {k_received}",
+        )
+
+    def test_no_labels_when_save_kv_cache_false(self):
+        """forward_extend with save_kv_cache=False must not write to the label table."""
+        from sglang.srt.layers.attention.dsa_backend import NativeSparseAttnBackend
+        from unittest.mock import MagicMock
+
+        T, num_heads, nope_dim, v_head_dim, kv_lora_rank, label_dim = 2, 2, 4, 4, 8, 2
+        cache_loc = torch.tensor([5, 10], dtype=torch.int64)
+
+        table, channel_sel_all, fake_proj = self._make_table_and_proj(
+            T, num_heads, nope_dim, v_head_dim, kv_lora_rank, label_dim
+        )
+        backend = self._make_backend(table, channel_sel_all, nope_dim, kv_lora_rank)
+
+        head_dim = 16
+        backend.use_mha = True
+        backend.dsa_prefill_impl = "flashmla_kv"
+        backend.dsa_decode_impl = "flashmla_kv"
+        backend.forward_metadata = SimpleNamespace()
+        backend._forward_standard_mha = MagicMock(
+            return_value=torch.zeros(T, num_heads * v_head_dim)
+        )
+        backend.token_to_kv_pool = SimpleNamespace(
+            set_mla_kv_buffer=lambda *a, **kw: None,
+            get_key_buffer=lambda lid: torch.zeros(64, kv_lora_rank),
+        )
+
+        layer = SimpleNamespace(
+            layer_id=0,
+            is_cross_attention=False,
+            kv_b_proj=fake_proj,
+            v_head_dim=v_head_dim,
+            tp_q_head_num=num_heads,
+            tp_k_head_num=num_heads,
+            tp_v_head_num=num_heads,
+            head_dim=head_dim,
+            scaling=1.0,
+            logit_cap=0.0,
+        )
+        forward_batch = SimpleNamespace(
+            out_cache_loc=cache_loc,
+            encoder_out_cache_loc=None,
+            forward_mode=SimpleNamespace(
+                is_target_verify=lambda: False,
+                is_draft_extend=lambda include_v2=False: False,
+            ),
+        )
+
+        q = torch.randn(T, num_heads * head_dim)
+        k = torch.randn(T, 1, kv_lora_rank)
+        v = torch.randn(T, 1, kv_lora_rank)
+
+        backend.forward_extend(
+            q=q, k=k, v=v, layer=layer, forward_batch=forward_batch, save_kv_cache=False
+        )
+
+        # With save_kv_cache=False, the KV-write block is skipped; table must remain zero
+        self.assertFalse(table.written[0, 5].item(), "slot 5 written despite save_kv_cache=False")
+        self.assertFalse(table.written[0, 10].item(), "slot 10 written despite save_kv_cache=False")
+
+
 if __name__ == "__main__":
     unittest.main()
