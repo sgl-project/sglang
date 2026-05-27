@@ -739,18 +739,15 @@ jobs:
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh
 
-      - name: Restore precision baseline cache
-        uses: actions/cache@v4
-        with:
-          path: /tmp/sglang_precision_baselines
-          key: nightly-precision-baseline-${{ github.sha }}
-          restore-keys: |
-            nightly-precision-baseline-
-
       - name: Run precision regression test
         timeout-minutes: 120
         env:
           SGLANG_PRECISION_BASELINE_DIR: /tmp/sglang_precision_baselines
+          # Empty SGLANG_PRECISION_HF_REPO → local-only (no cross-run state).
+          SGLANG_PRECISION_HF_REPO: ${{ vars.SGLANG_PRECISION_HF_REPO }}
+          SGLANG_PRECISION_HF_REVISION: ${{ vars.SGLANG_PRECISION_HF_REVISION || 'main' }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN_PRECISION_STORE }}
+          SGLANG_PRECISION_COMMIT: ${{ github.sha }}
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite nightly-precision-8-gpu-h200 --nightly --continue-on-error --timeout-per-file 3600
