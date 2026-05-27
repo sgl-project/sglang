@@ -2,12 +2,16 @@
 
 ## Why this loop exists
 
+**Framing:** the implementation we are landing is **sglang-last's DS algorithm (per-token sparsity, dense prefill, sparse decode, per-token K_label cache slot-indexed by `out_cache_loc`) — but performant**. The performance knobs sglang-last couldn't support (FlashMLA backend, FP8 KV cache, MLA model, CUDA graphs, radix cache, page sizes including 64, multi-process TP rank sync, mixed batches via per-request range masks) come "for free" from inheriting the rest of sglang's modern infrastructure once the selection granularity is right. The win vs sglang-last is not a different algorithm — it's the same algorithm at the modern operating point.
+
 Loop 3 set the scope at 3 items (M1/M2/M3) and never ran. The structural plumbing landed in Loops 1–2 (3,887 LOC, 150 unit tests, ABI locked, `bind_runtime_data` wired at `deepseek_v2.py:1541`), but the **data isn't flowing through it on real V3.2** and the **selection granularity was page-level, paying complexity for memory savings that only matter at 1M context** (no client ask).
 
 Loop 4 makes two changes at once:
 
-1. **Rotates the architecture to token-level signatures at page_size=64** (per `06-proposed-architecture-v2.md` §13). Selection is per-token, storage is per-token, FlashMLA still reads at page granularity via NSA's existing `transform_index_page_table_decode`. This deletes the custom page adapter, the chunked-prefill page accumulation logic, the page lifecycle hooks, and the within-page averaging quality delta — all in one move. It is the design point sglang-last incidentally got right and the paper proposed.
+1. **Rotates the architecture to token-level signatures at page_size=64** (per `06-proposed-architecture-v2.md` §13). Selection is per-token, storage is per-token (slot-indexed by `out_cache_loc` exactly like K and V), FlashMLA still reads at page granularity via NSA's existing `transform_index_page_table_decode`. This deletes the custom page adapter, the page lifecycle hooks, and the within-page averaging quality delta — all in one move, by becoming the same shape sglang-last had.
 2. **Reaches the MVP at the Option B operating point** (FP8 + `flashmla_kv` + overlap off + piecewise off, both DSA baseline and DS at the same operating point): DS-on matches or beats DSA-on TPS at conc=64 with NIAH-Δ ≤ 5 pp and MMLU-Δ ≤ 1 pp.
+
+**Chunked prefill is *probed*, not actively supported.** sglang-last got chunked prefill for free because its K_label cache was slot-indexed by `out_cache_loc`. The token-level rotation preserves that property, so chunked prefill *should* work implicitly. **Phase A includes a probe test** that asserts implicit support. **If the probe fails**, the Phase B comparison disables chunked prefill on both DSA and DS (`--chunked-prefill-size -1`) and chunked-prefill explicit support becomes Loop 5 scope. **No explicit chunked-prefill code lands in Loop 4 regardless of the probe outcome** — either it works implicitly and we leave it alone, or it doesn't and the baseline gets adjusted.
 
 **Anchor:** start from `dev/double-sparsity-standalone` at the head with §13 committed.
 
@@ -29,7 +33,9 @@ Note: page_size=64 is **unchanged**. It is FlashMLA's KV layout requirement; sel
 
 ### M1 — Live token-label cache population from the KV-write path
 
-Hook the per-token write at `set_mla_kv_buffer` call sites in `python/sglang/srt/layers/attention/nsa_backend.py` (Codex flagged ~L1383, ~L1583, ~L2108 in Loop 2). The hook writes one label row per token slot, indexed by `out_cache_loc`. **Chunked prefill is implicit** because the write fires once per chunk and writes the chunk's own slots — no cross-chunk accumulation needed (this is exactly what sglang-last got for free).
+Hook the per-token write at `set_mla_kv_buffer` call sites in `python/sglang/srt/layers/attention/nsa_backend.py` (Codex flagged ~L1383, ~L1583, ~L2108 in Loop 2). The hook writes one label row per token slot, indexed by `out_cache_loc`.
+
+**Chunked prefill is expected to work implicitly** because the write fires once per chunk and writes the chunk's own slots — same way sglang-last got it for free with its slot-indexed `label_buffer`. Phase A includes a probe (AC-1b) that asserts this implicit support. **No explicit chunked-prefill code is written in Loop 4**; if the probe fails, the Phase B baseline disables chunked prefill on both sides (see AC-8 / AC-9) and explicit support becomes Loop 5.
 
 The token-label cache shares the KV pool's allocator lifetime — when a slot is freed/evicted/reused on the KV side, the label slot follows automatically. No explicit retract code.
 
@@ -82,7 +88,9 @@ Re-run `bench_serving` at the same Option B operating point but with radix cache
 
 - **AC-0 (architecture rotation):** Token-level signatures land. `python -c "from sglang.srt.layers.attention.double_sparsity import TokenLabelTable, retrieve_topk; ..."` works. The selector's `retrieve_topk` returns `(selected_token_indices: int32[bs, max_top_k_tokens], valid_lengths: int32[bs])`, sequence-ascending. `page_table_adapter.py` is < 150 LOC (down from 404). The renamed files preserve `__init__.py` re-exports.
 
-- **AC-1 (M1):** Token-label cache slots transition from default to populated for newly written tokens within the same forward step. Verified by (a) a hardware-level test that runs a real forward pass and inspects the slots at the request's `out_cache_loc`, and (b) the M3 benchmark not crashing on selector reads. **Chunked-prefill positive test:** a prefill of 8192 tokens at `chunked_prefill_size=4096` writes labels to chunk 1's slots and chunk 2's slots independently; the test asserts no chunk's labels overwrite the other's.
+- **AC-1 (M1):** Token-label cache slots transition from default to populated for newly written tokens within the same forward step. Verified by (a) a hardware-level test that runs a real forward pass and inspects the slots at the request's `out_cache_loc`, and (b) the M3 benchmark not crashing on selector reads.
+
+- **AC-1b (chunked-prefill probe — NOT a code AC):** Phase A includes a one-time probe: run M3 (AC-8) once with `chunked_prefill_size=4096` (forces a ≥ 4096-token prompt across two chunks). Assert the per-token label for tokens 0..4095 written by chunk 1 is byte-equal to what it would be in a non-chunked baseline. **Pass:** chunked prefill works implicitly; AC-8 / AC-9 run with the H200 default (`chunked_prefill_size=8192`). **Fail:** AC-8 / AC-9 disable chunked prefill on both DSA baseline and DS (`--chunked-prefill-size -1`), and explicit chunked-prefill support is moved to Loop 5's scope. **No code is written in Loop 4 to fix the probe failure.**
 
 - **AC-2 (M1 cleanup):** Token-label cache shares the KV pool's allocator lifetime. Running 2× the slot budget of requests through the same server doesn't leak labels — the slot count consumed never exceeds the KV pool's slot count.
 
@@ -125,6 +133,8 @@ These are deferred per `06-proposed-architecture-v2.md` §12 and the cookbook-sc
 - **AC-8 device-side value-domain assertion kernel; M3-B perturbation negative.** Test gaps, not runtime gaps.
 - **Page-level signature design at 1M context.** Documented in §3.3 and recoverable from git history; not in scope until a client asks for 256K+ context.
 - **`SGLANG_DS_RADIX_OVERRIDE` env var.** Intentionally kept (Loop 2 task 11 deliberation).
+
+- **Explicit chunked-prefill support code.** Loop 4 only *probes* (AC-1b). If the probe fails, the baseline disables chunked prefill and explicit code becomes **Loop 5 scope**. The DSA cookbook default at the Option B operating point uses `chunked_prefill_size=8192` (auto on H200 per `_handle_gpu_memory_settings`); if Loop 4's baseline has to set this to `-1` because of the probe, that's a known operating-point asymmetry — to be closed in Loop 5, not Loop 4.
 
 ## "Done" definition for the loop (single sentence)
 
@@ -212,5 +222,9 @@ python -m sglang.launch_server \
 ```
 
 CUDA graphs are ON by default in both (full-graph; piecewise off per `--disable-piecewise-cuda-graph`). Overlap scheduler OFF in both. Radix cache ON in DSA baseline; ON in DS after AC-10.
+
+**Chunked prefill (conditional on AC-1b outcome):**
+- If AC-1b probe **passes** (chunked prefill works implicitly under token-level DS): leave the H200 auto-default (`chunked_prefill_size=8192`) on both DSA and DS.
+- If AC-1b probe **fails**: append `--chunked-prefill-size -1` to **both** launch commands. The asymmetry vs the cookbook default is intentional and recorded in the Loop 4 round summary. Explicit chunked-prefill support is then Loop 5 scope.
 
 Note: `top_k=2048` in the DS config is now **max tokens** (matches sglang-last's `--ds-heavy-token-num` semantics post-AC-0), not max pages. At page_size=64, that's at most 32 pages of FlashMLA `block_table` after `transform_index_page_table_decode` (in the worst case where each of the 2048 tokens lands in a distinct page — typically fewer pages because tokens cluster).
