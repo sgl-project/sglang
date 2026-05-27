@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     124,
+        "agents":     125,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -238,6 +238,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "file_processor":    7876,
             "price_monitor":     7877,
             "ai_assistant":      7865,
+            "referral_engine":   7878,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -562,6 +563,7 @@ _INTENTS = {
     "auth_verify":             lambda a, k: {"action": "auth_verify_queued", "token": k.get("token", "")},
     "file_process":            lambda a, k: {"action": "file_process_queued", "operation": k.get("operation", ""), "input_data": k.get("input_data", "")},
     "price_check":             lambda a, k: {"action": "price_check_queued", "watch_id": k.get("watch_id", 0)},
+    "referral_convert":        lambda a, k: {"action": "referral_convert_queued", "link_code": k.get("link_code", ""), "order_value": k.get("order_value", 0), "order_ref": k.get("order_ref", "")},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
