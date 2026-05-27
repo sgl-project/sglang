@@ -87,16 +87,10 @@ suite_xeon = {
     ],
 }
 
-# Add Intel XPU tests
-# NOTE: please sort the test cases alphabetically by the test file name
-suite_xpu = {
-    "per-commit-xpu": [
-        TestFile("xpu/test_deepseek_ocr.py", 360),
-        TestFile("xpu/test_deepseek_ocr_triton.py", 360),
-        # TestFile("xpu/test_internvl.py"),
-        TestFile("xpu/test_intel_xpu_backend.py"),
-    ],
-}
+# XPU tests migrated to test/registered/xpu/ using register_xpu_ci().
+# The legacy per-commit-xpu suite is replaced by stage-a-test-1-gpu-xpu
+# and stage-b-test-1-gpu-xpu in test/run_suite.py (registry-based).
+suite_xpu = {}
 
 suites.update(suite_amd)
 suites.update(suite_arm64)

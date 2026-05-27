@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_npu = is_npu()
 
 # Token-buf consume tracking: init to -1, assert non-negative on gather,
 # write -1 back. Catches "gather without intermediate stash" bugs. CI enables
@@ -23,7 +24,7 @@ _is_hip = is_hip()
 _DEBUG_ASSERT = os.getenv("SGLANG_IS_IN_CI", "").lower() == "true"
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=_is_npu)
 def _assert_nonneg_and_invalidate(
     values: torch.Tensor, buf: torch.Tensor, indices: torch.Tensor
 ) -> None:
@@ -33,7 +34,7 @@ def _assert_nonneg_and_invalidate(
     buf[indices] = -1
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=_is_npu)
 def _gather_spec_extras(
     indices: torch.Tensor,
     topk_p_buf: torch.Tensor,
@@ -104,6 +105,16 @@ class FutureMap:
         self.new_seq_lens_buf = torch.empty(
             (self.req_pool_size,), dtype=torch.int64, device=self.device
         )
+        # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
+        # D2H pulls (gated only on publish, off the schedule stream).
+        if _is_cuda or _is_hip:
+            self.new_seq_lens_cpu_pinned = torch.empty(
+                (self.req_pool_size,), dtype=torch.int64, pin_memory=True
+            )
+            self.fwd_prepare_d2h_stream = torch.get_device_module(self.device).Stream()
+        else:
+            self.new_seq_lens_cpu_pinned = None
+            self.fwd_prepare_d2h_stream = None
         if self.spec_algo.is_some():
             self._forward_buf_initialized = False
 
@@ -185,17 +196,31 @@ class FutureMap:
         batch.input_ids = -future_indices
 
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
-        # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
-        # schedule). Write into both CPU and GPU so SB.seq_lens stays a faithful
-        # seq_lens_cpu mirror.
+        # seq_lens_cpu may be needed on the host for kernel-launch prep (some backends).
+        # Run this D2H on a standalone stream to avoid chain-blocking forward_n ->
+        # prepare_{n+1}: a sync on the schedule stream would inherit its WAR barrier and
+        # stall the host until forward_n ends.
         fi = batch.spec_info.future_indices if batch.spec_info is not None else None
         if fi is None:
             return
         if self.publish_ready is not None:
             self.publish_ready.wait()
-        new_seq_lens = self.new_seq_lens_buf[fi]
-        batch.seq_lens = new_seq_lens
-        batch.seq_lens_cpu = new_seq_lens.cpu()
+        batch.seq_lens = self.new_seq_lens_buf[fi]
+
+        if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
+            batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            return
+
+        # Mechanism: don't sync the schedule stream; gate a private stream on the
+        # publish event and copy into the static pinned buffer.
+        self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
+        with torch.get_device_module(self.device).stream(self.fwd_prepare_d2h_stream):
+            self.new_seq_lens_cpu_pinned.copy_(self.new_seq_lens_buf, non_blocking=True)
+        self.fwd_prepare_d2h_stream.synchronize()
+
+        # FIXME: fi == batch.req_pool_indices; unify future_indices and req_pool_indices.
+        batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
     def publish(self, future_indices: torch.Tensor, new_seq_lens: torch.Tensor) -> None:
@@ -203,7 +228,7 @@ class FutureMap:
         if indices.shape[0] == 0:
             return  # DP idle
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
-        # Fast path: only spec_v2 needs the event (schedule-stream D2H sync).
+        # Only spec_v2 needs the event; it gates the seq_lens D2H on the private stream.
         if self.spec_algo.is_some():
             if self.publish_ready is None:
                 self.publish_ready = torch.get_device_module(self.device).Event()
