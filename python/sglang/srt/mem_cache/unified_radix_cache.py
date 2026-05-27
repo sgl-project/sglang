@@ -838,9 +838,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         for component in self._components_tuple:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
-        new_node.hash_value, child.hash_value = split_node_hash_value(
-            child.hash_value, split_len, self.page_size
-        )
         new_node.parent.children[key.child_key(self.page_size)] = new_node
 
         self._for_each_component_lru(
