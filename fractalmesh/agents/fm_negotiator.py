@@ -86,6 +86,8 @@ def _proposal(prospect: str, tier_key: str, urgency: bool = False) -> dict:
     now     = datetime.utcnow().strftime("%d %B %Y")
     payment_link = os.getenv("STRIPE_PAYMENT_LINK", "https://fractalmesh.net/products.html")
 
+    disc_line = f"\n  • Urgency discount applied: -${disc:.2f} AUD" if disc else ""
+
     body = f"""Dear {prospect},
 
 Thank you for your interest in FractalMesh sovereign infrastructure services.
@@ -106,7 +108,7 @@ SCOPE
 INVESTMENT
   • Project Fee: ${final:,.2f} AUD (ex GST)
   • Payment Terms: 50% upfront, 50% on delivery
-  • Secure payment: {payment_link}{"" if not disc else f"\n  • Urgency discount applied: -${disc:.2f} AUD"}
+  • Secure payment: {payment_link}{disc_line}
 
 NEXT STEP
   Reply to confirm scope, and I'll send the MSA for e-signature.

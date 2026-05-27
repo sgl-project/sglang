@@ -1236,6 +1236,11 @@ module.exports = {
             ['fm-audit',          'fm_audit_log',        '25M'],
             ['fm-l10n',           'fm_localization',     '25M'],
             ['fm-oauth',          'fm_oauth_server',     '25M'],
+            ['fm-lba-firewall',   'fm_lba_firewall',     '25M'],
+            ['fm-legacy-governor','fm_legacy_governor',  '20M'],
+            ['fm-rss-ingest',     'fm_rss_ingest',       '30M'],
+            ['fm-stripe-worker',  'fm_stripe_worker',    '25M'],
+            ['fm-negotiator',     'fm_negotiator',       '25M'],
         ].map(([name, script, mem]) => ({
             name,
             script:            `agents/${script}.py`,
