@@ -803,6 +803,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 False,
             )
 
+            # shuffle_weight_a16w4(gate_up=True) above preshuffles w13 into aiter's
+            # preshuffle + gate/up-interleaved layout. Tag the Parameter so apply()
+            # can carry the metadata across .view(float4_e2m1fn_x2) and aiter's
+            # fused_moe selects the preshuffle_on kernel family.
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
+
             layer.w13_weight_bias.data = (
                 layer.w13_weight_bias.data.view(-1, n // 2, 2)
                 .permute(0, 2, 1)
@@ -1206,6 +1213,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w13_weight = layer.w13_weight
                 w2_weight = layer.w2_weight
 
+            # .view(float4_e2m1fn_x2) creates a fresh tensor view that drops the
+            # `is_shuffled` tag set in process_weights_after_loading. Propagate it
+            # so aiter's dispatcher routes to the preshuffle_on kernel.
+            if hasattr(layer.w13_weight, "is_shuffled"):
+                w13_weight.is_shuffled = layer.w13_weight.is_shuffled
+                w2_weight.is_shuffled = layer.w2_weight.is_shuffled
+
             x_padded = torch.nn.functional.pad(
                 x, (0, self.hidden_pad), mode="constant", value=0.0
             )
@@ -1221,6 +1235,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 doweight_stage1=self.moe_runner_config.apply_router_weight_on_input,
                 hidden_pad=self.hidden_pad,
                 intermediate_pad=self.intermediate_pad,
+                # Triggers aiter's INTERLEAVE gate_mode dispatch (required for our
+                # preshuffled gate/up-interleaved weight layout) and applies the
+                # model's swiglu clamp. `gemm1_clamp_limit` here is the same scalar
+                # that aiter exposes as `swiglu_limit`; see the rename in
+                # `models/gpt_oss.py` (`self.gemm1_clamp_limit = config.swiglu_limit`).
+                swiglu_limit=(self.moe_runner_config.gemm1_clamp_limit or 0.0),
             )
             return self.runner.run(
                 dispatch_output._replace(hidden_states=x_padded), quant_info
