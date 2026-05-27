@@ -99,6 +99,7 @@ class EmbeddingCacheController:
         tp_group=None,
         all_rank_get=False,
     ):
+        self.tp_rank = tp_rank
         self.tp_world_size = tp_size
         self.tp_group = tp_group
         self.all_rank_get = all_rank_get
