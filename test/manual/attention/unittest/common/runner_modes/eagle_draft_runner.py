@@ -94,6 +94,17 @@ from ..attention_methods.dsv4_attention import (
 from ..attention_methods.dsv4_attention import (
     _token_loc as _dsv4_token_loc,
 )
+from ..attention_methods.dsa_attention import (
+    DSA_PAGE_SIZE,
+    DSA_SPARSE_ATOL,
+    DSA_SPARSE_INDEX_TOPK,
+    DSA_SPARSE_QK_NOPE_HEAD_DIM,
+    DSA_SPARSE_QK_ROPE_HEAD_DIM,
+    DSA_SPARSE_RTOL,
+    DSAAttentionCase,
+    build_dsa_sparse_attention_fixture,
+)
+from ..attention_methods.dsa_attention import _token_loc as _dsa_token_loc
 
 
 def _assert_draft_outputs_close(actual, expected, settings) -> None:
@@ -2513,6 +2524,342 @@ def run_dsv4_eagle_draft_extend_cuda_graph_runner_case(
         assert_outputs_close=_dsv4_assert_draft_extend_outputs_close,
     )
     run_eagle_draft_extend_cuda_graph_runner_case(
+        testcase,
+        case,
+        adapter=adapter,
+        build_kwargs=dict(
+            max_context_len=max_context_len,
+            dtype=dtype,
+            device=device,
+        ),
+        settings=settings,
+    )
+
+
+# ---------------------------------------------------------------------------
+# DSA EAGLE draft CUDA-graph runner adapter
+# ---------------------------------------------------------------------------
+#
+# DSA's speculative decoding uses `DeepseekSparseAttnMultiStepBackend` —
+# a thin wrapper that fans out per-step `DeepseekSparseAttnBackend`
+# instances. The standard EagleDraftCudaGraphRunner contract works
+# out-of-the-box modulo two DSA-specific bits the model_forward has to
+# bridge:
+#
+#   1. DSA's `forward_decode` expects `topk_indices` as a kwarg
+#      (production gets them from the indexer, a separate model layer).
+#      The synthetic draft test computes them on the fly from
+#      `batch.seq_lens` — trailing-topk indices in token-position space
+#      (NOT pool slots; the backend's
+#      `transform_index_page_table_decode` does the slot translation).
+#   2. The fixture's `ProjectedDSASparseAttention` has no
+#      `forward(hidden_states, forward_batch)` method. The wrapper
+#      inlines the projection + attn call, mirroring what production
+#      `DeepseekSparseAttention.forward` does.
+#
+# Chain-only (topk=1). Tree draft for DSA needs a non-trivial
+# parent-indices plumbing through the topk_indices synthesis; deferred.
+
+
+class _DSAEagleDraftForward:
+    """Minimal DSA draft model forward.
+
+    Synthesizes `topk_indices` from `batch.seq_lens` (production gets
+    them from the DSA indexer module). For chain draft (topk=1) the
+    indices for each request's query token are the trailing
+    `DSA_SPARSE_INDEX_TOPK` positions, in [0, seq_len+1) token-position
+    space — the backend translates them to pool slots via
+    `transform_index_page_table_decode`.
+    """
+
+    def __init__(
+        self,
+        *,
+        module,
+        hidden_size: int,
+        vocab_size: int,
+        dtype: torch.dtype,
+        device: str,
+    ):
+        self.module = module
+        self.token_embed = nn.Embedding(
+            vocab_size, hidden_size, dtype=dtype, device=device
+        )
+        self.lm_head = nn.Linear(
+            hidden_size, vocab_size, bias=False, dtype=dtype, device=device
+        )
+
+    def _synthesize_topk_indices(
+        self, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        """Trailing-topk indices per query in token-position space.
+
+        At a draft decode step, each request has one query token and
+        `seq_lens[req_idx] + 1` keys (the prefix + steps written so far
+        + the just-written step). The trailing-topk window covers the
+        most-recent `DSA_SPARSE_INDEX_TOPK` positions, with `-1` padding
+        when `key_count < DSA_SPARSE_INDEX_TOPK`.
+
+        Built entirely on-GPU (no CPU<->GPU copies) so the captured CUDA
+        graph stays valid — the previous CPU-list construction tripped
+        `cudaErrorOperationNotPermitted` during capture.
+        """
+        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        device = seq_lens.device
+        topk = DSA_SPARSE_INDEX_TOPK
+        key_counts = seq_lens + 1
+        key_starts = torch.clamp(key_counts - topk, min=0)
+        offsets = torch.arange(topk, dtype=torch.int32, device=device)
+        indices = key_starts[:, None] + offsets[None, :]
+        mask = indices < key_counts[:, None]
+        return torch.where(
+            mask,
+            indices,
+            torch.full_like(indices, -1),
+        )
+
+    def __call__(
+        self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool
+    ):
+        del skip_attn_backend_init
+        spec_info = forward_batch.spec_info
+        hidden_states = spec_info.hidden_states
+        if hidden_states is None:
+            raise ValueError("EAGLE draft runner tests expect hidden-state drafts.")
+
+        token_hidden = self.token_embed(forward_batch.input_ids)
+        hidden_states = hidden_states + token_hidden
+
+        # DSA projects to nope+rope separately and writes the new K to
+        # cache through `module.attn` (which delegates to the backend's
+        # `forward_decode`).
+        q_nope, q_rope = self.module.project_q(hidden_states)
+        k_nope, k_rope = self.module.project_k(hidden_states)
+
+        topk_indices = self._synthesize_topk_indices(forward_batch)
+
+        attn_output = self.module.attn(
+            q_nope,
+            k_nope,
+            k_nope,  # MLA absorbs V into K
+            forward_batch,
+            k_rope=k_rope,
+            q_rope=q_rope,
+            topk_indices=topk_indices,
+        )
+        attn_output = attn_output.reshape(
+            -1, self.module.num_heads * self.module.qk_nope_head_dim
+        )
+        hidden_states = self.module.o_proj(attn_output)
+        # Map back to spec hidden_size dim. The o_proj output is
+        # `hidden_size`; lm_head expects `hidden_size` too.
+        logits = self.lm_head(hidden_states).float()
+        return SimpleNamespace(
+            logits_output=LogitsProcessorOutput(
+                next_token_logits=logits,
+                hidden_states=hidden_states,
+            )
+        )
+
+
+def _make_dsa_model_forward(fixture, settings: EagleDraftRunnerSettings):
+    return _DSAEagleDraftForward(
+        module=fixture.actual_module,
+        hidden_size=settings.hidden_size,
+        vocab_size=settings.vocab_size,
+        dtype=settings.dtype,
+        device=settings.device,
+    )
+
+
+def _make_dsa_draft_inputs(
+    case: DSAAttentionCase,
+    settings: EagleDraftRunnerSettings,
+) -> dict[str, torch.Tensor]:
+    with _seeded_rng(9380 + len(case.name), device=settings.device):
+        topk_index = (
+            torch.arange(
+                case.batch_size * settings.topk,
+                dtype=torch.int64,
+                device=settings.device,
+            ).view(case.batch_size, settings.topk)
+            + 5
+        ) % settings.vocab_size
+        topk_p = torch.linspace(
+            0.55,
+            0.95,
+            steps=case.batch_size * settings.topk,
+            dtype=torch.float32,
+            device=settings.device,
+        ).view(case.batch_size, settings.topk)
+        topk_p = topk_p / topk_p.sum(dim=-1, keepdim=True)
+        return {
+            "hidden_states": torch.randn(
+                case.batch_size,
+                settings.hidden_size,
+                dtype=settings.dtype,
+                device=settings.device,
+            ),
+            "topk_p": topk_p,
+            "topk_index": topk_index,
+        }
+
+
+def _prepare_dsa_draft_replay_state(
+    fixture,
+    case: DSAAttentionCase,
+    _draft_inputs,
+    settings: EagleDraftRunnerSettings,
+) -> None:
+    """Populate req_to_token mappings for prefix + draft steps.
+
+    DSA chain decode writes one new token per step at the position
+    `prefix_len + step`. The `_dsa_token_loc` helper assigns a unique
+    pool slot per (req, position).
+    """
+    runner = fixture.runner
+    max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
+    for req_idx, prefix_len in enumerate(case.prefix_lens):
+        for pos in range(prefix_len):
+            runner.req_to_token_pool.req_to_token[req_idx, pos] = _dsa_token_loc(
+                req_idx,
+                pos,
+                page_size=case.page_size,
+                max_context_len=max_context_len,
+            )
+        for step in range(settings.speculative_num_steps):
+            pos = prefix_len + step
+            runner.req_to_token_pool.req_to_token[req_idx, pos] = _dsa_token_loc(
+                req_idx,
+                pos,
+                page_size=case.page_size,
+                max_context_len=max_context_len,
+            )
+
+
+def _check_dsa_draft_cache_layout(
+    case: DSAAttentionCase,
+    settings: EagleDraftRunnerSettings,
+) -> None:
+    if settings.topk != 1:
+        raise ValueError(
+            "DSA EAGLE draft runner coverage is chain-only (topk=1). Tree "
+            "draft requires parent-indices plumbing through the "
+            "topk_indices synthesis; deferred."
+        )
+    if case.page_size != DSA_PAGE_SIZE:
+        raise ValueError(
+            f"DSA backend requires page_size == {DSA_PAGE_SIZE} (got {case.page_size})."
+        )
+
+
+def _make_dsa_eagle_draft_forward_batch(
+    case: DSAAttentionCase,
+    draft_inputs: dict[str, torch.Tensor],
+    settings: EagleDraftRunnerSettings,
+) -> ForwardBatch:
+    out_cache_locs = []
+    for req_idx, prefix_len in enumerate(case.prefix_lens):
+        for step in range(settings.speculative_num_steps):
+            out_cache_locs.append(
+                _dsa_token_loc(
+                    req_idx,
+                    prefix_len + step,
+                    page_size=case.page_size,
+                    max_context_len=settings.max_context_len,
+                )
+            )
+
+    spec_info = EagleDraftInput(
+        topk_p=draft_inputs["topk_p"].clone(),
+        topk_index=draft_inputs["topk_index"].clone(),
+        hidden_states=draft_inputs["hidden_states"].clone(),
+        capture_hidden_mode=CaptureHiddenMode.LAST,
+        num_tokens_per_req=settings.topk,
+        num_tokens_for_logprob_per_req=settings.topk,
+    )
+    seq_lens = torch.tensor(
+        case.prefix_lens,
+        dtype=torch.int32,
+        device=settings.device,
+    )
+    return ForwardBatch(
+        forward_mode=ForwardMode.DECODE,
+        batch_size=case.batch_size,
+        input_ids=torch.zeros(
+            case.batch_size * settings.topk,
+            dtype=torch.int32,
+            device=settings.device,
+        ),
+        req_pool_indices=torch.arange(
+            case.batch_size,
+            dtype=torch.int32,
+            device=settings.device,
+        ),
+        seq_lens=seq_lens,
+        seq_lens_cpu=torch.tensor(case.prefix_lens, dtype=torch.int32, device="cpu"),
+        out_cache_loc=torch.tensor(
+            out_cache_locs,
+            dtype=torch.int64,
+            device=settings.device,
+        ),
+        seq_lens_sum=sum(case.prefix_lens),
+        positions=seq_lens.repeat_interleave(settings.topk).to(torch.int64),
+        spec_algorithm=SpeculativeAlgorithm.EAGLE,
+        spec_info=spec_info,
+        capture_hidden_mode=CaptureHiddenMode.LAST,
+    )
+
+
+def run_dsa_eagle_draft_cuda_graph_runner_case(
+    testcase,
+    case: DSAAttentionCase,
+    *,
+    topk: int = 1,
+    speculative_num_steps: int = 2,
+    speculative_num_draft_tokens: int = 2,
+    cuda_graph_capture_batch_size: int = 2,
+    # The DSA sparse fixture's `ProjectedDSASparseAttention.q_nope_proj`
+    # expects an input dim equal to the fixture's `hidden_size`
+    # (= DEFAULT_HIDDEN_SIZE = 64 from dense_attention). The EAGLE
+    # draft's synthetic `token_embed` / `lm_head` operate at the same
+    # `hidden_size` so the spec_info `hidden_states` shape lines up.
+    hidden_size: int = 64,
+    max_context_len: int = 256,
+    vocab_size: int = 64,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+):
+    """DSA EAGLE draft CUDA-graph runner coverage. Chain-only (topk=1)
+    for now; the DSA indexer-replacement synthesis here uses trailing
+    topk in token-position space.
+
+    Pads `hidden_size` via the existing DSA sparse fixture's
+    `qk_nope + qk_rope` head_dim. `vocab_size` is intentionally small
+    so the synthetic `token_embed`/`lm_head` stay cheap.
+    """
+    settings = EagleDraftRunnerSettings(
+        topk=topk,
+        speculative_num_steps=speculative_num_steps,
+        speculative_num_draft_tokens=speculative_num_draft_tokens,
+        capture_batch_size=cuda_graph_capture_batch_size,
+        hidden_size=hidden_size,
+        vocab_size=vocab_size,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        atol=DSA_SPARSE_ATOL,
+        rtol=DSA_SPARSE_RTOL,
+    )
+    adapter = EagleDraftCudaGraphRunnerAdapter(
+        build_fixture=build_dsa_sparse_attention_fixture,
+        make_model_forward=_make_dsa_model_forward,
+        make_draft_inputs=_make_dsa_draft_inputs,
+        prepare_replay_state=_prepare_dsa_draft_replay_state,
+        make_forward_batch=_make_dsa_eagle_draft_forward_batch,
+        check_case=_check_dsa_draft_cache_layout,
+    )
+    run_eagle_draft_cuda_graph_runner_case(
         testcase,
         case,
         adapter=adapter,

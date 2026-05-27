@@ -32,6 +32,9 @@ from common.attention_methods.dsa_attention import (
 from common.runner_modes.cuda_graph_decode_runner import (
     run_dsa_sparse_cuda_graph_decode_case,
 )
+from common.runner_modes.eagle_draft_runner import (
+    run_dsa_eagle_draft_cuda_graph_runner_case,
+)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -268,6 +271,29 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
 
     def test_sparse_tilelang_decode_case(self):
         run_dsa_sparse_tilelang_decode_case(self, self.TILELANG_DECODE_CASE)
+
+    # EAGLE production draft CUDA-graph runner integration. Wires DSA
+    # through `eagle_draft_runner.py`'s shared
+    # `EagleDraftCudaGraphRunnerAdapter` (same lifecycle as DSV4 /
+    # dense / MLA). DSA's chain-only constraint comes from the
+    # synthesized topk_indices path — tree draft needs parent-indices
+    # plumbing through that synthesis; deferred.
+    EAGLE_DRAFT_CASES = (
+        DSAAttentionCase(
+            name="runner_eagle_draft_decode_cuda_graph_dsa_chain",
+            backend="dsa",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=1,
+            page_size=DSA_PAGE_SIZE,
+            prefix_lens=(128, 192),
+        ),
+    )
+
+    def test_runner_mode_eagle_draft_cuda_graph_runner_cases(self):
+        for case in self.EAGLE_DRAFT_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_dsa_eagle_draft_cuda_graph_runner_case(self, case)
 
     # CG decode replay with FP8 KV cache. Captures and replays through
     # `flashmla_kv` (the only FP8-compatible decode kernel). The
