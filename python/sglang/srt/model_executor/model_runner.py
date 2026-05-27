@@ -2506,6 +2506,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
+            hc_hidden_size=getattr(self.model_config, "hc_hidden_size", None),
         )
         buffers.num_token_non_padded[...] = num_tokens
 
