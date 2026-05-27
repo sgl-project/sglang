@@ -470,8 +470,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             enable_memory_saver,
         )
 
+        indexer_size = (
+            self.c4_logical_size
+            if (not _is_hip or envs.SGLANG_OPT_USE_COMPRESSOR_V2.get())
+            else c4_size
+        )
         self.c4_indexer_kv_pool = DeepSeekV4IndexerPool(
-            self.c4_logical_size if not _is_hip else c4_size,
+            indexer_size,
             c4_page_size,
             dtype,
             indexer_head_dim,
@@ -578,6 +583,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 enable_memory_saver=enable_memory_saver,
                 ratio=ratio,
                 online=(ratio == 128 and ONLINE_C128),
+                swa_page_size=self.swa_page_size,
             )
 
             if ratio == 4:
