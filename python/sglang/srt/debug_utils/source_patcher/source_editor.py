@@ -51,6 +51,11 @@ def _resolve_replacement(*, edit: EditSpec, match_text: str) -> str:
 
 
 def _find_match(*, source_lines: list[str], match_lines: list[str]) -> int:
+    """Find the start index of match_lines in source_lines (strip-compared).
+
+    Returns the index of the first matching line.
+    Raises PatchApplicationError if not found or found multiple times.
+    """
     stripped_source: list[str] = [line.strip() for line in source_lines]
     stripped_match: list[str] = [line.strip() for line in match_lines]
     match_len: int = len(stripped_match)
