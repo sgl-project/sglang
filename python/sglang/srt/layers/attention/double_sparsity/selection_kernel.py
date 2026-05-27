@@ -346,6 +346,7 @@ def _compute_logical_token_scores(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
     seq_lens: torch.Tensor,
+    max_seq_len: int = 0,
 ) -> torch.Tensor:
     """Score tokens in logical-sequence-position space.
 
@@ -356,9 +357,15 @@ def _compute_logical_token_scores(
 
     This keeps the top-K output in logical-position domain so that
     ``logical_to_physical`` can convert it correctly.
+
+    ``max_seq_len`` must be a static Python int when called inside a
+    ``torch.cuda.graph`` capture region. Providing it skips the
+    ``seq_lens.max().item()`` host sync that would raise
+    ``CUDA error: operation not permitted when stream is capturing``.
     """
     bs = queries.shape[0]
-    max_seq_len = int(seq_lens.max().item()) if bs > 0 else 0
+    if max_seq_len <= 0:
+        max_seq_len = int(seq_lens.max().item()) if bs > 0 else 0
     device = queries.device
 
     if max_seq_len == 0:
@@ -416,6 +423,7 @@ def retrieve_topk_via_labels(
     req_pool_indices: Optional[torch.Tensor] = None,
     req_to_token: Optional[torch.Tensor] = None,
     seq_lens: Optional[torch.Tensor] = None,
+    max_seq_len: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """End-to-end selector flow: score → all-reduce → per-request mask → top-K → ascend.
 
@@ -454,6 +462,7 @@ def retrieve_topk_via_labels(
             req_pool_indices=req_pool_indices,
             req_to_token=req_to_token,
             seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
         )
         scores = all_reduce_token_scores(scores, process_group=process_group)
     else:
@@ -488,6 +497,53 @@ def retrieve_topk_via_labels(
             total_valid_pages=total_valid_tokens,
         )
     return indices, valid_lengths
+
+
+def retrieve_topk_graph_safe(
+    *,
+    queries: torch.Tensor,
+    token_signatures: torch.Tensor,
+    written: torch.Tensor,
+    channel_selection: torch.Tensor,
+    channel_weights: torch.Tensor,
+    layer_id: int,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    max_top_k: int,
+    out_indices: torch.Tensor,
+    out_lengths: torch.Tensor,
+    process_group=None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Capture-safe retrieve_topk that writes results into caller-owned output buffers.
+
+    ``max_seq_len`` must be a static Python int — no ``.item()`` call is made
+    inside, making this function safe to use inside a ``torch.cuda.graph``
+    capture region.  Pass ``state.selected_indices`` and
+    ``state.valid_lengths`` as ``out_indices`` / ``out_lengths`` to route
+    results directly into the pre-allocated :class:`DSGraphState` buffers so
+    graph replay writes to the same stable addresses every step.
+    """
+    indices, valid = retrieve_topk_via_labels(
+        queries=queries,
+        token_signatures=token_signatures,
+        written=written,
+        channel_selection=channel_selection,
+        channel_weights=channel_weights,
+        layer_id=layer_id,
+        max_top_k=max_top_k,
+        process_group=process_group,
+        req_pool_indices=req_pool_indices,
+        req_to_token=req_to_token,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+    )
+    bs = indices.shape[0]
+    mtk = indices.shape[1]
+    out_indices[:bs, :mtk].copy_(indices)
+    out_lengths[:bs].copy_(valid)
+    return out_indices, out_lengths
 
 
 # Public alias for the end-to-end selector pipeline.

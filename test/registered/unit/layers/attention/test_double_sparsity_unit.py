@@ -3030,6 +3030,127 @@ class TestCUDAGraphCapture(unittest.TestCase):
             with assert_no_alloc_in_region("cpu-noop"):
                 _ = torch.empty(4)  # no-op on CPU; no error expected
 
+    def _make_bound_selector_cuda(self, device):
+        """Return (selector, req_to_token) for CUDA graph capture tests.
+
+        Same layout as ``_make_bound_selector_with_known_sigs`` but on the
+        given device.  Physical sigs: [9.0, 8.0, 1.0, 2.0].
+        req_to_token = [[2, 3, 0, 1]] → logical top-2 = [2, 3].
+        """
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import ChannelMask
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+        L, T, H, Ld, hd = 1, 4, 1, 1, 1
+        cfg_str = (
+            '{"top_k": 2, "page_size": 64, '
+            '"channel_mask_path": "/tmp/x.safetensors", "device_buffer_size": 4096}'
+        )
+        cfg = parse_double_sparsity_config(cfg_str)
+        sel = DoubleSparsitySelector(
+            config=cfg, num_local_heads=H, head_dim=hd, device=device,
+        )
+        table = allocate_token_label_table(
+            num_layers_local=L, max_tokens=T, num_heads_local=H, label_dim=Ld,
+            page_size=64, dtype=torch.float32, device=device,
+        )
+        table.signatures[0, :, 0, 0] = torch.tensor([9.0, 8.0, 1.0, 2.0], device=device)
+        table.written[0, :] = True
+        mask = ChannelMask(
+            channel_selection=torch.zeros(L, H, Ld, dtype=torch.int32, device=device),
+            channel_weights=torch.ones(L, H, Ld, dtype=torch.float32, device=device),
+            schema_version="1", dtype="fp8_e4m3", head_dim=hd, page_size=64,
+            label_dim=Ld, content_sha256="test",
+        )
+        sel.bind_runtime_data(table, mask)
+        req_to_token = torch.tensor([[2, 3, 0, 1]], dtype=torch.int32, device=device)
+        return sel, req_to_token
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_cuda_graph_100_step_replay_matches_eager(self):
+        """CUDA graph replay 100x produces results bit-equal to the eager path."""
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            allocate_graph_state, capture_decode_step,
+        )
+        device = torch.device("cuda")
+        sel, req_to_token = self._make_bound_selector_cuda(device)
+        # max_seq_len=4 matches the 4-token fixture; stored in state for graph-safe path.
+        state = allocate_graph_state(
+            max_bs=1, max_top_k=2, max_seq_len=4, device=device,
+        )
+        queries = torch.ones(1, 1, 1, dtype=torch.float32, device=device)
+        req_pool = torch.zeros(1, dtype=torch.int32, device=device)
+        sparse_mask = torch.ones(1, 4, dtype=torch.int32, device=device)
+        seq_lens = torch.tensor([4], dtype=torch.int32, device=device)
+
+        replay = capture_decode_step(
+            sel, state=state,
+            queries=queries, layer_id=0,
+            req_pool_indices=req_pool,
+            sparse_mask=sparse_mask,
+            seq_lens=seq_lens,
+            req_to_token=req_to_token,
+        )
+        # Reference: eager call without graph.
+        idx_eager, len_eager = sel.retrieve_topk(
+            queries=queries, layer_id=0,
+            req_pool_indices=req_pool,
+            sparse_mask=sparse_mask,
+            seq_lens=seq_lens,
+            req_to_token=req_to_token,
+        )
+        torch.cuda.synchronize()
+
+        for step in range(100):
+            idx_r, len_r = replay()
+            torch.cuda.synchronize()
+            self.assertTrue(
+                torch.equal(idx_r[:1, :2], idx_eager),
+                f"step {step}: replay {idx_r[:1,:2].tolist()} != eager {idx_eager.tolist()}",
+            )
+            self.assertTrue(
+                torch.equal(len_r[:1], len_eager),
+                f"step {step}: replay lengths {len_r[:1].tolist()} != eager {len_eager.tolist()}",
+            )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_cuda_graph_replay_zero_allocations(self):
+        """CUDA graph replay shows zero new CUDA allocations (graph reuses captured memory)."""
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            allocate_graph_state, capture_decode_step, assert_no_alloc_in_region,
+        )
+        device = torch.device("cuda")
+        sel, req_to_token = self._make_bound_selector_cuda(device)
+        state = allocate_graph_state(
+            max_bs=1, max_top_k=2, max_seq_len=4, device=device,
+        )
+        queries = torch.ones(1, 1, 1, dtype=torch.float32, device=device)
+        req_pool = torch.zeros(1, dtype=torch.int32, device=device)
+        sparse_mask = torch.ones(1, 4, dtype=torch.int32, device=device)
+        seq_lens = torch.tensor([4], dtype=torch.int32, device=device)
+
+        replay = capture_decode_step(
+            sel, state=state,
+            queries=queries, layer_id=0,
+            req_pool_indices=req_pool,
+            sparse_mask=sparse_mask,
+            seq_lens=seq_lens,
+            req_to_token=req_to_token,
+        )
+        torch.cuda.synchronize()
+
+        # Graph replay must not trigger any new CUDA allocations.
+        # Intermediate tensors allocated during capture are reused in-place.
+        with assert_no_alloc_in_region("cuda-graph-replay"):
+            idx, lens = replay()
+        torch.cuda.synchronize()
+
+        self.assertEqual(int(lens[0].item()), 2)
+        self.assertTrue(
+            torch.equal(idx[0, :2], torch.tensor([2, 3], dtype=torch.int32, device=device)),
+            f"unexpected indices: {idx[0, :2].tolist()}",
+        )
+
 
 _CUDA_AVAILABLE = torch.cuda.is_available()
 

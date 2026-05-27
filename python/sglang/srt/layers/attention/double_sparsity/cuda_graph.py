@@ -54,12 +54,14 @@ class DSGraphState:
     valid_lengths: torch.Tensor  # int32 [max_bs]
     scratch_partial_scores: Optional[torch.Tensor] = None  # [max_bs, num_blocks, partial_k]
     scratch_partial_indices: Optional[torch.Tensor] = None  # [max_bs, num_blocks, partial_k]
+    max_seq_len: int = 0  # static sequence width for graph-safe logical scoring
 
 
 def allocate_graph_state(
     *,
     max_bs: int,
     max_top_k: int,
+    max_seq_len: int = 0,
     num_score_blocks: int = 1,
     partial_topk: int = 0,
     device: Optional[torch.device] = None,
@@ -70,6 +72,11 @@ def allocate_graph_state(
     concurrencies (16 / 32 / 64 per the plan). ``num_score_blocks`` and
     ``partial_topk`` size the two-stage scratch; default 0 disables the
     stage-1 partial buffers (single-pass selection path).
+
+    ``max_seq_len`` sets :attr:`DSGraphState.max_seq_len`, which
+    ``capture_decode_step`` uses as a static Python int to avoid the
+    ``seq_lens.max().item()`` host sync during CUDA graph capture. Set to
+    the maximum sequence length at the configured concurrency.
     """
 
     if max_bs <= 0:
@@ -103,6 +110,7 @@ def allocate_graph_state(
         valid_lengths=valid,
         scratch_partial_scores=scratch_scores,
         scratch_partial_indices=scratch_indices,
+        max_seq_len=max_seq_len,
     )
 
 
@@ -116,6 +124,7 @@ def capture_decode_step(
     sparse_mask: torch.Tensor,
     seq_lens: torch.Tensor,
     req_to_token: Optional[torch.Tensor] = None,
+    max_seq_len: int = 0,
 ) -> Callable[[], Tuple[torch.Tensor, torch.Tensor]]:
     """Capture one ``retrieve_topk`` call and return a replayable closure.
 
@@ -128,9 +137,23 @@ def capture_decode_step(
     physical-domain path, which produces the wrong top-K during graph replay
     when physical slots differ across TP ranks.
 
+    ``max_seq_len`` provides the static sequence width for the graph-safe
+    logical scoring path.  Resolution priority: ``state.max_seq_len`` (set
+    at :func:`allocate_graph_state` time) > ``max_seq_len`` parameter >
+    dynamic ``seq_lens.max().item()`` (host sync — only safe on CPU / before
+    the CUDA graph capture region).
+
     On non-CUDA devices the function returns an eager closure that does no
     capture; this keeps unit tests portable.
     """
+
+    # Resolve static max_seq_len BEFORE any capture region.
+    # state.max_seq_len is the preferred source (set at allocate_graph_state time).
+    # Fall through to the parameter, then to a one-time .item() that is safe here
+    # because we have not yet entered a torch.cuda.graph() block.
+    _max_seq_len: int = state.max_seq_len if state.max_seq_len > 0 else max_seq_len
+    if _max_seq_len <= 0 and seq_lens.numel() > 0:
+        _max_seq_len = int(seq_lens.max().item())
 
     if state.selected_indices.device.type != "cuda":
         logger.debug(
@@ -146,6 +169,7 @@ def capture_decode_step(
                 sparse_mask=sparse_mask,
                 seq_lens=seq_lens,
                 req_to_token=req_to_token,
+                max_seq_len=_max_seq_len,
             )
             bs = out_idx.shape[0]
             mtk = out_idx.shape[1]
@@ -168,6 +192,7 @@ def capture_decode_step(
             sparse_mask=sparse_mask,
             seq_lens=seq_lens,
             req_to_token=req_to_token,
+            max_seq_len=_max_seq_len,
         )
         bs = out_idx.shape[0]
         mtk = out_idx.shape[1]
@@ -184,6 +209,7 @@ def capture_decode_step(
             sparse_mask=sparse_mask,
             seq_lens=seq_lens,
             req_to_token=req_to_token,
+            max_seq_len=_max_seq_len,
         )
         bs = out_idx.shape[0]
         mtk = out_idx.shape[1]
