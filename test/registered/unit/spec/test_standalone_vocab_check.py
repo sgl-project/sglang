@@ -12,7 +12,7 @@ from sglang.srt.speculative.standalone_worker import StandaloneWorker
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _VOCAB = {"hello": 0, "world": 1, "foo": 2, "<eos>": 3}
 _VOCAB_DIFFERENT_MAPPING = {"hello": 0, "world": 1, "foo": 99, "<eos>": 3}
