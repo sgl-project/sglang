@@ -2219,13 +2219,8 @@ class Scheduler(
 
         deleted_reqs = set()
         deadline = time.perf_counter() - timeout_s
+        # audit AB7: chunked-resume no longer in waiting_queue (C4), bypass removed.
         for req in self.waiting_queue:
-            # Chunked-resume reqs sit in waiting_queue across iters while
-            # actively prefilling — they are not idle. Their entry_time is
-            # from their original arrival, so a long prefill would falsely
-            # trigger the timeout and leak KV + row.
-            if req.has_pending_chunk:
-                continue
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
                 if self.enable_hicache_storage:
@@ -2454,9 +2449,8 @@ class Scheduler(
             # Drop chunked-resume reqs before merging last_batch into
             # running_batch. running_batch runs decode forward and admitting
             # a mid-prefill req there breaks shapes + KV accounting. The
-            # dropped reqs persist in self.waiting_queue (retention at
-            # ~line 2775: `x not in can_run_set or x.has_pending_chunk`)
-            # and re-enter via next iter's Stage A stash + admission.
+            # dropped reqs persist in self.active_reqs and re-enter via the
+            # inline chunked admission in _get_new_batch_prefill_raw.
             #
             # PP cross-mb: also drop reqs whose LAST chunk forward is still
             # in flight in another mb (when more decodes will follow — i.e.,
@@ -2588,15 +2582,19 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
-        # Identify any in-flight chunked-resume req held in waiting_queue —
-        # priority + has_pending_chunk make it sit at the head, but its
-        # presence relaxes the "is queue empty / pool full" early exits below
-        # (we must keep scheduling it to make progress, or memory leaks).
-        has_chunked_resume = any(r.has_pending_chunk for r in self.waiting_queue)
+        # audit H4 + Q5: chunked-resume now lives in active_reqs (not
+        # waiting_queue, post-C4). Compute the single-flight view once here
+        # and reuse below for early-exit relaxation, dynamic chunking, and
+        # the inline chunked admission entry.
+        chunked_in_active = list(self.chunked_reqs())
+        assert len(chunked_in_active) <= 1, (
+            f"single-flight violated: {len(chunked_in_active)} chunked reqs "
+            f"in active ({[r.rid for r in chunked_in_active]})"
+        )
 
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and not has_chunked_resume:
+        ) and not chunked_in_active:
             return None
 
         running_bs = len(self.running_batch.reqs)
@@ -2607,7 +2605,7 @@ class Scheduler(
         # check should not block them.
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
-            and not has_chunked_resume
+            and not chunked_in_active
             and not self.enable_priority_preemption
         ):
             self.running_batch.batch_is_full = True
@@ -2624,17 +2622,15 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
-        if self.enable_dynamic_chunking:
-            # Single-flight invariant: at most one chunked-resume req in the
-            # queue at any time (priority + budget enforce this naturally).
-            chunked_resume = next(
-                (r for r in self.waiting_queue if r.has_pending_chunk), None
-            )
-            if chunked_resume is not None:
-                history_len = len(chunked_resume.prefix_indices)
-                dynamic_size = self.predict_next_chunk_size(history_len)
-                if dynamic_size is not None:
-                    chunked_prefill_size = dynamic_size
+        if self.enable_dynamic_chunking and chunked_in_active:
+            # audit H5: chunked-resume lives in active_reqs; reuse the
+            # single-flight view computed above instead of scanning
+            # waiting_queue.
+            chunked_resume = chunked_in_active[0]
+            history_len = len(chunked_resume.prefix_indices)
+            dynamic_size = self.predict_next_chunk_size(history_len)
+            if dynamic_size is not None:
+                chunked_prefill_size = dynamic_size
 
         # Prefill policy
         adder = PrefillAdder(
@@ -2653,14 +2649,6 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
-        )
-
-        # audit Q5: single-flight invariant — at most one chunked-resume req
-        # in active at any time.
-        chunked_in_active = list(self.chunked_reqs())
-        assert len(chunked_in_active) <= 1, (
-            f"single-flight violated: {len(chunked_in_active)} chunked reqs "
-            f"in active ({[r.rid for r in chunked_in_active]})"
         )
 
         # Inline chunked admission (Plan §C3, do NOT recreate
