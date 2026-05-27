@@ -9,10 +9,17 @@ from pathlib import Path
 from test_deepseek_ocr import TestDeepSeekOCR
 
 from sglang.srt.utils.hf_transformers import get_tokenizer
+from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
+)
+
+register_xpu_ci(
+    est_time=360,
+    suite="stage-b-test-1-gpu-xpu",
+    disabled="Temporarily disabled until Triton-XPU upgrade",
 )
 
 
