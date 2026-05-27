@@ -6,6 +6,7 @@ python3 -m unittest test_intel_xpu_backend.TestIntelXPUBackend.test_latency_qwen
 import unittest
 from functools import wraps
 
+from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
@@ -14,6 +15,8 @@ from sglang.test.test_utils import (
     is_in_ci,
     run_bench_one_batch,
 )
+
+register_xpu_ci(est_time=600, suite="stage-b-test-1-gpu-xpu")
 
 
 def intel_xpu_benchmark(
