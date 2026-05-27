@@ -87,6 +87,9 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
+from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
+    try_fused_hc_post_pre,
+)
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
 
 if not _is_hip:
@@ -131,6 +134,28 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
         output_unquantized_inp1=True,
     )
     return x_quant, x_bf16
+
+
+_FREQS_CIS_TO_COS_SIN: dict[
+    Tuple[int, torch.dtype, torch.device], Tuple[torch.Tensor, torch.Tensor]
+] = {}
+
+
+def _freqs_cis_to_cos_sin(
+    freqs_cis: torch.Tensor, dtype: torch.dtype, device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Derive (cos, sin) bf16 contiguous tables from a complex64 `freqs_cis`,
+    cached by `(id(freqs_cis), dtype, device)` so that all layers sharing the
+    same `freqs_cis` (via `precompute_freqs_cis`'s lru_cache) reuse one pair."""
+    key = (id(freqs_cis), dtype, device)
+    cached = _FREQS_CIS_TO_COS_SIN.get(key)
+    if cached is not None:
+        return cached
+    fr = torch.view_as_real(freqs_cis)
+    cos = fr[..., 0].to(device=device, dtype=dtype).contiguous()
+    sin = fr[..., 1].to(device=device, dtype=dtype).contiguous()
+    _FREQS_CIS_TO_COS_SIN[key] = (cos, sin)
+    return cos, sin
 
 
 if TYPE_CHECKING:
@@ -319,7 +344,7 @@ class MQALayer(nn.Module):
                 )
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
-        self.fuse_wqa_wkv = not _is_hip and envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        self.fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         if self.fuse_wqa_wkv:
             self.wqkv_a = ReplicatedLinear(
                 self.hidden_size,
@@ -641,6 +666,7 @@ class MQALayer(nn.Module):
                 x=x,
                 q_lora=q_lora,
                 forward_batch=forward_batch,
+                attn_backend=attn_backend,
                 skip_compressor=True,
             )
         elif self.compressor is not None:
@@ -795,6 +821,7 @@ class MQALayer(nn.Module):
             and get_is_capture_mode()
             and x.shape[0] <= self._multi_stream_bs_limit
             and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
+            and not (_is_hip and self.compressor is None)
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
@@ -1187,15 +1214,33 @@ class DeepseekV4DecoderLayer(nn.Module):
             x_quant=x_quant,
         )
 
-        hidden_states = self.hc_post(hidden_states, residual, post, comb)
-        residual = hidden_states
-        hidden_states, post, comb, norm_fused = self.hc_pre(
+        fused_mhc = try_fused_hc_post_pre(
             hidden_states,
-            self.hc_ffn_fn,
+            residual,
+            post,
+            comb,
+            self.hc_ffn_fn.T,
             self.hc_ffn_scale,
             self.hc_ffn_base,
-            norm=self.post_attention_layernorm,
+            self.hc_mult,
+            self.rms_norm_eps,
+            self.hc_eps,
+            2.0,
+            self.hc_sinkhorn_iters,
+            _is_gfx95_supported,
         )
+        if fused_mhc is not None:
+            residual, hidden_states, post, comb, norm_fused = fused_mhc
+        else:
+            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            residual = hidden_states  # [n, hc, d]
+            hidden_states, post, comb, norm_fused = self.hc_pre(
+                hidden_states,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                norm=self.post_attention_layernorm,
+            )  # -> [n, d]
         if not norm_fused:
             hidden_states = self.post_attention_layernorm(hidden_states)
 
@@ -1759,7 +1804,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         cache_compressor_weight = {}
         COMPRESSOR_PART = ".compressor.w"
 
-        fuse_wqa_wkv = not _is_hip and envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
 
         def auto_weight_loader(module):
