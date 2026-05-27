@@ -8,30 +8,37 @@ python/sglang/srt/disaggregation/nixl/conn.py, which is required on
 Intel XPU where device addresses have bit 63 set (e.g. 0xffff81ab54e01000)
 and would overflow np.int64.
 
+Requirements:
+    The ``sglang-router`` package must be installed in the environment (it is
+    provided by the XPU/disagg test image, same as other PD tests).
+
 Usage:
     python3 -m pytest test/registered/disaggregation/test_disaggregation_xpu.py -v
 """
 
-import subprocess
 import unittest
 
 import requests
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
 
-register_cuda_ci(
+register_xpu_ci(
     est_time=300,
-    stage="base-a",
-    runner_config="1-gpu-small",
-    disabled="Intel XPU only — not available in standard CUDA CI",
+    stage="stage-b",
+    runner_config="1-gpu-xpu",
+    disabled=(
+        "Requires NIXL XPU support which depends on upstream PRs not yet merged: "
+        "NIXL https://github.com/ai-dynamo/nixl/pull/1536 and "
+        "UCX https://github.com/openucx/ucx/pull/11218"
+    ),
 )
 
-_XPU_AVAILABLE = torch.xpu.is_available()
+_XPU_AVAILABLE = hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
 @unittest.skipUnless(
@@ -49,11 +56,6 @@ class TestDisaggregationNixlBasic(PDDisaggregationServerBase):
         cls.rdma_devices = []
         cls.extra_prefill_args = ["--device", "xpu"]
         cls.extra_decode_args = ["--device", "xpu"]
-        subprocess.check_call(
-            ["pip", "install", "sglang-router"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
         cls.launch_all()
 
     def test_completion_returns_text(self):
