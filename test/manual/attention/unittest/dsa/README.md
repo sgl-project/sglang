@@ -101,10 +101,6 @@ hardware/SDK. The variant tests live in `test_dsa.py` as
 
 ## Next Work
 
-- **DSA production EAGLE draft-extend graph-runner integration** —
-  the draft-decode runner is now wired (see "Production runner
-  integration" below); draft-extend follows the same shape as DSV4's
-  `run_dsv4_eagle_draft_extend_cuda_graph_case`.
 - **HiSparse coordinator path** — `set_dsa_prefill_impl` forces
   `use_mha=False` when `self.hisparse_coordinator is not None`; the
   fixture sets it to `None`. Adding HiSparse coverage would exercise
@@ -115,10 +111,16 @@ hardware/SDK. The variant tests live in `test_dsa.py` as
 
 ## Production Runner Integration
 
-- DSA EAGLE draft CUDA-graph runner: wired via the shared
+- **DSA EAGLE draft CUDA-graph runner**: wired via the shared
   `EagleDraftCudaGraphRunnerAdapter`. Chain-only (topk=1).
   `_DSAEagleDraftForward.__call__` synthesizes `topk_indices` on-GPU
   (trailing-topk in token-position space) since production gets them
   from the DSA indexer that's outside attention. Tree draft requires
   parent-indices plumbing through the topk_indices synthesis and is
   deferred.
+- **DSA EAGLE draft-extend CUDA-graph runner**: wired via the shared
+  `EagleDraftExtendCudaGraphRunnerAdapter`. Multi-query-per-request,
+  routes through `forward_extend` with the `is_draft_extend(include_v2)`
+  branch selecting `dsa_decode_impl`. `_DSAEagleDraftExtendForward`
+  uses `batch.positions` (not `batch.seq_lens`) to compute per-token
+  trailing-topk indices. Chain-only.

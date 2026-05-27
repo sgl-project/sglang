@@ -358,6 +358,14 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Added DSA EAGLE production draft-extend CUDA-graph runner
+  integration. Mirrors the draft-decode runner but with three
+  draft-extend-specific bits: multi-query-per-request hidden_states,
+  routing through `forward_extend` with the
+  `is_draft_extend(include_v2)` branch selecting `dsa_decode_impl`,
+  and a single-backend `_create_dsa_prefill_backend` (not multi-step).
+  The topk_indices synthesis uses `batch.positions` to compute the
+  absolute key_count per query token. Chain-only.
 - Added DSA EAGLE production draft CUDA-graph runner integration.
   Wires DSA sparse into the shared
   `EagleDraftCudaGraphRunnerAdapter` lifecycle (same shape as DSV4 /
@@ -1091,6 +1099,9 @@ Latest verification:
 - `python test/manual/attention/unittest/gdn/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_flashinfer.py -v`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
+  - Ran 154 tests in 37.705s (21 skipped) after adding DSA EAGLE
+    production draft-extend CUDA-graph runner integration.
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
   - Ran 153 tests in 37.248s (21 skipped) after adding DSA EAGLE
     production draft CUDA-graph runner + tokenspeed_mla FP8 KV cache
