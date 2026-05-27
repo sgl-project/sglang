@@ -1198,6 +1198,8 @@ module.exports = {
             ['fm-blockchain',     'fm_blockchain_bridge','30M'],
             ['fm-email-campaign', 'fm_email_campaign',  '30M'],
             ['fm-support-desk',   'fm_support_desk',    '35M'],
+            ['fm-subscription',   'fm_subscription_engine','35M'],
+            ['fm-api-marketplace','fm_api_marketplace', '30M'],
         ].map(([name, script, mem]) => ({
             name,
             script:            `agents/${script}.py`,

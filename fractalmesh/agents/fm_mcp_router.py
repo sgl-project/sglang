@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     114,
+        "agents":     116,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -228,6 +228,8 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "blockchain_bridge": 7866,
             "email_campaign":    7867,
             "support_desk":      7868,
+            "subscription_engine":7869,
+            "api_marketplace":   7870,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -543,6 +545,8 @@ _INTENTS = {
     "wallet_watch":            lambda a, k: {"action": "wallet_watch_queued", "address": k.get("address", ""), "label": k.get("label", ""), "chain": k.get("chain", "eth")},
     "campaign_send":           lambda a, k: {"action": "campaign_send_queued", "campaign_id": k.get("campaign_id", 0), "scheduled_at": k.get("scheduled_at", "")},
     "support_ticket":          lambda a, k: {"action": "support_ticket_queued", "customer_email": k.get("customer_email", ""), "subject": k.get("subject", ""), "body": k.get("body", "")},
+    "subscribe":               lambda a, k: {"action": "subscribe_queued", "customer_email": k.get("customer_email", ""), "plan_id": k.get("plan_id", "starter"), "billing_cycle": k.get("billing_cycle", "monthly")},
+    "api_key_validate":        lambda a, k: {"action": "api_key_validate_queued", "api_key": k.get("api_key", "")},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
