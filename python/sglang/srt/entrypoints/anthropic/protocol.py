@@ -134,6 +134,27 @@ class AnthropicMessagesRequest(BaseModel):
             raise ValueError("max_tokens must be positive")
         return v
 
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature_range(cls, v):
+        if v is not None and not 0.0 <= v <= 1.0:
+            raise ValueError(f"temperature must be in [0, 1], got {v}")
+        return v
+
+    @field_validator("top_p")
+    @classmethod
+    def validate_top_p_range(cls, v):
+        if v is not None and not 0.0 <= v <= 1.0:
+            raise ValueError(f"top_p must be in [0, 1], got {v}")
+        return v
+
+    @field_validator("top_k")
+    @classmethod
+    def validate_top_k_range(cls, v):
+        if v is not None and not 0 <= v <= 500:
+            raise ValueError(f"top_k must be in [0, 500], got {v}")
+        return v
+
 
 class AnthropicDelta(BaseModel):
     """Delta for streaming responses"""
