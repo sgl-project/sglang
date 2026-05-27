@@ -526,8 +526,10 @@ class Envs:
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
-    SGLANG_SPEC_NAN_DETECTION = EnvBool(False)
-    SGLANG_SPEC_OOB_DETECTION = EnvBool(False)
+    # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
+    # page alignment). Off in prod; tests turn it on to fail-fast on
+    # numerical / index violations instead of getting silent NaN cascades.
+    SGLANG_ENABLE_ASYNC_ASSERT = EnvBool(False)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)

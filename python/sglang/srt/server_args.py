@@ -183,7 +183,14 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
-DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
+DISAGG_TRANSFER_BACKEND_CHOICES = [
+    "mooncake",
+    "nixl",
+    "ascend",
+    "fake",
+    "mori",
+    "mooncake_tcp",
+]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
@@ -505,6 +512,8 @@ class ServerArgs:
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
     sampling_defaults: str = "model"
+    asr_max_buffer_seconds: int = 60
+    asr_max_concurrent_sessions: int = 32
 
     # Data parallelism
     dp_size: int = 1
@@ -732,7 +741,6 @@ class ServerArgs:
     piecewise_cuda_graph_tokens: Optional[List[int]] = None
     piecewise_cuda_graph_compiler: str = "eager"
     torchao_config: str = ""
-    enable_nan_detection: bool = False
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
     triton_attention_num_kv_splits: int = 8
@@ -858,9 +866,15 @@ class ServerArgs:
         self._handle_multimodal()
         # Validate SSL arguments early (before dummy-model short-circuit).
         self._handle_ssl_validation()
+        # Validate transcription/ASR-specific server args (model-independent).
+        self._handle_asr_validation()
 
         # Validate PD disaggregation flags early (before dummy-model short-circuit).
-        self._handle_pd_disaggregation()
+        from sglang.srt.arg_groups.pd_disaggregation_hook import (
+            handle_pd_disaggregation,
+        )
+
+        handle_pd_disaggregation(self)
 
         # Validate --prefill-only-disable-kv-cache args early (before dummy-model
         # short-circuit). The backend check is run later after backends settle.
@@ -1109,14 +1123,6 @@ class ServerArgs:
                 f"The tool_call_parser '{self.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[self.tool_call_parser]}' instead."
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
-
-        if self.enable_nan_detection:
-            logger.warning(
-                "--enable-nan-detection is deprecated. "
-                "Use SGLANG_SPEC_NAN_DETECTION=1 and SGLANG_SPEC_OOB_DETECTION=1 instead."
-            )
-            envs.SGLANG_SPEC_NAN_DETECTION.set(True)
-            envs.SGLANG_SPEC_OOB_DETECTION.set(True)
 
         # Deprecated attention-backend alias: "compressed" -> "dsv4".
         for attr in (
@@ -2343,10 +2349,16 @@ class ServerArgs:
             logger.info(
                 f"Using {self.attention_backend} as attention backend for {model_arch}."
             )
-        elif model_arch in ["KimiLinearForCausalLM", "BailingMoeV2_5ForCausalLM"]:
+        elif model_arch in ["KimiLinearForCausalLM"]:
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
                 support_mamba_cache=False,
+            )
+        elif model_arch in ["BailingMoeV2_5ForCausalLM"]:
+            self._handle_mamba_radix_cache(
+                model_arch=model_arch,
+                support_mamba_cache=True,
+                support_mamba_cache_extra_buffer=True,
             )
         elif model_arch in ["NemotronHForCausalLM"]:
             from sglang.srt.arg_groups.nemotron_h_hook import (
@@ -3757,62 +3769,6 @@ class ServerArgs:
         except Exception:
             return False
 
-    def _handle_pd_disaggregation(self):
-        if self.disaggregation_mode == "decode":
-            if self.disaggregation_decode_enable_radix_cache:
-                if self.enable_hisparse:
-                    raise ValueError(
-                        "--disaggregation-decode-enable-radix-cache is incompatible "
-                        "with --enable-hisparse"
-                    )
-                if self.disaggregation_transfer_backend not in ("nixl", "mooncake"):
-                    raise ValueError(
-                        "--disaggregation-decode-enable-radix-cache currently "
-                        "requires --disaggregation-transfer-backend in "
-                        "('nixl', 'mooncake'), but got "
-                        f"{self.disaggregation_transfer_backend!r}"
-                    )
-                if self.speculative_algorithm is not None:
-                    raise ValueError(
-                        "--disaggregation-decode-enable-radix-cache is incompatible "
-                        "with speculative decoding "
-                        f"(--speculative-algorithm {self.speculative_algorithm})"
-                    )
-                if self.enable_dp_attention:
-                    logger.warning(
-                        "EXPERIMENTAL: Decode radix cache with DP attention. "
-                        "Requires prefix-aware DP rank routing for optimal cache hits."
-                    )
-                self.disable_radix_cache = False
-                logger.warning("EXPERIMENTAL: Radix cache is enabled for decode server")
-            else:
-                self.disable_radix_cache = True
-                logger.warning("KV cache is forced as chunk cache for decode server")
-                if self.enable_mamba_extra_buffer():
-                    logger.warning(
-                        "Mamba extra_buffer is disabled because decode disaggregation "
-                        "currently forces chunk cache. Falling back to no_buffer."
-                    )
-                    self.mamba_scheduler_strategy = "no_buffer"
-
-        elif self.disaggregation_mode == "prefill":
-            assert (
-                self.disaggregation_transfer_backend != "fake"
-            ), "Prefill server does not support 'fake' as the transfer backend"
-
-            self.disable_cuda_graph = True
-
-        if self.disaggregation_mode in ("prefill", "decode"):
-            if (
-                envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-                and self.disaggregation_transfer_backend not in ("mooncake", "nixl")
-            ):
-                raise ValueError(
-                    f"SGLANG_DISAGG_STAGING_BUFFER requires "
-                    f"disaggregation_transfer_backend='mooncake' or 'nixl', "
-                    f"got '{self.disaggregation_transfer_backend}'."
-                )
-
     def _handle_encoder_disaggregation(self):
         if self.enable_prefix_mm_cache and not self.encoder_only:
             raise ValueError(
@@ -4190,6 +4146,19 @@ class ServerArgs:
                 "Mixed chunked prefill is disabled because of using diffusion LLM inference."
             )
             self.enable_mixed_chunk = False
+
+    def _handle_asr_validation(self):
+        """Validate transcription/ASR-specific server args."""
+        if self.asr_max_buffer_seconds <= 0:
+            raise ValueError(
+                f"--asr-max-buffer-seconds must be positive "
+                f"(got {self.asr_max_buffer_seconds})."
+            )
+        if self.asr_max_concurrent_sessions <= 0:
+            raise ValueError(
+                f"--asr-max-concurrent-sessions must be positive "
+                f"(got {self.asr_max_concurrent_sessions})."
+            )
 
     def _handle_other_validations(self):
         # Handle model inference tensor dump.
@@ -5240,6 +5209,24 @@ class ServerArgs:
             "'model' uses the model's generation_config.json to get the recommended "
             "sampling parameters if available. Default is 'model'.",
         )
+        parser.add_argument(
+            "--asr-max-buffer-seconds",
+            type=int,
+            default=ServerArgs.asr_max_buffer_seconds,
+            help="Maximum seconds of PCM audio the streaming ASR WebSocket handler "
+            "will accumulate before closing the session with a buffer_overflow "
+            "error. Guards against OOM when a client streams audio faster than "
+            "inference can consume it. Default 60s.",
+        )
+        parser.add_argument(
+            "--asr-max-concurrent-sessions",
+            type=int,
+            default=ServerArgs.asr_max_concurrent_sessions,
+            help="Maximum number of concurrent realtime ASR WebSocket sessions "
+            "served by /v1/realtime. New connections beyond this cap are "
+            "accepted, sent an error{code:too_many_sessions} frame, and closed. "
+            "Default 32.",
+        )
 
         # Data parallelism
         parser.add_argument(
@@ -5451,6 +5438,7 @@ class ServerArgs:
                 "ascend_attn",
                 "aiter_attn",
                 "flashinfer_cudnn",
+                "amx_attn",
             ],
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
@@ -6386,11 +6374,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.torchao_config,
             help="Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row",
-        )
-        parser.add_argument(
-            "--enable-nan-detection",
-            action="store_true",
-            help="[Deprecated] Use SGLANG_SPEC_NAN_DETECTION=1 and SGLANG_SPEC_OOB_DETECTION=1 instead.",
         )
         parser.add_argument(
             "--enable-p2p-check",
