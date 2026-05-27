@@ -372,6 +372,18 @@ class DeepseekSparseAttnBackend(
             except Exception:
                 # Fall back to the canonical V3.2 default.
                 self.ds_max_top_k = 2048
+        # Token-label write context: populated by finalize_double_sparsity_bind()
+        # (called in model_runner before init_attention_backend), so these
+        # attributes are non-None whenever DS is enabled.
+        self._ds_token_label_table = getattr(
+            model_runner.server_args, "_double_sparsity_token_label_table", None
+        )
+        self._ds_channel_selection = getattr(
+            model_runner.server_args, "_ds_channel_selection", None
+        )
+        self._ds_qk_nope_head_dim: int = int(
+            getattr(model_runner.server_args, "_ds_qk_nope_head_dim", 128)
+        )
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
@@ -1380,6 +1392,56 @@ class DeepseekSparseAttnBackend(
 
         self.forward_metadata = metadata
 
+    def _write_token_labels(
+        self,
+        layer,
+        cache_loc: torch.Tensor,
+        k: torch.Tensor,
+    ) -> None:
+        """Write per-slot token labels after a KV-cache write.
+
+        Projects the 512-d MLA latent key ``k`` through ``layer.kv_b_proj``
+        to obtain 128-d K_noPE per local head, then writes the selected
+        ``label_dim`` channels to the shared token label table.
+
+        No-ops if DS is not enabled or the bind context is unavailable.
+        ``k`` shape: ``[T, 1, kv_lora_rank]``.
+        """
+        if (
+            not self.enable_double_sparsity
+            or self._ds_token_label_table is None
+            or self._ds_channel_selection is None
+        ):
+            return
+        kv_b_proj = getattr(layer, "kv_b_proj", None)
+        if kv_b_proj is None:
+            return
+
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
+        )
+
+        T = k.shape[0]
+        kv_lora_rank = k.shape[-1]
+        k_latent = k.view(T, kv_lora_rank)
+
+        with torch.no_grad():
+            kv_proj_out = kv_b_proj(k_latent)[0]
+
+        H_local = self._ds_token_label_table.num_heads_local
+        nope_dim = self._ds_qk_nope_head_dim
+        k_nope = kv_proj_out[:, : H_local * nope_dim].view(T, H_local, nope_dim)
+
+        layer_id = layer.layer_id
+        token_label_write(
+            signatures=self._ds_token_label_table.signatures,
+            written=self._ds_token_label_table.written,
+            layer_id=layer_id,
+            cache_loc=cache_loc,
+            k_nope=k_nope,
+            channel_selection_layer=self._ds_channel_selection[layer_id],
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1442,6 +1504,7 @@ class DeepseekSparseAttnBackend(
                     k,
                     k_rope,
                 )
+                self._write_token_labels(layer, cache_loc, k)
 
         # Use MHA kernel if in MHA_ONE_SHOT mode
         if self.use_mha:
@@ -1640,6 +1703,7 @@ class DeepseekSparseAttnBackend(
                     k,
                     k_rope,
                 )
+                self._write_token_labels(layer, cache_loc, k)
 
         # Do absorbed multi-latent attention
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -2160,6 +2224,7 @@ class DeepseekSparseAttnBackend(
                 else forward_batch.encoder_out_cache_loc
             )
             self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
+            self._write_token_labels(layer, cache_loc, k)
 
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)

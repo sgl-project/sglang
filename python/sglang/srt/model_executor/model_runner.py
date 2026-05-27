@@ -751,6 +751,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Bind DS attention modules now that the KV pool is sized.
         if getattr(self.server_args, "enable_double_sparsity", False) and self.req_to_token_pool is not None:
             self.server_args._ds_req_to_token_pool = self.req_to_token_pool
+            # Physical KV slot capacity for label table sizing.
+            self.server_args._ds_token_to_kv_pool = self.token_to_kv_pool
             for module in self.model.modules():
                 if hasattr(module, "finalize_double_sparsity_bind"):
                     module.finalize_double_sparsity_bind()

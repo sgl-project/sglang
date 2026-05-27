@@ -1903,15 +1903,18 @@ class DeepseekV2AttentionMLA(
         table = getattr(server_args, "_double_sparsity_token_label_table", None)
         if table is None:
             num_layers_local = int(getattr(config, "num_hidden_layers", 1))
-            ds_pool = getattr(server_args, "_ds_req_to_token_pool", None)
-            if ds_pool is None:
+            # Physical KV slot capacity: out_cache_loc values range 0..size+page_size-1.
+            # This is the first dimension of the KV buffer, NOT req_to_token_pool.size
+            # (which is the request-row count — a much smaller number).
+            kv_pool = getattr(server_args, "_ds_token_to_kv_pool", None)
+            if kv_pool is None:
                 raise RuntimeError(
-                    "Double Sparsity: req_to_token_pool is not available at bind time. "
+                    "Double Sparsity: token_to_kv_pool is not available at bind time. "
                     "finalize_double_sparsity_bind() must be called after "
                     "ModelRunner.init_memory_pool() so that TokenLabelTable is sized "
-                    "from the real KV pool, not device_buffer_size."
+                    "from the real KV slot address space."
                 )
-            max_tokens = ds_pool.size
+            max_tokens = kv_pool.size + kv_pool.page_size
             label_dim = int(local_mask.label_dim)
             page_size = int(ds_parsed.page_size)
             try:
@@ -1933,6 +1936,9 @@ class DeepseekV2AttentionMLA(
                 )
                 raise
             setattr(server_args, "_double_sparsity_token_label_table", table)
+            # Publish channel selection and nope_dim for the KV-write hook in dsa_backend.
+            setattr(server_args, "_ds_channel_selection", local_mask.channel_selection)
+            setattr(server_args, "_ds_qk_nope_head_dim", self.qk_nope_head_dim)
 
         # Pick the attn TP process group when world > 1; otherwise leave None.
         process_group = None

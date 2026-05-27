@@ -4237,5 +4237,287 @@ class TestR9Coverage(unittest.TestCase):
         self.assertEqual(len(origin_input_ids), 1)
 
 
+class TestAC0RealSlotRegression(unittest.TestCase):
+    """Regression guard: TokenLabelTable must be sized from the physical KV
+    slot address space, not from req_to_token_pool.size (request-row count).
+
+    A req_to_token_pool with size=4 can serve requests whose out_cache_loc
+    values reach 512+.  The label table must cover those physical slot indices.
+    """
+
+    def _make_table(self, max_tokens):
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+        return allocate_token_label_table(
+            num_layers_local=2,
+            max_tokens=max_tokens,
+            num_heads_local=4,
+            label_dim=8,
+            page_size=64,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+
+    def _make_channel_sel(self):
+        # [L=2, H=4, D=8] int32 picking first 8 channels from 16-d space
+        return torch.arange(8, dtype=torch.int32).unsqueeze(0).unsqueeze(0).expand(2, 4, -1).contiguous()
+
+    def test_write_to_large_physical_slots_succeeds(self):
+        """Physical slots [7,64,200,512] succeed when max_tokens=600."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
+        )
+        table = self._make_table(max_tokens=600)
+        channel_sel = self._make_channel_sel()
+
+        # k_nope: 4 tokens × 4 heads × 16 channels (only first 8 selected)
+        k_nope = torch.ones(4, 4, 16, dtype=torch.float32)
+        k_nope[:, :, :8] = 2.0  # selected channels set to 2.0
+
+        cache_loc = torch.tensor([7, 64, 200, 512], dtype=torch.int64)
+        token_label_write(
+            signatures=table.signatures,
+            written=table.written,
+            layer_id=0,
+            cache_loc=cache_loc,
+            k_nope=k_nope,
+            channel_selection_layer=channel_sel[0],
+        )
+        # Slots should be written
+        self.assertTrue(table.written[0, 7].item())
+        self.assertTrue(table.written[0, 64].item())
+        self.assertTrue(table.written[0, 200].item())
+        self.assertTrue(table.written[0, 512].item())
+        # Unwritten slots remain zero
+        self.assertFalse(table.written[0, 0].item())
+        self.assertFalse(table.written[0, 599].item())
+        # Written values match selected channels
+        self.assertAlmostEqual(table.signatures[0, 7, 0, 0].item(), 2.0, places=4)
+        self.assertAlmostEqual(table.signatures[0, 512, 0, 0].item(), 2.0, places=4)
+
+    def test_req_to_token_pool_size_too_small_raises(self):
+        """Proves req_to_token_pool.size=4 is wrong: writing slot 64 raises IndexError."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
+        )
+        # max_tokens=4 simulates the old wrong sizing from req_to_token_pool.size
+        table = self._make_table(max_tokens=4)
+        channel_sel = self._make_channel_sel()
+        k_nope = torch.ones(1, 4, 16, dtype=torch.float32)
+        cache_loc = torch.tensor([64], dtype=torch.int64)  # slot 64 > max_tokens=4
+
+        with self.assertRaises((IndexError, RuntimeError)):
+            token_label_write(
+                signatures=table.signatures,
+                written=table.written,
+                layer_id=0,
+                cache_loc=cache_loc,
+                k_nope=k_nope,
+                channel_selection_layer=channel_sel[0],
+            )
+
+    def test_real_logical_domain_scoring_and_adapter_roundtrip(self):
+        """Non-contiguous slots [7,64,200,512] via real _compute_logical_token_scores.
+
+        req_to_token maps 1 request × 4 logical positions → physical [7,64,200,512].
+        After writing labels and scoring, retrieve_topk returns logical [0,1,2,3];
+        the adapter maps those back to the original physical slots.
+        """
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
+        )
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            retrieve_topk_via_labels,
+        )
+        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+            logical_to_physical,
+        )
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+
+        # Physical slots scattered (not contiguous, well beyond req-pool size=1)
+        phys_slots = [7, 64, 200, 512]
+        max_tokens = 600
+        num_layers = 2
+        num_heads = 4
+        label_dim = 8
+        nope_dim = 16
+
+        table = allocate_token_label_table(
+            num_layers_local=num_layers,
+            max_tokens=max_tokens,
+            num_heads_local=num_heads,
+            label_dim=label_dim,
+            page_size=64,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        channel_sel = torch.arange(label_dim, dtype=torch.int32).unsqueeze(0).expand(num_heads, -1).contiguous()
+        channel_sel_all = channel_sel.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
+        channel_weights_all = torch.ones(num_layers, num_heads, label_dim, dtype=torch.float32)
+
+        # Write high-amplitude labels at each physical slot (layer 0 only)
+        k_nope = torch.zeros(4, num_heads, nope_dim, dtype=torch.float32)
+        for i in range(label_dim):
+            k_nope[:, :, i] = float(i + 1) * 10.0  # strong signal in first label_dim channels
+
+        cache_loc = torch.tensor(phys_slots, dtype=torch.int64)
+        token_label_write(
+            signatures=table.signatures,
+            written=table.written,
+            layer_id=0,
+            cache_loc=cache_loc,
+            k_nope=k_nope,
+            channel_selection_layer=channel_sel,
+        )
+
+        # req_to_token: 1 request, max_ctx=600; logical positions [0,1,2,3] → phys [7,64,200,512]
+        max_ctx = 600
+        req_to_token = torch.full((1, max_ctx), -1, dtype=torch.int32)
+        for logical_pos, phys in enumerate(phys_slots):
+            req_to_token[0, logical_pos] = phys
+
+        req_pool_indices = torch.tensor([0], dtype=torch.int32)
+        seq_lens = torch.tensor([len(phys_slots)], dtype=torch.int32)
+
+        # Query: same shape as labels → high dot-product with all written slots
+        queries = torch.ones(1, num_heads, label_dim, dtype=torch.float32)
+
+        selected, valid_lens = retrieve_topk_via_labels(
+            queries=queries,
+            token_signatures=table.signatures,
+            written=table.written,
+            channel_selection=channel_sel_all,
+            channel_weights=channel_weights_all,
+            layer_id=0,
+            max_top_k=len(phys_slots),
+            per_request_valid=None,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            seq_lens=seq_lens,
+        )
+
+        # selected: [1, max_top_k] logical positions; valid_lens: [1]
+        valid = valid_lens[0].item()
+        self.assertEqual(valid, len(phys_slots))
+
+        logical_positions = selected[0, :valid].tolist()
+        # All 4 written logical positions must appear
+        self.assertEqual(sorted(logical_positions), [0, 1, 2, 3])
+
+        # Adapter: logical → physical
+        topk_out = torch.full((1, len(phys_slots)), -1, dtype=torch.int32)
+        logical_to_physical(selected[:, :valid], req_pool_indices, req_to_token.contiguous(), topk_out)
+        recovered_phys = sorted(topk_out[0, :valid].tolist())
+        self.assertEqual(recovered_phys, sorted(phys_slots))
+
+
+class TestAC1HookUnit(unittest.TestCase):
+    """Unit tests for the AC-1 token-label write hook in dsa_backend._write_token_labels."""
+
+    def test_write_token_labels_populates_table(self):
+        """_write_token_labels writes non-zero signatures at cache_loc after the hook."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+        from sglang.srt.layers.attention.dsa_backend import NativeSparseAttnBackend
+        from types import SimpleNamespace
+
+        num_layers = 2
+        num_heads = 2
+        label_dim = 4
+        kv_lora_rank = 8
+        nope_dim = 8
+
+        table = allocate_token_label_table(
+            num_layers_local=num_layers,
+            max_tokens=64,
+            num_heads_local=num_heads,
+            label_dim=label_dim,
+            page_size=64,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        channel_sel = torch.arange(label_dim, dtype=torch.int32).unsqueeze(0).expand(num_heads, -1).contiguous()
+        channel_sel_all = channel_sel.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
+
+        # Build a minimal backend stub via object.__new__
+        backend = object.__new__(NativeSparseAttnBackend)
+        backend.enable_double_sparsity = True
+        backend._ds_token_label_table = table
+        backend._ds_channel_selection = channel_sel_all
+        backend._ds_qk_nope_head_dim = nope_dim
+
+        # kv_b_proj stub: identity projection k_latent → k_latent (padded to num_heads * nope_dim * 2)
+        proj_out_dim = num_heads * nope_dim * 2  # [K_nope | V] concatenated
+        W = torch.zeros(kv_lora_rank, proj_out_dim)
+        # Make first num_heads*nope_dim columns an identity block for the first kv_lora_rank dims
+        for i in range(min(kv_lora_rank, num_heads * nope_dim)):
+            W[i, i] = 1.0
+
+        class _FakeProj:
+            def __call__(self, x):
+                return (x @ W,)
+
+        layer = SimpleNamespace(
+            layer_id=0,
+            kv_b_proj=_FakeProj(),
+        )
+
+        # k: [3 tokens, 1, kv_lora_rank] with known values
+        T = 3
+        k = torch.zeros(T, 1, kv_lora_rank)
+        k[0, 0, 0] = 5.0
+        k[1, 0, 1] = 7.0
+        k[2, 0, 2] = 3.0
+
+        cache_loc = torch.tensor([4, 10, 20], dtype=torch.int64)
+
+        # Verify signatures are zero before
+        self.assertTrue(table.signatures[0, 4].sum().item() == 0.0)
+
+        backend._write_token_labels(layer, cache_loc, k)
+
+        # written flags should be set
+        self.assertTrue(table.written[0, 4].item())
+        self.assertTrue(table.written[0, 10].item())
+        self.assertTrue(table.written[0, 20].item())
+        self.assertFalse(table.written[0, 0].item())
+
+        # Signatures should be non-zero at the written slots
+        self.assertGreater(table.signatures[0, 4].abs().sum().item(), 0.0)
+
+    def test_write_token_labels_noop_when_disabled(self):
+        """_write_token_labels is a no-op when enable_double_sparsity=False."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+        from sglang.srt.layers.attention.dsa_backend import NativeSparseAttnBackend
+        from types import SimpleNamespace
+
+        table = allocate_token_label_table(
+            num_layers_local=1, max_tokens=32, num_heads_local=2,
+            label_dim=4, page_size=64, dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        backend = object.__new__(NativeSparseAttnBackend)
+        backend.enable_double_sparsity = False
+        backend._ds_token_label_table = table
+        backend._ds_channel_selection = torch.zeros(1, 2, 4, dtype=torch.int32)
+        backend._ds_qk_nope_head_dim = 4
+
+        layer = SimpleNamespace(layer_id=0, kv_b_proj=lambda x: (x,))
+        k = torch.ones(2, 1, 4)
+        cache_loc = torch.tensor([5, 6], dtype=torch.int64)
+
+        backend._write_token_labels(layer, cache_loc, k)
+
+        # Nothing should be written
+        self.assertFalse(table.written[0, 5].item())
+        self.assertFalse(table.written[0, 6].item())
+
+
 if __name__ == "__main__":
     unittest.main()

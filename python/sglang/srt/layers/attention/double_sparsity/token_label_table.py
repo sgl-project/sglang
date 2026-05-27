@@ -4,8 +4,10 @@ The token label table is GPU metadata living next to the KV cache.
 Each row is a compressed ``label_dim``-wide projection of one KV slot's
 128-d nope K, used by the runtime selector's top-K kernel.
 
-The table is sized by the KV pool's slot count (``max_tokens =
-req_to_token_pool.size``), not by a separate lifecycle.  When a slot is
+The table is sized by the physical KV slot address space (``max_tokens =
+token_to_kv_pool.size + token_to_kv_pool.page_size``), not by the request-row
+count (``req_to_token_pool.size`` is much smaller and would cause out-of-bounds
+writes for ``out_cache_loc`` values beyond the request count).  When a slot is
 freed or evicted by the KV allocator the label entry is left in place;
 the per-request range mask (M2) prevents cross-request picks, and the
 write hook overwrites the entry before it is read for the new request.
@@ -75,8 +77,8 @@ def allocate_token_label_table(
 ) -> TokenLabelTable:
     """Allocate the token label table on the target device.
 
-    ``max_tokens`` must equal ``req_to_token_pool.size`` so the table
-    is indexed directly by physical KV slot indices (``out_cache_loc``).
+    ``max_tokens`` must equal ``token_to_kv_pool.size + token_to_kv_pool.page_size``
+    so the table covers all possible ``out_cache_loc`` physical KV slot indices.
     """
 
     if num_layers_local <= 0 or max_tokens <= 0 or num_heads_local <= 0 or label_dim <= 0:
