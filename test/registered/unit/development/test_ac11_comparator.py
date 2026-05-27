@@ -24,6 +24,9 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[4]
 BC_PATH = REPO_ROOT / "development" / "benchmark_compare.py"
 
 
+_OMIT = object()  # sentinel: drop the field from a sidecar override
+
+
 def _load_bc():
     spec = importlib.util.spec_from_file_location("_bc", BC_PATH)
     mod = importlib.util.module_from_spec(spec)
@@ -45,6 +48,7 @@ def _write_bench_jsonl(
     num_prompts: int = 320,
     input_len: int = 4096,
     output_len: int = 512,
+    duration: float = 600.0,
     extra: dict = None,
     sidecar: bool = True,
     sidecar_overrides: dict = None,
@@ -60,6 +64,11 @@ def _write_bench_jsonl(
     sidecar with the timing floors satisfied. Tests that exercise the
     validation gauntlet either suppress the sidecar (``sidecar=False``) or
     pass ``sidecar_overrides`` to inject specific bad fields.
+
+    ``duration`` defaults to the AC-11 measurement-window floor so the
+    Round-32 JSONL duration validator does not refuse the default
+    fixture. Tests that exercise that validator pass ``duration=5.0`` or
+    ``extra={"duration": None}``.
     """
     summary = {
         "max_concurrency": concurrency,
@@ -76,6 +85,7 @@ def _write_bench_jsonl(
         "selected_tokens_mean": 1024.0,
         "total_tokens_mean": 4096.0,
         "dense_fallback_total": 0,
+        "duration": duration,
         "server_info": {
             "gpu_id": gpu_id,
             "tp_size": tp_size,
@@ -85,19 +95,26 @@ def _write_bench_jsonl(
     }
     if extra:
         summary.update(extra)
+    # Allow tests to delete the duration field explicitly by passing
+    # ``extra={"duration": None}``.
+    if summary.get("duration", "<sentinel>") is None:
+        summary.pop("duration", None)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(json.dumps(summary) + "\n")
 
     if sidecar:
+        # Both DSA and DS sidecars expose disable_radix_cache because the
+        # /server_info endpoint always reports the launch flag — only its
+        # value differs (DSA: False, DS: True until AC-10 closes).
         sa = {
             "tp_size": tp_size,
             "page_size": page_size,
             "chunked_prefill_size": 8192,
+            "disable_radix_cache": disable_radix_cache,
         }
         if mode == "double_sparsity":
             sa["enable_double_sparsity"] = True
             sa["double_sparsity_config"] = "/tmp/x.safetensors"
-            sa["disable_radix_cache"] = True
         meta = {
             "commit_sha": "abc123",
             "mode": mode,
@@ -115,7 +132,15 @@ def _write_bench_jsonl(
             "server_args_error": None,
         }
         if sidecar_overrides:
-            meta.update(sidecar_overrides)
+            # ``override[key] = _OMIT`` removes the field from the sidecar
+            # entirely so missing-field validation can be exercised. Any
+            # other value (including ``None``) replaces in place — the
+            # validator treats both "absent" and "None" as refusal-worthy.
+            for k, v in sidecar_overrides.items():
+                if v is _OMIT:
+                    meta.pop(k, None)
+                else:
+                    meta[k] = v
         with open(path + ".meta.json", "w", encoding="utf-8") as fh:
             json.dump(meta, fh)
 
@@ -289,14 +314,18 @@ class TestEvaluateAC11Gates(unittest.TestCase):
 class TestAC11EndToEnd(unittest.TestCase):
 
     def _make_trials(self, tmp, label, conc, tps_values, ttft_values, *,
-                     sidecar=True, sidecar_overrides=None, disable_radix=None):
+                     sidecar=True, sidecar_overrides=None, disable_radix=None,
+                     extra_summary=None):
         paths = []
         is_dsa = label.startswith("dsa") or label.startswith("native")
         mode = "native_nsa" if is_dsa else "double_sparsity"
-        # DSA baseline runs with radix ON; DS runs with radix OFF (AC-10
-        # gap). The comparator allows this via _DS_ONLY_SERVER_ARG_KEYS.
+        # Round 32: both sides default to radix OFF (disable_radix_cache
+        # =True). The Round-32 comparator refuses a radix-cache mismatch
+        # (AC-11 depends on AC-10 closing the radix gap), so the default
+        # fixture must keep parity. Tests that exercise the mismatch
+        # refusal pass disable_radix explicitly.
         if disable_radix is None:
-            disable_radix = (mode == "double_sparsity")
+            disable_radix = True
         for i, (tps, ttft) in enumerate(zip(tps_values, ttft_values)):
             p = os.path.join(tmp, f"{label}_c{conc}_t{i}.jsonl")
             _write_bench_jsonl(
@@ -305,6 +334,7 @@ class TestAC11EndToEnd(unittest.TestCase):
                 disable_radix_cache=disable_radix,
                 sidecar=sidecar,
                 sidecar_overrides=sidecar_overrides,
+                extra=extra_summary,
             )
             paths.append(p)
         return paths
@@ -507,8 +537,7 @@ class TestAC11EndToEnd(unittest.TestCase):
             for i in range(3):
                 p = os.path.join(tmp, f"dsa_c64_t{i}.jsonl")
                 _write_bench_jsonl(p, concurrency=64, tps_p50=100, ttft_p99_s=10,
-                                   num_prompts=320, mode="native_nsa",
-                                   disable_radix_cache=False)
+                                   num_prompts=320, mode="native_nsa")
                 dsa_paths.append(p)
                 p2 = os.path.join(tmp, f"ds_c64_t{i}.jsonl")
                 _write_bench_jsonl(p2, concurrency=64, tps_p50=100, ttft_p99_s=10,
@@ -533,11 +562,16 @@ class TestAC11EndToEnd(unittest.TestCase):
             self.assertEqual(self._ac11_main(dsa, ds_paths), 2)
 
     def test_allowed_ds_only_differences_still_pass(self):
-        """DS has enable_double_sparsity + disable_radix_cache; DSA doesn't.
-        Both are in _DS_ONLY_SERVER_ARG_KEYS so the comparator must PASS."""
+        """After Round 32 only ``enable_double_sparsity`` +
+        ``double_sparsity_config`` are allowed to differ between DSA and
+        DS. With radix-cache PARITY on both sides (both off until AC-10
+        closes) and the DS-only flags present on DS only, the comparator
+        must still PASS."""
         with tempfile.TemporaryDirectory() as tmp:
-            # _make_trials with default mode logic: DSA → native_nsa (no DS
-            # flags, radix on), DS → double_sparsity (DS flags, radix off).
+            # _make_trials defaults both sides to disable_radix=True
+            # (Round 32 parity requirement). DS adds enable_double_sparsity
+            # + double_sparsity_config which are dropped from comparison
+            # by _DS_ONLY_SERVER_ARG_KEYS.
             dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10])
             ds = self._make_trials(tmp, "ds", 64, [100, 100, 100], [10, 10, 10])
             self.assertEqual(self._ac11_main(dsa, ds), 0)
@@ -591,6 +625,172 @@ class TestAC11EndToEnd(unittest.TestCase):
                     fh.write("not-json-at-all\n")
                 ds_paths.append(p)
             self.assertEqual(self._ac11_main(dsa, ds_paths), 2)
+
+    # ---- Round 32: residual AC-11 defects from Codex review ---------
+
+    def test_short_jsonl_duration_refused(self):
+        """JSONL ``duration=5`` (operator forgot to size ``num_prompts``)
+        must refuse even when the sidecar claims a full 600s window."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10])
+            ds = self._make_trials(
+                tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                extra_summary={"duration": 5.0},
+            )
+            self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_missing_jsonl_duration_refused(self):
+        """JSONL with no ``duration`` key cannot be verified for the AC-11
+        measurement-window floor."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10])
+            ds = self._make_trials(
+                tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                extra_summary={"duration": None},  # writer pops the key
+            )
+            self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_radix_mismatch_refused(self):
+        """DSA radix ON (cache enabled, ``disable_radix_cache=False``) vs
+        DS radix OFF (``disable_radix_cache=True``) must refuse — AC-11
+        depends on AC-10 closing this configuration gap."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(
+                tmp, "dsa", 64, [100, 100, 100], [10, 10, 10],
+                disable_radix=False,
+            )
+            ds = self._make_trials(
+                tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                disable_radix=True,
+            )
+            self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_missing_required_sidecar_field_refused(self):
+        """``_require_sidecar_fields`` refuses sidecars that omit any of
+        the reproducibility/workload fields. Codex Round 31 caught the
+        comparator treating ``None == None`` as agreement; enforcing
+        presence inside the meta reader closes that hole."""
+        for field in (
+            "seed", "commit_sha", "chunked_prefill_size",
+            "num_prompts", "isl_total_tokens", "osl_tokens", "server_args",
+        ):
+            with self.subTest(field=field):
+                with tempfile.TemporaryDirectory() as tmp:
+                    dsa = self._make_trials(
+                        tmp, "dsa", 64, [100, 100, 100], [10, 10, 10],
+                    )
+                    ds = self._make_trials(
+                        tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                        sidecar_overrides={field: _OMIT},
+                    )
+                    self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_server_args_empty_dict_refused(self):
+        """``server_args = {}`` is not a valid sidecar — the writer must
+        capture /get_server_info even if it has to fall back to an
+        ``unknown`` chunked_prefill_size."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10])
+            ds = self._make_trials(
+                tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                sidecar_overrides={"server_args": {}},
+            )
+            self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_commit_sha_unknown_refused(self):
+        """``commit_sha == "unknown"`` defeats reproducibility — refuse."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10])
+            ds = self._make_trials(
+                tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                sidecar_overrides={"commit_sha": "unknown"},
+            )
+            self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_commit_sha_empty_string_refused(self):
+        """Empty-string commit_sha is just as bad as missing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10])
+            ds = self._make_trials(
+                tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                sidecar_overrides={"commit_sha": ""},
+            )
+            self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_sidecar_concurrency_mismatch_refused(self):
+        """Sidecar's ``concurrency`` field must match the grouping
+        concurrency. Catches operator/file-rename mishaps."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(tmp, "dsa", 64, [100, 100, 100], [10, 10, 10])
+            ds = self._make_trials(
+                tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                sidecar_overrides={"concurrency": 32},
+            )
+            self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_dynamic_server_info_drift_does_not_self_refuse(self):
+        """``/get_server_info`` emits dynamic telemetry
+        (``internal_states``, ``kv_events``, ``last_gen_throughput``,
+        ``gpu_memory_used_bytes``, …) that drifts between sequential
+        trials. After Round 32 the comparator projects ``server_args``
+        onto a stable launch-args whitelist, so this drift must NOT
+        cause within-side or cross-side refusal."""
+        with tempfile.TemporaryDirectory() as tmp:
+            stable_dsa_sa = {
+                "tp_size": 8,
+                "page_size": 64,
+                "chunked_prefill_size": 8192,
+                "disable_radix_cache": True,
+            }
+            stable_ds_sa = {
+                **stable_dsa_sa,
+                "enable_double_sparsity": True,
+                "double_sparsity_config": "/tmp/x.safetensors",
+            }
+            dsa_paths = []
+            ds_paths = []
+            for i, drift in enumerate([100.0, 200.0, 300.0]):
+                # Per-trial dynamic telemetry that drifts. Identical
+                # whitelist fields, distinct telemetry.
+                dyn = {
+                    "internal_states": [{"last_gen_throughput": drift}],
+                    "kv_events": [{"step": i, "type": "alloc"}],
+                    "last_gen_throughput": drift,
+                    "gpu_memory_used_bytes": 12345 + i,
+                    "step_time": 0.01 * (i + 1),
+                }
+                p_dsa = os.path.join(tmp, f"dsa_c64_t{i}.jsonl")
+                _write_bench_jsonl(
+                    p_dsa, concurrency=64, tps_p50=100, ttft_p99_s=10,
+                    mode="native_nsa",
+                    sidecar_overrides={"server_args": {**stable_dsa_sa, **dyn}},
+                )
+                dsa_paths.append(p_dsa)
+                p_ds = os.path.join(tmp, f"ds_c64_t{i}.jsonl")
+                _write_bench_jsonl(
+                    p_ds, concurrency=64, tps_p50=100, ttft_p99_s=10,
+                    mode="double_sparsity",
+                    sidecar_overrides={"server_args": {**stable_ds_sa, **dyn}},
+                )
+                ds_paths.append(p_ds)
+            self.assertEqual(self._ac11_main(dsa_paths, ds_paths), 0)
+
+    def test_chunked_prefill_size_unknown_string_allowed_when_consistent(self):
+        """``_bench_meta_writer.py`` falls back to the string
+        ``"unknown"`` when ``/server_info`` doesn't expose
+        ``chunked_prefill_size``. As long as both sides agree, the
+        comparator must accept it (the writer's behavior is the writer's
+        problem, not the comparator's)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa = self._make_trials(
+                tmp, "dsa", 64, [100, 100, 100], [10, 10, 10],
+                sidecar_overrides={"chunked_prefill_size": "unknown"},
+            )
+            ds = self._make_trials(
+                tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                sidecar_overrides={"chunked_prefill_size": "unknown"},
+            )
+            self.assertEqual(self._ac11_main(dsa, ds), 0)
 
     def test_legacy_mode_still_works(self):
         """The single-trial AC-7/AC-8 report path must still work after Round 30."""
