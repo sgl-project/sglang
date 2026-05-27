@@ -376,13 +376,18 @@ class Compressor(nn.Module):
             ape = torch.cat([ape[0], ape[1]], dim=0)
             self.ape.data.copy_(ape.view(self.ratio, -1))
 
-    def get_state_pool(self, attn_backend: AttentionBackend) -> CompressStatePool:
+    def get_state_pool(
+        self,
+        attn_backend: AttentionBackend,
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> CompressStatePool:
         token_to_kv_pool = attn_backend.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        backend = forward_batch.attn_backend
         override = None
-        if hasattr(backend, "get_override_compress_state_pool"):
-            override = backend.get_override_compress_state_pool(
+        if forward_batch is not None and hasattr(
+            attn_backend, "get_override_compress_state_pool"
+        ):
+            override = attn_backend.get_override_compress_state_pool(
                 compressor=self,
                 token_to_kv_pool=token_to_kv_pool,
                 forward_batch=forward_batch,
@@ -423,7 +428,9 @@ class Compressor(nn.Module):
 
         if TYPE_CHECKING:
             assert isinstance(attn_backend, DeepseekV4AttnBackend)
-        kv_score_buffer = self.get_state_pool(attn_backend).kv_score_buffer.kv_score
+        kv_score_buffer = self.get_state_pool(
+            attn_backend, forward_batch
+        ).kv_score_buffer.kv_score
         return attn_backend.forward_compress(
             kv_score_buffer=kv_score_buffer,
             kv_score_input=kv_score,
