@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import bisect
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, List, Optional
@@ -276,21 +277,47 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         return is_bs_supported
 
     def _create_graph(self):
+        if str(self.model_runner.device).startswith("npu"):
+            return torch.npu.NPUGraph()
         return torch.cuda.CUDAGraph()
 
     def _capture_init(self, run_once_fn):
         for _ in range(2):
-            torch.cuda.synchronize()
+            if str(self.model_runner.device).startswith("npu"):
+                torch.npu.synchronize()
+            else:
+                torch.cuda.synchronize()
             self.model_runner.tp_group.barrier()
             run_once_fn()
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
-        with torch.cuda.graph(graph, pool=pool, stream=stream):
-            out = run_once_fn()
+        if str(self.model_runner.device).startswith("npu"):
+            with torch.npu.graph(
+                graph,
+                pool=pool,
+                stream=stream,
+                auto_dispatch_capture=True,
+            ):
+                out = run_once_fn()
+        else:
+            with torch.cuda.graph(graph, pool=pool, stream=stream):
+                out = run_once_fn()
         return out
 
     def _replay(self, forward_batch: ForwardBatch):
-        self.graphs[self.bs].replay()
+        if str(self.model_runner.device).startswith("npu"):
+            seq_lens = self.buffers.seq_lens_cpu[: self.raw_bs].tolist() + [0] * (
+                self.bs - self.raw_bs
+            )
+            thread = threading.Thread(
+                target=self.graphs[self.bs].update,
+                kwargs={"cpu_update_input": [{"actual_seq_kvlen": seq_lens}]},
+            )
+            thread.start()
+            self.graphs[self.bs].replay()
+            thread.join()
+        else:
+            self.graphs[self.bs].replay()
 
     def capture(self):
         CudaGraphRunner.capture(self)
