@@ -186,6 +186,20 @@ the port-to-modern-SGLang effort.
     `model.layers.<i>.self_attn.<q|k>_proj` keys. DeepSeek-V3 (MLA),
     GLM-5.1, and Qwen2-MoE will not load these JSONs without a key
     rewrite.
+13. **Calibration-set sensitivity.** All three repos' configs come from
+    one recipe: `mit-han-lab/pile-val-backup`,
+    `shuffle(seed=42)`, 256 × 512 tokens, Method 1
+    (`(q ⊙ k).abs().mean(dim=0)` post-RoPE) — every value hardcoded in
+    `DoubleSparse/config/offline_calibration.py:18-22,91-93,152`. B's
+    test cites a stale path `evaluation/group_channel_config.py` (not
+    present in this snapshot) but the procedure is identical; C reuses
+    A's JSONs verbatim. No seed flag, no dataset flag, no ablation
+    script, no domain-specific configs (code/math/multilingual). Top-`r`
+    overlap across seeds, datasets, or scoring methods (1–5) is
+    unmeasured. Inferred prior: Method 1 is token-local and probably
+    moderately robust on natural-language workloads; sensitivity on
+    domain-shifted traffic (agentic, code, Chinese) is uncharacterised.
+    See `00-survey.md` §9.1 for the suggested empirical test.
 
 ---
 

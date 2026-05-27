@@ -337,3 +337,35 @@ Carrying this survey into Phase 2:
 5. Performance budget — is "match B's measured speedup" the bar, or "exceed it materially via fused kernel / MLA-aware design"?
 
 These five answers materially shape Phase 2.
+
+### 9.1 Empirical open question — Calibration sensitivity
+
+**Question.** Does the choice of calibration set materially affect the channel rankings, and therefore downstream accuracy on workloads other than the calibration distribution?
+
+**What the code says (Observed).** The calibration procedure is identical across all three repos and entirely hardcoded:
+
+- Dataset: `mit-han-lab/pile-val-backup` (`config/offline_calibration.py:19`). No CLI flag.
+- Seed: `shuffle(seed=42)` (line 20). No CLI flag.
+- Budget: 256 samples × 512 tokens = ~131K total tokens (lines 18, 152). Samples whose tokenized length > 512 are silently dropped (lines 27–28), excluding long-form documents.
+- Scoring: "Method 1" only — per-token `(q ⊙ k).abs().mean(dim=0)` post-RoPE (lines 91–93). Methods 2–5 are commented out with no author note on why.
+- Output: per-head sorted channel indices; only the first `r` are kept downstream.
+
+**Provenance across the three repos.**
+- **A** owns the script; 13+ shipped configs under `config/<owner>/<model>.json` all come from this exact recipe.
+- **B (sglang-last)** has no in-tree calibration. The test (`test/manual/test_double_sparsity.py:25`) cites `https://github.com/andy-yang-1/DoubleSparse/blob/main/evaluation/group_channel_config.py` — a path that does **not** exist in this DoubleSparse snapshot (likely renamed to `config/offline_calibration.py`). The shipped JSON was produced by the same Pile-val seed-42 Method-1 pipeline.
+- **C (Twilight)** hardcodes `selector.config_path` to A's `/data/chaofan/DoubleSparse/config/…` in its benchmark configs. Same recipe, inherited.
+
+**No ablation evidence anywhere.** No seed flag, no dataset flag, no sensitivity script, no domain-specific config (code/math/multilingual/instruct), no README discussion of robustness. Both confirms and refutes "agnostic" are absent from the code.
+
+**Inferred priors (NOT in code).**
+- Method 1 is *token-local* (no softmax, no cross-token interaction) — the least context-dependent of the five options — so **moderate** dataset robustness is plausible.
+- 131K tokens is a small estimator budget; channels near the top-`r` boundary (e.g. at `r=8`) may be seed-unstable.
+- Broader activation-channel-quant literature (SmoothQuant, AWQ, RTN) finds linear-projection channel rankings somewhat stable across diverse natural-language corpora but degraded on domain-shifted calibration. Whether this transfers to *attention-projection* channels selected by `|q ⊙ k|` is unverified.
+- Pile-val configs are evaluated on AIME (math), LongBench, LiveCodeBench, MMLU with reportedly competitive results — suggests **practical robustness on tested workloads**, weaker than "agnostic".
+
+**Suggested empirical test (Phase 2 candidate).**
+1. Re-run calibration with ≥ 3 seeds (42 / 7 / 1337) on Llama-3.1-8B; measure top-`r` channel overlap per layer × head at `r ∈ {8, 16, 32}`.
+2. Re-run with workload-matched datasets (e.g. Pile vs StarCoder vs Long-NQ vs ShareGPT); measure top-`r` overlap and downstream PPL / MMLU / LongBench / AIME deltas.
+3. Decision rule: if top-`r` overlap > 80% **and** downstream accuracy delta < 1%, treat calibration as practically dataset-agnostic for natural language; otherwise require re-calibration on a workload-representative sample before deployment.
+
+**Why this matters for the porting goal.** A DeepSeek-V3.2 / GLM-5.1 deployment on agentic / tool-call / code-heavy / Chinese / multilingual traffic would inherit the Pile-val bias of every shipped config. Re-calibration is cheap (~131K-token forward pass), so the safer deployment story is "always recalibrate on a representative sample" rather than "use whatever config ships".
