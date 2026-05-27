@@ -2133,19 +2133,24 @@ class DeepseekV2AttentionMLA(
                 _selector = self.double_sparsity_selector
                 _seq_lens = getattr(forward_batch, "seq_lens", None)
                 _sparse_mask = getattr(forward_batch, "sparse_mask", None)
-                _ds_graph_state = getattr(forward_batch, "ds_graph_state", None)
+                # Resolve `_dsa_metadata` from the active ForwardContext
+                # whenever possible, so both `_ds_graph_state` AND
+                # `ds_topk_indices_out` can fall back to it during CUDA-graph
+                # capture/replay (where the capture-time `ForwardBatch` is
+                # constructed without DS fields — see cuda_graph_runner.py).
                 _dsa_metadata = None
-                if _ds_graph_state is None and _has_forward_context():
+                if _has_forward_context():
                     _fc_backend2 = _get_attn_backend()
                     if isinstance(_fc_backend2, _TboAttnBackend):
                         _fc_backend2 = _fc_backend2.primary
                     _dsa_metadata = getattr(
                         _fc_backend2, "forward_metadata", None
                     )
-                    if _dsa_metadata is not None:
-                        _ds_graph_state = getattr(
-                            _dsa_metadata, "ds_graph_state", None
-                        )
+                _ds_graph_state = getattr(forward_batch, "ds_graph_state", None)
+                if _ds_graph_state is None and _dsa_metadata is not None:
+                    _ds_graph_state = getattr(
+                        _dsa_metadata, "ds_graph_state", None
+                    )
                 _use_graph_safe = (
                     _ds_graph_state is not None
                     and _ds_graph_state.scratch_scores is not None
@@ -2227,20 +2232,19 @@ class DeepseekV2AttentionMLA(
                     )
                 # AC-8: prefer the NSA-metadata-owned buffer, allocated
                 # once per batch in init_forward_metadata (also for
-                # capture/replay). Fall back to per-batch lazy alloc on
-                # forward_batch only when the NSA backend has not
-                # allocated one (e.g. synthetic unit tests with
-                # SimpleNamespace forward_batches).
+                # capture/replay). Resolve from the same real production
+                # objects used for `ds_graph_state` above:
+                #   (1) forward_batch.ds_topk_indices_out — dynamic
+                #       non-graph forwards (set by
+                #       dsa_backend.init_forward_metadata).
+                #   (2) ForwardContext-published attention backend's
+                #       forward_metadata.ds_topk_indices_out — CUDA-graph
+                #       capture/replay path (no forward_batch field).
+                # Last resort: lazy `torch.empty_like` for CPU unit tests
+                # that synthesize `forward_batch` without either source.
                 ds_out = getattr(forward_batch, "ds_topk_indices_out", None)
-                if ds_out is None:
-                    attn_backend = getattr(forward_batch, "attn_backend", None)
-                    nsa_metadata = (
-                        getattr(attn_backend, "forward_metadata", None)
-                        if attn_backend is not None
-                        else None
-                    )
-                    if nsa_metadata is not None:
-                        ds_out = getattr(nsa_metadata, "ds_topk_indices_out", None)
+                if ds_out is None and _dsa_metadata is not None:
+                    ds_out = getattr(_dsa_metadata, "ds_topk_indices_out", None)
                 bs = int(selected_indices.shape[0])
                 if ds_out is None:
                     ds_out = torch.empty_like(selected_indices)

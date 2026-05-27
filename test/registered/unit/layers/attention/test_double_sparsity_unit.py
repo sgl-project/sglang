@@ -3466,6 +3466,86 @@ class TestCUDAGraphCapture(unittest.TestCase):
             "production path still allocating via retrieve_topk_via_labels.",
         )
 
+    def test_select_topk_indices_uses_metadata_ds_topk_indices_out_via_forward_context(self):
+        """`_select_topk_indices` writes into the metadata-owned
+        `ds_topk_indices_out` buffer when the only source is
+        `ForwardContext.attn_backend.forward_metadata`.
+
+        Asserts `torch.empty_like` is NOT called inside the function and
+        that the returned tensor's storage aliases the metadata buffer.
+        This regression catches the Round 19 bug where `ds_topk_indices_out`
+        was still looked up via the (non-existent) synthetic
+        `forward_batch.attn_backend` path and silently fell back to a
+        per-call lazy `torch.empty_like` allocation.
+        """
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            allocate_graph_state,
+        )
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext, forward_context,
+        )
+        from unittest.mock import patch as _patch
+
+        device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        attn = TestSelectTopkIndicesHookBranch()._make_attn(use_ds=True)
+        if device.type == "cuda":
+            sel, req_to_token, _q = self._make_bound_selector_cuda_fp16(
+                device, q_dtype=torch.float32,
+            )
+        else:
+            sel, req_to_token = self._make_bound_selector_with_known_sigs()
+            _q = torch.ones(1, 1, 1, dtype=torch.float32)
+        attn.double_sparsity_selector = sel
+
+        state = allocate_graph_state(
+            max_bs=1, max_top_k=2, max_seq_len=4, device=device,
+        )
+        ds_topk_out_metadata = torch.full(
+            (1, 2), -7, dtype=torch.int32, device=device,
+        )
+        metadata_buf_ptr = ds_topk_out_metadata.data_ptr()
+
+        # ForwardBatch carries NO ds_topk_indices_out and NO ds_graph_state.
+        forward_batch = self._make_production_forward_batch(
+            device, req_to_token=req_to_token, bs=1, max_seq_len=4,
+        )
+        self.assertFalse(hasattr(forward_batch, "ds_topk_indices_out"))
+        self.assertFalse(hasattr(forward_batch, "ds_graph_state"))
+
+        attn_backend_stub = SimpleNamespace(
+            forward_metadata=SimpleNamespace(
+                ds_graph_state=state,
+                ds_topk_indices_out=ds_topk_out_metadata,
+                cache_seqlens_int32=torch.full(
+                    (1,), 4, dtype=torch.int32, device=device,
+                ),
+            ),
+        )
+
+        empty_like_spy = MagicMock(wraps=torch.empty_like)
+        with _patch.object(torch, "empty_like", new=empty_like_spy), \
+             forward_context(ForwardContext(attn_backend=attn_backend_stub)):
+            result = attn._select_topk_indices(
+                x=torch.zeros(1, 1, 1, device=device),
+                q_lora=torch.zeros(1, 1, 1, dtype=torch.float32, device=device),
+                q_nope=_q,
+                positions=torch.zeros(1, dtype=torch.int32, device=device),
+                forward_batch=forward_batch,
+                layer_id=0,
+            )
+
+        self.assertEqual(
+            empty_like_spy.call_count, 0,
+            "_select_topk_indices fell back to torch.empty_like — "
+            "metadata-owned ds_topk_indices_out was not reached via ForwardContext.",
+        )
+        self.assertEqual(
+            result.data_ptr(), metadata_buf_ptr,
+            "Returned ds_out does not alias the metadata-owned buffer.",
+        )
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_select_topk_indices_zero_allocs_production_path(self):
         """`_select_topk_indices` is replay-safe under CUDA graph capture
@@ -3497,18 +3577,22 @@ class TestCUDAGraphCapture(unittest.TestCase):
         state = allocate_graph_state(
             max_bs=1, max_top_k=2, max_seq_len=4, device=device,
         )
-        # ds_topk_indices_out + ds_per_request_summary must be pre-set so
-        # the captured body has stable buffers (matches what
-        # init_forward_metadata does in production).
+        # Publish BOTH ds_graph_state AND ds_topk_indices_out only through
+        # ForwardContext.attn_backend.forward_metadata (the real CUDA-graph
+        # capture path — `cuda_graph_runner.py` constructs a local
+        # `ForwardBatch` without DS fields and publishes the attention
+        # backend via `set_forward_context`). Do NOT pre-set
+        # forward_batch.ds_topk_indices_out — this is the regression Codex
+        # asked for.
         ds_topk_out = torch.empty(1, 2, dtype=torch.int32, device=device)
         forward_batch = self._make_production_forward_batch(
             device, req_to_token=req_to_token, bs=1, max_seq_len=4,
         )
-        forward_batch.ds_topk_indices_out = ds_topk_out
         forward_batch.ds_per_request_summary = {}
         attn_backend_stub = SimpleNamespace(
             forward_metadata=SimpleNamespace(
                 ds_graph_state=state,
+                ds_topk_indices_out=ds_topk_out,
                 cache_seqlens_int32=torch.full(
                     (1,), 4, dtype=torch.int32, device=device,
                 ),
@@ -5233,12 +5317,21 @@ class TestR6Coverage(unittest.TestCase):
 class TestR7Coverage(unittest.TestCase):
     """R7 verifies AC-8 capture/replay buffer + AC-9 early-abort + non-row containment."""
 
-    def test_select_topk_indices_reads_metadata_buffer_via_attn_backend(self):
-        """AC-8 capture/replay path: when forward_batch lacks the
-        ds_topk_indices_out attribute but the NSA backend's
-        forward_metadata has one (the capture/replay case), the DS
-        branch reads from metadata and writes in place.
+    def test_select_topk_indices_reads_metadata_buffer_via_forward_context(self):
+        """AC-8 capture/replay path: when `forward_batch` lacks the
+        `ds_topk_indices_out` attribute but the active ``ForwardContext``
+        publishes a backend whose ``forward_metadata`` has one (the real
+        CUDA-graph capture/replay case), the DS branch reads from
+        metadata and writes in place.
+
+        This previously used a synthetic `forward_batch.attn_backend`
+        attribute that production never sets; Round 20 routes the
+        lookup through `ForwardContext` to match `cuda_graph_runner.py`.
         """
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext, forward_context,
+        )
+
         attn = TestSelectTopkIndicesHookBranch()._make_attn(use_ds=True)
         attn.double_sparsity_selector.IS_PLACEHOLDER = False
 
@@ -5250,9 +5343,6 @@ class TestR7Coverage(unittest.TestCase):
             return_value=(sel, vl)
         )
 
-        # Synthesize an NSA backend whose forward_metadata carries the
-        # pre-allocated ds_topk_indices_out buffer (mirrors the
-        # capture/replay path).
         metadata_buf = torch.zeros((1, max_top_k), dtype=torch.int32)
         forward_batch = SimpleNamespace(
             req_pool_indices=torch.tensor([0], dtype=torch.int32),
@@ -5262,20 +5352,24 @@ class TestR7Coverage(unittest.TestCase):
                 req_to_token=torch.zeros((1, 1024), dtype=torch.int32),
             ),
             batch_size=1,
-            attn_backend=SimpleNamespace(
-                forward_metadata=SimpleNamespace(
-                    ds_topk_indices_out=metadata_buf,
-                )
+            out_cache_loc=None,
+        )
+        # Production source-of-truth for the attention backend.
+        attn_backend_stub = SimpleNamespace(
+            forward_metadata=SimpleNamespace(
+                ds_graph_state=None,
+                ds_topk_indices_out=metadata_buf,
             ),
         )
 
-        result = attn._select_topk_indices(
-            x=torch.zeros(1, 16, 128),
-            q_lora=torch.zeros(1, 16, 128),
-            positions=torch.zeros(1, dtype=torch.int32),
-            forward_batch=forward_batch,
-            layer_id=0,
-        )
+        with forward_context(ForwardContext(attn_backend=attn_backend_stub)):
+            result = attn._select_topk_indices(
+                x=torch.zeros(1, 16, 128),
+                q_lora=torch.zeros(1, 16, 128),
+                positions=torch.zeros(1, dtype=torch.int32),
+                forward_batch=forward_batch,
+                layer_id=0,
+            )
         # The metadata buffer is the same tensor object the adapter wrote into.
         self.assertIs(result, metadata_buf)
         # The first selected page (0) becomes token-pos 0 = 0.
@@ -6948,8 +7042,11 @@ class TestAC7MHABypass(unittest.TestCase):
         attn = self._make_attn_real()
         self._mock_retrieve_topk(attn)
 
-        mock_backend = MagicMock()
-        mock_backend.use_mha = False
+        # Use SimpleNamespace, not MagicMock, so getattr(backend,
+        # 'forward_metadata', None) returns None instead of an auto-generated
+        # MagicMock that would otherwise pollute the new always-resolved
+        # _dsa_metadata lookup in _select_topk_indices.
+        mock_backend = SimpleNamespace(use_mha=False, forward_metadata=None)
 
         forward_batch = SimpleNamespace(
             req_pool_indices=torch.tensor([0], dtype=torch.int32),
