@@ -111,44 +111,6 @@ global_workspace_buffer = None
 global_override_indptr_cpu = None
 
 
-def _spec_prefix_lens(
-    forward_mode: ForwardMode,
-    seq_lens: torch.Tensor,
-    spec_info: SpecInput,
-) -> torch.Tensor:
-    """Return the cached-KV length per sequence for SWA + EAGLE/MTP paths.
-
-    ``update_sliding_window`` needs ``prefix_lens`` so it can compute
-    ``paged_kernel_lens = min(seq_lens, SW + seq_lens - prefix_lens)``. In
-    non-speculative extend this is ``forward_batch.extend_prefix_lens``, but
-    that field is either absent (target_verify) or stale (draft_extend, since
-    ``prepare_extend_after_decode`` does not refresh it). We derive it locally
-    from spec metadata instead:
-
-    - ``is_target_verify``: ``seq_lens`` here does *not* include the draft
-      tokens being verified -- those are added inside
-      ``EagleVerifyInput.generate_attn_arg_prefill`` via ``+ draft_token_num``.
-      The full ``seq_lens`` is already cached, so ``prefix_lens = seq_lens``
-      (Q_len = 0 at this level). Matches the triton backend's target_verify
-      path, which computes ``min(seq_lens, SW)``.
-
-    - ``is_draft_extend``: ``seq_lens`` is the post-verify length (verify
-      advances ``batch.seq_lens`` by ``num_accept_tokens`` per request),
-      and ``spec_info.num_accept_tokens`` counts the Q tokens this forward
-      pass produces (drafts + 1 bonus), so
-      ``prefix_lens = seq_lens - num_accept_tokens``.
-    """
-    if forward_mode.is_target_verify():
-        return seq_lens
-    if forward_mode.is_draft_extend():
-        assert (spec_info.num_accept_tokens <= seq_lens).all(), (
-            "num_accept_tokens must be <= seq_lens "
-            "(invariant from prepare_extend_after_decode)"
-        )
-        return seq_lens - spec_info.num_accept_tokens
-    raise ValueError(f"_spec_prefix_lens called with unsupported mode: {forward_mode}")
-
-
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -489,10 +451,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_cpu,
                 forward_batch.seq_lens_sum,
-                prefix_lens=_spec_prefix_lens(
-                    forward_batch.forward_mode,
-                    forward_batch.seq_lens,
-                    forward_batch.spec_info,
+                prefix_lens=(
+                    forward_batch.seq_lens
+                    - forward_batch.spec_info.num_accept_tokens
                 ),
                 prefill_wrappers=self.prefill_wrappers_paged,
                 use_ragged=False,
@@ -508,11 +469,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_cpu,
                 forward_batch.seq_lens_sum,
-                prefix_lens=_spec_prefix_lens(
-                    forward_batch.forward_mode,
-                    forward_batch.seq_lens,
-                    forward_batch.spec_info,
-                ),
+                prefix_lens=forward_batch.seq_lens,
                 prefill_wrappers=self.prefill_wrappers_verify,
                 use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
@@ -686,7 +643,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens,
                 seq_lens.cpu(),  # may add a little overhead in capture stage
                 seq_lens_sum,
-                prefix_lens=_spec_prefix_lens(forward_mode, seq_lens, spec_info),
+                prefix_lens=seq_lens,
                 prefill_wrappers=prefill_wrappers,
                 use_ragged=False,
                 encoder_lens=encoder_lens,
@@ -716,7 +673,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens,
                 seq_lens.cpu(),  # may add a little overhead in capture stage
                 seq_lens_sum,
-                prefix_lens=_spec_prefix_lens(forward_mode, seq_lens, spec_info),
+                prefix_lens=seq_lens - spec_info.num_accept_tokens,
                 prefill_wrappers=prefill_wrappers,
                 use_ragged=False,
                 encoder_lens=encoder_lens,
@@ -785,7 +742,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
-                prefix_lens=_spec_prefix_lens(forward_mode, seq_lens[:bs], spec_info),
+                prefix_lens=seq_lens[:bs],
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
@@ -797,7 +754,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
-                prefix_lens=_spec_prefix_lens(forward_mode, seq_lens[:bs], spec_info),
+                prefix_lens=seq_lens[:bs] - spec_info.num_accept_tokens,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
