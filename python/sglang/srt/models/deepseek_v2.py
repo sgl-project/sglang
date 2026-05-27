@@ -2068,15 +2068,25 @@ class DeepseekV2AttentionMLA(
                 assert_real_selector_or_placeholder_allowed,
             )
 
-            # AC-7: skip sparse selection during short-seq MHA-mode prefill.
-            # When the DSA backend dispatches to dense MHA (use_mha=True), the
-            # KV slots for this step are not yet written to the label table at
-            # selection time. The label write in dsa_backend._write_token_labels
-            # fires unconditionally (before the use_mha branch); only scoring
-            # is skipped here so decode steps can call retrieve_topk normally.
-            _attn_backend = getattr(forward_batch, "attn_backend", None)
-            if getattr(_attn_backend, "use_mha", False):
-                return None
+            # Skip sparse selection during short-seq MHA-mode prefill.
+            # Read the MHA decision from the active ForwardContext backend —
+            # the same source handle_attention_dsa uses — not from ForwardBatch,
+            # which has no attn_backend field in production.
+            # Guarded by has_forward_context() so unit tests that do not publish
+            # a ForwardContext are unaffected (no bypass in that case).
+            from sglang.srt.layers.attention.tbo_backend import (
+                TboAttnBackend as _TboAttnBackend,
+            )
+            from sglang.srt.model_executor.forward_context import (
+                get_attn_backend as _get_attn_backend,
+                has_forward_context as _has_forward_context,
+            )
+            if _has_forward_context():
+                _fc_backend = _get_attn_backend()
+                if isinstance(_fc_backend, _TboAttnBackend):
+                    _fc_backend = _fc_backend.primary
+                if hasattr(_fc_backend, "use_mha") and _fc_backend.use_mha:
+                    return None
 
             req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
             req_to_token = (

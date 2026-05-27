@@ -474,6 +474,17 @@ class DeepseekMHAForwardMixin:
                 self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
             )
 
+        # Write DS token labels for the MHA_ONE_SHOT path.  dsa_backend.forward_extend
+        # guards _write_token_labels behind save_kv_cache=True, but forward_normal_prepare
+        # calls this function then passes save_kv_cache=False to the attention kernel,
+        # so labels would never be written for short dense prefills without this hook.
+        if getattr(self, "use_double_sparsity", False):
+            _ds_backend = _resolve_attn_backend(forward_batch)
+            if hasattr(_ds_backend, "_write_token_labels"):
+                _ds_backend._write_token_labels(
+                    self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1)
+                )
+
     def _get_mla_kv_buffer(
         self: DeepseekV2AttentionMLA,
         kv_indices: torch.Tensor,

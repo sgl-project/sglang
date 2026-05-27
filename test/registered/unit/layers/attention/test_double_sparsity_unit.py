@@ -5518,8 +5518,9 @@ class TestAC7MHABypass(unittest.TestCase):
     """AC-7: short-seq MHA bypass in _select_topk_indices.
 
     When the DSA backend is in dense MHA mode (use_mha=True), DS selection
-    must be skipped (returns None) so that stale or unwritten labels are not
-    scored.  The label write path is independent and unaffected.
+    must be skipped (returns None).  The bypass reads use_mha from the active
+    ForwardContext backend — NOT from ForwardBatch, which has no attn_backend
+    field in production.
     """
 
     def _make_attn_real(self):
@@ -5537,84 +5538,99 @@ class TestAC7MHABypass(unittest.TestCase):
         attn.indexer = MagicMock()
         return attn
 
-    def test_mha_bypass_returns_none_and_skips_retrieve_topk(self):
-        """use_mha=True → _select_topk_indices returns None, retrieve_topk not called."""
+    def _mock_retrieve_topk(self, attn):
+        max_top_k = attn.double_sparsity_selector.max_top_k
+        sel = torch.full((1, max_top_k), -1, dtype=torch.int32)
+        sel[0, 0] = 0
+        vl = torch.tensor([1], dtype=torch.int32)
+        attn.double_sparsity_selector.retrieve_topk = MagicMock(return_value=(sel, vl))
+
+    def _req_to_token(self):
+        return torch.arange(256, dtype=torch.int32).unsqueeze(0).expand(1, -1).contiguous()
+
+    def test_bypass_fires_via_forward_context_use_mha_true(self):
+        """Bypass reads use_mha from ForwardContext; forward_batch has no attn_backend.
+        This is the production path.  Test FAILS if has_forward_context() guard removed."""
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+
         attn = self._make_attn_real()
         attn.double_sparsity_selector.retrieve_topk = MagicMock()
 
+        mock_backend = MagicMock()
+        mock_backend.use_mha = True
+
+        # forward_batch intentionally has no attn_backend attribute
         forward_batch = SimpleNamespace(
             req_pool_indices=torch.tensor([0], dtype=torch.int32),
             seq_lens=torch.tensor([64], dtype=torch.int32),
             sparse_mask=None,
             req_to_token_pool=None,
             out_cache_loc=None,
-            attn_backend=SimpleNamespace(use_mha=True),
         )
 
-        result = attn._select_topk_indices(
-            x=torch.zeros(1, 16, 128),
-            q_lora=torch.zeros(1, 16, 128),
-            positions=torch.zeros(1, dtype=torch.int32),
-            forward_batch=forward_batch,
-            layer_id=0,
-        )
+        with forward_context(ForwardContext(attn_backend=mock_backend)):
+            result = attn._select_topk_indices(
+                x=torch.zeros(1, 16, 128),
+                q_lora=torch.zeros(1, 16, 128),
+                positions=torch.zeros(1, dtype=torch.int32),
+                forward_batch=forward_batch,
+                layer_id=0,
+            )
 
-        self.assertIsNone(result, "MHA bypass must return None (no indices)")
+        self.assertIsNone(result, "bypass must return None when ForwardContext.use_mha=True")
         attn.double_sparsity_selector.retrieve_topk.assert_not_called()
 
-    def test_no_bypass_when_use_mha_false(self):
-        """use_mha=False → _select_topk_indices calls retrieve_topk normally."""
-        attn = self._make_attn_real()
-        max_top_k = attn.double_sparsity_selector.max_top_k
-        sel = torch.full((1, max_top_k), -1, dtype=torch.int32)
-        sel[0, 0] = 0
-        vl = torch.tensor([1], dtype=torch.int32)
-        attn.double_sparsity_selector.retrieve_topk = MagicMock(return_value=(sel, vl))
-
-        req_to_token = (
-            torch.arange(256, dtype=torch.int32).unsqueeze(0).expand(1, -1).contiguous()
+    def test_no_bypass_when_forward_context_use_mha_false(self):
+        """ForwardContext.use_mha=False → retrieve_topk called (decode or long prefill)."""
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
         )
+
+        attn = self._make_attn_real()
+        self._mock_retrieve_topk(attn)
+
+        mock_backend = MagicMock()
+        mock_backend.use_mha = False
+
         forward_batch = SimpleNamespace(
             req_pool_indices=torch.tensor([0], dtype=torch.int32),
             seq_lens=torch.tensor([128], dtype=torch.int32),
             sparse_mask=None,
-            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            req_to_token_pool=SimpleNamespace(req_to_token=self._req_to_token()),
             out_cache_loc=None,
-            attn_backend=SimpleNamespace(use_mha=False),
         )
 
-        result = attn._select_topk_indices(
-            x=torch.zeros(1, 16, 128),
-            q_lora=torch.zeros(1, 16, 128),
-            positions=torch.zeros(1, dtype=torch.int32),
-            forward_batch=forward_batch,
-            layer_id=0,
-        )
+        with forward_context(ForwardContext(attn_backend=mock_backend)):
+            result = attn._select_topk_indices(
+                x=torch.zeros(1, 16, 128),
+                q_lora=torch.zeros(1, 16, 128),
+                positions=torch.zeros(1, dtype=torch.int32),
+                forward_batch=forward_batch,
+                layer_id=0,
+            )
 
         attn.double_sparsity_selector.retrieve_topk.assert_called_once()
-        self.assertIsNotNone(result, "Non-MHA DS path must return topk indices tensor")
+        self.assertIsNotNone(result)
 
-    def test_bypass_when_no_attn_backend(self):
-        """attn_backend=None → use_mha defaults False → retrieve_topk IS called."""
+    def test_no_bypass_without_forward_context(self):
+        """No active ForwardContext → has_forward_context()=False → no bypass, retrieve_topk called.
+        This preserves backward compatibility for unit tests that do not publish a context."""
         attn = self._make_attn_real()
-        max_top_k = attn.double_sparsity_selector.max_top_k
-        sel = torch.full((1, max_top_k), -1, dtype=torch.int32)
-        sel[0, 0] = 0
-        vl = torch.tensor([1], dtype=torch.int32)
-        attn.double_sparsity_selector.retrieve_topk = MagicMock(return_value=(sel, vl))
+        self._mock_retrieve_topk(attn)
 
-        req_to_token = (
-            torch.arange(256, dtype=torch.int32).unsqueeze(0).expand(1, -1).contiguous()
-        )
         forward_batch = SimpleNamespace(
             req_pool_indices=torch.tensor([0], dtype=torch.int32),
             seq_lens=torch.tensor([128], dtype=torch.int32),
             sparse_mask=None,
-            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            req_to_token_pool=SimpleNamespace(req_to_token=self._req_to_token()),
             out_cache_loc=None,
-            attn_backend=None,  # no backend attached
         )
 
+        # Deliberately NOT wrapping in forward_context — simulates legacy unit test pattern
         result = attn._select_topk_indices(
             x=torch.zeros(1, 16, 128),
             q_lora=torch.zeros(1, 16, 128),
@@ -5627,27 +5643,113 @@ class TestAC7MHABypass(unittest.TestCase):
         self.assertIsNotNone(result)
 
     def test_mha_bypass_does_not_affect_nsa_path(self):
-        """use_double_sparsity=False: MHA flag on backend is irrelevant — NSA indexer called."""
+        """use_double_sparsity=False: ForwardContext.use_mha is irrelevant — NSA indexer called."""
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
         from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
         attn = object.__new__(DeepseekV2AttentionMLA)
         attn.use_double_sparsity = False
         attn.indexer = MagicMock(return_value=torch.tensor([0, 1], dtype=torch.int32))
 
-        forward_batch = SimpleNamespace(
-            attn_backend=SimpleNamespace(use_mha=True),
-        )
+        mock_backend = MagicMock()
+        mock_backend.use_mha = True
 
-        result = attn._select_topk_indices(
-            x=torch.zeros(1, 16, 128),
-            q_lora=torch.zeros(1, 16, 128),
-            positions=torch.zeros(1, dtype=torch.int32),
-            forward_batch=forward_batch,
-            layer_id=0,
-        )
+        forward_batch = SimpleNamespace()
+
+        with forward_context(ForwardContext(attn_backend=mock_backend)):
+            result = attn._select_topk_indices(
+                x=torch.zeros(1, 16, 128),
+                q_lora=torch.zeros(1, 16, 128),
+                positions=torch.zeros(1, dtype=torch.int32),
+                forward_batch=forward_batch,
+                layer_id=0,
+            )
 
         attn.indexer.assert_called_once()
         self.assertTrue(torch.equal(result, torch.tensor([0, 1], dtype=torch.int32)))
+
+    def test_mha_label_write_fires_in_set_mla_kv_buffer(self):
+        """_set_mla_kv_buffer must call _write_token_labels when use_double_sparsity=True.
+        This covers the MHA_ONE_SHOT path where dsa_backend.forward_extend is NOT called
+        with save_kv_cache=True, so labels would never be written without this hook.
+        Test FAILS if the _write_token_labels call is removed from _set_mla_kv_buffer."""
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+        from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+        attn = object.__new__(DeepseekV2AttentionMLA)
+        attn.use_double_sparsity = True
+        attn.kv_lora_rank = 4
+        attn.attn_mha = MagicMock()
+
+        write_calls: list = []
+
+        def spy_write(layer, cache_loc, k):
+            write_calls.append(k.shape)
+
+        mock_pool = MagicMock()
+        mock_backend = MagicMock()
+        mock_backend.token_to_kv_pool = mock_pool
+        mock_backend.use_mha = True
+        mock_backend._write_token_labels = spy_write
+
+        T, kv_lora_rank, rope_dim = 3, 4, 2
+        latent_cache = torch.zeros(T, 1, kv_lora_rank + rope_dim)
+        kv_a = torch.randn(T, kv_lora_rank)
+        k_pe = torch.zeros(T, 1, rope_dim)
+        cache_loc = torch.arange(T, dtype=torch.int64)
+        forward_batch = SimpleNamespace(out_cache_loc=cache_loc)
+
+        with forward_context(ForwardContext(attn_backend=mock_backend)):
+            attn._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
+
+        self.assertEqual(
+            len(write_calls), 1,
+            "_write_token_labels must be called once by _set_mla_kv_buffer"
+        )
+        self.assertEqual(
+            write_calls[0],
+            torch.Size([T, 1, kv_lora_rank]),
+            "k passed to _write_token_labels must be kv_a.unsqueeze(1): [T, 1, kv_lora_rank]"
+        )
+
+    def test_no_label_write_when_not_double_sparsity(self):
+        """When use_double_sparsity=False, _set_mla_kv_buffer must NOT call _write_token_labels."""
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+        from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+        attn = object.__new__(DeepseekV2AttentionMLA)
+        attn.use_double_sparsity = False
+        attn.kv_lora_rank = 4
+        attn.attn_mha = MagicMock()
+
+        write_calls: list = []
+
+        mock_pool = MagicMock()
+        mock_backend = MagicMock()
+        mock_backend.token_to_kv_pool = mock_pool
+        mock_backend._write_token_labels = MagicMock(side_effect=lambda *a: write_calls.append(1))
+
+        T, kv_lora_rank, rope_dim = 2, 4, 2
+        latent_cache = torch.zeros(T, 1, kv_lora_rank + rope_dim)
+        kv_a = torch.zeros(T, kv_lora_rank)
+        k_pe = torch.zeros(T, 1, rope_dim)
+        cache_loc = torch.arange(T, dtype=torch.int64)
+        forward_batch = SimpleNamespace(out_cache_loc=cache_loc)
+
+        with forward_context(ForwardContext(attn_backend=mock_backend)):
+            attn._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
+
+        self.assertEqual(len(write_calls), 0,
+                         "_write_token_labels must NOT fire when use_double_sparsity=False")
 
 
 if __name__ == "__main__":
