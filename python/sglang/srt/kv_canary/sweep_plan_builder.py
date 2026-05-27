@@ -38,12 +38,10 @@ def build_verify_plan_radix_sweep(
         assert (
             full_to_swa_index_mapping is not None
         ), "full_to_swa_index_mapping is required when SWA is enabled"
-        slot_indices = _swa_translate(
-            indices=slot_indices,
-            lut=full_to_swa_index_mapping,
-        )
-        prev_slot_indices = _swa_translate(
-            indices=prev_slot_indices,
+        slot_indices, prev_slot_indices, positions = _swa_translate_sweep_plan(
+            slot_indices=slot_indices,
+            prev_slot_indices=prev_slot_indices,
+            positions=positions,
             lut=full_to_swa_index_mapping,
         )
 
@@ -59,19 +57,38 @@ def build_verify_plan_radix_sweep(
     return verify_plan
 
 
-def _swa_translate(
+def _swa_translate_sweep_plan(
     *,
-    indices: torch.Tensor,
+    slot_indices: torch.Tensor,
+    prev_slot_indices: torch.Tensor,
+    positions: torch.Tensor,
     lut: torch.Tensor,
-) -> torch.Tensor:
-    if indices.numel() == 0:
-        return indices
-    lut_dev = lut.to(indices.device).to(torch.int64)
-    sentinel_mask = indices < 0
-    safe = torch.where(sentinel_mask, torch.zeros_like(indices), indices).to(
-        torch.int64
-    )
-    translated = lut_dev[safe]
-    return torch.where(
-        sentinel_mask, indices.to(torch.int64), translated.to(torch.int64)
-    )
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # full_to_swa_index_mapping uses 0 as the "SWA-evicted / unmapped" sentinel
+    # (see SWAKVPool.free_swa: writes 0 on free). SWA-pool slot 0 is the
+    # padding/null slot and is never allocated, so its canary fields stay all
+    # zero -- if we let an evicted FULL index translate to SWA slot 0, the
+    # verify kernel would read those zeros and flag every chain-link to an
+    # evicted ancestor as a verify_chain_hash mismatch (expected_aux=0 flood).
+    #
+    # Drop rows where either the current slot or the prev slot lands on the
+    # 0 sentinel after translation. The walker's own -1 anchor on root edges
+    # is preserved (chain hash anchor); only LUT-introduced 0s are filtered.
+    if slot_indices.numel() == 0:
+        return slot_indices, prev_slot_indices, positions
+    lut_dev = lut.to(slot_indices.device).to(torch.int64)
+
+    def translate(x: torch.Tensor) -> torch.Tensor:
+        anchor_mask = x < 0
+        safe = torch.where(anchor_mask, torch.zeros_like(x), x).to(torch.int64)
+        looked_up = lut_dev[safe]
+        return torch.where(anchor_mask, x.to(torch.int64), looked_up)
+
+    slot_swa = translate(slot_indices)
+    prev_swa = translate(prev_slot_indices)
+
+    valid_slot = slot_swa != 0
+    valid_prev = (prev_slot_indices < 0) | (prev_swa != 0)
+    keep = valid_slot & valid_prev
+
+    return slot_swa[keep], prev_swa[keep], positions[keep]

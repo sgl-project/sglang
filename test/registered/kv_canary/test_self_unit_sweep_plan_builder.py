@@ -72,6 +72,27 @@ class TestSelfUnitSweepPlanBuilder(CustomTestCase):
         )
         self.assertEqual(int(out.verify_num_valid.item()), 0)
 
+    def test_swa_translate_drops_evicted_rows(self) -> None:
+        """SWA LUT-evicted (=0) slots and their dependents are filtered out of the sweep plan."""
+        cache = make_radix_cache([[], [100, 101, 102]], device=self.device)
+        cache.req_to_token_pool = make_req_to_token_pool(self.device)
+
+        lut = torch.zeros(200, dtype=torch.int64, device=self.device)
+        lut[100] = 500
+        lut[101] = 0
+        lut[102] = 502
+
+        out = build_verify_plan_radix_sweep(
+            radix_cache=cache,
+            swa_window_size=128,
+            full_to_swa_index_mapping=lut,
+        )
+        num_valid = int(out.verify_num_valid.item())
+        self.assertEqual(num_valid, 1)
+        self.assertEqual(out.verify_slot_indices[:num_valid].tolist(), [500])
+        self.assertEqual(out.verify_prev_slot_indices[:num_valid].tolist(), [-1])
+        self.assertEqual(out.verify_expected_positions[:num_valid].tolist(), [0])
+
 
 if __name__ == "__main__":
     unittest.main()
