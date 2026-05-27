@@ -806,3 +806,105 @@ def run_gdn_eagle_draft_extend_case(
     actual = run_gdn_fixture_eager(fixture)
     expected = _pure_torch_gdn_reference(fixture, initial_state[1]).output
     torch.testing.assert_close(actual, expected, atol=GDN_ATOL, rtol=GDN_RTOL)
+
+
+def run_kda_eagle_draft_extend_case(
+    testcase,
+    case,
+    *,
+    head_k_dim: int = 32,
+    head_v_dim: int = 32,
+    max_context_len: int = 64,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+):
+    """KDA EAGLE DRAFT_EXTEND eager. Same pattern as GDN/Mamba2:
+    the recurrent backend processes draft tokens linearly regardless
+    of the spec_info tree mask, so the existing EXTEND-style
+    sigmoid-gated delta-rule reference doubles as the DRAFT_EXTEND
+    reference. CG is structurally blocked across the HybridLinearAttn
+    family (`hybrid_linear_attn_backend.py:509,572`)."""
+    from ..attention_methods.kda_attention import (
+        KDA_ATOL,
+        KDA_RTOL,
+        _clone_kda_cache,
+        build_kda_attention_fixture,
+        expected_kda_output_from_inputs,
+        kda_fixture_inputs,
+        run_kda_fixture_eager,
+    )
+
+    if not case.forward_mode.is_draft_extend():
+        raise ValueError(
+            "KDA DRAFT_EXTEND coverage expects a DRAFT_EXTEND case."
+        )
+    fixture = build_kda_attention_fixture(
+        testcase,
+        case,
+        head_k_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+    )
+    initial_state = _clone_kda_cache(fixture)
+    inputs = kda_fixture_inputs(fixture)
+    fixture.forward_batch.spec_info = _make_eagle_draft_extend_input(
+        case,
+        fixture.forward_batch,
+        device=device,
+    )
+    actual = run_kda_fixture_eager(fixture)
+    expected = expected_kda_output_from_inputs(fixture, case, inputs, initial_state)
+    torch.testing.assert_close(actual, expected, atol=KDA_ATOL, rtol=KDA_RTOL)
+
+
+def run_lightning_eagle_draft_extend_case(
+    testcase,
+    case,
+    *,
+    head_dim: int = 128,
+    max_context_len: int = 64,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+    atol: float = 5e-2,
+    rtol: float = 5e-2,
+):
+    """Lightning EAGLE DRAFT_EXTEND eager. Same pattern as the other
+    HybridLinearAttn family backends. The default Lightning reference
+    matches the DRAFT_EXTEND actual within ~0.031 max diff — just
+    above the default `LIGHTNING_ATOL=3e-2` — so the runner uses a
+    slightly looser `5e-2` to absorb the seg_la kernel's per-token
+    accumulation drift on the draft path. CG is structurally blocked."""
+    from ..attention_methods.lightning_attention import (
+        _clone_lightning_cache,
+        build_lightning_attention_fixture,
+        expected_lightning_output_from_inputs,
+        lightning_fixture_inputs,
+        run_lightning_fixture_eager,
+    )
+
+    if not case.forward_mode.is_draft_extend():
+        raise ValueError(
+            "Lightning DRAFT_EXTEND coverage expects a DRAFT_EXTEND case."
+        )
+    fixture = build_lightning_attention_fixture(
+        testcase,
+        case,
+        head_dim=head_dim,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+    )
+    initial_state = _clone_lightning_cache(fixture)
+    inputs = lightning_fixture_inputs(fixture)
+    fixture.forward_batch.spec_info = _make_eagle_draft_extend_input(
+        case,
+        fixture.forward_batch,
+        device=device,
+    )
+    actual = run_lightning_fixture_eager(fixture)
+    expected = expected_lightning_output_from_inputs(
+        fixture, case, inputs, initial_state
+    )
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
