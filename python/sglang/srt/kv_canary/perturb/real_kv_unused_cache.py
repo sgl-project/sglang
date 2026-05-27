@@ -134,6 +134,27 @@ def run(
         )
         return
     slot, owning_node = pick
+
+    # SWARadixCache.inc_lock_ref asserts that the node (and every
+    # ancestor up to the sliding-window cap) is not swa_tombstoned. The
+    # walker's swa_resident_only filter handles the picked node itself,
+    # but an ancestor — and even the picked node, if a parallel SWA
+    # eviction tombstoned it between walker collection and our inc — can
+    # still be tombstone at lock time. Recheck the whole chain inside the
+    # scheduler thread (no GIL release until inc_lock_ref runs); if any
+    # would-be-locked node is now a tombstone, abort this perturb cycle
+    # entirely (do not flip the byte either).
+    assert radix_cache is not None  # _pick_sweep_slot_for_group needs it
+    if _path_is_swa_safe_to_lock(
+        radix_cache=radix_cache, leaf=owning_node
+    ) is False:
+        logger.info(
+            "kv_canary perturb real_kv_unused_cache: skipped because node id=%d "
+            "(or an ancestor) became swa_tombstone between walk and lock",
+            getattr(owning_node, "id", -1),
+        )
+        return
+
     source_pick = int(torch.randint(0, len(group.real_kv_sources_k), (1,)).item())
     source = group.real_kv_sources_k[source_pick]
     flip_result = flip_first_byte_in_source(
@@ -158,7 +179,6 @@ def run(
     # observes the corruption. SWARadixCache returns swa_uuid_for_lock /
     # related fields that must be replayed back through dec_lock_ref to
     # release only what we acquired, so capture them now.
-    assert radix_cache is not None  # _pick_sweep_slot_for_group needs it
     inc_result = radix_cache.inc_lock_ref(owning_node)
     state.pending.append(
         _PinnedNode(
@@ -181,6 +201,36 @@ def run(
         original_byte ^ 0xFF,
         outer_step_counter + _PIN_SWEEP_CYCLES * sweep_interval,
     )
+
+
+def _path_is_swa_safe_to_lock(
+    *,
+    radix_cache: "BasePrefixCache",
+    leaf: "TreeNode",
+) -> bool:
+    """Re-check the leaf-to-root chain for swa_tombstones.
+
+    SWARadixCache.inc_lock_ref walks ``leaf`` up to root and asserts no
+    swa_tombstone node along the way (for the SWA half of the lock, which
+    fires while accumulated value len < sliding_window_size). Between the
+    walker emitting a node and this perturb code calling inc_lock_ref, a
+    parallel SWA eviction may have tombstoned any node in this chain.
+    Return False in that case so the caller can skip this perturb cycle
+    rather than crashing the scheduler with an assertion error.
+
+    For plain RadixCache this always returns True (no tombstones exist).
+    """
+    from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache  # local: avoid cycle
+
+    if type(radix_cache) is not SWARadixCache:
+        return True
+    node = leaf
+    root = radix_cache.root_node
+    while node is not None and node is not root:
+        if getattr(node, "swa_tombstone", False):
+            return False
+        node = node.parent
+    return True
 
 
 def _unpin_expired(
