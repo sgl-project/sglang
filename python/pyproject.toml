@@ -42,6 +42,7 @@ dependencies = [
   "nvidia-ml-py",
   "openai-harmony==0.0.4",
   "openai==2.6.1",
+  "distro>=1.7,<2",
   "orjson",
   "outlines==0.1.11",
   "packaging",

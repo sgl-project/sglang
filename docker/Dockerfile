@@ -706,6 +706,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     # Python runtime
     python3.12-full \
     python3.12-dev \
+    python3-distro \
     wget \
     # Core system utilities
     ca-certificates \
