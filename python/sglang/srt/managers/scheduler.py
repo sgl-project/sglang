@@ -1408,6 +1408,10 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            # WAR barrier: this iter's schedule writes to shared GPU buffers
+            # (alloc / retract free_swa) wait for the previous forward's reads.
+            self.schedule_stream.wait_stream(self.forward_stream)
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
