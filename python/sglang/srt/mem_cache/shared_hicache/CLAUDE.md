@@ -35,6 +35,102 @@ source is authoritative at transfer time.
 - `control.py`: target/source control-plane messages and transfer-handle glue.
 - `pending.py`: pending target transfer state and timeout helpers.
 
+## Router To Engine Walkthrough
+
+Roles:
+
+- Router: external request router that knows which workers have advertised
+  host-tier KV blocks.
+- Target worker: the SGLang worker selected to serve the request now.
+- Source worker: the SGLang worker that may still have the wanted blocks in its
+  HiCache host tier.
+
+High-level flow:
+
+```text
+client request
+  |
+  v
+router
+  |  chooses target worker
+  |  attaches SharedHiCachePlan hint:
+  |    source_worker_id, target_worker_id, block hashes, TP shape, expiry
+  v
+target engine frontend / tokenizer path
+  |
+  v
+target scheduler waiting queue
+  |
+  v
+target SharedHiCache manager
+  |  validates plan and current local prefix
+  |  allocates target GPU KV pages
+  |  sends async transfer request to source TP rank
+  v
+source SharedHiCache service
+  |  revalidates plan, rank, expiry, and host block hashes
+  |  decides whether it can serve now
+  |  protects source host nodes only if it will transfer
+  |  performs NIXL host-to-target-GPU transfer
+  v
+target SharedHiCache manager
+  |  receives completion notification
+  |  validates transferred hash sequence
+  |  inserts transferred pages into target radix cache
+  |  schedules request using the extended prefix
+  v
+model forward on target worker
+```
+
+Detailed lifecycle:
+
+1. The router receives a client request and computes block hashes for the
+   request prefix.
+2. The router picks a target worker for the request.
+3. If another worker has useful host-tier blocks, the router attaches a
+   `shared_hicache_plan` to the engine request. This is a hint, not a lease.
+4. The SGLang engine API carries `shared_hicache_plan` through request objects
+   into `ScheduleBatch.Req`.
+5. The target scheduler runs normal local prefix matching first.
+6. The target scheduler asks Shared HiCache to prepare extra prefix blocks only
+   for the remaining suffix beyond the local device/host hit.
+7. The target manager validates that the plan names this worker as target, that
+   the TP shape/rank is compatible, that the block size matches the local page
+   size, and that the plan has not expired.
+8. The target reserves GPU KV indices for the planned suffix. These indices are
+   not visible to the radix cache yet.
+9. The target sends a JSON transfer request to the source control endpoint for
+   the matching TP rank. The request includes target session metadata, target KV
+   pointers, target page indices, and the original plan.
+10. The source service receives the request on its per-rank async worker.
+11. The source revalidates source worker id, source/target TP rank, plan expiry,
+    block size, and the requested block hashes against the current HiCache host
+    block index.
+12. The source may reject without pinning if blocks are missing, the request is
+    malformed, topology/rank ownership is wrong, or source policy says it should
+    not serve now.
+13. If the source accepts, it protects the matched host nodes with
+    `TreeNode.protect_host()`. Host eviction must not free those pages while the
+    direct transfer is in flight.
+14. The source transfer backend copies pages from source host memory into the
+    target GPU KV pages and sends a completion notification to the target.
+15. The source releases host protection in a `finally` path after transfer
+    completion or failure.
+16. The target observes transfer completion, validates that returned pages are
+    contiguous and match the expected hashes, then inserts the target KV indices
+    into the radix cache.
+17. If insertion succeeds, `req.shared_hicache_hit_length` is updated and the
+    scheduler uses the longer prefix for model forward.
+18. If any step fails, the target frees or quarantines reserved GPU KV indices,
+    records a miss/error metric, and the request continues with normal prefill.
+
+Source admission rule:
+
+- Source is authoritative at transfer time.
+- Source can say no even if the router hint said it probably had the blocks.
+- Once source says yes and starts transfer, it must keep the accepted host pages
+  protected until transfer finishes or fails.
+
 ## Request Lifecycle
 
 1. The scheduler receives a request with a Shared HiCache plan.
