@@ -38,7 +38,13 @@ from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import get_current_device_stream_fast, is_cpu, is_cuda, is_hip
+from sglang.srt.utils import (
+    device_stream_context,
+    get_current_device_stream_fast,
+    is_cpu,
+    is_cuda,
+    is_hip,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -480,7 +486,7 @@ def apply_qk_norm(
     q_norm: RMSNorm,
     k_norm: RMSNorm,
     head_dim: int,
-    alt_stream: Optional[torch.cuda.Stream] = None,
+    alt_stream: Optional[torch.Stream] = None,
     allow_inplace: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -493,7 +499,7 @@ def apply_qk_norm(
         q_norm: RMSNorm layer for query normalization
         k_norm: RMSNorm layer for key normalization
         head_dim: Dimension of each attention head
-        alt_stream: Optional alternative CUDA stream for overlapping computation
+        alt_stream: Optional alternative device stream for overlapping computation
         allow_inplace: Whether to allow inplace normalization. (True for better performance)
 
     Returns:
@@ -534,7 +540,7 @@ def apply_qk_norm(
         alt_stream.wait_stream(current_stream)
         q_by_head = _reshape_for_qk_norm(q, head_dim)
         q_by_head = q_norm(q_by_head)
-        with torch.cuda.stream(alt_stream):
+        with device_stream_context(alt_stream):
             k_by_head = _reshape_for_qk_norm(k, head_dim)
             k_by_head = k_norm(k_by_head)
         current_stream.wait_stream(alt_stream)

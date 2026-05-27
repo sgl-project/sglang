@@ -8,11 +8,14 @@ python/sglang/srt/disaggregation/nixl/conn.py, which is required on
 Intel XPU where device addresses have bit 63 set (e.g. 0xffff81ab54e01000)
 and would overflow np.int64.
 
+Requirements:
+    The ``sglang-router`` package must be installed in the environment (it is
+    provided by the XPU/disagg test image, same as other PD tests).
+
 Usage:
     python3 -m pytest test/registered/disaggregation/test_disaggregation_xpu.py -v
 """
 
-import subprocess
 import unittest
 
 import requests
@@ -24,14 +27,29 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
 
-register_xpu_ci(est_time=300, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(
+    est_time=300,
+    suite="nightly-xpu-2-gpu",
+    nightly=True,
+    disabled=(
+        "Requires NIXL XPU support which depends on upstream PRs not yet merged: "
+        "NIXL https://github.com/ai-dynamo/nixl/pull/1536 and "
+        "UCX https://github.com/openucx/ucx/pull/11218"
+    ),
+)
 
 _XPU_AVAILABLE = torch.xpu.is_available()
-
-
-@unittest.skipUnless(
-    _XPU_AVAILABLE, "Intel XPU not available (torch.xpu.is_available() returned False)"
+# PD disaggregation needs two devices: the fixture puts decode on
+# decode_base_gpu_id=1 while prefill holds device 0.
+_XPU_DEVICE_COUNT = torch.xpu.device_count() if _XPU_AVAILABLE else 0
+_SKIP_REASON = (
+    "Intel XPU not available (torch.xpu.is_available() returned False)"
+    if not _XPU_AVAILABLE
+    else f"PD disaggregation needs 2 XPUs, found {_XPU_DEVICE_COUNT}"
 )
+
+
+@unittest.skipUnless(_XPU_DEVICE_COUNT >= 2, _SKIP_REASON)
 class TestDisaggregationNixlBasic(PDDisaggregationServerBase):
     """Smoke-test the NIXL disaggregation backend with a small completion."""
 
@@ -39,16 +57,16 @@ class TestDisaggregationNixlBasic(PDDisaggregationServerBase):
     def setUpClass(cls):
         super().setUpClass()
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
-        # Force the NIXL backend and XPU device.
         cls.transfer_backend = ["--disaggregation-transfer-backend", "nixl"]
         cls.rdma_devices = []
         cls.extra_prefill_args = ["--device", "xpu"]
-        cls.extra_decode_args = ["--device", "xpu"]
-        subprocess.check_call(
-            ["pip", "install", "sglang-router"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        # host_pool retraction backup calls cudaHostRegister, which is CUDA-only.
+        cls.extra_decode_args = [
+            "--device",
+            "xpu",
+            "--disaggregation-decode-retraction-backup",
+            "cpu_tensor",
+        ]
         cls.launch_all()
 
     def test_completion_returns_text(self):
@@ -80,7 +98,6 @@ class TestDisaggregationNixlBasic(PDDisaggregationServerBase):
         )
         self.assertEqual(response.status_code, 200, response.text)
         generated = response.json()["text"]
-        # The model should produce "2" somewhere in the first few tokens.
         self.assertIn("2", generated, f"Expected '2' in output, got: {generated!r}")
 
 
