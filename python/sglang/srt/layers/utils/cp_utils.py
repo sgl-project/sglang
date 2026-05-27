@@ -569,9 +569,9 @@ def prepare_context_parallel_metadata(
     # Per-sequence cumulatives used for FA cache_seqlens.
     #   kv_len_prev[s] = sum of seq s's blocks [0..cp_rank] (inclusive).
     #   kv_len_next[s] = sum of seq s's blocks [0..cp_segment_num-cp_rank-1] (inclusive).
-    from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+    from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 
-    nsa_mode = is_nsa_enable_prefill_cp()
+    nsa_mode = is_dsa_enable_prefill_cp()
     kv_len_prev_list: List[int] = []
     kv_len_next_list: List[int] = []
     actual_seq_q_prev_list: List[int] = []
