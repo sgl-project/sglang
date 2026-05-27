@@ -348,6 +348,50 @@ echo "Persistent-looking mounts (excluding tmpfs/overlay/proc/sys/cgroup):"
 awk '$3 != "tmpfs" && $3 != "overlay" && $3 != "proc" && $3 != "sysfs" && $3 != "cgroup" && $3 != "cgroup2" && $3 != "devpts" && $3 != "mqueue" {print $1, "->", $2, "type", $3}' /proc/mounts 2>/dev/null || true
 echo "=========================================="
 
+echo "=========================================="
+echo "Host network diagnostics"
+echo "=========================================="
+echo "DNS servers (/etc/resolv.conf):"
+grep -E '^(nameserver|search)' /etc/resolv.conf 2>/dev/null || echo "  (no /etc/resolv.conf)"
+echo ""
+echo "Default route:"
+ip route show default 2>/dev/null || echo "  (no ip command)"
+echo ""
+echo "Interfaces (brief):"
+ip -br addr 2>/dev/null || ifconfig -a 2>/dev/null || echo "  (no ip/ifconfig)"
+echo ""
+
+if ! command -v curl >/dev/null 2>&1; then
+    echo "curl not available on host; skipping latency/throughput tests"
+else
+    HOST_CURL_AUTH=()
+    if [[ -n "${HF_TOKEN:-}" ]]; then
+        HOST_CURL_AUTH=(-H "Authorization: Bearer ${HF_TOKEN}")
+    fi
+
+    echo "Endpoint latency (curl --max-time 15):"
+    for url in \
+        https://huggingface.co/api/models/gpt2 \
+        https://huggingface.co/api/models/meta-llama/Llama-3.1-8B-Instruct \
+        https://cdn-lfs.huggingface.co/ \
+        https://github.com \
+        https://pypi.org/simple/ \
+        http://10.245.143.50:5000/v2/; do
+        result=$(curl -sS -o /dev/null --max-time 15 "${HOST_CURL_AUTH[@]}" \
+            -w "dns=%{time_namelookup}s conn=%{time_connect}s ssl=%{time_appconnect}s ttfb=%{time_starttransfer}s total=%{time_total}s speed=%{speed_download}B/s http=%{http_code}" \
+            "$url" 2>&1) || result="FAILED (timeout / network error)"
+        printf '  %-70s %s\n' "$url" "$result"
+    done
+    echo ""
+
+    echo "HF CDN throughput test: first 10MB of public gpt2 weights"
+    speed_url="https://huggingface.co/gpt2/resolve/main/pytorch_model.bin"
+    curl -sS -o /dev/null --range 0-10485759 --max-time 60 \
+        -w "  total=%{time_total}s speed=%{speed_download}B/s bytes=%{size_download} http=%{http_code}\n" \
+        "$speed_url" 2>&1 || echo "  FAILED (timeout / connection error)"
+fi
+echo "=========================================="
+
 echo "Launching container: ci_sglang"
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   --ulimit nofile=65536:65536 \
@@ -370,8 +414,6 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   "${IMAGE}"
 
 docker exec ci_sglang bash -lc '
-  # EXPERIMENT: temporarily ENABLE NUMA balancing to A/B-test its impact on AMD CI flakiness.
-  # Revert this block to "echo 0" once the experiment is done.
   numa_balancing_path=/proc/sys/kernel/numa_balancing
 
   if [[ ! -r "${numa_balancing_path}" ]]; then
@@ -379,23 +421,21 @@ docker exec ci_sglang bash -lc '
     exit 0
   fi
 
-  echo "[EXPERIMENT] kernel.numa_balancing=$(cat "${numa_balancing_path}") (before)"
+  echo "kernel.numa_balancing=$(cat "${numa_balancing_path}")"
 
-  if [[ "$(cat "${numa_balancing_path}")" != "1" ]]; then
+  if [[ "$(cat "${numa_balancing_path}")" != "0" ]]; then
     if [[ -w "${numa_balancing_path}" ]]; then
-      if echo 1 > "${numa_balancing_path}"; then
-        echo "[EXPERIMENT] ENABLED kernel.numa_balancing for AMD CI (was off; explicit A/B test)"
+      if echo 0 > "${numa_balancing_path}"; then
+        echo "Disabled kernel.numa_balancing for AMD CI"
       else
-        echo "WARNING: failed to enable kernel.numa_balancing" >&2
+        echo "WARNING: failed to disable kernel.numa_balancing" >&2
       fi
     else
-      echo "WARNING: ${numa_balancing_path} is not writable; unable to enable NUMA balancing" >&2
+      echo "WARNING: ${numa_balancing_path} is not writable; unable to disable NUMA balancing" >&2
     fi
-  else
-    echo "[EXPERIMENT] kernel.numa_balancing already 1; nothing to do"
   fi
 
-  echo "[EXPERIMENT] kernel.numa_balancing=$(cat "${numa_balancing_path}") (after)"
+  echo "kernel.numa_balancing=$(cat "${numa_balancing_path}")"
 '
 
 docker exec ci_sglang bash -lc '
@@ -427,6 +467,52 @@ docker exec ci_sglang bash -lc '
     ls -la /sgl-data 2>/dev/null | head -20 || true
     echo "HF hub cache (first 20):"
     ls -la /sgl-data/hf-cache/hub 2>/dev/null | head -20 || echo "  (hf-cache/hub not present)"
+  fi
+  echo "=========================================="
+'
+
+docker exec ci_sglang bash -lc '
+  echo "=========================================="
+  echo "In-container network diagnostics"
+  echo "=========================================="
+  echo "DNS servers (/etc/resolv.conf):"
+  grep -E "^(nameserver|search)" /etc/resolv.conf 2>/dev/null || echo "  (no /etc/resolv.conf)"
+  echo ""
+  echo "Default route:"
+  ip route show default 2>/dev/null || echo "  (no ip command)"
+  echo ""
+  echo "Interfaces (brief):"
+  ip -br addr 2>/dev/null || ifconfig -a 2>/dev/null || echo "  (no ip/ifconfig)"
+  echo ""
+
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "curl not available in container; skipping latency/throughput tests"
+  else
+    CURL_AUTH=()
+    if [[ -n "${HF_TOKEN:-}" ]]; then
+      CURL_AUTH=(-H "Authorization: Bearer ${HF_TOKEN}")
+    fi
+
+    echo "Endpoint latency (curl --max-time 15):"
+    for url in \
+      https://huggingface.co/api/models/gpt2 \
+      https://huggingface.co/api/models/meta-llama/Llama-3.1-8B-Instruct \
+      https://cdn-lfs.huggingface.co/ \
+      https://github.com \
+      https://pypi.org/simple/ \
+      http://10.245.143.50:5000/v2/; do
+      result=$(curl -sS -o /dev/null --max-time 15 "${CURL_AUTH[@]}" \
+        -w "dns=%{time_namelookup}s conn=%{time_connect}s ssl=%{time_appconnect}s ttfb=%{time_starttransfer}s total=%{time_total}s speed=%{speed_download}B/s http=%{http_code}" \
+        "$url" 2>&1) || result="FAILED (timeout / network error)"
+      printf "  %-70s %s\n" "$url" "$result"
+    done
+    echo ""
+
+    echo "HF CDN throughput test: first 10MB of public gpt2 weights"
+    speed_url="https://huggingface.co/gpt2/resolve/main/pytorch_model.bin"
+    curl -sS -o /dev/null --range 0-10485759 --max-time 60 \
+      -w "  total=%{time_total}s speed=%{speed_download}B/s bytes=%{size_download} http=%{http_code}\n" \
+      "$speed_url" 2>&1 || echo "  FAILED (timeout / connection error)"
   fi
   echo "=========================================="
 '
