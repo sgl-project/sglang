@@ -40,6 +40,9 @@ def mooncake_trace_slice(
     if trace_ctx is None:
         return
 
+    if not trace_ctx.tracing_enable:
+        return
+
     start_ts = convert_time_to_realtime_ns(start_ts)
     trace_ctx.trace_slice_start(stage.stage_name, stage.level, start_ts)
     trace_ctx.trace_slice_end(

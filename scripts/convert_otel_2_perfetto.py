@@ -231,7 +231,7 @@ def generate_perfetto_span(engine_root_spans, smg_otel_spans, thread_meta_data):
     for root_span in engine_root_spans:
         root_span["spans"] = []
 
-        rid = root_span["attributes"].get("rid", "")
+        rid = root_span["attributes"]["rid"]
         bootstrap_room = root_span["attributes"].get("bootstrap_room", "")
 
         for thread_span in root_span["child"]:

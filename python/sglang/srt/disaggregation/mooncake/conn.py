@@ -8,7 +8,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -1161,7 +1161,7 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
-                if kv_chunk.trace_ctx:
+                if get_global_server_args().enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
@@ -1332,14 +1332,14 @@ class MooncakeKVManager(CommonKVManager):
                         if kv_chunk.is_last_chunk and req.room in self.request_status:
                             self.update_status(req.room, KVPoll.Success)
 
-                    if kv_chunk.trace_ctx:
+                    if get_global_server_args().enable_trace:
                         mooncake_trace_slice(
                             kv_chunk.trace_ctx,
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND_SESSION,
                             start_ts,
                         )
 
-                if kv_chunk.trace_ctx:
+                if get_global_server_args().enable_trace:
                     kv_chunk.trace_ctx.trace_slice_end(
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
@@ -1496,7 +1496,7 @@ class MooncakeKVManager(CommonKVManager):
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
-        trace_ctx: Optional[TraceReqContext, TraceNullContext] = None,
+        trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -1522,6 +1522,9 @@ class MooncakeKVManager(CommonKVManager):
         dst_infos = self.transfer_infos[bootstrap_room].keys()
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
+
+        if trace_ctx is None:
+            trace_ctx = TraceNullContext()
 
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
