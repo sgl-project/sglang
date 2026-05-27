@@ -48,6 +48,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.models.utils import create_fused_set_kv_buffer_arg, enable_fused_set_kv_buffer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
@@ -462,9 +463,25 @@ class Gemma4Attention(nn.Module):
                 v = self.v_norm(v)
 
         # Apply rotary embedding
+        use_fused_kv = False
         if k is not None:
             k = k.flatten(-2, -1)
-            q, k = self.rotary_emb(positions, q, k)
+            # Fuse RoPE + KV-cache write for non-SWA layers with bf16 cache
+            can_fuse = (
+                self.sliding_window is None
+                and hasattr(forward_batch.token_to_kv_pool, "dtype")
+                and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
+            )
+            if can_fuse:
+                fused_arg = create_fused_set_kv_buffer_arg(
+                    value=v.flatten(-2, -1) if v.dim() == 3 else v,
+                    layer=self.attn,
+                    forward_batch=forward_batch,
+                )
+                use_fused_kv = True
+            else:
+                fused_arg = None
+            q, k = self.rotary_emb(positions, q, k, fused_set_kv_buffer_arg=fused_arg)
             k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
         else:
             # Rotary embedding requires a key input; use zeros since KV is shared from another layer
@@ -477,7 +494,7 @@ class Gemma4Attention(nn.Module):
             k,
             v,
             forward_batch=forward_batch,
-            save_kv_cache=not self.is_kv_shared_layer,
+            save_kv_cache=not self.is_kv_shared_layer and not use_fused_kv,
         )
         if attn_output.dim() == 3:
             attn_output = attn_output.flatten(-2, -1)
@@ -696,6 +713,7 @@ class Gemma4DecoderLayer(nn.Module):
 
         if (
             not self.has_ple
+            and self.moe is None
             and (hidden_states.is_cuda or hidden_states.is_xpu)
             and hidden_states.dim() == 2
         ):
