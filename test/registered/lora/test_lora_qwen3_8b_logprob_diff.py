@@ -37,10 +37,7 @@ from sglang.srt.lora.utils import auto_detect_lora_target_modules
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(
-    est_time=40,
-    suite="stage-b-test-1-gpu-large",
-)
+register_cuda_ci(est_time=40, stage="extra-a", runner_config="1-gpu-large")
 
 BASE_MODEL = "Qwen/Qwen3-8B"
 LORA_HF_REPO = "yushengsu/lora-diff-Qwen3-8B"
@@ -113,11 +110,15 @@ class TestLoRAQwen3_8BLogprobDiff(CustomTestCase):
         of internal param names that would break LoRA auto-detection."""
         model = _build_qwen3_mock()
 
-        with patch("sglang.srt.layers.linear.LinearBase", _MockLinearBase), patch(
-            "sglang.srt.layers.moe.fused_moe_triton.layer.FusedMoE", _MockFusedMoE
-        ), patch(
-            "sglang.srt.layers.vocab_parallel_embedding.ParallelLMHead",
-            _MockParallelLMHead,
+        with (
+            patch("sglang.srt.layers.linear.LinearBase", _MockLinearBase),
+            patch(
+                "sglang.srt.layers.moe.fused_moe_triton.layer.FusedMoE", _MockFusedMoE
+            ),
+            patch(
+                "sglang.srt.layers.vocab_parallel_embedding.ParallelLMHead",
+                _MockParallelLMHead,
+            ),
         ):
             detected = auto_detect_lora_target_modules(model)
 

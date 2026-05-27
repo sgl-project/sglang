@@ -245,6 +245,9 @@ def maybe_load_fsdp_model(
         )
 
     weight_iterator = safetensors_weights_iterator(weight_dir_list)
+    preprocess_loaded_state_dict = getattr(model, "preprocess_loaded_state_dict", None)
+    if preprocess_loaded_state_dict is not None:
+        weight_iterator = preprocess_loaded_state_dict(weight_iterator)
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
     load_model_from_full_model_state_dict(
         model,
@@ -610,9 +613,11 @@ def load_model_from_full_model_state_dict(
         "wcscales",
         "wtscale",
         "input_scale",
+        "weight_scale",
         "bias",
         "norm_q",
         "norm_k",
+        "weight_scale",
     ]
     for new_param_name in unused_keys:
         meta_sharded_param = meta_sd.get(new_param_name)
@@ -640,7 +645,14 @@ def load_model_from_full_model_state_dict(
 
         if missing_param_init == "ones" or any(
             p in new_param_name
-            for p in ("wcscales", "wtscale", "input_scale", "norm_q", "norm_k")
+            for p in (
+                "wcscales",
+                "wtscale",
+                "input_scale",
+                "weight_scale",
+                "norm_q",
+                "norm_k",
+            )
         ):
             init_like = torch.ones_like
         elif missing_param_init == "zeros" or missing_param_init is None:
