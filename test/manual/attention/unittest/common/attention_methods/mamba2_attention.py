@@ -263,7 +263,20 @@ class MockMamba2ModelRunner(ModelRunner):
         self.gpu_id = 0
         self.page_size = case.page_size
         self.model_config = model_config
-        speculative_num_draft_tokens = 0
+        # MambaMixer2 asserts the layer_cache is a `SpeculativeState`
+        # whenever `spec_info` is present (TARGET_VERIFY / DRAFT_EXTEND).
+        # The HybridReqToTokenPool only allocates the extra
+        # `intermediate_ssm` / `intermediate_conv_window` buffers when
+        # `speculative_num_draft_tokens is not None`, so auto-derive the
+        # count from `case.extend_lens` for the speculative modes.
+        if case.forward_mode.is_target_verify() or case.forward_mode.is_draft_extend(
+            include_v2=True
+        ):
+            speculative_num_draft_tokens = (
+                max(case.extend_lens) if case.extend_lens else 1
+            )
+        else:
+            speculative_num_draft_tokens = 0
         self.server_args = SimpleNamespace(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
@@ -346,7 +359,14 @@ class MockMamba2ModelRunner(ModelRunner):
             cache_params=cache_params,
             mamba_layer_ids=[0],
             enable_mamba_extra_buffer=False,
-            speculative_num_draft_tokens=None,
+            # Pass through so the pool allocates the SpeculativeState
+            # intermediate buffers (required by MambaMixer2 when
+            # `spec_info` is set).
+            speculative_num_draft_tokens=(
+                speculative_num_draft_tokens
+                if speculative_num_draft_tokens > 0
+                else None
+            ),
             enable_overlap_schedule=False,
         )
         max_token_loc = case.page_size + pool_batch_size * max_context_len
@@ -470,11 +490,20 @@ class ProjectedMamba2Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         output = torch.empty_like(hidden_states)
+        # `MambaMixer2.forward` asserts `use_triton_causal_conv=True` whenever
+        # `spec_info` is present (target-verify / draft-extend paths), because
+        # the kernel needs the Triton causal-conv variant for intermediate
+        # state support. The dense-extend path leaves it False.
+        use_triton_causal_conv = (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        )
         self.backend.forward(
             self.mixer,
             hidden_states,
             output,
             layer_id=0,
+            use_triton_causal_conv=use_triton_causal_conv,
         )
         return output
 
@@ -891,6 +920,45 @@ def expected_mamba2_output_from_inputs(
     (ssm_states, conv_states) snapshot; the reference walks the actual
     fixture's recurrence using the same hidden_states stored on the
     fixture (set via `prepare_mamba2_runner_inputs`)."""
+    initial_ssm, initial_conv = state
+    return _pure_torch_mamba2_reference(
+        fixture,
+        initial_conv_states=initial_conv,
+        initial_ssm_states=initial_ssm,
+    ).output
+
+
+def expected_mamba2_verify_output_from_inputs(
+    fixture: Mamba2AttentionFixture,
+    case: Mamba2AttentionCase,
+    inputs: dict[str, torch.Tensor],
+    state,
+    *,
+    topk: int,
+) -> torch.Tensor:
+    """Reference output for chain (topk=1) target-verify cases.
+
+    Mamba2's SSM kernel does not consume the tree mask: under any topk it
+    processes the per-request draft tokens linearly through the chunked-scan
+    recurrence, just like EXTEND. For `topk == 1` this matches the
+    chain semantics the EAGLE verifier expects, so the eager SSM
+    reference (`_pure_torch_mamba2_reference`) doubles as the verify
+    reference. For `topk > 1` the production kernel still processes
+    siblings as a chain — this is documented at the call site as
+    structurally unsupported rather than wired through a tree-aware
+    reference.
+    """
+    if topk != 1:
+        raise ValueError(
+            "Mamba2 tree verify (topk>1) is not exercised: the SSM kernel "
+            "ignores the tree mask and processes draft tokens linearly. "
+            "Wiring a parent-indices-aware reference here would not match "
+            "production behavior. Only chain (topk=1) is supported."
+        )
+    del inputs
+    # `state` is the (ssm_states, conv_states) snapshot captured before
+    # the forward; same shape contract as
+    # `expected_mamba2_output_from_inputs`.
     initial_ssm, initial_conv = state
     return _pure_torch_mamba2_reference(
         fixture,

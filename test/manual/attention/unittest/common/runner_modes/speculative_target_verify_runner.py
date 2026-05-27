@@ -123,6 +123,34 @@ from ..attention_methods.lightning_attention import (
 from ..attention_methods.lightning_attention import (
     _make_forward_batch as _make_lightning_forward_batch,
 )
+from ..attention_methods.mamba2_attention import (
+    DEFAULT_DEVICE as MAMBA2_DEFAULT_DEVICE,
+)
+from ..attention_methods.mamba2_attention import (
+    DEFAULT_DTYPE as MAMBA2_DEFAULT_DTYPE,
+)
+from ..attention_methods.mamba2_attention import (
+    DEFAULT_MAX_CONTEXT_LEN as MAMBA2_DEFAULT_MAX_CONTEXT_LEN,
+)
+from ..attention_methods.mamba2_attention import (
+    MAMBA2_ATOL,
+    MAMBA2_GRAPH_ATOL,
+    MAMBA2_GRAPH_RTOL,
+    MAMBA2_RTOL,
+    Mamba2AttentionCase,
+    _clone_mamba2_cache,
+    _restore_mamba2_cache,
+    build_mamba2_attention_fixture,
+    expected_mamba2_verify_output_from_inputs,
+    make_mamba2_case_with_prefix_lens,
+    make_mamba2_random_inputs,
+    mamba2_fixture_inputs,
+    prepare_mamba2_runner_inputs,
+    run_mamba2_forward,
+)
+from ..attention_methods.mamba2_attention import (
+    _make_forward_batch as _make_mamba2_forward_batch,
+)
 from ..attention_methods.mla_attention import DEFAULT_DEVICE as MLA_DEFAULT_DEVICE
 from ..attention_methods.mla_attention import DEFAULT_DTYPE as MLA_DEFAULT_DTYPE
 from ..attention_methods.mla_attention import (
@@ -1151,6 +1179,147 @@ def run_lightning_eagle_verify_cuda_graph_case(
         adapter=adapter,
         build_kwargs=dict(
             head_dim=head_dim,
+            max_context_len=max_context_len,
+            dtype=dtype,
+            device=device,
+        ),
+        capture_batch_size=cuda_graph_capture_batch_size,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+    )
+
+
+def run_mamba2_eagle_verify_case(
+    testcase,
+    case: Mamba2AttentionCase,
+    *,
+    topk: int,
+    max_context_len: int = MAMBA2_DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = MAMBA2_DEFAULT_DTYPE,
+    device: str = MAMBA2_DEFAULT_DEVICE,
+    atol: float = MAMBA2_ATOL,
+    rtol: float = MAMBA2_RTOL,
+):
+    """Mamba2 EAGLE chain verify (eager). Mamba2's SSM kernel processes
+    draft tokens as a chain regardless of the spec_info tree mask, so
+    only `topk == 1` is supported here — the EXTEND-style recurrence
+    reference (`_pure_torch_mamba2_reference`) doubles as the chain
+    verify reference. Tree verify (topk > 1) is structurally blocked
+    (the kernel doesn't consume the parent-indices plumbing); see
+    `expected_mamba2_verify_output_from_inputs`."""
+    if topk != 1:
+        testcase.skipTest(
+            "Mamba2 tree verify (topk>1) is structurally unsupported — "
+            "the SSM kernel ignores tree masks; only chain (topk=1) is "
+            "exercised. See `expected_mamba2_verify_output_from_inputs`."
+        )
+    fixture = build_mamba2_attention_fixture(
+        testcase,
+        case,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+    )
+    _prepare_target_verify_batch(fixture.forward_batch, case, device)
+    fixture.forward_batch.spec_info = _make_eagle_verify_input(
+        case,
+        fixture.forward_batch,
+        topk=topk,
+        device=device,
+    )
+    inputs = mamba2_fixture_inputs(fixture)
+    initial_state = _clone_mamba2_cache(fixture)
+    expected = expected_mamba2_verify_output_from_inputs(
+        fixture,
+        case,
+        inputs,
+        initial_state,
+        topk=topk,
+    )
+
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+        fixture.backend.init_forward_metadata(fixture.forward_batch)
+        actual = run_mamba2_forward(fixture, fixture.forward_batch, inputs)
+
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+
+
+def _prepare_mamba2_verify_batch(case, batch, *, topk: int, device: str) -> None:
+    _prepare_target_verify_batch(batch, case, device)
+    batch.spec_info = _make_eagle_verify_input(
+        case,
+        batch,
+        topk=topk,
+        device=device,
+    )
+
+
+def run_mamba2_eagle_verify_cuda_graph_case(
+    testcase,
+    case: Mamba2AttentionCase,
+    *,
+    topk: int,
+    max_context_len: int = MAMBA2_DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = MAMBA2_DEFAULT_DTYPE,
+    device: str = MAMBA2_DEFAULT_DEVICE,
+    cuda_graph_capture_batch_size: int | None = None,
+):
+    """Mamba2 EAGLE chain verify (CG). Chain-only for the same reason as
+    eager (`run_mamba2_eagle_verify_case`). Uses loose
+    `MAMBA2_GRAPH_ATOL=1e-1` to absorb the chunked-scan kernel's
+    CG-replay drift, mirroring the CG-decode tolerance."""
+    if topk != 1:
+        testcase.skipTest(
+            "Mamba2 tree verify (topk>1) is structurally unsupported."
+        )
+    cuda_graph_capture_batch_size = cuda_graph_capture_batch_size or case.batch_size
+    adapter = SpeculativeCudaGraphAdapter(
+        build_fixture=build_mamba2_attention_fixture,
+        make_capture_case=lambda base, name, capture_prefix_len, bs: (
+            make_mamba2_case_with_prefix_lens(
+                base, name, (capture_prefix_len,) * bs
+            )
+        ),
+        make_replay_case=lambda base, name, _pad_prefix_lens: (
+            make_mamba2_case_with_prefix_lens(base, name, base.prefix_lens)
+        ),
+        make_forward_batch=_make_mamba2_forward_batch,
+        fixture_inputs=mamba2_fixture_inputs,
+        make_capture_inputs=make_mamba2_random_inputs,
+        make_replay_inputs=lambda _case, fixture, *_args, **_kwargs: (
+            mamba2_fixture_inputs(fixture)
+        ),
+        prepare_batch=lambda spec_case, batch: _prepare_mamba2_verify_batch(
+            spec_case,
+            batch,
+            topk=topk,
+            device=device,
+        ),
+        prepare_inputs=prepare_mamba2_runner_inputs,
+        run_forward=run_mamba2_forward,
+        expected_output=lambda fixture, spec_case, inputs, state: (
+            expected_mamba2_verify_output_from_inputs(
+                fixture,
+                spec_case,
+                inputs,
+                state,
+                topk=topk,
+            )
+        ),
+        clone_state=_clone_mamba2_cache,
+        restore_state=_restore_mamba2_cache,
+        allow_padding=False,
+        run_graph_eager=False,
+        compare_replay_to_graph_eager=False,
+        atol=MAMBA2_GRAPH_ATOL,
+        rtol=MAMBA2_GRAPH_RTOL,
+    )
+    run_speculative_cuda_graph_case(
+        testcase,
+        case,
+        adapter=adapter,
+        build_kwargs=dict(
             max_context_len=max_context_len,
             dtype=dtype,
             device=device,

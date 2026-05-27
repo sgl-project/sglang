@@ -30,6 +30,10 @@ from common.attention_methods.mamba2_attention import (
 from common.runner_modes.cuda_graph_decode_runner import (
     run_mamba2_cuda_graph_decode_case,
 )
+from common.runner_modes.speculative_target_verify_runner import (
+    run_mamba2_eagle_verify_case,
+    run_mamba2_eagle_verify_cuda_graph_case,
+)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -68,6 +72,51 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
             prefix_lens=(14, 15, 16),
         ),
     )
+    # EAGLE chain verify (topk=1) — Mamba2's SSM kernel processes draft
+    # tokens as a chain regardless of the spec_info tree mask, so the
+    # EXTEND-style recurrence reference doubles as the chain verify
+    # reference. Tree verify (topk>1) is structurally unsupported (the
+    # kernel ignores tree masks) and skip-gated at the runner.
+    EAGLE_VERIFY_CASES = (
+        (
+            Mamba2AttentionCase(
+                name="runner_eagle_verify_mamba2_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=DEFAULT_NUM_HEADS,
+                head_dim=DEFAULT_HEAD_DIM,
+                state_size=DEFAULT_STATE_SIZE,
+                n_groups=DEFAULT_N_GROUPS,
+                conv_kernel=DEFAULT_CONV_KERNEL,
+                mamba_chunk_size=DEFAULT_MAMBA_CHUNK_SIZE,
+                hidden_size=DEFAULT_HIDDEN_SIZE,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+        ),
+    )
+    EAGLE_VERIFY_CUDA_GRAPH_CASES = (
+        (
+            Mamba2AttentionCase(
+                name="runner_cuda_graph_eagle_verify_mamba2_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=DEFAULT_NUM_HEADS,
+                head_dim=DEFAULT_HEAD_DIM,
+                state_size=DEFAULT_STATE_SIZE,
+                n_groups=DEFAULT_N_GROUPS,
+                conv_kernel=DEFAULT_CONV_KERNEL,
+                mamba_chunk_size=DEFAULT_MAMBA_CHUNK_SIZE,
+                hidden_size=DEFAULT_HIDDEN_SIZE,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+        ),
+    )
 
     def test_projected_mamba2_attention_cases(self):
         for case in self.CASES:
@@ -78,6 +127,16 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
         for case in self.CUDA_GRAPH_CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_mamba2_cuda_graph_decode_case(self, case)
+
+    def test_runner_mode_eagle_verify_cases(self):
+        for case, topk in self.EAGLE_VERIFY_CASES:
+            with self.subTest(case=case.name, backend=case.backend, topk=topk):
+                run_mamba2_eagle_verify_case(self, case, topk=topk)
+
+    def test_runner_mode_eagle_verify_cuda_graph_cases(self):
+        for case, topk in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:
+            with self.subTest(case=case.name, backend=case.backend, topk=topk):
+                run_mamba2_eagle_verify_cuda_graph_case(self, case, topk=topk)
 
     # PCG/BCG split-op extend is deliberately NOT covered. The
     # `MambaMixer2.forward` asserts `num_actual_tokens ==
