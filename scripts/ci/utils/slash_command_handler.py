@@ -995,11 +995,20 @@ def handle_rerun_test(
     # Phase 0: Expand wildcard specs into concrete test files. A spec whose
     # file part contains a glob metacharacter (* ? [) expands to every
     # matching file; plain specs pass through to single-file resolution.
-    # De-dupe so an explicit file and a glob that also matches it (or two
-    # overlapping globs) don't dispatch the same file twice.
     resolve_failures = []
+    seen_failures = set()
+
+    def _record_failure(spec, error):
+        # De-dupe failures by canonical path so the same un-dispatchable file
+        # reported two ways (explicit + glob, or two globs) yields one line.
+        key = spec.strip().strip("\"'`")
+        if key.startswith("test/"):
+            key = key[len("test/") :]
+        if key not in seen_failures:
+            seen_failures.add(key)
+            resolve_failures.append({"spec": spec, "error": error})
+
     expanded_specs = []
-    seen_specs = set()
     for spec in test_specs:
         # Quotes/backticks are never meaningful here (the command isn't
         # shell-parsed), so strip them. Backtick-wrapping is in fact the
@@ -1008,38 +1017,38 @@ def handle_rerun_test(
         # either way the handler reads the raw body, so the `*` survives.
         file_part = spec.split("::", 1)[0].strip().strip("\"'`")
         if not _is_glob_pattern(file_part):
-            if spec not in seen_specs:
-                seen_specs.add(spec)
-                expanded_specs.append(spec)
+            expanded_specs.append(spec)
             continue
         if "::" in spec:
-            resolve_failures.append(
-                {
-                    "spec": spec,
-                    "error": (
-                        "Wildcard patterns can't be combined with a `::test` "
-                        "selector — drop the `::...` to rerun whole files."
-                    ),
-                }
+            _record_failure(
+                spec,
+                "Wildcard patterns can't be combined with a `::test` "
+                "selector — drop the `::...` to rerun whole files.",
             )
             continue
         matched, err = expand_glob_spec(file_part)
         if err:
-            resolve_failures.append({"spec": spec, "error": err})
+            _record_failure(spec, err)
             continue
-        for m in matched:
-            if m not in seen_specs:
-                seen_specs.add(m)
-                expanded_specs.append(m)
+        expanded_specs.extend(matched)
 
-    # Phase 1: Resolve all specs
+    # Phase 1: Resolve all specs, de-duping by the *resolved* identity. A glob
+    # expands to `test/`-prefixed paths while an explicit spec keeps the form
+    # the user typed, so the same file requested both ways resolves to two
+    # different raw strings — keying de-dup on the resolved (mode, test_command)
+    # is what collapses them into a single dispatch instead of running twice.
     resolved = []
+    seen_commands = set()
     for spec in expanded_specs:
         r = _resolve_test_spec(spec)
         if r.get("error"):
-            resolve_failures.append(r)
-        else:
-            resolved.append(r)
+            _record_failure(r["spec"], r["error"])
+            continue
+        key = (r["mode"], r["test_command"])
+        if key in seen_commands:
+            continue
+        seen_commands.add(key)
+        resolved.append(r)
 
     # Phase 2: Group by dispatch shape.
     groups = {}
