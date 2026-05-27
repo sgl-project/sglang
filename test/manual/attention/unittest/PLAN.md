@@ -358,6 +358,24 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Added DSA EAGLE production draft CUDA-graph runner integration.
+  Wires DSA sparse into the shared
+  `EagleDraftCudaGraphRunnerAdapter` lifecycle (same shape as DSV4 /
+  dense / MLA). `_DSAEagleDraftForward.__call__` inlines projection +
+  `module.attn(..., topk_indices=...)` and synthesizes `topk_indices`
+  on-GPU from `batch.seq_lens` (trailing-topk in token-position
+  space; production sources them from the DSA indexer that lives
+  outside attention). Chain-only (topk=1) — tree draft needs
+  parent-indices plumbing through the topk_indices synthesis;
+  deferred. Closes the largest remaining DSA gap.
+- Enabled `tokenspeed_mla` by adding FP8 KV cache support to the MLA
+  fixture. `MockMLAModelRunner` now decouples `kv_cache_dtype` from
+  the model `dtype` and routes K writes through the FP8 quantize
+  path. Reference reads BF16 K independent of the FP8 cache so the
+  per-element drift from the BF16→FP8 cast is absorbed by a
+  per-case `atol=0.2` override.  On H200/SM9.0 `tokenspeed_mla` still
+  skips for SM<10 with a clear reason; on Blackwell + tokenspeed
+  package, it now runs.
 - Added Frozen-KV MTP DRAFT_EXTEND coverage across multiple
   backends. Threaded `spec_kind` through `run_*_eagle_draft_extend_case`
   for the HybridLinearAttn family (GDN/KDA/Lightning/Mamba2) and MLA,
@@ -1073,6 +1091,10 @@ Latest verification:
 - `python test/manual/attention/unittest/gdn/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_flashinfer.py -v`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
+  - Ran 153 tests in 37.248s (21 skipped) after adding DSA EAGLE
+    production draft CUDA-graph runner + tokenspeed_mla FP8 KV cache
+    fixture enablement.
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
   - Ran 152 tests in 36.668s (21 skipped) after adding KDA + Lightning
     EAGLE DRAFT_EXTEND eager and Frozen-KV MTP DRAFT_EXTEND across the

@@ -101,10 +101,10 @@ hardware/SDK. The variant tests live in `test_dsa.py` as
 
 ## Next Work
 
-- **DSA production EAGLE graph-runner integration** — wire DSA sparse
-  into `common/runner_modes/eagle_draft_runner.py` so the
-  `EAGLEDraftCudaGraphRunner` / `EAGLEDraftExtendCudaGraphRunner`
-  contracts are exercised against real DSA metadata.
+- **DSA production EAGLE draft-extend graph-runner integration** —
+  the draft-decode runner is now wired (see "Production runner
+  integration" below); draft-extend follows the same shape as DSV4's
+  `run_dsv4_eagle_draft_extend_cuda_graph_case`.
 - **HiSparse coordinator path** — `set_dsa_prefill_impl` forces
   `use_mha=False` when `self.hisparse_coordinator is not None`; the
   fixture sets it to `None`. Adding HiSparse coverage would exercise
@@ -112,3 +112,13 @@ hardware/SDK. The variant tests live in `test_dsa.py` as
   and `swap_in_selected_pages` during decode.
 - Add non-trailing index-layout sparse cases when a representative
   index-construction path is identified.
+
+## Production Runner Integration
+
+- DSA EAGLE draft CUDA-graph runner: wired via the shared
+  `EagleDraftCudaGraphRunnerAdapter`. Chain-only (topk=1).
+  `_DSAEagleDraftForward.__call__` synthesizes `topk_indices` on-GPU
+  (trailing-topk in token-position space) since production gets them
+  from the DSA indexer that's outside attention. Tree draft requires
+  parent-indices plumbing through the topk_indices synthesis and is
+  deferred.
