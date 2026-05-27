@@ -358,6 +358,33 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Finished the DSA variant matrix. The previously deferred FP8 /
+  TARGET_VERIFY / tilelang follow-ups are now wired in:
+  - **FP8 KV cache** (`fp8_kv_cache=True`) flips
+    `DSATokenToKVPool.dsa_kv_cache_store_fp8`, switches the pool to
+    656-byte packed FP8-nope/scale/BF16-rope storage, and routes K
+    writes through `quantize_k_cache_separate`. New methods
+    `test_sparse_fp8_prefill_cases` /
+    `test_sparse_fp8_decode_cases` /
+    `test_sparse_fp8_cuda_graph_decode_case` exercise
+    `flashmla_sparse` + RAGGED topk, `flashmla_kv` PAGED topk
+    prefill/decode, and the CG capture/replay path. `fa3`,
+    `flashmla_sparse` decode, and `tilelang` decode are skip-gated
+    via `DSA_FP8_COMPATIBLE_*_IMPLS` (kernels assert BF16 K). The
+    reference stays on BF16 K, with `DSA_SPARSE_FP8_ATOL=0.2`
+    absorbing FP8 quant noise — same separation principle as DSV4.
+  - **Tilelang** (`tilelang_sparse_fwd` requires `topk == 2048`)
+    runs on a dedicated `index_topk=2048` fixture via
+    `test_sparse_tilelang_prefill_case` /
+    `test_sparse_tilelang_decode_case`. The index width is now a
+    threaded fixture parameter rather than a module-level constant.
+  - **TARGET_VERIFY** runs end-to-end: the previous deep_gemm
+    `paged_mqa_logits_metadata` JIT compile failure
+    (`kAlignedBatchSize=0U`) was caused by our fixture pinning
+    `speculative_num_draft_tokens=0`. `DSAMockModelRunner.__init__`
+    now derives the count from `case.extend_lens` for any
+    speculative forward mode (TARGET_VERIFY, DRAFT_EXTEND,
+    DRAFT_EXTEND_V2) so `seqlens_expanded` is non-empty.
 - Strengthened DSA coverage to span every kernel implementation
   variant the backend dispatches between. DSA exposes
   `flashmla_sparse`, `flashmla_kv`, `fa3`, `tilelang`, `trtllm`, and
@@ -373,12 +400,12 @@ Latest verification:
   - `test_sparse_decode_impl_variants` (eager DECODE)
   - `test_sparse_cuda_graph_decode_impl_variants` (CG decode replay)
   Plus a new `test_sparse_speculative_forward_mode_cases` covering
-  DRAFT_EXTEND and DRAFT_EXTEND_V2 forward modes through the decode
-  impl dispatcher. On H200/SM9.0 this exercises `flashmla_sparse`,
-  `flashmla_kv`, and `fa3`; `tilelang` (topk=2048 contract), `trtllm`
-  (Blackwell-only), and `aiter` (HIP-only) emit explicit `skipTest`
+  TARGET_VERIFY, DRAFT_EXTEND, and DRAFT_EXTEND_V2 forward modes
+  through the decode impl dispatcher. On H200/SM9.0 this exercises
+  `flashmla_sparse`, `flashmla_kv`, `fa3`, and `tilelang`; `trtllm`
+  (Blackwell-only) and `aiter` (HIP-only) emit explicit `skipTest`
   with the gate reason. `dsa/README.md` documents the variant matrix
-  and the remaining FP8 / TARGET_VERIFY / tilelang follow-ups.
+  and the remaining HiSparse / EAGLE-graph-runner follow-ups.
 - Added FA3 and FA4 production EAGLE `DRAFT_EXTEND` (V1) graph-runner
   coverage in `dense/test_fa3.py` and `dense/test_fa4.py` via
   `run_dense_eagle_draft_extend_cuda_graph_runner_case`. Both FA3 and
@@ -935,6 +962,12 @@ Latest verification:
 - `python test/manual/attention/unittest/gdn/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_flashinfer.py -v`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
+  - Ran 141 tests in 36.049s (21 skipped) after finishing the DSA
+    variant matrix (added FP8 KV cache, tilelang via topk=2048
+    fixture, and TARGET_VERIFY). The skip count rises because each
+    new test method iterates over the same impl matrix and re-emits
+    the gate skips per impl.
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
   - Ran 136 tests in 35.002s (12 skipped) after adding the DSA
     implementation-variant matrix (`test_sparse_prefill_impl_variants` +

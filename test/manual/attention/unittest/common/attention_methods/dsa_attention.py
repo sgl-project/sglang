@@ -258,6 +258,19 @@ class DSAMockModelRunner(ModelRunner):
         # 656 bytes/token while the model still projects K/V in BF16;
         # `set_mla_kv_buffer` does the quantize on the way in.
         self.kv_cache_dtype = torch.float8_e4m3fn if fp8_kv_cache else dtype
+        # For TARGET_VERIFY / DRAFT_EXTEND, the DSA backend uses
+        # `self.speculative_num_draft_tokens` to size `seqlens_expanded`
+        # (`dsa_backend.py:482-486,510-515`). When zero, deep_gemm's
+        # `paged_mqa_logits_metadata` JIT-compiles with
+        # `kAlignedBatchSize=0U`, which fails to compile. We auto-derive
+        # the draft-token count from `case.extend_lens` so the
+        # speculative paths produce a non-empty `seqlens_expanded`.
+        if case.forward_mode.is_target_verify() or case.forward_mode.is_draft_extend(
+            include_v2=True
+        ):
+            spec_num_draft_tokens = max(case.extend_lens) if case.extend_lens else 1
+        else:
+            spec_num_draft_tokens = 0
         self.gpu_id = 0
         self.page_size = case.page_size
         self.model_config = model_config
@@ -290,7 +303,7 @@ class DSAMockModelRunner(ModelRunner):
             revision=None,
             speculative_algorithm=None,
             speculative_eagle_topk=0,
-            speculative_num_draft_tokens=0,
+            speculative_num_draft_tokens=spec_num_draft_tokens,
             speculative_num_steps=0,
             tp_size=1,
             triton_attention_num_kv_splits=8,
@@ -526,6 +539,13 @@ class DSASparseAttentionFixture:
     input_hidden: torch.Tensor
     topk_indices: torch.Tensor
     topk_rows: list[list[int]]
+    # The fixture's per-row trailing-topk index width. Defaults to the
+    # production-shape `DSA_SPARSE_INDEX_TOPK=128`; the tilelang variant
+    # bumps it to 2048 (`tilelang_sparse_fwd` asserts `topk == 2048`).
+    # Carried on the fixture so re-derivation paths (e.g. CG-runner
+    # `make_dsa_sparse_random_inputs`) can rebuild rows with the same
+    # width.
+    index_topk: int = DSA_SPARSE_INDEX_TOPK
 
 
 def build_dsa_attention_fixture(
@@ -621,15 +641,17 @@ def build_dsa_attention_fixture(
     )
 
 
-def _make_dsa_sparse_topk_rows(case: DSAAttentionCase) -> list[list[int]]:
+def _make_dsa_sparse_topk_rows(
+    case: DSAAttentionCase, *, index_topk: int = DSA_SPARSE_INDEX_TOPK
+) -> list[list[int]]:
     rows = []
     for req_idx, input_len in enumerate(case.input_lens):
         prefix_len = case.prefix_lens[req_idx]
         for offset in range(input_len):
             key_count = prefix_len + offset + 1
-            key_start = max(0, key_count - DSA_SPARSE_INDEX_TOPK)
+            key_start = max(0, key_count - index_topk)
             row = list(range(key_start, key_count))
-            row.extend([-1] * (DSA_SPARSE_INDEX_TOPK - len(row)))
+            row.extend([-1] * (index_topk - len(row)))
             rows.append(row)
     return rows
 
@@ -686,6 +708,7 @@ def build_dsa_sparse_attention_fixture(
     dsa_prefill_backend: str = "flashmla_auto",
     dsa_decode_backend: str = "flashmla_kv",
     fp8_kv_cache: bool = False,
+    index_topk: int = DSA_SPARSE_INDEX_TOPK,
 ) -> DSASparseAttentionFixture:
     max_context_len = max(max_context_len, max(case.seq_lens))
     if max_context_len % case.page_size:
@@ -707,7 +730,7 @@ def build_dsa_sparse_attention_fixture(
         qk_nope_head_dim=DSA_SPARSE_QK_NOPE_HEAD_DIM,
         qk_rope_head_dim=DSA_SPARSE_QK_ROPE_HEAD_DIM,
         kv_lora_rank=DSA_SPARSE_QK_NOPE_HEAD_DIM,
-        index_topk=DSA_SPARSE_INDEX_TOPK,
+        index_topk=index_topk,
     )
     runner = DSAMockModelRunner(
         case=case,
@@ -759,7 +782,7 @@ def build_dsa_sparse_attention_fixture(
         prefix_hidden,
         max_context_len=max_context_len,
     )
-    topk_rows = _make_dsa_sparse_topk_rows(case)
+    topk_rows = _make_dsa_sparse_topk_rows(case, index_topk=index_topk)
     topk_indices = torch.tensor(topk_rows, dtype=torch.int32, device=device)
 
     return DSASparseAttentionFixture(
@@ -772,6 +795,7 @@ def build_dsa_sparse_attention_fixture(
         input_hidden=input_hidden,
         topk_indices=topk_indices,
         topk_rows=topk_rows,
+        index_topk=index_topk,
     )
 
 
@@ -913,6 +937,7 @@ def run_dsa_sparse_attention_case(
     dsa_prefill_backend: str = "flashmla_auto",
     dsa_decode_backend: str = "flashmla_kv",
     fp8_kv_cache: bool = False,
+    index_topk: int = DSA_SPARSE_INDEX_TOPK,
 ) -> None:
     fixture = build_dsa_sparse_attention_fixture(
         testcase,
@@ -924,6 +949,7 @@ def run_dsa_sparse_attention_case(
         dsa_prefill_backend=dsa_prefill_backend,
         dsa_decode_backend=dsa_decode_backend,
         fp8_kv_cache=fp8_kv_cache,
+        index_topk=index_topk,
     )
     actual = run_dsa_sparse_fixture_eager(fixture, testcase)
     expected = expected_dsa_sparse_fixture_output(fixture)
@@ -1142,6 +1168,58 @@ def run_dsa_sparse_decode_impl_variant_case(
     )
 
 
+DSA_SPARSE_TILELANG_INDEX_TOPK = 2048
+# Tilelang's `tilelang_sparse_fwd` asserts `topk == 2048` at
+# `dsa/tilelang_kernel.py:1345`, so the tilelang variant runs against a
+# separate fixture instance with this index width. Cases need
+# `prefix >= 2048` so the trailing-topk-row builder fills out a real
+# 2048-wide row (rather than `[0, ..., key_count - 1, -1, ..., -1]`).
+
+
+def run_dsa_sparse_tilelang_prefill_case(
+    testcase,
+    case: DSAAttentionCase,
+) -> None:
+    """Tilelang sparse-prefill on its dedicated topk=2048 fixture. The
+    other prefill kernels (`flashmla_sparse`, `flashmla_kv`, `fa3`) are
+    capable of running against topk=2048 too but are already covered by
+    the topk=128 variant matrix; this method is scoped to the kernel
+    that *requires* topk=2048."""
+    supported, reason = dsa_impl_capability("tilelang")
+    if not supported:
+        testcase.skipTest(f"DSA tilelang impl not supported: {reason}")
+    if not case.forward_mode.is_extend_without_speculative():
+        raise ValueError(
+            "run_dsa_sparse_tilelang_prefill_case expects an EXTEND case."
+        )
+    run_dsa_sparse_attention_case(
+        testcase,
+        case,
+        dsa_prefill_backend="tilelang",
+        index_topk=DSA_SPARSE_TILELANG_INDEX_TOPK,
+    )
+
+
+def run_dsa_sparse_tilelang_decode_case(
+    testcase,
+    case: DSAAttentionCase,
+) -> None:
+    """Tilelang sparse-decode on its dedicated topk=2048 fixture."""
+    supported, reason = dsa_impl_capability("tilelang")
+    if not supported:
+        testcase.skipTest(f"DSA tilelang impl not supported: {reason}")
+    if not case.forward_mode.is_decode():
+        raise ValueError(
+            "run_dsa_sparse_tilelang_decode_case expects a DECODE case."
+        )
+    run_dsa_sparse_attention_case(
+        testcase,
+        case,
+        dsa_decode_backend="tilelang",
+        index_topk=DSA_SPARSE_TILELANG_INDEX_TOPK,
+    )
+
+
 def run_dsa_sparse_fp8_prefill_case(
     testcase,
     case: DSAAttentionCase,
@@ -1247,27 +1325,24 @@ def run_dsa_sparse_speculative_forward_mode_case(
     device: str = DEFAULT_DEVICE,
     dsa_decode_backend: str = "flashmla_kv",
 ) -> None:
-    """Run a sparse case with a speculative forward mode (DRAFT_EXTEND or
-    DRAFT_EXTEND_V2). DSA dispatches `is_draft_extend(include_v2=True)`
-    through `dsa_decode_impl` (`dsa_backend.py:1352-1358`), so the kernel
-    selection is the same as plain decode but the metadata path
-    (`extend_seq_lens`, `cu_seqlens_q`, etc.) is exercised differently."""
-    if not case.forward_mode.is_draft_extend(include_v2=True):
+    """Run a sparse case with a speculative forward mode (TARGET_VERIFY,
+    DRAFT_EXTEND, or DRAFT_EXTEND_V2). DSA dispatches both
+    `is_target_verify()` and `is_draft_extend(include_v2=True)` through
+    `dsa_decode_impl` (`dsa_backend.py:1352-1358`), so the kernel
+    selection matches plain DECODE but `seqlens_expanded` is computed
+    differently per forward mode (`dsa_backend.py:469-529`).
+    `DSAMockModelRunner.__init__` derives
+    `speculative_num_draft_tokens` from `case.extend_lens` for the
+    speculative modes so deep_gemm's `paged_mqa_logits_metadata` JIT
+    compiles with a non-zero `kAlignedBatchSize`."""
+    if not (
+        case.forward_mode.is_target_verify()
+        or case.forward_mode.is_draft_extend(include_v2=True)
+    ):
         raise ValueError(
             "run_dsa_sparse_speculative_forward_mode_case expects a "
-            "DRAFT_EXTEND or DRAFT_EXTEND_V2 case."
+            "TARGET_VERIFY, DRAFT_EXTEND, or DRAFT_EXTEND_V2 case."
         )
-    # NOTE: TARGET_VERIFY isn't covered here because the deep_gemm
-    # `paged_mqa_logits_metadata` kernel fails to compile for small
-    # `aligned_batch_size` values that the synthetic fixture produces
-    # (`zero-sized variable "num_segs" is not allowed in device code` in
-    # `deep_gemm/include/deep_gemm/scheduler/paged_mqa_logits.cuh:38`).
-    # This is a kernel-side limit on minimum batch shape rather than a
-    # DSA backend bug; production scenarios always run TARGET_VERIFY at
-    # larger aligned batch sizes via the speculative graph runner. The
-    # variant is left out of this matrix until the fixture can grow a
-    # large enough TARGET_VERIFY shape (or deep_gemm relaxes the
-    # alignment constraint).
     run_dsa_sparse_attention_case(
         testcase,
         case,
@@ -1514,7 +1589,7 @@ def make_dsa_sparse_random_inputs(
     input_hidden = torch.randn(
         case.num_input_tokens, hidden_size, dtype=dtype, device=device
     )
-    topk_rows = _make_dsa_sparse_topk_rows(case)
+    topk_rows = _make_dsa_sparse_topk_rows(case, index_topk=fixture.index_topk)
     topk_indices = torch.tensor(topk_rows, dtype=torch.int32, device=device)
     return {
         "input_hidden": input_hidden,

@@ -16,7 +16,7 @@ Columns are runner modes; rows are the two DSA sub-paths exercised through the
 | DSA sub-path | Eager Phase 2 | CG decode | PCG extend | BCG extend | Verify eager | Verify CG | DE eager | DE CG | DE-V2 CG | EAGLE-draft runner | EAGLE-DE runner | FKVMTP runner |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | `dsa` MHA_ONE_SHOT dense prefill fallback | ✓ 6 dense-fallback extend layouts: no-prefix ragged, no-prefix exact-page, prefix ragged, cross-page-boundary, prefix-exact-page, total-exact-page | deferred: graph metadata parity not scoped | blocked: K-slice mismatch | blocked | — | — | — | — | — | — | — | — |
-| `dsa` sparse top-k (`flashmla_sparse` prefill + `flashmla_kv` decode) | ✓ 7 sparse top-k layouts: long-prefix bsz=1 prefill, long-prefix multi-token prefill, multi-request long-prefix prefill, decode with bsz=2 trailing-topk, decode with sub-topk prefix padding, ragged 3-request decode, long-prefix decode | ✓ flashmla_kv | — | — | blocked: deep_gemm metadata fails on small `aligned_batch_size` | blocked | ✓ DRAFT_EXTEND eager | — | ✓ DRAFT_EXTEND_V2 eager | — | — | — |
+| `dsa` sparse top-k (`flashmla_sparse` prefill + `flashmla_kv` decode) | ✓ 7 sparse top-k layouts: long-prefix bsz=1 prefill, long-prefix multi-token prefill, multi-request long-prefix prefill, decode with bsz=2 trailing-topk, decode with sub-topk prefix padding, ragged 3-request decode, long-prefix decode | ✓ flashmla_kv + FP8 flashmla_kv | — | — | ✓ TARGET_VERIFY eager | — | ✓ DRAFT_EXTEND eager | — | ✓ DRAFT_EXTEND_V2 eager | — | — | — |
 
 ## Implementation Variant Matrix (`--dsa-prefill-backend` / `--dsa-decode-backend`)
 
@@ -30,7 +30,7 @@ hardware/SDK. The variant tests live in `test_dsa.py` as
 | `flashmla_sparse` | ✓ | ✓ | ✓ | SM>=9.0 + `sgl_kernel.flash_mla` |
 | `flashmla_kv` | ✓ | ✓ | ✓ | SM>=9.0 + `sgl_kernel.flash_mla` |
 | `fa3` | ✓ | ✓ | ✓ | SM>=9.0 + `sglang.jit_kernel.flash_attention` |
-| `tilelang` | skipped: topk=2048 contract | skipped: topk=2048 contract | skipped: topk=2048 contract | `tilelang_sparse_fwd` asserts `topk == 2048`; shared sparse fixture uses `topk=128`. Needs a topk=2048 fixture variant. |
+| `tilelang` | ✓ (topk=2048 dedicated fixture) | ✓ (topk=2048 dedicated fixture) | skipped: not yet wired into CG runner | `tilelang_sparse_fwd` asserts `topk == 2048`; the topk=2048 fixture instance (`build_dsa_sparse_attention_fixture(..., index_topk=2048)`) is used by `test_sparse_tilelang_prefill_case` / `test_sparse_tilelang_decode_case`. The default-topk impl-variant matrix still skips tilelang with the same reason. |
 | `trtllm` | skipped: SM<10 | skipped: SM<10 | skipped: SM<10 | TRT-LLM Gen FMHA/MLA requires Blackwell (SM>=10.0). |
 | `aiter` | skipped: not HIP | skipped: not HIP | skipped: not HIP | AMD-only kernel library. |
 | `flashmla_auto` (default) | ✓ (resolves to `flashmla_sparse` for bf16, `flashmla_kv` for FP8) | ✓ | ✓ | covered indirectly by all sparse cases |
@@ -101,22 +101,14 @@ hardware/SDK. The variant tests live in `test_dsa.py` as
 
 ## Next Work
 
-- **FP8 KV cache path** — `DSATokenToKVPool.dsa_kv_cache_store_fp8`
-  needs `dtype=torch.float8_e4m3fn` and a non-None `override_kv_cache_dim`;
-  the fixture currently uses bf16. Adding it would unlock
-  `TopkTransformMethod.RAGGED` coverage (`get_topk_transform_method`:
-  RAGGED needs `dsa_kv_cache_store_fp8 AND dsa_prefill_impl == "flashmla_sparse"
-  AND forward_mode == EXTEND`) and the FP8 `flashmla_auto → flashmla_kv`
-  resolution branch. The prefix-write path also needs to pack BF16 K into
-  the FP8 store layout (UE8M0 scales + packed quants) so the reference
-  matches what the kernel reads from cache.
-- **TARGET_VERIFY** — deep_gemm's `paged_mqa_logits_metadata` kernel
-  fails to compile for small `aligned_batch_size`
-  (`zero-sized variable "num_segs"`); the production speculative graph
-  runner only hits large aligned shapes, so the synthetic fixture would
-  need to mock the deep_gemm metadata path or raise the alignment.
-- **tilelang topk=2048 fixture** — `tilelang_sparse_fwd` asserts
-  `topk == 2048`; building a separate sparse fixture with
-  `DSA_SPARSE_INDEX_TOPK=2048` would unlock the tilelang variant tests.
+- **DSA production EAGLE graph-runner integration** — wire DSA sparse
+  into `common/runner_modes/eagle_draft_runner.py` so the
+  `EAGLEDraftCudaGraphRunner` / `EAGLEDraftExtendCudaGraphRunner`
+  contracts are exercised against real DSA metadata.
+- **HiSparse coordinator path** — `set_dsa_prefill_impl` forces
+  `use_mha=False` when `self.hisparse_coordinator is not None`; the
+  fixture sets it to `None`. Adding HiSparse coverage would exercise
+  `_forward_flashmla_kv`'s `translate_loc_to_hisparse_device` branch
+  and `swap_in_selected_pages` during decode.
 - Add non-trailing index-layout sparse cases when a representative
   index-construction path is identified.

@@ -26,6 +26,8 @@ from common.attention_methods.dsa_attention import (
     run_dsa_sparse_fp8_prefill_case,
     run_dsa_sparse_prefill_impl_variant_case,
     run_dsa_sparse_speculative_forward_mode_case,
+    run_dsa_sparse_tilelang_decode_case,
+    run_dsa_sparse_tilelang_prefill_case,
 )
 from common.runner_modes.cuda_graph_decode_runner import (
     run_dsa_sparse_cuda_graph_decode_case,
@@ -123,15 +125,24 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
                     self, self.DECODE_IMPL_CASE, impl
                 )
 
-    # Speculative forward-mode coverage. DRAFT_EXTEND and DRAFT_EXTEND_V2
-    # route through the `dsa_decode_impl` dispatcher (the same kernel
-    # selection as plain DECODE), but exercise a different metadata setup
-    # path. TARGET_VERIFY is intentionally absent — deep_gemm's
-    # `paged_mqa_logits_metadata` kernel does not compile for the small
-    # `aligned_batch_size` shapes produced by this fixture; the larger
-    # aligned shapes only appear in the production speculative graph
-    # runner.
+    # Speculative forward-mode coverage. TARGET_VERIFY, DRAFT_EXTEND,
+    # and DRAFT_EXTEND_V2 all route through the `dsa_decode_impl`
+    # dispatcher (the same kernel selection as plain DECODE) but
+    # produce different `seqlens_expanded` and `cu_seqlens_q` from
+    # `dsa_backend.py:469-529`. `DSAMockModelRunner.__init__` derives
+    # `speculative_num_draft_tokens` from `case.extend_lens` so deep_gemm
+    # JIT-compiles with a non-zero aligned batch size.
     SPECULATIVE_FORWARD_MODE_CASES = (
+        DSAAttentionCase(
+            name="dsa_sparse_target_verify",
+            backend="dsa",
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            num_heads=4,
+            num_kv_heads=1,
+            page_size=DSA_PAGE_SIZE,
+            prefix_lens=(128,),
+            extend_lens=(3,),
+        ),
         DSAAttentionCase(
             name="dsa_sparse_draft_extend",
             backend="dsa",
@@ -226,6 +237,37 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
                 run_dsa_sparse_fp8_decode_case(
                     self, self.FP8_DECODE_CASE, dsa_decode_backend=impl
                 )
+
+    # Tilelang sparse cases — dedicated topk=2048 fixture.
+    # `tilelang_sparse_fwd` asserts `topk == 2048` at
+    # `dsa/tilelang_kernel.py:1345`, so this fixture variant carries a
+    # 2048-wide trailing-topk row builder. Prefix length must be >= 2048
+    # to produce a real (non-padded) topk row.
+    TILELANG_PREFILL_CASE = DSAAttentionCase(
+        name="dsa_sparse_tilelang_prefill",
+        backend="dsa",
+        forward_mode=ForwardMode.EXTEND,
+        num_heads=4,
+        num_kv_heads=1,
+        page_size=DSA_PAGE_SIZE,
+        prefix_lens=(4096,),
+        extend_lens=(1,),
+    )
+    TILELANG_DECODE_CASE = DSAAttentionCase(
+        name="dsa_sparse_tilelang_decode",
+        backend="dsa",
+        forward_mode=ForwardMode.DECODE,
+        num_heads=4,
+        num_kv_heads=1,
+        page_size=DSA_PAGE_SIZE,
+        prefix_lens=(4096,),
+    )
+
+    def test_sparse_tilelang_prefill_case(self):
+        run_dsa_sparse_tilelang_prefill_case(self, self.TILELANG_PREFILL_CASE)
+
+    def test_sparse_tilelang_decode_case(self):
+        run_dsa_sparse_tilelang_decode_case(self, self.TILELANG_DECODE_CASE)
 
     # CG decode replay with FP8 KV cache. Captures and replays through
     # `flashmla_kv` (the only FP8-compatible decode kernel). The
