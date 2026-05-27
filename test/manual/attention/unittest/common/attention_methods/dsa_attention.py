@@ -1126,6 +1126,22 @@ def dsa_impl_capability(impl: str) -> tuple[bool, str]:
             )
         except ImportError as exc:
             return False, f"tilelang_kernel unavailable: {exc}"
+        # Container gate (KNOWN_FAILURES.md §2): on SM10.x the tilelang JIT
+        # generates a `wait_wgmma` WGMMA-sync intrinsic that the container's
+        # MMA template library doesn't ship, raising `RuntimeError: namespace
+        # "tl" has no member "wait_wgmma"` at PTX compilation time. Skip
+        # tilelang on SM>=10 until the container is re-imaged with an SM10.x
+        # tilelang version. Override with `SGLANG_TEST_DSA_TILELANG_FORCE=1`
+        # if you've verified the wait_wgmma intrinsic is present.
+        import os as _os
+        if major >= 10 and not _os.environ.get("SGLANG_TEST_DSA_TILELANG_FORCE"):
+            return (
+                False,
+                f"tilelang JIT on SM{major}.{minor} needs `wait_wgmma` template "
+                f"that the container doesn't ship "
+                f"(KNOWN_FAILURES.md §2). Re-image or set "
+                f"SGLANG_TEST_DSA_TILELANG_FORCE=1 to override.",
+            )
         # `tilelang_sparse_fwd` asserts `topk == 2048`; our existing sparse
         # fixture uses `DSA_SPARSE_INDEX_TOPK=128`. Tests requesting the
         # tilelang variant must build a topk=2048 fixture variant.

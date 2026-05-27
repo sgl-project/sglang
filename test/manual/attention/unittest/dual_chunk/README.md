@@ -37,6 +37,21 @@ Columns are runner modes; rows are kernel-path modes of the single
   prompt bypasses the sparse kernel and falls through to the dense chunk
   flash path, exercising the gate semantics in the wrapper.
 
+## Container Gate (SM10.x)
+
+`DualChunkFlashAttentionBackend` calls `flash_attn_varlen_func` via
+`sglang.jit_kernel.flash_attention`. On SM8.x / SM9.x that resolves to sgl-kernel's
+FA3 build; on SM != {8, 9} (notably SM10.x / GB300) the JIT kernel falls back
+to the upstream `flash_attn` (FA2) wheel, which the
+`lmsysorg/sglang:nightly-dev-cu13` container ships without an SM10.x-compiled
+`flash_attn_varlen_func`. `test_dual_chunk_flash_attn.py` probes both paths at
+module import: if FA3 is supported (`major in {8, 9}`) it runs unconditionally;
+otherwise it tries `from flash_attn import flash_attn_varlen_func` and skips the
+whole class with the documented reason if the symbol is missing. Re-image with
+an SM10.x-compiled flash_attn wheel to clear; no test-code change needed.
+
+See `KNOWN_FAILURES.md` §1 for the full root cause + fix.
+
 ## Production-Unsupported
 
 - **Non-prefill / non-decode forward modes** —

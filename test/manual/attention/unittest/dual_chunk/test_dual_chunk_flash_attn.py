@@ -23,8 +23,45 @@ from common.runner_modes.cuda_graph_decode_runner import (
     run_dual_chunk_cuda_graph_decode_case,
 )
 
+# Container gate (KNOWN_FAILURES.md §1): `DualChunkFlashAttentionBackend` calls
+# `flash_attn_varlen_func` on every forward via
+# `sglang.jit_kernel.flash_attention`. On SM8x/SM9x, that resolves to sgl-kernel's
+# FA3 build (which works). On SM != {8, 9} (notably SM10.3 / GB300), the JIT
+# kernel falls back to the upstream `flash_attn` (FA2) wheel — but the
+# `lmsysorg/sglang:nightly-dev-cu13` container's `flash_attn` package ships
+# without `flash_attn_varlen_func` on SM10.x, so every dual-chunk forward
+# fails at import time inside the fallback. Skip the whole suite only when
+# that fallback path is actually broken (not on Hopper, where we never enter it).
+# Re-image the container with an SM10.3-compiled flash_attn wheel to clear.
+def _dual_chunk_fa_supported() -> tuple[bool, str]:
+    if not torch.cuda.is_available():
+        return False, "CUDA is required"
+    major, _minor = torch.cuda.get_device_capability()
+    # FA3 path is taken when sm major is 8 or 9 (see
+    # `sglang.jit_kernel.flash_attention_v3._is_fa3_supported`). On that path
+    # the upstream `flash_attn` fallback is never invoked.
+    if major in (8, 9):
+        return True, ""
+    # Otherwise (sm 7.x or sm >= 10.x) the JIT kernel falls back to upstream
+    # `flash_attn.flash_attn_varlen_func`. Probe it; if missing, skip.
+    try:
+        from flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func  # noqa: F401
+        return True, ""
+    except ImportError as exc:
+        return False, (
+            f"flash_attn_varlen_func is not available in upstream `flash_attn` "
+            f"(SM{major}.x JIT-kernel fallback): {exc}. "
+            f"Re-image the container with an SM{major}.x-compiled flash_attn wheel."
+        )
+
+
+_DUAL_CHUNK_FLASH_ATTN_AVAILABLE, _DUAL_CHUNK_SKIP_REASON = _dual_chunk_fa_supported()
+
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
+@unittest.skipIf(
+    not _DUAL_CHUNK_FLASH_ATTN_AVAILABLE, _DUAL_CHUNK_SKIP_REASON
+)
 class TestDualChunkFlashAttentionBackendCorrectness(CustomTestCase):
     CASES = make_dual_chunk_cases("dual_chunk_flash_attn")
     SPARSE_CASES = make_dual_chunk_sparse_cases("dual_chunk_flash_attn")

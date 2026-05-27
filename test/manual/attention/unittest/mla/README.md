@@ -72,6 +72,19 @@ multi-step draft backends and cannot ever appear at runtime.
   Cutlass MLA forces `page_size=128`, TRT-LLM MLA and Tokenspeed MLA force
   `page_size in {32, 64}`.
 
+## Backend Container Gate (SM10.x)
+
+`test_flashinfer.py::test_runner_mode_eagle_draft_cuda_graph_runner_cases`
+skips on `major >= 10`. The FlashInfer MLA multi-step draft backend
+(`FlashInferMLAMultiStepDraftBackend`) ships with an SM9x-targeted decode
+kernel in the current container; on SM10.x it falls back to a generic path
+that doesn't restore metadata buffers correctly under graph replay, producing
+~22 abs-diff vs the reference. The eager and DRAFT_EXTEND paths are
+unaffected; only this CG decode runner regresses. Update FlashInfer to a
+version that ships an SM10.x-compiled MLA multi-step decode kernel to clear.
+
+See `KNOWN_FAILURES.md` §3 for the full root cause + fix.
+
 ## Next Work
 
 - Fix or work around the FlashMLA `DRAFT_EXTEND` graph capture path (either
