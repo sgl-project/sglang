@@ -9,6 +9,7 @@ CI coverage to stay correct.
 from __future__ import annotations
 
 import importlib.util
+import os
 import pathlib
 import unittest
 
@@ -192,8 +193,157 @@ class TestAC12HarnessHelpers(unittest.TestCase):
         self.assertEqual(self._h._parse_mmlu_letter(" The answer is B."), "B")
         self.assertEqual(self._h._parse_mmlu_letter("D — definitely"), "D")
         self.assertIsNone(self._h._parse_mmlu_letter("hmm"))
-        # First A-D character wins (so "AB" → A).
-        self.assertEqual(self._h._parse_mmlu_letter("AB"), "A")
+
+    # ---- Round 27: robust answer-token parser -------------------------
+
+    def test_parse_mmlu_answer_prefix_returns_real_letter(self):
+        """Codex Round 26 review bug: ``Answer: B`` returned ``A``
+        (the A in "Answer"). The Round 27 parser must return ``B``."""
+        self.assertEqual(self._h._parse_mmlu_letter("Answer: B"), "B")
+
+    def test_parse_mmlu_lowercase_letter(self):
+        self.assertEqual(self._h._parse_mmlu_letter("b"), "B")
+
+    def test_parse_mmlu_paren_wrapped(self):
+        self.assertEqual(self._h._parse_mmlu_letter("(C)"), "C")
+
+    def test_parse_mmlu_letter_with_period(self):
+        self.assertEqual(self._h._parse_mmlu_letter("D."), "D")
+
+    def test_parse_mmlu_bracket_wrapped(self):
+        self.assertEqual(self._h._parse_mmlu_letter("[A]"), "A")
+
+    def test_parse_mmlu_answer_is_marker(self):
+        self.assertEqual(self._h._parse_mmlu_letter("answer is C"), "C")
+
+    def test_parse_mmlu_the_answer_is_marker_with_punct(self):
+        self.assertEqual(self._h._parse_mmlu_letter("The answer is D."), "D")
+
+    def test_parse_mmlu_option_marker(self):
+        self.assertEqual(self._h._parse_mmlu_letter("option B"), "B")
+
+    def test_parse_mmlu_choice_marker_paren(self):
+        self.assertEqual(self._h._parse_mmlu_letter("Choice (A)"), "A")
+
+    def test_parse_mmlu_narrative_decoy_no_marker_returns_none(self):
+        """Narrative text with no answer marker: do NOT guess. The
+        Round 26 first-A-D-char parser would have returned ``A`` from
+        the word ``Awful`` (or any other A-D-prefixed word)."""
+        self.assertIsNone(
+            self._h._parse_mmlu_letter("Awful question, no marker."),
+        )
+
+    def test_parse_mmlu_empty_string(self):
+        self.assertIsNone(self._h._parse_mmlu_letter(""))
+
+    def test_parse_mmlu_whitespace_only(self):
+        self.assertIsNone(self._h._parse_mmlu_letter("   \n  "))
+
+    def test_parse_mmlu_leading_punctuation_then_letter(self):
+        # Whitespace + open-paren + letter + comma + ...
+        self.assertEqual(self._h._parse_mmlu_letter(" (B), final"), "B")
+
+    # ---- Round 27: MMLU data self-prep helper -------------------------
+
+    def _make_fake_mmlu_tar(self, dest_tar: str) -> None:
+        """Build a tiny .tar with the expected ``data/{dev,test}`` layout."""
+        import tarfile
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as src_root:
+            for sub in ("dev", "test"):
+                os.makedirs(os.path.join(src_root, "data", sub), exist_ok=True)
+                with open(
+                    os.path.join(src_root, "data", sub, f"foo_{sub}.csv"),
+                    "w",
+                ) as fh:
+                    fh.write("q,a,b,c,d,gold\n")
+            with tarfile.open(dest_tar, "w") as tar:
+                tar.add(os.path.join(src_root, "data"), arcname="data")
+
+    def test_ensure_mmlu_data_dir_downloads_and_extracts(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = os.path.join(tmp, "mmlu")
+            fake_tar = os.path.join(tmp, "fake.tar")
+            self._make_fake_mmlu_tar(fake_tar)
+
+            def fake_urlretrieve(url, dst):
+                import shutil as _sh
+                _sh.copyfile(fake_tar, dst)
+                return dst, None
+
+            from unittest.mock import patch
+            with patch("urllib.request.urlretrieve", side_effect=fake_urlretrieve):
+                dev, test = self._h._ensure_mmlu_data_dir(data_dir)
+            self.assertEqual(dev, os.path.join(data_dir, "dev"))
+            self.assertEqual(test, os.path.join(data_dir, "test"))
+            self.assertTrue(os.path.isfile(os.path.join(dev, "foo_dev.csv")))
+            self.assertTrue(os.path.isfile(os.path.join(test, "foo_test.csv")))
+
+    def test_ensure_mmlu_data_dir_idempotent(self):
+        """Second call must NOT re-download when dev/ + test/ exist."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = os.path.join(tmp, "mmlu")
+            fake_tar = os.path.join(tmp, "fake.tar")
+            self._make_fake_mmlu_tar(fake_tar)
+
+            calls = []
+
+            def fake_urlretrieve(url, dst):
+                calls.append(url)
+                import shutil as _sh
+                _sh.copyfile(fake_tar, dst)
+                return dst, None
+
+            from unittest.mock import patch
+            with patch("urllib.request.urlretrieve", side_effect=fake_urlretrieve):
+                self._h._ensure_mmlu_data_dir(data_dir)
+                self._h._ensure_mmlu_data_dir(data_dir)  # second call
+
+            # urlretrieve called exactly once (first call); second was a no-op.
+            self.assertEqual(len(calls), 1)
+
+    def test_ensure_mmlu_data_dir_raises_on_download_failure(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = os.path.join(tmp, "mmlu")
+
+            def boom(url, dst):
+                raise IOError("network unreachable")
+
+            from unittest.mock import patch
+            with patch("urllib.request.urlretrieve", side_effect=boom):
+                with self.assertRaises(RuntimeError) as ctx:
+                    self._h._ensure_mmlu_data_dir(data_dir)
+            self.assertIn("download failed", str(ctx.exception))
+
+    def test_ensure_mmlu_data_dir_raises_when_archive_missing_subdirs(self):
+        """Tar with no data/dev or data/test must fail loudly."""
+        import tarfile
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = os.path.join(tmp, "mmlu")
+            fake_tar = os.path.join(tmp, "bad.tar")
+            # Build a tar that has data/ but no dev/test subdirs.
+            with tempfile.TemporaryDirectory() as src:
+                os.makedirs(os.path.join(src, "data"), exist_ok=True)
+                with open(os.path.join(src, "data", "stray.txt"), "w") as fh:
+                    fh.write("nope")
+                with tarfile.open(fake_tar, "w") as tar:
+                    tar.add(os.path.join(src, "data"), arcname="data")
+
+            def fake_urlretrieve(url, dst):
+                import shutil as _sh
+                _sh.copyfile(fake_tar, dst)
+                return dst, None
+
+            from unittest.mock import patch
+            with patch("urllib.request.urlretrieve", side_effect=fake_urlretrieve):
+                with self.assertRaises(RuntimeError) as ctx:
+                    self._h._ensure_mmlu_data_dir(data_dir)
+            self.assertIn("missing data/", str(ctx.exception))
 
 
 if __name__ == "__main__":

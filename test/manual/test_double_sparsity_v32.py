@@ -44,12 +44,16 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
+import shutil
+import tarfile
+import tempfile
 import time
 import unittest
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 # ----- env-var contract --------------------------------------------------
@@ -247,12 +251,119 @@ def _make_mmlu_5shot_prompt(
     return header + shots + test_q
 
 
+# Answer-token parser. The Round 26 implementation scanned for the first
+# A-D character anywhere in the response, which mis-scored "Answer: B"
+# as "A" (the A in "Answer"). Round 27 replaces it with a regex-driven
+# parser: leading isolated letter first (optionally wrapped in
+# punctuation), then answer-introducer markers, then None.
+
+# Leading isolated A-D after optional opening punctuation/whitespace,
+# followed by a non-word character (or end of string) so we never split
+# a word at its first letter.
+_LEADING_LETTER_RE = re.compile(r'^[\s\(\[\{<"\'`]*([A-Da-d])(?!\w)')
+
+# Marker phrases ("Answer:", "Answer is", "Option", "Choice", ...) followed
+# by a standalone A-D letter. Case-insensitive.
+_MARKER_RE = re.compile(
+    r'(?i)(?:answer\s*[:\-]?|answer\s+is|the\s+answer\s+is|option|choice)'
+    r'\s*[\(\[\{<"\'`:.]*\s*([A-Da-d])(?!\w)'
+)
+
+
 def _parse_mmlu_letter(response: str) -> Optional[str]:
-    """First A-D letter in the response; ``None`` if no letter found."""
-    for ch in response:
-        if ch in _MMLU_CHOICES:
-            return ch
+    """Extract the predicted A-D letter from an MMLU model completion.
+
+    Conservative parser — returns ``None`` rather than guess. Matches:
+
+    * Leading isolated letter, possibly wrapped in punctuation: ``"B"``,
+      ``" B"``, ``"(C)"``, ``"[A]"``, ``"D."``.
+    * After answer-introducer markers (case-insensitive): ``"Answer: B"``,
+      ``"answer is C"``, ``"The answer is D."``, ``"option B"``,
+      ``"Choice (A)"``.
+
+    Returns the upper-cased letter, or ``None``.
+    """
+    if not response:
+        return None
+    s = response.strip()
+    if not s:
+        return None
+    m = _LEADING_LETTER_RE.match(s)
+    if m:
+        return m.group(1).upper()
+    m2 = _MARKER_RE.search(s)
+    if m2:
+        return m2.group(1).upper()
     return None
+
+
+# ----- MMLU data self-prep (Hendrycks tarball) --------------------------
+
+
+MMLU_DATA_URL = "https://people.eecs.berkeley.edu/~hendrycks/data.tar"
+
+
+def _ensure_mmlu_data_dir(data_dir: str) -> Tuple[str, str]:
+    """Return ``(dev_dir, test_dir)`` for the MMLU CSVs, downloading on demand.
+
+    Idempotent: if ``data_dir/dev`` and ``data_dir/test`` already exist,
+    returns immediately. Otherwise fetches the Hendrycks data.tar via
+    ``urllib.request.urlretrieve`` into a temp dir, safely extracts only
+    members under the archive's ``data/`` prefix (rejects path-traversal
+    via tarfile's ``filter='data'``), and atomically moves
+    ``data/dev`` + ``data/test`` into ``data_dir``.
+
+    Raises ``RuntimeError`` on any failure (network, malformed archive,
+    missing subdirectories) so callers running with paired DS/DSA servers
+    fail loudly rather than silently skip.
+    """
+    dev_dir = os.path.join(data_dir, "dev")
+    test_dir = os.path.join(data_dir, "test")
+    if os.path.isdir(dev_dir) and os.path.isdir(test_dir):
+        return dev_dir, test_dir
+
+    os.makedirs(data_dir, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tar_path = os.path.join(tmpdir, "data.tar")
+        try:
+            urllib.request.urlretrieve(MMLU_DATA_URL, tar_path)
+        except Exception as exc:  # network, DNS, 404, etc.
+            raise RuntimeError(
+                f"_ensure_mmlu_data_dir: download failed from {MMLU_DATA_URL}: {exc}"
+            ) from exc
+
+        extract_root = os.path.join(tmpdir, "extracted")
+        os.makedirs(extract_root, exist_ok=True)
+        try:
+            with tarfile.open(tar_path) as tar:
+                safe_members = [
+                    m for m in tar.getmembers()
+                    if m.name.startswith("data/")
+                    and ".." not in m.name.split("/")
+                    and not os.path.isabs(m.name)
+                ]
+                # filter='data' (Python 3.12+) rejects symlinks/devices and
+                # any path outside the extraction root.
+                tar.extractall(
+                    path=extract_root, members=safe_members, filter="data",
+                )
+        except Exception as exc:
+            raise RuntimeError(
+                f"_ensure_mmlu_data_dir: extraction failed: {exc}"
+            ) from exc
+
+        for sub in ("dev", "test"):
+            src = os.path.join(extract_root, "data", sub)
+            dst = os.path.join(data_dir, sub)
+            if not os.path.isdir(src):
+                raise RuntimeError(
+                    f"_ensure_mmlu_data_dir: extracted archive missing data/{sub}/"
+                )
+            if os.path.isdir(dst):
+                shutil.rmtree(dst)
+            shutil.move(src, dst)
+
+    return dev_dir, test_dir
 
 
 # ----- result recording --------------------------------------------------
@@ -401,7 +512,9 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
 
         # Discover the MMLU CSV directories (test + dev). Operator can
         # override via AC12_MMLU_DATA_DIR; default is the standard
-        # benchmark/mmlu/data/ tree.
+        # benchmark/mmlu/data/ tree.  If the data is absent, self-prep
+        # by downloading the Hendrycks tarball — Round 26 silently
+        # skipped here, hiding the AC-12 gate.
         data_dir = os.environ.get(
             "AC12_MMLU_DATA_DIR",
             os.path.abspath(
@@ -411,12 +524,18 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
                 )
             ),
         )
-        test_dir = os.path.join(data_dir, "test")
-        dev_dir = os.path.join(data_dir, "dev")
-        if not (os.path.isdir(test_dir) and os.path.isdir(dev_dir)):
-            self.skipTest(
-                f"MMLU data not found at {data_dir}; download via "
-                "`python benchmark/mmlu/bench_sglang.py` once (it auto-fetches)."
+        try:
+            dev_dir, test_dir = _ensure_mmlu_data_dir(data_dir)
+        except Exception as exc:
+            # Servers are configured (class-level skipUnless passed) so
+            # an operator is actively running the AC-12 gate — silent
+            # skip would mask the failure. Fail loudly per plan §10
+            # ("loop does not close without AC-12 passing").
+            self.fail(
+                f"AC-12 MMLU data prep failed at {data_dir}: {exc}. "
+                "Pre-populate with `python benchmark/mmlu/bench_sglang.py` "
+                "or set AC12_MMLU_DATA_DIR to a directory containing "
+                "`dev/` and `test/` MMLU CSV trees."
             )
             return
 
