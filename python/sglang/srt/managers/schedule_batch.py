@@ -1504,11 +1504,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
-    # CPU mirror of req_pool_indices, maintained on the schedule batch only
-    # (build / filter / merge). It is intentionally NOT updated inside the spec
-    # draft-extend window, where req_pool_indices is temporarily swapped to the
-    # draft's own slots and restored afterwards. Read it on the schedule path
-    # (e.g. prepare_for_decode, before the forward), never inside a draft forward.
+    # CPU mirror of req_pool_indices; schedule-path only, stale in spec draft window
     req_pool_indices_cpu: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
