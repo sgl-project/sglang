@@ -36,10 +36,14 @@ def _init_guardrails(offload_to_cpu: bool = False) -> None:
             "cosmos_guardrail is required for Cosmos3 safety checks. "
             "Install it with: pip install cosmos-guardrail==0.3.1"
         )
-    logger.info("Initializing Cosmos3 guardrails (offload_to_cpu=%s) ...", offload_to_cpu)
+    logger.info(
+        "Initializing Cosmos3 guardrails (offload_to_cpu=%s) ...", offload_to_cpu
+    )
     _checker = CosmosSafetyChecker()
     idle_device = "cpu" if offload_to_cpu else "cuda"
     for runner in (_checker.text_guardrail, _checker.video_guardrail):
+        if runner is None or not hasattr(runner, "models"):
+            continue
         for m in runner.models:
             if isinstance(m, torch.nn.Module):
                 m.to(idle_device)
@@ -64,11 +68,14 @@ def check_video_safety(video: np.ndarray) -> np.ndarray:
     """
     if _checker is None:
         return video
-    batched = video.ndim == 5
-    frames = video[0] if batched else video
-    result = _checker.check_video_safety(frames)
-    out = result if result is not None else frames
-    return out[np.newaxis] if batched else out
+    if video.ndim == 5:
+        processed = []
+        for frames in video:
+            result = _checker.check_video_safety(frames)
+            processed.append(result if result is not None else frames)
+        return np.stack(processed)
+    result = _checker.check_video_safety(video)
+    return result if result is not None else video
 
 
 class Cosmos3TextGuardrailStage(PipelineStage):
