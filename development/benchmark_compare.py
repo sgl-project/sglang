@@ -23,6 +23,20 @@ SLO gate per AC-8: each row is annotated with `pass` / `fail` against
 
 No-op detector per AC-7: a row is flagged if any of
 ``selected_tokens == total_tokens`` or ``dense_fallback_total != 0``.
+
+The tool exposes two CLI modes:
+
+* Single-trial AC-7/AC-8 report (legacy): pass ``--baseline`` and
+  ``--ds`` to compare one DSA JSONL against one DS JSONL.
+* Three-trial AC-11 directional report: pass ``--ac11`` along with
+  ``--ac11-baseline-results`` and ``--ac11-ds-results`` lists. Each
+  side requires >= 3 trial JSONLs per concurrency; the comparator
+  groups by concurrency, takes per-field medians, and enforces the
+  AC-11 gates (DS TPS >= 95% of DSA TPS; DS P99 TTFT <= 1.10 * DSA
+  P99 TTFT). Exit codes: 0 = all gates pass, 3 = at least one gate
+  failed (Markdown output names the failing concurrencies + emits a
+  profiling obligation), 2 = input refusal (too few trials, missing
+  concurrency, or mismatched per-trial operating point).
 """
 
 from __future__ import annotations
@@ -251,6 +265,222 @@ def _match_or_refuse(
     return reasons
 
 
+# ----- AC-11 directional comparator (3-trial median, gates) -------------
+
+# Plan §AC-11: "DS-on TPS within 5% of DSA-on TPS at conc=64 (directional
+# gate). P99 TTFT ≤ DSA-on P99 TTFT × 1.10. Fixed seed, 600s window, 120s
+# warmup, 3 trials, median."
+AC11_TPS_FLOOR_RATIO = 0.95   # DS TPS must be ≥ 95% of DSA TPS.
+AC11_TTFT_CEIL_RATIO = 1.10   # DS P99 TTFT must be ≤ 1.10× DSA P99 TTFT.
+AC11_MIN_TRIALS = 3
+
+
+def _median(values: List[Optional[float]]) -> Optional[float]:
+    """Median ignoring ``None`` values. Returns ``None`` if empty after filtering."""
+    nums = [float(v) for v in values if v is not None]
+    if not nums:
+        return None
+    nums.sort()
+    n = len(nums)
+    mid = n // 2
+    if n % 2 == 1:
+        return float(nums[mid])
+    return float((nums[mid - 1] + nums[mid]) / 2.0)
+
+
+def _median_metrics(trials: List[RunMetrics]) -> RunMetrics:
+    """Aggregate a trial set into a single ``RunMetrics`` via per-field medians.
+
+    ``dense_fallback_total`` is summed (it's a counter, not a sample).
+    ``concurrency``, ``num_prompts``, ``isl``, ``osl`` must agree across
+    trials — refuse otherwise so a misgrouped sweep cannot silently pass.
+    """
+    if not trials:
+        raise ValueError("AC-11 median: empty trial set")
+    first = trials[0]
+    for t in trials[1:]:
+        for f in ("concurrency", "num_prompts", "isl", "osl"):
+            if getattr(t, f) != getattr(first, f):
+                raise ValueError(
+                    f"AC-11 median: trial {f}={getattr(t, f)} disagrees with "
+                    f"first trial {f}={getattr(first, f)} — refusing to median "
+                    "across mismatched operating points."
+                )
+    df_total = None
+    df_values = [t.dense_fallback_total for t in trials if t.dense_fallback_total is not None]
+    if df_values:
+        df_total = int(sum(df_values))
+    return RunMetrics(
+        concurrency=first.concurrency,
+        num_prompts=first.num_prompts,
+        isl=first.isl,
+        osl=first.osl,
+        output_tps_p50=_median([t.output_tps_p50 for t in trials]),
+        output_tps_p99=_median([t.output_tps_p99 for t in trials]),
+        ttft_p50_s=_median([t.ttft_p50_s for t in trials]),
+        ttft_p99_s=_median([t.ttft_p99_s for t in trials]),
+        tpot_p50_ms=_median([t.tpot_p50_ms for t in trials]),
+        tpot_p99_ms=_median([t.tpot_p99_ms for t in trials]),
+        goodput_under_slo=_median([t.goodput_under_slo for t in trials]),
+        selected_tokens_mean=_median([t.selected_tokens_mean for t in trials]),
+        dense_fallback_total=df_total,
+        total_tokens_mean=_median([t.total_tokens_mean for t in trials]),
+    )
+
+
+def _group_by_concurrency(paths: List[str]) -> Dict[int, List[str]]:
+    """Group ``paths`` by their resolved concurrency.
+
+    Resolution order matches `_read_bench_jsonl`: per-row `max_concurrency`
+    or `concurrency` (preferred — survives renames), then filename suffix
+    `_c<N>.jsonl` as a last resort. Raises ValueError when any path has no
+    resolvable concurrency.
+    """
+    by_conc: Dict[int, List[str]] = {}
+    for p in paths:
+        # Try the file's row data first.
+        try:
+            ctx, _m = _read_bench_jsonl(p)
+            conc = ctx.concurrency
+        except Exception:
+            conc = _filename_concurrency(p)
+        if conc is None:
+            raise ValueError(
+                f"AC-11 group: cannot resolve concurrency for {p!r}; "
+                "ensure the JSONL row carries `max_concurrency`/`concurrency` "
+                "or that the filename ends in `_c<N>.jsonl`."
+            )
+        by_conc.setdefault(int(conc), []).append(p)
+    return by_conc
+
+
+def _evaluate_ac11_gates(
+    dsa_median: RunMetrics, ds_median: RunMetrics,
+) -> Dict[str, object]:
+    """Evaluate the two AC-11 directional gates for one concurrency.
+
+    Returns a dict with the ratios + pass flags + a human-readable reason
+    on failure. Missing inputs → ``"missing-data"`` reason and both gates
+    treated as failed.
+    """
+    result: Dict[str, object] = {
+        "tps_ratio": None,
+        "ttft_ratio": None,
+        "tps_pass": False,
+        "ttft_pass": False,
+        "reason": "",
+    }
+    if (
+        dsa_median.output_tps_p50 is None
+        or ds_median.output_tps_p50 is None
+        or dsa_median.ttft_p99_s is None
+        or ds_median.ttft_p99_s is None
+    ):
+        result["reason"] = (
+            "missing-data: AC-11 gates need DSA + DS output_tps_p50 + "
+            "ttft_p99_s on both sides."
+        )
+        return result
+    if dsa_median.output_tps_p50 <= 0:
+        result["reason"] = (
+            f"degenerate DSA TPS={dsa_median.output_tps_p50!r} — refusing "
+            "to compute ratio."
+        )
+        return result
+    if dsa_median.ttft_p99_s <= 0:
+        result["reason"] = (
+            f"degenerate DSA P99 TTFT={dsa_median.ttft_p99_s!r} — refusing "
+            "to compute ratio."
+        )
+        return result
+    tps_ratio = float(ds_median.output_tps_p50) / float(dsa_median.output_tps_p50)
+    ttft_ratio = float(ds_median.ttft_p99_s) / float(dsa_median.ttft_p99_s)
+    tps_pass = tps_ratio >= AC11_TPS_FLOOR_RATIO
+    ttft_pass = ttft_ratio <= AC11_TTFT_CEIL_RATIO
+    reasons: List[str] = []
+    if not tps_pass:
+        reasons.append(
+            f"AC-11 TPS gate failed: DS/DSA = {tps_ratio:.4f} < "
+            f"{AC11_TPS_FLOOR_RATIO} (DS={ds_median.output_tps_p50:.2f} tok/s, "
+            f"DSA={dsa_median.output_tps_p50:.2f} tok/s)"
+        )
+    if not ttft_pass:
+        reasons.append(
+            f"AC-11 TTFT gate failed: DS/DSA P99 = {ttft_ratio:.4f} > "
+            f"{AC11_TTFT_CEIL_RATIO} (DS={ds_median.ttft_p99_s:.3f} s, "
+            f"DSA={dsa_median.ttft_p99_s:.3f} s)"
+        )
+    result["tps_ratio"] = tps_ratio
+    result["ttft_ratio"] = ttft_ratio
+    result["tps_pass"] = tps_pass
+    result["ttft_pass"] = ttft_pass
+    result["reason"] = "; ".join(reasons) if reasons else ""
+    return result
+
+
+def _render_ac11_markdown(
+    by_conc: Dict[int, Dict[str, object]],
+) -> str:
+    """Render the AC-11 per-concurrency report."""
+    rows: List[str] = []
+    rows.append("# AC-11 Directional Comparator — DS vs DSA")
+    rows.append("")
+    rows.append(
+        f"Gates: DS TPS ≥ {AC11_TPS_FLOOR_RATIO * 100:.0f}% of DSA TPS; "
+        f"DS P99 TTFT ≤ DSA P99 TTFT × {AC11_TTFT_CEIL_RATIO:.2f}. "
+        f"At least {AC11_MIN_TRIALS} trials per concurrency, median."
+    )
+    rows.append("")
+    rows.append(
+        "| Conc | DSA TPS p50 | DS TPS p50 | TPS ratio | TPS gate | "
+        "DSA TTFT p99 | DS TTFT p99 | TTFT ratio | TTFT gate |"
+    )
+    rows.append(
+        "|------|-------------|------------|-----------|----------|"
+        "--------------|-------------|------------|-----------|"
+    )
+
+    def _fmt(v):
+        return "—" if v is None else (f"{v:.3f}" if isinstance(v, float) else str(v))
+
+    overall_fail_reasons: List[str] = []
+    for conc in sorted(by_conc.keys()):
+        row = by_conc[conc]
+        dsa_m: RunMetrics = row["dsa_median"]  # type: ignore[assignment]
+        ds_m: RunMetrics = row["ds_median"]    # type: ignore[assignment]
+        gate: Dict[str, object] = row["gate"]  # type: ignore[assignment]
+        tps_gate = "pass" if gate["tps_pass"] else "FAIL"
+        ttft_gate = "pass" if gate["ttft_pass"] else "FAIL"
+        rows.append(
+            f"| {conc} "
+            f"| {_fmt(dsa_m.output_tps_p50)} "
+            f"| {_fmt(ds_m.output_tps_p50)} "
+            f"| {_fmt(gate.get('tps_ratio'))} "
+            f"| {tps_gate} "
+            f"| {_fmt(dsa_m.ttft_p99_s)} "
+            f"| {_fmt(ds_m.ttft_p99_s)} "
+            f"| {_fmt(gate.get('ttft_ratio'))} "
+            f"| {ttft_gate} |"
+        )
+        if not gate["tps_pass"] or not gate["ttft_pass"]:
+            overall_fail_reasons.append(f"conc={conc}: {gate['reason']}")
+    rows.append("")
+    if overall_fail_reasons:
+        rows.append("## AC-11 verdict: FAIL")
+        rows.append("")
+        rows.append(
+            "**Profiling obligation:** the failing concurrencies below "
+            "require a captured profile (`development/profile_ds.sh` or "
+            "equivalent) before the comparator row can be published."
+        )
+        rows.append("")
+        for reason in overall_fail_reasons:
+            rows.append(f"- {reason}")
+    else:
+        rows.append("## AC-11 verdict: PASS")
+    return "\n".join(rows) + "\n"
+
+
 def _slo_verdict(m: RunMetrics) -> str:
     if m.output_tps_p50 is None or m.ttft_p99_s is None:
         return "missing-data"
@@ -331,13 +561,128 @@ def render_markdown_report(
     return "\n".join(rows) + "\n"
 
 
+def _run_ac11_mode(args) -> int:
+    """AC-11 mode entry point: validate trial sets and enforce gates."""
+    if not args.ac11_baseline_results or not args.ac11_ds_results:
+        logger.error(
+            "AC-11 mode requires --ac11-baseline-results and --ac11-ds-results."
+        )
+        return 2
+
+    try:
+        dsa_by_conc = _group_by_concurrency(args.ac11_baseline_results)
+        ds_by_conc = _group_by_concurrency(args.ac11_ds_results)
+    except (ValueError, FileNotFoundError) as exc:
+        logger.error("AC-11 input refusal: %s", exc)
+        return 2
+
+    if set(dsa_by_conc.keys()) != set(ds_by_conc.keys()):
+        logger.error(
+            "AC-11 input refusal: concurrency sets disagree. "
+            "DSA: %s, DS: %s",
+            sorted(dsa_by_conc.keys()), sorted(ds_by_conc.keys()),
+        )
+        return 2
+
+    for conc, paths in dsa_by_conc.items():
+        if len(paths) < AC11_MIN_TRIALS:
+            logger.error(
+                "AC-11 input refusal: DSA conc=%d has only %d trial(s); "
+                "need >=%d.",
+                conc, len(paths), AC11_MIN_TRIALS,
+            )
+            return 2
+    for conc, paths in ds_by_conc.items():
+        if len(paths) < AC11_MIN_TRIALS:
+            logger.error(
+                "AC-11 input refusal: DS conc=%d has only %d trial(s); "
+                "need >=%d.",
+                conc, len(paths), AC11_MIN_TRIALS,
+            )
+            return 2
+
+    by_conc: Dict[int, Dict[str, object]] = {}
+    any_fail = False
+    for conc in sorted(dsa_by_conc.keys()):
+        dsa_trials = [_read_bench_jsonl(p)[1] for p in dsa_by_conc[conc]]
+        ds_trials = [_read_bench_jsonl(p)[1] for p in ds_by_conc[conc]]
+        try:
+            dsa_median = _median_metrics(dsa_trials)
+            ds_median = _median_metrics(ds_trials)
+        except ValueError as exc:
+            logger.error("AC-11 median refusal at conc=%d: %s", conc, exc)
+            return 2
+        gate = _evaluate_ac11_gates(dsa_median, ds_median)
+        by_conc[conc] = {
+            "dsa_median": dsa_median, "ds_median": ds_median, "gate": gate,
+        }
+        if not gate["tps_pass"] or not gate["ttft_pass"]:
+            any_fail = True
+
+    md = _render_ac11_markdown(by_conc)
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(md)
+        logger.info("wrote AC-11 Markdown report to %s", args.output)
+    else:
+        sys.stdout.write(md)
+    if args.json_output:
+        payload = {
+            "ac11_gates": {
+                "tps_floor_ratio": AC11_TPS_FLOOR_RATIO,
+                "ttft_ceil_ratio": AC11_TTFT_CEIL_RATIO,
+                "min_trials": AC11_MIN_TRIALS,
+            },
+            "per_concurrency": {
+                str(conc): {
+                    "dsa_median": asdict(row["dsa_median"]),
+                    "ds_median": asdict(row["ds_median"]),
+                    "gate": row["gate"],
+                }
+                for conc, row in by_conc.items()
+            },
+            "verdict": "FAIL" if any_fail else "PASS",
+        }
+        with open(args.json_output, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        logger.info("wrote AC-11 JSON report to %s", args.json_output)
+
+    return 3 if any_fail else 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="benchmark_compare.py",
         description="Side-by-side comparator for native_nsa vs double_sparsity bench_serving runs.",
     )
-    parser.add_argument("--baseline", required=True, help="Path to native_nsa *.jsonl")
-    parser.add_argument("--ds", required=True, help="Path to double_sparsity *.jsonl")
+    parser.add_argument(
+        "--ac11",
+        action="store_true",
+        help=(
+            "AC-11 directional comparator mode. Accepts >=3 trial JSONLs per "
+            "mode per concurrency via --ac11-baseline-results / "
+            "--ac11-ds-results; computes per-concurrency medians and "
+            "enforces DS TPS >= 0.95 * DSA TPS and DS P99 TTFT <= 1.10 * "
+            "DSA P99 TTFT. Exit 0 on pass, 3 on gate failure, 2 on input "
+            "refusal (too few trials, mismatched concurrency set)."
+        ),
+    )
+    parser.add_argument(
+        "--ac11-baseline-results", nargs="+", default=None,
+        help="AC-11 mode only: paths to >=3 DSA baseline trial JSONLs per concurrency.",
+    )
+    parser.add_argument(
+        "--ac11-ds-results", nargs="+", default=None,
+        help="AC-11 mode only: paths to >=3 DS trial JSONLs per concurrency.",
+    )
+    parser.add_argument(
+        "--baseline", default=None,
+        help="Single-trial mode: path to native_nsa *.jsonl (AC-7/AC-8 report).",
+    )
+    parser.add_argument(
+        "--ds", default=None,
+        help="Single-trial mode: path to double_sparsity *.jsonl (AC-7/AC-8 report).",
+    )
     parser.add_argument(
         "--output", default=None, help="Write Markdown report to this path (default stdout)."
     )
@@ -362,6 +707,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+    if args.ac11:
+        return _run_ac11_mode(args)
+
+    if not (args.baseline and args.ds):
+        parser.error(
+            "Single-trial mode requires both --baseline and --ds. "
+            "For the AC-11 directional gate pass --ac11 + "
+            "--ac11-baseline-results + --ac11-ds-results."
+        )
 
     baseline_ctx, baseline_m = _read_bench_jsonl(args.baseline)
     ds_ctx, ds_m = _read_bench_jsonl(args.ds)
