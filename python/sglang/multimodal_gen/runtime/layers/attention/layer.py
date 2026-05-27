@@ -65,8 +65,10 @@ def build_varlen_mask_meta(
     """Build varlen FA metadata from a ``[B, S]`` key mask.
 
     Returns ``cu_seqlens``, ``indices``, ``inv_indices``, ``max_seqlen``.
-    Intended to be built once per request and passed via
-    ``joint_attention_kwargs`` so every block reuses it.
+    Passing the result via ``joint_attention_kwargs`` opts the caller into
+    ``USPAttention``'s varlen FA fast path, which zero-fills masked query
+    rows on output — only use when those rows are dropped or ignored
+    downstream.
     """
     assert key_mask.dim() == 2, "key_mask must be [B, S]"
     bs, seq = key_mask.shape
@@ -83,61 +85,6 @@ def build_varlen_mask_meta(
         "inv_indices": inv_indices,
         "max_seqlen": seq,  # upper bound; FA varlen uses cu_seqlens for actual ranges
     }
-
-
-def _unpad_qkv_by_key_mask(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    key_mask: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor]:
-    """Pack ``[B, S, H, D]`` Q/K/V into varlen form via a ``[B, S]`` key mask.
-
-    Joint-self-attention only: Q/K/V must share the valid-position mask.
-    ``max_seqlen`` is the padded length S (upper bound — FA varlen uses
-    cu_seqlens for actual ranges) so we avoid a ``.item()`` host sync.
-    Returns ``(q_unpad, k_unpad, v_unpad, cu_seqlens, max_seqlen, indices)``.
-    """
-    assert key_mask.dim() == 2, "key_mask must be [B, S]"
-    bs, seq = key_mask.shape
-    assert (
-        q.shape[:2] == (bs, seq)
-        and k.shape[:2] == (bs, seq)
-        and v.shape[:2] == (bs, seq)
-    ), "q/k/v must be [B, S, H, D] aligned to key_mask"
-    bool_mask = key_mask.to(dtype=torch.bool)
-    valid_lens = bool_mask.sum(dim=1, dtype=torch.int32)
-    flat_mask = bool_mask.reshape(-1)
-    indices = flat_mask.nonzero(as_tuple=False).flatten()
-    cu_seqlens = torch.zeros(bs + 1, dtype=torch.int32, device=key_mask.device)
-    cu_seqlens[1:] = torch.cumsum(valid_lens, dim=0)
-    max_seqlen = seq  # upper bound; avoids .item() host sync
-    q_unpad = q.reshape(bs * seq, *q.shape[2:]).index_select(0, indices)
-    k_unpad = k.reshape(bs * seq, *k.shape[2:]).index_select(0, indices)
-    v_unpad = v.reshape(bs * seq, *v.shape[2:]).index_select(0, indices)
-    return q_unpad, k_unpad, v_unpad, cu_seqlens, max_seqlen, indices
-
-
-def _pad_output_by_indices(
-    out_unpad: torch.Tensor,
-    indices: torch.Tensor,
-    batch_size: int,
-    seqlen: int,
-) -> torch.Tensor:
-    """Scatter packed varlen output back to ``[B, S, H, D]`` with zero padding.
-
-    Note: padding values differ from the SDPA path (zeros vs unmasked
-    garbage). Safe for models that drop padding rows before consuming them
-    (e.g. Qwen-Image keeps only image-side rows for ``norm_out`` + unpatchify).
-    """
-    flat = torch.zeros(
-        batch_size * seqlen,
-        *out_unpad.shape[1:],
-        dtype=out_unpad.dtype,
-        device=out_unpad.device,
-    )
-    flat.index_copy_(0, indices, out_unpad)
-    return flat.view(batch_size, seqlen, *out_unpad.shape[1:])
 
 
 class UlyssesAttention(nn.Module):
@@ -536,8 +483,9 @@ class USPAttention(nn.Module):
                 sequence-sharded suffix (image tokens). Q has no replicated
                 portion and is fully sequence-sharded.
             attn_mask_meta: optional varlen metadata from
-                ``build_varlen_mask_meta(attn_mask)``, precomputed once per
-                request to skip the per-block ``nonzero`` + ``cumsum``.
+                ``build_varlen_mask_meta(attn_mask)``. Supplying this opts
+                into the varlen FA fast path, in which masked query rows
+                are zero-filled on output (differs from SDPA semantics).
 
         Note: Replicated tensors are not supported in this implementation.
         When skip_sequence_parallel=True (set at construction time), all SP
@@ -572,49 +520,38 @@ class USPAttention(nn.Module):
 
             sp_world_size = get_sequence_parallel_world_size()
             if effective_skip_sp or sp_world_size == 1:
-                # Varlen FA fast path: SDPA with a non-None attn_mask falls back
-                # to the EFFICIENT (cutlassF) kernel and skips FA3/FA4. Unpad
-                # Q/K/V by the key mask and call varlen FA instead. Gated to
-                # bool/int [B, S] masks with matching Q/K/V shapes (joint
-                # self-attention); other shapes fall through to SDPA so their
-                # semantics are preserved.
+                # Varlen FA fast path: SDPA with a non-None mask falls back
+                # to cutlassF. Meta-gated to opt in callers that drop masked
+                # query rows downstream (zero-filled on output, differs from
+                # SDPA semantics). Without meta, fall through to SDPA.
                 if (
                     _VARLEN_FA_ENABLED
+                    and attn_mask_meta is not None
                     and self.backend == AttentionBackendEnum.FA
                     and attn_mask.dim() == 2
                     and attn_mask.dtype
                     in (torch.bool, torch.uint8, torch.int32, torch.int64)
                     and q.device.type == "cuda"
+                    and attn_mask.device == q.device
                     and q.dtype in (torch.float16, torch.bfloat16)
                     and q.shape[:2] == attn_mask.shape == k.shape[:2] == v.shape[:2]
                 ):
                     bs, seq = q.shape[0], q.shape[1]
-                    if attn_mask_meta is not None:
-                        indices = attn_mask_meta["indices"]
-                        cu_seqlens = attn_mask_meta["cu_seqlens"]
-                        max_seqlen = attn_mask_meta["max_seqlen"]
-                        inv_indices = attn_mask_meta["inv_indices"]
-                        # Guard against a caller passing meta from a different
-                        # mask shape (silent corruption otherwise).
-                        assert (
-                            inv_indices.shape[0] == bs * seq
-                        ), "attn_mask_meta shape does not match attn_mask"
-                        q_unpad, k_unpad, v_unpad = fused_pack_qkv(q, k, v, indices)
-                    else:
-                        (
-                            q_unpad,
-                            k_unpad,
-                            v_unpad,
-                            cu_seqlens,
-                            max_seqlen,
-                            indices,
-                        ) = _unpad_qkv_by_key_mask(q, k, v, attn_mask)
-                        inv_indices = None
+                    indices = attn_mask_meta["indices"]
+                    cu_seqlens = attn_mask_meta["cu_seqlens"]
+                    max_seqlen = attn_mask_meta["max_seqlen"]
+                    inv_indices = attn_mask_meta["inv_indices"]
+                    # Guard against a caller passing meta from a different
+                    # mask shape (silent corruption otherwise).
+                    assert (
+                        inv_indices.shape[0] == bs * seq
+                    ), "attn_mask_meta shape does not match attn_mask"
                     # All-False mask: FA varlen rejects zero-length input.
                     # Fall through to SDPA which handles it via broadcast.
                     # (Joint attention with an image side is always non-empty
                     # in practice, so this only guards malformed inputs.)
                     if indices.shape[0] > 0:
+                        q_unpad, k_unpad, v_unpad = fused_pack_qkv(q, k, v, indices)
                         out_unpad = flash_attn_varlen_func(
                             q=q_unpad,
                             k=k_unpad,
@@ -627,11 +564,7 @@ class USPAttention(nn.Module):
                             causal=False,
                             ver=_fa_backend.fa_ver,
                         )
-                        if inv_indices is not None:
-                            return fused_scatter_to_padded(
-                                out_unpad, inv_indices, bs, seq
-                            )
-                        return _pad_output_by_indices(out_unpad, indices, bs, seq)
+                        return fused_scatter_to_padded(out_unpad, inv_indices, bs, seq)
 
                 q_ = q.transpose(1, 2)
                 k_ = k.transpose(1, 2)
