@@ -32,15 +32,15 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-# 5-8 min weight load + full GSM8K eval + slack.
+# DSR1-0528 can spend 20+ min in weight loading on MI35x before warmup.
 register_amd_ci(
-    est_time=1800,
+    est_time=5400,
     suite="nightly-amd-8-gpu-mi35x-deepseek-r1-hicache",
     nightly=True,
 )
 
 DEEPSEEK_R1_MODEL_PATH = "deepseek-ai/DeepSeek-R1-0528"
-SERVER_LAUNCH_TIMEOUT = 1500
+SERVER_LAUNCH_TIMEOUT = 3600
 
 # Threshold matches the existing nightly AMD DSR1-0528 accuracy tests:
 #   test/registered/amd/accuracy/mi35x/test_deepseek_r1_eval_mi35x.py

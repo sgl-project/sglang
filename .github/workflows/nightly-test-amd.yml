@@ -1145,7 +1145,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
       - name: Accuracy Test MI35x (8-GPU DeepSeek-R1 HiCache)
-        timeout-minutes: 60
+        timeout-minutes: 180
         run: |
           > github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
