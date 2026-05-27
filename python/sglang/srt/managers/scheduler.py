@@ -489,9 +489,6 @@ class Scheduler(
             page_size=self.page_size,
         )
 
-        # Init SharedHiCache once HiCache pools are available.
-        self.init_shared_hicache()
-
         # Init running status
         self.init_running_status()
 
@@ -509,6 +506,9 @@ class Scheduler(
             metrics_collector_context=self.metrics_collector_context,
             metrics_collector=self.metrics_collector,
         )
+
+        # Init SharedHiCache once HiCache pools and metrics wiring are available.
+        self.init_shared_hicache()
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()

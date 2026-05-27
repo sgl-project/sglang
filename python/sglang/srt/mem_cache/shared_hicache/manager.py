@@ -235,17 +235,19 @@ class SharedHiCacheManager:
             return None
         direct_transfer = make_shared_hicache_transfer_backend(scheduler)
         parallel_metadata = scheduler_parallel_metadata(scheduler)
+        metrics_reporter = getattr(scheduler, "metrics_reporter", None)
+        metrics_collector = (
+            scheduler.metrics_collector
+            if getattr(metrics_reporter, "enable_metrics", False)
+            else None
+        )
         return cls(
             server_args=server_args,
             tree_cache=scheduler.tree_cache,
             worker_id=worker_id,
             parallel_metadata=parallel_metadata,
             direct_transfer=direct_transfer,
-            metrics_collector=(
-                scheduler.metrics_collector
-                if getattr(scheduler, "enable_metrics", False)
-                else None
-            ),
+            metrics_collector=metrics_collector,
         )
 
     def _current_backend_label(self) -> str:
