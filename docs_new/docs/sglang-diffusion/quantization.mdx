@@ -210,7 +210,7 @@ official full Diffusers repos, and the FLUX.2 NVFP4 entry keeps the official
       <td><code>--model-path</code></td>
       <td><code>nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4</code></td>
       <td>full Diffusers repo with ModelOpt NVFP4 Wan2.2 components</td>
-      <td>current B200/Blackwell bring-up uses <code>SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=trtllm</code></td>
+      <td>default FP4 GEMM backend is <code>flashinfer_trtllm</code></td>
     </tr>
   </tbody>
 </table>
@@ -327,7 +327,6 @@ sglang generate \
 For Wan2.2 NVFP4:
 
 ```bash
-SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=trtllm \
 sglang generate \
   --model-path nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4 \
   --prompt "a fox walking through neon rain" \
@@ -340,23 +339,19 @@ sglang generate \
   directories that already include `config.json`.
 - Use `--transformer-weights-path` for raw NVFP4 exports, individual
   safetensors files, or repo layouts that should be treated as weights first.
-- For legacy mixed Wan2.2 transformer overrides, the primary
-  `--transformer-path` override targets only `transformer`. Use a per-component
-  override such as `--transformer-2-path` only when you intentionally want a
-  non-default `transformer_2`.
-- On Blackwell, the validated Wan2.2 ModelOpt NVFP4 path currently prefers
-  FlashInfer FP4 GEMM via
-  `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=trtllm`.
-- This environment-variable override selects the validated Wan2.2 NVFP4
-  full-repo path on Blackwell while the other NVFP4 CI cases continue to use
-  the generic `cudnn` backend.
+- For dual-transformer pipelines such as `Wan2.2-T2V-A14B-Diffusers`, the
+  primary `--transformer-path` override targets only `transformer`. Use a
+  per-component override such as `--transformer-2-path` only when you
+  intentionally want a non-default `transformer_2`.
+- On Blackwell, the diffusion ModelOpt NVFP4 path defaults to FlashInfer
+  TensorRT-LLM FP4 GEMM (`flashinfer_trtllm`).
 - Direct `--model-path` loading is a compatibility path for FLUX.2 NVFP4-style
   repos or local directories.
 - If `--transformer-weights-path` is provided explicitly, it takes precedence
   over the compatibility `--model-path` flow.
 - For local directories, SGLang first looks for `*-mixed.safetensors`, then
   falls back to loading from the directory.
-- To force the generic diffusion ModelOpt FP4 path onto a specific FlashInfer
+- To force the diffusion ModelOpt FP4 path onto a different FlashInfer
   backend, set `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND`. Supported values
   include `flashinfer_cudnn`, `flashinfer_cutlass`, and `flashinfer_trtllm`.
 - On disk, the quantization config stays `quant_method=modelopt` with
