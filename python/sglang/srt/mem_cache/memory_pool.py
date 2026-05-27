@@ -114,15 +114,18 @@ def _set_kv_buffer_impl(
         )
 
     if _is_xpu and same_kv_dim:
-        from sgl_kernel import store_cache_xpu
+        k_flat = k.view(-1, row_dim) if k.is_contiguous() else None
+        v_flat = v.view(-1, row_dim) if v.is_contiguous() else None
+        if k_flat is not None and v_flat is not None:
+            from sgl_kernel import store_cache_xpu
 
-        return store_cache_xpu(
-            k.view(-1, row_dim),
-            v.view(-1, row_dim),
-            k_cache.view(-1, row_dim),
-            v_cache.view(-1, row_dim),
-            indices,
-        )
+            return store_cache_xpu(
+                k_flat,
+                v_flat,
+                k_cache.view(-1, row_dim),
+                v_cache.view(-1, row_dim),
+                indices,
+            )
 
     from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 

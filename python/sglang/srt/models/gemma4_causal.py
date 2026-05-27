@@ -467,11 +467,8 @@ class Gemma4Attention(nn.Module):
         if k is not None:
             k = k.flatten(-2, -1)
             # Fuse RoPE + KV-cache write for non-SWA layers with bf16 cache
-            can_fuse = (
-                self.sliding_window is None
-                and hasattr(forward_batch.token_to_kv_pool, "dtype")
-                and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
-            )
+            # DISABLED: causes accuracy regression in launch_server path
+            can_fuse = False
             if can_fuse:
                 fused_arg = create_fused_set_kv_buffer_arg(
                     value=v.flatten(-2, -1) if v.dim() == 3 else v,
