@@ -9,12 +9,11 @@ import math
 from typing import Iterable, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.siglip import SiglipVisionModel
-
-import torch.nn.functional as F
 
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -33,9 +32,8 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
-
 from sglang.srt.models.cohere2_moe import Cohere2MoeForCausalLM
+from sglang.srt.utils import add_prefix
 
 
 class Cohere2VisionMultiModalProjector(nn.Module):
@@ -109,11 +107,13 @@ def _remap_quant_config_for_sglang(quant_config):
 
     def _rewrite(name: str) -> str:
         if name.startswith("model.language_model."):
-            return "language_model.model." + name[len("model.language_model."):]
+            return "language_model.model." + name[len("model.language_model.") :]
         if name.startswith("model.vision_tower."):
-            return "vision_tower." + name[len("model.vision_tower."):]
+            return "vision_tower." + name[len("model.vision_tower.") :]
         if name.startswith("model.multi_modal_projector."):
-            return "multi_modal_projector." + name[len("model.multi_modal_projector."):]
+            return (
+                "multi_modal_projector." + name[len("model.multi_modal_projector.") :]
+            )
         return name
 
     quant_config.ignore = [_rewrite(n) for n in quant_config.ignore]
@@ -225,17 +225,17 @@ class Cohere2VisionForConditionalGeneration(nn.Module):
             if name.startswith("model.language_model."):
                 # Drop the leading "model." so the LM sees the "language_model."
                 # prefix already stripped; the LM expects "model.layers..." names.
-                stripped = name[len("model.language_model."):]
+                stripped = name[len("model.language_model.") :]
                 lm_weights.append((f"model.{stripped}", w))
             elif name.startswith("language_model."):
-                stripped = name[len("language_model."):]
+                stripped = name[len("language_model.") :]
                 lm_weights.append((f"model.{stripped}", w))
             elif name.startswith("model.vision_tower."):
-                vision_weights.append((name[len("model."):], w))
+                vision_weights.append((name[len("model.") :], w))
             elif name.startswith("vision_tower."):
                 vision_weights.append((name, w))
             elif name.startswith("model.multi_modal_projector."):
-                projector_weights.append((name[len("model."):], w))
+                projector_weights.append((name[len("model.") :], w))
             elif name.startswith("multi_modal_projector."):
                 projector_weights.append((name, w))
             elif name.startswith("lm_head."):
@@ -255,10 +255,10 @@ class Cohere2VisionForConditionalGeneration(nn.Module):
         vt_params = dict(self.vision_tower.named_parameters())
         for name, w in vision_weights:
             assert name.startswith("vision_tower.")
-            stripped = name[len("vision_tower."):]
+            stripped = name[len("vision_tower.") :]
             # Some HF versions still keep the ``vision_model.`` middle prefix.
             if stripped not in vt_params and stripped.startswith("vision_model."):
-                stripped = stripped[len("vision_model."):]
+                stripped = stripped[len("vision_model.") :]
             if stripped not in vt_params:
                 sample = sorted(vt_params.keys())[:3]
                 raise ValueError(
@@ -275,7 +275,7 @@ class Cohere2VisionForConditionalGeneration(nn.Module):
         proj_params = dict(self.multi_modal_projector.named_parameters())
         for name, w in projector_weights:
             assert name.startswith("multi_modal_projector.")
-            stripped = name[len("multi_modal_projector."):]
+            stripped = name[len("multi_modal_projector.") :]
             if stripped not in proj_params:
                 raise ValueError(f"Unexpected projector weight: {name}")
             param = proj_params[stripped]

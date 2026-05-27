@@ -13,6 +13,7 @@ from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 try:
     from huggingface_hub.dataclasses import strict
 except ImportError:  # older huggingface_hub
+
     def strict(cls):  # type: ignore[misc]
         return cls
 
@@ -70,15 +71,19 @@ class Cohere2MoeConfig(PreTrainedConfig):
 
         if self.layer_types is None:
             prefix_layers = [
-                "sliding_attention"
-                if ((i + 1) % self.prefix_dense_sliding_window_pattern) != 0
-                else "full_attention"
+                (
+                    "sliding_attention"
+                    if ((i + 1) % self.prefix_dense_sliding_window_pattern) != 0
+                    else "full_attention"
+                )
                 for i in range(self.first_k_dense_replace)
             ]
             rest_layers = [
-                "sliding_attention"
-                if ((i + 1) % self.sliding_window_pattern) != 0
-                else "full_attention"
+                (
+                    "sliding_attention"
+                    if ((i + 1) % self.sliding_window_pattern) != 0
+                    else "full_attention"
+                )
                 for i in range(self.num_hidden_layers - self.first_k_dense_replace)
             ]
             self.layer_types = prefix_layers + rest_layers
