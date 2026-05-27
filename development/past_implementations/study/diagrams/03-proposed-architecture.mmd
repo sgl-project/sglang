@@ -1,0 +1,64 @@
+%% Proposed Standalone Double Sparsity for DeepSeek-V3.2 (FP8)
+%% Synthesized from: development/loop1/refined_plan_v3.md, loop2/refined_plan.md, loop3/draft.md,
+%% development/loop1/PR_DESCRIPTION.md, development/kernel_audit_memo.md, study/00-survey.md.
+%%
+%% Reading guide:
+%%   blue    = offline / once-per-checkpoint
+%%   green   = wired & captured under CUDA graph
+%%   orange  = present but not yet exercised end-to-end (Loop 3 M1/M2/M3 gap)
+%%   purple  = external dependency (dashed border)
+flowchart LR
+    classDef offline fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
+    classDef live    fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+    classDef gap     fill:#fff3e0,stroke:#e65100,color:#bf360c
+    classDef ext     fill:#f3e5f5,stroke:#6a1b9a,color:#4a148c,stroke-dasharray:3 3
+
+    subgraph OFF ["Offline · once per checkpoint"]
+        direction TB
+        CAL["calibrate.py<br/>NIAH-shaped synthetic<br/>(opt-in real dataset)"]:::offline
+        MASK["channel_mask.safetensors<br/>{selection, weights, sha256}<br/>schema_version, dtype, page_size"]:::offline
+        CAL --> MASK
+    end
+
+    subgraph BOOT ["Boot · validate + bind"]
+        direction TB
+        VAL["validate_double_sparsity<br/>shape + sha256 + sanity probe<br/>fail-fast, no silent fallback"]:::live
+        BIND["bind_runtime_data per layer<br/>(IS_PLACEHOLDER → False)"]:::live
+        PST["PageSignatureTable alloc<br/>[L_local, max_pages, H_local, label_dim]<br/>fp16, ~480 MB/rank @ 1M ctx TP=8"]:::live
+        VAL --> BIND
+        BIND --> PST
+    end
+
+    subgraph RUN ["Per-step · live"]
+        direction TB
+        KVW["KV write<br/>(nsa_backend.set_mla_kv_buffer)"]:::live
+        PSW["page_signature_write Triton<br/>reads inline FP8 scales<br/>dequant → project · channel_weights"]:::gap
+        MASKR["sparse_mask [bs, max_pages]<br/>per-request page ownership<br/>from req_to_token"]:::gap
+        SCORE["compute_page_scores<br/>q_channel · signature_table<br/>reduce heads with max"]:::live
+        AR["all_reduce(SUM) on [max_pages] scalar<br/>TP rank sync (DEC-9)<br/>no signature gather"]:::live
+        TK["select_topk_sequence_order<br/>device-side topk<br/>+ hot-page force-include<br/>+ ascending sort"]:::live
+        ADAPT["page_table_adapter<br/>logical → physical via req_to_token<br/>emits FlashMLA block_table"]:::live
+        FMLA["FlashMLA FP8 path<br/>(unmodified)"]:::live
+        KVW --> PSW
+        PSW --> PST
+        PST --> SCORE
+        MASKR --> SCORE
+        SCORE --> AR
+        AR --> TK
+        TK --> ADAPT
+        ADAPT --> FMLA
+    end
+
+    subgraph CG ["CUDA graph contract"]
+        direction TB
+        SBUF["static selected_indices<br/>[max_bs, max_top_k] -1 pad<br/>+ valid_lengths [max_bs]"]:::live
+        SCR["preallocated scratch<br/>(stage-1 partial topk)"]:::live
+        DEV["device-side branching only<br/>tl.where / mask multiply<br/>no host .item()"]:::live
+        SBUF --> DEV
+        SCR --> DEV
+    end
+
+    MASK -.-> VAL
+    DEV -.-> TK
+    PSW -. retract on KV-free .-> PST
+    FMLA -.-> EXT["FlashMLA<br/>flashmla_kv (fp8)<br/>flashmla_sparse (bf16)"]:::ext
