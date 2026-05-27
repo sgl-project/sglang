@@ -617,5 +617,37 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
             ServerArgs(**self._base_kwargs(kv_cache_dtype="fp4_e2m1"))
 
 
+class TestHiCachePrefetchServerArgs(unittest.TestCase):
+    """Tests for --hicache-prefetch-threshold and --hicache-prefetch-capacity-tokens."""
+
+    def test_hicache_prefetch_threshold_default(self):
+        args = ServerArgs(model_path="dummy")
+        self.assertEqual(args.hicache_prefetch_threshold, 256)
+
+    def test_hicache_prefetch_capacity_tokens_default(self):
+        args = ServerArgs(model_path="dummy")
+        self.assertEqual(args.hicache_prefetch_capacity_tokens, 0)
+
+    @patch("sglang.srt.server_args.get_device", return_value="cuda")
+    def test_hicache_prefetch_threshold_cli(self, _):
+        args = prepare_server_args(
+            ["--model-path", "dummy", "--hicache-prefetch-threshold", "16"]
+        )
+        self.assertEqual(args.hicache_prefetch_threshold, 16)
+
+    @patch("sglang.srt.server_args.get_device", return_value="cuda")
+    def test_hicache_prefetch_capacity_tokens_cli(self, _):
+        args = prepare_server_args(
+            ["--model-path", "dummy", "--hicache-prefetch-capacity-tokens", "4096"]
+        )
+        self.assertEqual(args.hicache_prefetch_capacity_tokens, 4096)
+
+    @patch("sglang.srt.server_args.get_device", return_value="cuda")
+    def test_hicache_prefetch_capacity_tokens_zero_means_auto(self, _):
+        """Default 0 means the controller auto-computes from host/device pool sizes."""
+        args = prepare_server_args(["--model-path", "dummy"])
+        self.assertEqual(args.hicache_prefetch_capacity_tokens, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
