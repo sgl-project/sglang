@@ -114,13 +114,13 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
         return True
 
     cp_min = cp_size * 2
-    for i, L in enumerate(extend_lens):
+    for L in extend_lens:
         if L < cp_min:
-            raise ValueError(
-                f"CP-prefill batch contains req[{i}] with extend_input_len={L} "
-                f"< cp_size*2={cp_min}. Scheduler must filter sub-threshold "
-                f"requests out of CP batches."
-            )
+            # A sub-threshold request cannot be zigzag-split into 2*cp_size
+            # blocks; fall back to a normal (non-CP) prefill for this batch
+            # instead of failing. Happens e.g. when a radix-cache prefix hit
+            # leaves only a few unique extend tokens.
+            return False
 
     return True
 
