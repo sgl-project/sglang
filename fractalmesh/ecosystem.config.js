@@ -1202,6 +1202,11 @@ module.exports = {
             ['fm-api-marketplace','fm_api_marketplace', '30M'],
             ['fm-task-queue',     'fm_task_queue',      '30M'],
             ['fm-knowledge-base', 'fm_knowledge_base',  '30M'],
+            ['fm-reporting',      'fm_reporting_engine','30M'],
+            ['fm-data-pipeline',  'fm_data_pipeline',   '30M'],
+            ['fm-auth-manager',   'fm_auth_manager',    '30M'],
+            ['fm-file-processor', 'fm_file_processor',  '30M'],
+            ['fm-price-monitor',  'fm_price_monitor',   '25M'],
         ].map(([name, script, mem]) => ({
             name,
             script:            `agents/${script}.py`,

@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     118,
+        "agents":     123,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -232,6 +232,11 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "api_marketplace":   7870,
             "task_queue":        7872,
             "knowledge_base":    7871,
+            "reporting_engine":  7873,
+            "data_pipeline":     7874,
+            "auth_manager":      7875,
+            "file_processor":    7876,
+            "price_monitor":     7877,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -551,6 +556,11 @@ _INTENTS = {
     "api_key_validate":        lambda a, k: {"action": "api_key_validate_queued", "api_key": k.get("api_key", "")},
     "task_enqueue":            lambda a, k: {"action": "task_enqueue_queued", "queue_name": k.get("queue_name", "default"), "task_type": k.get("task_type", "http"), "payload": k.get("payload", {})},
     "kb_search":               lambda a, k: {"action": "kb_search_queued", "query": k.get("query", ""), "limit": k.get("limit", 5)},
+    "report_run":              lambda a, k: {"action": "report_run_queued", "template_name": k.get("template_name", "daily_revenue")},
+    "pipeline_run":            lambda a, k: {"action": "pipeline_run_queued", "pipeline_name": k.get("pipeline_name", "")},
+    "auth_verify":             lambda a, k: {"action": "auth_verify_queued", "token": k.get("token", "")},
+    "file_process":            lambda a, k: {"action": "file_process_queued", "operation": k.get("operation", ""), "input_data": k.get("input_data", "")},
+    "price_check":             lambda a, k: {"action": "price_check_queued", "watch_id": k.get("watch_id", 0)},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
