@@ -644,13 +644,18 @@ class WaitingImageRequestGrpc(WaitingImageRequest):
 
 
 def _determine_tensor_transport_mode(server_args):
-    is_cross_node = server_args.dist_init_addr
 
-    if is_cross_node:
-        # Fallback to default CPU transport for multi-node
+    if server_args.dist_init_addr:
+        return "default"
+
+    device_type = getattr(server_args, "device_type", "cuda")
+
+    if device_type == "cuda":
+        return "cuda_ipc"
+    elif device_type == "xpu":
         return "default"
     else:
-        return "cuda_ipc"
+        return "default"
 
 
 class MMReceiverBase(ABC):
