@@ -424,10 +424,14 @@ Latest verification:
   `test/srt/test_dsv4_c4_indexer.py`) for the Compressor/Indexer math
   itself. Same rationale as RoPE: pre-processing modules whose outputs
   are inputs to the attention backend.
-- **GB300 (SM10.3 / Blackwell) first-ever run.** After switching the
-  cluster to the correct branch and adding hardware-gate fixes to five
-  test skip conditions, the suite reaches **19 failed, 145 passed, 76
-  skipped, 407 subtests passed in ~186s** on GB300 (sglang-kernel 0.4.3).
+- **GB300 (SM10.3 / Blackwell) verified run with layout-robustness
+  tests included.** After switching the cluster to the correct branch,
+  applying hardware-gate fixes to five test skip conditions, and
+  including the new layout-robustness infrastructure and per-backend
+  coverage, the suite reaches **19 failed, 157 passed, 86 skipped,
+  433 subtests passed in ~205s** on GB300 (sglang-kernel 0.4.3). The
+  12 new layout-robustness test items all pass or skip correctly (+12
+  passed, +10 skipped vs the pre-layout-robustness GB300 baseline).
   All 19 remaining failures are container-level blockers (the container
   image does not ship GB300-compatible builds for these libraries):
 
