@@ -59,3 +59,7 @@ class CompilationConfig:
         if hasattr(inductor_config, "combo_kernels"):
             inductor_config.combo_kernels = True
             inductor_config.benchmark_combo_kernel = True
+
+        # Enable PDL for Triton kernels.
+        if hasattr(inductor_config.triton, "enable_pdl"):
+            inductor_config.triton.enable_pdl = True
