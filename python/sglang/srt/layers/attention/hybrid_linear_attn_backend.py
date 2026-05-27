@@ -806,24 +806,18 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         replay_num_decodes = getattr(self, "_replay_num_decodes", None)
         for attn_backend in self.attn_backend_list:
-            if replay_num_decodes is not None:
-                setattr(attn_backend, "_replay_num_decodes", replay_num_decodes)
-            try:
-                attn_backend.init_forward_metadata_replay_cuda_graph(
-                    bs,
-                    req_pool_indices,
-                    seq_lens,
-                    seq_lens_sum,
-                    encoder_lens,
-                    forward_mode,
-                    spec_info,
-                    seq_lens_cpu,
-                )
-            finally:
-                if replay_num_decodes is not None and hasattr(
-                    attn_backend, "_replay_num_decodes"
-                ):
-                    delattr(attn_backend, "_replay_num_decodes")
+            attn_backend._replay_num_decodes = replay_num_decodes
+            attn_backend.init_forward_metadata_replay_cuda_graph(
+                bs,
+                req_pool_indices,
+                seq_lens,
+                seq_lens_sum,
+                encoder_lens,
+                forward_mode,
+                spec_info,
+                seq_lens_cpu,
+            )
+            attn_backend._replay_num_decodes = None
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.full_attn_backend.get_cuda_graph_seq_len_fill_value()
