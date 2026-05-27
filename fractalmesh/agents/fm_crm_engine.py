@@ -15,6 +15,7 @@ import json
 import sqlite3
 import time
 import hashlib
+import hmac
 import threading
 import re
 import math
@@ -400,8 +401,8 @@ def _drip_loop() -> None:
 def _is_admin(headers) -> bool:
     if not ADMIN_SECRET:
         return True
-    return headers.get("X-Admin-Secret", "") == ADMIN_SECRET or \
-           headers.get("x-admin-secret", "") == ADMIN_SECRET
+    provided = headers.get("X-Admin-Secret", "") or headers.get("x-admin-secret", "")
+    return hmac.compare_digest(provided, ADMIN_SECRET)
 
 
 def _is_mcp(headers) -> bool:

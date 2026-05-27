@@ -4,7 +4,7 @@ fm_rate_limiter.py — FractalMesh OMEGA Titan Distributed Rate Limiter / API Ga
 Token Bucket / Sliding Window rate limiting with SQLite WAL, admin controls, analytics.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os, json, time, sqlite3, threading, hashlib, fcntl
+import os, json, time, sqlite3, threading, hashlib, hmac, fcntl
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -216,7 +216,7 @@ def _seed_defaults() -> int:
 def _check_auth(handler: BaseHTTPRequestHandler) -> bool:
     if not ADMIN_SECRET:
         return True
-    return handler.headers.get("X-Admin-Secret", "") == ADMIN_SECRET
+    return hmac.compare_digest(handler.headers.get("X-Admin-Secret", ""), ADMIN_SECRET)
 
 
 # ---------------------------------------------------------------------------

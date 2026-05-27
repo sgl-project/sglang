@@ -4,7 +4,7 @@ fm_support_desk.py — FractalMesh OMEGA Titan Customer Support Desk (Port 7868)
 AI-powered ticketing system with auto-classification, SLA enforcement, and KB.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os, json, sqlite3, time, hashlib, threading, re, html
+import os, json, sqlite3, time, hashlib, hmac, threading, re, html
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.request import Request, urlopen
@@ -462,7 +462,7 @@ def _parse_body(handler) -> dict:
 def _auth_admin(handler) -> bool:
     if not ADMIN_SECRET:
         return True
-    return handler.headers.get("X-Admin-Secret", "") == ADMIN_SECRET
+    return hmac.compare_digest(handler.headers.get("X-Admin-Secret", ""), ADMIN_SECRET)
 
 
 def _row_to_dict(row) -> dict:

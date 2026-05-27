@@ -326,7 +326,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _unauthorized(self):
-        self._send_json(401, {"error": "unauthorized"})
+        body = json.dumps({"error": "unauthorized"}).encode()
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("WWW-Authenticate", 'X-Admin-Secret realm="FractalMesh"')
+        self.end_headers()
+        self.wfile.write(body)
 
     def _not_found(self):
         self._send_json(404, {"error": "not found"})

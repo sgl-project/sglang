@@ -15,6 +15,7 @@ import time
 import threading
 import signal
 import logging
+import hmac
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -358,7 +359,7 @@ def _run_heal(agent_name: str, pm2_name: str, port: int) -> dict:
 def _check_auth(handler: "WatchdogHandler") -> bool:
     if not ADMIN_SECRET:
         return True
-    return handler.headers.get("X-Admin-Secret", "") == ADMIN_SECRET
+    return hmac.compare_digest(handler.headers.get("X-Admin-Secret", ""), ADMIN_SECRET)
 
 # ---------------------------------------------------------------------------
 # Health-check daemon thread

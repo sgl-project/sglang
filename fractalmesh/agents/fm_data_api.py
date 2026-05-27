@@ -4,7 +4,7 @@ fm_data_api.py — FractalMesh OMEGA Titan Data Monetization REST/GraphQL API (P
 Sells structured data products via API keys with tier-based rate limiting.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os, json, time, sqlite3, secrets, logging, re, io, csv
+import os, json, time, sqlite3, secrets, logging, re, io, csv, hmac
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import date
@@ -294,7 +294,7 @@ class DataAPIHandler(BaseHTTPRequestHandler):
     def _admin_auth(self) -> bool:
         if not ADMIN_SECRET:
             return True
-        return self.headers.get("X-Admin-Secret", "") == ADMIN_SECRET
+        return hmac.compare_digest(self.headers.get("X-Admin-Secret", ""), ADMIN_SECRET)
 
     # ------------------------------------------------------------------
     # Router

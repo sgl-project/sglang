@@ -5,7 +5,7 @@ Structured knowledge base with full-text search, versioning, collections, and AI
 Samuel James Hiotis | ABN 56 628 117 363
 """
 
-import os, json, sqlite3, time, hashlib, re, html, gzip, base64, threading
+import os, json, sqlite3, time, hashlib, hmac, re, html, gzip, base64, threading
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs, quote
@@ -633,7 +633,7 @@ def _seed_content():
 def _is_admin(headers) -> bool:
     if not ADMIN_SECRET:
         return True
-    return headers.get("X-Admin-Secret", "") == ADMIN_SECRET
+    return hmac.compare_digest(headers.get("X-Admin-Secret", ""), ADMIN_SECRET)
 
 # ---------------------------------------------------------------------------
 # Request handler

@@ -88,7 +88,7 @@ smg-mesh = "=1.0.0"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2"
 openssl = "0.10.73"
-rmcp = { version = "0.8.3", features = ["client", "server",
+rmcp = { version = "1.4.0", features = ["client", "server",
     "transport-child-process",
     "transport-sse-client-reqwest",
     "transport-streamable-http-client-reqwest",
@@ -98,7 +98,7 @@ rmcp = { version = "0.8.3", features = ["client", "server",
     "auth"] }
 serde_yaml = "0.9"
 subtle = "2.6"
-jsonwebtoken = { version = "9.3", default-features = false, features = ["use_pem"] }
+jsonwebtoken = { version = "10.3", default-features = false, features = ["use_pem"] }
 num-traits = "0.2"
 num-bigint = "0.4"
 base64 = "0.22"
@@ -122,7 +122,7 @@ redis = { version = "0.27.6", features = ["tokio-comp", "json", "connection-mana
 
 # wasm dependencies
 sha2 = "0.10"
-wasmtime = { version = "38.0", features = ["component-model", "async"] }
+wasmtime = { version = "42.0.2", features = ["component-model", "async"] }
 
 [build-dependencies]
 chrono = { version = "0.4", features = ["clock"] }

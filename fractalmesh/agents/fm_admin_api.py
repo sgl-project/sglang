@@ -4,7 +4,7 @@ fm_admin_api.py — FractalMesh Unified Administration API (Port 7804)
 Mesh management, agent control, config, audit, port scanning, DB stats.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os, json, time, signal, sqlite3, logging, subprocess, socket, urllib.request
+import os, json, time, signal, sqlite3, logging, subprocess, socket, urllib.request, hmac
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -47,7 +47,7 @@ def _audit(action, params, result, actor="api"):
 
 def _auth(headers) -> bool:
     if not ADMIN_SECRET: return True  # open if no secret set
-    return headers.get("X-Admin-Secret","") == ADMIN_SECRET
+    return hmac.compare_digest(headers.get("X-Admin-Secret", ""), ADMIN_SECRET)
 
 def _pm2_list() -> list:
     try:
@@ -136,10 +136,23 @@ class AdminHandler(BaseHTTPRequestHandler):
         self.send_response(code); self.send_header("Content-Type","application/json")
         self.send_header("Content-Length",str(len(p))); self.end_headers(); self.wfile.write(p)
 
+    def _auth_401(self):
+        p = json.dumps({"error": "X-Admin-Secret required"}).encode()
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(p)))
+        self.send_header("WWW-Authenticate", 'X-Admin-Secret realm="FractalMesh"')
+        self.end_headers()
+        self.wfile.write(p)
+
     def do_GET(self):
         import urllib.parse
         qs = urllib.parse.parse_qs(self.path.split("?",1)[-1] if "?" in self.path else "")
         ep = self.path.split("?")[0]
+
+        _open_get = {"/health"}
+        if ep not in _open_get and not _auth(self.headers):
+            self._auth_401(); return
 
         if ep == "/health":
             procs = _pm2_list()
@@ -181,7 +194,7 @@ class AdminHandler(BaseHTTPRequestHandler):
             ep = self.path.split("?")[0]
 
             if ep not in ("/health",) and not _auth(self.headers):
-                self._r(401,{"error":"X-Admin-Secret required"}); return
+                self._auth_401(); return
 
             if ep == "/agent/restart":
                 agent = d.get("agent_name",""); r = _pm2_cmd("restart",agent)
