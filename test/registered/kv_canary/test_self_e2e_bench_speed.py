@@ -229,13 +229,15 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
             max_overhead_pct=3.0,
         )
 
-    def test_qwen3_decode_overhead_bs128_isl512_osl1024(self) -> None:
+    def test_qwen3_decode_overhead_bs64_isl256_osl512(self) -> None:
         # TODO: tighten further once per-forward canary glue is reduced (observed ~0.52% on
-        # Qwen3-30B-A3B, H200 — already amortizes well at bs=128).
+        # Qwen3-30B-A3B, H200 — already amortizes well at large bs). The smaller
+        # 64 * (256+512) = 49K-token budget fits the ~94K KV-cache slice that
+        # extra-a-test-1-gpu-large (H100) leaves after loading the 30B MoE.
         self._measure_overhead(
-            batch_size=128,
-            input_len=512,
-            output_len=1024,
+            batch_size=64,
+            input_len=256,
+            output_len=512,
             max_overhead_pct=1.0,
         )
 
