@@ -75,15 +75,16 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
             prefix_lens=(14, 15, 16),
         ),
     )
-    # EAGLE chain verify (topk=1) — Mamba2's SSM kernel processes draft
-    # tokens as a chain regardless of the spec_info tree mask, so the
-    # EXTEND-style recurrence reference doubles as the chain verify
-    # reference. Tree verify (topk>1) is structurally unsupported (the
-    # kernel ignores tree masks) and skip-gated at the runner.
-    EAGLE_VERIFY_CASES = (
+    # Chain verify (topk=1) across EAGLE plus the three non-EAGLE chain
+    # spec kinds (frozen_kv_mtp / dflash / ngram). Mamba2's SSM kernel
+    # processes draft tokens linearly regardless of the spec_info tree
+    # mask, so the EXTEND-style recurrence reference doubles as the
+    # chain verify reference across all kinds. Tree verify (topk>1) is
+    # structurally unsupported and skip-gated at the runner.
+    EAGLE_VERIFY_CASES = tuple(
         (
             Mamba2AttentionCase(
-                name="runner_eagle_verify_mamba2_chain",
+                name=f"runner_{spec_kind}_verify_mamba2_chain",
                 backend="triton",
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 num_heads=DEFAULT_NUM_HEADS,
@@ -98,7 +99,9 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
                 extend_lens=(3, 3),
             ),
             1,
-        ),
+            spec_kind,
+        )
+        for spec_kind in ("eagle", "frozen_kv_mtp", "dflash", "ngram")
     )
     EAGLE_VERIFY_CUDA_GRAPH_CASES = (
         (
@@ -155,9 +158,16 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
                 run_mamba2_cuda_graph_decode_case(self, case)
 
     def test_runner_mode_eagle_verify_cases(self):
-        for case, topk in self.EAGLE_VERIFY_CASES:
-            with self.subTest(case=case.name, backend=case.backend, topk=topk):
-                run_mamba2_eagle_verify_case(self, case, topk=topk)
+        for case, topk, spec_kind in self.EAGLE_VERIFY_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                topk=topk,
+                spec_kind=spec_kind,
+            ):
+                run_mamba2_eagle_verify_case(
+                    self, case, topk=topk, spec_kind=spec_kind
+                )
 
     def test_runner_mode_eagle_verify_cuda_graph_cases(self):
         for case, topk in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:

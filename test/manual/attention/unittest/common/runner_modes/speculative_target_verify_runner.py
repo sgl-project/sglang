@@ -1195,17 +1195,19 @@ def run_mamba2_eagle_verify_case(
     case: Mamba2AttentionCase,
     *,
     topk: int,
+    spec_kind: SpecVerifyKind = "eagle",
     max_context_len: int = MAMBA2_DEFAULT_MAX_CONTEXT_LEN,
     dtype: torch.dtype = MAMBA2_DEFAULT_DTYPE,
     device: str = MAMBA2_DEFAULT_DEVICE,
     atol: float = MAMBA2_ATOL,
     rtol: float = MAMBA2_RTOL,
 ):
-    """Mamba2 EAGLE chain verify (eager). Mamba2's SSM kernel processes
-    draft tokens as a chain regardless of the spec_info tree mask, so
-    only `topk == 1` is supported here — the EXTEND-style recurrence
-    reference (`_pure_torch_mamba2_reference`) doubles as the chain
-    verify reference. Tree verify (topk > 1) is structurally blocked
+    """Mamba2 chain verify (eager). Mamba2's SSM kernel processes draft
+    tokens linearly regardless of the spec_info tree mask, so only
+    `topk == 1` is supported here. The EXTEND-style recurrence reference
+    (`_pure_torch_mamba2_reference`) doubles as the chain verify
+    reference across all chain spec kinds (eagle / frozen_kv_mtp /
+    dflash / ngram). Tree verify (topk > 1) is structurally blocked
     (the kernel doesn't consume the parent-indices plumbing); see
     `expected_mamba2_verify_output_from_inputs`."""
     if topk != 1:
@@ -1222,11 +1224,12 @@ def run_mamba2_eagle_verify_case(
         device=device,
     )
     _prepare_target_verify_batch(fixture.forward_batch, case, device)
-    fixture.forward_batch.spec_info = _make_eagle_verify_input(
+    fixture.forward_batch.spec_info = _make_spec_verify_input(
         case,
         fixture.forward_batch,
         topk=topk,
         device=device,
+        spec_kind=spec_kind,
     )
     inputs = mamba2_fixture_inputs(fixture)
     initial_state = _clone_mamba2_cache(fixture)
