@@ -701,13 +701,8 @@ class GemmaRMSNorm(MultiPlatformOp):
         x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
         return x
 
-    def forward_xpu(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-        post_residual_addition: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        return self._forward_impl(x, residual, post_residual_addition)
+    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
 
     def forward_with_allreduce_fusion(
         self,
