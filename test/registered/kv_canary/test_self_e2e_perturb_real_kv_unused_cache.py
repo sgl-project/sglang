@@ -34,14 +34,17 @@ class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
             "SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB": "0.1",
             "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": str(cls.target_group),
             "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
-            # The violation ring is fill-once (writes beyond ring_capacity are
-            # dropped). In SWA mode the SWA-side sweep fires ~1k chain-hash
-            # violations within the first second of the test (window-shift
-            # natural noise), which fills the default 1024-entry ring before
-            # any FULL-side perturb has a chance to record its real-kv-hash
-            # mismatch. Bumping the ring to 64K keeps every group's
-            # violations visible to the reporter through the full test
-            # window.
+            # The violation ring is fill-once (writes past ring_capacity are
+            # dropped on the CUDA side). In SWA mode the SWA-side sweep emits
+            # ~1k verify_chain_hash violations within the first second
+            # (signature: expected_aux=0, i.e. prev_slot canary fields read as
+            # all-zero). Root cause is not yet understood — separately
+            # tracked; see project notes. Without bumping the ring those
+            # background violations saturate the default 1024-entry ring
+            # before the FULL-side perturb's real_kv_hash mismatch can
+            # record, so the assertion below sees nothing. 64K is large
+            # enough to outlast the background flood for the duration of
+            # this test.
             "SGLANG_KV_CANARY_RING_CAPACITY": "65536",
         }
         super().setUpClass()
