@@ -25,7 +25,7 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, Union
 
 from sglang.srt.utils.common import suppress_noisy_warnings
 
@@ -1073,6 +1073,12 @@ class Scheduler(
         assert (
             running_rids <= active_rids
         ), f"running not subset of active: {running_rids - active_rids}"
+
+    def chunked_reqs(self) -> Iterable[Req]:
+        """active_reqs 中 has_pending_chunk=True 的派生 view。
+        Single-flight 不变量（Q5，§7-Q5）：len(list(chunked_reqs())) <= 1，
+        在 _get_new_batch_prefill_raw 顶端断言（C3 引入）。"""
+        return (r for r in self.active_reqs.values() if r.has_pending_chunk)
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -2414,8 +2420,11 @@ class Scheduler(
         # for the duration of the scheduling pass. vLLM / TokenSpeed do not
         # need this because their admission reads a single monotone counter
         # (num_computed_tokens / FSM state), not a prefix-indices splice.
-        for req in self.waiting_queue:
-            if req.has_pending_chunk and not req.is_dllm():
+        # audit P1: Stage A — stash chunked-resume KV into radix tree at iter
+        # boundary. Switch from scanning waiting_queue (H3 hack) to iterating
+        # the chunked_reqs() view directly.
+        for req in self.chunked_reqs():
+            if not req.is_dllm():
                 maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
