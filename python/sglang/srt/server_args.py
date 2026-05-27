@@ -518,6 +518,7 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "auto"
+    dp_cache_affinity: str = "none"
 
     attn_cp_size: int = 1
     moe_dp_size: int = 1
@@ -5231,6 +5232,7 @@ class ServerArgs:
         # Data parallelism
         parser.add_argument(
             "--data-parallel-size",
+            "--dp",
             "--dp-size",
             type=int,
             default=ServerArgs.dp_size,
@@ -5247,6 +5249,16 @@ class ServerArgs:
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+            ],
+        )
+        parser.add_argument(
+            "--dp-cache-affinity",
+            type=str,
+            default=ServerArgs.dp_cache_affinity,
+            help="The cache affinity strategy for data parallel dispatch.",
+            choices=[
+                "none",
+                "routing_key",
             ],
         )
         parser.add_argument(

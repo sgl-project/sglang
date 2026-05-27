@@ -86,6 +86,21 @@ class LoadBalanceMethod(Enum):
             raise ValueError(f"Invalid load balance method: {method}") from exc
 
 
+class DPCacheAffinityMethod(Enum):
+    """DP cache affinity method."""
+
+    NONE = auto()
+    ROUTING_KEY = auto()
+
+    @classmethod
+    def from_str(cls, method: str):
+        method = method.upper()
+        try:
+            return cls[method]
+        except KeyError as exc:
+            raise ValueError(f"Invalid DP cache affinity method: {method}") from exc
+
+
 class DPBudget:
     def __init__(self, dp_size: int):
         self.dp_size = dp_size
@@ -117,6 +132,10 @@ class DPBudget:
         self.total_tokens[target_rank] += estimated_tokens
         return target_rank
 
+    def record_dispatch(self, dp_rank: int, estimated_tokens: int = 0):
+        self.total_requests[dp_rank] += 1
+        self.total_tokens[dp_rank] += estimated_tokens
+
 
 class DataParallelController:
     """A controller that dispatches requests to multiple data parallel workers."""
@@ -132,6 +151,9 @@ class DataParallelController:
         self.port_args = port_args
         self.load_balance_method = LoadBalanceMethod.from_str(
             server_args.load_balance_method
+        )
+        self.dp_cache_affinity_method = DPCacheAffinityMethod.from_str(
+            server_args.dp_cache_affinity
         )
         self.run_scheduler_process_func = run_scheduler_process_func
 
@@ -154,6 +176,7 @@ class DataParallelController:
 
         # Load balance budget
         self.dp_budget = DPBudget(server_args.dp_size)
+        self.routing_key_to_dp_rank: dict[str, int] = {}
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
@@ -565,18 +588,62 @@ class DataParallelController:
             return True
         return False
 
+    def is_healthy_rank(self, dp_rank: int):
+        return 0 <= dp_rank < len(self.workers) and self.status[dp_rank]
+
+    def dispatch_with_cache_affinity(self, req: Req, select_base_rank: Callable):
+        target_rank = self.get_cache_affinity_rank(req)
+        if target_rank is None:
+            target_rank = select_base_rank(req)
+            self.remember_cache_affinity_rank(req, target_rank)
+        else:
+            estimated_tokens = (
+                len(req.input_ids)
+                if self.load_balance_method == LoadBalanceMethod.TOTAL_TOKENS
+                else 0
+            )
+            self.dp_budget.record_dispatch(target_rank, estimated_tokens)
+
+        self.workers[target_rank].send_pyobj(req)
+
+    def get_cache_affinity_rank(self, req: Req):
+        if self.dp_cache_affinity_method == DPCacheAffinityMethod.NONE:
+            return None
+
+        if (
+            self.dp_cache_affinity_method == DPCacheAffinityMethod.ROUTING_KEY
+            and req.routing_key
+        ):
+            target_rank = self.routing_key_to_dp_rank.get(req.routing_key)
+            if target_rank is None:
+                return None
+            if self.is_healthy_rank(target_rank):
+                return target_rank
+            del self.routing_key_to_dp_rank[req.routing_key]
+
+        return None
+
+    def remember_cache_affinity_rank(self, req: Req, target_rank: int):
+        if self.dp_cache_affinity_method != DPCacheAffinityMethod.ROUTING_KEY:
+            return
+        if req.routing_key:
+            self.routing_key_to_dp_rank[req.routing_key] = target_rank
+
     def round_robin_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
 
+        self.dispatch_with_cache_affinity(req, self.select_round_robin_rank)
+
+    def select_round_robin_rank(self, req: Req):
         while True:
             if self.status[self.round_robin_counter]:
                 logger.debug(f"Choose worker {self.round_robin_counter}")
-                self.workers[self.round_robin_counter].send_pyobj(req)
+                target_rank = self.round_robin_counter
                 self.round_robin_counter = (self.round_robin_counter + 1) % len(
                     self.workers
                 )
-                break
+                return target_rank
             self.round_robin_counter = (self.round_robin_counter + 1) % len(
                 self.workers
             )
@@ -585,27 +652,33 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
+        self.dispatch_with_cache_affinity(req, self.select_follow_bootstrap_room_rank)
+
+    def select_follow_bootstrap_room_rank(self, req: Req):
         assert req.bootstrap_room is not None, (
             "req.bootstrap_room should not be None. Do not send requests directly to "
             "prefill or decode instances; send to the router instead."
         )
-        target_rank = req.bootstrap_room % len(self.workers)
-        self.workers[target_rank].send_pyobj(req)
+        return req.bootstrap_room % len(self.workers)
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
-        self.workers[target_worker].send_pyobj(req)
+        self.dispatch_with_cache_affinity(req, self.select_total_requests_rank)
+
+    def select_total_requests_rank(self, req: Req):
+        return self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
 
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
+        self.dispatch_with_cache_affinity(req, self.select_total_tokens_rank)
+
+    def select_total_tokens_rank(self, req: Req):
         estimated_tokens = len(req.input_ids)
-        target_worker = self.dp_budget.dispatch(
+        return self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
-        self.workers[target_worker].send_pyobj(req)
 
     def event_loop(self):
         while True:

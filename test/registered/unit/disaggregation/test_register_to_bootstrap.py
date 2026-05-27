@@ -165,6 +165,8 @@ class TestRegisterToBootstrap(CustomTestCase):
             "rank_port",
             "page_size",
             "kv_cache_dtype",
+            "load_balance_method",
+            "dp_cache_affinity",
         ]
         for field in required_fields:
             self.assertIn(field, payload)
@@ -218,6 +220,7 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.server_args = MagicMock()
         mgr.server_args.kv_cache_dtype = "auto"
         mgr.server_args.load_balance_method = "follow_bootstrap_room"
+        mgr.server_args.dp_cache_affinity = "none"
 
         return mgr
 
