@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.utils.common import is_sm100_supported, is_sm120_supported
+from sglang.srt.utils.common import is_sm100_supported
 from sglang.srt.utils.custom_op import register_custom_op_from_extern
 
 if TYPE_CHECKING:
@@ -144,12 +144,7 @@ def initialize_fp4_gemm_config(server_args: ServerArgs) -> None:
 
     backend = server_args.fp4_gemm_runner_backend
     if backend == "auto":
-        if is_sm120_supported():
-            # flashinfer_cutlass produces NaN in dense MLP layers with
-            # heterogeneous batches on SM120 (Blackwell).  cudnn is stable.
-            # See: https://github.com/sgl-project/sglang/issues/20043
-            backend = "flashinfer_cudnn"
-        elif is_sm100_supported():
+        if is_sm100_supported():
             backend = "flashinfer_cutedsl"
         else:
             backend = "flashinfer_cutlass"
