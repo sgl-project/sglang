@@ -358,6 +358,29 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Enabled `trtllm_mha` CUDA-graph decode replay coverage. Previously
+  documented as "the shared CUDA-graph decode helper currently
+  mismatches on replay"; the FlashInfer TRT-LLM Gen FMHA decode
+  backend's capture/replay metadata path has since stabilized, and
+  all four shapes (MHA, GQA, MQA, page-32) match the HF-style dense
+  reference. Adds `test_runner_mode_cuda_graph_decode_cases` to
+  `dense/test_trtllm_mha.py`.
+- Filled the dense Triton and dense FlashInfer spec_kind CG verify
+  matrices. Both backends previously had partial coverage on the CG
+  verify path; each one now exercises EAGLE chain + EAGLE tree + all
+  three non-EAGLE chain spec kinds (frozen_kv_mtp / dflash / ngram).
+- Added FrozenKVMTP production graph-runner coverage to dense Triton,
+  FA3, and FA4. Previously only dense FlashInfer had
+  `test_runner_mode_frozen_kv_mtp_cuda_graph_runner_cases`; the
+  shared adapter produces a matching draft-decode graph
+  capture/replay against the other three dense backends without
+  modification.
+- Added MLA Triton EAGLE tree-verify eager and EAGLE chain-verify CG
+  coverage. Previously the file only had chain-eager and tree-CG;
+  the symmetric eager-tree + CG-chain pair fills the chain+tree ×
+  eager+CG MLA Triton matrix.
+- Added SWA Triton frozen_kv_mtp CG verify (closing the spec-kind
+  matrix on SWA Triton CG).
 - Broadened the speculative `TARGET_VERIFY` matrix to cover the three
   non-EAGLE chain spec kinds (`frozen_kv_mtp`, `dflash`, `ngram`)
   across every backend whose verify kernel handles them.
@@ -994,6 +1017,17 @@ Latest verification:
 - `python test/manual/attention/unittest/gdn/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_flashinfer.py -v`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
+  - Ran 146 tests in 37.164s (21 skipped) after:
+    1. MLA Triton tree-verify eager + EAGLE chain CG;
+    2. Dense Triton / FA3 / FA4 FrozenKVMTP production graph-runner
+       coverage;
+    3. trtllm_mha CG decode (previously documented as backend
+       mismatch — has since been fixed in FlashInfer TRT-LLM Gen FMHA);
+    4. SWA Triton frozen_kv_mtp CG verify (filling the spec-kind
+       matrix);
+    5. Dense Triton + FlashInfer eagle-chain CG + remaining
+       spec-kind chain CG variants.
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
   - Ran 142 tests in 36.522s (21 skipped) after the spec_kind
     expansion arc (FA3/FA4/SWA Triton/MLA Triton/GDN/Lightning) and
