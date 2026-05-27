@@ -77,6 +77,19 @@ class TestTritonMLAAttentionBackendCorrectness(CustomTestCase):
         ),
         (
             MLAAttentionCase(
+                name="runner_eagle_verify_mla_tree",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            2,
+            "eagle",
+        ),
+        (
+            MLAAttentionCase(
                 name="runner_frozen_kv_mtp_verify_mla_chain",
                 backend="triton",
                 forward_mode=ForwardMode.TARGET_VERIFY,
@@ -116,6 +129,19 @@ class TestTritonMLAAttentionBackendCorrectness(CustomTestCase):
         ),
     )
     EAGLE_VERIFY_CUDA_GRAPH_CASES = (
+        (
+            MLAAttentionCase(
+                name="runner_cuda_graph_eagle_verify_mla_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "eagle",
+        ),
         (
             MLAAttentionCase(
                 name="runner_cuda_graph_eagle_verify_mla_tree",

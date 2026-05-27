@@ -20,6 +20,7 @@ from common.runner_modes.cuda_graph_decode_runner import (
 from common.runner_modes.eagle_draft_runner import (
     run_dense_eagle_draft_cuda_graph_runner_case,
     run_dense_eagle_draft_extend_v2_cuda_graph_runner_case,
+    run_dense_frozen_kv_mtp_cuda_graph_runner_case,
 )
 from common.runner_modes.speculative_draft_extend_runner import (
     run_dense_draft_extend_v2_cuda_graph_case,
@@ -259,6 +260,17 @@ class TestTritonDenseAttentionBackendCorrectness(CustomTestCase):
             4,
         ),
     )
+    FROZEN_KV_MTP_RUNNER_CASES = (
+        DenseAttentionCase(
+            name="runner_frozen_kv_mtp_decode_cuda_graph",
+            backend="triton",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(4, 7),
+        ),
+    )
 
     def test_projected_dense_attention_cases(self):
         for case in self.CASES:
@@ -335,6 +347,11 @@ class TestTritonDenseAttentionBackendCorrectness(CustomTestCase):
                     topk=topk,
                     speculative_num_draft_tokens=num_draft_tokens,
                 )
+
+    def test_runner_mode_frozen_kv_mtp_cuda_graph_runner_cases(self):
+        for case in self.FROZEN_KV_MTP_RUNNER_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_dense_frozen_kv_mtp_cuda_graph_runner_case(self, case)
 
 
 if __name__ == "__main__":
