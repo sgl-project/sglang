@@ -114,14 +114,45 @@ intentionally conservative until the container ships SM10.3-compiled binaries.
 
 ## 5. Documented layout limitations (SUBSKIPPED via `LAYOUT_KNOWN_FAILURES`)
 
-These are real production limitations surfaced by the layout-robustness tests.
-They are not container issues and will not be fixed by re-imaging.
+These are real production limitations surfaced by the layout-robustness tests
+(see PLAN.md "Latest verification — Layout-robustness arc"). They are not
+container issues and will not be fixed by re-imaging. Each `LAYOUT_KNOWN_FAILURES`
+entry in the test file records the production-side cause inline so the next
+person can pick up fixes without re-discovering the bug.
 
-| Test | Case / layout | Root cause |
-|---|---|---|
-| `dual_chunk/test_dual_chunk_flash_attn.py::test_layout_robustness_cases` | `layout_dual_chunk_extend_two_request` / `non_monotonic_extend` | `_dual_chunk_flash_attn_prefill_func` uses `cu_seqlens_*` indexing into contiguous K slots (backend.py:834+); scattered extend-token slots break that contiguity |
+All entries are exercised through `test_layout_robustness_cases` (one method
+per affected backend) and skip cleanly with the documented reason when the
+test runs. Three layouts are tested per case: `interleaved_pages`,
+`non_monotonic_extend`, and (the default everywhere) `shuffled_pages` — the
+last is exercised by every test in the suite, so a regression in shuffled_pages
+shows up immediately in any test, not just `test_layout_robustness_cases`.
 
-See `dual_chunk/README.md` for the engineering path to fix.
+### FlashAttention dense family
+
+| Test | Case | Layout | Root cause |
+|---|---|---|---|
+| `dense/test_fa3.py::test_layout_robustness_cases` | `layout_extend_two_request_ragged` | `non_monotonic_extend` | FA3 prefill metadata assumes `out_cache_loc` is monotonic within an extend; a fragmented allocator could trip this |
+| `dense/test_fa4.py::test_layout_robustness_cases` | `layout_extend_two_request_ragged` | `non_monotonic_extend` | FA4 inherits FA3's prefill metadata assumption |
+
+### MLA family
+
+| Test | Case | Layout | Root cause |
+|---|---|---|---|
+| `mla/test_flashinfer.py::test_layout_robustness_cases` | `layout_mla_extend_prefix_exact_page` | `interleaved_pages` | FlashInfer MLA paged-prefill metadata assumes a tidy page-table layout; interleaved pages trip an illegal memory access inside the kernel |
+| `mla/test_flashinfer.py::test_layout_robustness_cases` | `layout_mla_extend_prefix_exact_page` | `non_monotonic_extend` | FlashInfer MLA paged-prefill metadata assumes monotonic `out_cache_loc` within an extend; scattered extend slots trip an illegal memory access |
+| `mla/test_flashinfer.py::test_layout_robustness_cases` | `layout_mla_decode_page_boundary` | `interleaved_pages` | FlashInfer MLA paged-decode metadata raises `CUBLAS_STATUS_EXECUTION_FAILED` on interleaved-page layouts |
+| `mla/test_flashmla.py::test_layout_robustness_cases` | `layout_mla_extend_prefix_exact_page` | `interleaved_pages` | FlashMLA extend path raises CUDA illegal memory access on interleaved-page layouts; the kernel assumes a tidy page-table layout |
+| `mla/test_flashmla.py::test_layout_robustness_cases` | `layout_mla_extend_prefix_exact_page` | `non_monotonic_extend` | FlashMLA extend path raises CUDA illegal memory access on non-monotonic `out_cache_loc` within an extend |
+| `mla/test_flashmla.py::test_layout_robustness_cases` | `layout_mla_decode_page_boundary` | `interleaved_pages` | FlashMLA decode path raises a shape mismatch (`shape '[-1, 64, 1, 32]' is invalid for input of size N`) on interleaved-page layouts |
+
+### Dual-chunk
+
+| Test | Case | Layout | Root cause |
+|---|---|---|---|
+| `dual_chunk/test_dual_chunk_flash_attn.py::test_layout_robustness_cases` | `layout_dual_chunk_extend_two_request` | `non_monotonic_extend` | `_dual_chunk_flash_attn_prefill_func` uses `cu_seqlens_*` indexing into contiguous K slots (`dual_chunk_flashattention_backend.py:834+`); scattered extend-token slots break that contiguity |
+
+Total: **9 documented layout failures** across 5 backend test files. See per-method
+READMEs for engineering paths to fix.
 
 ---
 
@@ -133,4 +164,4 @@ See `dual_chunk/README.md` for the engineering path to fix.
 | 2 | `dsa/test_dsa.py` | 2 | Container: tilelang missing SM10.3 MMA | Re-image |
 | 3 | `mla/test_flashinfer.py` | 1 | Backend: FlashInfer MLA draft CG on Blackwell | Update FlashInfer |
 | 4 | Various | 0 (now correctly SKIPPED) | Hardware gate: SM90a/SM10.0 kernels | Fixed in test gates |
-| 5 | `dual_chunk/test_dual_chunk_flash_attn.py` | 1 (SUBSKIPPED) | Production limitation: contiguous K assumption | Backend fix (see README) |
+| 5 | `dense/test_fa3.py`, `dense/test_fa4.py`, `mla/test_flashinfer.py`, `mla/test_flashmla.py`, `dual_chunk/test_dual_chunk_flash_attn.py` | 9 (SUBSKIPPED) | Production limitation: backend metadata assumes tidy `(req_to_token, out_cache_loc)` layout | Backend fix (see per-method READMEs) |
