@@ -89,17 +89,18 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
     // slot's chain_hash was already written. In either case the expected chain hash cannot be
     // recomputed (slot 0 is the reserved padding/null slot, whose canary fields stay zero), so the
     // chain check is skipped; the current slot's other fields are still verified.
-    const bool prev_unreachable = (prev_slot_idx == kTokenToKvSlotPadding);
+    const bool prev_reachable = (prev_slot_idx != kTokenToKvSlotPadding);
     const int64_t expected_chain_hash =
-        prev_unreachable ? stored_chain_hash
-                         : static_cast<int64_t>(compute_slot_hash(p.canary_buf, p.slot_stride_bytes, prev_slot_idx));
+        prev_reachable
+            ? static_cast<int64_t>(compute_slot_hash(p.canary_buf, p.slot_stride_bytes, prev_slot_idx))
+            : stored_chain_hash;
 
     const uint64_t expected_real_kv_hash_u64 =
         real_kv_fold_sources(p.sources, p.num_sources, slot_idx, p.real_kv_hash_mode);
     const int64_t expected_real_kv_hash = static_cast<int64_t>(expected_real_kv_hash_u64);
 
     FailReason fail_reason_bits{};
-    if (!prev_unreachable && stored_chain_hash != expected_chain_hash) {
+    if (prev_reachable && stored_chain_hash != expected_chain_hash) {
       fail_reason_bits |= FailReason::kVerifyChainHashMismatch;
     }
     if constexpr (CHECK_VERIFY_EXPECTED_TOKEN) {
