@@ -17,6 +17,7 @@ class PerformanceTestParams:
     dataset_name: str = "mmmu"  # For VLM perf test
     # MTP/EAGLE speculative decoding: minimum accept length threshold (None = no validation)
     spec_accept_length_threshold: Optional[float] = None
+    enable_profile: bool = True  # Set False for non-NVIDIA backends (CPU, AMD)
 
 
 @dataclass
@@ -49,6 +50,7 @@ def run_performance_test(
     is_vlm: bool = False,
     dataset_name: str = "mmmu",
     spec_accept_length_threshold: Optional[float] = None,
+    enable_profile: bool = True,
 ) -> PerformanceTestResult:
 
     # Set default for mutable argument
@@ -79,6 +81,7 @@ def run_performance_test(
             other_args=model.extra_args,
             variant=model.variant or "",
             extra_bench_args=extra_bench_args,
+            enable_profile=enable_profile,
             env=model.env,
         )
 

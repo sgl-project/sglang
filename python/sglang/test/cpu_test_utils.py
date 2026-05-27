@@ -670,3 +670,17 @@ def unpack_and_dequant_gptq(qweight, qzeros, scales):
     unpacked_qweight = (unpacked_qweight - unpacked_qzeros) * scales
 
     return unpacked_qweight.T
+
+
+# Common server args shared by CPU nightly model tests.
+CPU_BASE_ARGS = [
+    "--device",
+    "cpu",
+    "--trust-remote-code",
+    "--disable-radix-cache",
+    "--disable-overlap-schedule",
+    "--mem-fraction-static",
+    "0.8",
+    "--max-total-tokens",
+    "65536",
+]
