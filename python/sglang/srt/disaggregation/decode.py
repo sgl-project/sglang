@@ -1654,7 +1654,7 @@ class SchedulerDisaggregationDecodeMixin:
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch()
         if new_prebuilt_batch:
-            assert not any(r.has_pending_chunk for r in self.waiting_queue)
+            # C10: dead assert removed — post-C4 chunked-resume not in waiting_queue.
             self.batch_result_processor.process_batch_result_prebuilt(
                 new_prebuilt_batch
             )

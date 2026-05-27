@@ -556,6 +556,8 @@ class SchedulerDisaggregationPrefillMixin:
                         # This can happen if the grammar is not set correctly or the token is invalid.
                         error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                         release_kv_cache(req, self.tree_cache)
+                        # audit D-prefill-1: disagg PREFILL release path
+                        self._deactivate(req)
                         prepare_abort(
                             req,
                             error_message,
@@ -640,6 +642,8 @@ class SchedulerDisaggregationPrefillMixin:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
+                # audit D-prefill-2: disagg PREFILL release path
+                self._deactivate(req)
                 req.finished_reason = FINISH_LENGTH(length=0)
                 # FIXME: clean up req's data in transfer engine
                 if hasattr(req.disagg_kv_sender, "clear"):
@@ -655,6 +659,8 @@ class SchedulerDisaggregationPrefillMixin:
                 logger.warning(error_message)
                 req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
+                # audit D-prefill-3: disagg PREFILL release path
+                self._deactivate(req)
                 prepare_abort(
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
@@ -725,10 +731,10 @@ class SchedulerDisaggregationPrefillMixin:
         return transferred_rids
 
     def process_prefill_chunk(self: Scheduler) -> None:
-        # Per-req stash for any in-flight chunked-resume reqs (now sitting in
-        # the waiting_queue with has_pending_chunk == True).
-        for req in self.waiting_queue:
-            if req.has_pending_chunk and not req.is_dllm():
+        # audit C10: disagg PREFILL chunked-resume now lives in active_reqs
+        # (same as sync mode post-C4); iterate chunked_reqs() view.
+        for req in self.chunked_reqs():
+            if not req.is_dllm():
                 maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
                 if self.enable_overlap:
                     # Delay KV transfer to process_batch_result_disagg_prefill
@@ -746,8 +752,8 @@ class SchedulerDisaggregationPrefillMixin:
             # Drop chunked-resume reqs from last_batch — running_batch runs
             # decode forward and admitting a mid-prefill req there breaks
             # shape + KV accounting. The dropped reqs stay in
-            # self.waiting_queue (chunked-resume retention) and re-enter via
-            # the next iter's Stage A stash + admission cycle.
+            # self.active_reqs and re-enter via the next iter's Stage A
+            # stash + admission cycle.
             self.last_batch.filter_batch(exclude_chunked_req=True)
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False

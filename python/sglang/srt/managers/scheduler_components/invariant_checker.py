@@ -50,7 +50,7 @@ class SchedulerInvariantChecker:
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
     get_running_batch: Callable
-    get_waiting_queue: Callable
+    get_active_reqs: Callable
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
 
@@ -163,20 +163,21 @@ class SchedulerInvariantChecker:
             and not self.get_running_batch().is_empty()
         ):
             req_groups.append(list(self.get_running_batch().reqs))
-        # Chunked-resume reqs in waiting_queue carry uncached tail
+        # Chunked-resume reqs in active_reqs carry uncached tail
         # (kv_committed_len - cache_protected_len, < page_size) that
         # filter_batch just removed from last_batch but haven't been
         # re-admitted to running_batch yet. The leak invariant must count it.
+        # C10: chunked-resume now lives in active_reqs (post-C4).
         seen_ids = {id(req) for group in req_groups for req in group}
-        chunked_in_queue = [
+        chunked_in_active = [
             req
-            for req in self.get_waiting_queue()
+            for req in self.get_active_reqs().values()
             if req.has_pending_chunk
             and req.req_pool_idx is not None
             and id(req) not in seen_ids
         ]
-        if chunked_in_queue:
-            req_groups.append(chunked_in_queue)
+        if chunked_in_active:
+            req_groups.append(chunked_in_active)
 
         full_uncached = 0
         swa_uncached = 0

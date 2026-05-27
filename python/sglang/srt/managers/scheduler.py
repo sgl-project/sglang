@@ -609,7 +609,7 @@ class Scheduler(
             max_total_num_tokens=self.max_total_num_tokens,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
-            get_waiting_queue=lambda: self.waiting_queue,
+            get_active_reqs=lambda: self.active_reqs,
         )
 
         self.invariant_checker = SchedulerInvariantChecker(
@@ -627,7 +627,7 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
-            get_waiting_queue=lambda: self.waiting_queue,
+            get_active_reqs=lambda: self.active_reqs,
         )
 
         self.kv_events_publisher = SchedulerKvEventsPublisher(
@@ -1041,18 +1041,12 @@ class Scheduler(
     def _activate(self, req: Req) -> None:
         """Mark req as entering active lifecycle.
 
-        Gated: only sync-mode non-DLLM reqs enter active_reqs. Disagg
-        PREFILL/DECODE reqs are owned by their respective queues
-        (disagg_*_queue); DLLM reqs are owned by dllm_manager.staging_queue.
-        See plan §2 Scope (Q1=(c)) and audit §1 总览.
-
-        Without this gate, _activate would enroll disagg PREFILL / DLLM
-        admits (they share _get_new_batch_prefill_raw with sync mode) into
-        active_reqs, but their finish paths don't call _deactivate, leading
-        to memory leak + abort_all crash on the active-segment stashed-
-        chunked assert (C6).
+        Gated: only sync mode + disagg PREFILL + non-DLLM reqs enter
+        active_reqs. Disagg DECODE has its own prealloc/transfer queue
+        ownership; DLLM has its own staging_queue. See plan §2 Scope and
+        C10 fix plan §2 (disagg PREFILL bug).
         """
-        if self.disaggregation_mode != DisaggregationMode.NULL:
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
             return
         if req.is_dllm():
             return

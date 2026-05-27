@@ -234,13 +234,8 @@ class SchedulePolicy:
         temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
 
+        # C10: chunked-resume no longer in waiting_queue (post-C4); revert to main-upstream sort.
         for r in waiting_queue:
-            if r.has_pending_chunk:
-                # Chunked-resume reqs already have prefix_indices + last_node
-                # set by the prior chunk's Stage A stash, plus an inc'd
-                # lock_ref on last_node. Re-running match_prefix here would
-                # overwrite both, leaving the prior inc unbalanced.
-                continue
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             match_result = match_prefix_for_req(self.tree_cache, r, prefix_ids)
@@ -283,19 +278,12 @@ class SchedulePolicy:
         waiting_queue: List[Req], temporary_deprioritized: Set[int]
     ) -> None:
         """Sorts the waiting queue based on the longest prefix match."""
-        # Chunked-resume reqs sort first: their prefix_indices length only
-        # reflects the chunks already prefilled (kv_committed_len), not the
-        # full prompt prefix they could have hit had they been fresh. Without
-        # this floor, a fresh req with a long cached prefix outranks them
-        # every iter, starving them under tight budget.
+        # C10: chunked-resume no longer in waiting_queue (post-C4); revert to main-upstream sort.
         waiting_queue.sort(
             key=lambda r: (
-                0 if r.has_pending_chunk else 1,
-                (
-                    -len(r.prefix_indices)
-                    if r.rid not in temporary_deprioritized
-                    else float("inf")
-                ),
+                -len(r.prefix_indices)
+                if r.rid not in temporary_deprioritized
+                else float("inf")
             )
         )
 
@@ -304,15 +292,9 @@ class SchedulePolicy:
         waiting_queue: List[Req], tree_cache: BasePrefixCache
     ) -> None:
         """Sorts the waiting queue based on a depth-first search weighting."""
-        # Pull chunked-resume reqs out before DFS — their last_node points at
-        # a mid-chunk stash node with weight 1 (no siblings share it), which
-        # otherwise drops them to a low DFS priority and starves them under
-        # tight budget. They go back to the front of the queue afterwards.
-        chunked_reqs = [req for req in waiting_queue if req.has_pending_chunk]
-        non_chunked_reqs = [req for req in waiting_queue if not req.has_pending_chunk]
-
+        # C10: chunked-resume no longer in waiting_queue (post-C4); revert to main-upstream sort.
         last_node_to_reqs = defaultdict(list)
-        for req in non_chunked_reqs:
+        for req in waiting_queue:
             last_node_to_reqs[req.last_node].append(req)
 
         node_to_weight = defaultdict(int)
@@ -321,7 +303,6 @@ class SchedulePolicy:
         SchedulePolicy._calc_weight(tree_cache.root_node, node_to_weight)
 
         waiting_queue.clear()
-        waiting_queue.extend(chunked_reqs)
         SchedulePolicy._get_dfs_priority(
             tree_cache.root_node,
             node_to_weight,
