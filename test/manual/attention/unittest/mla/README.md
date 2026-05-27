@@ -19,7 +19,7 @@ Columns are runner modes; rows are attention backends. Cells use:
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | `triton` | ✓ 10 input layouts (page 1/16/32, prefix/decode edges) | ✓ MLA decode page-boundary | ✓ ragged page-boundary extend | ✓ ragged page-boundary extend | ✓ EAGLE chain (topk=1) | ✓ EAGLE tree (topk=2) | — (V1 DE not enabled for Triton MLA; Triton uses V2 path) | — | ✓ fixed-tokens-per-req | ✓ chain (topk=1) + tree (topk=2) | ✓ via `DRAFT_EXTEND_V2` graph runner | — (no FKVMTP wiring for MLA) |
 | `flashinfer` | ✓ 10 input layouts with DeepSeek-like `kv_lora_rank=512`, `qk_rope_head_dim=64` | ✓ MLA decode page-boundary | ✓ ragged page-boundary extend | ✓ ragged page-boundary extend | ✓ EAGLE chain (topk=1) | ✓ EAGLE chain (topk=1) | ✓ EAGLE ragged-accept | ✓ EAGLE ragged-accept | blocked: `is_draft_extend()` default `include_v2=False` (`flashinfer_mla_backend.py:432,501,454-455,512`) | ✓ chain (topk=1) only — tree blocked by `topk=1` reject (`flashinfer_mla_backend.py:910-913`) | ✓ EAGLE ragged-accept (V1) | — (no FKVMTP wiring for MLA) |
-| `flashmla` | ✓ FlashMLA-compatible page-size-64 cases (zero-prefix exact page, cross page, ragged, decode page-boundary) | ✓ page-size-64 decode page-boundary | ✓ ragged page-boundary extend | ✓ ragged page-boundary extend | ✓ EAGLE chain (topk=1) | ✓ EAGLE chain (topk=1) | ✓ EAGLE ragged-accept | deferred: parent FlashInfer-MLA capture path expects 1D `cuda_graph_kv_indices`, FlashMLA allocates 2D `[max_bs, (max_context+PAGE_SIZE)//PAGE_SIZE]` (`flashmla_backend.py:347-348` + parent `init_forward_metadata_capture_cuda_graph`) | — (FlashMLA does not implement V2) | ✓ chain (topk=1) only — tree blocked by `topk=1` reject (`flashmla_backend.py:555-558`) | — (DE CG deferred above) | — |
+| `flashmla` | ✓ FlashMLA-compatible page-size-64 cases (zero-prefix exact page, input page edges 63/64/65, prefix exact page, total exact page, cross page, ragged, decode page-boundary, decode bsz=1 nonzero prefix) | ✓ page-size-64 decode page-boundary | ✓ ragged page-boundary extend | ✓ ragged page-boundary extend | ✓ EAGLE chain (topk=1) | ✓ EAGLE chain (topk=1) | ✓ EAGLE ragged-accept | deferred: parent FlashInfer-MLA capture path expects 1D `cuda_graph_kv_indices`, FlashMLA allocates 2D `[max_bs, (max_context+PAGE_SIZE)//PAGE_SIZE]` (`flashmla_backend.py:347-348` + parent `init_forward_metadata_capture_cuda_graph`) | — (FlashMLA does not implement V2) | ✓ chain (topk=1) only — tree blocked by `topk=1` reject (`flashmla_backend.py:555-558`) | — (DE CG deferred above) | — |
 | `cutlass_mla` | skip:hw — needs SM 10.0+ (Blackwell); current 1 case uses `ForwardMode.EXTEND` but `CutlassMLABackend` only overrides `forward_decode` (`cutlass_mla_backend.py:226`) and falls through to FlashInfer MLA for other modes → **case should be DECODE**; PAGE_SIZE fixed at 128 (`cutlass_mla_backend.py:31`) | — (decode-only backend; no extend/CG) | — | — | blocked: tree via `topk=1` reject inherited from FlashInfer MLA parent | — | — | — | — | — | — | — |
 | `trtllm_mla` | skip:hw — needs SM 12.0a / 12.1a (`is_sm120_supported`) | — | — | — | blocked: `topk=1` only (`trtllm_mla_backend.py:1223-1229` inherits from FlashInfer MLA) | — | — | — | — | — | — | — |
 | `tokenspeed_mla` | skip:hw — needs `find_spec("tokenspeed_mla")`, SM 10.0+, and `kv_cache_dtype=fp8_e4m3` (`server_args.py:2814-2818`); current MLA fixture does not emit FP8 KV cache | — | — | — | blocked: `topk=1` only (`tokenspeed_mla_backend.py:341-347` inherits from TRT-LLM MLA) | — | — | — | — | — | — | — |
@@ -30,7 +30,13 @@ Columns are runner modes; rows are attention backends. Cells use:
 - Ragged page-boundary extend batches.
 - Representative page-size-32 crossing case (`triton`, `flashinfer`).
 - FlashMLA cases use `page_size=64` because `FlashMLABackend` forces that size
-  (`server_args.py:2767-2770`).
+  (`server_args.py:2767-2770`). The 8 FlashMLA EXTEND/DECODE input
+  variants cover zero-prefix exact-page, input page edges
+  (`extend=(63, 64, 65)`), prefix exact-page (`prefix=64`), total
+  exact-page (`prefix=32, extend=32`), cross-page-boundary
+  (`prefix=63, extend=2`), ragged page-boundary
+  (`prefix=(0, 32, 64), extend=(63, 32, 1)`), decode page-boundary,
+  and decode bsz=1 nonzero-prefix.
 - Nonzero MLA rope dimension support is present in the fixture, but RoPE math
   is intentionally orthogonal to the runner/backend matrix.
 

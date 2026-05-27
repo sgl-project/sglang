@@ -159,12 +159,45 @@ def make_mamba2_cases(backend: str) -> tuple[Mamba2AttentionCase, ...]:
             extend_lens=(32,),
             **common,
         ),
+        # Page-boundary edge sweep at the extend size: one below, exactly at,
+        # one above page boundary. Mamba2 doesn't read paged KV, but the
+        # req_to_token_pool still indexes by page; this exercises the metadata
+        # builder under different per-request seq layouts. Use bsz=3 so the
+        # batched metadata path sees mixed lengths.
+        Mamba2AttentionCase(
+            name="mamba2_extend_zero_prefix_input_page_edges",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(0, 0, 0),
+            extend_lens=(15, 16, 17),
+            **common,
+        ),
         Mamba2AttentionCase(
             name="mamba2_extend_with_prefix",
             forward_mode=ForwardMode.EXTEND,
             page_size=16,
             prefix_lens=(16,),
             extend_lens=(16,),
+            **common,
+        ),
+        # Required input case: prefix + extend that lands exactly at one page
+        # (total == page_size) with nonzero prefix.
+        Mamba2AttentionCase(
+            name="mamba2_extend_total_exact_page",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(8,),
+            extend_lens=(8,),
+            **common,
+        ),
+        # Required input case: prefix + extend that crosses a page boundary,
+        # with prefix just below the boundary.
+        Mamba2AttentionCase(
+            name="mamba2_extend_cross_page_boundary",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(15,),
+            extend_lens=(2,),
             **common,
         ),
         Mamba2AttentionCase(
@@ -183,12 +216,31 @@ def make_mamba2_cases(backend: str) -> tuple[Mamba2AttentionCase, ...]:
             extend_lens=(16, 16),
             **common,
         ),
+        # Required ragged case: requests with sequences below/at/above a page
+        # boundary in the same batch.
+        Mamba2AttentionCase(
+            name="mamba2_extend_ragged_page_boundary",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(0, 8, 16),
+            extend_lens=(15, 8, 1),
+            **common,
+        ),
         Mamba2AttentionCase(
             name="mamba2_extend_page_size_1",
             forward_mode=ForwardMode.EXTEND,
             page_size=1,
             prefix_lens=(0,),
             extend_lens=(16,),
+            **common,
+        ),
+        # Required representative page-size-32 cross-page-boundary case.
+        Mamba2AttentionCase(
+            name="mamba2_extend_page32_cross_boundary",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=32,
+            prefix_lens=(31,),
+            extend_lens=(2,),
             **common,
         ),
         Mamba2AttentionCase(

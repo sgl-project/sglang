@@ -21,7 +21,7 @@ Columns are runner modes; rows are the SSM kernel backend
 
 | SSM kernel | Eager Phase 2 | CG decode | PCG extend | BCG extend | Verify eager | Verify CG | DE eager | DE CG | DE-V2 CG | EAGLE-draft runner | EAGLE-DE runner | FKVMTP runner |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `triton` (`Mamba2AttnBackend`) | ✓ EXTEND zero-prefix exact-page / below-page / above-page, with-prefix, multi-request zero-prefix / ragged, page_size=1 (7 variants) + DECODE page-boundary + DECODE bsz=1 nonzero-prefix (9 variants total) | ✓ decode page-boundary (full forward replay with SSM+conv state snapshot/restore via `_clone_mamba2_cache`/`_restore_mamba2_cache`; uses `MAMBA2_GRAPH_ATOL=1e-1` to absorb chunked-scan kernel CG-replay drift; eager `MAMBA2_ATOL=5e-2` kept for non-graph cases). Plus the M21 metadata-only padding test (`seq_lens_cpu=[5,1,1]`). | blocked: `MambaMixer2.forward` asserts `num_actual_tokens == projected_states.shape[0]` (`mamba.py:467`) — the in-mixer projection requires `hidden_states.shape[0]` to equal the LIVE token count exactly, no padding tolerance. The shared split-op runner pads `hidden_states` to a fixed static upper bound, so Mamba2 trips this assert. See "Production-Unsupported". | blocked: same | deferred | deferred | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
+| `triton` (`Mamba2AttnBackend`) | ✓ EXTEND zero-prefix exact-page / below-page / above-page / page-edges (15/16/17), with-prefix, total-exact-page (prefix=8 + extend=8), cross-page-boundary (prefix=15 + extend=2), multi-request zero-prefix / ragged / ragged-page-boundary (prefix=(0,8,16) + extend=(15,8,1)), page_size=1, page_size=32 cross-boundary (12 variants) + DECODE page-boundary + DECODE bsz=1 nonzero-prefix (14 variants total) | ✓ decode page-boundary (full forward replay with SSM+conv state snapshot/restore via `_clone_mamba2_cache`/`_restore_mamba2_cache`; uses `MAMBA2_GRAPH_ATOL=1e-1` to absorb chunked-scan kernel CG-replay drift; eager `MAMBA2_ATOL=5e-2` kept for non-graph cases). Plus the M21 metadata-only padding test (`seq_lens_cpu=[5,1,1]`). | blocked: `MambaMixer2.forward` asserts `num_actual_tokens == projected_states.shape[0]` (`mamba.py:467`) — the in-mixer projection requires `hidden_states.shape[0]` to equal the LIVE token count exactly, no padding tolerance. The shared split-op runner pads `hidden_states` to a fixed static upper bound, so Mamba2 trips this assert. See "Production-Unsupported". | blocked: same | deferred | deferred | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
 
 ## Hybrid dispatch fan-out tests (MagicMock-based)
 
@@ -41,18 +41,28 @@ call.
 
 ## Input And Config Coverage
 
-- 9 input layouts via `make_mamba2_cases('triton')`:
-  - **EXTEND (7):** zero-prefix exact-page (16 tokens), zero-prefix
+- 14 input layouts via `make_mamba2_cases('triton')`:
+  - **EXTEND (12):** zero-prefix exact-page (16 tokens), zero-prefix
     below-page (8 tokens), zero-prefix above-page (32 tokens,
-    cross-page), with-prefix (`prefix=16, extend=16`), multi-request
-    zero-prefix (`extend=(16, 16)`), multi-request ragged
-    (`prefix=(0, 16), extend=(16, 16)`), and `page_size=1` (16 tokens).
+    cross-page), zero-prefix input page edges (`extend=(15, 16, 17)`
+    — sequence length one below / exactly at / one above a page),
+    with-prefix (`prefix=16, extend=16`), total-exact-page
+    (`prefix=8, extend=8`), cross-page-boundary (`prefix=15, extend=2`),
+    multi-request zero-prefix (`extend=(16, 16)`), multi-request ragged
+    (`prefix=(0, 16), extend=(16, 16)`), ragged-page-boundary
+    (`prefix=(0, 8, 16), extend=(15, 8, 1)` — requests below / at / above
+    page), `page_size=1` (16 tokens), and `page_size=32` cross-boundary
+    (`prefix=31, extend=2`).
   - **DECODE (2):** page-boundary (`prefix_lens=(14, 15, 16)`) and
     bsz=1 nonzero-prefix (`prefix_lens=(7,)`). The fixture's
     `MockMamba2ModelRunner.__init__` calls
     `initialize_mamba_selective_state_update_backend(server_args)`
     (mirroring scheduler startup) so `MambaMixer2.forward_decode`
     finds the global selective-state-update backend.
+- Page-size variants (`page_size=1`, `page_size=16`, `page_size=32`)
+  test the req-pool / token-pool indexing layout under different page
+  sizes; the Mamba2 backend itself is an SSM scan and does not read
+  paged KV, so different page sizes mainly exercise the metadata path.
 - `num_heads=DEFAULT_NUM_HEADS=2`, `head_dim=DEFAULT_HEAD_DIM=16`,
   `state_size=16`, `n_groups=1`, `conv_kernel=4`,
   `mamba_chunk_size=DEFAULT_MAMBA_CHUNK_SIZE=16`, `hidden_size=32`.

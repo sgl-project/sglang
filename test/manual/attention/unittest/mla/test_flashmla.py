@@ -59,6 +59,39 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
             prefix_lens=(0,),
             extend_lens=(64,),
         ),
+        # Sequence length one below / exactly at / one above the page
+        # boundary with zero prefix (Required input case: "Sequence length
+        # one token below and one token above a page boundary").
+        MLAAttentionCase(
+            name="mla_extend_flashmla_input_page_edges",
+            backend="flashmla",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            page_size=64,
+            prefix_lens=(0, 0, 0),
+            extend_lens=(63, 64, 65),
+        ),
+        # Prefix length exactly equal to one page (Required input case).
+        MLAAttentionCase(
+            name="mla_extend_prefix_exact_flashmla_page",
+            backend="flashmla",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            page_size=64,
+            prefix_lens=(64,),
+            extend_lens=(2,),
+        ),
+        # Prefix plus extend length exactly equal to one page (Required
+        # input case).
+        MLAAttentionCase(
+            name="mla_extend_total_exact_flashmla_page",
+            backend="flashmla",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            page_size=64,
+            prefix_lens=(32,),
+            extend_lens=(32,),
+        ),
         MLAAttentionCase(
             name="mla_extend_cross_flashmla_page_boundary",
             backend="flashmla",
@@ -84,6 +117,15 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
             num_heads=4,
             page_size=64,
             prefix_lens=(61, 62, 63),
+        ),
+        # Decode with nonzero prefix at batch-size 1 (Required input case).
+        MLAAttentionCase(
+            name="mla_decode_flashmla_bsz1_nonzero_prefix",
+            backend="flashmla",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            page_size=64,
+            prefix_lens=(31,),
         ),
     )
     CUDA_GRAPH_CASES = (
