@@ -358,6 +358,38 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Broadened the speculative `TARGET_VERIFY` matrix to cover the three
+  non-EAGLE chain spec kinds (`frozen_kv_mtp`, `dflash`, `ngram`)
+  across every backend whose verify kernel handles them.
+  Generalized `run_*_eagle_verify_case` and
+  `run_*_eagle_verify_cuda_graph_case` to accept `spec_kind`
+  (defaulting to `"eagle"`) and route through the shared
+  `_make_spec_verify_input` factory. Added coverage:
+  - Dense FA3, FA4 — eager + CG, all 3 new kinds
+  - SWA Triton — eager (all 3) + CG (dflash, ngram)
+  - MLA Triton — eager + CG, all 3 new kinds
+  - GDN Triton + FlashInfer — eager + CG, all 3 new kinds
+  - Lightning Triton — eager (all 3) (CG only EAGLE, chain-only)
+  Documented opt-outs: **MLA FlashInfer / FlashMLA** trip a CUDA
+  illegal-memory access in `forward_extend` on non-EAGLE spec_info
+  attrs; **KDA** falls 1 / 384 elements at ~0.11 max diff against
+  the 0.1 verify tolerance and needs a kind-specific reference
+  adjustment; **FlashInfer SWA** uses the documented
+  `prefix_lens=None` handling that uniformly rejects the non-EAGLE
+  kinds.
+- Added SWA torch_native runner-mode eager coverage mirroring
+  `dense/test_torch_native.py`. torch_native is the only SWA backend
+  with no CG / split-op support (raises `NotImplementedError`), so
+  eager is the only relevant runner mode; the new method covers MHA
+  + GQA window-edge DECODE and within-window EXTEND.
+- Probed DSV4 PCG/BCG split-op extend and confirmed it's
+  structurally unreachable: the `flash_mla.flash_mla_with_kvcache`
+  kernel asserts `indices must have shape (b, s_q, topk)`, but the
+  metadata buffers DSV4 builds at `init_forward_metadata` are sized
+  for the live (`raw_batch.batch_size`) request count, while the
+  piecewise context produces a static-token-padded q. The shape
+  mismatch only manifests inside the kernel, not at metadata init.
+  The DSV4 README already documents this row as `—`.
 - Finished the DSA variant matrix. The previously deferred FP8 /
   TARGET_VERIFY / tilelang follow-ups are now wired in:
   - **FP8 KV cache** (`fp8_kv_cache=True`) flips
@@ -962,6 +994,10 @@ Latest verification:
 - `python test/manual/attention/unittest/gdn/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_flashinfer.py -v`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
+  - Ran 142 tests in 36.522s (21 skipped) after the spec_kind
+    expansion arc (FA3/FA4/SWA Triton/MLA Triton/GDN/Lightning) and
+    the SWA torch_native runner-eager addition.
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
   - Ran 141 tests in 36.049s (21 skipped) after finishing the DSA
     variant matrix (added FP8 KV cache, tilelang via topk=2048
