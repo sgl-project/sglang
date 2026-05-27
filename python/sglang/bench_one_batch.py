@@ -89,6 +89,7 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
     set_gpu_proc_affinity,
     suppress_other_loggers,
+    maybe_reindex_device_id,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.tensor_bridge import use_mlx
@@ -953,19 +954,19 @@ def main(server_args, bench_args):
     else:
         workers = []
         for tp_rank in range(local_rank_start, local_rank_end):
-            gpu_id = tp_rank - local_rank_start  # Local GPU index
-            proc = multiprocessing.Process(
-                target=work_func,
-                args=(
-                    server_args,
-                    port_args,
-                    bench_args,
-                    gpu_id,
-                    tp_rank,
-                ),
-            )
-            proc.start()
-            workers.append(proc)
+            with maybe_reindex_device_id(tp_rank - local_rank_start) as gpu_id:
+                proc = multiprocessing.Process(
+                    target=work_func,
+                    args=(
+                        server_args,
+                        port_args,
+                        bench_args,
+                        gpu_id,
+                        tp_rank,
+                    ),
+                )
+                proc.start()
+                workers.append(proc)
 
         for proc in workers:
             proc.join()
