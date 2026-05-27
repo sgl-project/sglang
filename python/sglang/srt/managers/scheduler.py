@@ -3638,10 +3638,7 @@ class Scheduler(
 
     def abort_request(self, recv_req: AbortReq):
         # todo hisparse, release resources for abort requests in hisparse coordinator
-        # Build batch rid set: chunked-resume reqs may live in both waiting_queue
-        # and batch.reqs simultaneously (stateless-scheduler refactor). Skip the
-        # waiting_queue removal for those — let the to_finish path below handle
-        # them, otherwise we send_output / release_kv_cache twice.
+        # Post-C4: chunked-resume reqs live in active_reqs only, never in waiting_queue.
         if self.cur_batch is self.running_batch or self.cur_batch is None:
             batch_reqs = list(self.running_batch.reqs)
         else:
@@ -3690,21 +3687,18 @@ class Scheduler(
                     req, self.req_to_metadata_buffer_idx_allocator
                 )
 
-            # For mamba radix cache, or for chunked-resume reqs whose prior
-            # admissions already allocated a row + KV + radix lock_ref. Without
-            # this branch, aborting a chunked-resume req that is currently only
-            # in waiting_queue (not in any batch's reqs) leaks all three.
+            # audit AB4 simplified post-C4: only mamba radix cache reqs can be
+            # in waiting_queue with mamba_pool_idx held. Chunked-resume reqs
+            # are NOT in waiting_queue anymore (live in active_reqs); their
+            # abort-time release happens in the active_reqs loop below.
             if (
                 req.mamba_pool_idx is not None
-                or (req.has_pending_chunk and req.req_pool_idx is not None)
-            ) and self.disaggregation_mode != DisaggregationMode.DECODE:
+                and self.disaggregation_mode != DisaggregationMode.DECODE
+            ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
-                # Defensive: clear pending-chunk flags on the orphaned req so a
-                # stale reference can't trigger Stage A re-stash of the freed row.
-                req.has_pending_chunk = False
-                req.pending_middle_outputs = 0
-                # audit D6: orphan release in waiting_queue (sync mode mamba or
-                # chunked-resume mid-prefill); drop from active set.
+                # audit D6 (mamba branch): drop from active set if present.
+                # (mamba-radix path may or may not put req in active_reqs;
+                # _deactivate is idempotent.)
                 self._deactivate(req)
             logger.debug(f"Abort queued request. {req.rid=}")
 
@@ -3757,16 +3751,40 @@ class Scheduler(
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
-        # Delete requests in the running batch (reuse batch_reqs built above)
-        for req in batch_reqs:
-            if not req.finished() and (
-                recv_req.abort_all or req.rid.startswith(recv_req.rid)
-            ):
-                # Abort method 3: set `to_finish`
-                # The request will still run one decode forward pass.
-                # Then we reuse all existing code to clean up the KV cache allocation.
+        # audit finding 2 (Plan §C6 Edit 3): iterate active_reqs instead of
+        # batch_reqs so that stashed chunked-resume reqs (in active_reqs but
+        # NOT in any current batch) get their resources released immediately.
+        # batch_rids was built above and includes cur_batch + running_batch +
+        # PP mbs[*]; "in-batch" reqs go through to_finish, "stashed-chunked"
+        # reqs need explicit release because no batch result path will pick
+        # them up.
+        for rid in list(self.active_reqs.keys()):
+            req = self.active_reqs[rid]
+            if req.finished():
+                continue
+            if not (recv_req.abort_all or rid.startswith(recv_req.rid)):
+                continue
+
+            if rid in batch_rids:
+                # In some batch: standard to_finish path; release_kv_cache +
+                # _deactivate happen in process_batch_result_*.
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
+            else:
+                # Active but not in any batch — the only legitimate case is
+                # a stashed chunked-resume mid-prefill (audit finding 2).
+                # Release immediately, else row+KV+lock_ref leak.
+                assert req.has_pending_chunk and req.req_pool_idx is not None, (
+                    f"unexpected active-but-not-in-batch req: {rid} "
+                    f"has_pending_chunk={req.has_pending_chunk} "
+                    f"req_pool_idx={req.req_pool_idx}"
+                )
+                if self.disaggregation_mode != DisaggregationMode.DECODE:
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    req.has_pending_chunk = False
+                    req.pending_middle_outputs = 0
+                    self._deactivate(req)
+                logger.debug(f"Abort stashed chunked-resume request. {req.rid=}")
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
