@@ -1653,7 +1653,6 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Process the last batch
             if self.last_batch:
-                # Skip if need_grammar_sync already drained the queued result above.
                 if not need_grammar_sync:
                     tmp_batch, tmp_result = self.result_queue.popleft()
                     self.process_batch_result(tmp_batch, tmp_result)

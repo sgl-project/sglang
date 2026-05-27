@@ -23,7 +23,6 @@ Notes for whoever runs this on GPU hardware:
 
 import json
 import unittest
-from types import SimpleNamespace
 
 import requests
 
@@ -70,18 +69,16 @@ class TestDisaggregationSpecV2Grammar(PDDisaggregationServerBase):
             "--cuda-graph-max-bs",
             "8",
             "--dtype=float16",
+            # Cap context to the EAGLE3 draft's native length so the target and
+            # draft ModelConfigs agree (the draft derives 2048 vs the Llama-3.1
+            # target's 131072, which the Spec V2 draft worker otherwise rejects).
+            # 2048 is far above this test's output length.
+            "--context-length",
+            "2048",
         ]
         cls.extra_prefill_args = spec_args
         cls.extra_decode_args = spec_args
-        with (
-            envs.SGLANG_ENABLE_SPEC_V2.override(True),
-            # The EAGLE3 draft model config derives a 2048 context length, which is
-            # shorter than the Llama-3.1 target's 131072. The Spec V2 draft worker
-            # (eagle_worker_v2.py) builds its own ModelConfig and rejects this
-            # mismatch unless overriding longer context is allowed. Outputs here are
-            # well under 2048 tokens, so allowing the override is safe.
-            envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(True),
-        ):
+        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
             cls.launch_all()
 
     @staticmethod
