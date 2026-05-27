@@ -2733,14 +2733,6 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            # Chunked-resume req is admitted via the inline block above
-            # (Plan §C3). It still rides H2 retention in waiting_queue until
-            # C4 removes that — skip it here to avoid double-admit. Once C4
-            # drops the retention, this guard becomes a no-op and can be
-            # removed.
-            if req.has_pending_chunk:
-                continue
-
             # audit H6: chunked-resume no longer flows through main loop;
             # drainer check applies uniformly.
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -2825,14 +2817,11 @@ class Scheduler(
             if req.rid not in self.active_reqs:
                 self._activate(req)
 
-        # Drop admitted reqs from waiting_queue, but KEEP chunked-resume reqs
-        # (has_pending_chunk == True after admission) so they stay at the head
-        # for the next iter's stash + admission. Single-flight is preserved
-        # naturally by budget + priority.
+        # audit H2: retention removed. chunked-resume reqs are no longer
+        # anchored in waiting_queue — they live in active_reqs and are
+        # re-admitted via the inline chunked admission loop (C3).
         can_run_set = set(can_run_list)
-        self.waiting_queue = [
-            x for x in self.waiting_queue if x not in can_run_set or x.has_pending_chunk
-        ]
+        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:
             for req in adder.preempt_list:
                 # audit R2: PrefillAdder.preempt_to_schedule already released
