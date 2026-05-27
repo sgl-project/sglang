@@ -155,13 +155,13 @@ export const GLM5Deployment = () => {
     cmd += `  --model-path ${modelName}`;
     cmd += ` \\\n  --tp ${tpValue}`;
 
-    // NVFP4 B200: trtllm NSA backends, flashinfer fusion, FP8 KV cache.
+    // NVFP4 B200: trtllm DSA backends, flashinfer fusion, FP8 KV cache.
     if (isNVFP4) {
       cmd += ' \\\n  --trust-remote-code';
       cmd += ' \\\n  --quantization modelopt_fp4';
       cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
-      cmd += ' \\\n  --nsa-decode-backend trtllm';
-      cmd += ' \\\n  --nsa-prefill-backend trtllm';
+      cmd += ' \\\n  --dsa-decode-backend trtllm';
+      cmd += ' \\\n  --dsa-prefill-backend trtllm';
       cmd += ' \\\n  --moe-runner-backend flashinfer_trtllm';
       cmd += ' \\\n  --enable-flashinfer-allreduce-fusion';
       cmd += ' \\\n  --enable-dp-lm-head';
@@ -174,11 +174,11 @@ export const GLM5Deployment = () => {
       return cmd;
     }
 
-    // AMD-specific: NSA tilelang backend.
+    // AMD-specific: DSA tilelang backend.
     if (isAMD) {
       cmd += ' \\\n  --trust-remote-code';
-      cmd += ' \\\n  --nsa-prefill-backend tilelang';
-      cmd += ' \\\n  --nsa-decode-backend tilelang';
+      cmd += ' \\\n  --dsa-prefill-backend tilelang';
+      cmd += ' \\\n  --dsa-decode-backend tilelang';
       cmd += ' \\\n  --chunked-prefill-size 131072';
       cmd += ' \\\n  --watchdog-timeout 1200';
     }
@@ -199,10 +199,15 @@ export const GLM5Deployment = () => {
     if (hardware === 'b200' && effectiveQuant === 'fp8') {
       cmd += ' \\\n  --ep 1';
       cmd += ' \\\n  --quantization fp8';
-      cmd += ' \\\n  --attention-backend nsa';
-      cmd += ' \\\n  --nsa-decode-backend trtllm';
-      cmd += ' \\\n  --nsa-prefill-backend trtllm';
+      cmd += ' \\\n  --attention-backend dsa';
+      cmd += ' \\\n  --dsa-decode-backend trtllm';
+      cmd += ' \\\n  --dsa-prefill-backend trtllm';
       cmd += ' \\\n  --moe-runner-backend flashinfer_trtllm';
+      cmd += ' \\\n  --enable-flashinfer-allreduce-fusion';
+    }
+
+    // H200 FP8: flashinfer allreduce fusion.
+    if (hardware === 'h200' && effectiveQuant === 'fp8') {
       cmd += ' \\\n  --enable-flashinfer-allreduce-fusion';
     }
 

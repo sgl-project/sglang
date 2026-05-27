@@ -16,7 +16,7 @@ import torch
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 # ---------------------------------------------------------------------------
 # Test configuration (small-scale for fast CI runs)
@@ -52,9 +52,12 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         finished_reason=None,
         hisparse_staging=False,
         staging=False,
-        is_chunked=0,
+        inflight_middle_chunks=0,
     )
     req.finished = lambda: req.finished_reason is not None
+    req.set_extend_input_len = lambda extend_input_len: setattr(
+        req, "extend_input_len", extend_input_len
+    )
     return req
 
 
@@ -91,11 +94,11 @@ class TestHiSparseUnit(unittest.TestCase):
         global_page_size = 1 if is_hip() else PAGE_SIZE
 
         from sglang.srt.mem_cache.hisparse_memory_pool import (
-            HiSparseNSATokenToKVPool,
+            HiSparseDSATokenToKVPool,
             HiSparseTokenToKVPoolAllocator,
         )
 
-        cls.device_pool = HiSparseNSATokenToKVPool(
+        cls.device_pool = HiSparseDSATokenToKVPool(
             size=SIZE,
             page_size=global_page_size,
             kv_lora_rank=KV_LORA_RANK,
@@ -161,6 +164,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.req_to_device_buffer.zero_()
         self.coordinator.req_device_buffer_size.zero_()
         self.coordinator.req_to_host_pool.fill_(-1)
+        self.coordinator.req_to_host_pool_allocated_len.zero_()
         self.coordinator.req_device_buffer_tokens.fill_(-1)
         self.coordinator.req_device_buffer_token_locs.fill_(-1)
         self.coordinator.lru_slots[:] = self.coordinator._lru_init.view(1, 1, -1)
@@ -241,6 +245,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.assertIsNotNone(host_indices, "Host alloc failed")
         host_indices = host_indices.to(device="cuda")
         self.coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
+        self.coordinator.req_to_host_pool_allocated_len[req.req_pool_idx] = fill_len
         for lid in range(LAYER_NUM):
             for i in range(fill_len):
                 host_pool.kv_buffer[lid][host_indices[i]] = self._kv_pattern(lid, i)
@@ -555,6 +560,56 @@ class TestHiSparseUnit(unittest.TestCase):
         self._assert_sizes_restored(initial, "staging_path")
 
     # ==================================================================
+    # Test: Single-node staging host page allocation
+    # ==================================================================
+    def test_single_node_staging_allocates_paged_host_slots(self):
+        """Single-node staging should allocate host slots at page granularity."""
+        initial = self._get_initial_sizes()
+        fill_len = self.page_size * 2 + 1
+        rounded_len = (fill_len + self.page_size - 1) // self.page_size * self.page_size
+        req = _make_req("single-node-staging-pages", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len)
+        self._write_device_patterns(kv_loc, fill_len)
+
+        self.coordinator.admit_request_into_staging(req)
+        torch.cuda.synchronize()
+        ready = self.coordinator.collect_ready_reqs()
+        self.assertEqual(ready, [req])
+
+        host_row = self.coordinator.req_to_host_pool[req.req_pool_idx, :rounded_len]
+        self.assertTrue(torch.all(host_row >= 0))
+        self.assertEqual(torch.unique(host_row).numel(), rounded_len)
+        self.assertEqual(
+            int(self.coordinator.req_to_host_pool_allocated_len[req.req_pool_idx]),
+            rounded_len,
+        )
+
+        available_size = self.coordinator.mem_pool_host.available_size()
+        next_host_index = self.coordinator.mem_pool_host.alloc_paged_token_slots(
+            self.coordinator.req_to_host_pool,
+            self.coordinator.req_to_host_pool_allocated_len,
+            req.req_pool_idx,
+            fill_len,
+            1,
+        )
+        self.assertEqual(
+            self.coordinator.mem_pool_host.available_size(), available_size
+        )
+        self.assertTrue(torch.all(next_host_index >= 0))
+
+        allocated_host_indices = self.coordinator.mem_pool_host.allocated_host_indices(
+            self.coordinator.req_to_host_pool,
+            req.req_pool_idx,
+            int(self.coordinator.req_to_host_pool_allocated_len[req.req_pool_idx]),
+        )
+        self.assertEqual(allocated_host_indices.numel(), rounded_len)
+
+        self._cleanup_req(req, kv_loc)
+        self._assert_sizes_restored(initial, "single_node_staging_pages")
+
+    # ==================================================================
     # Test: Direct-to-host (PD separated) path
     # ==================================================================
     def test_request_lifecycle_direct_path(self):
@@ -588,6 +643,61 @@ class TestHiSparseUnit(unittest.TestCase):
 
         self._cleanup_req(req, kv_loc, logical_only=True)
         self._assert_sizes_restored(initial, "direct_path")
+
+    # ==================================================================
+    # Test: PD decode prealloc host page allocation
+    # ==================================================================
+    def test_pd_decode_prealloc_hisparse_host_slots(self):
+        """PD decode prealloc should allocate RDMA targets through the host pool."""
+        initial = self._get_initial_sizes()
+        fill_len = self.page_size * 2 + 1
+        req = _make_req("pd-decode-prealloc", list(range(fill_len)))
+
+        from sglang.srt.disaggregation.decode import DecodePreallocQueue
+
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.req_to_token_pool = self.req_to_token_pool
+        queue.token_to_kv_pool_allocator = self.allocator
+        queue.tree_cache = SimpleNamespace(
+            evictable_size=lambda: 0,
+            protected_size=lambda: 0,
+        )
+        queue.scheduler = SimpleNamespace(
+            enable_hisparse=True,
+            hisparse_coordinator=self.coordinator,
+            server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=False),
+        )
+
+        host_indices = queue._pre_alloc(req)
+        self.assertEqual(host_indices.numel(), fill_len)
+        self.assertTrue(torch.all(host_indices >= 0))
+        self.assertTrue(
+            torch.equal(
+                host_indices,
+                self.coordinator.req_to_host_pool[req.req_pool_idx, :fill_len],
+            )
+        )
+        self.assertEqual(req.kv_allocated_len, fill_len)
+        self.assertEqual(req.kv_committed_len, fill_len)
+        self.assertEqual(req.extend_input_len, fill_len)
+
+        rounded_len = (fill_len + self.page_size - 1) // self.page_size * self.page_size
+        self.assertEqual(
+            int(self.coordinator.req_to_host_pool_allocated_len[req.req_pool_idx]),
+            rounded_len,
+        )
+        allocated_host_indices = self.coordinator.mem_pool_host.allocated_host_indices(
+            self.coordinator.req_to_host_pool,
+            req.req_pool_idx,
+            int(self.coordinator.req_to_host_pool_allocated_len[req.req_pool_idx]),
+        )
+        self.assertEqual(allocated_host_indices.numel(), rounded_len)
+
+        kv_loc = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : req.kv_allocated_len
+        ].clone()
+        self._cleanup_req(req, kv_loc, logical_only=True)
+        self._assert_sizes_restored(initial, "pd_decode_prealloc_hisparse")
 
     # ==================================================================
     # Test: Batch multiple requests
