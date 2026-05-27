@@ -54,27 +54,59 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
         ),
     )
     DRAFT_EXTEND_CASES = (
-        DenseAttentionCase(
-            name="runner_fa3_eagle_draft_extend",
-            backend="fa3",
-            forward_mode=ForwardMode.DRAFT_EXTEND,
-            num_heads=4,
-            num_kv_heads=4,
-            page_size=16,
-            prefix_lens=(4, 7),
-            extend_lens=(3, 3),
+        (
+            DenseAttentionCase(
+                name="runner_fa3_eagle_draft_extend",
+                backend="fa3",
+                forward_mode=ForwardMode.DRAFT_EXTEND,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            "eagle",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_fa3_frozen_kv_mtp_draft_extend",
+                backend="fa3",
+                forward_mode=ForwardMode.DRAFT_EXTEND,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            "frozen_kv_mtp",
         ),
     )
     DRAFT_EXTEND_CUDA_GRAPH_CASES = (
-        DenseAttentionCase(
-            name="runner_cuda_graph_fa3_eagle_draft_extend",
-            backend="fa3",
-            forward_mode=ForwardMode.DRAFT_EXTEND,
-            num_heads=4,
-            num_kv_heads=4,
-            page_size=16,
-            prefix_lens=(4, 7),
-            extend_lens=(3, 3),
+        (
+            DenseAttentionCase(
+                name="runner_cuda_graph_fa3_eagle_draft_extend",
+                backend="fa3",
+                forward_mode=ForwardMode.DRAFT_EXTEND,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            "eagle",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_cuda_graph_fa3_frozen_kv_mtp_draft_extend",
+                backend="fa3",
+                forward_mode=ForwardMode.DRAFT_EXTEND,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            "frozen_kv_mtp",
         ),
     )
     DRAFT_EXTEND_V2_CUDA_GRAPH_CASES = (
@@ -332,21 +364,27 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
                 )
 
     def test_runner_mode_eagle_draft_extend_cases(self):
-        for case in self.DRAFT_EXTEND_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
+        for case, spec_kind in self.DRAFT_EXTEND_CASES:
+            with self.subTest(
+                case=case.name, backend=case.backend, spec_kind=spec_kind
+            ):
                 run_dense_eagle_draft_extend_case(
                     self,
                     case,
+                    spec_kind=spec_kind,
                     head_dim=self.HEAD_DIM,
                     hidden_size=self.HIDDEN_SIZE,
                 )
 
     def test_runner_mode_draft_extend_cuda_graph_cases(self):
-        for case in self.DRAFT_EXTEND_CUDA_GRAPH_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
+        for case, spec_kind in self.DRAFT_EXTEND_CUDA_GRAPH_CASES:
+            with self.subTest(
+                case=case.name, backend=case.backend, spec_kind=spec_kind
+            ):
                 run_dense_draft_extend_cuda_graph_case(
                     self,
                     case,
+                    spec_kind=spec_kind,
                     head_dim=self.HEAD_DIM,
                     hidden_size=self.HIDDEN_SIZE,
                 )
