@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     102,
+        "agents":     105,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -216,6 +216,9 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "stripe_gateway":    7854,
             "trading_engine":    7855,
             "analytics_hub":     7856,
+            "document_forge":    7857,
+            "social_manager":    7858,
+            "inventory_manager": 7859,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -519,6 +522,9 @@ _INTENTS = {
     "stripe_charge":           lambda a, k: {"action": "stripe_charge_queued", "amount": k.get("amount", 0), "currency": k.get("currency", "aud"), "customer_email": k.get("customer_email", "")},
     "trade_signal":            lambda a, k: {"action": "trade_signal_queued", "symbol": k.get("symbol", "BTC"), "side": k.get("side", "buy"), "strategy": k.get("strategy", "rsi")},
     "kpi_record":              lambda a, k: {"action": "kpi_record_queued", "metric_name": k.get("metric_name", ""), "metric_value": k.get("metric_value", 0)},
+    "doc_generate":            lambda a, k: {"action": "doc_generate_queued", "doc_type": k.get("doc_type", "invoice"), "recipient_email": k.get("recipient_email", ""), "variables": k.get("variables", {})},
+    "social_post":             lambda a, k: {"action": "social_post_queued", "platform": k.get("platform", "twitter"), "content": k.get("content", ""), "scheduled_for": k.get("scheduled_for", None)},
+    "inventory_adjust":        lambda a, k: {"action": "inventory_adjust_queued", "sku": k.get("sku", ""), "quantity": k.get("quantity", 0), "reason": k.get("reason", "")},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
