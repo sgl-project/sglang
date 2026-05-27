@@ -698,6 +698,7 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
+            deactivate_req=self._deactivate,
         )
 
         self.is_initializing = False
@@ -996,6 +997,12 @@ class Scheduler(
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
+        # By-rid ownership tracker for sync-mode reqs the scheduler currently
+        # owns the lifecycle of (admitted, not finished, not retracted). Runs
+        # as a parallel tracker alongside waiting_queue / running_batch.reqs /
+        # chunked retention without changing scheduler behavior. See
+        # agent-drafts/2026-05-25-waiting-queue-refactor-plan.md (C1).
+        self.active_reqs: Dict[str, Req] = {}
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -1012,6 +1019,60 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+
+    def _activate(self, req: Req) -> None:
+        """Mark req as entering active lifecycle (initial admission).
+
+        Caller must ensure req.rid is not already in active_reqs (chunked-resume
+        re-admit is filtered at the call site). See refactor plan §C1.
+        """
+        assert req.rid not in self.active_reqs, f"already active: {req.rid}"
+        self.active_reqs[req.rid] = req
+
+    def _deactivate(self, req: Req) -> None:
+        """Mark req as leaving active lifecycle (finish / abort / retract).
+
+        Important: this function ONLY pops from active_reqs dict.
+        - Does not clear req.req_pool_idx: batch_result_processor.py:774-787 PP
+          cross-mb idempotency guard relies on it as an "already released"
+          sentinel.
+        - Does not clear req.has_pending_chunk / req.pending_middle_outputs:
+          owned by the semantic finish/abort/retract sites.
+        - Does not call release_kv_cache: that is the responsibility of
+          release_req / abort / finish paths.
+        This function only answers "scheduler no longer owns this req's
+        lifecycle".
+        """
+        self.active_reqs.pop(req.rid, None)
+
+    def _assert_invariants(self) -> None:
+        """Debug-only invariant checks for active_reqs ownership tracking.
+
+        Gated by DEBUG_INVARIANTS=1 to avoid slowing down normal runs. Skipped
+        in disagg modes (Q1=(c): disagg has its own ownership model).
+        """
+        if not os.environ.get("DEBUG_INVARIANTS"):
+            return
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            return
+        waiting_rids = {r.rid for r in self.waiting_queue}
+        active_rids = set(self.active_reqs.keys())
+        running_rids = {r.rid for r in self.running_batch.reqs}
+
+        # sync mode: chunked-resume reqs still live in waiting_queue until C4
+        # deletes the retention. Relax waiting ∩ active here: any rid in the
+        # intersection must be a chunked-resume req.
+        intersection_rids = waiting_rids & active_rids
+        for rid in intersection_rids:
+            assert self.active_reqs[
+                rid
+            ].has_pending_chunk, (
+                f"{rid} in both waiting and active but not chunked-resume"
+            )
+
+        assert (
+            running_rids <= active_rids
+        ), f"running not subset of active: {running_rids - active_rids}"
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -2331,6 +2392,7 @@ class Scheduler(
         return rids
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        self._assert_invariants()
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
         self._abort_on_waiting_timeout()
@@ -2467,6 +2529,7 @@ class Scheduler(
             if self.enable_fpm:
                 ret.fpm_start_time = self._fpm_batch_t0
 
+        self._assert_invariants()
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
@@ -2676,6 +2739,14 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
+        # audit A1: mark newly-admitted reqs as active. Filter chunked-resume
+        # re-admit (already active from a prior iter) — _activate's internal
+        # assert would trip otherwise. Filter can be removed once C3+C4 move
+        # chunked-resume out of the main admission loop.
+        for req in can_run_list:
+            if req.rid not in self.active_reqs:
+                self._activate(req)
+
         # Drop admitted reqs from waiting_queue, but KEEP chunked-resume reqs
         # (has_pending_chunk == True after admission) so they stay at the head
         # for the next iter's stash + admission. Single-flight is preserved
@@ -2686,6 +2757,10 @@ class Scheduler(
         ]
         if adder.preempt_list:
             for req in adder.preempt_list:
+                # audit R2: PrefillAdder.preempt_to_schedule already released
+                # the victim's resources via running_batch.release_req. Drop
+                # from active_reqs before re-enqueueing as a waiting req.
+                self._deactivate(req)
                 self._add_request_to_queue(req)
 
         # Bump pending_middle_outputs for every admitted req that's still
@@ -2859,7 +2934,13 @@ class Scheduler(
                 )
             logger.warning(msg_prefix + msg_details)
 
+            # audit R1: retract_decode released row + KV via release_req for
+            # both retracted_reqs (re-enqueued as waiting) and reqs_to_abort
+            # (final OOM eviction). Drop both from active_reqs.
+            for req in reqs_to_abort:
+                self._deactivate(req)
             for req in retracted_reqs:
+                self._deactivate(req)
                 self._add_request_to_queue(req, is_retracted=True)
         else:
             self.new_token_ratio_tracker.decay_step()
@@ -3567,6 +3648,9 @@ class Scheduler(
                 # stale reference can't trigger Stage A re-stash of the freed row.
                 req.has_pending_chunk = False
                 req.pending_middle_outputs = 0
+                # audit D6: orphan release in waiting_queue (sync mode mamba or
+                # chunked-resume mid-prefill); drop from active set.
+                self._deactivate(req)
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
@@ -3676,7 +3760,11 @@ class Scheduler(
                 self.running_batch.filter_batch(v1_spec_info_filtered=True)
                 if len(self.running_batch.reqs) != 0:
                     retracted_reqs = self.running_batch.retract_all(self.server_args)
+                    # audit R3: retract_all released resources via release_req
+                    # for every running req; drop from active_reqs before
+                    # re-enqueueing as waiting.
                     for req in retracted_reqs:
+                        self._deactivate(req)
                         self._add_request_to_queue(req)
 
                 self.running_batch.batch_is_full = False
@@ -3702,6 +3790,10 @@ class Scheduler(
                         req.disagg_kv_sender = None
                     release_kv_cache(req, self.tree_cache, is_insert=False)
                     req.reset_for_retract()
+                    # audit D7: chunked-resume req released via reset_for_retract
+                    # stays in waiting_queue for re-prefill but no longer holds
+                    # row/KV, so it leaves the active set.
+                    self._deactivate(req)
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         if recv_req.torch_empty_cache:
