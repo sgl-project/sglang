@@ -160,24 +160,20 @@ def get_processor(
             trust_remote_code=trust_remote_code,
             revision=revision,
         )
+    elif model_name is not None:
+        config = AutoConfig.from_pretrained(
+            model_name,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
     else:
-        try:
-            config = AutoConfig.from_pretrained(
-                tokenizer_name,
-                trust_remote_code=trust_remote_code,
-                revision=revision,
-                **kwargs,
-            )
-        except ValueError:
-            if model_name is not None:
-                config = AutoConfig.from_pretrained(
-                    model_name,
-                    trust_remote_code=trust_remote_code,
-                    revision=revision,
-                    **kwargs,
-                )
-            else:
-                raise
+        config = AutoConfig.from_pretrained(
+            tokenizer_name,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
     is_ocr2 = _is_deepseek_ocr2_model(config)
     if _is_deepseek_ocr_model(config) or is_ocr2:
         config.model_type = "deepseek-ocr"
