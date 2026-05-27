@@ -85,6 +85,14 @@ from sglang.srt.model_loader.weight_utils import (
     replace_prefix,
     replace_substrings,
 )
+from sglang.srt.models.nemotron_h_utils import (
+    _get_real_num_tokens,
+    _is_attn_layer,
+    _make_layer_communicator,
+    _pad_to_original_num_tokens,
+    _zero_dp_global_padding_rows,
+    _zero_dp_padding_rows,
+)
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -97,117 +105,6 @@ from sglang.srt.utils.custom_op import register_custom_op
 from sglang.utils import logger
 
 _is_cuda = is_cuda()
-
-ATTN_LAYERS = (MAMBA, ATTENTION)
-
-
-def _is_sparse_layer(layer_type: str) -> bool:
-    return layer_type == MOE
-
-
-def _is_attn_layer(layer_type: str) -> bool:
-    return layer_type in ATTN_LAYERS
-
-
-def _get_real_num_tokens(
-    hidden_states: torch.Tensor, forward_batch: ForwardBatch
-) -> int:
-    real_tokens = hidden_states.shape[0]
-    num_token_non_padded_cpu = getattr(
-        forward_batch, "num_token_non_padded_cpu", None
-    )
-    if num_token_non_padded_cpu is not None:
-        real_tokens = min(real_tokens, int(num_token_non_padded_cpu))
-    if (
-        forward_batch.forward_mode.is_extend()
-        and not forward_batch.forward_mode.is_mixed()
-        and forward_batch.extend_seq_lens_cpu is not None
-    ):
-        real_tokens = min(real_tokens, int(sum(forward_batch.extend_seq_lens_cpu)))
-    return real_tokens
-
-
-def _zero_dp_padding_rows(
-    hidden_states: torch.Tensor, forward_batch: ForwardBatch
-) -> torch.Tensor:
-    real_tokens = _get_real_num_tokens(hidden_states, forward_batch)
-    if real_tokens < hidden_states.shape[0]:
-        hidden_states[real_tokens:].zero_()
-    return hidden_states
-
-
-def _zero_dp_padding_rows_pair(
-    hidden_states: torch.Tensor,
-    residual: Optional[torch.Tensor],
-    forward_batch: ForwardBatch,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    real_tokens = _get_real_num_tokens(hidden_states, forward_batch)
-    if real_tokens < hidden_states.shape[0]:
-        hidden_states[real_tokens:].zero_()
-        if residual is not None and residual.shape[0] == hidden_states.shape[0]:
-            residual[real_tokens:].zero_()
-    return hidden_states, residual
-
-
-def _zero_dp_global_padding_rows(
-    hidden_states: torch.Tensor, forward_batch: ForwardBatch
-) -> torch.Tensor:
-    actual_tokens = getattr(forward_batch, "original_global_num_tokens_cpu", None)
-    padded_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
-    if actual_tokens is None or padded_tokens is None:
-        return _zero_dp_padding_rows(hidden_states, forward_batch)
-
-    offset = 0
-    for actual, padded in zip(actual_tokens, padded_tokens):
-        actual = min(int(actual), int(padded))
-        padded = int(padded)
-        if offset + actual < hidden_states.shape[0]:
-            end = min(offset + padded, hidden_states.shape[0])
-            hidden_states[offset + actual : end].zero_()
-        offset += padded
-        if offset >= hidden_states.shape[0]:
-            break
-    return hidden_states
-
-
-def _pad_to_original_num_tokens(
-    output: torch.Tensor,
-    original_num_tokens: int,
-) -> torch.Tensor:
-    if output.shape[0] == original_num_tokens:
-        return output
-    padded = output.new_zeros((original_num_tokens, *output.shape[1:]))
-    padded[: output.shape[0]] = output
-    return padded
-
-
-def _build_layer_scatter_modes() -> LayerScatterModes:
-    # Nemotron-H uses attention/mamba as local-DP, attn-TP-partial producers.
-    # The following MLP/MoE layer is the only place that gathers/reduces that
-    # partial into the full TP layout before scattering back to the local DP slice.
-    return LayerScatterModes(
-        layer_input_mode=ScatterMode.TP_ATTN_FULL,
-        attn_mode=ScatterMode.TP_ATTN_FULL,
-        mlp_mode=ScatterMode.FULL,
-        middle_residual_mode=ScatterMode.TP_ATTN_FULL,
-        layer_output_mode=ScatterMode.TP_ATTN_FULL,
-    )
-
-
-def _make_layer_communicator(
-    layer_norm: RMSNorm,
-    *,
-    for_attn: bool,
-) -> LayerCommunicator:
-    return LayerCommunicator(
-        layer_scatter_modes=_build_layer_scatter_modes(),
-        input_layernorm=layer_norm if for_attn else nn.Identity(),
-        post_attention_layernorm=nn.Identity() if for_attn else layer_norm,
-        # Keep residual+RMSNorm at the same per-token boundary as normal TP
-        # execution. The DP gather should move already-normalized tokens into the
-        # global MLP/MoE TP layout, not change the residual-add boundary.
-        force_layernorm_after_dp_gather=False,
-    )
 
 
 class NemotronHMLP(nn.Module):
@@ -464,8 +361,8 @@ class NemotronHMLPDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if is_dp_attention_enabled():
-            hidden_states, residual = _zero_dp_padding_rows_pair(
-                hidden_states, residual, forward_batch
+            hidden_states, residual = _zero_dp_padding_rows(
+                hidden_states, forward_batch, residual
             )
             hidden_states, residual = self.layer_communicator.prepare_mlp(
                 hidden_states, residual, forward_batch
@@ -518,8 +415,8 @@ class NemotronHMoEDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if is_dp_attention_enabled():
-            hidden_states, residual = _zero_dp_padding_rows_pair(
-                hidden_states, residual, forward_batch
+            hidden_states, residual = _zero_dp_padding_rows(
+                hidden_states, forward_batch, residual
             )
             hidden_states, residual = self.layer_communicator.prepare_mlp(
                 hidden_states, residual, forward_batch
@@ -604,8 +501,8 @@ class NemotronHMambaDecoderLayer(nn.Module):
         if is_dp_attention_enabled():
             if self.prev_layer_is_attn and residual is not None:
                 hidden_states = attn_tp_all_reduce(hidden_states)
-            hidden_states, residual = _zero_dp_padding_rows_pair(
-                hidden_states, residual, forward_batch
+            hidden_states, residual = _zero_dp_padding_rows(
+                hidden_states, forward_batch, residual
             )
             hidden_states, residual = self.layer_communicator.prepare_attn(
                 hidden_states, residual, forward_batch
@@ -622,7 +519,7 @@ class NemotronHMambaDecoderLayer(nn.Module):
             # so keep DP-attention on the explicit forward until the graph op
             # learns the same padding contract.
             output = self._forward_mamba(hidden_states, forward_batch)
-            output = _zero_dp_padding_rows(output, forward_batch)
+            output, _ = _zero_dp_padding_rows(output, forward_batch)
             return output, residual
 
         if residual is None:
@@ -733,24 +630,24 @@ class NemotronHAttention(nn.Module):
             # trim K/V and cache locations to real rows.
             forward_batch.out_cache_loc = original_out_cache_loc[:real_tokens]
 
-        try:
-            qkv, _ = self.qkv_proj(hidden_states)
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            if trim_for_attention:
-                k = k[:real_tokens]
-                v = v[:real_tokens]
-                if trim_q_for_attention:
-                    q = q[:real_tokens]
-            attn_output = self.attn.forward(q, k, v, forward_batch)
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if trim_for_attention:
+            k = k[:real_tokens]
+            v = v[:real_tokens]
             if trim_q_for_attention:
-                padded_attn_output = attn_output.new_zeros(
-                    (padded_shape, attn_output.shape[1])
-                )
-                padded_attn_output[:real_tokens].copy_(attn_output)
-                attn_output = padded_attn_output
-            output, _ = self.o_proj(attn_output)
-        finally:
-            forward_batch.out_cache_loc = original_out_cache_loc
+                q = q[:real_tokens]
+        attn_output = self.attn.forward(q, k, v, forward_batch)
+        # out_cache_loc is only consumed by self.attn.forward (KV write); restore
+        # it right after so the rest of the forward sees the original batch.
+        forward_batch.out_cache_loc = original_out_cache_loc
+        if trim_q_for_attention:
+            padded_attn_output = attn_output.new_zeros(
+                (padded_shape, attn_output.shape[1])
+            )
+            padded_attn_output[:real_tokens].copy_(attn_output)
+            attn_output = padded_attn_output
+        output, _ = self.o_proj(attn_output)
 
         if output.shape[0] > real_tokens:
             output[real_tokens:].zero_()
@@ -792,8 +689,8 @@ class NemotronHAttentionDecoderLayer(nn.Module):
         if is_dp_attention_enabled():
             if self.prev_layer_is_attn and residual is not None:
                 hidden_states = attn_tp_all_reduce(hidden_states)
-            hidden_states, residual = _zero_dp_padding_rows_pair(
-                hidden_states, residual, forward_batch
+            hidden_states, residual = _zero_dp_padding_rows(
+                hidden_states, forward_batch, residual
             )
             hidden_states, residual = self.layer_communicator.prepare_attn(
                 hidden_states, residual, forward_batch

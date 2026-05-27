@@ -209,7 +209,12 @@ class Mamba2Metadata(ForwardMetadata):
             num_prefills = len(forward_batch.extend_seq_lens)
         else:
             num_prefills = len(extend_seq_lens_cpu)
-        num_prefill_tokens = int(forward_metadata.query_start_loc[num_prefills].item())
+        # Compute from CPU-side data to avoid a host-device sync (.item() on a
+        # GPU tensor would block on the prefill query_start_loc).
+        if extend_seq_lens_cpu is not None:
+            num_prefill_tokens = int(sum(extend_seq_lens_cpu))
+        else:
+            num_prefill_tokens = int(forward_batch.extend_num_tokens)
         batch_size = getattr(
             forward_batch, "_original_batch_size", len(forward_batch.seq_lens)
         )

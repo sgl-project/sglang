@@ -1536,9 +1536,11 @@ class RowParallelLinear(LinearBase):
                 get_tp_group(), disabled=not is_allocation_symmetric()
             )
         emulate_global_tp_chunks = 1
-        if (
-            getattr(self, "emulate_global_tp_chunks", False)
-            and self.quant_method.__class__.__name__ == "UnquantizedLinearMethod"
+        # Local import to avoid a circular import at module load time.
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        if getattr(self, "emulate_global_tp_chunks", False) and isinstance(
+            self.quant_method, UnquantizedLinearMethod
         ):
             global_tp_size = get_tensor_model_parallel_world_size()
             if global_tp_size > self.tp_size and global_tp_size % self.tp_size == 0:

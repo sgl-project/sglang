@@ -12,6 +12,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.layers.attention.fla.layernorm_gated import rms_norm_gated
 from sglang.srt.layers.dp_attention import (
+    attn_tp_all_reduce,
     get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -80,7 +81,9 @@ class Mixer2RMSNormGated(MultiPlatformOp):
                 # Compute local sum and then reduce to obtain global sum
                 local_sums = x.pow(2).sum(dim=-1, keepdim=True)
                 if self.use_attn_tp_group:
-                    global_sums = get_attention_tp_group().all_reduce(local_sums)
+                    # NOTE: ProcessGroup.all_reduce is in-place and returns a Work
+                    # handle, so use attn_tp_all_reduce which returns the tensor.
+                    global_sums = attn_tp_all_reduce(local_sums)
                 else:
                     global_sums = tensor_model_parallel_all_reduce(local_sums)
                 # Calculate the variance
