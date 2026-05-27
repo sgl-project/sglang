@@ -101,4 +101,3 @@ Pass LocalService options via `--hicache-storage-backend-extra-config` (JSON). K
 
 
 For more options, see [MemCache Configuration Guide — LocalService Config](https://gitcode.com/Ascend/memcache/blob/master/doc/memcache_config.md#localservice-config).
-

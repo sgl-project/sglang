@@ -83,7 +83,10 @@ def set_default_server_args(args: "ServerArgs"):
 
     # # handles hierarchical cache configs
 
-    if args.enable_hierarchical_cache:
+    if (
+        args.enable_hierarchical_cache
+        or args.disaggregation_decode_enable_offload_kvcache
+    ):
         # Respect user override; only patch default values
         if args.hicache_io_backend == "kernel":
             args.hicache_io_backend = "kernel_ascend"
