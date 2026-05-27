@@ -777,6 +777,136 @@ class ServingResponsesTestCase(unittest.TestCase):
         msg = get_developer_message(instructions="be helpful", tools=tools)
         self.assertIsNotNone(msg)
 
+    def test_tool_call_items_emitted_after_prose(self):
+        # When the parser leaves prose alongside a tool call, the prose must
+        # land in a message item BEFORE the function_call item so the SDK
+        # surfaces "I'll check the weather" before the call it introduces.
+        from openai.types.responses.response_function_tool_call import (
+            ResponseFunctionToolCall,
+        )
+
+        from sglang.srt.function_call.core_types import ToolCallItem
+
+        serving = _make_serving()
+        serving.tool_call_parser = "qwen3_coder"
+
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            store=False,
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        )
+
+        fake_call = ToolCallItem(
+            tool_index=0,
+            name="get_weather",
+            parameters='{"city": "Beijing"}',
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_responses.FunctionCallParser"
+        ) as parser_cls:
+            instance = parser_cls.return_value
+            instance.has_tool_call.return_value = True
+            instance.parse_non_stream.return_value = (
+                "I'll check the weather.",
+                [fake_call],
+            )
+            output_items = serving._make_response_output_items(
+                request, "raw model output", tokenizer=Mock()
+            )
+
+        types = [type(item).__name__ for item in output_items]
+        self.assertEqual(types, ["ResponseOutputMessage", "ResponseFunctionToolCall"])
+
+    def test_previous_response_id_input_list_uses_list_not_copy_module(self):
+        # ``copy`` (the module) is *not* callable; the previous_response
+        # input-list branch must use list()/copy.copy and not crash.
+        from openai.types.responses.response_function_tool_call import (
+            ResponseFunctionToolCall,
+        )
+
+        serving = _make_serving()
+        # Force the harmony path so _construct_input_messages_with_harmony
+        # runs against a real ``request.input`` list.
+        serving.use_harmony = True
+        prev = Mock(id="resp_prev")
+        prev.output = [
+            ResponseFunctionToolCall(
+                arguments="{}",
+                call_id="call_x",
+                name="t",
+                type="function_call",
+                id="fc_x",
+                status="completed",
+            )
+        ]
+
+        request = ResponsesRequest(
+            model="x",
+            input=[{"role": "user", "content": "hi"}],
+            previous_response_id="resp_prev",
+            store=False,
+        )
+
+        try:
+            serving._construct_input_messages_with_harmony(request, prev)
+        except TypeError as exc:
+            # The bug we're regressing on raises "'module' object is not
+            # callable"; surface it.
+            self.fail(f"copy() module-call regression: {exc}")
+        except Exception:
+            # Any other failure (jinja, harmony tokenizer absence on CPU)
+            # is acceptable for this regression — we only assert that we got
+            # past the ``copy()`` call site.
+            pass
+
+    def test_required_tool_choice_without_function_tool_returns_400(self):
+        # tool_choice="required" must reject requests whose only tools are
+        # built-ins we can't actually execute (web_search, mcp, namespace).
+        serving = _make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            tool_choice="required",
+            tools=[{"type": "web_search"}, {"type": "mcp"}],
+            store=False,
+        )
+
+        result = asyncio.run(serving.create_responses(request, raw_request=None))
+        # ORJSONResponse from create_error_response carries status_code 400.
+        self.assertEqual(getattr(result, "status_code", None), 400)
+
+    def test_parallel_tool_calls_false_not_coerced(self):
+        from sglang.srt.entrypoints.openai.protocol import (
+            ResponsesResponse,
+            UsageInfo,
+        )
+
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            parallel_tool_calls=False,
+            store=False,
+        )
+        # ResponsesResponse.from_request must not coerce False → True.
+        response = ResponsesResponse.from_request(
+            request,
+            sampling_params={},
+            model_name="x",
+            created_time=0,
+            output=[],
+            status="completed",
+            usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+        self.assertFalse(response.parallel_tool_calls)
+
     def test_no_tool_call_extraction_when_tool_choice_none(self):
         serving = _make_serving()
         serving.tool_call_parser = "qwen3_coder"

@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import logging
 import time
@@ -175,6 +174,20 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         # FIXME: If the engine is dead, raise an error
         # This is required for the streaming case
+
+        # ``tool_choice="required"`` only has a defined behaviour when the
+        # request carries at least one tool the server can actually execute.
+        # Today that means ``function`` (the rest of the Responses spec is
+        # accepted at the schema level but only routed through harmony or an
+        # attached tool_server, which can't honour ``required``). Reject the
+        # request rather than silently degrading to ``tool_choice="none"``.
+        if request.tool_choice == "required" and not any(
+            tool.type == "function" for tool in (request.tools or [])
+        ):
+            return self.create_error_response(
+                'tool_choice="required" requires at least one tool with '
+                'type="function"; other built-in tool types cannot be forced.'
+            )
 
         # Handle the previous response ID
         prev_response_id = request.previous_response_id
@@ -636,6 +649,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         # client as plain text.
         chat_tools = self._response_tools_to_chat_tools(request)
         is_required = request.tool_choice == "required"
+        tool_call_items: list[ResponseFunctionToolCall] = []
         parsed_via_native = False
         if (
             content
@@ -655,7 +669,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 try:
                     content, call_info_list = parser.parse_non_stream(content)
                     for call_info in call_info_list:
-                        output_items.append(
+                        tool_call_items.append(
                             ResponseFunctionToolCall(
                                 arguments=call_info.parameters or "",
                                 call_id=f"call_{random_uuid()[:24]}",
@@ -685,7 +699,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         arguments = json.dumps(
                             tool.get("parameters", {}), ensure_ascii=False
                         )
-                        output_items.append(
+                        tool_call_items.append(
                             ResponseFunctionToolCall(
                                 arguments=arguments,
                                 call_id=f"call_{random_uuid()[:24]}",
@@ -699,6 +713,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             except Exception as e:
                 logger.error("Required tool JSON parse error: %s", e)
 
+        # Preserve model output order: any prose around the tool call is
+        # emitted before the tool-call items so a "I'll check the weather"
+        # prefix doesn't appear after the function_call item it introduced.
         if content:
             output_text = ResponseOutputText(
                 text=content,
@@ -714,6 +731,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 type="message",
             )
             output_items.append(message)
+        output_items.extend(tool_call_items)
         return output_items
 
     def _make_response_output_items_with_harmony(
@@ -1010,7 +1028,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             messages.append(get_user_message(request.input))
         else:
             if prev_response is not None:
-                prev_outputs = copy(prev_response.output)
+                prev_outputs = list(prev_response.output)
             else:
                 prev_outputs = []
             for response_msg in request.input:
@@ -1912,20 +1930,80 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else:
                     normal_text, tool_calls = delta, []
 
-                if tool_calls:
-                    # Once a tool call appears, any in-progress reasoning or
-                    # text item is finalized to keep the event order valid.
+                # Emit text BEFORE tool calls so a prose prefix ("I'll check
+                # the weather…") stays in front of the function_call it
+                # introduces — both within a single parse step and across
+                # text→tool→text transitions. Any open tool-call items are
+                # finalized when prose resumes so the function_call's
+                # ``output_item.done`` lands before the next message opens.
+                if normal_text:
                     if reasoning_state["open"]:
                         for ev in _close_reasoning_item():
                             yield ev
-                    if message_state["open"]:
-                        for ev in _close_message_item():
+                    for tool_index in list(tool_call_states):
+                        for ev in _close_tool_call_state(tool_index):
                             yield ev
+                    if not message_state["open"]:
+                        item_id = _open_message_item()
+                        yield _send_event(
+                            openai_responses_types.ResponseOutputItemAddedEvent(
+                                type="response.output_item.added",
+                                sequence_number=-1,
+                                output_index=message_state["output_index"],
+                                item=ResponseOutputMessage(
+                                    id=item_id,
+                                    type="message",
+                                    role="assistant",
+                                    content=[],
+                                    status="in_progress",
+                                ),
+                            )
+                        )
+                        yield _send_event(
+                            openai_responses_types.ResponseContentPartAddedEvent(
+                                type="response.content_part.added",
+                                sequence_number=-1,
+                                output_index=message_state["output_index"],
+                                item_id=message_state["item_id"],
+                                content_index=0,
+                                part=openai_responses_types.ResponseOutputText(
+                                    type="output_text",
+                                    text="",
+                                    annotations=[],
+                                    logprobs=None,
+                                ),
+                            )
+                        )
+                    message_state["text"] += normal_text
+                    yield _send_event(
+                        openai_responses_types.ResponseTextDeltaEvent(
+                            type="response.output_text.delta",
+                            sequence_number=-1,
+                            content_index=0,
+                            output_index=message_state["output_index"],
+                            item_id=message_state["item_id"],
+                            delta=normal_text,
+                            logprobs=[],
+                        )
+                    )
+
+                if not tool_calls:
+                    continue
+
+                # Close any in-progress reasoning or message item before
+                # opening the function_call items so the event order stays
+                # valid in OpenAI's typed-SSE schema.
+                if reasoning_state["open"]:
+                    for ev in _close_reasoning_item():
+                        yield ev
+                if message_state["open"]:
+                    for ev in _close_message_item():
+                        yield ev
 
                 for call in tool_calls:
                     tool_index = call.tool_index
                     state = tool_call_states.get(tool_index)
-                    if state is None:
+                    if state is None or state.get("done"):
                         current_output_index += 1
                         item_id = f"fc_{random_uuid()[:8]}"
                         call_id = f"call_{random_uuid()[:24]}"
@@ -1973,56 +2051,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 delta=call.parameters,
                             )
                         )
-
-                if not normal_text:
-                    continue
-
-                if reasoning_state["open"]:
-                    for ev in _close_reasoning_item():
-                        yield ev
-                if not message_state["open"]:
-                    item_id = _open_message_item()
-                    yield _send_event(
-                        openai_responses_types.ResponseOutputItemAddedEvent(
-                            type="response.output_item.added",
-                            sequence_number=-1,
-                            output_index=message_state["output_index"],
-                            item=ResponseOutputMessage(
-                                id=item_id,
-                                type="message",
-                                role="assistant",
-                                content=[],
-                                status="in_progress",
-                            ),
-                        )
-                    )
-                    yield _send_event(
-                        openai_responses_types.ResponseContentPartAddedEvent(
-                            type="response.content_part.added",
-                            sequence_number=-1,
-                            output_index=message_state["output_index"],
-                            item_id=message_state["item_id"],
-                            content_index=0,
-                            part=openai_responses_types.ResponseOutputText(
-                                type="output_text",
-                                text="",
-                                annotations=[],
-                                logprobs=None,
-                            ),
-                        )
-                    )
-                message_state["text"] += normal_text
-                yield _send_event(
-                    openai_responses_types.ResponseTextDeltaEvent(
-                        type="response.output_text.delta",
-                        sequence_number=-1,
-                        content_index=0,
-                        output_index=message_state["output_index"],
-                        item_id=message_state["item_id"],
-                        delta=normal_text,
-                        logprobs=[],
-                    )
-                )
         except Exception as exc:
             logger.exception("Error while streaming /v1/responses")
             failed = ResponsesResponse.from_request(

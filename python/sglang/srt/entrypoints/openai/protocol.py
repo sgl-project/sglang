@@ -1574,7 +1574,11 @@ class ResponsesResponse(BaseModel):
             output=output,
             status=status,
             usage=usage,
-            parallel_tool_calls=request.parallel_tool_calls or True,
+            parallel_tool_calls=(
+                request.parallel_tool_calls
+                if request.parallel_tool_calls is not None
+                else True
+            ),
             tool_choice=request.tool_choice,
             tools=request.tools,
             # fields for parity with v1/responses
