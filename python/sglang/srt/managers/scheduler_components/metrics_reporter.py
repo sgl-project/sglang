@@ -661,8 +661,11 @@ class SchedulerMetricsReporter:
             self.stats.fwd_occupancy = self.fwd_occupancy
             self._update_lora_metrics()
             self._log_hicache_stats()
-            self.metrics_collector.log_stats(self.stats)
+            # Mark the flush invariant before emitting so a log_stats
+            # exception cannot leave the next idle iteration throttled
+            # back to the 30 s stale-gauge state.
             self._idle_flush_pending = True
+            self.metrics_collector.log_stats(self.stats)
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
 
@@ -880,8 +883,11 @@ class SchedulerMetricsReporter:
             self.stats.fwd_occupancy = self.fwd_occupancy
             self._update_lora_metrics()
             self._log_hicache_stats()
-            self.metrics_collector.log_stats(self.stats)
+            # See report_prefill_stats — flag the flush invariant before
+            # emitting so an exception in log_stats does not regress to
+            # the 30 s stale-gauge throttle.
             self._idle_flush_pending = True
+            self.metrics_collector.log_stats(self.stats)
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
 
