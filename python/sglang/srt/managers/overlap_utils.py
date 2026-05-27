@@ -104,16 +104,16 @@ class FutureMap:
         self.new_seq_lens_buf = torch.empty(
             (self.req_pool_size,), dtype=torch.int64, device=self.device
         )
-        # Pinned host copy of new_seq_lens_buf + private stream for the
-        # seq_lens_cpu pull (gated only on publish, off the schedule stream).
+        # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
+        # D2H pulls (gated only on publish, off the schedule stream).
         if _is_cuda or _is_hip:
             self.new_seq_lens_cpu_pinned = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, pin_memory=True
             )
-            self.seq_lens_copy_stream = torch.get_device_module(self.device).Stream()
+            self.fwd_prepare_d2h_stream = torch.get_device_module(self.device).Stream()
         else:
             self.new_seq_lens_cpu_pinned = None
-            self.seq_lens_copy_stream = None
+            self.fwd_prepare_d2h_stream = None
         if self.spec_algo.is_some():
             self._forward_buf_initialized = False
 
@@ -205,17 +205,17 @@ class FutureMap:
             self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
-        if self.seq_lens_copy_stream is None or self.publish_ready is None:
+        if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
             batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
             return
 
         # seq_lens_cpu off the schedule stream: D2H the relay buf on a private
         # stream (gated on publish), host-select via req_pool_indices_cpu.
-        self.seq_lens_copy_stream.wait_event(self.publish_ready)
-        with torch.get_device_module(self.device).stream(self.seq_lens_copy_stream):
+        self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
+        with torch.get_device_module(self.device).stream(self.fwd_prepare_d2h_stream):
             self.new_seq_lens_cpu_pinned.copy_(self.new_seq_lens_buf, non_blocking=True)
-        self.seq_lens_copy_stream.synchronize()
+        self.fwd_prepare_d2h_stream.synchronize()
         batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
