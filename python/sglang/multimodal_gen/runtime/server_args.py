@@ -219,6 +219,9 @@ class ServerArgs(DisaggArgsMixin):
     # Compilation
     enable_torch_compile: bool = False
 
+    # NVTX profiling
+    enable_layerwise_nvtx_marker: bool = False
+
     # warmup
     warmup: bool = False
     warmup_resolutions: list[str] = None
@@ -503,6 +506,18 @@ class ServerArgs(DisaggArgsMixin):
         return (
             self.ltx2_two_stage_device_mode == "snapshot"
             and self._is_ltx23_two_stage_pipeline()
+        )
+
+    def _uses_ltx23_high_memory_resident_two_stage_mode(self) -> bool:
+        if (
+            self.ltx2_two_stage_device_mode != "resident"
+            or not self._is_ltx23_two_stage_pipeline()
+            or not current_platform.is_cuda()
+        ):
+            return False
+        return (
+            current_platform.get_device_total_memory() / BYTES_PER_GB
+            >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB
         )
 
     def _adjust_attention_backend(self):
@@ -1178,6 +1193,17 @@ class ServerArgs(DisaggArgsMixin):
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
         )
 
+        parser.add_argument(
+            "--enable-layerwise-nvtx-marker",
+            action=StoreBoolean,
+            default=ServerArgs.enable_layerwise_nvtx_marker,
+            help="Enable layerwise NVTX markers for profiling with Nsight Systems. "
+            "Adds NVTX ranges around each pipeline stage, the denoising loop, "
+            "every denoising step, the predict_noise / scheduler_step "
+            "sub-operations, and every transformer submodule forward (recursive). "
+            "Warmup steps are excluded to keep captured traces clean.",
+        )
+
         # warmup
         parser.add_argument(
             "--warmup",
@@ -1292,8 +1318,9 @@ class ServerArgs(DisaggArgsMixin):
                 "auto-detected from the checkpoint config or safetensors metadata when "
                 "possible. Applies to both pre-quantized checkpoints and online "
                 "quantization. Use this flag to override auto-detection. "
-                "Options: 'fp8', 'mxfp8', 'mxfp4', 'modelslim'. "
-                "Note: MXFP4 requires ROCm and MI350+ (gfx95x)."
+                "Options: 'fp8', 'mxfp8', 'mxfp4', 'mxfp4_npu', 'modelslim'. "
+                "Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "
+                "'mxfp4_npu' / 'mxfp8' target Ascend NPU (A5 series for mxfp4_npu)."
             ),
         )
         parser.add_argument(

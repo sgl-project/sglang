@@ -26,8 +26,8 @@ import heapq
 import logging
 import sys
 import time
+from array import array
 from collections import defaultdict
-from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
 import torch
@@ -70,7 +70,7 @@ class RadixKey:
 
     def __init__(
         self,
-        token_ids: List[int],
+        token_ids: array[int],
         extra_key: Optional[str] = None,
         is_bigram: bool = False,
     ):
@@ -87,6 +87,7 @@ class RadixKey:
             return n - 1 if n > 0 else 0
         return len(self.token_ids)
 
+    # TODO(Jialin): vectorize with numpy without PyLong boxing
     def __iter__(self) -> Iterator:
         if self.is_bigram:
             t = self.token_ids
@@ -110,7 +111,7 @@ class RadixKey:
         if self.is_bigram:
             # bigrams [start, stop) span raw tokens [start, stop + 1);
             # empty slice -> empty raw tokens (not a dangling boundary token).
-            raw = self.token_ids[start : stop + 1] if stop > start else []
+            raw = self.token_ids[start : stop + 1] if stop > start else array("q")
             return RadixKey(raw, self.extra_key, is_bigram=True)
         return RadixKey(self.token_ids[start:stop], self.extra_key)
 
@@ -144,6 +145,7 @@ class RadixKey:
                 f"{self.extra_key=} != {other.extra_key=}"
             )
 
+    # TODO(Jialin): replace zip with numpy to skip per-element PyLong boxing
     def match(self, other: "RadixKey", page_size: int = 1) -> int:
         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
         self._check_compatible(other)
@@ -255,7 +257,6 @@ class TreeNode:
             return None
         return self.hash_value[-1]
 
-    @lru_cache(maxsize=1)
     def get_prefix_hash_values(self, node: TreeNode) -> List[str]:
         if node is None or node.hash_value is None:
             return []
@@ -337,7 +338,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
     def reset(self):
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)
-        self.root_node.key = RadixKey(token_ids=[], extra_key=None)
+        self.root_node.key = RadixKey(token_ids=array("q"), extra_key=None)
         self.root_node.value = []
         self.root_node.host_value = []
         self.root_node.lock_ref = 1
@@ -811,20 +812,15 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 if __name__ == "__main__":
     tree = RadixCache.create_simulated()
 
-    # Example token id sequences (as lists of ints)
-    tree.insert(InsertParams(key=RadixKey(token_ids=[1, 2, 3], extra_key=None)))
-    tree.insert(InsertParams(key=RadixKey(token_ids=[1, 2, 3], extra_key=None)))
-    tree.insert(InsertParams(key=RadixKey(token_ids=[1, 2, 4, 5], extra_key=None)))
-    tree.insert(
-        InsertParams(key=RadixKey(token_ids=[1, 2, 4, 5, 6, 7], extra_key=None))
-    )
-    tree.insert(
-        InsertParams(key=RadixKey(token_ids=[8, 9, 10, 11, 12], extra_key=None))
-    )
+    tree.insert(InsertParams(key=RadixKey(token_ids=array("q", [1, 2, 3]))))
+    tree.insert(InsertParams(key=RadixKey(token_ids=array("q", [1, 2, 3]))))
+    tree.insert(InsertParams(key=RadixKey(token_ids=array("q", [1, 2, 4, 5]))))
+    tree.insert(InsertParams(key=RadixKey(token_ids=array("q", [1, 2, 4, 5, 6, 7]))))
+    tree.insert(InsertParams(key=RadixKey(token_ids=array("q", [8, 9, 10, 11, 12]))))
     tree.pretty_print()
 
     print(
         tree.match_prefix(
-            MatchPrefixParams(key=RadixKey(token_ids=[1, 2, 3, 13, 14], extra_key=None))
+            MatchPrefixParams(key=RadixKey(token_ids=array("q", [1, 2, 3, 13, 14])))
         )
     )

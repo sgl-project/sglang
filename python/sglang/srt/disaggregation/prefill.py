@@ -510,11 +510,22 @@ class SchedulerDisaggregationPrefillMixin:
                 logits_output.input_token_logprobs = tuple(
                     logits_output.input_token_logprobs.tolist()
                 )
+            if logits_output.next_token_top_logprobs_val:
+                logits_output.next_token_top_logprobs_val = [
+                    v.tolist() for v in logits_output.next_token_top_logprobs_val
+                ]
+                logits_output.next_token_top_logprobs_idx = [
+                    x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                ]
+            if logits_output.next_token_token_ids_logprobs_val:
+                logits_output.next_token_token_ids_logprobs_val = [
+                    v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
+                ]
 
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
-            if req.is_chunked <= 0:
+            if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
                 # There is no output_ids for prefill
@@ -564,7 +575,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req.grammar.finished = req.finished()
             else:
                 # being chunked reqs' prefill is not finished
-                req.is_chunked -= 1
+                req.inflight_middle_chunks -= 1
 
                 if req.return_logprob:
                     extend_logprob_start_len = extend_logprob_start_len_per_req[i]
@@ -586,7 +597,7 @@ class SchedulerDisaggregationPrefillMixin:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
-        can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+        can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
             batch=batch,
             prefill_stats=batch.prefill_stats,
@@ -818,7 +829,7 @@ class SchedulerDisaggregationPrefillMixin:
                     window_kv_indices_swa.cpu().numpy(), page_size
                 )
 
-            def _nsa_payload():
+            def _dsa_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
@@ -833,8 +844,8 @@ class SchedulerDisaggregationPrefillMixin:
                     state_indices.append(_mamba_payload())
                 elif st == StateType.SWA:
                     state_indices.append(_swa_payload())
-                elif st == StateType.NSA:
-                    state_indices.append(_nsa_payload())
+                elif st == StateType.DSA:
+                    state_indices.append(_dsa_payload())
                 else:
                     state_indices.append(None)
 

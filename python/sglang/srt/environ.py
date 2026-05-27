@@ -134,6 +134,41 @@ class EnvInt(EnvField):
             raise ValueError(f'"{value}" is not a valid integer value')
 
 
+class _DeprecatedEnvFallback:
+    """Mixin for EnvField subclasses: if the canonical env var is not set,
+    check *deprecated_name* and emit DeprecationWarning before reading it.
+
+    Usage:
+        SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(True, deprecated_name="SGLANG_NSA_FUSE_TOPK")
+    """
+
+    def __init__(self, default: Any, deprecated_name: str):
+        super().__init__(default)
+        self.deprecated_name = deprecated_name
+
+    def get(self) -> Any:
+        if os.getenv(self.name) is None:
+            fallback = os.getenv(self.deprecated_name)
+            if fallback is not None:
+                warnings.warn(
+                    f"Environment variable '{self.deprecated_name}' is deprecated; "
+                    f"use '{self.name}' instead. "
+                    "The alias will be removed in a future release.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                os.environ[self.name] = fallback
+        return super().get()
+
+
+class EnvBoolWithAlias(_DeprecatedEnvFallback, EnvBool):
+    pass
+
+
+class EnvIntWithAlias(_DeprecatedEnvFallback, EnvInt):
+    pass
+
+
 class EnvFloat(EnvField):
     def parse(self, value: str) -> float:
         try:
@@ -205,6 +240,7 @@ class Envs:
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
+    SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
@@ -252,12 +288,16 @@ class Envs:
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
+    # since process_batch_result_prefill discards next_token_ids for those anyway.
+    SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
+    SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
     SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(None)
     SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
     SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
@@ -305,6 +345,8 @@ class Envs:
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
+    SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)
+    SGLANG_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)
 
     # Mooncake Store
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
@@ -368,6 +410,8 @@ class Envs:
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
+    # Enable per-token NVFP4 activation scaling path for FlashInfer TRT-LLM MoE.
+    SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
@@ -423,11 +467,21 @@ class Envs:
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
 
-    # NSA Backend
-    SGLANG_NSA_FUSE_TOPK = EnvBool(True)
-    SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
+    # DSA Backend (canonical names; fall back to SGLANG_NSA_* with deprecation warning)
+    SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(True, deprecated_name="SGLANG_NSA_FUSE_TOPK")
+    SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
+    SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
+    SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBoolWithAlias(
+        True, deprecated_name="SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA"
+    )
+    SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
+        2048, deprecated_name="SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"
+    )
+    SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
+    )
+    SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
-    SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -472,8 +526,10 @@ class Envs:
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
-    SGLANG_SPEC_NAN_DETECTION = EnvBool(False)
-    SGLANG_SPEC_OOB_DETECTION = EnvBool(False)
+    # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
+    # page alignment). Off in prod; tests turn it on to fail-fast on
+    # numerical / index violations instead of getting silent NaN cascades.
+    SGLANG_ENABLE_ASYNC_ASSERT = EnvBool(False)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
@@ -571,6 +627,17 @@ class Envs:
 
     # ====================================================================
     # DeepSeek V4
+    SGLANG_OPT_DPSK_V4_RADIX = EnvBool(True)
+    SGLANG_OPT_USE_OLD_COMPRESSOR = EnvBool(False)
+    SGLANG_OPT_USE_TRITON_SWA_PREPARE = EnvBool(True)
+    SGLANG_OPT_USE_AITER_MHC_PRE = EnvBool(True)
+    SGLANG_OPT_USE_AITER_MHC_POST = EnvBool(True)
+    SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
+    SGLANG_OPT_USE_FUSED_COMPRESS = EnvBool(False)
+    SGLANG_OPT_USE_FUSED_COMPRESS_TRITON = EnvBool(False)
+    SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
+    SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL = EnvBool(True)
+    SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
     # ====================================================================
 
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
@@ -584,6 +651,7 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
+    SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
@@ -628,6 +696,7 @@ class Envs:
 
     # Cache / overlap
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
+    SGLANG_OPT_USE_JIT_NORM = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # CUDA graph
@@ -648,6 +717,9 @@ class Envs:
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
+    SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU = EnvBool(False)
+    SGLANG_ENCODER_MAX_BATCH_SIZE = EnvInt(8)
+    SGLANG_ENCODER_REQ_TIMEOUT = EnvFloat(180.0)
 
     # Elastic EP Backup Port
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
