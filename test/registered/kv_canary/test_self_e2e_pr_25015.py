@@ -48,6 +48,8 @@ class _EaglePositionsBase(CanaryE2EBase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        if cls is _EaglePositionsBase:
+            raise unittest.SkipTest("abstract base; concrete subclasses set revert_pr")
         cls.extra_env = (
             _SPEC_EAGLE_REVERT_PR_ENV if cls.revert_pr else _SPEC_EAGLE_TOKEN_ORACLE_ENV
         )

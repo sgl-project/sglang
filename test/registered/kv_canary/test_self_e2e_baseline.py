@@ -14,10 +14,16 @@ class _BaselineBase(CanaryE2EBase):
     """No perturb, kv-canary=log, sweep off. Server should run clean with no canary
     violations and every request must come back 200."""
 
-    __test__ = False
+    __test__ = False  # pytest convention; unittest skip is in setUpClass below.
 
     kv_canary_mode = CanaryMode.LOG
     extra_env = {}
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if cls is _BaselineBase:
+            raise unittest.SkipTest("abstract base; concrete subclasses set model_mode")
+        super().setUpClass()
 
     def test_no_violation(self) -> None:
         """Verify the baseline canary run completes without violations."""

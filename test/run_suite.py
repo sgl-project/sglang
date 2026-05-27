@@ -284,14 +284,9 @@ def run_a_suite(args):
     files += glob.glob(
         os.path.join(jit_kernel_dir, "tests", "**", "test_*.py"), recursive=True
     )
-    files += [
-        f
-        for f in glob.glob(
-            os.path.join(jit_kernel_dir, "benchmark", "**", "bench_*.py"),
-            recursive=True,
-        )
-        if not f.endswith("/kv_canary/bench_helpers.py")
-    ]
+    files += glob.glob(
+        os.path.join(jit_kernel_dir, "benchmark", "**", "bench_*.py"), recursive=True
+    )
 
     # Strict: all discovered files must have proper registration
     sanity_check = True

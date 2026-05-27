@@ -38,6 +38,8 @@ class _EagleChunkedRotationBase(CanaryE2EBase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        if cls is _EagleChunkedRotationBase:
+            raise unittest.SkipTest("abstract base; concrete subclasses set revert_pr")
         cls.extra_env = {"SGLANG_DEBUG_REVERT_PR": "26329"} if cls.revert_pr else {}
         super().setUpClass()
 

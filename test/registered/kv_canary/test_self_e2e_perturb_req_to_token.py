@@ -11,7 +11,7 @@ register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
 
 
 class _PerturbReqToTokenBase(CanaryE2EBase):
-    __test__ = False
+    __test__ = False  # pytest convention; unittest skip is in setUpClass below.
 
     kv_canary_mode = CanaryMode.LOG
     extra_env = {
@@ -24,6 +24,12 @@ class _PerturbReqToTokenBase(CanaryE2EBase):
         # mode so the leak warning doesn't crash the scheduler.
         "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "0",
     }
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if cls is _PerturbReqToTokenBase:
+            raise unittest.SkipTest("abstract base; concrete subclasses set model_mode")
+        super().setUpClass()
 
     def test_req_to_token_perturbation_reports_chain_hash_violation(self) -> None:
         """Verify req_to_token perturbation reports a chain hash violation."""

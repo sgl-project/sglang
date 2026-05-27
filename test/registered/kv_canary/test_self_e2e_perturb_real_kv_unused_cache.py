@@ -13,7 +13,7 @@ register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
 
 
 class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
-    __test__ = False
+    __test__ = False  # pytest convention; unittest skip is in setUpClass below.
 
     kv_canary_mode = CanaryMode.LOG
     extra_server_args = (
@@ -28,6 +28,10 @@ class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        if cls is _PerturbRealKvUnusedCacheBase:
+            raise unittest.SkipTest(
+                "abstract base; concrete subclasses set model_mode + target_group"
+            )
         cls.extra_env = {
             "SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB": "0.1",
             "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": str(cls.target_group),

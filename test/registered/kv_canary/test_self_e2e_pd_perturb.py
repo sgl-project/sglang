@@ -19,6 +19,10 @@ class _PDPerturbBase(CanaryPDFixture):
 
     @classmethod
     def setUpClass(cls) -> None:
+        if cls is _PDPerturbBase:
+            raise unittest.SkipTest(
+                "abstract base; concrete subclasses set model_mode + target_group"
+            )
         cls.extra_prefill_env = {
             "SGLANG_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB": "1.0",
             "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": str(cls.target_group),

@@ -2184,12 +2184,6 @@ class CustomTestCase(unittest.TestCase):
         orig_func = setup.__func__
 
         def safe_setUpClass(klass):
-            # Honor the pytest `__test__ = False` convention on abstract base
-            # test classes. unittest does not skip these natively, so without
-            # this guard their setUpClass runs and typically fails because the
-            # base lacks attributes that the subclasses define.
-            if not getattr(klass, "__test__", True):
-                raise unittest.SkipTest(f"{klass.__name__}: __test__ = False")
             try:
                 orig_func(klass)
             except Exception:
