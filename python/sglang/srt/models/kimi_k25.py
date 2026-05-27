@@ -681,11 +681,8 @@ class KimiK25ForConditionalGeneration(nn.Module):
         return self.language_model
 
     def __setattr__(self, name, value):
-        # Block writes to "model" so the runner's
-        # `self.model.model = resolve_language_model(self.model)` is a no-op
-        # instead of duplicate nn.Module registration. nn.Module.__setattr__
-        # bypasses @property setters for Module values, so the guard must live
-        # here to keep state_dict and loading paths unchanged.
+        # Skip redundant self.model.model assignment in runner to avoid duplicate
+        # nn.Module registration.
         if name == "model":
             return
         super().__setattr__(name, value)
