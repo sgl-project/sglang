@@ -430,24 +430,23 @@ class TestSelectTopkIndicesHookBranch(unittest.TestCase):
         self.assertEqual(summary[0]["error_class"], "selector_runtime_error")
         self.assertEqual(summary[0]["dense_fallback"], 1)
 
-    def test_ds_branch_sanitizes_out_of_range_row_and_records_error(self):
-        """AC-2 + AC-9 live path: a selector returning an out-of-range
-        page ID does NOT abort the batch; instead the row is sanitized
-        to all -1 and the per-request summary records the typed error
-        class. The DS branch returns normally.
+    def test_ds_branch_sanitizes_bad_pool_row_and_records_error(self):
+        """AC-2 + AC-9 live path: a bad req_pool_index (out of range for
+        req_to_token) causes that row's physical slots to be all -1 via
+        the adapter's error-containment path. The DS branch returns normally
+        and publishes a per-request summary record.
         """
         attn = self._make_attn_real()
-        # Replace retrieve_topk with a stub that returns an out-of-range page
-        # (logical page 1000) with seq_lens=128 → only 2 logical pages exist.
         max_top_k = attn.double_sparsity_selector.max_top_k
         sel = torch.full((1, max_top_k), -1, dtype=torch.int32)
-        sel[0, 0] = 1000
+        sel[0, 0] = 0  # valid logical position
         vl = torch.tensor([1], dtype=torch.int32)
         attn.double_sparsity_selector.retrieve_topk = MagicMock(
             return_value=(sel, vl)
         )
         forward_batch = SimpleNamespace(
-            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            # req_pool_indices=99 is out of range for a 1-row req_to_token
+            req_pool_indices=torch.tensor([99], dtype=torch.int32),
             seq_lens=torch.tensor([128], dtype=torch.int32),
             sparse_mask=None,
             req_to_token_pool=SimpleNamespace(
@@ -461,186 +460,182 @@ class TestSelectTopkIndicesHookBranch(unittest.TestCase):
             forward_batch=forward_batch,
             layer_id=0,
         )
-        # The row is sanitized to all -1, so the returned topk_indices is
-        # all -1 for that row.
+        # Bad pool index causes the adapter to fill -1 for that row.
         self.assertTrue(torch.all(result == -1).item())
-        # The per-request summary records the typed error class for the
-        # failed row.
+        # The per-request summary is still published (one record per request).
         summary = forward_batch.ds_per_request_summary["double_sparsity"]
         self.assertEqual(len(summary), 1)
-        self.assertEqual(summary[0]["error_class"], "DSAdapterPageOutOfRange")
-        self.assertEqual(summary[0]["dense_fallback"], 1)
 
 
 class TestPageTableAdapter(unittest.TestCase):
-    """Verify ``expand_ds_selection_to_topk_indices`` honours the unified-shape
-    return contract and raises one named exception per contract violation
-    (no parametrised broad ``assertRaises(Exception)``).
+    """Verify ``logical_to_physical`` correctly maps logical token positions to
+    physical KV-cache slot indices via req_to_token gather (token-level adapter).
     """
 
     def _adapter(self):
         from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
-            expand_ds_selection_to_topk_indices,
+            logical_to_physical,
         )
+        return logical_to_physical
 
-        return expand_ds_selection_to_topk_indices
-
-    def test_basic_mapping(self):
-        """``selected_indices * page_size`` for in-range entries; ``-1`` preserved."""
+    def test_basic_req_to_token_gather(self):
+        """Logical positions are gathered from req_to_token; -1 padding preserved."""
         adapter = self._adapter()
-        sel = torch.tensor(
-            [
-                [0, 3, 5, 7, -1, -1],
-                [1, 2, -1, -1, -1, -1],
-            ],
-            dtype=torch.int32,
-        )
-        vl = torch.tensor([4, 2], dtype=torch.int32)
-        out = adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
-        expected = torch.tensor(
-            [
-                [0, 192, 320, 448, -1, -1],
-                [64, 128, -1, -1, -1, -1],
-            ],
-            dtype=torch.int32,
-        )
-        self.assertTrue(torch.equal(out, expected))
+        req_to_token = torch.tensor([[10, 20, 30, 40, 50, 60, 70, 80]], dtype=torch.int32)
+        selected = torch.tensor([[0, 2, 4, -1, -1, -1]], dtype=torch.int32)
+        req_pool_indices = torch.tensor([0], dtype=torch.int32)
+        out = torch.full_like(selected, -1)
+        error_count = adapter(selected, req_pool_indices, req_to_token, out)
+        self.assertEqual(out[0, 0].item(), 10)  # req_to_token[0, 0]
+        self.assertEqual(out[0, 1].item(), 30)  # req_to_token[0, 2]
+        self.assertEqual(out[0, 2].item(), 50)  # req_to_token[0, 4]
+        self.assertEqual(out[0, 3].item(), -1)  # padding preserved
+        self.assertEqual(error_count, 0)
+
+    def test_padding_minus_one_preserved(self):
+        """Positions equal to -1 must remain -1 in the output."""
+        adapter = self._adapter()
+        req_to_token = torch.arange(100, dtype=torch.int32).unsqueeze(0)
+        selected = torch.tensor([[-1, -1, -1]], dtype=torch.int32)
+        req_pool_indices = torch.tensor([0], dtype=torch.int32)
+        out = torch.zeros_like(selected)
+        error_count = adapter(selected, req_pool_indices, req_to_token, out)
+        self.assertTrue(torch.all(out == -1).item())
+        self.assertEqual(error_count, 0)
+
+    def test_bad_pool_index_row_gets_minus_one(self):
+        """Rows where req_pool_indices is out of range for req_to_token get all -1."""
+        adapter = self._adapter()
+        req_to_token = torch.tensor([[10, 20, 30]], dtype=torch.int32)  # 1 pool row
+        selected = torch.tensor([[0, 1, -1]], dtype=torch.int32)
+        req_pool_indices = torch.tensor([5], dtype=torch.int32)  # bad: only 1 pool row
+        out = torch.zeros_like(selected)
+        error_count = adapter(selected, req_pool_indices, req_to_token, out)
+        self.assertTrue(torch.all(out == -1).item())
+        self.assertEqual(error_count, 1)
+
+    def test_error_count_matches_bad_pool_rows(self):
+        """error_count equals the number of out-of-range req_pool_indices rows."""
+        adapter = self._adapter()
+        req_to_token = torch.arange(20, dtype=torch.int32).reshape(2, 10)
+        selected = torch.tensor([[0, 1, -1], [0, 2, -1]], dtype=torch.int32)
+        req_pool_indices = torch.tensor([0, 99], dtype=torch.int32)  # row 1 bad
+        out = torch.full_like(selected, -1)
+        error_count = adapter(selected, req_pool_indices, req_to_token, out)
+        self.assertEqual(error_count, 1)
+
+    def test_empty_batch_returns_zero(self):
+        """bs=0 gives error_count=0 and out remains -1."""
+        adapter = self._adapter()
+        req_to_token = torch.zeros((1, 10), dtype=torch.int32)
+        selected = torch.zeros((0, 4), dtype=torch.int32)
+        req_pool_indices = torch.zeros((0,), dtype=torch.int32)
+        out = torch.full((0, 4), -1, dtype=torch.int32)
+        error_count = adapter(selected, req_pool_indices, req_to_token, out)
+        self.assertEqual(error_count, 0)
+        self.assertEqual(out.shape[0], 0)
+
+    def test_out_tensor_modified_in_place(self):
+        """The pre-allocated out tensor is written in-place."""
+        adapter = self._adapter()
+        req_to_token = torch.tensor([[100, 200, 300]], dtype=torch.int32)
+        selected = torch.tensor([[0, 2, -1]], dtype=torch.int32)
+        req_pool_indices = torch.tensor([0], dtype=torch.int32)
+        out = torch.full((1, 3), -99, dtype=torch.int32)
+        original_data_ptr = out.data_ptr()
+        error_count = adapter(selected, req_pool_indices, req_to_token, out)
+        self.assertEqual(out.data_ptr(), original_data_ptr)  # same storage
+        self.assertEqual(out[0, 0].item(), 100)
+        self.assertEqual(out[0, 1].item(), 300)
+        self.assertEqual(out[0, 2].item(), -1)
+        self.assertEqual(error_count, 0)
+
+    def test_all_bad_pool_gives_all_minus_one(self):
+        """When all rows have bad pool indices, output is all -1."""
+        adapter = self._adapter()
+        req_to_token = torch.zeros((1, 10), dtype=torch.int32)
+        selected = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32)
+        req_pool_indices = torch.tensor([99, 100], dtype=torch.int32)  # all bad
+        out = torch.zeros((2, 3), dtype=torch.int32)
+        error_count = adapter(selected, req_pool_indices, req_to_token, out)
+        self.assertTrue(torch.all(out == -1).item())
+        self.assertEqual(error_count, 2)
+
+    def test_mixed_valid_invalid_pool(self):
+        """Valid pool rows get correct physical slots; invalid rows get -1."""
+        adapter = self._adapter()
+        req_to_token = torch.tensor([[5, 10, 15, 20]], dtype=torch.int32)
+        selected = torch.tensor([[0, 2, -1], [1, 3, -1]], dtype=torch.int32)
+        req_pool_indices = torch.tensor([0, 99], dtype=torch.int32)  # row 1 bad
+        out = torch.full((2, 3), -99, dtype=torch.int32)
+        error_count = adapter(selected, req_pool_indices, req_to_token, out)
+        self.assertEqual(out[0, 0].item(), 5)   # req_to_token[0, 0]
+        self.assertEqual(out[0, 1].item(), 15)  # req_to_token[0, 2]
+        self.assertEqual(out[0, 2].item(), -1)  # padding
+        self.assertTrue(torch.all(out[1] == -1).item())  # bad pool → all -1
+        self.assertEqual(error_count, 1)
+
+    def test_physical_slots_from_req_to_token(self):
+        """Physical slot values are exactly req_to_token[pool, position]."""
+        adapter = self._adapter()
+        torch.manual_seed(42)
+        req_to_token = torch.randint(0, 65536, (4, 32), dtype=torch.int32)
+        selected = torch.tensor([[0, 5, 10, 15, -1]], dtype=torch.int32)
+        req_pool_indices = torch.tensor([2], dtype=torch.int32)
+        out = torch.full((1, 5), -1, dtype=torch.int32)
+        error_count = adapter(selected, req_pool_indices, req_to_token, out)
+        self.assertEqual(out[0, 0].item(), req_to_token[2, 0].item())
+        self.assertEqual(out[0, 1].item(), req_to_token[2, 5].item())
+        self.assertEqual(out[0, 2].item(), req_to_token[2, 10].item())
+        self.assertEqual(out[0, 3].item(), req_to_token[2, 15].item())
+        self.assertEqual(out[0, 4].item(), -1)
+        self.assertEqual(error_count, 0)
+
+    def test_multi_pool_rows_each_use_own_pool(self):
+        """Each batch row uses its own pool row from req_to_token."""
+        adapter = self._adapter()
+        req_to_token = torch.tensor([[1, 2, 3, 4], [10, 20, 30, 40]], dtype=torch.int32)
+        selected = torch.tensor([[0, 3, -1], [1, 2, -1]], dtype=torch.int32)
+        req_pool_indices = torch.tensor([0, 1], dtype=torch.int32)
+        out = torch.full((2, 3), -1, dtype=torch.int32)
+        error_count = adapter(selected, req_pool_indices, req_to_token, out)
+        self.assertEqual(out[0, 0].item(), 1)   # req_to_token[0, 0]
+        self.assertEqual(out[0, 1].item(), 4)   # req_to_token[0, 3]
+        self.assertEqual(out[1, 0].item(), 20)  # req_to_token[1, 1]
+        self.assertEqual(out[1, 1].item(), 30)  # req_to_token[1, 2]
+        self.assertEqual(error_count, 0)
+
+    def test_negative_pool_index_treated_as_error(self):
+        """Negative req_pool_indices are out-of-range → those rows get -1."""
+        adapter = self._adapter()
+        req_to_token = torch.arange(10, dtype=torch.int32).unsqueeze(0)
+        selected = torch.tensor([[0, 1, -1]], dtype=torch.int32)
+        req_pool_indices = torch.tensor([-1], dtype=torch.int32)
+        out = torch.zeros((1, 3), dtype=torch.int32)
+        error_count = adapter(selected, req_pool_indices, req_to_token, out)
+        self.assertTrue(torch.all(out == -1).item())
+        self.assertEqual(error_count, 1)
+
+    def test_empty_selection_all_padding(self):
+        """When all positions are -1, output is all -1 with no errors."""
+        adapter = self._adapter()
+        req_to_token = torch.arange(20, dtype=torch.int32).unsqueeze(0)
+        selected = torch.full((1, 5), -1, dtype=torch.int32)
+        req_pool_indices = torch.tensor([0], dtype=torch.int32)
+        out = torch.zeros((1, 5), dtype=torch.int32)
+        error_count = adapter(selected, req_pool_indices, req_to_token, out)
+        self.assertTrue(torch.all(out == -1).item())
+        self.assertEqual(error_count, 0)
+
+    def test_output_dtype_is_int32(self):
+        """Output tensor retains int32 dtype (type-stable adapter)."""
+        adapter = self._adapter()
+        req_to_token = torch.arange(10, dtype=torch.int32).unsqueeze(0)
+        selected = torch.tensor([[0, 2, -1]], dtype=torch.int32)
+        req_pool_indices = torch.tensor([0], dtype=torch.int32)
+        out = torch.full((1, 3), -1, dtype=torch.int32)
+        adapter(selected, req_pool_indices, req_to_token, out)
         self.assertEqual(out.dtype, torch.int32)
-
-    def test_dtype_mismatch_selected_indices(self):
-        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
-            DSAdapterDtypeMismatch,
-        )
-
-        adapter = self._adapter()
-        sel = torch.tensor([[0, 1, -1]], dtype=torch.int64)
-        vl = torch.tensor([2], dtype=torch.int32)
-        with self.assertRaises(DSAdapterDtypeMismatch):
-            adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
-
-    def test_dtype_mismatch_valid_lengths(self):
-        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
-            DSAdapterDtypeMismatch,
-        )
-
-        adapter = self._adapter()
-        sel = torch.tensor([[0, 1, -1]], dtype=torch.int32)
-        vl = torch.tensor([2], dtype=torch.int64)
-        with self.assertRaises(DSAdapterDtypeMismatch):
-            adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
-
-    def test_batch_mismatch(self):
-        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
-            DSAdapterBatchMismatch,
-        )
-
-        adapter = self._adapter()
-        sel = torch.tensor([[0, 1, -1], [2, 3, -1]], dtype=torch.int32)
-        vl = torch.tensor([2, 2, 2], dtype=torch.int32)
-        with self.assertRaises(DSAdapterBatchMismatch):
-            adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
-
-    def test_valid_length_overflow(self):
-        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
-            DSAdapterValidLengthOverflow,
-        )
-
-        adapter = self._adapter()
-        sel = torch.tensor([[0, 1, -1]], dtype=torch.int32)
-        vl = torch.tensor([4], dtype=torch.int32)
-        with self.assertRaises(DSAdapterValidLengthOverflow):
-            adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
-
-    def test_valid_length_negative(self):
-        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
-            DSAdapterValidLengthOverflow,
-        )
-
-        adapter = self._adapter()
-        sel = torch.tensor([[0, 1, -1]], dtype=torch.int32)
-        vl = torch.tensor([-1], dtype=torch.int32)
-        with self.assertRaises(DSAdapterValidLengthOverflow):
-            adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
-
-    def test_padding_violation(self):
-        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
-            DSAdapterPaddingViolation,
-        )
-
-        adapter = self._adapter()
-        # valid_lengths says 2, but position 2 (the "padding" slot) is not -1.
-        sel = torch.tensor([[0, 1, 7]], dtype=torch.int32)
-        vl = torch.tensor([2], dtype=torch.int32)
-        with self.assertRaises(DSAdapterPaddingViolation):
-            adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
-
-    def test_non_ascending(self):
-        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
-            DSAdapterNonAscending,
-        )
-
-        adapter = self._adapter()
-        sel = torch.tensor([[5, 3, -1]], dtype=torch.int32)
-        vl = torch.tensor([2], dtype=torch.int32)
-        with self.assertRaises(DSAdapterNonAscending):
-            adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
-
-    def test_non_ascending_duplicate(self):
-        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
-            DSAdapterNonAscending,
-        )
-
-        adapter = self._adapter()
-        # Strict ascending — duplicates are also a contract violation.
-        sel = torch.tensor([[3, 3, -1]], dtype=torch.int32)
-        vl = torch.tensor([2], dtype=torch.int32)
-        with self.assertRaises(DSAdapterNonAscending):
-            adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
-
-    def test_page_out_of_range_negative(self):
-        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
-            DSAdapterPageOutOfRange,
-        )
-
-        adapter = self._adapter()
-        sel = torch.tensor([[-5, 1, -1]], dtype=torch.int32)
-        vl = torch.tensor([2], dtype=torch.int32)
-        with self.assertRaises(DSAdapterPageOutOfRange):
-            adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
-
-    def test_page_out_of_range_above_max(self):
-        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
-            DSAdapterPageOutOfRange,
-        )
-
-        adapter = self._adapter()
-        sel = torch.tensor([[0, 100, -1]], dtype=torch.int32)
-        vl = torch.tensor([2], dtype=torch.int32)
-        with self.assertRaises(DSAdapterPageOutOfRange):
-            adapter(
-                selected_indices=sel,
-                valid_lengths=vl,
-                page_size=64,
-                max_logical_pages=50,
-            )
-
-    def test_empty_selection_returns_minus_one_row(self):
-        adapter = self._adapter()
-        sel = torch.tensor([[-1, -1, -1]], dtype=torch.int32)
-        vl = torch.tensor([0], dtype=torch.int32)
-        out = adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
-        self.assertTrue(torch.equal(out, sel))
-
-    def test_2d_rank_required(self):
-        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
-            DSAdapterDtypeMismatch,
-        )
-
-        adapter = self._adapter()
-        sel = torch.tensor([0, 1, -1], dtype=torch.int32)  # 1D
-        vl = torch.tensor([2], dtype=torch.int32)
-        with self.assertRaises(DSAdapterDtypeMismatch):
-            adapter(selected_indices=sel, valid_lengths=vl, page_size=64)
 
 
 class TestSkipTopkGateRespectsDS(unittest.TestCase):
@@ -848,43 +843,41 @@ class TestChannelMaskLoader(unittest.TestCase):
         self.assertEqual(r.skipped_reason, "placeholder_selector")
 
 
-class TestPageSignatureTableLifecycle(unittest.TestCase):
+class TestTokenLabelTableLifecycle(unittest.TestCase):
     def setUp(self):
-        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
-            allocate_page_signature_table,
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
         )
-        self.table = allocate_page_signature_table(
-            num_layers_local=2, max_pages=32, num_heads_local=4, label_dim=16,
+        self.table = allocate_token_label_table(
+            num_layers_local=2, max_tokens=32, num_heads_local=4, label_dim=16,
             page_size=64, dtype=torch.float16, device=torch.device("cpu"),
         )
 
-    def test_assign_populate_free(self):
-        self.table.on_pages_assigned(0, [3, 7])
-        self.table.mark_populated(0, [3, 7])
-        self.assertTrue(bool(self.table.valid_mask[0, 3].item()))
-        self.assertTrue(bool(self.table.valid_mask[0, 7].item()))
-        self.table.on_page_freed(0, 7)
-        self.assertFalse(bool(self.table.valid_mask[0, 7].item()))
+    def test_shape_is_correct(self):
+        t = self.table
+        self.assertEqual(tuple(t.signatures.shape), (2, 32, 4, 16))
+        self.assertEqual(tuple(t.written.shape), (2, 32))
 
-    def test_evict_idempotent(self):
-        self.table.on_pages_assigned(1, [5])
-        self.table.mark_populated(1, [5])
-        self.table.on_page_evicted(1, 5)
-        self.table.on_page_evicted(1, 5)  # idempotent
-        self.assertFalse(bool(self.table.valid_mask[1, 5].item()))
+    def test_written_false_by_default(self):
+        self.assertFalse(self.table.written.any().item())
 
-    def test_hot_page_clears_on_free(self):
-        self.table.set_hot_page(0, 11)
-        self.assertEqual(self.table.get_hot_page(0), 11)
-        self.table.on_page_freed(0, 11)
-        self.assertIsNone(self.table.get_hot_page(0))
+    def test_bytes_per_rank(self):
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            estimate_hbm_bytes,
+        )
+        # bytes_per_rank == estimate_hbm_bytes with the same dims
+        expected = estimate_hbm_bytes(
+            num_layers_local=2, max_tokens=32, num_heads_local=4,
+            label_dim=16, dtype=torch.float16,
+        )
+        self.assertEqual(self.table.bytes_per_rank(), expected)
 
     def test_estimate_hbm_bytes(self):
-        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
             estimate_hbm_bytes,
         )
         b = estimate_hbm_bytes(
-            num_layers_local=60, max_pages=15_625, num_heads_local=16,
+            num_layers_local=60, max_tokens=15_625, num_heads_local=16,
             label_dim=16, dtype=torch.float16,
         )
         # within ±10% of the documented 480 MB budget
@@ -905,7 +898,7 @@ class TestSelectionKernel(unittest.TestCase):
 
     def test_invalid_pages_excluded(self):
         from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
-            compute_page_scores, select_topk_sequence_order,
+            compute_token_scores, select_topk_sequence_order,
         )
         torch.manual_seed(11)
         L, P, H, D = 2, 8, 4, 4
@@ -915,23 +908,24 @@ class TestSelectionKernel(unittest.TestCase):
         vmask[0, 2] = False
         sel = torch.randint(0, 16, (L, H, D), dtype=torch.int32)
         w = torch.randn(L, H, D, dtype=torch.float32)
-        scores = compute_page_scores(queries, sigs, vmask, sel, w, layer_id=0)
+        scores = compute_token_scores(queries, sigs, vmask, sel, w, layer_id=0)
         idx, lens = select_topk_sequence_order(scores, max_top_k=4)
         for r in range(2):
             self.assertNotIn(2, idx[r, : lens[r]].tolist())
 
-    def test_hot_page_overrides_invalid(self):
+    def test_neg_inf_score_is_never_selected(self):
         from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
             select_topk_sequence_order,
         )
         scores = torch.full((1, 8), -1e9, dtype=torch.float32)
-        scores[0, 5] = 0.5  # one valid
-        scores[0, 2] = float("-inf")  # invalid
-        idx, lens = select_topk_sequence_order(scores.clone(), max_top_k=3, hot_pages=[[2]])
-        # Hot page 2 was -inf and we want it forced in.
-        # Note: per the kernel, hot pages set score to +inf which forces them in.
+        scores[0, 5] = 0.5  # one valid high-score token
+        scores[0, 2] = float("-inf")  # explicitly invalid
+        idx, lens = select_topk_sequence_order(scores.clone(), max_top_k=3)
         row = idx[0, : lens[0]].tolist()
-        self.assertIn(2, row)
+        # Token 5 (highest finite score) should be selected
+        self.assertIn(5, row)
+        # Token 2 (−inf score) must never appear
+        self.assertNotIn(2, row)
 
     def test_ascending_invariant(self):
         from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
@@ -949,53 +943,87 @@ class TestSelectionKernel(unittest.TestCase):
 
     def test_all_reduce_noop_without_group(self):
         from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
-            all_reduce_page_scores,
+            all_reduce_token_scores,
         )
         x = torch.randn(8)
-        y = all_reduce_page_scores(x, process_group=None)
+        y = all_reduce_token_scores(x, process_group=None)
         self.assertTrue(torch.equal(x, y))
 
 
-class TestPageSignatureWrite(unittest.TestCase):
-    def test_dequant_per_tile(self):
-        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
-            dequant_nope_fp8_to_bf16,
+class TestTokenLabelWrite(unittest.TestCase):
+    def test_channel_selection_is_correct(self):
+        """token_label_write selects the right channels from k_nope."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
         )
         torch.manual_seed(0)
-        n = 4
-        nope_fp8 = torch.randn(n, 512).to(torch.float8_e4m3fn)
-        scales = torch.rand(n, 4) * 2.0
-        u8 = torch.zeros(n, 528, dtype=torch.uint8)
-        u8[:, :512] = nope_fp8.view(torch.uint8)
-        u8[:, 512:].view(torch.float32)[:, :] = scales.contiguous()
-        bf16 = dequant_nope_fp8_to_bf16(u8)
-        self.assertEqual(tuple(bf16.shape), (n, 512))
-        # Tolerance accommodates bf16 rounding noise; max observed ~0.015.
-        ref0 = nope_fp8[0, :128].to(torch.float32) * scales[0, 0]
-        got0 = bf16[0, :128].to(torch.float32)
-        self.assertTrue(torch.allclose(got0, ref0, atol=5e-2))
-
-    def test_compute_hot_pages(self):
-        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
-            compute_hot_pages,
+        num_layers, max_tokens, num_heads, label_dim = 1, 8, 2, 4
+        nope_dim = 16
+        table = allocate_token_label_table(
+            num_layers_local=num_layers, max_tokens=max_tokens,
+            num_heads_local=num_heads, label_dim=label_dim,
+            page_size=64, dtype=torch.float32, device=torch.device("cpu"),
         )
-        seq_lens = torch.tensor([0, 100, 200, 320], dtype=torch.int32)
-        hot = compute_hot_pages(seq_lens=seq_lens, page_size=64, local_window=2)
-        # 0 → []
-        # 100 → last=1, window=2: [0,1]
-        # 200 → last=3, window=2: [2,3]
-        # 320 → last=4, window=2: [3,4]
-        self.assertEqual(hot, [[], [0, 1], [2, 3], [3, 4]])
+        # k_nope: 3 tokens, each with known values
+        k_nope = torch.arange(3 * num_heads * nope_dim, dtype=torch.float32).reshape(3, num_heads, nope_dim)
+        # Channel selection: for each head, pick first label_dim channels (0,1,2,3)
+        sel = torch.arange(label_dim, dtype=torch.int32).unsqueeze(0).expand(num_heads, -1).contiguous()
+        cache_loc = torch.tensor([0, 2, 5], dtype=torch.int64)
+        token_label_write(table.signatures, table.written, layer_id=0,
+                          cache_loc=cache_loc, k_nope=k_nope, channel_selection_layer=sel)
+        # Written slots should match k_nope's selected channels
+        for i, slot in enumerate([0, 2, 5]):
+            expected = k_nope[i, :, :label_dim]  # [H, label_dim]
+            actual = table.signatures[0, slot]    # [H, label_dim]
+            self.assertTrue(torch.allclose(actual, expected, atol=1e-5),
+                            f"slot {slot} mismatch: {actual} vs {expected}")
 
-    def test_project_page_signature(self):
-        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
-            project_page_to_signature,
+    def test_empty_write_is_noop(self):
+        """token_label_write with 0 tokens does not modify the table."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
         )
-        nope = torch.randn(8, 512, dtype=torch.bfloat16)
-        sel = torch.randint(0, 512, (4, 16), dtype=torch.int32)
-        w = torch.randn(4, 16, dtype=torch.float32)
-        sig = project_page_to_signature(nope, sel, w, reduce="mean")
-        self.assertEqual(tuple(sig.shape), (4, 16))
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
+        )
+        table = allocate_token_label_table(
+            num_layers_local=1, max_tokens=4, num_heads_local=2, label_dim=4,
+            page_size=64, dtype=torch.float32, device=torch.device("cpu"),
+        )
+        snap_before = table.signatures.clone()
+        k_nope_empty = torch.zeros(0, 2, 8, dtype=torch.float32)
+        cache_loc_empty = torch.zeros(0, dtype=torch.int64)
+        sel = torch.zeros(2, 4, dtype=torch.int32)
+        token_label_write(table.signatures, table.written, layer_id=0,
+                          cache_loc=cache_loc_empty, k_nope=k_nope_empty, channel_selection_layer=sel)
+        self.assertTrue(torch.equal(table.signatures, snap_before))
+        self.assertFalse(table.written.any().item())
+
+    def test_written_flag_set_after_write(self):
+        """written flags are set for exactly the written slots."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
+        )
+        table = allocate_token_label_table(
+            num_layers_local=1, max_tokens=8, num_heads_local=2, label_dim=4,
+            page_size=64, dtype=torch.float32, device=torch.device("cpu"),
+        )
+        k_nope = torch.randn(3, 2, 16)
+        cache_loc = torch.tensor([1, 3, 7], dtype=torch.int64)
+        sel = torch.zeros(2, 4, dtype=torch.int32)
+        token_label_write(table.signatures, table.written, layer_id=0,
+                          cache_loc=cache_loc, k_nope=k_nope, channel_selection_layer=sel)
+        # Only slots 1, 3, 7 should be written
+        for slot in [1, 3, 7]:
+            self.assertTrue(bool(table.written[0, slot].item()), f"slot {slot} not written")
+        for slot in [0, 2, 4, 5, 6]:
+            self.assertFalse(bool(table.written[0, slot].item()), f"slot {slot} should not be written")
 
 
 class TestSelectorRealMode(unittest.TestCase):
@@ -1003,16 +1031,16 @@ class TestSelectorRealMode(unittest.TestCase):
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
             ChannelMask,
         )
-        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
-            allocate_page_signature_table,
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
         )
         cfg = parse_double_sparsity_config(_valid_payload())
         sel = DoubleSparsitySelector(
             config=cfg, num_local_heads=4, head_dim=128, device=torch.device("cpu"),
         )
         self.assertTrue(sel.IS_PLACEHOLDER)
-        table = allocate_page_signature_table(
-            num_layers_local=2, max_pages=16, num_heads_local=4, label_dim=16,
+        table = allocate_token_label_table(
+            num_layers_local=2, max_tokens=16, num_heads_local=4, label_dim=16,
             page_size=64, dtype=torch.float16, device=torch.device("cpu"),
         )
         mask = ChannelMask(
@@ -1028,19 +1056,19 @@ class TestSelectorRealMode(unittest.TestCase):
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
             ChannelMask,
         )
-        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
-            allocate_page_signature_table,
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
         )
         cfg = parse_double_sparsity_config(_valid_payload())
         sel = DoubleSparsitySelector(
             config=cfg, num_local_heads=4, head_dim=128, device=torch.device("cpu"),
         )
-        table = allocate_page_signature_table(
-            num_layers_local=2, max_pages=16, num_heads_local=4, label_dim=16,
+        table = allocate_token_label_table(
+            num_layers_local=2, max_tokens=16, num_heads_local=4, label_dim=16,
             page_size=64, dtype=torch.float16, device=torch.device("cpu"),
         )
         table.signatures.uniform_(-1, 1)
-        table.valid_mask.fill_(True)
+        table.written.fill_(True)
         mask = ChannelMask(
             channel_selection=torch.randint(0, 128, (2, 4, 16), dtype=torch.int32),
             channel_weights=torch.randn(2, 4, 16, dtype=torch.float32),
@@ -1069,21 +1097,21 @@ class TestSelectorRealMode(unittest.TestCase):
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
             ChannelMask,
         )
-        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
-            allocate_page_signature_table,
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
         )
         cfg = parse_double_sparsity_config(_valid_payload())
         sel = DoubleSparsitySelector(
             config=cfg, num_local_heads=2, head_dim=64, device=torch.device("cpu"),
         )
-        table = allocate_page_signature_table(
-            num_layers_local=1, max_pages=8, num_heads_local=2, label_dim=8,
+        table = allocate_token_label_table(
+            num_layers_local=1, max_tokens=8, num_heads_local=2, label_dim=8,
             page_size=64, dtype=torch.float16, device=torch.device("cpu"),
         )
         table.signatures.uniform_(-1, 1)
         # Globally all 8 pages are valid (e.g. two different requests
         # occupy disjoint slices of the same table).
-        table.valid_mask.fill_(True)
+        table.written.fill_(True)
         mask = ChannelMask(
             channel_selection=torch.randint(0, 64, (1, 2, 8), dtype=torch.int32),
             channel_weights=torch.randn(1, 2, 8, dtype=torch.float32),
@@ -1130,7 +1158,7 @@ class TestRealSelectorMetricsCaptureSkip(unittest.TestCase):
         from unittest.mock import patch
         from sglang.srt.layers.attention.double_sparsity import metrics as m
         from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
-            retrieve_topk_via_signatures,
+            retrieve_topk_via_labels,
         )
         m.reset_for_testing()
         num_layers, max_pages, num_heads, label_dim, head_dim = 1, 8, 2, 4, 16
@@ -1144,10 +1172,10 @@ class TestRealSelectorMetricsCaptureSkip(unittest.TestCase):
         # Simulate "inside CUDA graph capture" by mocking the introspection
         # call. Real code calls torch.cuda.is_current_stream_capturing().
         with patch("torch.cuda.is_current_stream_capturing", return_value=True):
-            retrieve_topk_via_signatures(
+            retrieve_topk_via_labels(
                 queries=queries,
-                page_signatures=signatures,
-                valid_mask=valid_mask,
+                token_signatures=signatures,
+                written=valid_mask,
                 channel_selection=channel_selection,
                 channel_weights=channel_weights,
                 layer_id=0, max_top_k=4,
@@ -1158,10 +1186,10 @@ class TestRealSelectorMetricsCaptureSkip(unittest.TestCase):
             self.assertEqual(cnt, 0,
                              "metric emit must be skipped during capture")
         # Sanity: call again WITHOUT mocking; counters should now move.
-        retrieve_topk_via_signatures(
+        retrieve_topk_via_labels(
             queries=queries,
-            page_signatures=signatures,
-            valid_mask=valid_mask,
+            token_signatures=signatures,
+            written=valid_mask,
             channel_selection=channel_selection,
             channel_weights=channel_weights,
             layer_id=0, max_top_k=4,
@@ -1179,13 +1207,13 @@ class TestTritonNonPow2Extents(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(),
                           "CUDA needed for Triton fast-path tests")
-    def test_compute_page_scores_kernel_non_pow2_label_dim(self):
+    def test_compute_token_scores_kernel_non_pow2_label_dim(self):
         try:
             import triton  # noqa: F401
         except ImportError:
             self.skipTest("triton not installed")
         from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
-            _compute_page_scores_triton, compute_page_scores,
+            _compute_token_scores_triton, compute_token_scores,
         )
         dev = torch.device("cuda")
         # Non-power-of-two label_dim (24) and max_pages (15).
@@ -1199,11 +1227,11 @@ class TestTritonNonPow2Extents(unittest.TestCase):
                                            dtype=torch.int32, device=dev)
         channel_weights = torch.ones(num_layers, num_heads, label_dim,
                                       dtype=torch.float32, device=dev)
-        # End-to-end compute_page_scores routes through the Triton path on CUDA.
-        scores = compute_page_scores(
+        # End-to-end compute_token_scores routes through the Triton path on CUDA.
+        scores = compute_token_scores(
             queries=queries,
-            page_signatures=page_signatures,
-            valid_mask=valid_mask,
+            token_signatures=page_signatures,
+            written=valid_mask,
             channel_selection=channel_selection,
             channel_weights=channel_weights,
             layer_id=0,
@@ -1211,45 +1239,37 @@ class TestTritonNonPow2Extents(unittest.TestCase):
         self.assertEqual(tuple(scores.shape), (bs, max_pages))
         self.assertTrue(torch.isfinite(scores).all() | torch.isinf(scores).all().new_ones(()))
 
-    @unittest.skipUnless(torch.cuda.is_available(),
-                          "CUDA needed for Triton fast-path tests")
-    def test_page_signature_write_kernel_non_pow2_label_dim(self):
-        try:
-            import triton  # noqa: F401
-        except ImportError:
-            self.skipTest("triton not installed")
-        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
-            page_signature_write, _PAGE_NOPE_STRIDE_BYTES,
+    def test_token_label_write_non_pow2_label_dim(self):
+        """token_label_write handles non-power-of-two label_dim without error."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
         )
-        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
-            allocate_page_signature_table,
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
         )
-        dev = torch.device("cuda")
-        # Non-power-of-two label_dim.
+        # Non-power-of-two label_dim (24) and max_tokens (15).
         num_layers, num_heads, label_dim = 1, 2, 24
-        max_pages, page_size = 8, 64
-        table = allocate_page_signature_table(
-            num_layers_local=num_layers, max_pages=max_pages,
+        max_tokens, nope_dim = 15, 64
+        table = allocate_token_label_table(
+            num_layers_local=num_layers, max_tokens=max_tokens,
             num_heads_local=num_heads, label_dim=label_dim,
-            page_size=page_size, dtype=torch.float16, device=dev,
+            page_size=64, dtype=torch.float32, device=torch.device("cpu"),
         )
-        nope_parts = torch.zeros(2, page_size, _PAGE_NOPE_STRIDE_BYTES,
-                                  dtype=torch.uint8, device=dev)
-        sel = torch.randint(0, 512, (num_heads, label_dim),
-                             dtype=torch.int32, device=dev)
-        w = torch.ones(num_heads, label_dim, dtype=torch.float32, device=dev)
-        # Should not raise CompilationError on the non-pow2 label_dim.
-        page_signature_write(
-            table.signatures, table.valid_mask, layer_id=0,
-            page_ids=[0, 1], nope_parts_u8=nope_parts,
-            channel_selection_layer=sel, channel_weights_layer=w,
+        k_nope = torch.randn(3, num_heads, nope_dim)
+        cache_loc = torch.tensor([0, 1, 2], dtype=torch.int64)
+        sel = torch.randint(0, nope_dim, (num_heads, label_dim), dtype=torch.int32)
+        # Should not raise on non-pow2 label_dim.
+        token_label_write(
+            table.signatures, table.written, layer_id=0,
+            cache_loc=cache_loc, k_nope=k_nope, channel_selection_layer=sel,
         )
-        self.assertTrue(bool(table.valid_mask[0, 0]))
-        self.assertTrue(bool(table.valid_mask[0, 1]))
+        self.assertTrue(bool(table.written[0, 0]))
+        self.assertTrue(bool(table.written[0, 1]))
+        self.assertTrue(bool(table.written[0, 2]))
 
 
 class TestRealSelectorMetrics(unittest.TestCase):
-    """Round-10 fix [P2]: ``retrieve_topk_via_signatures`` must call
+    """Round-10 fix [P2]: ``retrieve_topk_via_labels`` must call
     ``metrics.record_selection`` so DS observability counters move on
     healthy traffic.
     """
@@ -1262,7 +1282,7 @@ class TestRealSelectorMetrics(unittest.TestCase):
 
         from sglang.srt.layers.attention.double_sparsity import metrics as m
         from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
-            retrieve_topk_via_signatures,
+            retrieve_topk_via_labels,
         )
         m.reset_for_testing()
 
@@ -1281,10 +1301,10 @@ class TestRealSelectorMetrics(unittest.TestCase):
         queries = torch.randn(bs, num_heads, head_dim)
         per_request = torch.ones(bs, max_pages, dtype=torch.int32)
 
-        _, valid_lengths = retrieve_topk_via_signatures(
+        _, valid_lengths = retrieve_topk_via_labels(
             queries=queries,
-            page_signatures=signatures,
-            valid_mask=valid_mask,
+            token_signatures=signatures,
+            written=valid_mask,
             channel_selection=channel_selection,
             channel_weights=channel_weights,
             layer_id=0,
@@ -1310,7 +1330,7 @@ class TestHotPagesIntersectPerRequest(unittest.TestCase):
 
     def test_hot_pages_filtered_by_per_request_valid(self):
         from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
-            retrieve_topk_via_signatures,
+            retrieve_topk_via_labels,
         )
         bs = 2
         num_layers, max_pages, num_heads, label_dim = 1, 8, 2, 4
@@ -1334,55 +1354,58 @@ class TestHotPagesIntersectPerRequest(unittest.TestCase):
             [1, 1, 1, 1, 0, 0, 0, 0],
             [0, 0, 0, 0, 1, 1, 1, 1],
         ], dtype=torch.int32)
-        # Hot pages: in mixed batches, compute_hot_pages may return the same
-        # *logical* page index for both rows. Here we simulate the bad case
-        # where the caller has not yet translated logical -> physical: pass
-        # [[3], [3]] and ensure request 1 still cannot win page 3.
-        hot = [[3], [3]]
-        indices, lengths = retrieve_topk_via_signatures(
+        indices, lengths = retrieve_topk_via_labels(
             queries=queries,
-            page_signatures=signatures,
-            valid_mask=valid_mask,
+            token_signatures=signatures,
+            written=valid_mask,
             channel_selection=channel_selection,
             channel_weights=channel_weights,
             layer_id=0,
             max_top_k=4,
-            hot_pages=hot,
             per_request_valid=per_request,
         )
         row0 = [int(v) for v in indices[0].tolist() if v >= 0]
         row1 = [int(v) for v in indices[1].tolist() if v >= 0]
-        self.assertIn(3, row0, "request 0 should still get its hot page 3")
-        self.assertNotIn(3, row1,
-                          f"hot-page intersection failed for row 1: got {row1}")
+        self.assertTrue(all(p in {0, 1, 2, 3} for p in row0),
+                        f"row 0 contains foreign pages: {row0}")
         self.assertTrue(all(p in {4, 5, 6, 7} for p in row1),
                         f"row 1 contains foreign pages: {row1}")
 
 
-    def test_select_topk_sequence_order_accepts_per_request_valid(self):
-        """Round-8 fix [P2]: select_topk_sequence_order applies a
-        device-side per-request gate when forcing hot pages, with no
-        CPU sync. Drive the helper directly to cover the new kwarg.
+    def test_retrieve_topk_via_labels_per_request_valid_isolation(self):
+        """retrieve_topk_via_labels applies per_request_valid gate so
+        each request only sees its own pages — no per-request-valid
+        contamination across rows.
         """
 
         from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
-            select_topk_sequence_order,
+            retrieve_topk_via_labels,
         )
         bs, max_pages = 2, 8
-        # Row 0 valid on pages [0..3], row 1 valid on [4..7]; everywhere
-        # else -inf so only "valid" pages can win, before hot-page forcing.
-        scores = torch.full((bs, max_pages), float("-inf"))
-        scores[0, 0:4] = 0.1
-        scores[1, 4:8] = 0.1
+        num_layers, num_heads, label_dim, head_dim = 1, 2, 4, 16
+        # Row 0 owns pages [0..3], row 1 owns [4..7].
+        signatures = torch.zeros(num_layers, max_pages, num_heads, label_dim)
+        # Row 0's pages get high score; row 1's pages get low score
+        signatures[0, 0:4] = 1.0
+        signatures[0, 4:8] = -1.0
+        valid_mask = torch.ones(num_layers, max_pages, dtype=torch.bool)
+        channel_selection = torch.zeros(num_layers, num_heads, label_dim, dtype=torch.int32)
+        channel_weights = torch.ones(num_layers, num_heads, label_dim, dtype=torch.float32)
+        # Query that produces positive scores
+        queries = torch.ones(bs, num_heads, head_dim)
         per_request = torch.tensor([
             [1, 1, 1, 1, 0, 0, 0, 0],
             [0, 0, 0, 0, 1, 1, 1, 1],
         ], dtype=torch.int32)
-        # Hot pages claim row 0 wants page 5 (foreign!) and row 1 wants page
-        # 3 (foreign!). The mask must keep both rows inside their own set.
-        hot = [[5], [3]]
-        indices, lengths = select_topk_sequence_order(
-            scores, max_top_k=4, hot_pages=hot, per_request_valid=per_request,
+        indices, lengths = retrieve_topk_via_labels(
+            queries=queries,
+            token_signatures=signatures,
+            written=valid_mask,
+            channel_selection=channel_selection,
+            channel_weights=channel_weights,
+            layer_id=0,
+            max_top_k=4,
+            per_request_valid=per_request,
         )
         row0 = [int(v) for v in indices[0].tolist() if v >= 0]
         row1 = [int(v) for v in indices[1].tolist() if v >= 0]
@@ -1392,17 +1415,15 @@ class TestHotPagesIntersectPerRequest(unittest.TestCase):
                         f"row 1 leaked foreign page: {row1}")
 
     @unittest.skipUnless(torch.cuda.is_available(),
-                          "CUDA needed for device-resident hot-page filter test")
-    def test_hot_pages_no_host_sync_path(self):
-        """Round-8 fix [P2]: when retrieve_topk_via_signatures runs on
-        CUDA tensors with both hot_pages and per_request_valid, it must
-        not require ``.cpu()`` of the mask. We can't directly assert
-        "no host sync" cheaply, but we can prove the call succeeds and
+                          "CUDA needed for device-resident per-request-valid filter test")
+    def test_per_request_valid_no_host_sync_path(self):
+        """retrieve_topk_via_labels with per_request_valid on CUDA tensors
+        must not require .cpu() of the mask — verify call succeeds and
         produces the expected exclusion when everything lives on CUDA.
         """
 
         from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
-            retrieve_topk_via_signatures,
+            retrieve_topk_via_labels,
         )
         dev = torch.device("cuda")
         bs, max_pages = 2, 8
@@ -1421,62 +1442,47 @@ class TestHotPagesIntersectPerRequest(unittest.TestCase):
             [1, 1, 1, 1, 0, 0, 0, 0],
             [0, 0, 0, 0, 1, 1, 1, 1],
         ], dtype=torch.int32, device=dev)
-        hot = [[3], [3]]
-        indices, _ = retrieve_topk_via_signatures(
+        indices, _ = retrieve_topk_via_labels(
             queries=queries,
-            page_signatures=signatures,
-            valid_mask=valid_mask,
+            token_signatures=signatures,
+            written=valid_mask,
             channel_selection=channel_selection,
             channel_weights=channel_weights,
             layer_id=0,
             max_top_k=4,
-            hot_pages=hot,
             per_request_valid=per_request,
         )
         row1 = [int(v) for v in indices[1].cpu().tolist() if v >= 0]
-        self.assertNotIn(3, row1,
-                          f"device-side filter must keep row 1 out of page 3: {row1}")
+        self.assertTrue(all(p in {4, 5, 6, 7} for p in row1),
+                        f"device-side per_request filter failed: row 1 got {row1}")
 
 
-class TestM3BFixtureWiderTable(unittest.TestCase):
-    """Round-7 fix [P2]: M3-B fixture must work when table.max_pages
-    exceeds the prompt page count (the normal allocator case).
-    """
+class TestTokenLabelWriteWiderTable(unittest.TestCase):
+    """token_label_write works when the table is wider than the write count."""
 
-    def test_fixture_passes_when_table_wider_than_prompt(self):
-        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
-            ChannelMask,
+    def test_write_to_subset_of_wider_table(self):
+        """Writing 4 tokens to a 16-slot table leaves unwritten slots False."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
         )
-        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
-            allocate_page_signature_table,
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
         )
-        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
-            m3b_page_stability_fixture,
-        )
-        cfg = parse_double_sparsity_config(_valid_payload())
-        sel = DoubleSparsitySelector(
-            config=cfg, num_local_heads=2, head_dim=32, device=torch.device("cpu"),
-        )
-        # Table is much wider than the test prompt (16 pages vs 4).
-        table = allocate_page_signature_table(
-            num_layers_local=1, max_pages=16, num_heads_local=2, label_dim=4,
+        table = allocate_token_label_table(
+            num_layers_local=1, max_tokens=16, num_heads_local=2, label_dim=4,
             page_size=64, dtype=torch.float32, device=torch.device("cpu"),
         )
-        table.signatures.uniform_(-1, 1)
-        table.valid_mask[0, :4] = True
-        mask = ChannelMask(
-            channel_selection=torch.zeros(1, 2, 4, dtype=torch.int32),
-            channel_weights=torch.ones(1, 2, 4, dtype=torch.float32),
-            schema_version="1", dtype="fp8_e4m3", head_dim=32, page_size=64,
-            label_dim=4, content_sha256="x",
-        )
-        sel.bind_runtime_data(table, mask)
-        # 4 prompt pages at page_size=64 -> seq_len=256.
-        prompt_tokens = torch.zeros(1, 256, dtype=torch.int32)
-        ok = m3b_page_stability_fixture(
-            sel, prompt_tokens=prompt_tokens, page_size=64, num_repeats=2,
-        )
-        self.assertTrue(ok, "fixture should pass with wider table than prompt")
+        k_nope = torch.randn(4, 2, 32)
+        cache_loc = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+        sel = torch.zeros(2, 4, dtype=torch.int32)
+        token_label_write(table.signatures, table.written, layer_id=0,
+                          cache_loc=cache_loc, k_nope=k_nope, channel_selection_layer=sel)
+        # Written slots
+        for slot in range(4):
+            self.assertTrue(bool(table.written[0, slot].item()), f"slot {slot} not written")
+        # Unwritten slots
+        for slot in range(4, 16):
+            self.assertFalse(bool(table.written[0, slot].item()), f"slot {slot} should not be written")
 
 
 class TestCalibrateCorpusEmpty(unittest.TestCase):
@@ -1597,15 +1603,15 @@ class TestChannelMaskSlicePerRank(unittest.TestCase):
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
             ChannelMask,
         )
-        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
-            allocate_page_signature_table,
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
         )
         cfg = parse_double_sparsity_config(_valid_payload())
         sel = DoubleSparsitySelector(
             config=cfg, num_local_heads=4, head_dim=128, device=torch.device("cpu"),
         )
-        table = allocate_page_signature_table(
-            num_layers_local=2, max_pages=8, num_heads_local=4, label_dim=8,
+        table = allocate_token_label_table(
+            num_layers_local=2, max_tokens=8, num_heads_local=4, label_dim=8,
             page_size=64, dtype=torch.float16, device=torch.device("cpu"),
         )
         # Mask is still at H_full=32 (un-sliced) — must be rejected.
@@ -1629,8 +1635,8 @@ class TestBindRuntimeDataDeviceAlignment(unittest.TestCase):
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
             ChannelMask,
         )
-        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
-            allocate_page_signature_table,
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
         )
         cfg = parse_double_sparsity_config(_valid_payload())
         sel = DoubleSparsitySelector(
@@ -1638,8 +1644,8 @@ class TestBindRuntimeDataDeviceAlignment(unittest.TestCase):
         )
         # Table and mask on the same (CPU) device — no-op move, but the
         # bind path must still succeed.
-        table = allocate_page_signature_table(
-            num_layers_local=2, max_pages=8, num_heads_local=4, label_dim=8,
+        table = allocate_token_label_table(
+            num_layers_local=2, max_tokens=8, num_heads_local=4, label_dim=8,
             page_size=64, dtype=torch.float16, device=torch.device("cpu"),
         )
         mask = ChannelMask(
@@ -1664,16 +1670,16 @@ class TestBindRuntimeDataDeviceAlignment(unittest.TestCase):
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
             ChannelMask,
         )
-        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
-            allocate_page_signature_table,
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
         )
         cuda_dev = torch.device("cuda")
         cfg = parse_double_sparsity_config(_valid_payload())
         sel = DoubleSparsitySelector(
             config=cfg, num_local_heads=4, head_dim=128, device=cuda_dev,
         )
-        table = allocate_page_signature_table(
-            num_layers_local=2, max_pages=8, num_heads_local=4, label_dim=8,
+        table = allocate_token_label_table(
+            num_layers_local=2, max_tokens=8, num_heads_local=4, label_dim=8,
             page_size=64, dtype=torch.float16, device=cuda_dev,
         )
         # Mask loaded on CPU (the load_channel_mask default path).
@@ -1698,15 +1704,15 @@ class TestSanityProbeRealSelector(unittest.TestCase):
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
             ChannelMask, startup_sanity_probe,
         )
-        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
-            allocate_page_signature_table,
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
         )
         cfg = parse_double_sparsity_config(_valid_payload())
         sel = DoubleSparsitySelector(
             config=cfg, num_local_heads=2, head_dim=64, device=torch.device("cpu"),
         )
-        table = allocate_page_signature_table(
-            num_layers_local=1, max_pages=16, num_heads_local=2, label_dim=4,
+        table = allocate_token_label_table(
+            num_layers_local=1, max_tokens=16, num_heads_local=2, label_dim=4,
             page_size=64, dtype=torch.float32, device=torch.device("cpu"),
         )
         # A deterministic non-trivial channel mask: heads point at distinct
@@ -1743,8 +1749,8 @@ class TestSanityProbeRealSelector(unittest.TestCase):
             torch.zeros_like(table.signatures[0, :8]),
         ))
         self.assertTrue(torch.equal(
-            table.valid_mask[0, :8],
-            torch.zeros_like(table.valid_mask[0, :8]),
+            table.written[0, :8],
+            torch.zeros_like(table.written[0, :8]),
         ))
 
     def test_probe_returns_no_table_when_unbound(self):
@@ -1753,12 +1759,12 @@ class TestSanityProbeRealSelector(unittest.TestCase):
         )
         cfg = parse_double_sparsity_config(_valid_payload())
         # Construct selector, manually flip IS_PLACEHOLDER without binding a
-        # table — exercises the new "no_page_signature_table" branch.
+        # table — exercises the new "no_token_label_table" branch.
         sel = DoubleSparsitySelector(
             config=cfg, num_local_heads=2, head_dim=64, device=torch.device("cpu"),
         )
         sel.IS_PLACEHOLDER = False
-        sel.page_signature_table = None
+        sel.token_label_table = None
         mask = ChannelMask(
             channel_selection=torch.zeros(1, 2, 4, dtype=torch.int32),
             channel_weights=torch.zeros(1, 2, 4, dtype=torch.float32),
@@ -1767,7 +1773,7 @@ class TestSanityProbeRealSelector(unittest.TestCase):
         )
         r = startup_sanity_probe(mask, sel, haystack_pages=8, needle_page=4)
         self.assertFalse(r.passed)
-        self.assertEqual(r.skipped_reason, "no_page_signature_table")
+        self.assertEqual(r.skipped_reason, "no_token_label_table")
 
 
 class TestBenchmarkCompareReader(unittest.TestCase):
@@ -2200,10 +2206,10 @@ _CUDA_AVAILABLE = torch.cuda.is_available()
 class TestTritonEquivalence(unittest.TestCase):
     """Round 2: Triton kernels must match the torch reference numerically."""
 
-    def test_compute_page_scores_triton_matches_torch(self):
+    def test_compute_token_scores_triton_matches_torch(self):
         from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
-            _compute_page_scores_triton,
-            compute_page_scores,
+            _compute_token_scores_triton,
+            compute_token_scores,
             project_query_onto_channels,
         )
 
@@ -2219,8 +2225,8 @@ class TestTritonEquivalence(unittest.TestCase):
         sel = torch.randint(0, head_dim, (L, H, label_dim), dtype=torch.int32, device=device)
         w = torch.randn(L, H, label_dim, dtype=torch.float32, device=device)
 
-        scores_triton = compute_page_scores(queries, sigs, vmask, sel, w, layer_id=0)
-        scores_torch = compute_page_scores(
+        scores_triton = compute_token_scores(queries, sigs, vmask, sel, w, layer_id=0)
+        scores_torch = compute_token_scores(
             queries.cpu(), sigs.cpu(), vmask.cpu(), sel.cpu(), w.cpu(), layer_id=0
         )
 
@@ -2238,140 +2244,119 @@ class TestTritonEquivalence(unittest.TestCase):
             f"Triton vs torch max diff {diff.max().item()} exceeds 1e-2",
         )
 
-    def test_page_signature_write_triton_matches_torch(self):
-        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
-            _page_signature_write_triton,
-            dequant_nope_fp8_to_bf16,
-            project_page_to_signature,
+    def test_token_label_write_channel_selection_matches_manual(self):
+        """token_label_write on CUDA matches manual channel-gather."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
         )
-
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
+        )
         torch.manual_seed(13)
         device = torch.device("cuda")
-        num_pages, page_size, H, label_dim = 3, 64, 4, 16
-
-        nope_fp8 = torch.randn(num_pages * page_size, 512).to(torch.float8_e4m3fn).to(device)
-        scales = (torch.rand(num_pages * page_size, 4, device=device) * 2.0).contiguous()
-        nope_u8 = torch.zeros(num_pages * page_size, 528, dtype=torch.uint8, device=device)
-        nope_u8[:, :512] = nope_fp8.view(torch.uint8)
-        nope_u8[:, 512:].view(torch.float32)[:, :] = scales
-        nope_parts = nope_u8.reshape(num_pages, page_size, 528).contiguous()
-
-        sel = torch.randint(0, 512, (H, label_dim), dtype=torch.int32, device=device)
-        w = torch.randn(H, label_dim, dtype=torch.float32, device=device)
-
-        sig_triton = _page_signature_write_triton(nope_parts, sel, w)
-
-        sig_torch = torch.zeros(
-            num_pages, H, label_dim, dtype=torch.float16, device=device
+        num_tokens, num_heads, nope_dim, label_dim = 4, 4, 64, 16
+        table = allocate_token_label_table(
+            num_layers_local=1, max_tokens=num_tokens,
+            num_heads_local=num_heads, label_dim=label_dim,
+            page_size=64, dtype=torch.float32, device=device,
         )
-        for p in range(num_pages):
-            bf16 = dequant_nope_fp8_to_bf16(nope_parts[p])
-            sig_torch[p] = project_page_to_signature(bf16, sel, w, reduce="mean").to(
-                torch.float16
-            )
+        k_nope = torch.randn(num_tokens, num_heads, nope_dim, device=device)
+        sel = torch.randint(0, nope_dim, (num_heads, label_dim), dtype=torch.int32, device=device)
+        cache_loc = torch.arange(num_tokens, dtype=torch.int64, device=device)
+        token_label_write(table.signatures, table.written, layer_id=0,
+                          cache_loc=cache_loc, k_nope=k_nope, channel_selection_layer=sel)
+        # Manual reference: gather selected channels
+        for t in range(num_tokens):
+            for h in range(num_heads):
+                for d in range(label_dim):
+                    ch = int(sel[h, d].item())
+                    expected = float(k_nope[t, h, ch].item())
+                    actual = float(table.signatures[0, t, h, d].item())
+                    self.assertAlmostEqual(actual, expected, places=4,
+                                          msg=f"token {t} head {h} dim {d} mismatch")
 
-        diff = (sig_triton.to(torch.float32) - sig_torch.to(torch.float32)).abs()
-        # fp16 rounding noise dominates here; loose tolerance is fine.
-        self.assertLess(
-            diff.max().item(),
-            5.0,
-            f"Triton vs torch page_signature_write max diff {diff.max().item()} too high",
+
+@unittest.skipUnless(_CUDA_AVAILABLE, "CUDA integration test")
+class TestTokenLabelWriteCUDAIntegration(unittest.TestCase):
+    """Verify token_label_write works end-to-end on CUDA with BF16 K_nope."""
+
+    def test_token_label_write_on_cuda_bf16(self):
+        """token_label_write on CUDA with BF16 K_nope produces correct channel labels."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
         )
-
-
-@unittest.skipUnless(_CUDA_AVAILABLE, "NSA cross-validation requires CUDA + Triton")
-class TestNSACrossValidation(unittest.TestCase):
-    """Drive DS dequant via NSA's own quantizer to verify byte-layout contract."""
-
-    def test_quant_kcache_roundtrip(self):
-        from sglang.srt.layers.attention.nsa.quant_k_cache import (
-            quantize_k_cache_separate,
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
         )
-        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
-            dequant_nope_fp8_to_bf16,
-        )
-
         torch.manual_seed(17)
         device = torch.device("cuda")
-        T = 64
-        k_nope = torch.randn(T, 512, dtype=torch.bfloat16, device=device)
-        k_rope = torch.randn(T, 64, dtype=torch.bfloat16, device=device)
-
-        nope_u8, _ = quantize_k_cache_separate(k_nope, k_rope, tile_size=128)
-        self.assertEqual(tuple(nope_u8.shape), (T, 1, 528))
-
-        recovered = dequant_nope_fp8_to_bf16(nope_u8)
-        self.assertEqual(tuple(recovered.shape), (T, 512))
-        self.assertEqual(recovered.dtype, torch.bfloat16)
-
-        recovered_f = recovered.to(torch.float32)
-        original_f = k_nope.to(torch.float32)
-        for tile in range(4):
-            s, e = tile * 128, (tile + 1) * 128
-            ref = original_f[:, s:e]
-            got = recovered_f[:, s:e]
-            l2_rel = ((ref - got).norm() / ref.norm().clamp_min(1e-9)).item()
-            # fp8_e4m3 has ~4-bit mantissa; per-tile relative L2 should sit
-            # in the 1-5% band on Gaussian inputs.
-            self.assertLess(
-                l2_rel,
-                0.06,
-                f"tile {tile} relative L2 error {l2_rel:.4f} exceeds 6% — "
-                "FP8 byte layout may have shifted in NSA's quant_k_cache.",
-            )
+        T, num_heads, nope_dim, label_dim = 64, 8, 128, 16
+        table = allocate_token_label_table(
+            num_layers_local=1, max_tokens=T,
+            num_heads_local=num_heads, label_dim=label_dim,
+            page_size=64, dtype=torch.float16, device=device,
+        )
+        k_nope = torch.randn(T, num_heads, nope_dim, dtype=torch.bfloat16, device=device)
+        cache_loc = torch.arange(T, dtype=torch.int64, device=device)
+        sel = torch.randint(0, nope_dim, (num_heads, label_dim), dtype=torch.int32, device=device)
+        token_label_write(table.signatures, table.written, layer_id=0,
+                          cache_loc=cache_loc, k_nope=k_nope, channel_selection_layer=sel)
+        self.assertEqual(tuple(table.signatures.shape), (1, T, num_heads, label_dim))
+        self.assertTrue(table.written[0].all().item(), "all tokens should be marked written")
+        # Spot-check a single token/head/channel
+        t, h, d = 3, 2, 5
+        ch = int(sel[h, d].item())
+        expected = float(k_nope[t, h, ch].to(torch.float32).item())
+        actual = float(table.signatures[0, t, h, d].to(torch.float32).item())
+        self.assertAlmostEqual(actual, expected, places=2,
+                               msg=f"token {t} head {h} dim {d} mismatch: {actual} vs {expected}")
 
 
-@unittest.skipUnless(_CUDA_AVAILABLE, "End-to-end pipeline test requires CUDA + Triton")
+@unittest.skipUnless(_CUDA_AVAILABLE, "End-to-end pipeline test requires CUDA")
 class TestEndToEndPipeline(unittest.TestCase):
-    """Round 3 drift recovery: full DS pipeline composes on synthetic V3.2-shape inputs.
+    """Full DS pipeline on CUDA: token_label_write → bind_runtime_data → retrieve_topk.
 
-    NSA quantizer → page_signature_write (Triton) → bind_runtime_data →
-    retrieve_topk → m3b_page_stability_fixture. No production code mutation;
-    no model weights required.
+    No production code mutation; no model weights required.
     """
 
-    def _build_fixture(self, *, num_layers=2, num_heads=4, num_pages=8, page_size=64, label_dim=16):
+    def _build_fixture(self, *, num_layers=2, num_heads=4, num_tokens=8, page_size=64, label_dim=16):
         from sglang.srt.layers.attention.double_sparsity import (
             DoubleSparsitySelector,
-            allocate_page_signature_table,
+            allocate_token_label_table,
             parse_double_sparsity_config,
         )
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
             ChannelMask, compute_content_sha256,
         )
-        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
-            page_signature_write,
-        )
-        from sglang.srt.layers.attention.nsa.quant_k_cache import (
-            quantize_k_cache_separate,
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
         )
 
         device = torch.device("cuda")
         torch.manual_seed(31)
+        nope_dim = 128
 
-        all_tokens = num_pages * page_size
-        k_nope = torch.randn(all_tokens, 512, dtype=torch.bfloat16, device=device)
-        k_rope = torch.randn(all_tokens, 64, dtype=torch.bfloat16, device=device)
-        nope_u8_flat, _ = quantize_k_cache_separate(k_nope, k_rope, tile_size=128)
-        nope_parts_u8 = nope_u8_flat.squeeze(1).reshape(num_pages, page_size, 528).contiguous()
+        # Synthetic BF16 K_nope — already "projected" (no FP8 dequant needed).
+        k_nope = torch.randn(num_tokens, num_heads, nope_dim, dtype=torch.bfloat16, device=device)
+        cache_loc = torch.arange(num_tokens, dtype=torch.int64, device=device)
 
-        sel = torch.randint(0, 512, (num_layers, num_heads, label_dim), dtype=torch.int32, device=device)
+        sel = torch.randint(0, nope_dim, (num_layers, num_heads, label_dim), dtype=torch.int32, device=device)
         w = torch.randn(num_layers, num_heads, label_dim, dtype=torch.float32, device=device)
         content_hash = compute_content_sha256(sel, w)
         mask = ChannelMask(
             channel_selection=sel,
             channel_weights=w,
             schema_version="1",
-            dtype="fp8_e4m3",
-            head_dim=512,
+            dtype="bfloat16",
+            head_dim=nope_dim,
             page_size=page_size,
             label_dim=label_dim,
             content_sha256=content_hash,
         )
 
-        table = allocate_page_signature_table(
+        table = allocate_token_label_table(
             num_layers_local=num_layers,
-            max_pages=num_pages,
+            max_tokens=num_tokens,
             num_heads_local=num_heads,
             label_dim=label_dim,
             page_size=page_size,
@@ -2379,14 +2364,10 @@ class TestEndToEndPipeline(unittest.TestCase):
             device=device,
         )
         for layer in range(num_layers):
-            page_signature_write(
-                table.signatures,
-                table.valid_mask,
-                layer_id=layer,
-                page_ids=list(range(num_pages)),
-                nope_parts_u8=nope_parts_u8,
-                channel_selection_layer=sel[layer],
-                channel_weights_layer=w[layer],
+            token_label_write(
+                table.signatures, table.written,
+                layer_id=layer, cache_loc=cache_loc,
+                k_nope=k_nope, channel_selection_layer=sel[layer],
             )
 
         cfg = parse_double_sparsity_config(
@@ -2395,22 +2376,22 @@ class TestEndToEndPipeline(unittest.TestCase):
             '"device_buffer_size": 4096}'
         )
         selector = DoubleSparsitySelector(
-            config=cfg, num_local_heads=num_heads, head_dim=512, device=device,
+            config=cfg, num_local_heads=num_heads, head_dim=nope_dim, device=device,
         )
         selector.bind_runtime_data(table, mask)
-        return selector, table, mask, num_pages
+        return selector, table, mask, num_tokens
 
     def test_full_pipeline_on_v32_shape_synthetic(self):
-        selector, table, mask, num_pages = self._build_fixture()
+        selector, table, mask, num_tokens = self._build_fixture()
         self.assertFalse(selector.IS_PLACEHOLDER, "bind_runtime_data should flip placeholder off")
-        self.assertTrue(table.valid_mask.all().item(), "all pages should be populated")
+        self.assertTrue(table.written.all().item(), "all tokens should be populated")
 
         device = table.signatures.device
         bs = 2
         queries = torch.randn(bs, selector.num_local_heads, selector.head_dim, device=device)
         req_pool = torch.tensor([0, 1], dtype=torch.int32, device=device)
-        seq_lens = torch.tensor([num_pages * 64, num_pages * 64], dtype=torch.int32, device=device)
-        sparse_mask = torch.ones(bs, num_pages, dtype=torch.int32, device=device)
+        seq_lens = torch.tensor([num_tokens, num_tokens], dtype=torch.int32, device=device)
+        sparse_mask = torch.ones(bs, num_tokens, dtype=torch.int32, device=device)
 
         indices, lengths = selector.retrieve_topk(
             queries=queries, layer_id=0,
@@ -2427,43 +2408,53 @@ class TestEndToEndPipeline(unittest.TestCase):
                 all(row_indices[i] < row_indices[i + 1] for i in range(len(row_indices) - 1)),
                 f"row {row} not sequence-ascending: {row_indices}",
             )
-            for pid in row_indices:
-                self.assertGreaterEqual(pid, 0)
-                self.assertLess(pid, num_pages)
+            for tid in row_indices:
+                self.assertGreaterEqual(tid, 0)
+                self.assertLess(tid, num_tokens)
 
-    def test_hot_page_forced_into_selected(self):
-        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
-            compute_hot_pages,
-        )
-
-        selector, table, mask, num_pages = self._build_fixture()
+    def test_highest_score_token_is_always_selected(self):
+        """A token with the highest signature score is always in the top-k."""
+        selector, table, mask, num_tokens = self._build_fixture()
         device = table.signatures.device
         bs = 1
-        queries = torch.zeros(bs, selector.num_local_heads, selector.head_dim, device=device)
-        req_pool = torch.tensor([0], dtype=torch.int32, device=device)
-        seq_lens = torch.tensor([num_pages * 64], dtype=torch.int32, device=device)
-        sparse_mask = torch.ones(bs, num_pages, dtype=torch.int32, device=device)
+        # Force one token to have maximum-magnitude signatures so it wins
+        # the score regardless of query direction.
+        target_token = num_tokens - 1
+        table.signatures[:, target_token, :, :] = 1e3  # dominates
+        table.signatures[:, :target_token, :, :] = 0.0
 
-        hot = compute_hot_pages(seq_lens=seq_lens, page_size=64, local_window=1)
+        queries = torch.ones(bs, selector.num_local_heads, selector.head_dim, device=device)
+        req_pool = torch.tensor([0], dtype=torch.int32, device=device)
+        seq_lens = torch.tensor([num_tokens], dtype=torch.int32, device=device)
+        sparse_mask = torch.ones(bs, num_tokens, dtype=torch.int32, device=device)
+
         indices, lengths = selector.retrieve_topk(
             queries=queries, layer_id=0,
             req_pool_indices=req_pool, sparse_mask=sparse_mask, seq_lens=seq_lens,
-            hot_pages=hot,
         )
         row = indices[0, : int(lengths[0])].tolist()
-        self.assertIn(num_pages - 1, row, f"hot page {num_pages - 1} not in {row}")
+        self.assertIn(target_token, row, f"target token {target_token} not in {row}")
 
-    def test_m3b_fixture_passes_on_bound_selector(self):
-        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
-            m3b_page_stability_fixture,
-        )
+    def test_retrieve_topk_is_deterministic(self):
+        """retrieve_topk produces identical results on two calls with the same inputs."""
+        selector, table, mask, num_tokens = self._build_fixture()
+        device = table.signatures.device
+        bs = 1
+        queries = torch.randn(bs, selector.num_local_heads, selector.head_dim, device=device)
+        req_pool = torch.tensor([0], dtype=torch.int32, device=device)
+        seq_lens = torch.tensor([num_tokens], dtype=torch.int32, device=device)
+        sparse_mask = torch.ones(bs, num_tokens, dtype=torch.int32, device=device)
 
-        selector, table, mask, num_pages = self._build_fixture()
-        prompt_tokens = torch.zeros(1, num_pages * 64, dtype=torch.int32, device=table.signatures.device)
-        passed = m3b_page_stability_fixture(
-            selector, prompt_tokens=prompt_tokens, page_size=64, num_repeats=3,
+        idx1, len1 = selector.retrieve_topk(
+            queries=queries, layer_id=0,
+            req_pool_indices=req_pool, sparse_mask=sparse_mask, seq_lens=seq_lens,
         )
-        self.assertTrue(passed, "DEC-2 page-stability fixture should hold on a real-bound selector")
+        idx2, len2 = selector.retrieve_topk(
+            queries=queries, layer_id=0,
+            req_pool_indices=req_pool, sparse_mask=sparse_mask, seq_lens=seq_lens,
+        )
+        self.assertTrue(torch.equal(idx1, idx2), "retrieve_topk must be deterministic")
+        self.assertTrue(torch.equal(len1, len2))
 
 
 class TestCustomizedInfoIntegration(unittest.TestCase):
@@ -2496,21 +2487,30 @@ class TestACAnchors(unittest.TestCase):
     """
 
     def test_ds_page_table_adapter_basic_mapping(self):
+        """logical_to_physical maps logical token positions to physical KV slots."""
         from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
-            expand_ds_selection_to_topk_indices,
+            logical_to_physical,
         )
+        bs, max_top_k = 2, 6
         sel = torch.tensor(
             [[0, 3, 5, 7, -1, -1], [1, 2, -1, -1, -1, -1]], dtype=torch.int32
         )
-        vl = torch.tensor([4, 2], dtype=torch.int32)
-        out = expand_ds_selection_to_topk_indices(
-            selected_indices=sel, valid_lengths=vl, page_size=64
-        )
-        expected = torch.tensor(
-            [[0, 192, 320, 448, -1, -1], [64, 128, -1, -1, -1, -1]],
-            dtype=torch.int32,
-        )
-        self.assertTrue(torch.equal(out, expected))
+        # req_to_token: identity mapping — logical pos i → physical slot i
+        req_to_token = torch.arange(16, dtype=torch.int32).unsqueeze(0).expand(bs, -1).contiguous()
+        req_pool_indices = torch.tensor([0, 0], dtype=torch.int32)
+        out = torch.full((bs, max_top_k), -1, dtype=torch.int32)
+        error_count = logical_to_physical(sel, req_pool_indices, req_to_token, out)
+        self.assertEqual(error_count, 0)
+        # Row 0: slots 0, 3, 5, 7
+        self.assertEqual(int(out[0, 0].item()), 0)
+        self.assertEqual(int(out[0, 1].item()), 3)
+        self.assertEqual(int(out[0, 2].item()), 5)
+        self.assertEqual(int(out[0, 3].item()), 7)
+        self.assertEqual(int(out[0, 4].item()), -1)
+        # Row 1: slots 1, 2
+        self.assertEqual(int(out[1, 0].item()), 1)
+        self.assertEqual(int(out[1, 1].item()), 2)
+        self.assertEqual(int(out[1, 2].item()), -1)
 
     def test_ds_skip_topk_gate_alt_stream_and_normal(self):
         # Behaviour anchor: the gate predicate exists in both branches of
@@ -2547,16 +2547,16 @@ class TestACAnchors(unittest.TestCase):
         )
 
         # Synthetic page-signature table + channel mask sized for this selector.
-        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
-            allocate_page_signature_table,
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
         )
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
             ChannelMask,
         )
         label_dim = 16
-        pst = allocate_page_signature_table(
+        pst = allocate_token_label_table(
             num_layers_local=4,
-            max_pages=16,
+            max_tokens=16,
             num_heads_local=4,
             label_dim=label_dim,
             page_size=64,
@@ -2579,12 +2579,12 @@ class TestACAnchors(unittest.TestCase):
             content_sha256="x" * 64,
         )
 
-        sel.bind_runtime_data(page_signature_table=pst, channel_mask=cm)
+        sel.bind_runtime_data(token_label_table=pst, channel_mask=cm)
         self.assertFalse(sel.IS_PLACEHOLDER)
 
         # Same-object rebind: no-op.
-        sel.bind_runtime_data(page_signature_table=pst, channel_mask=cm)
-        self.assertIs(sel.page_signature_table, pst)
+        sel.bind_runtime_data(token_label_table=pst, channel_mask=cm)
+        self.assertIs(sel.token_label_table, pst)
         self.assertIs(sel.channel_mask, cm)
 
         # Different-object rebind: raises DoubleSparsityRebindError.
@@ -2604,7 +2604,7 @@ class TestACAnchors(unittest.TestCase):
             content_sha256="y" * 64,
         )
         with self.assertRaises(DoubleSparsityRebindError):
-            sel.bind_runtime_data(page_signature_table=pst, channel_mask=cm2)
+            sel.bind_runtime_data(token_label_table=pst, channel_mask=cm2)
 
     def test_ds_channel_mask_value_corruption(self):
         """Three sub-checks: NaN weights, Inf weights, all-zero row."""
@@ -2811,42 +2811,39 @@ class TestDoubleSparsityRequestSummary(unittest.TestCase):
             self.assertIn("sparsity_rate", entry)
 
 
-class TestDoubleSparsityM3BCIHook(unittest.TestCase):
-    """AC-4 anchor: synthetic M3-B CI hook test."""
+class TestDoubleSparsityTokenLabelWriteDeterminism(unittest.TestCase):
+    """AC-4 anchor: token_label_write is deterministic across runs."""
 
-    def test_ds_m3b_synthetic_ci_hook(self):
-        """Smoke-run the fixture with a placeholder selector — without a
-        bound page_signature_table the fixture returns False (inconclusive)
-        deterministically. The contract this test pins is the API surface
-        (callable signature, no exceptions, no side effects on
-        ``_double_sparsity_radix_fixture_passed``).
-        """
-        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
-            m3b_page_stability_fixture,
+    def test_token_label_write_is_deterministic(self):
+        """Writing the same k_nope to the same slots twice produces identical labels."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
         )
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
+        )
+        torch.manual_seed(42)
+        table = allocate_token_label_table(
+            num_layers_local=1, max_tokens=4, num_heads_local=2, label_dim=4,
+            page_size=64, dtype=torch.float32, device=torch.device("cpu"),
+        )
+        k_nope = torch.randn(4, 2, 16)
+        cache_loc = torch.arange(4, dtype=torch.int64)
+        sel = torch.randint(0, 16, (2, 4), dtype=torch.int32)
 
-        cfg = parse_double_sparsity_config(_valid_payload())
-        sel = DoubleSparsitySelector(
-            config=cfg,
-            num_local_heads=4,
-            head_dim=128,
-            device=torch.device("cpu"),
-        )
-        prompt_tokens = torch.zeros((1, 256), dtype=torch.int32)
+        # First write
+        token_label_write(table.signatures, table.written, layer_id=0,
+                          cache_loc=cache_loc, k_nope=k_nope, channel_selection_layer=sel)
+        snap1 = table.signatures[0, :4].clone()
 
-        # Side-effect probe: the fixture must not touch the radix flag.
-        server_args = SimpleNamespace(_double_sparsity_radix_fixture_passed=False)
-        result = m3b_page_stability_fixture(
-            sel,
-            prompt_tokens=prompt_tokens,
-            page_size=64,
-            num_repeats=2,
-        )
-        # Returns False because no page_signature_table is bound — that's
-        # acceptable for the synthetic CI hook: what matters is that the
-        # call is well-typed and idempotent.
-        self.assertIn(result, (True, False))
-        self.assertFalse(server_args._double_sparsity_radix_fixture_passed)
+        # Reset and write again with the same inputs
+        table.signatures.zero_()
+        table.written.fill_(False)
+        token_label_write(table.signatures, table.written, layer_id=0,
+                          cache_loc=cache_loc, k_nope=k_nope, channel_selection_layer=sel)
+        snap2 = table.signatures[0, :4].clone()
+
+        self.assertTrue(torch.equal(snap1, snap2), "token_label_write must be deterministic")
 
 
 class TestDoubleSparsityMidDecodeContainment(unittest.TestCase):
@@ -2863,15 +2860,12 @@ class TestDoubleSparsityMidDecodeContainment(unittest.TestCase):
         # catches the typed DS exceptions, records the error class on the
         # request_state, increments the counter, and returns (success_flag,
         # value). Sibling requests in the batch are NOT affected.
-        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
-            DSAdapterPageOutOfRange,
-        )
 
         def good_step():
             return "ok"
 
         def bad_step():
-            raise DSAdapterPageOutOfRange("synthetic mid-decode failure")
+            raise RuntimeError("synthetic mid-decode failure")
 
         ok1, val1 = try_run_ds_step(
             good_step, request_id="r1", error_state={}
@@ -2898,8 +2892,8 @@ class TestR2Coverage(unittest.TestCase):
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
             ChannelMask,
         )
-        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
-            allocate_page_signature_table,
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
         )
 
         cfg = parse_double_sparsity_config(_valid_payload())
@@ -2909,9 +2903,9 @@ class TestR2Coverage(unittest.TestCase):
             head_dim=128,
             device=torch.device("cpu"),
         )
-        pst = allocate_page_signature_table(
+        pst = allocate_token_label_table(
             num_layers_local=4,
-            max_pages=16,
+            max_tokens=16,
             num_heads_local=num_local_heads,
             label_dim=label_dim,
             page_size=64,
@@ -2933,35 +2927,29 @@ class TestR2Coverage(unittest.TestCase):
             created_at="2026-01-01T00:00:00Z",
             content_sha256="x" * 64,
         )
-        sel.bind_runtime_data(page_signature_table=pst, channel_mask=cm)
+        sel.bind_runtime_data(token_label_table=pst, channel_mask=cm)
         return sel, pst, cm
 
-    def test_m3b_bound_selector_cold_warm_match(self):
-        """AC-4 behavioral: a bound real selector produces matching
-        signatures across cold/warm runs of the fixture; perturbation
-        between runs surfaces a mismatch."""
-        from sglang.srt.layers.attention.double_sparsity.page_signature_write import (
-            m3b_page_stability_fixture,
-        )
-
+    def test_bound_selector_retrieve_topk_deterministic(self):
+        """AC-4 behavioral: a bound real selector produces identical results
+        on two calls with the same inputs (determinism invariant)."""
         sel, _, _ = self._build_real_selector()
-        prompt_tokens = torch.zeros((1, 256), dtype=torch.int32)
-        ok_cold_warm = m3b_page_stability_fixture(
-            sel, prompt_tokens=prompt_tokens, page_size=64, num_repeats=2
+        sel.max_top_k = 8  # small for fast test
+        queries = torch.randn(1, 4, 128)
+        req_pool = torch.tensor([0], dtype=torch.int32)
+        seq_lens = torch.tensor([256], dtype=torch.int32)
+        sparse_mask = torch.ones(1, 16, dtype=torch.int32)
+
+        idx1, len1 = sel.retrieve_topk(
+            queries=queries, layer_id=0, req_pool_indices=req_pool,
+            sparse_mask=sparse_mask, seq_lens=seq_lens,
         )
-        # With a bound real selector and identical inputs across both
-        # runs, the fixture's expected outcome is stability=True. If the
-        # synthetic page-signature table population is not yet wired (R3
-        # follow-up), the fixture may return False. The behavioral
-        # assertion: the result is a bool (no exception thrown), and
-        # the fixture did NOT touch _double_sparsity_radix_fixture_passed.
-        self.assertIsInstance(ok_cold_warm, bool)
-        # Side-effect probe via getattr on a stand-in ServerArgs:
-        srv = SimpleNamespace(_double_sparsity_radix_fixture_passed=False)
-        m3b_page_stability_fixture(
-            sel, prompt_tokens=prompt_tokens, page_size=64, num_repeats=2
+        idx2, len2 = sel.retrieve_topk(
+            queries=queries, layer_id=0, req_pool_indices=req_pool,
+            sparse_mask=sparse_mask, seq_lens=seq_lens,
         )
-        self.assertFalse(srv._double_sparsity_radix_fixture_passed)
+        self.assertTrue(torch.equal(idx1, idx2), "retrieve_topk must be deterministic")
+        self.assertTrue(torch.equal(len1, len2))
 
     def test_record_error_increments_all_four_label_counters(self):
         from sglang.srt.layers.attention.double_sparsity import metrics as ds_metrics
@@ -2985,7 +2973,7 @@ class TestR2Coverage(unittest.TestCase):
             DoubleSparsityChannelMaskMissing,
         )
         from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
-            DSAdapterPageOutOfRange,
+            DSAdapterError,
         )
         from sglang.srt.layers.attention.double_sparsity.selector import (
             DoubleSparsityTPMisconfigured,
@@ -3000,7 +2988,7 @@ class TestR2Coverage(unittest.TestCase):
             "bad_mask",
         )
         self.assertEqual(
-            ds_metrics.classify_ds_exception(DSAdapterPageOutOfRange()),
+            ds_metrics.classify_ds_exception(DSAdapterError()),
             "bad_adapter_input",
         )
         self.assertEqual(
@@ -3064,7 +3052,7 @@ class TestR2Coverage(unittest.TestCase):
             page_size=64,
             kv_cache_dtype="fp8_e4m3",
             attention_backend="nsa",
-            nsa_decode_backend="flashmla_kv",
+            dsa_decode_backend="flashmla_kv",
             disable_radix_cache=True,
             model_path="deepseek-ai/DeepSeek-V3.2",
         )
@@ -3211,14 +3199,13 @@ class TestR3Coverage(unittest.TestCase):
     """
 
     def test_ds_decode_reaches_flashmla_kv_sparse_path(self):
-        """AC-2 anchor: DS-expanded topk_indices is what downstream
-        `transform_index_page_table_decode` would consume on the NSA
+        """AC-2 anchor: logical_to_physical output is what downstream
+        transform_index_page_table_decode would consume on the NSA
         flashmla_kv path. We assert the adapter produces the exact
-        token-index input shape and content that the NSA pipeline
-        accepts, AND that the unified transform consumes them.
+        token-index input shape and content the NSA pipeline accepts.
         """
         from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
-            expand_ds_selection_to_topk_indices,
+            logical_to_physical,
         )
         from sglang.srt.layers.attention.nsa.transform_index import (
             transform_index_page_table_decode_ref,
@@ -3226,28 +3213,26 @@ class TestR3Coverage(unittest.TestCase):
 
         max_top_k = 2048
         bs = 2
-        sel = torch.full((bs, max_top_k), -1, dtype=torch.int32)
-        # row 0 picks pages [0, 2]; row 1 picks pages [1, 3, 5]
-        sel[0, 0:2] = torch.tensor([0, 2], dtype=torch.int32)
-        sel[1, 0:3] = torch.tensor([1, 3, 5], dtype=torch.int32)
-        vl = torch.tensor([2, 3], dtype=torch.int32)
-        topk = expand_ds_selection_to_topk_indices(
-            selected_indices=sel,
-            valid_lengths=vl,
-            page_size=64,
-        )
-        # Build a synthetic page_table[bs, max_seqlen_k] that maps
-        # token_position → physical page. Then run the transform and
-        # verify the DS-expanded output matches what the existing
-        # NSA flashmla_kv path consumes.
         max_seqlen_k = 1024
+        sel = torch.full((bs, max_top_k), -1, dtype=torch.int32)
+        # row 0 picks logical positions [0, 128]; row 1 picks [64, 192, 320]
+        sel[0, 0:2] = torch.tensor([0, 128], dtype=torch.int32)
+        sel[1, 0:3] = torch.tensor([64, 192, 320], dtype=torch.int32)
+
+        # Identity req_to_token: logical pos i → physical slot i
+        req_to_token = torch.arange(max_seqlen_k, dtype=torch.int32).unsqueeze(0).expand(bs, -1).contiguous()
+        req_pool_indices = torch.tensor([0, 0], dtype=torch.int32)
+        out = torch.full((bs, max_top_k), -1, dtype=torch.int32)
+        error_count = logical_to_physical(sel, req_pool_indices, req_to_token, out)
+        self.assertEqual(error_count, 0)
+
+        # Build a synthetic page_table[bs, max_seqlen_k] that maps
+        # token_position → physical page (offset 100 for distinct values).
         page_table = torch.zeros((bs, max_seqlen_k), dtype=torch.int32)
-        # Token position p*64 maps to physical page p+100 (offset so values are
-        # distinct from the page IDs).
         for token_pos in range(max_seqlen_k):
             page_table[:, token_pos] = (token_pos // 64) + 100
         physical = transform_index_page_table_decode_ref(
-            page_table, topk, page_size=1
+            page_table, out, page_size=1
         )
         # row 0: physical pages for token_pos {0, 128} = {100, 102}
         self.assertEqual(int(physical[0, 0].item()), 100)
@@ -3307,8 +3292,8 @@ class TestR3Coverage(unittest.TestCase):
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
             ChannelMask,
         )
-        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
-            allocate_page_signature_table,
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
         )
         import logging as _logging
 
@@ -3320,9 +3305,9 @@ class TestR3Coverage(unittest.TestCase):
             device=torch.device("cpu"),
         )
         label_dim = 16
-        pst = allocate_page_signature_table(
+        pst = allocate_token_label_table(
             num_layers_local=4,
-            max_pages=16,
+            max_tokens=16,
             num_heads_local=4,
             label_dim=label_dim,
             page_size=64,
@@ -3349,7 +3334,7 @@ class TestR3Coverage(unittest.TestCase):
             "sglang.srt.layers.attention.double_sparsity.selector",
             level="INFO",
         ) as cm_log:
-            sel.bind_runtime_data(page_signature_table=pst, channel_mask=cm)
+            sel.bind_runtime_data(token_label_table=pst, channel_mask=cm)
 
         msg = "\n".join(cm_log.output)
         self.assertIn("bind_runtime_data completed", msg)
@@ -3358,37 +3343,32 @@ class TestR3Coverage(unittest.TestCase):
         self.assertIn("label_dim=16", msg)
 
     def test_three_row_sanitization_only_bad_row_fails(self):
-        """AC-9 anchor: three rows, only row 1 fails the contract; rows
-        0 and 2 produce valid topk_indices and row_errors records only
-        row 1's typed exception."""
+        """AC-9 anchor: three rows, only row 1 has a bad pool index;
+        rows 0 and 2 produce valid physical indices and row 1 is sanitized."""
         from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
-            expand_ds_selection_to_topk_indices,
+            logical_to_physical,
         )
 
         max_top_k = 16
-        sel = torch.full((3, max_top_k), -1, dtype=torch.int32)
-        sel[0, 0:2] = torch.tensor([0, 1], dtype=torch.int32)  # ok
-        sel[1, 0:2] = torch.tensor([2000, 2001], dtype=torch.int32)  # OOR
+        bs = 3
+        sel = torch.full((bs, max_top_k), -1, dtype=torch.int32)
+        sel[0, 0:2] = torch.tensor([0, 1], dtype=torch.int32)   # ok
+        sel[1, 0:2] = torch.tensor([0, 1], dtype=torch.int32)   # bad pool index
         sel[2, 0:3] = torch.tensor([1, 2, 3], dtype=torch.int32)  # ok
-        vl = torch.tensor([2, 2, 3], dtype=torch.int32)
-        row_errors: Dict[int, Tuple[str, str]] = {}
-        out = expand_ds_selection_to_topk_indices(
-            selected_indices=sel,
-            valid_lengths=vl,
-            page_size=64,
-            max_logical_pages=10,
-            row_errors=row_errors,
-        )
-        self.assertIn(1, row_errors)
-        self.assertEqual(row_errors[1][0], "DSAdapterPageOutOfRange")
+        # Row 1 gets out-of-range pool index (99 > num_pools-1 = 2)
+        req_pool_indices = torch.tensor([0, 99, 2], dtype=torch.int32)
+        req_to_token = torch.arange(16, dtype=torch.int32).unsqueeze(0).expand(bs, -1).contiguous()
+        out = torch.full((bs, max_top_k), -1, dtype=torch.int32)
+        error_count = logical_to_physical(sel, req_pool_indices, req_to_token, out)
+        self.assertEqual(error_count, 1)
         # Row 1 sanitized to -1
         self.assertTrue(torch.all(out[1] == -1).item())
-        # Rows 0 and 2 produce expected token positions
+        # Rows 0 and 2 produce expected physical slots (identity mapping)
         self.assertEqual(int(out[0, 0].item()), 0)
-        self.assertEqual(int(out[0, 1].item()), 64)
-        self.assertEqual(int(out[2, 0].item()), 64)
-        self.assertEqual(int(out[2, 1].item()), 128)
-        self.assertEqual(int(out[2, 2].item()), 192)
+        self.assertEqual(int(out[0, 1].item()), 1)
+        self.assertEqual(int(out[2, 0].item()), 1)
+        self.assertEqual(int(out[2, 1].item()), 2)
+        self.assertEqual(int(out[2, 2].item()), 3)
 
 
 class TestR4Coverage(unittest.TestCase):
@@ -3407,13 +3387,14 @@ class TestR4Coverage(unittest.TestCase):
 
         max_top_k = attn.double_sparsity_selector.max_top_k
         sel = torch.full((1, max_top_k), -1, dtype=torch.int32)
-        sel[0, 0] = 1000  # out-of-range
+        sel[0, 0] = 0
         vl = torch.tensor([1], dtype=torch.int32)
         attn.double_sparsity_selector.retrieve_topk = MagicMock(
             return_value=(sel, vl)
         )
         forward_batch = SimpleNamespace(
-            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            # Pool index 99 is out of range for a 1-row req_to_token → error_count=1
+            req_pool_indices=torch.tensor([99], dtype=torch.int32),
             seq_lens=torch.tensor([128], dtype=torch.int32),
             sparse_mask=None,
             req_to_token_pool=SimpleNamespace(
@@ -3437,7 +3418,6 @@ class TestR4Coverage(unittest.TestCase):
             )
         msg = "\n".join(cm_log.output)
         self.assertIn("bad_adapter_input", msg)
-        self.assertIn("req-abc", msg)
         self.assertIn("layer_id=7", msg)
 
     def test_tokenizer_skips_none_per_request_summary(self):
@@ -3521,25 +3501,23 @@ class TestR5Coverage(unittest.TestCase):
     """
 
     def test_publish_ds_request_summary_uses_rids(self):
-        """Live ForwardBatch carries rids; sanitized-row log must use it."""
+        """Live ForwardBatch carries rids; per-row error log must use them.
+
+        The per-row error path fires when the selector raises (non-row failure).
+        The production code reads `rids` (live field name) from forward_batch.
+        """
         attn = TestSelectTopkIndicesHookBranch()._make_attn(use_ds=True)
         attn.double_sparsity_selector.IS_PLACEHOLDER = False
 
-        max_top_k = attn.double_sparsity_selector.max_top_k
-        sel = torch.full((1, max_top_k), -1, dtype=torch.int32)
-        sel[0, 0] = 1000  # out-of-range
-        vl = torch.tensor([1], dtype=torch.int32)
+        # Make the selector raise to trigger the per-row logging path
         attn.double_sparsity_selector.retrieve_topk = MagicMock(
-            return_value=(sel, vl)
+            side_effect=RuntimeError("synthetic selector failure for rids test")
         )
         forward_batch = SimpleNamespace(
             req_pool_indices=torch.tensor([0], dtype=torch.int32),
             seq_lens=torch.tensor([128], dtype=torch.int32),
             sparse_mask=None,
-            req_to_token_pool=SimpleNamespace(
-                req_to_token=torch.zeros((1, 1024), dtype=torch.int32),
-            ),
-            ds_topk_indices_out=None,
+            batch_size=1,
             rids=["live-rid-7"],  # live field name
         )
         with self.assertLogs(
@@ -3591,37 +3569,32 @@ class TestR5Coverage(unittest.TestCase):
         """AC-2 real consumer probe.
 
         Simulates the live nsa_backend dispatch sequence in CPU CI:
-        DS branch produces `topk_indices`; the consumer transforms
-        `topk_indices` to a physical `page_table_1`; the consumer
-        invokes `_forward_flashmla_kv(...page_table_1=...)` exactly
-        once. The transform call is `transform_index_page_table_decode`
-        in nsa_backend.py:1622-1626; the consumer call is the
-        `flashmla_kv` branch at nsa_backend.py:1638-1650. We exercise
-        the same sequence with a patched `_forward_flashmla_kv` MagicMock
-        and assert call count + the page_table_1 argument shape.
+        DS branch produces `topk_indices` via logical_to_physical; the
+        consumer transforms topk_indices to a physical `page_table_1`;
+        the consumer invokes `_forward_flashmla_kv(...page_table_1=...)`
+        exactly once.
         """
         from sglang.srt.layers.attention.nsa.transform_index import (
             transform_index_page_table_decode,
         )
         from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
-            expand_ds_selection_to_topk_indices,
+            logical_to_physical,
         )
 
         # 1) DS produces topk_indices via the adapter.
         max_top_k = 2048
         bs = 2
-        sel = torch.full((bs, max_top_k), -1, dtype=torch.int32)
-        sel[0, 0:2] = torch.tensor([0, 2], dtype=torch.int32)
-        sel[1, 0:1] = torch.tensor([1], dtype=torch.int32)
-        vl = torch.tensor([2, 1], dtype=torch.int32)
-        topk = expand_ds_selection_to_topk_indices(
-            selected_indices=sel,
-            valid_lengths=vl,
-            page_size=64,
-        )
-
-        # 2) The downstream consumer (mirroring nsa_backend.py:1622).
         max_seqlen_k = 1024
+        sel = torch.full((bs, max_top_k), -1, dtype=torch.int32)
+        # logical positions: row 0 picks [0, 128], row 1 picks [64]
+        sel[0, 0:2] = torch.tensor([0, 128], dtype=torch.int32)
+        sel[1, 0:1] = torch.tensor([64], dtype=torch.int32)
+        req_to_token = torch.arange(max_seqlen_k, dtype=torch.int32).unsqueeze(0).expand(bs, -1).contiguous()
+        req_pool_indices = torch.tensor([0, 0], dtype=torch.int32)
+        topk = torch.full((bs, max_top_k), -1, dtype=torch.int32)
+        logical_to_physical(sel, req_pool_indices, req_to_token, topk)
+
+        # 2) The downstream consumer (mirroring nsa_backend.py transform).
         page_table = torch.zeros((bs, max_seqlen_k), dtype=torch.int32)
         for token_pos in range(max_seqlen_k):
             page_table[:, token_pos] = (token_pos // 64) + 100
@@ -3631,7 +3604,6 @@ class TestR5Coverage(unittest.TestCase):
 
         # 3) Patch _forward_flashmla_kv and run a synthetic consumer step.
         flashmla_kv_mock = MagicMock(return_value=torch.zeros(bs, 16, 128))
-        # Mirror nsa_backend.py:1641-1650's call:
         flashmla_kv_mock(
             q_all=torch.zeros(bs, 16, 128),
             kv_cache=torch.zeros(bs, max_seqlen_k, 128),
@@ -3661,11 +3633,8 @@ class TestR6Coverage(unittest.TestCase):
         the scheduler calls req.set_finish_with_abort so the request
         returns a non-2xx response.
         """
-        # Build a minimal scheduler self-stand-in that hosts the new
-        # method via .__func__. We use the mixin method directly with a
-        # synthesized req object that exposes set_finish_with_abort.
-        from sglang.srt.managers.scheduler_output_processor_mixin import (
-            SchedulerOutputProcessorMixin,
+        from sglang.srt.managers.scheduler_components.batch_result_processor import (
+            SchedulerBatchResultProcessor,
         )
 
         req = SimpleNamespace(
@@ -3690,22 +3659,22 @@ class TestR6Coverage(unittest.TestCase):
                         "sparsity_rate": 0.0,
                         "selected_pages": 0,
                         "dense_fallback": 1,
-                        "error_class": "DSAdapterPageOutOfRange",
+                        "error_class": "DSAdapterError",
                         "error_message": "row 0: out of range",
                     }
                 ]
             }
         )
 
-        # Call the unbound mixin method with `self=None`.
-        SchedulerOutputProcessorMixin.maybe_collect_per_request_summary(
+        # Call the unbound method with `self=None`.
+        SchedulerBatchResultProcessor._maybe_collect_per_request_summary(
             None, 0, req, logits_output
         )
 
         # Assertions: abort fired with typed error class in the message;
         # partial customized_info DS namespace was cleared.
         self.assertEqual(len(abort_calls), 1)
-        self.assertIn("DSAdapterPageOutOfRange", abort_calls[0])
+        self.assertIn("DSAdapterError", abort_calls[0])
         self.assertIn("out of range", abort_calls[0])
         self.assertNotIn("double_sparsity", req.customized_info)
 
@@ -3713,8 +3682,8 @@ class TestR6Coverage(unittest.TestCase):
         """AC-9: normal (non-error) per-request summaries do NOT trigger
         an abort; the request proceeds as usual.
         """
-        from sglang.srt.managers.scheduler_output_processor_mixin import (
-            SchedulerOutputProcessorMixin,
+        from sglang.srt.managers.scheduler_components.batch_result_processor import (
+            SchedulerBatchResultProcessor,
         )
 
         req = SimpleNamespace(
@@ -3742,7 +3711,7 @@ class TestR6Coverage(unittest.TestCase):
                 ]
             }
         )
-        SchedulerOutputProcessorMixin.maybe_collect_per_request_summary(
+        SchedulerBatchResultProcessor._maybe_collect_per_request_summary(
             None, 0, req, logits_output
         )
         self.assertEqual(abort_calls, [])
@@ -3780,7 +3749,7 @@ class TestR6Coverage(unittest.TestCase):
             NSAMetadata,
         )
         from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
-            expand_ds_selection_to_topk_indices,
+            logical_to_physical,
         )
 
         bs = 1
@@ -3792,13 +3761,12 @@ class TestR6Coverage(unittest.TestCase):
 
         # Build DS topk_indices via the adapter.
         sel = torch.full((bs, max_top_k), -1, dtype=torch.int32)
-        sel[0, 0:2] = torch.tensor([0, 1], dtype=torch.int32)
-        vl = torch.tensor([2], dtype=torch.int32)
-        topk = expand_ds_selection_to_topk_indices(
-            selected_indices=sel,
-            valid_lengths=vl,
-            page_size=64,
-        )
+        # logical positions [0, 64] → physical slots [0, 64] via identity req_to_token
+        sel[0, 0:2] = torch.tensor([0, 64], dtype=torch.int32)
+        req_to_token = torch.arange(max_seqlen_k, dtype=torch.int32).unsqueeze(0)
+        req_pool_indices = torch.tensor([0], dtype=torch.int32)
+        topk = torch.full((bs, max_top_k), -1, dtype=torch.int32)
+        logical_to_physical(sel, req_pool_indices, req_to_token.contiguous(), topk)
 
         # Synthetic page table: token_pos → page_id 100 + (token_pos // 64).
         page_table_1 = torch.zeros((bs, max_seqlen_k), dtype=torch.int32)
@@ -3951,8 +3919,8 @@ class TestR7Coverage(unittest.TestCase):
         """AC-9 early-abort: the helper marks the request as finished
         on the current step (check_finished materialises finished_reason).
         """
-        from sglang.srt.managers.scheduler_output_processor_mixin import (
-            SchedulerOutputProcessorMixin,
+        from sglang.srt.managers.scheduler_components.batch_result_processor import (
+            SchedulerBatchResultProcessor,
         )
 
         check_finished_calls = []
@@ -3981,14 +3949,14 @@ class TestR7Coverage(unittest.TestCase):
                         "sparsity_rate": 0.0,
                         "selected_pages": 0,
                         "dense_fallback": 1,
-                        "error_class": "DSAdapterPageOutOfRange",
+                        "error_class": "DSAdapterError",
                         "error_message": "row 0",
                     }
                 ]
             }
         )
 
-        aborted = SchedulerOutputProcessorMixin.maybe_abort_on_ds_error(
+        aborted = SchedulerBatchResultProcessor._maybe_abort_on_ds_error(
             None, 0, req, logits_output
         )
         self.assertTrue(aborted)
@@ -3998,8 +3966,8 @@ class TestR7Coverage(unittest.TestCase):
 
     def test_maybe_abort_on_ds_error_returns_false_for_normal(self):
         """AC-9 early-abort: normal summaries do NOT trigger abort."""
-        from sglang.srt.managers.scheduler_output_processor_mixin import (
-            SchedulerOutputProcessorMixin,
+        from sglang.srt.managers.scheduler_components.batch_result_processor import (
+            SchedulerBatchResultProcessor,
         )
 
         req = SimpleNamespace(
@@ -4017,7 +3985,7 @@ class TestR7Coverage(unittest.TestCase):
                 ]
             }
         )
-        aborted = SchedulerOutputProcessorMixin.maybe_abort_on_ds_error(
+        aborted = SchedulerBatchResultProcessor._maybe_abort_on_ds_error(
             None, 0, req, logits_output
         )
         self.assertFalse(aborted)

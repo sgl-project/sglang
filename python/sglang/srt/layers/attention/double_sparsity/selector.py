@@ -1,11 +1,12 @@
 """Double Sparsity selector — replaces NSA Indexer.forward selection role.
 
 This is the **placeholder** implementation. It returns deterministic
-sequence-order-ascending logical page IDs so that the FlashMLA block-table
-plumbing in ``DeepseekV2AttentionMLA.forward_core`` can be wired and tested
-end-to-end before real selection kernels land. The placeholder guard refuses
-to serve real traffic; production must call ``bind_runtime_data`` with the
-real ``PageSignatureTable`` and ``ChannelMask`` before serving.
+sequence-order-ascending logical token positions so that the FlashMLA
+block-table plumbing in ``DeepseekV2AttentionMLA.forward_core`` can be
+wired and tested end-to-end before real selection kernels land. The
+placeholder guard refuses to serve real traffic; production must call
+``bind_runtime_data`` with the real ``TokenLabelTable`` and ``ChannelMask``
+before serving.
 
 The class does NOT inherit from any HiSparse base and is NOT registered in
 ``_ALGORITHM_REGISTRY``.
@@ -26,8 +27,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.double_sparsity.config import (
         DoubleSparsityConfig,
     )
-    from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
-        PageSignatureTable,
+    from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+        TokenLabelTable,
     )
 
 
@@ -49,19 +50,19 @@ class DoubleSparsityTPMisconfigured(RuntimeError):
 
 
 class DoubleSparsitySelector:
-    """Sequence-order-ascending top-K logical-page selector.
+    """Sequence-order-ascending top-K logical-token selector.
 
     Two modes:
 
     * **Placeholder** (default after construction). ``retrieve_topk`` returns
-      deterministic ascending logical-page IDs so the downstream FlashMLA
-      wiring is exercisable in unit tests before real selection kernels and
-      a real channel mask are wired. Production serving is refused by the
-      placeholder guard until ``bind_runtime_data`` flips the selector
-      into real mode.
+      deterministic ascending logical token positions so the downstream
+      FlashMLA wiring is exercisable in unit tests before real selection
+      kernels and a real channel mask are wired. Production serving is
+      refused by the placeholder guard until ``bind_runtime_data`` flips the
+      selector into real mode.
 
     * **Real** — after :meth:`bind_runtime_data` is called with a populated
-      :class:`PageSignatureTable` and a loaded :class:`ChannelMask`, the
+      :class:`TokenLabelTable` and a loaded :class:`ChannelMask`, the
       selector switches to the real score → all-reduce → top-K flow from
       :mod:`selection_kernel`. ``IS_PLACEHOLDER`` flips to ``False``.
 
@@ -89,14 +90,14 @@ class DoubleSparsitySelector:
                 f"Double Sparsity max_top_k must be positive, got {self.max_top_k}."
             )
 
-        self.page_signature_table: Optional["PageSignatureTable"] = None
+        self.token_label_table: Optional["TokenLabelTable"] = None
         self.channel_mask: Optional["ChannelMask"] = None
         self.process_group = None
         self.IS_PLACEHOLDER = True
 
     def bind_runtime_data(
         self,
-        page_signature_table: "PageSignatureTable",
+        token_label_table: "TokenLabelTable",
         channel_mask: "ChannelMask",
         *,
         process_group=None,
@@ -108,7 +109,7 @@ class DoubleSparsitySelector:
         flow from :mod:`selection_kernel`.
 
         Idempotence contract: a second call with the SAME object
-        identities for ``page_signature_table``, ``channel_mask``, and
+        identities for ``token_label_table``, ``channel_mask``, and
         ``process_group`` is a no-op. A second call with any different
         object raises :class:`DoubleSparsityRebindError` to prevent
         silent invalidation of CUDA-graph buffers and TP state captured
@@ -117,7 +118,7 @@ class DoubleSparsitySelector:
 
         if not self.IS_PLACEHOLDER:
             same_objects = (
-                self.page_signature_table is page_signature_table
+                self.token_label_table is token_label_table
                 and self.channel_mask is channel_mask
                 and self.process_group is process_group
             )
@@ -131,18 +132,18 @@ class DoubleSparsitySelector:
                 "DoubleSparsitySelector."
             )
 
-        if page_signature_table is None:
-            raise ValueError("page_signature_table is required for real selection.")
+        if token_label_table is None:
+            raise ValueError("token_label_table is required for real selection.")
         if channel_mask is None:
             raise ValueError("channel_mask is required for real selection.")
-        if channel_mask.label_dim != page_signature_table.label_dim:
+        if channel_mask.label_dim != token_label_table.label_dim:
             raise ValueError(
                 f"channel_mask.label_dim={channel_mask.label_dim} does not match "
-                f"page_signature_table.label_dim={page_signature_table.label_dim}."
+                f"token_label_table.label_dim={token_label_table.label_dim}."
             )
-        if page_signature_table.num_heads_local != self.num_local_heads:
+        if token_label_table.num_heads_local != self.num_local_heads:
             raise ValueError(
-                f"page_signature_table.num_heads_local={page_signature_table.num_heads_local} "
+                f"token_label_table.num_heads_local={token_label_table.num_heads_local} "
                 f"does not match selector.num_local_heads={self.num_local_heads}."
             )
         mask_num_heads = int(channel_mask.channel_selection.shape[1])
@@ -155,11 +156,11 @@ class DoubleSparsitySelector:
                 "tp_size=...) before bind_runtime_data."
             )
 
-        # The mask is typically loaded from disk on CPU while the page
-        # signature table + queries live on the selector's device. Align the
+        # The mask is typically loaded from disk on CPU while the token
+        # label table + queries live on the selector's device. Align the
         # mask tensors to the table's device so retrieve_topk's torch.gather
         # and weight-multiply don't trip a device mismatch.
-        target_device = page_signature_table.signatures.device
+        target_device = token_label_table.signatures.device
         if channel_mask.channel_selection.device != target_device:
             channel_mask = replace(
                 channel_mask,
@@ -167,7 +168,7 @@ class DoubleSparsitySelector:
                 channel_weights=channel_mask.channel_weights.to(target_device),
             )
 
-        self.page_signature_table = page_signature_table
+        self.token_label_table = token_label_table
         self.channel_mask = channel_mask
         self.process_group = process_group
         self.IS_PLACEHOLDER = False
@@ -189,14 +190,14 @@ class DoubleSparsitySelector:
             "process_group_size=%d process_group_rank=%d",
             id(self),
             self.num_local_heads,
-            page_signature_table.label_dim,
+            token_label_table.label_dim,
             self.page_size,
             pg_size,
             pg_rank,
             extra={
                 "ds_selector_id": id(self),
                 "ds_num_local_heads": self.num_local_heads,
-                "ds_label_dim": page_signature_table.label_dim,
+                "ds_label_dim": token_label_table.label_dim,
                 "ds_page_size": self.page_size,
                 "ds_process_group_size": pg_size,
                 "ds_process_group_rank": pg_rank,
@@ -210,18 +211,17 @@ class DoubleSparsitySelector:
         req_pool_indices: torch.Tensor,
         sparse_mask: torch.Tensor,
         seq_lens: Optional[torch.Tensor] = None,
-        hot_pages: Optional[Sequence[Sequence[int]]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return ``(selected_indices, valid_lengths)``.
 
-        ``selected_indices``: int32 ``[bs, max_top_k]``, logical page IDs in
+        ``selected_indices``: int32 ``[bs, max_top_k]``, logical token positions in
             **sequence-order ascending**, ``-1`` padded.
         ``valid_lengths``: int32 ``[bs]``, the unpadded length of each row.
 
         Dispatches to the real :mod:`selection_kernel` pipeline once
-        :meth:`bind_runtime_data` has installed a populated page signature
-        table and channel mask; otherwise runs the placeholder ascending-IDs
-        scheme so downstream wiring is exercisable in unit tests.
+        :meth:`bind_runtime_data` has installed a populated token label
+        table and channel mask; otherwise runs the placeholder ascending
+        positions scheme so downstream wiring is exercisable in unit tests.
         """
 
         if queries.dim() < 2:
@@ -229,20 +229,19 @@ class DoubleSparsitySelector:
                 f"Double Sparsity expects queries with at least 2 dims, got shape {tuple(queries.shape)}."
             )
 
-        if self.page_signature_table is not None and self.channel_mask is not None:
+        if self.token_label_table is not None and self.channel_mask is not None:
             from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
-                retrieve_topk_via_signatures,
+                retrieve_topk_via_labels,
             )
 
-            return retrieve_topk_via_signatures(
+            return retrieve_topk_via_labels(
                 queries=queries,
-                page_signatures=self.page_signature_table.signatures,
-                valid_mask=self.page_signature_table.valid_mask,
+                token_signatures=self.token_label_table.signatures,
+                written=self.token_label_table.written,
                 channel_selection=self.channel_mask.channel_selection,
                 channel_weights=self.channel_mask.channel_weights,
                 layer_id=layer_id,
                 max_top_k=self.max_top_k,
-                hot_pages=hot_pages,
                 process_group=self.process_group,
                 per_request_valid=sparse_mask,
             )
@@ -254,23 +253,21 @@ class DoubleSparsitySelector:
             if sparse_mask is None or sparse_mask.dim() < 2:
                 raise ValueError(
                     "Double Sparsity placeholder requires either explicit seq_lens or a "
-                    "2-D sparse_mask of shape [bs, max_seq_pages]."
+                    "2-D sparse_mask of shape [bs, max_seq_tokens]."
                 )
-            page_lens = sparse_mask.to(torch.int32).sum(dim=-1)
+            token_lens = sparse_mask.to(torch.int32).sum(dim=-1)
         else:
-            page_lens = (
-                (seq_lens.to(torch.int64) + self.page_size - 1) // self.page_size
-            ).to(torch.int32)
+            token_lens = seq_lens.to(torch.int32)
 
-        if page_lens.shape[0] != batch_size:
+        if token_lens.shape[0] != batch_size:
             raise ValueError(
-                f"Double Sparsity placeholder: page_lens batch size {page_lens.shape[0]} "
+                f"Double Sparsity placeholder: token_lens batch size {token_lens.shape[0]} "
                 f"does not match req_pool_indices batch size {batch_size}."
             )
 
         valid_lengths = torch.minimum(
-            page_lens,
-            torch.full_like(page_lens, self.max_top_k),
+            token_lens,
+            torch.full_like(token_lens, self.max_top_k),
         ).to(torch.int32)
 
         selected_indices = torch.full(
@@ -323,5 +320,5 @@ def assert_real_selector_or_placeholder_allowed(selector: DoubleSparsitySelector
     raise RuntimeError(
         "Double Sparsity is built with the placeholder selector. Refusing to serve "
         "production traffic. Call DoubleSparsitySelector.bind_runtime_data with the "
-        "real PageSignatureTable and ChannelMask before serving."
+        "real TokenLabelTable and ChannelMask before serving."
     )

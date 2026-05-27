@@ -1842,7 +1842,7 @@ class DeepseekV2AttentionMLA(
 
         Reads the validator-loaded channel mask off ``server_args``,
         slices it for this rank's heads, allocates a shared per-model
-        PageSignatureTable on first use, calls
+        TokenLabelTable on first use, calls
         ``bind_runtime_data`` exactly once, and runs the TP-misconfig
         fail-fast check. After this method returns, the selector reports
         ``IS_PLACEHOLDER == False``.
@@ -1851,8 +1851,8 @@ class DeepseekV2AttentionMLA(
         from sglang.srt.layers.attention.double_sparsity.channel_mask import (
             slice_per_rank,
         )
-        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
-            allocate_page_signature_table,
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
         )
         from sglang.srt.layers.attention.double_sparsity.selector import (
             assert_tp_configured,
@@ -1878,19 +1878,24 @@ class DeepseekV2AttentionMLA(
             tp_size=max(attn_tp_size, 1),
         )
 
-        # Shared per-rank PageSignatureTable: one allocator-owned object
-        # across all DS attention layers in the same model+rank. Stored on
-        # server_args so the second layer's init reuses it.
-        table = getattr(server_args, "_double_sparsity_page_signature_table", None)
+        # Shared per-rank TokenLabelTable: one allocator-owned object across
+        # all DS attention layers in the same model+rank. Stored on server_args
+        # so the second layer's init reuses it.
+        table = getattr(server_args, "_double_sparsity_token_label_table", None)
         if table is None:
             num_layers_local = int(getattr(config, "num_hidden_layers", 1))
-            max_pages = int(getattr(ds_parsed, "device_buffer_size", 4096))
+            # Derive max_tokens from the KV pool so the label table is
+            # slot-consistent with the allocator (AC-0: not device_buffer_size).
+            ds_pool = getattr(server_args, "_ds_req_to_token_pool", None)
+            max_tokens = ds_pool.size if ds_pool is not None else int(
+                getattr(ds_parsed, "device_buffer_size", 4096)
+            )
             label_dim = int(local_mask.label_dim)
             page_size = int(ds_parsed.page_size)
             try:
-                table = allocate_page_signature_table(
+                table = allocate_token_label_table(
                     num_layers_local=num_layers_local,
-                    max_pages=max_pages,
+                    max_tokens=max_tokens,
                     num_heads_local=self.num_local_heads,
                     label_dim=label_dim,
                     page_size=page_size,
@@ -1900,12 +1905,12 @@ class DeepseekV2AttentionMLA(
             except Exception as exc:
                 _ds_metrics.record_error(
                     "bad_mask",
-                    message=f"PageSignatureTable allocation failed: {exc}",
+                    message=f"TokenLabelTable allocation failed: {exc}",
                     selector_id=f"layer{self.layer_id}-tp_rank{attn_tp_rank}",
                     layer_id=self.layer_id,
                 )
                 raise
-            setattr(server_args, "_double_sparsity_page_signature_table", table)
+            setattr(server_args, "_double_sparsity_token_label_table", table)
 
         # Pick the attn TP process group when world > 1; otherwise leave None.
         process_group = None
@@ -1918,7 +1923,7 @@ class DeepseekV2AttentionMLA(
                 process_group = None
 
         self.double_sparsity_selector.bind_runtime_data(
-            page_signature_table=table,
+            token_label_table=table,
             channel_mask=local_mask,
             process_group=process_group,
         )
@@ -1932,7 +1937,7 @@ class DeepseekV2AttentionMLA(
         forward_batch: ForwardBatch,
         selected_indices: torch.Tensor,
         valid_lengths: torch.Tensor,
-        row_errors: Dict[int, Tuple[str, str]],
+        error_count: int,
         layer_id: int,
     ) -> None:
         """Publish per-row DS stats onto ``forward_batch.ds_per_request_summary``.
@@ -1957,44 +1962,16 @@ class DeepseekV2AttentionMLA(
         vl_cpu = valid_lengths.detach().to("cpu").tolist()
         sl_cpu = seq_lens.detach().to("cpu").tolist()
 
-        # Pull per-request identifiers when available; fall back to row
-        # index strings so structured logs still have a stable key. The
-        # live ForwardBatch carries them as `rids` (not `req_ids`); we
-        # accept either for forward-compat with synthetic fixtures.
-        req_ids = getattr(forward_batch, "rids", None)
-        if req_ids is None:
-            req_ids = getattr(forward_batch, "req_ids", None)
+        if error_count > 0:
+            _ds_metrics.record_error(
+                "bad_adapter_input",
+                message=f"{error_count} bad req_pool_indices in batch at layer {layer_id}",
+                layer_id=layer_id,
+                selector_id=f"layer{layer_id}",
+            )
 
         records: List[Optional[Dict[str, Any]]] = []
         for b in range(bs):
-            req_id_str = (
-                str(req_ids[b])
-                if req_ids is not None and b < len(req_ids)
-                else f"row{b}"
-            )
-            if b in row_errors:
-                cls, msg = row_errors[b]
-                records.append(
-                    {
-                        "sparsity_rate": 0.0,
-                        "selected_pages": 0,
-                        "dense_fallback": 1,
-                        "error_class": cls,
-                        "error_message": msg,
-                    }
-                )
-                # Surface the row-level failure through the Prometheus
-                # counter + structured WARNING log so it is observable
-                # even though the request is not aborted (per-request
-                # abort plumbing through the scheduler is queued).
-                _ds_metrics.record_error(
-                    "bad_adapter_input",
-                    message=msg,
-                    request_id=req_id_str,
-                    layer_id=layer_id,
-                    selector_id=f"layer{layer_id}-row{b}",
-                )
-                continue
             selected = int(vl_cpu[b])
             total_pages = max(
                 1, (int(sl_cpu[b]) + page_size - 1) // page_size
@@ -2034,10 +2011,10 @@ class DeepseekV2AttentionMLA(
         any isinstance dispatch.
 
         When ``self.use_double_sparsity`` is true the selector returns
-        page-level ``(selected_indices, valid_lengths)``; the page-table
-        adapter (``expand_ds_selection_to_topk_indices``) translates that
-        page-level output into the token-level ``topk_indices`` shape so
-        the downstream pipeline is unchanged. See
+        token-level ``(selected_indices, valid_lengths)`` (logical positions);
+        the page-table adapter (``logical_to_physical``) converts them to
+        physical KV-cache slot indices via ``req_to_token`` gather so
+        the downstream FlashMLA sparse path is unchanged. See
         :mod:`sglang.srt.layers.attention.double_sparsity.page_table_adapter`.
         """
 
@@ -2046,7 +2023,7 @@ class DeepseekV2AttentionMLA(
                 try_run_ds_step,
             )
             from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
-                expand_ds_selection_to_topk_indices,
+                logical_to_physical,
             )
             from sglang.srt.layers.attention.double_sparsity.selector import (
                 assert_real_selector_or_placeholder_allowed,
@@ -2071,10 +2048,6 @@ class DeepseekV2AttentionMLA(
                     if req_to_token_pool is not None
                     else None
                 )
-                # Per-row error sanitization: the adapter now writes the
-                # failed row indices into `row_errors` and clamps those
-                # rows to -1 instead of raising for the whole batch.
-                row_errors: Dict[int, Tuple[str, str]] = {}
                 # AC-8: prefer the NSA-metadata-owned buffer, allocated
                 # once per batch in init_forward_metadata (also for
                 # capture/replay). Fall back to per-batch lazy alloc on
@@ -2097,26 +2070,25 @@ class DeepseekV2AttentionMLA(
                     setattr(forward_batch, "ds_topk_indices_out", ds_out)
                 elif ds_out.shape[0] != bs:
                     ds_out = ds_out[:bs]
-                topk_out = expand_ds_selection_to_topk_indices(
-                    selected_indices=selected_indices,
-                    valid_lengths=valid_lengths,
-                    page_size=self.double_sparsity_selector.page_size,
-                    req_to_token=req_to_token,
-                    req_pool_indices=getattr(forward_batch, "req_pool_indices", None),
-                    seq_lens=getattr(forward_batch, "seq_lens", None),
-                    out=ds_out,
-                    row_errors=row_errors,
-                )
-                # Publish per-row DS stats + per-row failure classes to
-                # the scheduler via a forward_batch side-channel.
+                _rpi = getattr(forward_batch, "req_pool_indices", None)
+                if req_to_token is not None and _rpi is not None:
+                    error_count = logical_to_physical(
+                        selected_indices=selected_indices,
+                        req_pool_indices=_rpi,
+                        req_to_token=req_to_token,
+                        out=ds_out,
+                    )
+                else:
+                    ds_out.fill_(-1)
+                    error_count = 0
                 self._publish_ds_request_summary(
                     forward_batch=forward_batch,
                     selected_indices=selected_indices,
                     valid_lengths=valid_lengths,
-                    row_errors=row_errors,
+                    error_count=error_count,
                     layer_id=layer_id,
                 )
-                return topk_out
+                return ds_out
 
             error_state: Dict[str, Any] = {}
             # `record_error_on_failure=False`: the production

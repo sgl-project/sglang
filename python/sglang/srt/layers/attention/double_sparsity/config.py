@@ -4,6 +4,11 @@ The configuration surface is intentionally narrow: ``top_k``, ``page_size``,
 ``channel_mask_path``, ``device_buffer_size``, plus a free ``extra`` dict.
 No ``selection_mode`` / ``top_p`` / ``min_top_k`` / ``max_top_k`` — top-p
 selection (Twilight) is a separate follow-on with its own ABI design.
+
+``top_k`` counts maximum **tokens** per request (not pages).  At Option B
+operating point this matches the model's intrinsic ``index_topk=2048``.
+``device_buffer_size`` is the score-scratch buffer cap (maximum concurrently
+live tokens for the decode scoring scratch tensor).
 """
 
 from __future__ import annotations
@@ -22,12 +27,17 @@ _ALLOWED_FIELDS = {
 }
 
 
+_DEFAULT_TOP_K = 2048           # matches DeepSeek-V3.2 index_topk (max tokens per request)
+_DEFAULT_PAGE_SIZE = 64         # FlashMLA KV layout requirement
+_DEFAULT_DEVICE_BUFFER_SIZE = 4096  # score-scratch buffer cap in tokens
+
+
 @dataclass
 class DoubleSparsityConfig:
-    top_k: int
-    page_size: int
     channel_mask_path: str
-    device_buffer_size: int
+    top_k: int = _DEFAULT_TOP_K
+    page_size: int = _DEFAULT_PAGE_SIZE
+    device_buffer_size: int = _DEFAULT_DEVICE_BUFFER_SIZE
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -90,18 +100,15 @@ def parse_double_sparsity_config(payload: str) -> DoubleSparsityConfig:
             "and are not accepted by the initial deliverable."
         )
 
-    missing = {"top_k", "page_size", "channel_mask_path", "device_buffer_size"} - set(
-        data.keys()
-    )
-    if missing:
+    if "channel_mask_path" not in data:
         raise ValueError(
-            f"Double Sparsity config is missing required field(s): {sorted(missing)}."
+            "Double Sparsity config is missing required field 'channel_mask_path'."
         )
 
     return DoubleSparsityConfig(
-        top_k=data["top_k"],
-        page_size=data["page_size"],
         channel_mask_path=data["channel_mask_path"],
-        device_buffer_size=data["device_buffer_size"],
+        top_k=int(data.get("top_k", _DEFAULT_TOP_K)),
+        page_size=int(data.get("page_size", _DEFAULT_PAGE_SIZE)),
+        device_buffer_size=int(data.get("device_buffer_size", _DEFAULT_DEVICE_BUFFER_SIZE)),
         extra=data.get("extra", {}),
     )

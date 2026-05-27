@@ -645,6 +645,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.elastic_ep_backend:
             ElasticEPStateManager.init(self.server_args)
+        # Expose the pool to model __init__ so DS bind can derive max_tokens.
+        if self.req_to_token_pool is not None:
+            self.server_args._ds_req_to_token_pool = self.req_to_token_pool
         # Load the model
         self.sampler = create_sampler()
         self.load_model()

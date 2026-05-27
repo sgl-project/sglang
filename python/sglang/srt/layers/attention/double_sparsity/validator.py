@@ -117,20 +117,19 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
     else:
         allowed = _BACKEND_BY_DTYPE[kv_cache_dtype]
         for attr, label in (
-            ("nsa_prefill_backend", "prefill"),
-            ("nsa_decode_backend", "decode"),
+            ("dsa_prefill_backend", "prefill"),
+            ("dsa_decode_backend", "decode"),
         ):
             backend = getattr(server_args, attr, None)
             if backend is not None and backend not in allowed:
                 raise ValueError(
                     f"Double Sparsity with --kv-cache-dtype={kv_cache_dtype} requires "
-                    f"--nsa-{label}-backend in {sorted(allowed)}, but got {backend!r}."
+                    f"--dsa-{label}-backend in {sorted(allowed)}, but got {backend!r}."
                 )
 
-    # Capability check (DEC-10): the running model must expose the NSA Indexer
-    # hook surface that Double Sparsity replaces. is_deepseek_nsa() recognises
-    # DeepSeek V3.2 today; GLM-5.1 should also pass once it ships the same
-    # interface (DEC-6 deferred-but-hard requirement).
+    # Capability check: the running model must expose the DSA Indexer
+    # hook surface that Double Sparsity replaces.
+    hf_config = None
     if callable(getattr(server_args, "get_model_config", None)):
         try:
             hf_config = server_args.get_model_config().hf_config  # type: ignore[union-attr]
@@ -145,12 +144,40 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
 
             if not is_deepseek_nsa(hf_config):
                 raise ValueError(
-                    "Double Sparsity currently requires a model that exposes the NSA "
+                    "Double Sparsity currently requires a model that exposes the DSA "
                     "Indexer hook surface (e.g. DeepSeek V3.2). The capability check "
-                    "via is_deepseek_nsa(hf_config) returned False for this model. "
-                    "Note: this generalizes to GLM-5.1 once it ships the same "
-                    "indexer interface (DEC-6 / DEC-10)."
+                    "via is_deepseek_nsa(hf_config) returned False for this model."
                 )
+
+    # top_k == get_dsa_index_topk(hf_config) boot assert.
+    # DS must pick the same number of tokens as the DSA lightning indexer so
+    # the Option B apples-to-apples comparison holds. Override with
+    # SGLANG_DS_ALLOW_TOPK_MISMATCH=1 for ablation runs.
+    if hf_config is not None:
+        try:
+            from sglang.srt.configs.model_config import get_dsa_index_topk
+
+            model_topk = get_dsa_index_topk(hf_config)
+            if model_topk > 0 and config.top_k != model_topk:
+                if os.environ.get("SGLANG_DS_ALLOW_TOPK_MISMATCH") != "1":
+                    raise ValueError(
+                        f"Double Sparsity top_k={config.top_k} does not match the model's "
+                        f"DSA index_topk={model_topk}. The two must agree for the "
+                        "Option B apples-to-apples comparison. Either set "
+                        f"top_k={model_topk} in --double-sparsity-config or set "
+                        "SGLANG_DS_ALLOW_TOPK_MISMATCH=1 to override."
+                    )
+                else:
+                    logger.warning(
+                        "Double Sparsity top_k=%d != model DSA index_topk=%d; "
+                        "SGLANG_DS_ALLOW_TOPK_MISMATCH=1 override active.",
+                        config.top_k,
+                        model_topk,
+                    )
+        except ImportError:
+            logger.debug(
+                "get_dsa_index_topk not available; skipping top_k assertion."
+            )
 
     # Channel-mask file existence + content-hash verification. The loader
     # raises DoubleSparsityChannelMaskMissing for absent files and

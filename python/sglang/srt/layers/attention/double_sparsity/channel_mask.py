@@ -2,8 +2,8 @@
 
 The channel mask file is produced offline by :mod:`calibrate` and consumed at
 server startup. It freezes the per-(layer, head) projection that the
-:mod:`page_signature_write` Triton kernel uses to compress each KV page into
-a ``label_dim``-wide signature for runtime top-K selection.
+:mod:`token_label_write` Triton kernel uses to compress each KV token into
+a ``label_dim``-wide label for runtime top-K selection.
 
 Schema (``safetensors``):
 
@@ -444,14 +444,14 @@ def startup_sanity_probe(
     needle_page: int = 4,
     abort_on_placeholder: bool = False,
 ) -> SanityProbeResult:
-    """NIAH-min sanity probe: one needle, one short haystack.
+    """NIAH-min sanity probe: one needle, one short token haystack.
 
-    Constructs a deterministic 512-token haystack split into 8 pages of 64
-    tokens each, plants a "needle" page-score signal at ``needle_page``, runs
-    the selector, and asserts the needle page lands in
-    ``selected_indices``. With the placeholder selector the probe is
-    inconclusive (returns ``passed=False, skipped_reason=...``) — production
-    serving is independently refused by the placeholder-guard.
+    Constructs a deterministic haystack of ``haystack_pages * page_size``
+    token slots, plants a "needle" token signal at token position
+    ``needle_page * page_size``, runs the selector, and asserts the needle
+    token lands in ``selected_indices``. With the placeholder selector the
+    probe is inconclusive (returns ``passed=False, skipped_reason=...``) —
+    production serving is independently refused by the placeholder-guard.
     """
 
     if needle_page >= haystack_pages or needle_page < 0:
@@ -478,16 +478,17 @@ def startup_sanity_probe(
             skipped_reason="placeholder_selector",
         )
 
-    # Real-selector path: plant a needle directly in the page-signature
-    # table (label-dim 0 set high at `needle_page`, low at the others), build
-    # a query that projects onto label-dim 0 via the loaded channel mask, and
-    # ask the selector to retrieve a SMALL top-K. The probe must discriminate
-    # the needle from the haystack — a trivial top_k >= haystack_pages passes
-    # by inclusion alone, so this overrides max_top_k to a sharp value.
-    table = getattr(selector, "page_signature_table", None)
+    # Real-selector path: plant a needle directly in the token-label
+    # table (label-dim 0 set high at `needle_page * page_size`, low at the
+    # others), build a query that projects onto label-dim 0 via the loaded
+    # channel mask, and ask the selector to retrieve a SMALL top-K. The probe
+    # must discriminate the needle from the haystack — a trivial
+    # top_k >= haystack_tokens passes by inclusion alone, so this overrides
+    # max_top_k to a sharp value.
+    table = getattr(selector, "token_label_table", None)
     if table is None:
         msg = (
-            "channel mask sanity probe needs a bound page_signature_table "
+            "channel mask sanity probe needs a bound token_label_table "
             "on the selector; got None. Call bind_runtime_data first."
         )
         if abort_on_placeholder:
@@ -498,32 +499,34 @@ def startup_sanity_probe(
             score=0.0,
             needle_position=needle_page,
             selected_indices=None,
-            skipped_reason="no_page_signature_table",
+            skipped_reason="no_token_label_table",
         )
 
     from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
-        retrieve_topk_via_signatures,
+        retrieve_topk_via_labels,
     )
 
     device = table.signatures.device
     num_heads = int(getattr(selector, "num_local_heads", table.signatures.shape[2]))
     head_dim = int(getattr(selector, "head_dim", 128))
     layer_id = 0
+    haystack_tokens = haystack_pages * page_size
+    needle_token = needle_page * page_size
 
     # Move per-layer mask slices onto the table device.
     sel_layer = mask.channel_selection[layer_id].to(device)  # [H, label_dim] int32
     w_layer = mask.channel_weights[layer_id].to(device)  # [H, label_dim] fp32
 
-    # Snapshot the layer's signatures and valid_mask so we can restore on exit.
-    sig_snapshot = table.signatures[layer_id, :haystack_pages].clone()
-    valid_snapshot = table.valid_mask[layer_id, :haystack_pages].clone()
+    # Snapshot the layer's signatures and written so we can restore on exit.
+    sig_snapshot = table.signatures[layer_id, :haystack_tokens].clone()
+    written_snapshot = table.written[layer_id, :haystack_tokens].clone()
 
     try:
-        # Plant: weak baseline along label-dim 0, strong signal at needle_page.
-        table.signatures[layer_id, :haystack_pages].zero_()
-        table.signatures[layer_id, :haystack_pages, :, 0] = 0.1
-        table.signatures[layer_id, needle_page, :, 0] = 10.0
-        table.valid_mask[layer_id, :haystack_pages] = True
+        # Plant: weak baseline along label-dim 0, strong signal at needle_token.
+        table.signatures[layer_id, :haystack_tokens].zero_()
+        table.signatures[layer_id, :haystack_tokens, :, 0] = 0.1
+        table.signatures[layer_id, needle_token, :, 0] = 10.0
+        table.written[layer_id, :haystack_tokens] = True
 
         # Build a query that, when projected through (sel_layer, w_layer),
         # has its first label-dim slot equal to ~1.0 per head.
@@ -536,16 +539,16 @@ def startup_sanity_probe(
             queries[0, h, ch_idx] = 1.0 / weight if abs(weight) > 1e-6 else 1.0
 
         # Sharp top-K so the probe must discriminate.
-        probe_top_k = max(1, haystack_pages // 4)
+        probe_top_k = max(1, haystack_tokens // 4)
         per_request_valid = torch.zeros(
             1, table.signatures.shape[1], dtype=torch.bool, device=device
         )
-        per_request_valid[0, :haystack_pages] = True
+        per_request_valid[0, :haystack_tokens] = True
 
-        selected_indices, valid_lengths = retrieve_topk_via_signatures(
+        selected_indices, valid_lengths = retrieve_topk_via_labels(
             queries=queries,
-            page_signatures=table.signatures,
-            valid_mask=table.valid_mask,
+            token_signatures=table.signatures,
+            written=table.written,
             channel_selection=mask.channel_selection.to(device),
             channel_weights=mask.channel_weights.to(device),
             layer_id=layer_id,
@@ -553,18 +556,18 @@ def startup_sanity_probe(
             per_request_valid=per_request_valid,
         )
     finally:
-        table.signatures[layer_id, :haystack_pages] = sig_snapshot
-        table.valid_mask[layer_id, :haystack_pages] = valid_snapshot
+        table.signatures[layer_id, :haystack_tokens] = sig_snapshot
+        table.written[layer_id, :haystack_tokens] = written_snapshot
 
     row = selected_indices[0]
     length = int(valid_lengths[0])
     unpadded = [int(v) for v in row[:length].tolist() if v >= 0]
-    passed = needle_page in unpadded
+    passed = needle_token in unpadded
     score = 1.0 if passed else 0.0
     return SanityProbeResult(
         passed=passed,
         score=score,
-        needle_position=needle_page,
+        needle_position=needle_token,
         selected_indices=selected_indices,
         skipped_reason=None,
     )
