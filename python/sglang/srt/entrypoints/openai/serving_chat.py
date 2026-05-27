@@ -123,6 +123,53 @@ class OpenAIServingChat(OpenAIServingBase):
 
         self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
 
+        # When tools are requested, _process_messages forces
+        # skip_special_tokens=False so the tool-call parser can see its
+        # markers. This also leaks structural specials (e.g. <|im_end|>)
+        # into content; strip them post-parse to mirror
+        # skip_special_tokens=True semantics.
+        self._special_token_strings: tuple[str, ...] = self._compute_special_token_strings()
+
+    def _compute_special_token_strings(self) -> tuple[str, ...]:
+        """Text form of every token marked special=True in the tokenizer.
+
+        Matches what decode(..., skip_special_tokens=True) would strip.
+        Tokens with special=False (e.g. <tool_call>, <arg_key>, <think>)
+        are not included — those are kept for the tool-call/reasoning
+        parsers to consume.
+        """
+        tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
+        if tokenizer is None:
+            return ()
+        markers: set[str] = set()
+        atd = getattr(tokenizer, "added_tokens_decoder", None)
+        if isinstance(atd, dict):
+            for _tid, info in atd.items():
+                # info may be a transformers AddedToken or a plain dict
+                is_special = bool(getattr(info, "special", None) or
+                                  (isinstance(info, dict) and info.get("special")))
+                if not is_special:
+                    continue
+                content = getattr(info, "content", None)
+                if content is None and isinstance(info, dict):
+                    content = info.get("content")
+                if isinstance(content, str) and content:
+                    markers.add(content)
+        # Fallback for tokenizers that don't list EOS in added_tokens_decoder.
+        eos = getattr(tokenizer, "eos_token", None)
+        if isinstance(eos, str) and eos:
+            markers.add(eos)
+        return tuple(markers)
+
+    def _strip_special_tokens(self, text: Optional[str]) -> Optional[str]:
+        """Strip structural special-token text from a content field."""
+        if not text or not self._special_token_strings:
+            return text
+        for marker in self._special_token_strings:
+            if marker in text:
+                text = text.replace(marker, "")
+        return text
+
     def _handle_last_assistant_message(
         self,
         messages: List[Dict[str, Any]],
@@ -766,6 +813,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_text, delta = self._process_reasoning_stream(
                         index, delta, reasoning_parser_dict, content, request
                     )
+                    reasoning_text = self._strip_special_tokens(reasoning_text)
+                    delta = self._strip_special_tokens(delta)
                     if reasoning_text:
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
@@ -818,6 +867,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 else:
                     # Regular content
+                    delta = self._strip_special_tokens(delta)
                     if delta:
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
@@ -1040,6 +1090,11 @@ class OpenAIServingChat(OpenAIServingBase):
                     history_tool_calls_cnt,
                     chat_template_kwargs=getattr(request, "chat_template_kwargs", None),
                 )
+
+            # Strip structural special tokens that leaked through because
+            # skip_special_tokens=False was forced for the tool-call parser.
+            text = self._strip_special_tokens(text)
+            reasoning_text = self._strip_special_tokens(reasoning_text)
 
             # Extract prompt_token_ids if requested
             choice_prompt_token_ids = (
@@ -1399,6 +1454,8 @@ class OpenAIServingChat(OpenAIServingBase):
             normal_text, calls = result.normal_text, result.calls
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
+
+        normal_text = self._strip_special_tokens(normal_text)
 
         # Yield normal text
         if normal_text:
