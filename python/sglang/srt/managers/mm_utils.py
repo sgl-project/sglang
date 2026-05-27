@@ -355,6 +355,7 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 embedding_cache: Optional[MultiModalStaticCache] = None
 mm_global_cache_controller: Optional[Any] = None
 _mm_global_cache_executor: Optional[ThreadPoolExecutor] = None
+_mm_global_cache_read_executor: Optional[ThreadPoolExecutor] = None
 
 
 def init_mm_embedding_cache(max_size: int = 0):
@@ -364,13 +365,16 @@ def init_mm_embedding_cache(max_size: int = 0):
 
 def init_mm_global_cache(controller: Optional[Any] = None):
     """Initialize the global cache controller for multi-node embedding sharing."""
-    global mm_global_cache_controller, _mm_global_cache_executor
+    global mm_global_cache_controller, _mm_global_cache_executor, _mm_global_cache_read_executor
     mm_global_cache_controller = controller
 
     # Create a dedicated thread pool for global cache background writes
     if controller is not None and _mm_global_cache_executor is None:
         _mm_global_cache_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="mm_global_cache_writer"
+        )
+        _mm_global_cache_read_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mm_global_cache_reader"
         )
 
 
@@ -742,25 +746,20 @@ def _get_chunked_prefill_embedding(
         try:
 
             def check_global_cache():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    return loop.run_until_complete(
-                        mm_global_cache_controller.batch_is_exist(check_hashes)
-                    )
-                finally:
-                    loop.close()
+                return asyncio.run(
+                    mm_global_cache_controller.batch_is_exist(check_hashes)
+                )
 
             # Quick check with short timeout to avoid blocking encoder
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(check_global_cache)
-                try:
-                    exist_mask = future.result(timeout=exist_timeout)
-                except TimeoutError:
-                    logger.debug(
-                        "Global cache existence check timeout, fallback to ViT"
-                    )
-                    exist_mask = [False] * len(check_hashes)
+            # Use dedicated read executor to avoid being blocked by background writes
+            future = _mm_global_cache_read_executor.submit(check_global_cache)
+            try:
+                exist_mask = future.result(timeout=exist_timeout)
+            except TimeoutError:
+                logger.debug(
+                    "Global cache existence check timeout, fallback to ViT"
+                )
+                exist_mask = [False] * len(check_hashes)
 
             # Categorize items by L2 existence
             global_hit_items = []  # (item, token_count) for L2 hits
