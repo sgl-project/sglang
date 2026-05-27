@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
@@ -516,6 +517,49 @@ class TestNgramExternalSamArgs(CustomTestCase):
         with self.assertRaises(ValueError) as context:
             handle_speculative_decoding(args)
         self.assertIn("external-corpus-max-tokens", str(context.exception))
+
+
+class TestHiSparseMTPServerArgs(unittest.TestCase):
+    def _make_hisparse_mtp_args(self, **overrides) -> ServerArgs:
+        args = ServerArgs(model_path="dummy")
+        args.served_model_name = "dummy"
+        args.enable_hisparse = True
+        args.disable_radix_cache = True
+        args.speculative_algorithm = "EAGLE"
+        args.speculative_num_draft_tokens = 4
+        args.speculative_eagle_topk = 1
+        args.enable_mixed_chunk = False
+        args.hisparse_config = '{"top_k": 128}'
+        args.kv_cache_dtype = "bfloat16"
+        args.nsa_prefill_backend = "flashmla_sparse"
+        args.nsa_decode_backend = "flashmla_sparse"
+        args.page_size = 1
+        args.chunked_prefill_size = -1
+        args.enable_grpc = False
+        args.grpc_port = None
+        args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["GlmMoeDsaForCausalLM"],
+                index_topk=128,
+            )
+        )
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_missing_hisparse_page_size_uses_default_capacity(self):
+        args = self._make_hisparse_mtp_args()
+
+        args.check_server_args()
+
+    def test_explicit_small_hisparse_page_size_still_rejects_draft_tokens(self):
+        args = self._make_hisparse_mtp_args(hisparse_config='{"page_size": 4}')
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "hiSparse extra page capacity \\(3 slots\\) is insufficient",
+        ):
+            args.check_server_args()
 
 
 class TestDeepEPWaterfillArgs(CustomTestCase):

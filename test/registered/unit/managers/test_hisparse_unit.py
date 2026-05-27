@@ -170,6 +170,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.lru_slots[:] = self.coordinator._lru_init.view(1, 1, -1)
         self.coordinator.ack_staging_queue.clear()
         self.coordinator._has_pending_backup = False
+        self.coordinator._pending_draft_extend_backup = None
         for i in range(len(self.coordinator._skip_first_backup)):
             self.coordinator._skip_first_backup[i] = False
 
@@ -425,6 +426,62 @@ class TestHiSparseUnit(unittest.TestCase):
 
         self._cleanup_req(req, kv_loc, logical_only=True)
         self._assert_sizes_restored(initial, "long_seq")
+
+    def test_map_last_loc_records_newest_token_for_multistep_swap(self):
+        """Multi-step verify can resolve the newest-token extra-page slot."""
+        initial = self._get_initial_sizes()
+        fill_len = DEVICE_BUFFER_SIZE + self.page_size
+        req = _make_req("newest-token-metadata", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len)
+        self.coordinator.alloc_device_buffer(req)
+
+        req_idx = req.req_pool_idx
+        req_pool_indices = torch.tensor([req_idx], dtype=torch.int64, device="cuda")
+        seq_lens = torch.tensor([fill_len], dtype=torch.int64, device="cuda")
+        seq_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
+
+        self.coordinator.map_last_loc_to_buffer(
+            seq_lens=seq_lens,
+            out_cache_loc=kv_loc[-1:],
+            req_pool_indices=req_pool_indices,
+            seq_lens_cpu=seq_lens_cpu,
+        )
+
+        newest_slot = self.coordinator.req_to_device_buffer[req_idx, DEVICE_BUFFER_SIZE]
+        self.assertTrue(
+            torch.all(
+                self.coordinator.req_device_buffer_tokens[
+                    :, req_idx, DEVICE_BUFFER_SIZE
+                ]
+                == fill_len - 1
+            )
+        )
+        self.assertEqual(
+            int(
+                self.allocator.full_to_hisparse_device_index_mapping[kv_loc[-1]].item()
+            ),
+            int(newest_slot.item()),
+        )
+
+        topk = torch.full((1, 4, TOP_K), -1, dtype=torch.int32, device="cuda")
+        topk[0, 0, 0] = fill_len - 1
+        self.coordinator.num_real_reqs[0] = 1
+        locs = self.coordinator.swap_in_selected_pages(
+            req_pool_indices=req_pool_indices,
+            compressed_seq_lens=torch.full(
+                (4,), fill_len, dtype=torch.int32, device="cuda"
+            ),
+            top_k_result=topk,
+            layer_id=0,
+            token_position_space="full",
+            num_steps=4,
+        )
+        self.assertEqual(int(locs[0, 0, 0].item()), int(newest_slot.item()))
+
+        self._cleanup_req(req, kv_loc)
+        self._assert_sizes_restored(initial, "newest_token_metadata")
 
     # ==================================================================
     # Test: Kernel LRU replacement across multiple decode steps
@@ -755,6 +812,364 @@ class TestHiSparseUnit(unittest.TestCase):
             self._cleanup_req(req, kv_locs[i], logical_only=is_long)
 
         self._assert_sizes_restored(initial, "batch_multiple")
+
+    # ==================================================================
+    # Test: HiSparse MTP draft slots
+    # ==================================================================
+    def test_draft_slots_use_extra_page_after_newest_slot(self):
+        """Uniform draft slots start after the newest-token slot."""
+        initial = self._get_initial_sizes()
+        fill_len = DEVICE_BUFFER_SIZE
+        draft_num = 3
+        req = _make_req("draft-slots-uniform", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len)
+        self.coordinator.alloc_device_buffer(req)
+
+        req_idx = req.req_pool_idx
+        extra_start = DEVICE_BUFFER_SIZE + 1
+        req_pool_indices = torch.tensor([req_idx], dtype=torch.int64, device="cuda")
+        start_positions_cpu = torch.tensor([DEVICE_BUFFER_SIZE], dtype=torch.int64)
+
+        hot_tokens_before = self.coordinator.req_device_buffer_tokens[
+            :, req_idx, :DEVICE_BUFFER_SIZE
+        ].clone()
+        newest_token_sentinel = torch.full(
+            (LAYER_NUM,), 777, dtype=torch.int32, device="cuda"
+        )
+        self.coordinator.req_device_buffer_tokens[:, req_idx, DEVICE_BUFFER_SIZE] = (
+            newest_token_sentinel
+        )
+
+        device_slots = self.coordinator.get_draft_device_slots(
+            req_pool_indices,
+            draft_num,
+            start_positions_cpu,
+        )
+
+        expected_slots = self.coordinator.req_to_device_buffer[
+            req_idx, extra_start : extra_start + draft_num
+        ]
+        expected_token_positions = torch.arange(
+            DEVICE_BUFFER_SIZE,
+            DEVICE_BUFFER_SIZE + draft_num,
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        self.assertTrue(torch.equal(device_slots, expected_slots))
+        self.assertTrue(
+            torch.equal(
+                self.coordinator.req_device_buffer_tokens[
+                    :, req_idx, :DEVICE_BUFFER_SIZE
+                ],
+                hot_tokens_before,
+            ),
+            "Draft slots must not rewrite hot-buffer token metadata",
+        )
+        self.assertTrue(
+            torch.equal(
+                self.coordinator.req_device_buffer_tokens[
+                    :, req_idx, DEVICE_BUFFER_SIZE
+                ],
+                newest_token_sentinel,
+            ),
+            "Draft slots must not overwrite the newest-token slot",
+        )
+        self.assertTrue(
+            torch.equal(
+                self.coordinator.req_device_buffer_tokens[
+                    :, req_idx, extra_start : extra_start + draft_num
+                ],
+                expected_token_positions.unsqueeze(0).expand(LAYER_NUM, -1),
+            )
+        )
+
+        self._cleanup_req(req, kv_loc)
+        self._assert_sizes_restored(initial, "draft_slots_uniform")
+
+    def test_draft_slots_variable_respect_per_request_counts(self):
+        """Variable draft slots only populate each request's actual token count."""
+        initial = self._get_initial_sizes()
+        reqs = [
+            _make_req("draft-slots-variable-0"),
+            _make_req("draft-slots-variable-1"),
+        ]
+        for req in reqs:
+            self._alloc_req_slot(req)
+
+        req_pool_indices = torch.tensor(
+            [req.req_pool_idx for req in reqs], dtype=torch.int64, device="cuda"
+        )
+        tokens_per_req_cpu = torch.tensor([1, 3], dtype=torch.int64)
+        start_positions_cpu = torch.tensor(
+            [DEVICE_BUFFER_SIZE, DEVICE_BUFFER_SIZE], dtype=torch.int64
+        )
+        extra_start = DEVICE_BUFFER_SIZE + 1
+
+        device_slots = self.coordinator.get_draft_device_slots_variable(
+            req_pool_indices,
+            tokens_per_req_cpu,
+            start_positions_cpu,
+        )
+
+        expected_slots = torch.cat(
+            [
+                self.coordinator.req_to_device_buffer[
+                    reqs[0].req_pool_idx, extra_start : extra_start + 1
+                ],
+                self.coordinator.req_to_device_buffer[
+                    reqs[1].req_pool_idx, extra_start : extra_start + 3
+                ],
+            ]
+        )
+        self.assertTrue(torch.equal(device_slots, expected_slots))
+
+        req0_expected = torch.tensor(
+            [DEVICE_BUFFER_SIZE, -1, -1], dtype=torch.int32, device="cuda"
+        )
+        req1_expected = torch.arange(
+            DEVICE_BUFFER_SIZE,
+            DEVICE_BUFFER_SIZE + 3,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        self.assertTrue(
+            torch.equal(
+                self.coordinator.req_device_buffer_tokens[
+                    :, reqs[0].req_pool_idx, extra_start : extra_start + 3
+                ],
+                req0_expected.unsqueeze(0).expand(LAYER_NUM, -1),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                self.coordinator.req_device_buffer_tokens[
+                    :, reqs[1].req_pool_idx, extra_start : extra_start + 3
+                ],
+                req1_expected.unsqueeze(0).expand(LAYER_NUM, -1),
+            )
+        )
+
+        for req in reqs:
+            self.coordinator.request_finished(req)
+            self._free_req_slot(req)
+        self._assert_sizes_restored(initial, "draft_slots_variable")
+
+    def test_finalize_accepted_tokens_remaps_newest_and_clears_rejected(self):
+        """Accepted MTP tokens move the last accepted KV to newest slot."""
+        initial = self._get_initial_sizes()
+        fill_len = DEVICE_BUFFER_SIZE
+        draft_num = 4
+        req = _make_req("finalize-accepted", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len)
+        self.coordinator.alloc_device_buffer(req)
+
+        req_idx = req.req_pool_idx
+        req_pool_indices = torch.tensor([req_idx], dtype=torch.int64, device="cuda")
+        start_positions_cpu = torch.tensor([fill_len], dtype=torch.int64)
+        draft_device_slots = self.coordinator.get_draft_device_slots(
+            req_pool_indices,
+            draft_num,
+            start_positions_cpu,
+        )
+
+        device = self.allocator.device
+        prefix_lens = torch.tensor([fill_len], dtype=torch.int64, device=device)
+        prefix_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
+        seq_lens = torch.tensor(
+            [fill_len + draft_num], dtype=torch.int64, device=device
+        )
+        seq_lens_cpu = torch.tensor([fill_len + draft_num], dtype=torch.int64)
+        last_loc = kv_loc[-1:].to(device=device)
+        draft_cache_locs = self.allocator.alloc_extend_with_device_mapping(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            draft_num,
+            draft_device_slots,
+        )
+        self.req_to_token_pool.write(
+            (req_idx, slice(fill_len, fill_len + draft_num)), draft_cache_locs
+        )
+        req.kv_allocated_len = fill_len + draft_num
+        req.kv_committed_len = fill_len + draft_num
+
+        for lid in range(LAYER_NUM):
+            for i in range(draft_num):
+                self.device_pool.kv_buffer[lid][draft_device_slots[i]] = (
+                    self._kv_pattern(lid, fill_len + i)
+                )
+
+        accepted_cache_locs = draft_cache_locs[:2]
+        accepted_token_positions = torch.tensor(
+            [fill_len, fill_len + 1], dtype=torch.int64, device="cuda"
+        )
+        self.coordinator.finalize_accepted_tokens(
+            req_pool_indices=req_pool_indices,
+            accepted_cache_locs=accepted_cache_locs,
+            draft_cache_locs=draft_cache_locs,
+            num_correct_drafts=torch.tensor([1], dtype=torch.int64, device="cuda"),
+            num_correct_drafts_cpu=torch.tensor([1], dtype=torch.int64),
+            accepted_token_positions=accepted_token_positions,
+        )
+
+        mapping = self.allocator.full_to_hisparse_device_index_mapping
+        newest_slot = self.coordinator.req_to_device_buffer[req_idx, DEVICE_BUFFER_SIZE]
+
+        self.assertEqual(
+            int(mapping[accepted_cache_locs[0]].item()),
+            int(draft_device_slots[0].item()),
+        )
+        self.assertEqual(int(mapping[accepted_cache_locs[-1]].item()), int(newest_slot))
+        self.assertTrue(torch.all(mapping[draft_cache_locs[2:]] == 0))
+        self.assertTrue(
+            torch.all(
+                self.coordinator.req_device_buffer_tokens[
+                    :, req_idx, DEVICE_BUFFER_SIZE
+                ]
+                == fill_len + 1
+            )
+        )
+        self.assertTrue(
+            torch.all(
+                self.coordinator.req_to_host_pool[req_idx, accepted_token_positions]
+                >= 0
+            )
+        )
+        for lid in range(LAYER_NUM):
+            expected = self._kv_pattern(lid, fill_len + 1)
+            actual = self.device_pool.kv_buffer[lid][newest_slot.long()]
+            self.assertTrue(
+                torch.allclose(
+                    actual.float(),
+                    torch.full_like(actual.float(), expected),
+                    atol=1e-2,
+                ),
+                f"Layer {lid}: newest slot was not updated from last accepted token",
+            )
+
+        self.coordinator.finish_pending_draft_extend_backup()
+        self.assertEqual(int(mapping[accepted_cache_locs[0]].item()), 0)
+        self.assertEqual(int(mapping[accepted_cache_locs[-1]].item()), int(newest_slot))
+
+        self.coordinator.request_finished(req)
+        self.allocator.free(torch.cat([kv_loc, draft_cache_locs]))
+        self._free_req_slot(req)
+        self._assert_sizes_restored(initial, "finalize_accepted_tokens")
+
+    def test_finalize_accepted_tokens_keeps_short_last_token_in_hot_slot(self):
+        """Short-context accepted tokens use the hot slot read by the fast path."""
+        initial = self._get_initial_sizes()
+        fill_len = self.page_size
+        draft_num = 4
+        req = _make_req("finalize-accepted-short", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len)
+        self.coordinator.alloc_device_buffer(req)
+
+        req_idx = req.req_pool_idx
+        req_pool_indices = torch.tensor([req_idx], dtype=torch.int64, device="cuda")
+        start_positions_cpu = torch.tensor([fill_len], dtype=torch.int64)
+        draft_device_slots = self.coordinator.get_draft_device_slots(
+            req_pool_indices,
+            draft_num,
+            start_positions_cpu,
+        )
+
+        device = self.allocator.device
+        prefix_lens = torch.tensor([fill_len], dtype=torch.int64, device=device)
+        prefix_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
+        seq_lens = torch.tensor(
+            [fill_len + draft_num], dtype=torch.int64, device=device
+        )
+        seq_lens_cpu = torch.tensor([fill_len + draft_num], dtype=torch.int64)
+        last_loc = kv_loc[-1:].to(device=device)
+        draft_cache_locs = self.allocator.alloc_extend_with_device_mapping(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            draft_num,
+            draft_device_slots,
+        )
+        self.req_to_token_pool.write(
+            (req_idx, slice(fill_len, fill_len + draft_num)), draft_cache_locs
+        )
+        req.kv_allocated_len = fill_len + draft_num
+        req.kv_committed_len = fill_len + draft_num
+
+        accepted_cache_locs = draft_cache_locs[:2]
+        accepted_token_positions = torch.tensor(
+            [fill_len, fill_len + 1], dtype=torch.int64, device="cuda"
+        )
+        self.coordinator.finalize_accepted_tokens(
+            req_pool_indices=req_pool_indices,
+            accepted_cache_locs=accepted_cache_locs,
+            draft_cache_locs=draft_cache_locs,
+            num_correct_drafts=torch.tensor([1], dtype=torch.int64, device="cuda"),
+            num_correct_drafts_cpu=torch.tensor([1], dtype=torch.int64),
+            accepted_token_positions=accepted_token_positions,
+        )
+
+        mapping = self.allocator.full_to_hisparse_device_index_mapping
+        last_hot_slot = self.coordinator.req_to_device_buffer[req_idx, fill_len + 1]
+        extra_newest_slot = self.coordinator.req_to_device_buffer[
+            req_idx, DEVICE_BUFFER_SIZE
+        ]
+
+        self.assertEqual(
+            int(mapping[accepted_cache_locs[-1]].item()), int(last_hot_slot.item())
+        )
+        self.assertNotEqual(int(last_hot_slot.item()), int(extra_newest_slot.item()))
+        self.assertTrue(
+            torch.all(
+                self.coordinator.req_device_buffer_tokens[:, req_idx, fill_len + 1]
+                == fill_len + 1
+            )
+        )
+        self.assertTrue(
+            torch.all(
+                self.coordinator.req_device_buffer_token_locs[:, req_idx, fill_len + 1]
+                == last_hot_slot.to(torch.int32)
+            )
+        )
+        self.assertIsNone(self.coordinator._pending_draft_extend_backup)
+
+        self.coordinator.request_finished(req)
+        self.allocator.free(torch.cat([kv_loc, draft_cache_locs]))
+        self._free_req_slot(req)
+        self._assert_sizes_restored(initial, "finalize_accepted_tokens_short")
+
+    def test_draft_extend_cuda_graph_disabled_for_hisparse(self):
+        """Draft-extend graph replay is skipped when HiSparse owns KV mapping."""
+        from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+            EAGLEDraftExtendCudaGraphRunner,
+        )
+
+        runner = EAGLEDraftExtendCudaGraphRunner.__new__(
+            EAGLEDraftExtendCudaGraphRunner
+        )
+        runner.eagle_worker = SimpleNamespace(
+            target_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(hisparse_coordinator=object())
+            )
+        )
+        forward_batch = SimpleNamespace(
+            token_to_kv_pool=SimpleNamespace(
+                translate_loc_to_hisparse_device=lambda loc: loc
+            )
+        )
+
+        self.assertTrue(runner._uses_target_hisparse_coordinator(forward_batch))
+        self.assertFalse(runner.can_run(forward_batch))
 
 
 if __name__ == "__main__":

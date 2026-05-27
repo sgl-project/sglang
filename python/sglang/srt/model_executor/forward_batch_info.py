@@ -536,6 +536,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dimensions=batch.dimensions,
             return_pooled_hidden_states=batch.return_pooled_hidden_states,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
+            hisparse_coordinator=batch.hisparse_coordinator,
             rids=[req.rid for req in batch.reqs],
         )
 
