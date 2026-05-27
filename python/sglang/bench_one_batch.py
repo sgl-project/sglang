@@ -968,10 +968,10 @@ def main(server_args, bench_args):
                 proc.start()
                 workers.append(proc)
 
-            for proc in workers:
-                proc.join()
+        for proc in workers:
+            proc.join()
 
-            proc.terminate()
+        proc.terminate()
 
 
 if __name__ == "__main__":
