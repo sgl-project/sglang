@@ -150,7 +150,7 @@ class WeightChecker:
 
 
 def _hash_tensor(t: torch.Tensor) -> str:
-    return f"{tensor_hash(t):016x}"
+    return f"{tensor_hash(t):032x}"
 
 
 def _check_tensors(

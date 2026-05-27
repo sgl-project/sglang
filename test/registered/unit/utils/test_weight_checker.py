@@ -599,7 +599,7 @@ class TestComputeChecksum(_ChecksumTestBase):
     def test_hashes_are_hex_strings(self):
         out = self.checker._compute_checksum()
         for name, h in out["checksums"].items():
-            self.assertEqual(len(h), 16, f"unexpected hash length for {name!r}")
+            self.assertEqual(len(h), 32, f"unexpected hash length for {name!r}")
             int(h, 16)
 
     def test_parallelism_info_reflects_runner_state(self):
