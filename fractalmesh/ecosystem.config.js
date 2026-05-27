@@ -1209,6 +1209,8 @@ module.exports = {
             ['fm-price-monitor',  'fm_price_monitor',   '25M'],
             ['fm-ai-assistant',   'fm_ai_assistant',    '35M'],
             ['fm-referral',       'fm_referral_engine', '25M'],
+            ['fm-pos',            'fm_pos_system',      '35M'],
+            ['fm-courses',        'fm_course_platform', '35M'],
         ].map(([name, script, mem]) => ({
             name,
             script:            `agents/${script}.py`,

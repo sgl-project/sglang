@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     125,
+        "agents":     127,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -239,6 +239,8 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "price_monitor":     7877,
             "ai_assistant":      7865,
             "referral_engine":   7878,
+            "pos_system":        7879,
+            "course_platform":   7880,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -564,6 +566,8 @@ _INTENTS = {
     "file_process":            lambda a, k: {"action": "file_process_queued", "operation": k.get("operation", ""), "input_data": k.get("input_data", "")},
     "price_check":             lambda a, k: {"action": "price_check_queued", "watch_id": k.get("watch_id", 0)},
     "referral_convert":        lambda a, k: {"action": "referral_convert_queued", "link_code": k.get("link_code", ""), "order_value": k.get("order_value", 0), "order_ref": k.get("order_ref", "")},
+    "pos_checkout":            lambda a, k: {"action": "pos_checkout_queued", "cart_id": k.get("cart_id", ""), "payment_method": k.get("payment_method", "stripe")},
+    "course_enroll":           lambda a, k: {"action": "course_enroll_queued", "course_slug": k.get("course_slug", ""), "student_email": k.get("student_email", "")},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
