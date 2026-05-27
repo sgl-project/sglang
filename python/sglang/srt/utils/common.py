@@ -45,6 +45,7 @@ import traceback
 import types
 import uuid
 import warnings
+from array import array
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -99,6 +100,21 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
+
+
+def flatten_arrays_to_int64_tensor(
+    parts: List[array[int]], device, pin: bool
+) -> torch.Tensor:
+    """Flatten a list of array.array('q') buffers into one int64 tensor.
+
+    Uses NumPy here to speed up the conversion by using memcpy
+    instead of a per-element PyLong-to-int64 walk.
+    """
+    combined = np.concatenate([np.frombuffer(p, dtype=np.int64) for p in parts])
+    cpu_t = torch.from_numpy(combined)
+    if pin:
+        cpu_t = cpu_t.pin_memory()
+    return cpu_t.to(device, non_blocking=True)
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -314,6 +330,18 @@ def is_flashinfer_available():
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
+
+
+@lru_cache(maxsize=1)
+def is_tokenspeed_mla_available():
+    """
+    Check whether the tokenspeed_mla CuTe DSL kernels are available.
+    Only available on NVIDIA Blackwell (SM100) at the moment.
+    """
+    return (
+        importlib.util.find_spec("tokenspeed_mla") is not None
+        and is_blackwell_supported()
+    )
 
 
 def is_nvidia_cublas_version_ge_12_9():
@@ -587,7 +615,16 @@ def get_available_gpu_memory(
             )
         if empty_cache:
             empty_device_cache(torch.npu)
-        free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
+        if envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0:
+            import zbal
+
+            if not zbal.is_mix_alloc():
+                free_gpu_memory, total_gpu_memory = zbal.zbal_module.mem_get_info()
+            else:
+                # mix mode fall back into npu mem info since gva may not inited yet
+                free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
+        else:
+            free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
     elif device == "musa":
         num_gpus = torch.musa.device_count()
         assert gpu_id < num_gpus
@@ -761,17 +798,24 @@ def load_audio(
     if _BACKEND == "torchcodec":
         from torchcodec.decoders import AudioDecoder
 
-        decoder = AudioDecoder(
-            source,
-            sample_rate=sr,
-            num_channels=1 if mono else None,
-        )
-        samples = decoder.get_all_samples()
-        if mono:
-            return samples.data.squeeze(0).numpy()
-        return samples.data.T.numpy()
+        try:
+            decoder = AudioDecoder(
+                source,
+                sample_rate=sr,
+                num_channels=1 if mono else None,
+            )
+            samples = decoder.get_all_samples()
+            if mono:
+                return samples.data.squeeze(0).numpy()
+            return samples.data.T.numpy()
+        except Exception as e:
+            # torchcodec's bytes-buffer IO can fail on WAV files that carry
+            # large trailing metadata chunks. Fall back to soundfile, which reads the PCM payload directly.
+            logger.warning(
+                f"torchcodec AudioDecoder failed ({e}); falling back to soundfile + torchaudio."
+            )
 
-    # Fallback: soundfile + torchaudio (ARM / no FFmpeg)
+    # Fallback: soundfile + torchaudio (ARM / no FFmpeg / torchcodec failure)
     import soundfile as sf
     import torch
     import torchaudio
@@ -1032,6 +1076,33 @@ def suppress_noisy_warnings():
         category=FutureWarning,
     )
 
+    # cutlass-dsl emits these inside `catch_warnings()+simplefilter("always")`,
+    # which bypasses filterwarnings; override showwarning to drop them too.
+    cutlass_dsl_noisy = {
+        (
+            DeprecationWarning,
+            "Use explicit `struct.scalar.ptr` for pointer instead.",
+        ),
+        (
+            UserWarning,
+            "NamedBarrier wait also arrives on the barrier. "
+            "Routing call to NamedBarrier.arrive_and_wait().",
+        ),
+    }
+    for cat, msg in cutlass_dsl_noisy:
+        warnings.filterwarnings("ignore", message=re.escape(msg), category=cat)
+
+    if not getattr(warnings.showwarning, "_sglang_patched_cutlass_dsl", False):
+        prev_showwarning = warnings.showwarning
+
+        def _filtered_showwarning(message, category, *args, **kwargs):
+            if (category, str(message)) in cutlass_dsl_noisy:
+                return
+            prev_showwarning(message, category, *args, **kwargs)
+
+        _filtered_showwarning._sglang_patched_cutlass_dsl = True
+        warnings.showwarning = _filtered_showwarning
+
     # Suppress noisy third-party HTTP loggers.
     # huggingface_hub uses httpx which logs every HTTP request at INFO level.
     for name in ("httpx", "httpcore"):
@@ -1077,7 +1148,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.8.post1")
+        min_version: Minimum version required (e.g., "0.6.11.post1")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -1689,7 +1760,10 @@ def get_npu_memory_capacity():
     try:
         import torch_npu  # noqa: F401
 
-        return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
+        if envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0:
+            return envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get()  # unit: MB
+        else:
+            return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
     except ImportError as e:
         raise ImportError("torch_npu is required when run on npu device.")
 
@@ -3015,6 +3089,13 @@ def require_attn_tp_gather(server_args: ServerArgs):
     """
     Check if the input of attention is scattered.
     """
+    # Opt-out for models that manage SP scatter/gather at the model level
+    # and do not consume the upstream gathered_buffer. Without this, the
+    # cuda graph runner pads num_tokens to attn_tp_size, which can cause
+    # autotuners to pick suboptimal kernel variants at small batches.
+    if server_args.disable_attn_tp_gather:
+        return False
+
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     assert server_args.moe_dense_tp_size in [1, None]
@@ -3526,6 +3607,10 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "k_proj",
     "v_proj",
     "o_proj",
+    "q_a_proj",
+    "kv_a_proj_with_mqa",
+    "q_b_proj",
+    "kv_b_proj",
     "gate_proj",
     "up_proj",
     "down_proj",
@@ -3626,7 +3711,15 @@ class ConcurrentCounter:
 
 @lru_cache(maxsize=1)
 def is_triton_kernels_available() -> bool:
-    return importlib.util.find_spec("triton_kernels") is not None
+    if importlib.util.find_spec("triton_kernels") is None:
+        return False
+    try:
+        ragged_metadata_spec = importlib.util.find_spec(
+            "triton_kernels.tensor_details.ragged_tensor"
+        )
+    except ModuleNotFoundError:
+        return False
+    return ragged_metadata_spec is not None
 
 
 @lru_cache(maxsize=1)

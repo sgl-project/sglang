@@ -41,8 +41,15 @@ class FullComponent(TreeComponent):
         # HiCache state: set to host KV pool when HiCache enabled
         self._full_kv_pool_host = None
 
-    def create_match_validator(self) -> Callable[[UnifiedTreeNode], bool]:
-        # HiCache: evicted + backuped nodes are valid match boundaries
+    def create_match_validator(
+        self, match_device_only: bool = False
+    ) -> Callable[[UnifiedTreeNode], bool]:
+        if match_device_only:
+            return (
+                lambda node: node.component_data[self.component_type].value is not None
+            )
+
+        # HiCache: evicted + backuped nodes are valid match boundaries.
         return lambda node: (
             node.component_data[self.component_type].value is not None or node.backuped
         )
@@ -58,7 +65,7 @@ class FullComponent(TreeComponent):
         # last_device_node, summing host_value lengths of evicted nodes.
         ct = self.component_type
         kv_host_hit = 0
-        node = result.last_host_node
+        node = result.best_match_node
         root_node = self.cache.root_node
         while node is not result.last_device_node and node is not root_node:
             full_host = node.component_data[ct].host_value
@@ -148,16 +155,37 @@ class FullComponent(TreeComponent):
                 heapq.heappush(heap, (x.parent.last_access_time, x.parent))
 
     def acquire_component_lock(
-        self, node: UnifiedTreeNode, result: IncLockRefResult
+        self,
+        node: UnifiedTreeNode,
+        result: IncLockRefResult,
+        lock_host: bool = False,
     ) -> IncLockRefResult:
         ct = self.component_type
-        root = self.cache.root_node
-        delta = 0
-        cur = node
-        while cur != root:
-            cd = cur.component_data[ct]
-            assert cd.value is not None
 
+        # Only the last host node needs to be protected.
+        if lock_host:
+            cd = node.component_data[ct]
+            if cd.host_value is None:
+                return result
+            cd.host_lock_ref += 1
+            self.cache._update_evictable_leaf_sets(node)
+            return result
+
+        root = self.cache.root_node
+        cur = node
+
+        # Skip the bottom evicted segment
+        while cur is not root and cur.component_data[ct].value is None:
+            result.skip_lock_node_ids.setdefault(ct, set()).add(cur.id)
+            cur = cur.parent
+
+        # Lock the device-on segment up to root
+        delta = 0
+        while cur is not root:
+            cd = cur.component_data[ct]
+            assert (
+                cd.value is not None
+            ), f"FULL invariant broken: evicted ancestor {cur.id} above device-on segment"
             if cd.lock_ref == 0:
                 key_len = len(cd.value)
                 self.cache.component_evictable_size_[ct] -= key_len
@@ -170,12 +198,27 @@ class FullComponent(TreeComponent):
         return result
 
     def release_component_lock(
-        self, node: UnifiedTreeNode, params: Optional[DecLockRefParams]
+        self,
+        node: UnifiedTreeNode,
+        params: Optional[DecLockRefParams],
+        lock_host: bool = False,
     ) -> None:
         ct = self.component_type
+        if lock_host:
+            cd = node.component_data[ct]
+            if cd.host_value is None or cd.host_lock_ref == 0:
+                return
+            cd.host_lock_ref -= 1
+            self.cache._update_evictable_leaf_sets(node)
+            return
+
         root = self.cache.root_node
+        skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
         cur = node
         while cur != root:
+            if cur.id in skip_lock_node_ids:
+                cur = cur.parent
+                continue
             cd = cur.component_data[ct]
             assert cd.value is not None
             assert cd.lock_ref > 0
@@ -203,15 +246,16 @@ class FullComponent(TreeComponent):
             return None
 
         if phase == CacheTransferPhase.LOAD_BACK:
-            # Walk evicted chain, collect host_values and nodes
+            # `node` is best_match_node. FULL device evict only from leaves,
+            # so once we hit a device-on node, everything above is also device-on
             backed_up: list[torch.Tensor] = []
             nodes: list = []
             cur = node
             while cur.evicted:
                 cd = cur.component_data[ct]
-                if cd.host_value is not None:
-                    backed_up.append(cd.host_value)
-                    nodes.append(cur)
+                assert cd.host_value is not None
+                backed_up.append(cd.host_value)
+                nodes.append(cur)
                 cur = cur.parent
             backed_up.reverse()
             nodes.reverse()
@@ -235,6 +279,7 @@ class FullComponent(TreeComponent):
         node: UnifiedTreeNode,
         phase: CacheTransferPhase,
         transfers: list[PoolTransfer] = (),
+        **kw,
     ) -> None:
         ct = self.component_type
 

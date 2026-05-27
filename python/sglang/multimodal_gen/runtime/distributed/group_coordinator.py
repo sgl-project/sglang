@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # Copyright 2024 xDiT team.
