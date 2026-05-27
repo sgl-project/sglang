@@ -430,7 +430,10 @@ class SchedulerMetricsReporter:
         if tokens == 0:
             return 0.0, 0.0, 0.0
 
-        total_context = float(batch.seq_lens_cpu.sum().item())
+        seq_lens = (
+            batch.seq_lens_cpu if batch.seq_lens_cpu is not None else batch.seq_lens
+        )
+        total_context = float(seq_lens.sum().item())
         flops = (
             tokens * self._linear_flops_per_token
             + self._attn_dot_flops_coeff * total_context
@@ -736,7 +739,10 @@ class SchedulerMetricsReporter:
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.cache_hit_rate = cache_hit_rate
-            self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
+            decode_seq_lens = (
+                batch.seq_lens_cpu if batch.seq_lens_cpu is not None else batch.seq_lens
+            )
+            self.stats.decode_sum_seq_lens = decode_seq_lens.sum().item()
 
             # Memory pool usage ratios / Absolute token counts
             pool_stats.update_scheduler_stats(self.stats)

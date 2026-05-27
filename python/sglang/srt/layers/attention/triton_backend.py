@@ -443,8 +443,15 @@ class TritonAttnBackend(AttentionBackend):
                 forward_batch.extend_prefix_lens, dim=0
             )
             kv_indptr = kv_indptr[: bs + 1]
+            # extend_prefix_lens_cpu is None on the no-verify-sync path; eager
+            # already syncs, so recover the total from the GPU tensor.
+            kv_indices_len = (
+                sum(forward_batch.extend_prefix_lens_cpu)
+                if forward_batch.extend_prefix_lens_cpu is not None
+                else int(forward_batch.extend_prefix_lens.sum())
+            )
             kv_indices = torch.empty(
-                sum(forward_batch.extend_prefix_lens_cpu),
+                kv_indices_len,
                 dtype=torch.int64,
                 device=self.device,
             )
@@ -482,7 +489,11 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr = None
             attn_logits = None
             attn_lse = None
-            max_extend_len = max(forward_batch.extend_seq_lens_cpu)
+            max_extend_len = (
+                max(forward_batch.extend_seq_lens_cpu)
+                if forward_batch.extend_seq_lens_cpu is not None
+                else int(forward_batch.extend_seq_lens.max())
+            )
             num_kv_splits = None
 
         self.forward_metadata = ForwardMetadata(
