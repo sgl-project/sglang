@@ -2,11 +2,13 @@
 Multi-modality utils
 """
 
+import asyncio
 import copy
 import hashlib
 import pickle
 from abc import abstractmethod
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
@@ -14,6 +16,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.environ import envs
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
@@ -350,11 +353,25 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 
 
 embedding_cache: Optional[MultiModalStaticCache] = None
+mm_global_cache_controller: Optional[Any] = None
+_mm_global_cache_executor: Optional[ThreadPoolExecutor] = None
 
 
 def init_mm_embedding_cache(max_size: int = 0):
     global embedding_cache
     embedding_cache = MultiModalStaticCache(max_size)
+
+
+def init_mm_global_cache(controller: Optional[Any] = None):
+    """Initialize the global cache controller for multi-node embedding sharing."""
+    global mm_global_cache_controller, _mm_global_cache_executor
+    mm_global_cache_controller = controller
+
+    # Create a dedicated thread pool for global cache background writes
+    if controller is not None and _mm_global_cache_executor is None:
+        _mm_global_cache_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mm_global_cache_writer"
+        )
 
 
 def get_embedding_chunk(
@@ -633,6 +650,8 @@ def _get_chunked_prefill_embedding(
     Chunked prefill embedding: collect cache misses across all per-image
     requests, batch them into a single ViT call, then assemble per-request
     chunk embeddings from the results.
+
+    Implements three-tier cache: L1 (local) -> L2 (Global/Mooncake) -> Compute (ViT)
     """
     embedding_list = []
     device = input_ids.device
@@ -656,10 +675,10 @@ def _get_chunked_prefill_embedding(
             max_iterations,
         )
 
-    # collect chunk entries per request, accumulate all misses
+    # 1. Collect chunk entries per request, accumulate all L1 misses
     pending_requests = []
-    all_miss_items = []
-    all_miss_token_counts = []
+    all_l1_miss_items = []
+    all_l1_miss_token_counts = []
 
     for i in range(max_iterations):
         if items_size[i] == items_size[i + 1]:
@@ -686,40 +705,303 @@ def _get_chunked_prefill_embedding(
 
         for item, emb, start, end in chunk_entries:
             if emb is None:
-                all_miss_items.append(item)
-                all_miss_token_counts.append(end - start + 1)
+                all_l1_miss_items.append(item)
+                all_l1_miss_token_counts.append(end - start + 1)
 
         pending_requests.append((chunk_entries, chunk_start, chunk_end))
 
-    miss_embeddings = []
-    if all_miss_items:
+    if not pending_requests:
+        return None, input_ids
+
+    # 2. Check L2 (Global Cache) for L1 misses if available
+    hash_to_l2_emb = {}  # hash -> embedding (for L2 hits and TP sync)
+    l2_miss_items = []  # Items that miss both L1 and L2
+    l2_miss_token_counts = []
+
+    if mm_global_cache_controller is not None and all_l1_miss_items:
+        max_batch = envs.SGLANG_MM_GLOBAL_CACHE_MAX_BATCH.get()
+        exist_timeout = envs.SGLANG_MM_GLOBAL_CACHE_EXIST_TIMEOUT.get()
+        prefetch_timeout_per_item = envs.SGLANG_MM_GLOBAL_CACHE_PREFETCH_TIMEOUT.get()
+
+        # Limit batch size to avoid long blocking
+        if len(all_l1_miss_items) > max_batch:
+            logger.debug(
+                f"L1 miss items ({len(all_l1_miss_items)}) exceeds max batch size "
+                f"({max_batch}), processing first batch only"
+            )
+            items_to_check = all_l1_miss_items[:max_batch]
+            overflow_items = all_l1_miss_items[max_batch:]
+            overflow_counts = all_l1_miss_token_counts[max_batch:]
+        else:
+            items_to_check = all_l1_miss_items
+            overflow_items = []
+            overflow_counts = []
+
+        check_hashes = [item.hash for item in items_to_check]
+        try:
+
+            def check_global_cache():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    return loop.run_until_complete(
+                        mm_global_cache_controller.batch_is_exist(check_hashes)
+                    )
+                finally:
+                    loop.close()
+
+            # Quick check with short timeout to avoid blocking encoder
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(check_global_cache)
+                try:
+                    exist_mask = future.result(timeout=exist_timeout)
+                except TimeoutError:
+                    logger.debug(
+                        "Global cache existence check timeout, fallback to ViT"
+                    )
+                    exist_mask = [False] * len(check_hashes)
+
+            # Categorize items by L2 existence
+            global_hit_items = []  # (item, token_count) for L2 hits
+            global_hit_hashes = []
+            l2_check_miss = []  # (item, token_count) for L2 misses
+
+            for i, item in enumerate(items_to_check):
+                if exist_mask[i]:
+                    global_hit_hashes.append(item.hash)
+                    global_hit_items.append((item, all_l1_miss_token_counts[i]))
+                else:
+                    l2_check_miss.append((item, all_l1_miss_token_counts[i]))
+
+            # Add overflow items directly to ViT
+            for item, tc in zip(overflow_items, overflow_counts):
+                l2_check_miss.append((item, tc))
+
+            # Fetch embeddings from global cache for hits
+            if global_hit_hashes:
+                expected_tokens = [tc for _, tc in global_hit_items]
+                req_id = (
+                    f"prefetch_{str(global_hit_hashes[0])[:16]}"
+                    f"_{id(data_embedding_func)}"
+                )
+
+                modality = global_hit_items[0][0].modality if global_hit_items else None
+                mm_global_cache_controller.prefetch(
+                    req_id, global_hit_hashes, expected_tokens, modality
+                )
+
+                # Wait for prefetch completion with adaptive timeout
+                import time
+
+                start_wait = time.time()
+                prefetch_timeout = min(
+                    1.0, len(global_hit_hashes) * prefetch_timeout_per_item
+                )
+                while not mm_global_cache_controller.check_prefetch_progress(req_id):
+                    if time.time() - start_wait > prefetch_timeout:
+                        logger.debug(
+                            f"Global cache prefetch timeout ({prefetch_timeout:.2f}s), "
+                            f"falling back {len(global_hit_hashes)} items to ViT"
+                        )
+                        # Move all global hits back to L2 misses
+                        for item, tc in global_hit_items:
+                            l2_check_miss.append((item, tc))
+                        global_hit_items = []
+                        global_hit_hashes = []
+                        break
+                    time.sleep(0.002)  # 2ms polling interval
+
+                # Get embeddings from global cache
+                if global_hit_hashes:
+                    global_embeddings = mm_global_cache_controller.get_embeddings(
+                        global_hit_hashes
+                    )
+                    successful_items = []
+                    for (item, token_count), emb in zip(
+                        global_hit_items, global_embeddings
+                    ):
+                        if emb is None:
+                            logger.warning(
+                                f"Global cache returned None for hash {item.hash}, "
+                                f"fallback to ViT"
+                            )
+                            l2_check_miss.append((item, token_count))
+                            continue
+                        hash_to_l2_emb[item.hash] = emb
+                        # Also write to L1 cache for future local hits
+                        emb_result = EmbeddingResult(embedding=emb)
+                        embedding_cache.set(item.hash, emb_result)
+                        successful_items.append((item, token_count))
+
+                    # Update global_hit_items to only include successful hits
+                    global_hit_items = successful_items
+
+                    logger.debug(
+                        f"Global cache hit: {len(global_hit_items)} items, "
+                        f"L2 miss/ViT: {len(l2_check_miss)} items"
+                    )
+
+            l2_miss_items = [item for item, _ in l2_check_miss]
+            l2_miss_token_counts = [tc for _, tc in l2_check_miss]
+
+        except Exception as e:
+            logger.warning(f"Global cache check failed: {e}, falling back to ViT")
+            l2_miss_items = list(all_l1_miss_items)
+            l2_miss_token_counts = list(all_l1_miss_token_counts)
+    else:
+        l2_miss_items = list(all_l1_miss_items)
+        l2_miss_token_counts = list(all_l1_miss_token_counts)
+
+    # 3. TP-Group synchronization: ensure all ranks have consistent cache hit results
+    # Synchronize L1 + L2 hit status across all ranks using MIN operation (intersection)
+    # This prevents hang when different ranks have inconsistent cache hit states
+    tp_size = get_tensor_model_parallel_world_size()
+    if tp_size > 1 and mm_global_cache_controller is not None:
+        # Collect all items across all pending requests for TP sync
+        all_items_for_sync = []
+        for chunk_entries, _, _ in pending_requests:
+            for item, emb, start, end in chunk_entries:
+                all_items_for_sync.append((item, emb))
+
+        # Sort by hash to ensure consistent order across all ranks
+        sorted_items = sorted(all_items_for_sync, key=lambda x: x[0].hash)
+
+        # Build hit mask: 1 for hit (L1 or L2), 0 for miss
+        # All ranks have same order after sorting, use MIN to find intersection
+        hit_mask = []
+        for item, emb in sorted_items:
+            is_hit = emb is not None or item.hash in hash_to_l2_emb
+            hit_mask.append(1 if is_hit else 0)
+
+        # Convert to tensor for all_reduce
+        hit_tensor = torch.tensor(hit_mask, dtype=torch.int32, device="cpu")
+
+        # MIN operation: if any rank has 0 (miss), result is 0
+        # If all ranks have 1 (hit), result is 1
+        # Use cache controller's prefetch_tp_group (gloo backend for CPU tensors)
+        torch.distributed.all_reduce(
+            hit_tensor,
+            op=torch.distributed.ReduceOp.MIN,
+            group=mm_global_cache_controller.prefetch_tp_group,
+        )
+
+        # synced_mask[i] == 1 means ALL ranks have this item cached
+        # synced_mask[i] == 0 means at least one rank missed
+        synced_mask = hit_tensor.tolist()
+
+        # Build set of hashes that all ranks have (intersection)
+        synced_hash_set = set()
+        for i, (item, emb) in enumerate(sorted_items):
+            if synced_mask[i] == 1:
+                synced_hash_set.add(item.hash)
+
+        # Items that this rank hit but other ranks missed need to go to ViT
+        # Update chunk_entries and collect items for recompute
+        items_to_recompute = []
+        for req_idx, (chunk_entries, chunk_start, chunk_end) in enumerate(
+            pending_requests
+        ):
+            updated_entries = []
+            for item, emb, start, end in chunk_entries:
+                if item.hash not in synced_hash_set and (
+                    emb is not None or item.hash in hash_to_l2_emb
+                ):
+                    # Local hit but remote miss - need to recompute
+                    items_to_recompute.append((item, end - start + 1))
+                    # Set emb to None to mark as miss
+                    updated_entries.append((item, None, start, end))
+                    # Remove from L2 cache results
+                    if item.hash in hash_to_l2_emb:
+                        del hash_to_l2_emb[item.hash]
+                else:
+                    updated_entries.append((item, emb, start, end))
+            pending_requests[req_idx] = (updated_entries, chunk_start, chunk_end)
+
+        if items_to_recompute:
+            logger.info(
+                f"TP sync: {len(items_to_recompute)} items moved to ViT due to "
+                f"inconsistent cache hit across ranks (local hit but remote miss)"
+            )
+            l2_miss_items.extend(item for item, _ in items_to_recompute)
+            l2_miss_token_counts.extend(tc for _, tc in items_to_recompute)
+
+        # Log sync results
+        total_items = len(all_items_for_sync)
+        synced_hits = sum(synced_mask)
+        synced_misses = total_items - synced_hits
+        logger.info(
+            f"=== TP Cache Sync === Total: {total_items} | "
+            f"Synced Hits (all ranks): {synced_hits} | "
+            f"Synced Misses (ViT): {synced_misses}"
+        )
+
+    # 4. Batch encode all L2 cache-miss items in one ViT call
+    locally_encoded = []  # (item, embedding) for write-back to L2
+    if l2_miss_items:
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
-            _move_items_to_device(all_miss_items, device)
-        # vit_input_tokens = sum(
-        #     item.feature.shape[0] for item in all_miss_items
-        #     if isinstance(item.feature, torch.Tensor)
-        # )
-        # logger.info(f"ViT batch: {len(all_miss_items)} items, {vit_input_tokens} input patches, {sum(all_miss_token_counts)} output tokens")
-        all_miss_embedding = data_embedding_func(all_miss_items)
+            _move_items_to_device(l2_miss_items, device)
+        all_miss_embedding = data_embedding_func(l2_miss_items)
         all_miss_embedding = all_miss_embedding.reshape(
             -1, all_miss_embedding.shape[-1]
         )
         miss_embeddings = list(
-            torch.split(all_miss_embedding, all_miss_token_counts, dim=0)
+            torch.split(all_miss_embedding, l2_miss_token_counts, dim=0)
         )
-        for item, emb in zip(all_miss_items, miss_embeddings):
+        for item, emb in zip(l2_miss_items, miss_embeddings):
             embedding_cache.set(item.hash, EmbeddingResult(embedding=emb))
+            locally_encoded.append((item, emb))
 
-    # fill in miss embeddings and assemble per-request chunks
-    miss_iter = iter(miss_embeddings)
+    # 5. Write locally encoded embeddings back to L2 (Global Cache) for multi-node sharing
+    # Use background thread to avoid blocking the encoder
+    # Every rank writes so all local caches benefit
+    if mm_global_cache_controller is not None and locally_encoded:
+        global _mm_global_cache_executor
+        if _mm_global_cache_executor is not None:
+            hashes_to_insert = [item.hash for item, _ in locally_encoded]
+            embeddings_to_insert = [emb for _, emb in locally_encoded]
+
+            def _background_insert():
+                try:
+                    mm_global_cache_controller.insert_batch(
+                        hashes_to_insert, embeddings_to_insert
+                    )
+                except Exception as e:
+                    # Log but don't fail - global cache is best-effort
+                    logger.warning(f"Background global cache write failed: {e}")
+
+            # Submit to background thread pool (non-blocking)
+            _mm_global_cache_executor.submit(_background_insert)
+            logger.debug(
+                f"Submitted {len(locally_encoded)} embeddings to global cache "
+                f"(background)"
+            )
+
+    # 6. Fill in resolved embeddings and assemble per-request chunks
+    # Build hash -> embedding map for all non-L1-hit items (L2 hits + ViT results)
+    hash_to_resolved_emb = {}
+    hash_to_resolved_emb.update(hash_to_l2_emb)
+    for item, emb in locally_encoded:
+        hash_to_resolved_emb[item.hash] = emb
+
     for chunk_entries, chunk_start, chunk_end in pending_requests:
-        chunk_entries = [
-            (item, next(miss_iter) if emb is None else emb, start, end)
-            for item, emb, start, end in chunk_entries
-        ]
+        updated_entries = []
+        for item, emb, start, end in chunk_entries:
+            if emb is not None:
+                # L1 cache hit
+                updated_entries.append((item, emb, start, end))
+            elif item.hash in hash_to_resolved_emb:
+                # L2 hit or ViT computed
+                updated_entries.append(
+                    (item, hash_to_resolved_emb[item.hash], start, end)
+                )
+            else:
+                # Should not happen if logic is correct
+                logger.warning(
+                    f"Item {item.hash} has no embedding after all cache tiers"
+                )
 
         chunk_embedding = assemble_chunk_embedding(
-            chunk_entries, chunk_start, chunk_end
+            updated_entries, chunk_start, chunk_end
         )
         if chunk_embedding is not None:
             embedding_list.append(chunk_embedding)

@@ -540,6 +540,14 @@ class Envs:
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
 
+    # VLM Global Cache (Mooncake) Performance Tuning
+    # Max items to query global cache per batch (larger = more blocking risk)
+    SGLANG_MM_GLOBAL_CACHE_MAX_BATCH = EnvInt(32)
+    # Timeout for checking existence in global cache (seconds)
+    SGLANG_MM_GLOBAL_CACHE_EXIST_TIMEOUT = EnvFloat(0.5)
+    # Timeout for prefetching from global cache (seconds per item, max 1s)
+    SGLANG_MM_GLOBAL_CACHE_PREFETCH_TIMEOUT = EnvFloat(0.5)
+
 
     # VLM Item CUDA IPC Transport
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)

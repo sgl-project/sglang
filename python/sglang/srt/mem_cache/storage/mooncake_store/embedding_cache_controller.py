@@ -217,7 +217,7 @@ class EmbeddingCacheController:
                 ptrs.append(self.cpu_pool.data_ptr() + offset)
                 sizes.append(size_bytes)
 
-            if keys:
+            if self.tp_rank == 0 and keys:
                 logger.info(
                     f"Global Cache: Inserting {len(keys)} new embeddings into Mooncake cluster."
                 )
