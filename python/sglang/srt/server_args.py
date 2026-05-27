@@ -183,7 +183,14 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
-DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
+DISAGG_TRANSFER_BACKEND_CHOICES = [
+    "mooncake",
+    "nixl",
+    "ascend",
+    "fake",
+    "mori",
+    "mooncake_tcp",
+]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
@@ -859,7 +866,11 @@ class ServerArgs:
         self._handle_ssl_validation()
 
         # Validate PD disaggregation flags early (before dummy-model short-circuit).
-        self._handle_pd_disaggregation()
+        from sglang.srt.arg_groups.pd_disaggregation_hook import (
+            handle_pd_disaggregation,
+        )
+
+        handle_pd_disaggregation(self)
 
         # Validate --prefill-only-disable-kv-cache args early (before dummy-model
         # short-circuit). The backend check is run later after backends settle.
@@ -3748,62 +3759,6 @@ class ServerArgs:
         except Exception:
             return False
 
-    def _handle_pd_disaggregation(self):
-        if self.disaggregation_mode == "decode":
-            if self.disaggregation_decode_enable_radix_cache:
-                if self.enable_hisparse:
-                    raise ValueError(
-                        "--disaggregation-decode-enable-radix-cache is incompatible "
-                        "with --enable-hisparse"
-                    )
-                if self.disaggregation_transfer_backend not in ("nixl", "mooncake"):
-                    raise ValueError(
-                        "--disaggregation-decode-enable-radix-cache currently "
-                        "requires --disaggregation-transfer-backend in "
-                        "('nixl', 'mooncake'), but got "
-                        f"{self.disaggregation_transfer_backend!r}"
-                    )
-                if self.speculative_algorithm is not None:
-                    raise ValueError(
-                        "--disaggregation-decode-enable-radix-cache is incompatible "
-                        "with speculative decoding "
-                        f"(--speculative-algorithm {self.speculative_algorithm})"
-                    )
-                if self.enable_dp_attention:
-                    logger.warning(
-                        "EXPERIMENTAL: Decode radix cache with DP attention. "
-                        "Requires prefix-aware DP rank routing for optimal cache hits."
-                    )
-                self.disable_radix_cache = False
-                logger.warning("EXPERIMENTAL: Radix cache is enabled for decode server")
-            else:
-                self.disable_radix_cache = True
-                logger.warning("KV cache is forced as chunk cache for decode server")
-                if self.enable_mamba_extra_buffer():
-                    logger.warning(
-                        "Mamba extra_buffer is disabled because decode disaggregation "
-                        "currently forces chunk cache. Falling back to no_buffer."
-                    )
-                    self.mamba_scheduler_strategy = "no_buffer"
-
-        elif self.disaggregation_mode == "prefill":
-            assert (
-                self.disaggregation_transfer_backend != "fake"
-            ), "Prefill server does not support 'fake' as the transfer backend"
-
-            self.disable_cuda_graph = True
-
-        if self.disaggregation_mode in ("prefill", "decode"):
-            if (
-                envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-                and self.disaggregation_transfer_backend not in ("mooncake", "nixl")
-            ):
-                raise ValueError(
-                    f"SGLANG_DISAGG_STAGING_BUFFER requires "
-                    f"disaggregation_transfer_backend='mooncake' or 'nixl', "
-                    f"got '{self.disaggregation_transfer_backend}'."
-                )
-
     def _handle_encoder_disaggregation(self):
         if self.enable_prefix_mm_cache and not self.encoder_only:
             raise ValueError(
@@ -5442,6 +5397,7 @@ class ServerArgs:
                 "ascend_attn",
                 "aiter_attn",
                 "flashinfer_cudnn",
+                "amx_attn",
             ],
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
