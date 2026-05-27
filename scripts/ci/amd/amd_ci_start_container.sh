@@ -384,10 +384,10 @@ else
     done
     echo ""
 
-    echo "HF CDN throughput test: first 10MB of public gpt2 weights"
+    echo "HF CDN throughput test: first 10MB of public gpt2 weights (follow redirects)"
     speed_url="https://huggingface.co/gpt2/resolve/main/pytorch_model.bin"
-    curl -sS -o /dev/null --range 0-10485759 --max-time 60 \
-        -w "  total=%{time_total}s speed=%{speed_download}B/s bytes=%{size_download} http=%{http_code}\n" \
+    curl -sS -L -o /dev/null --range 0-10485759 --max-time 60 \
+        -w "  total=%{time_total}s speed=%{speed_download}B/s bytes=%{size_download} http=%{http_code} effective_url=%{url_effective}\n" \
         "$speed_url" 2>&1 || echo "  FAILED (timeout / connection error)"
 fi
 echo "=========================================="
@@ -508,10 +508,10 @@ docker exec ci_sglang bash -lc '
     done
     echo ""
 
-    echo "HF CDN throughput test: first 10MB of public gpt2 weights"
+    echo "HF CDN throughput test: first 10MB of public gpt2 weights (follow redirects)"
     speed_url="https://huggingface.co/gpt2/resolve/main/pytorch_model.bin"
-    curl -sS -o /dev/null --range 0-10485759 --max-time 60 \
-      -w "  total=%{time_total}s speed=%{speed_download}B/s bytes=%{size_download} http=%{http_code}\n" \
+    curl -sS -L -o /dev/null --range 0-10485759 --max-time 60 \
+      -w "  total=%{time_total}s speed=%{speed_download}B/s bytes=%{size_download} http=%{http_code} effective_url=%{url_effective}\n" \
       "$speed_url" 2>&1 || echo "  FAILED (timeout / connection error)"
   fi
   echo "=========================================="
