@@ -2194,12 +2194,13 @@ class NativeSparseAttnBackend(
             self.use_mha = False  # Decode/verify always use MLA
 
         # Set MLA implementation only if not using MHA
-        if not self.use_mha and self.enable_auto_select_prefill_impl:
+        if not self.use_mha:
             # FlyDSL override: force tilelang path which dispatches to FlyDSL kernel
             if os.environ.get("SGLANG_FLYDSL_PREFILL", "auto") not in ("0",):
                 if self.nsa_kv_cache_store_fp8:
                     self.nsa_prefill_impl = "tilelang"
                     return
+        if not self.use_mha and self.enable_auto_select_prefill_impl:
             if self.nsa_kv_cache_store_fp8:
                 if (
                     is_blackwell()
