@@ -14,6 +14,7 @@ from sglang.srt.model_executor.cuda_graph_runner_utils.buffers import (  # noqa:
 )
 from sglang.srt.model_executor.cuda_graph_runner_utils.capture_mode import (  # noqa: F401
     _set_capture_lora_variant,
+    compile_in_capture_mode,
     get_capture_lora_variant,
     get_is_capture_mode,
     model_capture_mode,

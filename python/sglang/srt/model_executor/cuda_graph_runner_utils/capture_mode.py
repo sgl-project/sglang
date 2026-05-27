@@ -9,6 +9,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Optional
 
+import torch
+
 # Detect whether the current forward pass is in capture mode.
 is_capture_mode = False
 
@@ -19,6 +21,19 @@ _capture_lora_variant: Optional[str] = None
 
 def get_is_capture_mode() -> bool:
     return is_capture_mode
+
+
+def compile_in_capture_mode(func):
+    """Decorator: wrap ``func`` with ``torch.compile`` only when defined
+    inside model capture mode; passthrough otherwise.
+
+    Used by model code (e.g. DeepSeek-V4) to opt nested helpers into
+    torch.compile during cuda-graph capture without paying the
+    compilation cost in the eager forward path.
+    """
+    if is_capture_mode:
+        return torch.compile(func)
+    return func
 
 
 def get_capture_lora_variant() -> Optional[str]:
