@@ -865,10 +865,9 @@ class TritonAttnBackend(AttentionBackend):
                 self.req_to_token.stride(0),
             )
             if self.sliding_window_size is not None and self.sliding_window_size > 0:
-                window_num_kv_splits = self.cuda_graph_window_num_kv_splits
                 window_kv_indices = self.cuda_graph_window_kv_indices
                 window_kv_offsets = self.cuda_graph_window_kv_offsets
-                _, _, window_kv_lens, window_kv_offsets[:bs] = (
+                _, _, _, window_kv_offsets[:bs] = (
                     update_sliding_window_buffer_cuda_graph(
                         self.window_kv_indptr,
                         window_kv_indices,
