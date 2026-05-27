@@ -199,6 +199,21 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
         ),
         (
             DenseAttentionCase(
+                name="runner_cuda_graph_frozen_kv_mtp_verify_swa_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(3, 5),
+                extend_lens=(3, 3),
+                sliding_window_size=4,
+            ),
+            1,
+            "frozen_kv_mtp",
+        ),
+        (
+            DenseAttentionCase(
                 name="runner_cuda_graph_dflash_verify_swa_chain",
                 backend="triton",
                 forward_mode=ForwardMode.TARGET_VERIFY,
