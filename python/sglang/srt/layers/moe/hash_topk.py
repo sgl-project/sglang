@@ -7,6 +7,9 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
@@ -32,6 +35,20 @@ class HashTopK(nn.Module):
         apply_routed_scaling_factor_on_output=False,
     ):
         super().__init__()
+        self.layer_id = None
+        from sglang.srt.server_args import get_global_server_args
+
+        self.enable_deepep_waterfill = (
+            num_fused_shared_experts > 0
+            and get_global_server_args().enable_deepep_waterfill
+        )
+        self.deepep_waterfill_balancer = None
+
+        if self.enable_deepep_waterfill:
+            # Waterfill appends the shared expert after EPLB maps routed IDs.
+            topk -= num_fused_shared_experts
+            num_fused_shared_experts = 0
+
         self.num_experts = num_experts
         self.topk = topk
         self.routed_scaling_factor = routed_scaling_factor
@@ -67,7 +84,21 @@ class HashTopK(nn.Module):
         topk_weights = torch.empty((0, topk), dtype=torch.float32, device=device)
         topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
-        return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+        return self._apply_deepep_waterfill(
+            StandardTopKOutput(topk_weights, topk_ids, router_logits),
+            num_tokens=0,
+        )
+
+    def _apply_deepep_waterfill(
+        self, topk_output: StandardTopKOutput, num_tokens: int
+    ) -> StandardTopKOutput:
+        if self.enable_deepep_waterfill and self.deepep_waterfill_balancer is None:
+            raise RuntimeError(
+                "DeepEP waterfill HashTopK must be prepared by ModelRunner before forward."
+            )
+        if self.deepep_waterfill_balancer is None:
+            return topk_output
+        return self.deepep_waterfill_balancer.expand_topk(topk_output, num_tokens)
 
     def _forward_torch(
         self, router_logits: torch.Tensor, input_ids: torch.Tensor
@@ -145,7 +176,8 @@ class HashTopK(nn.Module):
 
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
         _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+        get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
         topk_output = StandardTopKOutput(
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
         )
-        return topk_output
+        return self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
