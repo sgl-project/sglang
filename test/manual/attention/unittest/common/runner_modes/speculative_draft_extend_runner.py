@@ -64,6 +64,24 @@ from ..attention_methods.mla_attention import (
     prepare_mla_runner_inputs,
     run_mla_forward,
 )
+from ..attention_methods.mamba2_attention import (
+    DEFAULT_DEVICE as MAMBA2_DEFAULT_DEVICE,
+)
+from ..attention_methods.mamba2_attention import (
+    DEFAULT_DTYPE as MAMBA2_DEFAULT_DTYPE,
+)
+from ..attention_methods.mamba2_attention import (
+    DEFAULT_MAX_CONTEXT_LEN as MAMBA2_DEFAULT_MAX_CONTEXT_LEN,
+)
+from ..attention_methods.mamba2_attention import (
+    MAMBA2_ATOL,
+    MAMBA2_RTOL,
+    Mamba2AttentionCase,
+    build_mamba2_attention_fixture,
+    expected_mamba2_output_from_inputs,
+    mamba2_fixture_inputs,
+    run_mamba2_forward,
+)
 from .speculative_cuda_graph_runner import (
     SpeculativeCudaGraphAdapter,
     run_speculative_cuda_graph_case,
@@ -688,3 +706,53 @@ def run_dsv4_eagle_draft_extend_cuda_graph_case(
         rtol=DSV4_GRAPH_RTOL,
         max_num_tokens=lambda _case, bs: bs * num_tokens_per_req,
     )
+
+
+def run_mamba2_eagle_draft_extend_case(
+    testcase,
+    case: Mamba2AttentionCase,
+    *,
+    max_context_len: int = MAMBA2_DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = MAMBA2_DEFAULT_DTYPE,
+    device: str = MAMBA2_DEFAULT_DEVICE,
+):
+    """Mamba2 EAGLE DRAFT_EXTEND eager. Mamba2's SSM kernel processes
+    draft tokens linearly through the chunked-scan recurrence regardless
+    of the spec_info tree mask, so the existing EXTEND-style reference
+    (`expected_mamba2_output_from_inputs` / `_pure_torch_mamba2_reference`)
+    doubles as the DRAFT_EXTEND reference. CG is **not** covered:
+    `hybrid_linear_attn_backend.py:509,572` raises `ValueError` for
+    DRAFT_EXTEND capture/replay across the entire HybridLinearAttn
+    family (GDN, KDA, Lightning, Mamba2)."""
+    if not case.forward_mode.is_draft_extend():
+        raise ValueError(
+            "Mamba2 DRAFT_EXTEND coverage expects a DRAFT_EXTEND case."
+        )
+    fixture = build_mamba2_attention_fixture(
+        testcase,
+        case,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+    )
+    fixture.forward_batch.spec_info = _make_eagle_draft_extend_input(
+        case,
+        fixture.forward_batch,
+        device=device,
+    )
+    inputs = mamba2_fixture_inputs(fixture)
+    # Capture the cache state before forward (the `state` arg passed to
+    # `expected_mamba2_output_from_inputs` is `(ssm_states, conv_states)`
+    # — the same shape the EXTEND eager reference consumes).
+    from ..attention_methods.mamba2_attention import _clone_mamba2_cache
+    initial_state = _clone_mamba2_cache(fixture)
+
+    expected = expected_mamba2_output_from_inputs(
+        fixture, case, inputs, initial_state
+    )
+
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+        fixture.backend.init_forward_metadata(fixture.forward_batch)
+        actual = run_mamba2_forward(fixture, fixture.forward_batch, inputs)
+
+    torch.testing.assert_close(actual, expected, atol=MAMBA2_ATOL, rtol=MAMBA2_RTOL)

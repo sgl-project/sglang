@@ -30,6 +30,9 @@ from common.attention_methods.mamba2_attention import (
 from common.runner_modes.cuda_graph_decode_runner import (
     run_mamba2_cuda_graph_decode_case,
 )
+from common.runner_modes.speculative_draft_extend_runner import (
+    run_mamba2_eagle_draft_extend_case,
+)
 from common.runner_modes.speculative_target_verify_runner import (
     run_mamba2_eagle_verify_case,
     run_mamba2_eagle_verify_cuda_graph_case,
@@ -117,6 +120,29 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
             1,
         ),
     )
+    # EAGLE DRAFT_EXTEND eager — `HybridLinearAttnBackend` raises
+    # `ValueError("Invalid forward mode")` for DRAFT_EXTEND CG capture
+    # (`hybrid_linear_attn_backend.py:509,572`), so CG is structurally
+    # blocked; only eager is exercised. Same EXTEND-style chunked-scan
+    # recurrence reference doubles as the DRAFT_EXTEND reference, like
+    # the verify path.
+    EAGLE_DRAFT_EXTEND_CASES = (
+        Mamba2AttentionCase(
+            name="runner_eagle_draft_extend_mamba2",
+            backend="triton",
+            forward_mode=ForwardMode.DRAFT_EXTEND,
+            num_heads=DEFAULT_NUM_HEADS,
+            head_dim=DEFAULT_HEAD_DIM,
+            state_size=DEFAULT_STATE_SIZE,
+            n_groups=DEFAULT_N_GROUPS,
+            conv_kernel=DEFAULT_CONV_KERNEL,
+            mamba_chunk_size=DEFAULT_MAMBA_CHUNK_SIZE,
+            hidden_size=DEFAULT_HIDDEN_SIZE,
+            page_size=16,
+            prefix_lens=(4, 7),
+            extend_lens=(3, 3),
+        ),
+    )
 
     def test_projected_mamba2_attention_cases(self):
         for case in self.CASES:
@@ -137,6 +163,11 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
         for case, topk in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:
             with self.subTest(case=case.name, backend=case.backend, topk=topk):
                 run_mamba2_eagle_verify_cuda_graph_case(self, case, topk=topk)
+
+    def test_runner_mode_eagle_draft_extend_cases(self):
+        for case in self.EAGLE_DRAFT_EXTEND_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_mamba2_eagle_draft_extend_case(self, case)
 
     # PCG/BCG split-op extend is deliberately NOT covered. The
     # `MambaMixer2.forward` asserts `num_actual_tokens ==
