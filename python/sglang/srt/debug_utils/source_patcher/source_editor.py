@@ -79,9 +79,7 @@ def _find_match(*, source_lines: list[str], match_lines: list[str]) -> int:
     return found_indices[0]
 
 
-def _not_found_diagnostic(
-    stripped_source: list[str], stripped_match: list[str]
-) -> str:
+def _not_found_diagnostic(stripped_source: list[str], stripped_match: list[str]) -> str:
     preview = "\n".join(stripped_match)
     lines = [
         f"match text not found in source:\n{preview}",
