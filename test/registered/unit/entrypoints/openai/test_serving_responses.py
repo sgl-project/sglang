@@ -61,6 +61,7 @@ class _MockTokenizerManager:
             stream_response_default_include_usage=False,
             tokenizer_metrics_allowed_custom_labels=None,
             tool_call_parser=None,
+            incremental_streaming_output=False,
         )
         self.tokenizer = Mock()
         self.tokenizer.encode.return_value = [1, 2, 3]
@@ -628,6 +629,153 @@ class ServingResponsesTestCase(unittest.TestCase):
                 if line.startswith("data: "):
                     seqs.append(json.loads(line[len("data: ") :])["sequence_number"])
         self.assertEqual(seqs, list(range(len(seqs))))
+
+    def test_required_tool_choice_parses_json_array_without_native_parser(self):
+        # When tool_choice="required" falls back to a json_schema constraint
+        # (no native structural_tag parser configured) the model output is a
+        # JSON array of {name, parameters} objects; the Responses path must
+        # surface those as ResponseFunctionToolCall items instead of dumping
+        # the JSON into a message.
+        from openai.types.responses.response_function_tool_call import (
+            ResponseFunctionToolCall,
+        )
+
+        serving = _make_serving()
+        serving.tool_call_parser = None
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            tool_choice="required",
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {"type": "object"},
+                }
+            ],
+            store=False,
+        )
+        raw = '[{"name": "get_weather", "parameters": {"city": "Beijing"}}]'
+
+        output_items = serving._make_response_output_items(
+            request, raw, tokenizer=Mock()
+        )
+
+        tool_calls = [
+            item for item in output_items if isinstance(item, ResponseFunctionToolCall)
+        ]
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].name, "get_weather")
+        self.assertEqual(tool_calls[0].arguments, '{"city": "Beijing"}')
+        message_items = [
+            item for item in output_items if isinstance(item, ResponseOutputMessage)
+        ]
+        self.assertEqual(message_items, [])
+
+    def test_non_harmony_stream_required_tool_choice_emits_function_call_events(self):
+        # Mirrors chat streaming's JsonArrayParser fallback: tool_choice
+        # "required" + no native structural_tag → stream the JSON array as
+        # response.function_call_arguments.* and response.output_item.added/
+        # done for a function_call item, not as response.output_text.delta.
+        serving = _make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = None
+
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            store=False,
+            tool_choice="required",
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        )
+        request_metadata = RequestResponseMetadata(request_id=request.request_id)
+        payload = '[{"name": "get_weather", "parameters": {"city": "Beijing"}}]'
+
+        async def fake_generator():
+            sent = 0
+            while sent < len(payload):
+                step = min(8, len(payload) - sent)
+                sent += step
+                yield {
+                    "text": payload[:sent],
+                    "meta_info": {
+                        "id": "rid",
+                        "prompt_tokens": 5,
+                        "completion_tokens": sent,
+                        "cached_tokens": 0,
+                        "finish_reason": (
+                            {"type": "stop"} if sent == len(payload) else None
+                        ),
+                    },
+                }
+
+        async def collect():
+            events = []
+            async for chunk in serving.responses_stream_generator_non_harmony(
+                request,
+                sampling_params={},
+                result_generator=fake_generator(),
+                model_name="x",
+                tokenizer=Mock(),
+                request_metadata=request_metadata,
+            ):
+                events.append(chunk)
+            return events
+
+        events = asyncio.run(collect())
+        types = [
+            line[len("event: ") :].strip()
+            for chunk in events
+            for line in chunk.splitlines()
+            if line.startswith("event: ")
+        ]
+        self.assertIn("response.function_call_arguments.delta", types)
+        self.assertIn("response.function_call_arguments.done", types)
+        # The function_call item must be added and closed, and the model
+        # must NOT receive an output_text.delta or message item — otherwise
+        # the SDK would expose the raw JSON to the user.
+        self.assertIn("response.output_item.added", types)
+        self.assertIn("response.output_item.done", types)
+        self.assertNotIn("response.output_text.delta", types)
+        added_items = [
+            json.loads(line[len("data: ") :])["item"]["type"]
+            for chunk in events
+            for line in chunk.splitlines()
+            if line.startswith("data: ")
+            and "response.output_item.added" in chunk.splitlines()[0]
+            and '"item"' in line
+        ]
+        self.assertIn("function_call", added_items)
+
+    def test_harmony_developer_message_skips_unsupported_tool_types(self):
+        # ResponseTool now accepts namespace / mcp / file_search / etc.; the
+        # harmony developer message handler must skip them silently instead
+        # of raising, otherwise GPT-OSS users carrying those payloads break.
+        from sglang.srt.entrypoints.harmony_utils import get_developer_message
+        from sglang.srt.entrypoints.openai.protocol import ResponseTool
+
+        tools = [
+            ResponseTool(
+                type="function",
+                name="get_weather",
+                description="Look up weather.",
+                parameters={"type": "object"},
+            ),
+            ResponseTool(type="web_search"),
+            ResponseTool(type="namespace", name="codex"),
+            ResponseTool(type="mcp"),
+        ]
+        # Should not raise — namespace/mcp are dropped, web_search treated
+        # as a built-in, function tools land in the developer message.
+        msg = get_developer_message(instructions="be helpful", tools=tools)
+        self.assertIsNotNone(msg)
 
     def test_no_tool_call_extraction_when_tool_choice_none(self):
         serving = _make_serving()

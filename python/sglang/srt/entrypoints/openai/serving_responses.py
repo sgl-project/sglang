@@ -60,6 +60,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
@@ -628,11 +629,14 @@ class OpenAIServingResponses(OpenAIServingChat):
             output_items.append(reasoning_item)
 
         # Extract function tool calls from the assistant text. Mirrors the
-        # FunctionCallParser path in OpenAIServingChat._process_tool_calls so
-        # /v1/responses surfaces native tool-call output as
-        # ResponseFunctionToolCall items instead of leaking the raw markup
-        # back to the client as plain text.
+        # FunctionCallParser + JSON-array fallback paths in
+        # OpenAIServingChat._process_tool_calls so /v1/responses surfaces
+        # native tool-call output as ResponseFunctionToolCall items instead
+        # of leaking the raw markup (or the required JSON array) back to the
+        # client as plain text.
         chat_tools = self._response_tools_to_chat_tools(request)
+        is_required = request.tool_choice == "required"
+        parsed_via_native = False
         if (
             content
             and chat_tools
@@ -640,7 +644,14 @@ class OpenAIServingResponses(OpenAIServingChat):
             and request.tool_choice != "none"
         ):
             parser = FunctionCallParser(chat_tools, self.tool_call_parser)
-            if parser.has_tool_call(content):
+            # For required tool_choice the model is constrained either to
+            # structural_tag (native markup) or to json_schema (JSON array);
+            # only invoke the native parser when the detector actually
+            # supports structural_tag, mirroring chat completions.
+            should_try_native = (
+                not is_required or parser.detector.supports_structural_tag()
+            )
+            if should_try_native and parser.has_tool_call(content):
                 try:
                     content, call_info_list = parser.parse_non_stream(content)
                     for call_info in call_info_list:
@@ -654,8 +665,39 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 status="completed",
                             )
                         )
+                    parsed_via_native = bool(call_info_list)
                 except Exception as e:
                     logger.error("Tool call parsing error: %s", e)
+
+        # JSON-array fallback for required tool_choice when no native parser
+        # consumed the markup. The model is grammar-constrained to a JSON
+        # array of ``{"name": ..., "parameters": ...}`` objects, so a plain
+        # ``orjson.loads`` reconstructs the calls.
+        if content and chat_tools and is_required and not parsed_via_native:
+            try:
+                tool_call_data = orjson.loads(content)
+                if isinstance(tool_call_data, dict):
+                    tool_call_data = [tool_call_data]
+                if isinstance(tool_call_data, list):
+                    for tool in tool_call_data:
+                        if not isinstance(tool, dict) or "name" not in tool:
+                            continue
+                        arguments = json.dumps(
+                            tool.get("parameters", {}), ensure_ascii=False
+                        )
+                        output_items.append(
+                            ResponseFunctionToolCall(
+                                arguments=arguments,
+                                call_id=f"call_{random_uuid()[:24]}",
+                                type="function_call",
+                                name=tool["name"],
+                                id=f"fc_{random_uuid()[:8]}",
+                                status="completed",
+                            )
+                        )
+                    content = ""
+            except Exception as e:
+                logger.error("Required tool JSON parse error: %s", e)
 
         if content:
             output_text = ResponseOutputText(
@@ -1589,14 +1631,25 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
         chat_tools = self._response_tools_to_chat_tools(request)
-        use_tool_parser = bool(
-            chat_tools and self.tool_call_parser and request.tool_choice != "none"
-        )
-        tool_parser = (
-            FunctionCallParser(chat_tools, self.tool_call_parser)
-            if use_tool_parser
-            else None
-        )
+        is_required = request.tool_choice == "required"
+        # Tool-call parser selection mirrors chat streaming:
+        #   * native parser when configured AND it supports structural_tag
+        #     (or tool_choice="auto" — auto always uses the native parser);
+        #   * JsonArrayParser when tool_choice="required" but the constraint
+        #     falls back to a json_schema array (no native structural_tag,
+        #     or no native parser at all).
+        tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
+        if chat_tools and request.tool_choice != "none":
+            native_supports_structural_tag = False
+            if self.tool_call_parser:
+                probe = FunctionCallParser(chat_tools, self.tool_call_parser)
+                native_supports_structural_tag = (
+                    probe.detector.supports_structural_tag()
+                )
+            if is_required and not native_supports_structural_tag:
+                tool_parser = JsonArrayParser()
+            elif self.tool_call_parser:
+                tool_parser = FunctionCallParser(chat_tools, self.tool_call_parser)
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if self.reasoning_parser:
             reasoning_parser_obj = ReasoningParser(
@@ -1752,6 +1805,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         item_id=state["item_id"],
                         output_index=state["output_index"],
                         arguments=arguments,
+                        name=state["name"] or "",
                     )
                 ),
                 _send_event(
@@ -1848,7 +1902,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if not delta:
                     continue
 
-                if tool_parser is not None:
+                if isinstance(tool_parser, JsonArrayParser):
+                    # JsonArrayParser doesn't share FunctionCallParser's wrapper
+                    # signature; call its detector directly.
+                    sp = tool_parser.parse_streaming_increment(delta, chat_tools)
+                    normal_text, tool_calls = sp.normal_text or "", sp.calls
+                elif tool_parser is not None:
                     normal_text, tool_calls = tool_parser.parse_stream_chunk(delta)
                 else:
                     normal_text, tool_calls = delta, []

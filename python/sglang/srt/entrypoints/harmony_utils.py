@@ -3,6 +3,7 @@
 # Adapted from vLLM: https://github.com/vllm-project/vllm/blob/1b9902806915040ac9b3029f2ab7522ec505afc3/vllm/entrypoints/harmony_utils.py
 # Slight differences in processing chat messages
 import datetime
+import logging
 from collections.abc import Iterable
 from typing import Literal, Optional, Union
 
@@ -41,6 +42,8 @@ from openai_harmony import (
 
 from sglang.srt.entrypoints.openai.protocol import ResponseInputOutputItem
 from sglang.srt.utils import random_uuid
+
+logger = logging.getLogger(__name__)
 
 REASONING_EFFORT = {
     "high": ReasoningEffort.HIGH,
@@ -102,7 +105,16 @@ def get_developer_message(
             elif tool.type == "function":
                 function_tools.append(tool)
             else:
-                raise ValueError(f"tool type {tool.type} not supported")
+                # ``ResponseTool.type`` accepts the full Responses spec
+                # (namespace / mcp / file_search / image_generation / …) so
+                # clients like Codex CLI can advertise them, but harmony only
+                # has prompt templates for the three built-ins above plus
+                # ``function``. Drop the rest silently — the request still
+                # runs, the tool just isn't surfaced to the model.
+                logger.debug(
+                    "harmony: ignoring unsupported response tool type %r",
+                    tool.type,
+                )
         if function_tools:
             function_tool_descriptions = [
                 ToolDescription.new(
