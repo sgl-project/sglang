@@ -392,10 +392,38 @@ Deferred follow-ups:
   production page-table contract which changes too often to maintain a
   stable mock. Bringing up a real coordinator (page tables, swap policy)
   is out of scope for module-level unit tests. See `dsa/README.md`.
+- DSV4 Compressor / C4Indexer math — **intentionally out of Phase 2
+  scope, by design**. These are `nn.Module` instances owned by the DSV4
+  model (`models/deepseek_v4.py:296-311`), not by the attention backend.
+  Their outputs flow into the backend as cached bytes
+  (`set_extra_key_buffer`) and metadata indices
+  (`c4_sparse_page_indices`); the attention backend's contract is to
+  read those inputs correctly, which the current fixture verifies by
+  supplying known-good synthetic bytes/indices through the exact same
+  production pack + store path (`quant_to_nope_fp8_rope_bf16_pack_triton`
+  + `set_extra_key_buffer` at `dsv4_attention.py:1193-1195`). The
+  attention backend's own `init_compression_metadata` Triton kernel
+  (`deepseek_v4_backend.py:182`) IS exercised by the current fixture;
+  what's skipped is only the Compressor and C4Indexer `nn.Module`
+  forward math (`x → compressed_kv` and `x, q_lora → page_indices`).
+  Compressor/C4Indexer correctness is testable at the **component
+  level** against pure-PyTorch references (their natural home is
+  `test/srt/test_dsv4_compressor.py` / `test/srt/test_dsv4_c4_indexer.py`
+  if that coverage is wanted), not wedged into the attention backend
+  matrix. Same rationale as why RoPE is out of scope (PLAN.md "RoPE
+  handling" section) — pre-processing modules whose outputs are inputs
+  to the attention backend.
 - Keep additional backend expansion deferred until representative Phase 3 and
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Recorded the DSV4 Compressor / C4Indexer design decision in PLAN.md
+  "Deferred follow-ups" and in `dsv4/README.md`. Both flag the bypass
+  as intentional (not a Phase 2 gap) and point at the natural
+  component-level test home (`test/srt/test_dsv4_compressor.py`,
+  `test/srt/test_dsv4_c4_indexer.py`) for the Compressor/Indexer math
+  itself. Same rationale as RoPE: pre-processing modules whose outputs
+  are inputs to the attention backend.
 - Phase 2 input-config audit completed across all attention methods.
   Two parallel audit agents compared every method's case generator and
   test file against PLAN.md's "Required input cases" list and landed the

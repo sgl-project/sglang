@@ -112,8 +112,44 @@ Columns are runner modes; rows are `compress_ratio` modes of the single
   `init_forward_metadata` at `deepseek_v4_backend.py:713-714`. PCG/BCG
   split-op extend is therefore structurally unreachable.
 
+## Compressor / C4Indexer — intentionally out of scope for this matrix
+
+`Compressor` and `C4Indexer` are `nn.Module` instances owned by the DSV4
+**model** (`models/deepseek_v4.py:296-311`), not by the attention backend.
+The model's forward calls `self.indexer(...)` and
+`attn_backend.forward_core_compressor(x, ..., self.compressor)` *before*
+attention; their only outputs that flow into the attention backend are:
+
+- **Compressor**: writes bytes into `extra_k_cache` at the
+  `c4_out_loc` / `c128_out_loc` positions. The locations come from the
+  backend's `init_compression_metadata` Triton kernel
+  (`deepseek_v4_backend.py:182`), not from the Compressor.
+- **C4Indexer**: writes the `c4_sparse_page_indices` field that the
+  backend's `forward_extend` / `forward_decode` then read.
+
+The attention backend's contract with both is purely: "I gave you a place
+to write; you wrote something there; I'll read what you wrote." The
+current fixture verifies exactly that contract by supplying known-good
+synthetic bytes/indices through the **same production pack + store path**
+(`quant_to_nope_fp8_rope_bf16_pack_triton` + `set_extra_key_buffer` at
+`common/attention_methods/dsv4_attention.py:1193-1195`) and stashing the
+unquantized BF16 K on the fixture for the reference. The
+`init_compression_metadata` Triton kernel that produces page metadata IS
+exercised; what's skipped is only the Compressor and C4Indexer
+**`nn.Module` forward math** (`x → compressed_kv` and
+`x, q_lora → page_indices`).
+
+Compressor / C4Indexer math correctness belongs at the **component
+level** — `test/srt/test_dsv4_compressor.py` and
+`test/srt/test_dsv4_c4_indexer.py` are the natural homes, against
+pure-PyTorch references of those modules' math. Same rationale as why
+RoPE is out of scope for the attention-backend matrix (PLAN.md "RoPE
+handling"): pre-processing modules whose outputs are inputs to the
+attention backend.
+
 ## Next Work
 
-- Optional: model the `Compressor` and `C4Indexer` paths so the C4/C128 cases
-  no longer bypass them. Today only the `extra_k_cache + extra_indices`
-  integration into `flash_mla` is verified, not the compressor math itself.
+- Component-level Compressor / C4Indexer correctness tests at
+  `test/srt/` (separate from this matrix). Optional — the attention
+  backend already verifies its end of the contract via known-good
+  synthetic inputs.
