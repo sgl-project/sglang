@@ -87,7 +87,7 @@ RUN ${PIP_INSTALL} sglang-router
 
 ### Install PyTorch and PTA
 RUN . /etc/environment_new && \
-    (${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url https://download.pytorch.org/whl/cpu) \
+    (${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} --index-url https://download.pytorch.org/whl/cpu) \
     && (${PIP_INSTALL} ${PTA_URL})
 
 
@@ -96,7 +96,7 @@ RUN . /etc/environment_new && \
     (${PIP_INSTALL} pybind11) && \
     (${PIP_INSTALL} ${TRITON_URL})
 
-# Install SGLang
+# Install SGLang (editable mode to preserve source and git history)
 RUN git clone https://github.com/sgl-project/sglang --branch $SGLANG_TAG /sgl-workspace/sglang && \
     cd /sgl-workspace/sglang/python && rm -rf pyproject.toml && mv pyproject_npu.toml pyproject.toml && \
     ${PIP_INSTALL} -v -e .[all_npu]
