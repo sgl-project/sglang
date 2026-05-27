@@ -167,6 +167,20 @@ class TestTritonDenseAttentionBackendCorrectness(CustomTestCase):
     SPEC_VERIFY_CUDA_GRAPH_CASES = (
         (
             DenseAttentionCase(
+                name="runner_cuda_graph_eagle_verify_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "eagle",
+        ),
+        (
+            DenseAttentionCase(
                 name="runner_cuda_graph_eagle_verify_tree",
                 backend="triton",
                 forward_mode=ForwardMode.TARGET_VERIFY,
@@ -178,6 +192,20 @@ class TestTritonDenseAttentionBackendCorrectness(CustomTestCase):
             ),
             2,
             "eagle",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_cuda_graph_frozen_kv_mtp_verify_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "frozen_kv_mtp",
         ),
         (
             DenseAttentionCase(

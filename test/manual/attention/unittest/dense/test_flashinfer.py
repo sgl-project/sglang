@@ -176,6 +176,20 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
     SPEC_VERIFY_CUDA_GRAPH_CASES = (
         (
             DenseAttentionCase(
+                name="runner_cuda_graph_eagle_verify_chain",
+                backend="flashinfer",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "eagle",
+        ),
+        (
+            DenseAttentionCase(
                 name="runner_cuda_graph_eagle_verify_tree",
                 backend="flashinfer",
                 forward_mode=ForwardMode.TARGET_VERIFY,
@@ -215,6 +229,20 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
             ),
             1,
             "dflash",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_cuda_graph_ngram_verify_chain",
+                backend="flashinfer",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "ngram",
         ),
     )
     EAGLE_DRAFT_EXTEND_CASES = (
