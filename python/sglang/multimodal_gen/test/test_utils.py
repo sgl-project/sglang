@@ -33,13 +33,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_CI_DATA_REVISION = "b7455318873fc5af399c8447b3bb0d9471a5084c"
-SGL_TEST_FILES_CONSISTENCY_GT_CASE_REVISIONS = {
-    "zimage_image_t2i_multi_lora": "969596096a74c1f0a7320928fa7798e759fd2573",
-    "wan2_1_t2v_1_3b_lora_1gpu": "969596096a74c1f0a7320928fa7798e759fd2573",
-    "wan2_1_i2v_14b_lora_2gpu": "969596096a74c1f0a7320928fa7798e759fd2573",
-    "wan2_2_t2v_a14b_lora_2gpu": "969596096a74c1f0a7320928fa7798e759fd2573",
-}
+SGL_TEST_FILES_CI_DATA_REVISION = "2785589a8dd4dbd0bcd10a9a8263e32031df0b8e"
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
     f"sgl-project/ci-data/{SGL_TEST_FILES_CI_DATA_REVISION}/"
@@ -64,29 +58,6 @@ SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES = frozenset(
         "ltx_2_3_two_stage_ti2v_2gpus",
     }
 )
-
-
-def _consistency_gt_root_for_case(case_id: str) -> str:
-    revision = SGL_TEST_FILES_CONSISTENCY_GT_CASE_REVISIONS.get(
-        case_id, SGL_TEST_FILES_CI_DATA_REVISION
-    )
-    return (
-        "https://raw.githubusercontent.com/"
-        f"sgl-project/ci-data/{revision}/"
-        "diffusion-ci/consistency_gt"
-    )
-
-
-def _consistency_gt_sglang_base_for_case(case_id: str) -> str:
-    return f"{_consistency_gt_root_for_case(case_id)}/sglang_generated"
-
-
-def _consistency_gt_bases_for_case(case_id: str) -> tuple[str, ...]:
-    root = _consistency_gt_root_for_case(case_id)
-    if case_id in SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES:
-        return (f"{root}/official_generated", f"{root}/sglang_generated")
-    return (f"{root}/sglang_generated",)
-
 
 CONSISTENCY_THRESHOLD_JSON_PATH = (
     Path(__file__).resolve().parent / "server" / "consistency_threshold.json"
@@ -978,11 +949,7 @@ def get_consistency_gt_remote_files(
         return files
 
     return _remote_consistency_gt_candidates(
-        _consistency_gt_sglang_base_for_case(case_id),
-        case_id,
-        num_gpus,
-        is_video,
-        output_format,
+        SGL_TEST_FILES_CONSISTENCY_GT_BASE, case_id, num_gpus, is_video, output_format
     )
 
 
@@ -1030,7 +997,12 @@ def _find_remote_consistency_gt_files(
     is_video: bool,
     output_format: str | None = None,
 ) -> list[tuple[str, str]]:
-    for base_url in _consistency_gt_bases_for_case(case_id):
+    if case_id in SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES:
+        bases = SGL_TEST_FILES_CONSISTENCY_GT_BASES
+    else:
+        # Avoid accidentally comparing non-comparable CI cases against official GT.
+        bases = (SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,)
+    for base_url in bases:
         candidates = _remote_consistency_gt_candidates(
             base_url, case_id, num_gpus, is_video, output_format
         )

@@ -24,8 +24,6 @@ def test_consistency_gt_urls_are_pinned_to_ci_data_revision():
     assert "/ci-data/main/" not in test_utils.SGL_TEST_FILES_CONSISTENCY_GT_ROOT
     assert revision_path in test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE
     assert revision_path in test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
-    for revision in test_utils.SGL_TEST_FILES_CONSISTENCY_GT_CASE_REVISIONS.values():
-        assert revision != "main"
 
 
 def test_pixel_metrics_identical_image():
