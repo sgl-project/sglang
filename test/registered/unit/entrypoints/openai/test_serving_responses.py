@@ -907,6 +907,121 @@ class ServingResponsesTestCase(unittest.TestCase):
         )
         self.assertFalse(response.parallel_tool_calls)
 
+    def test_non_harmony_stream_final_output_preserves_text_tool_text_order(
+        self,
+    ):
+        # The completed response snapshot must mirror the on-the-wire order:
+        # message → tool_call → message, so SDK consumers reading the stored
+        # response see items in the same sequence they were emitted.
+        from sglang.srt.function_call.core_types import (
+            StreamingParseResult,
+            ToolCallItem,
+        )
+
+        serving = _make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = "qwen3_coder"
+
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            store=False,
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        )
+        request_metadata = RequestResponseMetadata(request_id=request.request_id)
+
+        chunks = [
+            (StreamingParseResult(normal_text="I'll check.", calls=[]), 3),
+            (
+                StreamingParseResult(
+                    normal_text="",
+                    calls=[
+                        ToolCallItem(
+                            tool_index=0,
+                            name="get_weather",
+                            parameters='{"city": "Beijing"}',
+                        )
+                    ],
+                ),
+                10,
+            ),
+            (
+                StreamingParseResult(normal_text="It's sunny.", calls=[]),
+                14,
+            ),
+        ]
+
+        async def fake_generator():
+            for sp, ctoks in chunks:
+                # Each engine "chunk" of (cumulative) text is irrelevant to
+                # this test because we stub the parser below; just yield
+                # incrementing-length text so the offset logic advances.
+                yield {
+                    "text": " " * ctoks,
+                    "meta_info": {
+                        "id": "rid",
+                        "prompt_tokens": 4,
+                        "completion_tokens": ctoks,
+                        "cached_tokens": 0,
+                        "finish_reason": ({"type": "stop"} if ctoks == 14 else None),
+                    },
+                }
+
+        # Drive the parser by stubbing FunctionCallParser.parse_stream_chunk
+        # to return one StreamingParseResult per chunk in order.
+        scripted = iter(chunks)
+
+        def fake_parse_stream_chunk(delta: str):
+            sp, _ = next(scripted)
+            return sp.normal_text, sp.calls
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_responses.FunctionCallParser"
+        ) as parser_cls:
+            instance = parser_cls.return_value
+            instance.detector.supports_structural_tag.return_value = True
+            instance.parse_stream_chunk.side_effect = fake_parse_stream_chunk
+
+            async def collect():
+                events = []
+                async for chunk in serving.responses_stream_generator_non_harmony(
+                    request,
+                    sampling_params={},
+                    result_generator=fake_generator(),
+                    model_name="x",
+                    tokenizer=Mock(),
+                    request_metadata=request_metadata,
+                ):
+                    events.append(chunk)
+                return events
+
+            events = asyncio.run(collect())
+
+        # The terminal ``response.completed`` event carries the snapshot
+        # the SDK / stored response sees. Its ``output`` list must mirror
+        # the stream order — message, function_call, message — and contain
+        # both message segments (not just the trailing one).
+        completed = None
+        for chunk in events:
+            lines = chunk.splitlines()
+            if lines and lines[0] == "event: response.completed":
+                completed = json.loads(lines[1][len("data: ") :])
+                break
+        self.assertIsNotNone(completed, "response.completed event missing")
+        output = completed["response"]["output"]
+        kinds = [item["type"] for item in output]
+        self.assertEqual(kinds, ["message", "function_call", "message"])
+        self.assertEqual(output[0]["content"][0]["text"], "I'll check.")
+        self.assertEqual(output[1]["name"], "get_weather")
+        self.assertEqual(output[2]["content"][0]["text"], "It's sunny.")
+
     def test_no_tool_call_extraction_when_tool_choice_none(self):
         serving = _make_serving()
         serving.tool_call_parser = "qwen3_coder"

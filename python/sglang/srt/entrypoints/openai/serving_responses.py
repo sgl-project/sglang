@@ -1693,15 +1693,23 @@ class OpenAIServingResponses(OpenAIServingChat):
             "text": "",
         }
         tool_call_states: dict[int, dict[str, Any]] = {}
+        # Ordered record of every output item that has been closed during the
+        # stream. The terminal ``response.completed`` event and the stored
+        # response build their ``output`` list from this so the snapshot
+        # mirrors the on-the-wire event order — including text → tool →
+        # text interleaving and repeated reasoning / message segments — and
+        # nothing is lost when an item closes and a new one with the same
+        # role reopens.
+        emitted_items: list = []
 
         # Track engine accounting so the terminal ``response.completed`` event
         # carries usage that matches the non-stream code path.
         prompt_tokens = 0
         completion_tokens = 0
         cached_tokens = 0
+        total_tokens_meta = 0
         reasoning_tokens_meta = 0
         finish_reason: Optional[dict[str, Any]] = None
-        last_chunk_id: Optional[str] = None
         stream_offset = 0
         incremental = self.tokenizer_manager.server_args.incremental_streaming_output
 
@@ -1717,9 +1725,17 @@ class OpenAIServingResponses(OpenAIServingChat):
         def _close_reasoning_item():
             if not reasoning_state["open"]:
                 return []
-            events = []
             text = reasoning_state["text"]
-            events.append(
+            completed_item = ResponseReasoningItem(
+                id=reasoning_state["item_id"],
+                type="reasoning",
+                summary=[],
+                content=[
+                    ResponseReasoningTextContent(type="reasoning_text", text=text),
+                ],
+                status="completed",
+            )
+            events = [
                 _send_event(
                     openai_responses_types.ResponseReasoningTextDoneEvent(
                         type="response.reasoning_text.done",
@@ -1729,28 +1745,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                         content_index=0,
                         text=text,
                     )
-                )
-            )
-            events.append(
+                ),
                 _send_event(
                     openai_responses_types.ResponseOutputItemDoneEvent(
                         type="response.output_item.done",
                         sequence_number=-1,
                         output_index=reasoning_state["output_index"],
-                        item=ResponseReasoningItem(
-                            id=reasoning_state["item_id"],
-                            type="reasoning",
-                            summary=[],
-                            content=[
-                                ResponseReasoningTextContent(
-                                    type="reasoning_text", text=text
-                                ),
-                            ],
-                            status="completed",
-                        ),
+                        item=completed_item,
                     )
-                )
-            )
+                ),
+            ]
+            emitted_items.append(completed_item)
             reasoning_state["open"] = False
             return events
 
@@ -1769,6 +1774,13 @@ class OpenAIServingResponses(OpenAIServingChat):
             text = message_state["text"]
             text_content = openai_responses_types.ResponseOutputText(
                 type="output_text", text=text, annotations=[], logprobs=None
+            )
+            completed_item = ResponseOutputMessage(
+                id=message_state["item_id"],
+                type="message",
+                role="assistant",
+                content=[text_content],
+                status="completed",
             )
             events = [
                 _send_event(
@@ -1797,16 +1809,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                         type="response.output_item.done",
                         sequence_number=-1,
                         output_index=message_state["output_index"],
-                        item=ResponseOutputMessage(
-                            id=message_state["item_id"],
-                            type="message",
-                            role="assistant",
-                            content=[text_content],
-                            status="completed",
-                        ),
+                        item=completed_item,
                     )
                 ),
             ]
+            emitted_items.append(completed_item)
             message_state["open"] = False
             return events
 
@@ -1815,6 +1822,14 @@ class OpenAIServingResponses(OpenAIServingChat):
             if state is None or state.get("done"):
                 return []
             arguments = state["arguments"]
+            completed_item = ResponseFunctionToolCall(
+                arguments=arguments,
+                call_id=state["call_id"],
+                name=state["name"] or "",
+                type="function_call",
+                id=state["item_id"],
+                status="completed",
+            )
             events = [
                 _send_event(
                     openai_responses_types.ResponseFunctionCallArgumentsDoneEvent(
@@ -1831,17 +1846,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                         type="response.output_item.done",
                         sequence_number=-1,
                         output_index=state["output_index"],
-                        item=ResponseFunctionToolCall(
-                            arguments=arguments,
-                            call_id=state["call_id"],
-                            name=state["name"] or "",
-                            type="function_call",
-                            id=state["item_id"],
-                            status="completed",
-                        ),
+                        item=completed_item,
                     )
                 ),
             ]
+            emitted_items.append(completed_item)
             state["done"] = True
             return events
 
@@ -1858,10 +1867,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if not isinstance(chunk, dict):
                     continue
                 meta = chunk.get("meta_info") or {}
-                last_chunk_id = meta.get("id", last_chunk_id)
                 prompt_tokens = meta.get("prompt_tokens", prompt_tokens)
                 completion_tokens = meta.get("completion_tokens", completion_tokens)
                 cached_tokens = meta.get("cached_tokens", cached_tokens)
+                total_tokens_meta = meta.get("total_tokens", total_tokens_meta)
                 reasoning_tokens_meta = meta.get(
                     "reasoning_tokens", reasoning_tokens_meta
                 )
@@ -2051,7 +2060,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 delta=call.parameters,
                             )
                         )
-        except Exception as exc:
+        except Exception:
             logger.exception("Error while streaming /v1/responses")
             failed = ResponsesResponse.from_request(
                 request,
@@ -2071,6 +2080,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             return
 
+        # Drain anything still open in stream order so emitted_items captures
+        # the trailing item and the SSE stream gets its closing events.
         for ev in _close_reasoning_item():
             yield ev
         for ev in _close_message_item():
@@ -2079,55 +2090,12 @@ class OpenAIServingResponses(OpenAIServingChat):
             for ev in _close_tool_call_state(tool_index):
                 yield ev
 
-        final_output_items: list = []
-        if reasoning_state["text"]:
-            final_output_items.append(
-                ResponseReasoningItem(
-                    id=reasoning_state["item_id"] or f"rs_{random_uuid()}",
-                    type="reasoning",
-                    summary=[],
-                    content=[
-                        ResponseReasoningTextContent(
-                            type="reasoning_text", text=reasoning_state["text"]
-                        ),
-                    ],
-                    status="completed",
-                )
-            )
-        for tool_index, state in sorted(tool_call_states.items()):
-            final_output_items.append(
-                ResponseFunctionToolCall(
-                    arguments=state["arguments"],
-                    call_id=state["call_id"],
-                    name=state["name"] or "",
-                    type="function_call",
-                    id=state["item_id"],
-                    status="completed",
-                )
-            )
-        if message_state["text"]:
-            final_output_items.append(
-                ResponseOutputMessage(
-                    id=message_state["item_id"] or f"msg_{random_uuid()}",
-                    type="message",
-                    role="assistant",
-                    content=[
-                        openai_responses_types.ResponseOutputText(
-                            type="output_text",
-                            text=message_state["text"],
-                            annotations=[],
-                            logprobs=None,
-                        )
-                    ],
-                    status="completed",
-                )
-            )
+        final_output_items = list(emitted_items)
 
-        total_tokens = prompt_tokens + completion_tokens
         usage = UsageInfo(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            total_tokens=total_tokens,
+            total_tokens=total_tokens_meta or (prompt_tokens + completion_tokens),
             reasoning_tokens=reasoning_tokens_meta,
         )
         if self.enable_prompt_tokens_details and cached_tokens:
