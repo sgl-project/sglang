@@ -2,12 +2,14 @@
 Config-driven diffusion generation test with pytest parametrization.
 
 
-If the actual run is significantly better than the baseline, the improved cases with their updated baseline will be printed
+Each collected request prints a performance log before validation.
 """
 
 from __future__ import annotations
 
 import os
+import queue
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -56,6 +58,21 @@ logger = init_logger(__name__)
 # Track test cases missing estimated_full_test_time_s for time measurement output
 _MISSING_ESTIMATED_TIME_CASES: set[str] = set()
 _PENDING_BASELINE_DUMPS: dict[str, tuple["PerformanceSummary", bool]] = {}
+_OPENAI_REQUEST_TIMEOUT_SECS = float(
+    os.environ.get("SGLANG_TEST_OPENAI_REQUEST_TIMEOUT_SECS", "600")
+)
+_SERVER_EXIT_POLL_INTERVAL_SECS = float(
+    os.environ.get("SGLANG_TEST_SERVER_EXIT_POLL_INTERVAL_SECS", "1")
+)
+_CONTROL_API_TIMEOUT_SECS = float(
+    os.environ.get("SGLANG_TEST_CONTROL_API_TIMEOUT_SECS", "300")
+)
+_SERVER_FATAL_LOG_PATTERNS = (
+    "terminate called after throwing an instance of",
+    "Fatal Python error:",
+    "Segmentation fault",
+    "Aborted (core dumped)",
+)
 
 
 @pytest.fixture
@@ -110,9 +127,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     # LoRA support
     if server_args.lora_path:
         extra_args += f" --lora-path {server_args.lora_path}"
-
-    if server_args.enable_warmup:
-        extra_args += " --warmup"
 
     # Strict ports: fail immediately if port is occupied instead of silently
     # picking another one (which causes the test client to connect to the wrong server).
@@ -225,13 +239,11 @@ class DiffusionServerBase:
     """
 
     _perf_results: list[dict[str, Any]] = []
-    _improved_baselines: list[dict[str, Any]] = []
     _pytest_config = None  # Store pytest config for stash access
 
     @classmethod
     def setup_class(cls):
         cls._perf_results = []
-        cls._improved_baselines = []
 
     @classmethod
     def teardown_class(cls):
@@ -251,20 +263,6 @@ class DiffusionServerBase:
                 "[DEBUG teardown_class] No pytest_config available, skipping stash update"
             )
 
-        if cls._improved_baselines:
-            import json
-
-            output = """
---- POTENTIAL BASELINE IMPROVEMENTS DETECTED ---
-The following test cases performed significantly better than their baselines.
-Consider updating perf_baselines.json with the snippets below:
-"""
-            for item in cls._improved_baselines:
-                output += (
-                    f'\n"{item["id"]}": {json.dumps(item["baseline"], indent=4)},\n'
-                )
-            print(output)
-
     @pytest.fixture(autouse=True)
     def _capture_pytest_config(self, request):
         """Capture pytest config for use in teardown_class."""
@@ -275,7 +273,79 @@ Consider updating perf_baselines.json with the snippets below:
         return OpenAI(
             api_key="sglang-anything",
             base_url=f"http://localhost:{ctx.port}/v1",
+            timeout=_OPENAI_REQUEST_TIMEOUT_SECS,
+            max_retries=0,
         )
+
+    def _fail_if_server_stopped_or_crashed(
+        self, ctx: ServerContext, case_id: str
+    ) -> None:
+        returncode = ctx.process.poll()
+        if returncode is None:
+            tail = ctx.log_tail()
+            for pattern in _SERVER_FATAL_LOG_PATTERNS:
+                if pattern in tail:
+                    pytest.fail(
+                        f"{case_id}: server reported a fatal backend error during "
+                        f"generation: {pattern}\n\nServer log tail:\n{tail}",
+                        pytrace=False,
+                    )
+            return
+
+        tail = ctx.log_tail()
+        message = (
+            f"{case_id}: server process exited during generation "
+            f"(code {returncode})."
+        )
+        if tail:
+            message += f"\n\nServer log tail:\n{tail}"
+        pytest.fail(message, pytrace=False)
+
+    def _run_generation_with_server_watchdog(
+        self,
+        ctx: ServerContext,
+        case_id: str,
+        generate_fn: Callable[[str, openai.Client], tuple[str, bytes]],
+        client: openai.Client,
+    ) -> tuple[str, bytes]:
+        result_queue: queue.Queue[tuple[str, tuple[str, bytes] | BaseException]] = (
+            queue.Queue(maxsize=1)
+        )
+
+        def _target() -> None:
+            try:
+                result_queue.put(("ok", generate_fn(case_id, client)))
+            except BaseException as exc:
+                result_queue.put(("error", exc))
+
+        # native backend crashes can leave the HTTP client blocked until its read
+        # timeout; keep the request in a daemon thread so the main test thread can
+        # fail as soon as the server subprocess exits
+        thread = threading.Thread(
+            target=_target,
+            name=f"diffusion-generation-{case_id}",
+            daemon=True,
+        )
+        thread.start()
+
+        while True:
+            try:
+                state, payload = result_queue.get(
+                    timeout=_SERVER_EXIT_POLL_INTERVAL_SECS
+                )
+            except queue.Empty:
+                self._fail_if_server_stopped_or_crashed(ctx, case_id)
+                continue
+
+            if state == "ok":
+                if isinstance(payload, BaseException):
+                    raise payload
+                return payload
+
+            self._fail_if_server_stopped_or_crashed(ctx, case_id)
+            if not isinstance(payload, BaseException):
+                pytest.fail(f"{case_id}: invalid generation result state: {state}")
+            raise payload
 
     def run_and_collect(
         self,
@@ -290,7 +360,9 @@ Consider updating perf_baselines.json with the snippets below:
             Tuple of (performance_record, content_bytes)
         """
         client = self._client(ctx)
-        rid, content = generate_fn(case_id, client)
+        rid, content = self._run_generation_with_server_watchdog(
+            ctx, case_id, generate_fn, client
+        )
 
         if not collect_perf:
             return None, content
@@ -351,6 +423,7 @@ Consider updating perf_baselines.json with the snippets below:
         )
 
         summary = validator.collect_metrics(perf_record)
+        self._print_performance_log(case, summary, scenario)
 
         if case.run_perf_check:
             if is_baseline_generation_mode:
@@ -364,8 +437,6 @@ Consider updating perf_baselines.json with the snippets below:
                         f"Testcase '{case.id}' not found in perf_baselines.json"
                     )
                 return
-
-            self._check_for_improvement(case, summary, scenario)
 
             # only run performance validation if run_perf_check is True
             try:
@@ -400,83 +471,43 @@ Consider updating perf_baselines.json with the snippets below:
             f"[DEBUG _validate_and_record] Appended result for {case.id}, class {self.__class__.__name__} now has {len(self.__class__._perf_results)} results"
         )
 
-    def _check_for_improvement(
+    def _print_performance_log(
         self,
         case: DiffusionTestCase,
         summary: PerformanceSummary,
-        scenario: "ScenarioConfig",
+        scenario: ScenarioConfig | None,
     ) -> None:
-        """Check for potential significant performance improvements and record them."""
-        is_improved = False
-        threshold = BASELINE_CONFIG.improvement_threshold
-
-        def is_sig_faster(actual, expected):
-            if expected == 0 or expected is None:
-                return False
-            return actual < expected * (1 - threshold)
-
-        def safe_get_metric(metric_dict, key):
-            val = metric_dict.get(key)
-            return val if val is not None else float("inf")
-
-        # Check for any significant improvement
-        if (
-            is_sig_faster(summary.e2e_ms, scenario.expected_e2e_ms)
-            or is_sig_faster(summary.avg_denoise_ms, scenario.expected_avg_denoise_ms)
-            or is_sig_faster(
-                summary.median_denoise_ms, scenario.expected_median_denoise_ms
+        lines = [
+            "",
+            f"--- Performance Log: {case.id} ---",
+            (
+                f"  e2e={summary.e2e_ms:.2f}ms, "
+                f"avg_denoise={summary.avg_denoise_ms:.2f}ms, "
+                f"median_denoise={summary.median_denoise_ms:.2f}ms"
+            ),
+        ]
+        if scenario is not None:
+            lines.append(
+                "  baseline: "
+                f"e2e={scenario.expected_e2e_ms:.2f}ms, "
+                f"avg_denoise={scenario.expected_avg_denoise_ms:.2f}ms, "
+                f"median_denoise={scenario.expected_median_denoise_ms:.2f}ms"
             )
-        ):
-            is_improved = True
-        # Combine metrics, always taking the better (lower) value
-        new_stages = {
-            stage: min(
-                safe_get_metric(summary.stage_metrics, stage),
-                safe_get_metric(scenario.stages_ms, stage),
+        if summary.stage_metrics:
+            stages = ", ".join(
+                f"{name}={duration:.2f}ms"
+                for name, duration in summary.stage_metrics.items()
             )
-            for stage in set(summary.stage_metrics) | set(scenario.stages_ms)
-        }
-        new_denoise_steps = {
-            step: min(
-                safe_get_metric(summary.all_denoise_steps, step),
-                safe_get_metric(scenario.denoise_step_ms, step),
+            lines.append(f"  stages: {stages}")
+        if summary.all_denoise_steps:
+            # ci retries need the exact outlier, not only sampled checkpoints
+            steps = ", ".join(
+                f"{idx}={duration:.2f}ms"
+                for idx, duration in sorted(summary.all_denoise_steps.items())
             )
-            for step in set(summary.all_denoise_steps.keys())
-            | set(scenario.denoise_step_ms)
-        }
-
-        # Check for stage-level improvements
-        if not is_improved:
-            for stage, new_val in new_stages.items():
-                if is_sig_faster(new_val, scenario.stages_ms.get(stage, float("inf"))):
-                    is_improved = True
-                    break
-        if not is_improved:
-            for step, new_val in new_denoise_steps.items():
-                if is_sig_faster(
-                    new_val, scenario.denoise_step_ms.get(step, float("inf"))
-                ):
-                    is_improved = True
-                    break
-
-        if is_improved:
-            new_baseline = {
-                "stages_ms": {k: round(v, 2) for k, v in new_stages.items()},
-                "denoise_step_ms": {
-                    str(k): round(v, 2) for k, v in new_denoise_steps.items()
-                },
-                "expected_e2e_ms": round(
-                    min(summary.e2e_ms, scenario.expected_e2e_ms), 2
-                ),
-                "expected_avg_denoise_ms": round(
-                    min(summary.avg_denoise_ms, scenario.expected_avg_denoise_ms), 2
-                ),
-                "expected_median_denoise_ms": round(
-                    min(summary.median_denoise_ms, scenario.expected_median_denoise_ms),
-                    2,
-                ),
-            }
-            self._improved_baselines.append({"id": case.id, "baseline": new_baseline})
+            lines.append(f"  denoise_steps: {steps}")
+        lines.append(f"--- End Performance Log: {case.id} ---")
+        print("\n".join(lines), flush=True)
 
     def _dump_baseline_for_testcase(
         self,
@@ -737,41 +768,55 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         This test verifies that each API call succeeds AND that generation works after each operation.
         """
         base_url = f"http://localhost:{ctx.port}/v1"
-        client = OpenAI(base_url=base_url, api_key="dummy")
+        client = self._client(ctx)
 
         # Test 1: unmerge_lora_weights - API should succeed and generation should work
         logger.info("[LoRA E2E] Testing unmerge_lora_weights for %s", case.id)
-        resp = requests.post(f"{base_url}/unmerge_lora_weights")
+        resp = requests.post(
+            f"{base_url}/unmerge_lora_weights", timeout=_CONTROL_API_TIMEOUT_SECS
+        )
         assert resp.status_code == 200, f"unmerge_lora_weights failed: {resp.text}"
 
         logger.info("[LoRA E2E] Verifying generation after unmerge for %s", case.id)
-        rid_after_unmerge, _ = generate_fn(case.id, client)
+        rid_after_unmerge, _ = self._run_generation_with_server_watchdog(
+            ctx, case.id, generate_fn, client
+        )
         assert rid_after_unmerge is not None, "Generation after unmerge failed"
         logger.info("[LoRA E2E] Generation after unmerge succeeded")
 
         # Test 2: merge_lora_weights - API should succeed and generation should work
         logger.info("[LoRA E2E] Testing merge_lora_weights for %s", case.id)
-        resp = requests.post(f"{base_url}/merge_lora_weights")
+        resp = requests.post(
+            f"{base_url}/merge_lora_weights", timeout=_CONTROL_API_TIMEOUT_SECS
+        )
         assert resp.status_code == 200, f"merge_lora_weights failed: {resp.text}"
 
         logger.info("[LoRA E2E] Verifying generation after re-merge for %s", case.id)
-        rid_after_merge, _ = generate_fn(case.id, client)
+        rid_after_merge, _ = self._run_generation_with_server_watchdog(
+            ctx, case.id, generate_fn, client
+        )
         assert rid_after_merge is not None, "Generation after merge failed"
         logger.info("[LoRA E2E] Generation after merge succeeded")
 
         # Test 3: set_lora (re-set the same adapter) - API should succeed and generation should work
         logger.info("[LoRA E2E] Testing set_lora for %s", case.id)
-        resp = requests.post(f"{base_url}/set_lora", json={"lora_nickname": "default"})
+        resp = requests.post(
+            f"{base_url}/set_lora",
+            json={"lora_nickname": "default"},
+            timeout=_CONTROL_API_TIMEOUT_SECS,
+        )
         assert resp.status_code == 200, f"set_lora failed: {resp.text}"
 
         logger.info("[LoRA E2E] Verifying generation after set_lora for %s", case.id)
-        rid_after_set, _ = generate_fn(case.id, client)
+        rid_after_set, _ = self._run_generation_with_server_watchdog(
+            ctx, case.id, generate_fn, client
+        )
         assert rid_after_set is not None, "Generation after set_lora failed"
         logger.info("[LoRA E2E] Generation after set_lora succeeded")
 
         # Test 4: list_loras - API should return the expected list of LoRA adapters
         logger.info("[LoRA E2E] Testing list_loras for %s", case.id)
-        resp = requests.get(f"{base_url}/list_loras")
+        resp = requests.get(f"{base_url}/list_loras", timeout=_CONTROL_API_TIMEOUT_SECS)
         assert resp.status_code == 200, f"list_loras failed: {resp.text}"
         lora_info = resp.json()
         logger.info("[LoRA E2E] list_loras returned %s", lora_info)
@@ -799,13 +844,15 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         and generation succeeds after each switch.
         """
         base_url = f"http://localhost:{ctx.port}/v1"
-        client = OpenAI(base_url=base_url, api_key="dummy")
+        client = self._client(ctx)
 
         # Test 1: Generate with initial LoRA
         logger.info(
             "[LoRA Switch E2E] Testing generation with initial LoRA for %s", case.id
         )
-        rid_initial, _ = generate_fn(case.id, client)
+        rid_initial, _ = self._run_generation_with_server_watchdog(
+            ctx, case.id, generate_fn, client
+        )
         assert rid_initial is not None, "Generation with initial LoRA failed"
         logger.info("[LoRA Switch E2E] Generation with initial LoRA succeeded")
 
@@ -816,6 +863,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         resp = requests.post(
             f"{base_url}/set_lora",
             json={"lora_nickname": "lora2", "lora_path": second_lora_path},
+            timeout=_CONTROL_API_TIMEOUT_SECS,
         )
         assert (
             resp.status_code == 200
@@ -824,20 +872,28 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         logger.info(
             "[LoRA Switch E2E] Verifying generation with second LoRA for %s", case.id
         )
-        rid_second, _ = generate_fn(case.id, client)
+        rid_second, _ = self._run_generation_with_server_watchdog(
+            ctx, case.id, generate_fn, client
+        )
         assert rid_second is not None, "Generation with second LoRA failed"
         logger.info("[LoRA Switch E2E] Generation with second LoRA succeeded")
 
         # Test 3: Switch back to original LoRA and generate
         logger.info("[LoRA Switch E2E] Switching back to original LoRA for %s", case.id)
-        resp = requests.post(f"{base_url}/set_lora", json={"lora_nickname": "default"})
+        resp = requests.post(
+            f"{base_url}/set_lora",
+            json={"lora_nickname": "default"},
+            timeout=_CONTROL_API_TIMEOUT_SECS,
+        )
         assert resp.status_code == 200, f"set_lora back to default failed: {resp.text}"
 
         logger.info(
             "[LoRA Switch E2E] Verifying generation after switching back for %s",
             case.id,
         )
-        rid_switched_back, _ = generate_fn(case.id, client)
+        rid_switched_back, _ = self._run_generation_with_server_watchdog(
+            ctx, case.id, generate_fn, client
+        )
         assert rid_switched_back is not None, "Generation after switching back failed"
         logger.info("[LoRA Switch E2E] Generation after switching back succeeded")
 
@@ -869,6 +925,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         resp = requests.post(
             f"{base_url}/set_lora",
             json={"lora_nickname": "default", "lora_path": dynamic_lora_path},
+            timeout=_CONTROL_API_TIMEOUT_SECS,
         )
         assert resp.status_code == 200, f"Dynamic set_lora failed: {resp.text}"
         logger.info("[Dynamic LoRA] set_lora succeeded for %s", case.id)
@@ -886,7 +943,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         Tests: basic multi-LoRA, different strengths, cached adapters, switch back to single.
         """
         base_url = f"http://localhost:{ctx.port}/v1"
-        client = OpenAI(base_url=base_url, api_key="dummy")
+        client = self._client(ctx)
 
         # Test 1: Basic multi-LoRA with list format
         resp = requests.post(
@@ -897,11 +954,14 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 "target": "all",
                 "strength": [1.0, 1.0],
             },
+            timeout=_CONTROL_API_TIMEOUT_SECS,
         )
         assert (
             resp.status_code == 200
         ), f"set_lora with multiple adapters failed: {resp.text}"
-        rid, _ = generate_fn(case.id, client)
+        rid, _ = self._run_generation_with_server_watchdog(
+            ctx, case.id, generate_fn, client
+        )
         assert rid is not None
 
         # Test 2: Different strengths
@@ -913,15 +973,22 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 "target": "all",
                 "strength": [0.8, 0.5],
             },
+            timeout=_CONTROL_API_TIMEOUT_SECS,
         )
         assert (
             resp.status_code == 200
         ), f"set_lora with different strengths failed: {resp.text}"
-        rid, _ = generate_fn(case.id, client)
+        rid, _ = self._run_generation_with_server_watchdog(
+            ctx, case.id, generate_fn, client
+        )
         assert rid is not None
 
         # Test 3: Different targets
-        requests.post(f"{base_url}/set_lora", json={"lora_nickname": "default"})
+        requests.post(
+            f"{base_url}/set_lora",
+            json={"lora_nickname": "default"},
+            timeout=_CONTROL_API_TIMEOUT_SECS,
+        )
         resp = requests.post(
             f"{base_url}/set_lora",
             json={
@@ -930,19 +997,28 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 "target": ["transformer", "transformer_2"],
                 "strength": [0.8, 0.5],
             },
+            timeout=_CONTROL_API_TIMEOUT_SECS,
         )
         assert (
             resp.status_code == 200
         ), f"set_lora with cached adapters failed: {resp.text}"
-        rid, _ = generate_fn(case.id, client)
+        rid, _ = self._run_generation_with_server_watchdog(
+            ctx, case.id, generate_fn, client
+        )
         assert rid is not None
 
         # Test 4: Switch back to single LoRA
-        resp = requests.post(f"{base_url}/set_lora", json={"lora_nickname": "default"})
+        resp = requests.post(
+            f"{base_url}/set_lora",
+            json={"lora_nickname": "default"},
+            timeout=_CONTROL_API_TIMEOUT_SECS,
+        )
         assert (
             resp.status_code == 200
         ), f"set_lora back to single adapter failed: {resp.text}"
-        rid, _ = generate_fn(case.id, client)
+        rid, _ = self._run_generation_with_server_watchdog(
+            ctx, case.id, generate_fn, client
+        )
         assert rid is not None
 
         logger.info("[Multi-LoRA] All multi-LoRA tests passed for %s", case.id)
@@ -958,7 +1034,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         # Test GET /v1/models
         logger.info("[Models API] Testing GET /v1/models for %s", case.id)
-        resp = requests.get(f"{base_url}/v1/models")
+        resp = requests.get(f"{base_url}/v1/models", timeout=_CONTROL_API_TIMEOUT_SECS)
         assert resp.status_code == 200, f"/v1/models failed: {resp.text}"
 
         data = resp.json()
@@ -1005,7 +1081,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         # Test GET /v1/models/{model_path}
         model_path = model["id"]
         logger.info("[Models API] Testing GET /v1/models/%s", model_path)
-        resp = requests.get(f"{base_url}/v1/models/{model_path}")
+        resp = requests.get(
+            f"{base_url}/v1/models/{model_path}", timeout=_CONTROL_API_TIMEOUT_SECS
+        )
         assert resp.status_code == 200, f"/v1/models/{model_path} failed: {resp.text}"
 
         single_model = resp.json()
@@ -1025,7 +1103,10 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         # Test GET /v1/models/{non_existent_model} returns 404
         logger.info("[Models API] Testing GET /v1/models/non_existent_model")
-        resp = requests.get(f"{base_url}/v1/models/non_existent_model")
+        resp = requests.get(
+            f"{base_url}/v1/models/non_existent_model",
+            timeout=_CONTROL_API_TIMEOUT_SECS,
+        )
         assert resp.status_code == 404, f"Expected 404, got {resp.status_code}"
         error_data = resp.json()
         assert "error" in error_data, "404 response missing 'error' field"
@@ -1043,7 +1124,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             return
 
         base_url = f"http://localhost:{ctx.port}"
-        resp = requests.get(f"{base_url}/v1/models")
+        resp = requests.get(f"{base_url}/v1/models", timeout=_CONTROL_API_TIMEOUT_SECS)
         assert resp.status_code == 200, f"/v1/models failed: {resp.text}"
         data = resp.json().get("data", [])
         if not data:
@@ -1058,7 +1139,11 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         if case.sampling_params.output_size:
             payload["size"] = case.sampling_params.output_size
 
-        resp = requests.post(f"{base_url}/v1/videos", json=payload)
+        resp = requests.post(
+            f"{base_url}/v1/videos",
+            json=payload,
+            timeout=_CONTROL_API_TIMEOUT_SECS,
+        )
         assert (
             resp.status_code == 400
         ), f"Expected 400 for T2V input_reference, got {resp.status_code}: {resp.text}"

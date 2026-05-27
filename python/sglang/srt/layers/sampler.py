@@ -17,9 +17,9 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import (
-    crash_on_warnings,
     get_bool_env_var,
     is_cuda,
+    is_musa,
     is_npu,
 )
 
@@ -32,6 +32,15 @@ if is_cuda():
         top_k_renorm_prob,
         top_p_renorm_prob,
     )
+
+if is_musa():
+    from sgl_kernel import (
+        min_p_sampling_from_probs,
+        top_k_renorm_prob,
+        top_k_top_p_sampling_from_probs,
+        top_p_renorm_prob,
+    )
+
 
 if is_npu():
     import torch_npu
@@ -47,7 +56,6 @@ _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
-        self.use_nan_detection = get_global_server_args().enable_nan_detection
         self.tp_sync_group = get_tp_group().device_group
         if is_dp_attention_enabled():
             self.tp_sync_group = get_attention_tp_group().device_group
@@ -64,20 +72,9 @@ class Sampler(nn.Module):
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
     ) -> torch.Tensor:
-        """Apply custom logit processors and handle NaN detection."""
-        # Apply the custom logit processors if registered in the sampling info
+        """Apply custom logit processors."""
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(logits, sampling_info)
-
-        # Detect and handle NaN values in logits
-        if self.use_nan_detection and torch.any(torch.isnan(logits)):
-            logger.warning("Detected errors during sampling! NaN in the logits.")
-            logits = torch.where(
-                torch.isnan(logits), torch.full_like(logits, -1e5), logits
-            )
-            if crash_on_warnings():
-                raise ValueError("Detected errors during sampling! NaN in the logits.")
-
         return logits
 
     def forward(
@@ -228,7 +225,6 @@ class Sampler(nn.Module):
                         sampling_info.top_ks,
                         sampling_info.top_ps,
                         filter_apply_order="joint",
-                        check_nan=self.use_nan_detection,
                     )
             elif backend == "pytorch":
                 # A slower fallback implementation with torch native operations.

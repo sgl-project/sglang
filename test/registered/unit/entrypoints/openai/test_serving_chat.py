@@ -32,7 +32,7 @@ from sglang.srt.managers.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _MockTokenizerManager:
@@ -119,9 +119,12 @@ class ServingChatTestCase(unittest.TestCase):
 
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
-        with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
-        ) as conv_mock, patch.object(self.chat, "_process_messages") as proc_mock:
+        with (
+            patch(
+                "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            ) as conv_mock,
+            patch.object(self.chat, "_process_messages") as proc_mock,
+        ):
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_ins.image_data = conv_ins.audio_data = None
@@ -1225,6 +1228,37 @@ class ServingChatTestCase(unittest.TestCase):
                 req.reasoning_effort = effort
                 self.assertEqual(chat._get_reasoning_from_request(req), expected)
 
+    def test_non_stream_reasoning_response_preserves_payload_whitespace(self):
+        self.chat.reasoning_parser = "qwen3"
+        self.template_manager.force_reasoning = False
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=False,
+            separate_reasoning=True,
+        )
+        ret = [
+            {
+                "text": "<think>\nLet me think\n</think>\n\nThe answer is 42.\n",
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 5,
+                    "completion_tokens": 8,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "test",
+                },
+                "index": 0,
+            }
+        ]
+
+        response = self.chat._build_chat_response(req, ret, created=123)
+
+        message = response.choices[0].message
+        self.assertEqual(message.reasoning_content, "\nLet me think\n")
+        self.assertEqual(message.content, "\n\nThe answer is 42.\n")
+
     # ------------- reasoning config tests -------------
     def test_get_reasoning_from_request_default_true_toggle(self):
         self.tm.server_args.reasoning_parser = "qwen3"
@@ -1439,6 +1473,26 @@ class ServingChatTestCase(unittest.TestCase):
             conv_mock.return_value = conv_ins
             result = self.chat._apply_conversation_template(req, is_multimodal=False)
         self.assertEqual(result.prompt, "BASE_PROMPT")
+
+    # ------------- hook method tests -------------
+    def test_encode_messages_returns_none_by_default(self):
+        """Default _encode_messages returns None (use standard encoding)."""
+        result = self.chat._encode_messages([], Mock(), False)
+        self.assertIsNone(result)
+
+    def test_decode_response_returns_text(self):
+        """Default _decode_response returns ret_item['text']."""
+        ret_item = {"text": "Hello world", "output_ids": [1, 2, 3]}
+        result = self.chat._decode_response(ret_item)
+        self.assertEqual(result, "Hello world")
+
+    def test_get_parsed_response_fields_passthrough(self):
+        """Default _get_parsed_response_fields passes through values."""
+        reasoning = "thinking..."
+        tool_calls = [{"name": "foo"}]
+        r, t = self.chat._get_parsed_response_fields(reasoning, tool_calls)
+        self.assertEqual(r, reasoning)
+        self.assertEqual(t, tool_calls)
 
 
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
