@@ -26,7 +26,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -224,43 +223,6 @@ class Cohere2MoeAttention(nn.Module):
         return output
 
 
-def _small_batch_moe(
-    experts: "FusedMoE",
-    x: torch.Tensor,
-    topk_output,
-) -> torch.Tensor:
-    """Triton fused_experts path for small decode batches.
-
-    Skips FusedMoE's runner dispatch (which is locked to flashinfer_cutlass via
-    the server arg, and CUTLASS's small-M GEMMs underperform Triton at batch
-    1-16) and calls sglang's Triton fused_experts kernel directly with the
-    layer's existing ``w13_weight`` / ``w2_weight`` tensors and runner config.
-    For the prefill/conc=128 path FusedMoE.forward is used as-is (CUTLASS wins
-    there). Result is TP-partial (no all-reduce); caller folds the reduce.
-    """
-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
-
-    return fused_experts(
-        x,
-        experts.w13_weight,
-        experts.w2_weight,
-        topk_output,
-        experts.moe_runner_config,
-    )
-
-
-# Decode batches at or below this size go through the Triton fused_experts
-# path instead of FusedMoE's CUTLASS runner. flashinfer_cutlass is great at
-# batch>=128 but adds fixed per-call overhead that dominates at batch=1,
-# costing ~5% per-request latency. Anything bigger uses the CUTLASS runner
-# via FusedMoE.
-#
-# Threshold=1 is conservative: only conc=1 single-stream goes Triton; everything
-# else (MMMU at conc=16, throughput at conc=128) stays on CUTLASS, which gave
-# the validated MMMU accuracy. Raising this requires re-verifying MMMU.
-_NATIVE_MOE_BATCH_THRESHOLD = 1
-
-
 class Cohere2MoeSparseMoeBlock(nn.Module):
     """Sigmoid-routed MoE with optional shared experts (combined via 'sum' or 'average')."""
 
@@ -351,24 +313,6 @@ class Cohere2MoeSparseMoeBlock(nn.Module):
             else None
         )
 
-    def _route_experts(self, hidden_states, topk_output):
-        """Dispatch to Triton fused_experts for small batches, FusedMoE
-        (flashinfer_cutlass) for big batches.
-        ``topk_output`` is a StandardTopKOutput(topk_weights, topk_ids, router_logits).
-        """
-        # _small_batch_moe calls fused_experts with raw weights and no quant
-        # args, so it is only valid for the unquantized method. Any quantized
-        # scheme (fp8, int8, W4A4/NVFP4/MXFP4 packed into uint8, AWQ/GPTQ, ...)
-        # must go through the standard runner, which applies the scales and the
-        # packed weight layout. Keying off quant_method (not weight dtype) covers
-        # all of them — a dtype denylist misses the uint8-packed 4-bit formats.
-        is_unquantized = isinstance(
-            self.experts.quant_method, UnquantizedFusedMoEMethod
-        )
-        if hidden_states.shape[0] <= _NATIVE_MOE_BATCH_THRESHOLD and is_unquantized:
-            return _small_batch_moe(self.experts, hidden_states, topk_output)
-        return self.experts(hidden_states, topk_output)
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
@@ -376,7 +320,7 @@ class Cohere2MoeSparseMoeBlock(nn.Module):
         if self.shared_experts is None:
             router_logits, _ = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
-            final_hidden_states = self._route_experts(hidden_states, topk_output)
+            final_hidden_states = self.experts(hidden_states, topk_output)
             return final_hidden_states.view(orig_shape)
 
         # FusedMoE.experts can write back into the input buffer when the
@@ -396,12 +340,12 @@ class Cohere2MoeSparseMoeBlock(nn.Module):
                 shared_out = self.shared_experts(shared_input)
             router_logits, _ = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
-            routed_out = self._route_experts(hidden_states, topk_output)
+            routed_out = self.experts(hidden_states, topk_output)
             current_stream.wait_stream(self.alt_stream)
         else:
             router_logits, _ = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
-            routed_out = self._route_experts(hidden_states, topk_output)
+            routed_out = self.experts(hidden_states, topk_output)
             shared_out = self.shared_experts(shared_input)
 
         final_hidden_states = routed_out + shared_out
