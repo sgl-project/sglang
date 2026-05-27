@@ -85,16 +85,42 @@ done
 section "network http (curl, small endpoints)"
 # Use HEAD-ish requests so we measure handshake/TTFB without pulling MB. The
 # Docker Hub manifest endpoint and PyPI simple index are exactly what the
-# install step hits later; failing them here predicts failures there.
+# install step hits later; failing them here predicts failures there. The
+# 10.245.143.50:5000 entry probes the AMD CI's LAN docker registry via TCP
+# (ping is ICMP-blocked on both pools, masking the fact that the registry
+# IS reachable from MI300 — confirmed in sgl-project/sglang#26260).
 fmt='%{http_code} dnstime=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s ttfb=%{time_starttransfer}s total=%{time_total}s\n'
 for url in \
     "https://registry-1.docker.io/v2/" \
     "https://auth.docker.io/token?service=registry.docker.io" \
+    "http://10.245.143.50:5000/v2/" \
     "https://pypi.org/simple/pip/" \
     "https://huggingface.co/api/models/meta-llama/Llama-3.1-8B-Instruct/tree/main" \
     "https://github.com/"; do
     out=$(timeout 15 curl -sS -o /dev/null -w "$fmt" "$url" 2>&1 || echo "curl_err")
     kv "http_${url}" "$out"
+done
+
+section "tcp tunables"
+# The MI300 vs MI325 host gap is dominated by these (see #26260): MI325
+# uses bbr + 16 MiB rmem/wmem, MI300 ships stock cubic + 6 MiB/4 MiB
+# rmem/wmem, which caps single-flow throughput to high-RTT CDNs (HF /
+# Docker Hub / S3) at ~rmem_max/RTT and is exactly the pattern visible in
+# the http_sample numbers above.
+for k in \
+    net.ipv4.tcp_congestion_control \
+    net.core.default_qdisc \
+    net.core.rmem_max \
+    net.core.wmem_max \
+    net.ipv4.tcp_rmem \
+    net.ipv4.tcp_wmem \
+    net.ipv4.tcp_window_scaling \
+    net.ipv4.tcp_mtu_probing \
+    net.ipv4.tcp_timestamps; do
+    v=$(sysctl -n "$k" 2>/dev/null || echo unavailable)
+    # Collapse tabs/multiple spaces so the kv= block stays single-line.
+    v=$(printf '%s' "$v" | tr '\t' ' ' | tr -s ' ')
+    kv "$k" "$v"
 done
 
 section "network http throughput (~10 MiB sample, follows redirects)"
