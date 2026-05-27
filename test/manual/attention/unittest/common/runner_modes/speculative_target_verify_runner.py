@@ -611,13 +611,16 @@ def run_gdn_eagle_verify_case(
     torch.testing.assert_close(actual, expected, atol=atol, rtol=GDN_RTOL)
 
 
-def _prepare_gdn_verify_batch(case, batch, *, topk: int, device: str) -> None:
+def _prepare_gdn_verify_batch(
+    case, batch, *, topk: int, device: str, spec_kind: SpecVerifyKind = "eagle"
+) -> None:
     _prepare_target_verify_batch(batch, case, device)
-    batch.spec_info = _make_eagle_verify_input(
+    batch.spec_info = _make_spec_verify_input(
         case,
         batch,
         topk=topk,
         device=device,
+        spec_kind=spec_kind,
     )
 
 
@@ -626,6 +629,7 @@ def run_gdn_eagle_verify_cuda_graph_case(
     case: GDNAttentionCase,
     *,
     topk: int,
+    spec_kind: SpecVerifyKind = "eagle",
     head_k_dim: int = DEFAULT_HEAD_K_DIM,
     head_v_dim: int = DEFAULT_HEAD_V_DIM,
     max_context_len: int = GDN_DEFAULT_MAX_CONTEXT_LEN,
@@ -654,6 +658,7 @@ def run_gdn_eagle_verify_cuda_graph_case(
             batch,
             topk=topk,
             device=device,
+            spec_kind=spec_kind,
         ),
         prepare_inputs=prepare_gdn_runner_inputs,
         run_forward=run_gdn_forward,

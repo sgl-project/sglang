@@ -161,6 +161,48 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
             2,
             "eagle",
         ),
+        (
+            GDNAttentionCase(
+                name="runner_cuda_graph_frozen_kv_mtp_verify_gdn_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "frozen_kv_mtp",
+        ),
+        (
+            GDNAttentionCase(
+                name="runner_cuda_graph_dflash_verify_gdn_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "dflash",
+        ),
+        (
+            GDNAttentionCase(
+                name="runner_cuda_graph_ngram_verify_gdn_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "ngram",
+        ),
     )
 
     def test_projected_gdn_attention_cases(self):
@@ -209,7 +251,9 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
                 topk=topk,
                 spec_kind=spec_kind,
             ):
-                run_gdn_eagle_verify_cuda_graph_case(self, case, topk=topk)
+                run_gdn_eagle_verify_cuda_graph_case(
+                    self, case, topk=topk, spec_kind=spec_kind
+                )
 
     # Spy directly on each sub-backend's `init_forward_metadata*` so
     # dispatch-layer slice mutations show up as a missing call, which

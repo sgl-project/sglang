@@ -160,6 +160,48 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
             2,
             "eagle",
         ),
+        (
+            GDNAttentionCase(
+                name="runner_cuda_graph_frozen_kv_mtp_verify_gdn_chain",
+                backend="flashinfer",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "frozen_kv_mtp",
+        ),
+        (
+            GDNAttentionCase(
+                name="runner_cuda_graph_dflash_verify_gdn_chain",
+                backend="flashinfer",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "dflash",
+        ),
+        (
+            GDNAttentionCase(
+                name="runner_cuda_graph_ngram_verify_gdn_chain",
+                backend="flashinfer",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "ngram",
+        ),
     )
 
     def test_projected_gdn_attention_cases(self):
@@ -229,6 +271,7 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
                     self,
                     case,
                     topk=topk,
+                    spec_kind=spec_kind,
                     head_k_dim=self.HEAD_K_DIM,
                     head_v_dim=self.HEAD_V_DIM,
                 )
