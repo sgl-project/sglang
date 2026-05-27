@@ -101,13 +101,32 @@ hardware/SDK. The variant tests live in `test_dsa.py` as
 
 ## Next Work
 
-- **HiSparse coordinator path** — `set_dsa_prefill_impl` forces
-  `use_mha=False` when `self.hisparse_coordinator is not None`; the
-  fixture sets it to `None`. Adding HiSparse coverage would exercise
-  `_forward_flashmla_kv`'s `translate_loc_to_hisparse_device` branch
-  and `swap_in_selected_pages` during decode.
-- Add non-trailing index-layout sparse cases when a representative
-  index-construction path is identified.
+- **HiSparse coordinator path (genuine follow-up — needs HiSparse infra)** —
+  `set_dsa_prefill_impl` forces `use_mha=False` when
+  `self.hisparse_coordinator is not None`; the fixture sets it to `None`.
+  Wiring HiSparse coverage would exercise `_forward_flashmla_kv`'s
+  `translate_loc_to_hisparse_device` branch and `swap_in_selected_pages`
+  during decode. This needs a real `HiSparseCoordinator` instance — a
+  production-side singleton owned by the model runner, not a single flag.
+  Building a unit-fixture version requires either:
+  1. **Mock the coordinator** — supply a tiny stand-in object that
+     exposes the methods the DSA backend calls
+     (`translate_loc_to_hisparse_device`, `swap_in_selected_pages`,
+     `selected_pages`, etc.). The mock must produce page mappings the
+     existing `DSATokenToKVPool` honors, which means mirroring the
+     production page-table contract. Deferred — the contract changes
+     fast enough that a stable mock isn't cheap.
+  2. **Bring up a real HiSparse coordinator in the fixture** — requires
+     loading the HiSparse memory layout, allocating the swap-in/swap-out
+     page tables, and wiring page-eviction policy. Out of scope for
+     module-level unit tests.
+- **Non-trailing index layouts**: `_make_dsa_sparse_topk_rows` now
+  supports `pattern in {"trailing", "strided", "head_tail"}` and the
+  fixture+runner thread `index_pattern` through. `test_sparse_topk_cases`
+  keeps the trailing default; `test_sparse_non_trailing_index_cases`
+  exercises strided + head_tail on a long-prefix decode. The reference
+  gathers via `fixture.topk_rows`, so any valid permutation of keys in
+  `[0, key_count)` produces a matching reference.
 
 ## Production Runner Integration
 

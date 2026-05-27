@@ -64,6 +64,48 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_dsa_sparse_attention_case(self, case)
 
+    # Non-trailing index layouts. The reference gathers Q/K via
+    # `fixture.topk_rows`, so any valid permutation of keys in
+    # `[0, key_count)` produces a matching reference. These layouts
+    # exercise the kernel's non-contiguous gather path (production
+    # top-k by attention score is not naturally trailing for long
+    # prefixes). Use long-prefix decode where `key_count > index_topk`
+    # so the pattern actually subsamples (with key_count <= topk,
+    # strided/head_tail collapse back to the trailing case).
+    NON_TRAILING_INDEX_CASES = (
+        (
+            DSAAttentionCase(
+                name="dsa_sparse_decode_strided_index_long_prefix",
+                backend="dsa",
+                forward_mode=ForwardMode.DECODE,
+                num_heads=4,
+                num_kv_heads=1,
+                page_size=DSA_PAGE_SIZE,
+                prefix_lens=(2048,),
+            ),
+            "strided",
+        ),
+        (
+            DSAAttentionCase(
+                name="dsa_sparse_decode_head_tail_index_long_prefix",
+                backend="dsa",
+                forward_mode=ForwardMode.DECODE,
+                num_heads=4,
+                num_kv_heads=1,
+                page_size=DSA_PAGE_SIZE,
+                prefix_lens=(2048,),
+            ),
+            "head_tail",
+        ),
+    )
+
+    def test_sparse_non_trailing_index_cases(self):
+        for case, pattern in self.NON_TRAILING_INDEX_CASES:
+            with self.subTest(
+                case=case.name, backend=case.backend, pattern=pattern
+            ):
+                run_dsa_sparse_attention_case(self, case, index_pattern=pattern)
+
     # CG decode replay via the sparse `flashmla_kv` path (cached MLA latent
     # KV, written by `_populate_dsa_sparse_prefix_kv` at fixture build).
     # Unlike the MHA_ONE_SHOT dense fallback (where K is passed inline as

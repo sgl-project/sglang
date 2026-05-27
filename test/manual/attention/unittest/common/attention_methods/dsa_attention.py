@@ -642,15 +642,54 @@ def build_dsa_attention_fixture(
 
 
 def _make_dsa_sparse_topk_rows(
-    case: DSAAttentionCase, *, index_topk: int = DSA_SPARSE_INDEX_TOPK
+    case: DSAAttentionCase,
+    *,
+    index_topk: int = DSA_SPARSE_INDEX_TOPK,
+    pattern: str = "trailing",
 ) -> list[list[int]]:
+    """Build per-query topk index rows.
+
+    The reference (`expected_dsa_sparse_fixture_output`) gathers Q/K via the
+    same `topk_rows`, so any valid permutation of keys in `[0, key_count)`
+    produces a matching reference. Patterns:
+
+    - ``trailing``: last `topk` keys, i.e. `[key_count - topk, key_count)`.
+      Mirrors the production indexer's most common selection for short prefixes.
+    - ``strided``: every other key from `[0, key_count)` until `topk` slots
+      are filled, then `-1` padding. Exercises the kernel's non-contiguous
+      gather path (top-k by attention score is not naturally trailing in
+      production for long prefixes).
+    - ``head_tail``: first `topk/2` keys + last `topk/2` keys. Forces a
+      genuinely sparse layout that drops the middle of the KV window.
+    """
     rows = []
     for req_idx, input_len in enumerate(case.input_lens):
         prefix_len = case.prefix_lens[req_idx]
         for offset in range(input_len):
             key_count = prefix_len + offset + 1
-            key_start = max(0, key_count - index_topk)
-            row = list(range(key_start, key_count))
+            if pattern == "trailing":
+                key_start = max(0, key_count - index_topk)
+                row = list(range(key_start, key_count))
+            elif pattern == "strided":
+                # Stride-2 from 0, falling back to trailing if the strided
+                # range can't fill topk slots.
+                strided = list(range(0, key_count, 2))[:index_topk]
+                if len(strided) < min(index_topk, key_count):
+                    extra = [
+                        k for k in range(key_count - 1, -1, -1) if k not in strided
+                    ]
+                    needed = min(index_topk, key_count) - len(strided)
+                    strided.extend(extra[:needed])
+                row = sorted(strided)
+            elif pattern == "head_tail":
+                # First topk/2 + last topk/2, clipped to key_count and
+                # deduplicated to avoid double-counting when key_count < topk.
+                half = max(1, index_topk // 2)
+                head = list(range(0, min(half, key_count)))
+                tail = list(range(max(half, key_count - half), key_count))
+                row = sorted(set(head) | set(tail))
+            else:
+                raise ValueError(f"unknown topk index pattern: {pattern!r}")
             row.extend([-1] * (index_topk - len(row)))
             rows.append(row)
     return rows
@@ -709,6 +748,7 @@ def build_dsa_sparse_attention_fixture(
     dsa_decode_backend: str = "flashmla_kv",
     fp8_kv_cache: bool = False,
     index_topk: int = DSA_SPARSE_INDEX_TOPK,
+    index_pattern: str = "trailing",
 ) -> DSASparseAttentionFixture:
     max_context_len = max(max_context_len, max(case.seq_lens))
     if max_context_len % case.page_size:
@@ -782,7 +822,9 @@ def build_dsa_sparse_attention_fixture(
         prefix_hidden,
         max_context_len=max_context_len,
     )
-    topk_rows = _make_dsa_sparse_topk_rows(case, index_topk=index_topk)
+    topk_rows = _make_dsa_sparse_topk_rows(
+        case, index_topk=index_topk, pattern=index_pattern
+    )
     topk_indices = torch.tensor(topk_rows, dtype=torch.int32, device=device)
 
     return DSASparseAttentionFixture(
@@ -938,6 +980,7 @@ def run_dsa_sparse_attention_case(
     dsa_decode_backend: str = "flashmla_kv",
     fp8_kv_cache: bool = False,
     index_topk: int = DSA_SPARSE_INDEX_TOPK,
+    index_pattern: str = "trailing",
 ) -> None:
     fixture = build_dsa_sparse_attention_fixture(
         testcase,
@@ -950,6 +993,7 @@ def run_dsa_sparse_attention_case(
         dsa_decode_backend=dsa_decode_backend,
         fp8_kv_cache=fp8_kv_cache,
         index_topk=index_topk,
+        index_pattern=index_pattern,
     )
     actual = run_dsa_sparse_fixture_eager(fixture, testcase)
     expected = expected_dsa_sparse_fixture_output(fixture)

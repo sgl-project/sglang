@@ -62,6 +62,42 @@ Columns are runner modes; rows are kernel-path modes of the single
 
 - Populate CUDA graph and PCG/BCG runner metadata after eager non-sparse
   coverage is stable across more chunk layouts.
-- Extend sparse-attention and critical-token reference coverage beyond the
-  all-column sparse kernel path (i.e., real sub-context-window pruning that
-  diverges from the dense reference).
+- **Sub-context-window sparse pruning reference (genuine follow-up)** —
+  The current "all-column" sparse cases match the dense reference exactly
+  because the chosen `vertical_size=16` + `slash_size=16` + `last_q=16`
+  configuration covers every column in the first chunk for `seq_len <= 16`.
+  A truly pruning case needs `seq_len >> vertical_size + slash_size` and a
+  reference that applies the same mask the kernel applies.
+
+  The blocker is that the production sparse-attention config
+  `("vertical_and_slash", v_size, s_size, threshold)` is **content-aware**:
+  per-head `v_idx` and `s_idx` are picked by top-k attention scores over
+  the last `last_q` queries, not from a fixed schedule
+  (`dual_chunk_flashattention_backend.py:_dual_chunk_flash_attn_prefill`).
+  An independent reference therefore has three paths:
+
+  1. **Mock the sparse-config lookup** — patch
+     `get_sparse_attention_config` or the per-layer top-k selection so the
+     fixture supplies known `v_idx` / `s_idx` tensors. Then write a
+     token-level reference that masks `attn_scores[q, k] = -inf` unless
+     `k in v_idx` or `(q - k) in s_idx` (with causal `k <= q`). This is the
+     cleanest path but needs a hook in `_dual_chunk_flash_attn_prefill_func`
+     that doesn't exist today.
+  2. **Replicate `convert_vertical_slash_indexes`** at block granularity in
+     pure-PyTorch, then iterate `(block_count, block_offset, column_count,
+     column_index)` to build a per-(query_block, key_block) mask matching
+     the kernel's selection. Faithful but tedious — the block math (M=64,
+     N=64) needs to be mirrored exactly.
+  3. **Statistical recovery check** — compute dense attention scores
+     `softmax(Q @ K^T)` per head, identify the top-k columns by score, and
+     verify the sparse kernel output approximates the dense output modulo
+     the dropped probability mass. Not strict `assert_close`; rejects only
+     gross divergences.
+
+  Option 1 is recommended. It requires either: (a) a new
+  `sparse_attention_config_override` kwarg threaded through
+  `DualChunkFlashAttentionBackend.__init__` that bypasses the content-aware
+  selection, or (b) monkeypatching `get_sparse_attention_config` on the
+  fixture's backend instance. Until that lands, the all-column sparse +
+  threshold-gated cases keep the kernel/wrapper integration covered but
+  the per-column sparse math is unverified.

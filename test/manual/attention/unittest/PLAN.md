@@ -369,19 +369,55 @@ Deferred follow-ups:
   now has representative input-config coverage in unit tests that skip cleanly
   on non-Blackwell. Remaining hardware-gated work is purely a matter of
   running the existing files on the matching SM.
+- DSA non-trailing index layouts (`strided`, `head_tail`) are now wired
+  through `_make_dsa_sparse_topk_rows(pattern=...)` and exercised by
+  `test_sparse_non_trailing_index_cases` on a long-prefix decode. The
+  reference gathers from `fixture.topk_rows`, so any valid permutation
+  matches; this exercises the kernel's non-contiguous gather path.
 - Dual-chunk sub-context-window sparse pruning needs an independent sparse
   reference that diverges from the dense all-column reference. The current
   fixture only covers "all-column" sparse where the dense reference is
-  exact. This is a new reference implementation, not additional cases.
+  exact. Production's `("vertical_and_slash", v, s, threshold)` sparse
+  config is **content-aware** — per-head `v_idx`/`s_idx` come from a top-k
+  selection over the last `last_q` queries, not from a fixed schedule —
+  so a faithful unit reference needs to either (a) mock
+  `get_sparse_attention_config` to return fixed indices then apply that
+  mask in pure-PyTorch, or (b) replicate `convert_vertical_slash_indexes`
+  at block granularity. Path (a) is recommended; see
+  `dual_chunk/README.md` for the engineering plan.
 - DSA HiSparse coordinator path (`set_dsa_prefill_impl`'s `use_mha=False`
-  branch when `hisparse_coordinator is not None`) and non-trailing index
-  layouts beyond the trailing-topk row builder both need a representative
-  production index-construction path identified before fixtures can match
-  it without diverging from the kernel semantics.
+  branch when `hisparse_coordinator is not None`) needs a real
+  `HiSparseCoordinator` instance — a production-side singleton owned by
+  the model runner. Mocking the coordinator requires mirroring the
+  production page-table contract which changes too often to maintain a
+  stable mock. Bringing up a real coordinator (page tables, swap policy)
+  is out of scope for module-level unit tests. See `dsa/README.md`.
 - Keep additional backend expansion deferred until representative Phase 3 and
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Added DSA non-trailing index-layout coverage. Generalized
+  `_make_dsa_sparse_topk_rows` to take `pattern in {"trailing", "strided",
+  "head_tail"}` and threaded `index_pattern` through
+  `build_dsa_sparse_attention_fixture` / `run_dsa_sparse_attention_case`.
+  Added `test_sparse_non_trailing_index_cases` in `dsa/test_dsa.py`
+  exercising both new patterns on a long-prefix decode. The reference
+  gathers from `fixture.topk_rows`, so any valid permutation matches by
+  construction; the new cases stress the kernel's non-contiguous gather
+  path that the existing trailing layout doesn't exercise.
+  - DSA HiSparse coordinator path stays deferred — needs a real
+    `HiSparseCoordinator` instance, not a flag. Engineering paths
+    spelled out in `dsa/README.md`.
+  - Dual-chunk sub-context-window sparse pruning stays deferred — the
+    content-aware `vertical_and_slash` selection makes building a
+    faithful PyTorch reference structurally hard. Three engineering
+    paths and the recommended one (mock `get_sparse_attention_config`)
+    documented in `dual_chunk/README.md`.
+- `python -m py_compile test/manual/attention/unittest/common/attention_methods/dsa_attention.py test/manual/attention/unittest/dsa/test_dsa.py`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
+  - Ran 155 tests in 115.137s (21 skipped) after adding DSA non-trailing
+    index-layout coverage. One new test method
+    (`test_sparse_non_trailing_index_cases`) and no regressions.
 - Expanded Phase 2 input-config coverage for the three hardware-gated MLA
   backends. Tests stay skipIf-gated on this H200/SM9.0 box, but the case
   lists now match the rest of the MLA suite's input-shape edge coverage:
