@@ -998,11 +998,29 @@ class Scheduler(
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
-        # By-rid ownership tracker for sync-mode reqs the scheduler currently
-        # owns the lifecycle of (admitted, not finished, not retracted). Runs
-        # as a parallel tracker alongside waiting_queue / running_batch.reqs /
-        # chunked retention without changing scheduler behavior. See
-        # agent-drafts/2026-05-25-waiting-queue-refactor-plan.md (C1).
+        # `active_reqs`: sync-mode reqs the scheduler currently owns the
+        # lifecycle of (admitted, not finished, not retracted, not aborted-
+        # released). by-rid indexed.
+        #
+        # Definition (Plan §7-Q7): admitted via `_get_new_batch_prefill_raw`
+        # and not yet released through finish/retract/abort. Includes normal
+        # decode reqs AND mid-prefill chunked-resume reqs AND PP cross-mb
+        # in-flight reqs (the last two: NOT in running_batch.reqs but still
+        # holding row + KV + lock_ref).
+        #
+        # Invariants:
+        # * `waiting_queue ∩ active_reqs == ∅` (sync mode; disagg modes use
+        #    their own ownership managers, see Q1=(c)).
+        # * `set(running_batch.reqs) ⊆ active_reqs` (in-batch always active).
+        # * `set(chunked_reqs()) ⊆ active_reqs` (by definition).
+        # * `len(list(chunked_reqs())) <= 1` (Q5 single-flight; asserted at
+        #    inline chunked admission entry).
+        # * `active_reqs` keys are in 1:1 correspondence with allocated
+        #    `req_to_token_pool` rows (sync mode).
+        #
+        # Maintained at: `_activate` / `_deactivate` (only entry points).
+        # See agent-drafts/2026-05-25-waiting-queue-refactor-plan.md and
+        # 2026-05-25-scheduler-lifecycle-audit.md.
         self.active_reqs: Dict[str, Req] = {}
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
@@ -1060,25 +1078,30 @@ class Scheduler(
         active_rids = set(self.active_reqs.keys())
         running_rids = {r.rid for r in self.running_batch.reqs}
 
-        # sync mode: chunked-resume reqs still live in waiting_queue until C4
-        # deletes the retention. Relax waiting ∩ active here: any rid in the
-        # intersection must be a chunked-resume req.
-        intersection_rids = waiting_rids & active_rids
-        for rid in intersection_rids:
-            assert self.active_reqs[
-                rid
-            ].has_pending_chunk, (
-                f"{rid} in both waiting and active but not chunked-resume"
-            )
+        # sync mode: waiting_queue and active_reqs are strictly disjoint
+        # (C4 removed chunked-resume retention; chunked-resume now lives in
+        # active_reqs only).
+        assert not waiting_rids & active_rids, (
+            f"waiting_queue and active_reqs must be disjoint (sync mode); "
+            f"overlap: {waiting_rids & active_rids}"
+        )
 
         assert (
             running_rids <= active_rids
         ), f"running not subset of active: {running_rids - active_rids}"
 
     def chunked_reqs(self) -> Iterable[Req]:
-        """active_reqs 中 has_pending_chunk=True 的派生 view。
-        Single-flight 不变量（Q5，§7-Q5）：len(list(chunked_reqs())) <= 1，
-        在 _get_new_batch_prefill_raw 顶端断言（C3 引入）。"""
+        """Active reqs currently in mid-prefill (`has_pending_chunk=True`).
+
+        Derived view over `active_reqs` — no separate storage. Single-flight
+        invariant (Q5): `len(list(chunked_reqs())) <= 1` at any iter
+        boundary; asserted at the entry of the inline chunked admission
+        block in `_get_new_batch_prefill_raw`.
+
+        Iteration semantics: returns a fresh generator each call; consume
+        once or wrap in `list(...)`. Callers that mutate `active_reqs`
+        during iteration must `list(...)` first.
+        """
         return (r for r in self.active_reqs.values() if r.has_pending_chunk)
 
     def init_chunked_prefill(self):
@@ -2797,13 +2820,18 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
-        # audit A1: mark newly-admitted reqs as active. Filter chunked-resume
-        # re-admit (already active from a prior iter) — _activate's internal
-        # assert would trip otherwise. Filter can be removed once C3+C4 move
-        # chunked-resume out of the main admission loop.
+        # audit A1: mark newly-admitted reqs as active. Post-C3/C4 the main
+        # admission loop (the for-loop over waiting_queue above) only
+        # produces brand-new admissions. The inline chunked admission block
+        # also appends to `can_run_list` for chunked-resume re-admit, and
+        # those reqs are already in active_reqs from a prior iter (the
+        # inline block does NOT call _activate). Skip them here so the
+        # strict `_activate` assert (post-C7) catches accidental
+        # double-admission for everything else.
         for req in can_run_list:
-            if req.rid not in self.active_reqs:
-                self._activate(req)
+            if req.rid in self.active_reqs:
+                continue
+            self._activate(req)
 
         # audit H2: retention removed. chunked-resume reqs are no longer
         # anchored in waiting_queue — they live in active_reqs and are
@@ -3842,14 +3870,18 @@ class Scheduler(
 
                 self.running_batch.batch_is_full = False
 
-            # Chunked-resume reqs in waiting_queue still hold their row + KV +
-            # radix lock_ref from prior admissions. Without explicit release,
-            # pause(retract)'s 'flush_cache can succeed' contract (see
-            # PauseGenerationReqInput docstring) is violated. Release in-place
-            # and reset their chunked state so continue_generation re-prefills
-            # them from origin_input_ids.
-            for req in self.waiting_queue:
-                if req.has_pending_chunk and req.req_pool_idx is not None:
+            # Chunked-resume reqs still hold their row + KV + radix lock_ref
+            # from prior admissions. Without explicit release, pause(retract)'s
+            # 'flush_cache can succeed' contract (see PauseGenerationReqInput
+            # docstring) is violated. Release in-place and reset their chunked
+            # state so continue_generation re-prefills them from
+            # origin_input_ids.
+            #
+            # audit C7: chunked-resume lives in active_reqs (post-C4),
+            # iterate chunked_reqs() directly. list(...) because we mutate
+            # active_reqs via _deactivate inside the loop.
+            for req in list(self.chunked_reqs()):
+                if req.req_pool_idx is not None:
                     # Disagg-prefill: signal the decode side that the send was
                     # retracted and drop our sender ref so re-prefill rebuilds
                     # the bootstrap state. start_send_idx / tmp_end_idx are
@@ -3864,9 +3896,16 @@ class Scheduler(
                     release_kv_cache(req, self.tree_cache, is_insert=False)
                     req.reset_for_retract()
                     # audit D7: chunked-resume req released via reset_for_retract
-                    # stays in waiting_queue for re-prefill but no longer holds
-                    # row/KV, so it leaves the active set.
+                    # no longer holds row/KV, so it leaves the active set.
                     self._deactivate(req)
+                    # TODO(post-refactor follow-up): plan §10 flag — after
+                    # reset_for_retract, this req is NOT re-enqueued to
+                    # waiting_queue. Either the design relies on the original
+                    # reference staying in waiting_queue (but C4 removed
+                    # retention!) or this is a pre-existing latent bug from
+                    # before the refactor. Investigate separately. See
+                    # agent-drafts/2026-05-25-waiting-queue-refactor-plan.md
+                    # §10.
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         if recv_req.torch_empty_cache:
