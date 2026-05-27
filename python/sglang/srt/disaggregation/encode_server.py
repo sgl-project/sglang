@@ -129,7 +129,7 @@ class TensorWrapper:
 
     def __init__(self, tensor):
         # Ensure tensor is on CPU and contiguous
-        if tensor.is_cuda:
+        if tensor.device.type != "cpu":
             tensor = tensor.cpu()
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
