@@ -11,9 +11,9 @@ ARG CANN_VERSION
 ARG DEVICE_TYPE
 ARG PIP_INDEX_URL="https://pypi.org/simple/"
 ARG APTMIRROR=""
-ARG PYTORCH_VERSION="2.8.0"
-ARG TORCHVISION_VERSION="0.23.0"
-ARG TORCHAUDIO_VERSION="2.8.0"
+ARG PYTORCH_VERSION="2.10.0"
+ARG TORCHVISION_VERSION="0.25.0"
+ARG TORCHAUDIO_VERSION="2.10.0"
 ARG PTA_URL_ARM64="https://gitcode.com/Ascend/pytorch/releases/download/v26.0.0-pytorch2.10.0/torch_npu-2.10.0-cp311-cp311-manylinux_2_28_aarch64.whl"
 ARG PTA_URL_AMD64="https://gitcode.com/Ascend/pytorch/releases/download/v26.0.0-pytorch2.10.0/torch_npu-2.10.0-cp311-cp311-manylinux_2_28_x86_64.whl"
 ARG TRITON_URL_ARM64="https://gitcode.com/Ascend/triton-ascend/releases/download/v3.2.1/triton_ascend-3.2.1-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl"
