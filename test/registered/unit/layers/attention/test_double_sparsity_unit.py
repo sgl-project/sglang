@@ -7532,5 +7532,129 @@ class TestAC7MHABypass(unittest.TestCase):
         )
 
 
+class TestAC12FaultInjection(unittest.TestCase):
+    """AC-12 sensitivity gates: SGLANG_DS_FAULT_INJECT_CORRUPT_MASK and
+    SGLANG_DS_FAULT_INJECT_ZERO_SIG. These are the two env-var gates the
+    sensitivity tests in test/manual/test_double_sparsity_v32.py target.
+
+    Negative cases (env unset) prove the default behavior is unaffected.
+    """
+
+    # ---- zero-signature gate (dsa_backend.py) ------------------------
+
+    def _make_zero_sig_fixture(self):
+        """Build a minimal backend + table for _write_token_labels tests."""
+        from types import SimpleNamespace
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+        from sglang.srt.layers.attention.dsa_backend import NativeSparseAttnBackend
+
+        nope_dim = 4
+        kv_lora_rank = 8
+        num_heads = 2
+        num_layers = 1
+        table = allocate_token_label_table(
+            num_layers_local=num_layers, max_tokens=32,
+            num_heads_local=num_heads, label_dim=nope_dim,
+            page_size=64, dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        # channel_selection picks the first nope_dim channels per head.
+        sel = torch.arange(nope_dim, dtype=torch.int32).unsqueeze(0).expand(num_heads, -1)
+        sel_all = sel.unsqueeze(0).expand(num_layers, -1, -1).contiguous()
+
+        backend = object.__new__(NativeSparseAttnBackend)
+        backend.enable_double_sparsity = True
+        backend._ds_token_label_table = table
+        backend._ds_channel_selection = sel_all
+        backend._ds_qk_nope_head_dim = nope_dim
+
+        # kv_b_proj stub: identity into K_noPE channels.
+        proj_out_dim = num_heads * nope_dim * 2  # [K_nope | V]
+        W = torch.zeros(kv_lora_rank, proj_out_dim)
+        for i in range(min(kv_lora_rank, num_heads * nope_dim)):
+            W[i, i] = 1.0
+
+        class _FakeProj:
+            def __call__(self, x):
+                return (x @ W,)
+
+        layer = SimpleNamespace(
+            layer_id=0, kv_b_proj=_FakeProj(), v_head_dim=nope_dim,
+        )
+        k = torch.ones(2, 1, kv_lora_rank)
+        cache_loc = torch.tensor([4, 10], dtype=torch.int64)
+        return backend, table, layer, k, cache_loc
+
+    def test_zero_sig_gate_default_off_keeps_signatures(self):
+        """Without SGLANG_DS_FAULT_INJECT_ZERO_SIG=1, signatures are
+        populated normally (existing behavior; sanity check that we
+        haven't introduced an unconditional zero)."""
+        backend, table, layer, k, cache_loc = self._make_zero_sig_fixture()
+        backend._ds_fault_zero_sig = False
+        backend._write_token_labels(layer, cache_loc, k)
+        self.assertTrue(table.written[0, 4].item())
+        # Signatures should be non-zero (identity projection of k=ones).
+        self.assertGreater(table.signatures[0, 4].abs().sum().item(), 0.0)
+        self.assertGreater(table.signatures[0, 10].abs().sum().item(), 0.0)
+
+    def test_zero_sig_gate_on_zeroes_just_written_row_keeps_written_true(self):
+        """SGLANG_DS_FAULT_INJECT_ZERO_SIG=1 zeroes the just-written
+        signature row but keeps written=True so the selector treats the
+        slot as populated with intentionally bad labels."""
+        backend, table, layer, k, cache_loc = self._make_zero_sig_fixture()
+        backend._ds_fault_zero_sig = True
+        backend._write_token_labels(layer, cache_loc, k)
+        # written stays True (slot is "populated", just with bad data).
+        self.assertTrue(table.written[0, 4].item())
+        self.assertTrue(table.written[0, 10].item())
+        # Signatures are exactly zero at the written slots.
+        self.assertEqual(table.signatures[0, 4].abs().sum().item(), 0.0)
+        self.assertEqual(table.signatures[0, 10].abs().sum().item(), 0.0)
+
+    # ---- corrupt-mask gate semantics (numpy/torch random shape/range) -
+
+    def test_corrupt_mask_gate_random_selection_shape_dtype_range(self):
+        """Verify the algorithm the corrupt-mask gate uses: a fresh random
+        selection with same shape/dtype, values in [0, head_dim), and
+        differing from the calibrated baseline. This mirrors the actual
+        gate code in `deepseek_v2.py` after `slice_per_rank`."""
+        head_dim = 128
+        label_dim = 16
+        L, H = 4, 2
+        baseline = torch.arange(label_dim, dtype=torch.int32) \
+            .unsqueeze(0).unsqueeze(0).expand(L, H, -1).contiguous()
+        # Replicate the gate's algorithm with a fixed seed.
+        gen = torch.Generator(device=baseline.device).manual_seed(0)
+        rows = []
+        for _ in range(L * H):
+            perm = torch.randperm(head_dim, generator=gen, device=baseline.device)
+            rows.append(perm[:label_dim])
+        corrupted = torch.stack(rows, dim=0).view(L, H, label_dim).to(baseline.dtype)
+
+        # Shape + dtype + device preserved.
+        self.assertEqual(corrupted.shape, baseline.shape)
+        self.assertEqual(corrupted.dtype, baseline.dtype)
+        self.assertEqual(corrupted.device, baseline.device)
+        # All values in [0, head_dim).
+        self.assertGreaterEqual(int(corrupted.min().item()), 0)
+        self.assertLess(int(corrupted.max().item()), head_dim)
+        # Differs from baseline (overwhelmingly likely with 128-d perm).
+        self.assertGreater(
+            (corrupted != baseline).to(torch.int32).sum().item(), 0,
+            "corrupted selection must differ from baseline",
+        )
+
+    def test_corrupt_mask_gate_deterministic_per_seed(self):
+        """Same seed → same corrupted selection (reproducibility for audit)."""
+        def _corrupt(seed: int) -> torch.Tensor:
+            gen = torch.Generator(device="cpu").manual_seed(seed)
+            rows = [torch.randperm(64, generator=gen)[:8] for _ in range(2)]
+            return torch.stack(rows, dim=0)
+        self.assertTrue(torch.equal(_corrupt(7), _corrupt(7)))
+        self.assertFalse(torch.equal(_corrupt(7), _corrupt(8)))
+
+
 if __name__ == "__main__":
     unittest.main()

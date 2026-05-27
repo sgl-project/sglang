@@ -10,12 +10,14 @@ quality, which is what the gate detects).
 
 Skips cleanly when env vars are unset so CI imports do not error.
 
-Usage::
+Usage (use the pytest file-path form — the repo ``test/`` tree is NOT a
+Python package, so ``python -m unittest test.manual...`` collides with
+the stdlib ``test`` package and fails to import)::
 
     DS_BASE_URL=http://localhost:30000 \
     DSA_BASE_URL=http://localhost:30001 \
     AC12_NIAH_NUM_PROMPTS=20 \
-    python -m unittest test.manual.test_double_sparsity_v32
+    PYTHONPATH=python python -m pytest test/manual/test_double_sparsity_v32.py -v
 
 Optional servers (sensitivity tests):
 
@@ -169,6 +171,90 @@ def _niah_recall_hits(
     return sum(1 for n, r in zip(needles, responses) if n in r)
 
 
+# ----- OpenAI-compatible URL normalization ------------------------------
+
+
+def _openai_base_url(base_url: str) -> str:
+    """Return the OpenAI-compatible base URL for ``base_url``.
+
+    sglang exposes ``/v1/chat/completions`` and similar OpenAI-compatible
+    endpoints under ``/v1`` (see ``sglang.srt.entrypoints.http_server``).
+    The repo's ``run_eval.py`` CLI appends ``/v1`` for the same reason.
+    Idempotent + case-insensitive on the suffix so callers can pass any
+    canonical form.
+    """
+    u = base_url.rstrip("/")
+    if u.lower().endswith("/v1"):
+        return u
+    return u + "/v1"
+
+
+# ----- MMLU 5-shot prompt construction ----------------------------------
+
+# These four choices mirror benchmark/mmlu/bench_sglang.py:20.
+_MMLU_CHOICES: List[str] = ["A", "B", "C", "D"]
+
+
+def _format_mmlu_subject(subject: str) -> str:
+    """Mirror benchmark/mmlu/bench_sglang.py:25 — pretty-print the subject."""
+    return " " + " ".join(subject.split("_"))
+
+
+def _format_mmlu_example(
+    row: List[Any], *, include_answer: bool,
+) -> str:
+    """One MMLU question rendered as ``Q\\nA. ...\\nB. ...\\n...\\nAnswer:[ X]``.
+
+    ``row`` layout matches the MMLU CSV: ``[question, choice_A, choice_B,
+    choice_C, choice_D, gold_letter]``. Set ``include_answer=True`` for
+    dev (5-shot prefix) rows; ``False`` for the test question.
+    """
+    if len(row) < 6:
+        raise ValueError(
+            f"MMLU row must be [question, A, B, C, D, gold]; got {len(row)} cols"
+        )
+    parts = [str(row[0])]
+    for j, letter in enumerate(_MMLU_CHOICES):
+        parts.append(f"\n{letter}. {row[j + 1]}")
+    parts.append("\nAnswer:")
+    if include_answer:
+        parts.append(f" {row[5]}\n\n")
+    return "".join(parts)
+
+
+def _make_mmlu_5shot_prompt(
+    dev_rows: List[List[Any]], subject: str, test_row: List[Any],
+) -> str:
+    """Build the full 5-shot MMLU prompt for ``test_row``.
+
+    ``dev_rows`` must contain at least 5 rows; the first 5 are used as
+    the in-context shots. Returns the rendered prompt ending in
+    ``"Answer:"`` so the model only needs to produce the gold letter.
+    """
+    if len(dev_rows) < 5:
+        raise ValueError(
+            f"MMLU 5-shot needs ≥5 dev rows; got {len(dev_rows)}"
+        )
+    header = (
+        "The following are multiple choice questions (with answers) about"
+        f"{_format_mmlu_subject(subject)}.\n\n"
+    )
+    shots = "".join(
+        _format_mmlu_example(row, include_answer=True)
+        for row in dev_rows[:5]
+    )
+    test_q = _format_mmlu_example(test_row, include_answer=False)
+    return header + shots + test_q
+
+
+def _parse_mmlu_letter(response: str) -> Optional[str]:
+    """First A-D letter in the response; ``None`` if no letter found."""
+    for ch in response:
+        if ch in _MMLU_CHOICES:
+            return ch
+    return None
+
+
 # ----- result recording --------------------------------------------------
 
 
@@ -272,6 +358,8 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
             {
                 "length_tokens": r.length_tokens,
                 "num_prompts": r.num_prompts,
+                "dsa_hits": r.dsa_hits,
+                "ds_hits": r.ds_hits,
                 "dsa_recall_pct": r.dsa_recall_pct,
                 "ds_recall_pct": r.ds_recall_pct,
                 "delta_pct": r.delta_pct,
@@ -297,57 +385,138 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
         self._niah_assert(65536)
 
     def test_mmlu_5shot(self):
-        """MMLU 5-shot via sglang.test.run_eval."""
+        """Real MMLU 5-shot via /generate.
+
+        Uses the same in-context format as ``benchmark/mmlu/bench_sglang.py``:
+        5 answered dev examples + 1 unanswered test question + ``Answer:``;
+        ``max_new_tokens=4`` (need room for the model's tokenizer to emit
+        the answer letter even when wrapped in punctuation or a space);
+        first stripped A-D character in the response is the prediction.
+        """
         try:
-            from sglang.test.run_eval import run_eval_once
-            from sglang.test.simple_eval_mmlu import MMLUEval
-        except ImportError as exc:
+            import pandas as pd
+        except ImportError:
+            self.skipTest("pandas required for MMLU 5-shot harness")
+            return
+
+        # Discover the MMLU CSV directories (test + dev). Operator can
+        # override via AC12_MMLU_DATA_DIR; default is the standard
+        # benchmark/mmlu/data/ tree.
+        data_dir = os.environ.get(
+            "AC12_MMLU_DATA_DIR",
+            os.path.abspath(
+                os.path.join(
+                    os.path.dirname(__file__),
+                    "..", "..", "benchmark", "mmlu", "data",
+                )
+            ),
+        )
+        test_dir = os.path.join(data_dir, "test")
+        dev_dir = os.path.join(data_dir, "dev")
+        if not (os.path.isdir(test_dir) and os.path.isdir(dev_dir)):
             self.skipTest(
-                f"sglang.test.run_eval / simple_eval_mmlu unavailable: {exc}"
+                f"MMLU data not found at {data_dir}; download via "
+                "`python benchmark/mmlu/bench_sglang.py` once (it auto-fetches)."
             )
             return
 
-        from argparse import Namespace
-        num_examples = _env_int("AC12_MMLU_NUM_EXAMPLES", 200)
-        num_threads = _env_int("AC12_MMLU_NUM_THREADS", 8)
-
-        filename = (
-            "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
+        # Subject set: default `all`; override AC12_MMLU_SUBJECTS=foo,bar
+        # to narrow.
+        all_subjects = sorted(
+            f.split("_test.csv")[0]
+            for f in os.listdir(test_dir)
+            if f.endswith("_test.csv")
         )
+        env_subjects = os.environ.get("AC12_MMLU_SUBJECTS", "all")
+        if env_subjects.strip().lower() == "all":
+            subjects = all_subjects
+        else:
+            subjects = [s.strip() for s in env_subjects.split(",") if s.strip()]
 
-        def _run_against(base_url: str) -> float:
-            eval_obj = MMLUEval(filename, num_examples, num_threads)
-            args = Namespace(
-                base_url=base_url,
-                model=None,
-                max_tokens=512,
-                top_p=1.0,
-                temperature=0.0,
-                api="chat",
-                reasoning_effort=None,
-                stop=None,
-            )
-            result, _latency, _sampler = run_eval_once(args, base_url, eval_obj)
-            return float(result.score) * 100.0
+        max_examples = _env_int("AC12_MMLU_NUM_EXAMPLES", 200)
+
+        # Build a single shuffled list of (subject, dev_rows, test_row,
+        # gold_letter) so we honour the cap across the whole MMLU mix
+        # rather than per-subject (matches simple_evals harness style).
+        examples: List[Dict[str, Any]] = []
+        per_subject_totals: Dict[str, int] = {}
+        for subject in subjects:
+            dev_path = os.path.join(dev_dir, subject + "_dev.csv")
+            test_path = os.path.join(test_dir, subject + "_test.csv")
+            if not (os.path.isfile(dev_path) and os.path.isfile(test_path)):
+                continue
+            dev_df = pd.read_csv(dev_path, header=None)
+            test_df = pd.read_csv(test_path, header=None)
+            if dev_df.shape[0] < 5:
+                continue
+            dev_rows = dev_df.iloc[:5].values.tolist()
+            for i in range(test_df.shape[0]):
+                row = test_df.iloc[i].tolist()
+                if len(row) < 6:
+                    continue
+                examples.append(
+                    {"subject": subject, "dev": dev_rows, "row": row}
+                )
+            per_subject_totals[subject] = per_subject_totals.get(subject, 0) + test_df.shape[0]
+
+        # Deterministic shuffle so the same examples are evaluated each run.
+        rng = random.Random(0xAC12)
+        rng.shuffle(examples)
+        if max_examples > 0 and len(examples) > max_examples:
+            examples = examples[:max_examples]
+
+        if not examples:
+            self.skipTest("MMLU data dir present but produced no usable examples")
+            return
+
+        def _eval_against(url: str) -> Dict[str, Any]:
+            correct = 0
+            per_subject: Dict[str, Dict[str, int]] = {}
+            for ex in examples:
+                prompt = _make_mmlu_5shot_prompt(ex["dev"], ex["subject"], ex["row"])
+                resp = _generate(url, prompt, max_new_tokens=4)
+                pred = _parse_mmlu_letter(resp.strip())
+                gold = str(ex["row"][5]).strip().upper()
+                hit = (pred == gold)
+                if hit:
+                    correct += 1
+                s = ex["subject"]
+                if s not in per_subject:
+                    per_subject[s] = {"hits": 0, "total": 0}
+                per_subject[s]["total"] += 1
+                if hit:
+                    per_subject[s]["hits"] += 1
+            return {
+                "score_pct": (correct / len(examples)) * 100.0,
+                "hits": correct,
+                "total": len(examples),
+                "per_subject": per_subject,
+            }
 
         # DSA first per plan §9.4 convention.
-        dsa_score = _run_against(self.dsa_url)
-        ds_score = _run_against(self.ds_url)
-        delta_pp = dsa_score - ds_score
+        dsa_result = _eval_against(self.dsa_url)
+        ds_result = _eval_against(self.ds_url)
+        delta_pp = dsa_result["score_pct"] - ds_result["score_pct"]
         _record_artifact(
             {
-                "num_examples": num_examples,
-                "dsa_score_pct": dsa_score,
-                "ds_score_pct": ds_score,
+                "subjects": subjects if env_subjects.lower() != "all" else "all",
+                "num_examples_evaluated": len(examples),
+                "dsa_score_pct": dsa_result["score_pct"],
+                "ds_score_pct": ds_result["score_pct"],
+                "dsa_hits": dsa_result["hits"],
+                "ds_hits": ds_result["hits"],
                 "delta_pp": delta_pp,
                 "threshold_pp": self.MMLU_TOLERANCE_PP,
+                "dsa_per_subject": dsa_result["per_subject"],
+                "ds_per_subject": ds_result["per_subject"],
             },
             suffix="mmlu_5shot",
         )
         self.assertLessEqual(
             delta_pp, self.MMLU_TOLERANCE_PP,
-            f"MMLU 5-shot: DS {ds_score:.2f}% < DSA {dsa_score:.2f}% by "
-            f"{delta_pp:.2f} pp (> {self.MMLU_TOLERANCE_PP} pp threshold).",
+            f"MMLU 5-shot: DS {ds_result['score_pct']:.2f}% < DSA "
+            f"{dsa_result['score_pct']:.2f}% by {delta_pp:.2f} pp "
+            f"(> {self.MMLU_TOLERANCE_PP} pp threshold).",
         )
 
     @unittest.skipUnless(
@@ -368,6 +537,8 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
             {
                 "length_tokens": r.length_tokens,
                 "num_prompts": r.num_prompts,
+                "dsa_hits": r.dsa_hits,
+                "ds_corrupt_hits": r.ds_hits,
                 "dsa_recall_pct": r.dsa_recall_pct,
                 "ds_corrupt_recall_pct": r.ds_recall_pct,
                 "delta_pct": r.delta_pct,
@@ -401,6 +572,8 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
             {
                 "length_tokens": r.length_tokens,
                 "num_prompts": r.num_prompts,
+                "dsa_hits": r.dsa_hits,
+                "ds_zero_hits": r.ds_hits,
                 "dsa_recall_pct": r.dsa_recall_pct,
                 "ds_zero_recall_pct": r.ds_recall_pct,
                 "delta_pct": r.delta_pct,

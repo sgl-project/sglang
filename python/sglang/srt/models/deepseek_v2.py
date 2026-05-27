@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -1896,6 +1897,44 @@ class DeepseekV2AttentionMLA(
             rank=attn_tp_rank,
             tp_size=max(attn_tp_size, 1),
         )
+
+        # AC-12 sensitivity gate: SGLANG_DS_FAULT_INJECT_CORRUPT_MASK=1
+        # replaces the calibrated channel selection with a deterministically
+        # random one drawn uniformly from [0, head_dim). Used to verify the
+        # NIAH @ 64K negative sensitivity assertion (recall must drop > 20 pp).
+        # Weights and dtype/device are preserved so only the selection
+        # changes. Logged once per (process, layer) so an operator cannot
+        # leave it on by accident.
+        if os.getenv("SGLANG_DS_FAULT_INJECT_CORRUPT_MASK") == "1":
+            from dataclasses import replace as _replace
+            sel = local_mask.channel_selection
+            # Deterministic per-layer seed: layer_id keeps each layer
+            # consistent across restarts but lets layers diverge.
+            gen = torch.Generator(device=sel.device).manual_seed(self.layer_id)
+            head_dim = int(local_mask.head_dim)
+            label_dim = int(sel.shape[-1])
+            if label_dim <= head_dim:
+                # Sample without replacement per (layer, head) row.
+                L, H, _ = sel.shape
+                rows = []
+                for _ in range(L * H):
+                    perm = torch.randperm(head_dim, generator=gen, device=sel.device)
+                    rows.append(perm[:label_dim])
+                corrupted = (
+                    torch.stack(rows, dim=0).view(L, H, label_dim).to(sel.dtype)
+                )
+            else:
+                corrupted = torch.randint(
+                    low=0, high=head_dim, size=sel.shape,
+                    generator=gen, device=sel.device, dtype=sel.dtype,
+                )
+            local_mask = _replace(local_mask, channel_selection=corrupted)
+            logger.warning(
+                "double_sparsity: SGLANG_DS_FAULT_INJECT_CORRUPT_MASK=1 — "
+                "channel_selection for layer %d was randomly permuted; "
+                "NIAH @ 64K is expected to drop > 20 pp.",
+                self.layer_id,
+            )
 
         # Shared per-rank TokenLabelTable: one allocator-owned object across
         # all DS attention layers in the same model+rank. Stored on server_args

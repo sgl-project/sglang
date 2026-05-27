@@ -372,6 +372,21 @@ class DeepseekSparseAttnBackend(
                 model_runner.server_args, "enable_double_sparsity", False
             )
         )
+        # AC-12 sensitivity gate: SGLANG_DS_FAULT_INJECT_ZERO_SIG=1 zeroes
+        # the signature row immediately after every token_label_write while
+        # keeping written=True, so the selector sees intentionally bad labels.
+        # Used to verify the NIAH @ 16K negative sensitivity assertion
+        # (recall must drop > 30 pp). Logged once per process.
+        import os as _os
+        self._ds_fault_zero_sig: bool = (
+            _os.getenv("SGLANG_DS_FAULT_INJECT_ZERO_SIG") == "1"
+        )
+        if self._ds_fault_zero_sig and self.enable_double_sparsity:
+            logger.warning(
+                "double_sparsity: SGLANG_DS_FAULT_INJECT_ZERO_SIG=1 — "
+                "token_label_table.signatures will be zeroed after every "
+                "write; NIAH @ 16K is expected to drop > 30 pp."
+            )
         self.ds_max_top_k: int = 2048
         if self.enable_double_sparsity:
             try:
@@ -1481,6 +1496,13 @@ class DeepseekSparseAttnBackend(
             k_nope=k_nope,
             channel_selection_layer=self._ds_channel_selection[layer_id],
         )
+        # AC-12 zero-signature fault injection: zero the just-written
+        # row but keep written=True so the selector treats the slot as
+        # populated with intentionally bad labels (not absent).
+        # `getattr` so unit fixtures that build the backend via
+        # `object.__new__(...)` without running __init__ stay green.
+        if getattr(self, "_ds_fault_zero_sig", False):
+            self._ds_token_label_table.signatures[layer_id, cache_loc] = 0
 
     def forward_extend(
         self,
