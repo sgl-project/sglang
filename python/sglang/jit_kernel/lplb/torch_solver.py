@@ -56,8 +56,8 @@ def _init_fused_backend() -> None:
     except ImportError as e:
         logger.info(
             f"LPLB fused solver disabled: {e}. "
-            "Provide Math-DX cuBLASDx via MATHDX_HOME or "
-            "python/sglang/jit_kernel/lplb/resources/download-mathdx.sh."
+            "Install Math-DX cuBLASDx via `pip install nvidia-mathdx` "
+            "or set MATHDX_HOME to an extracted archive."
         )
         return
 
@@ -75,8 +75,8 @@ def _unavailable_reason() -> str:
     if cap[0] < 9:
         return f"GPU SM {cap[0]}.{cap[1]} < 9.0 (requires Hopper or newer)"
     return (
-        "Math-DX cuBLASDx headers not found — set MATHDX_HOME or run "
-        "python/sglang/jit_kernel/lplb/resources/download-mathdx.sh"
+        "Math-DX cuBLASDx headers not found — install via "
+        "`pip install nvidia-mathdx` or set MATHDX_HOME"
     )
 
 
@@ -104,9 +104,9 @@ def solve_ipm(
     """Barrier-method Interior Point solver for standard-form LP.
 
     Dispatches to the JIT-compiled CUDA C++ kernel (Hopper+ GPU with
-    Math-DX cuBLASDx headers reachable via ``MATHDX_HOME``,
-    ``nvidia-mathdx``, or ``download-mathdx.sh``). Raises if the fused
-    backend is unavailable or the inputs aren't on CUDA in float32.
+    Math-DX cuBLASDx headers, reachable via ``nvidia-mathdx`` PyPI
+    package or ``MATHDX_HOME``). Raises if the fused backend is
+    unavailable or the inputs aren't on CUDA in float32.
 
     Args:
         A: Constraint matrix, shape (NC, NV), float32, on CUDA.

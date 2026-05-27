@@ -414,14 +414,11 @@ def get_flashinfer_include_paths() -> List[str]:
 
 
 def get_mathdx_root() -> Optional[pathlib.Path]:
-    """Locate the NVIDIA Math-DX install (cuBLASDx + cuSolverDx).
+    """Locate the NVIDIA Math-DX install (cuBLASDx headers).
 
     Searches in order:
       1. ``$MATHDX_HOME`` env var (extracted Math-DX archive root).
       2. The ``nvidia-mathdx`` PyPI package, if installed.
-      3. The bundled ``mathdx`` resource folder under ``jit_kernel/lplb/`` —
-         used by ``download-mathdx.sh`` so cluster deploys can drop the archive
-         next to the source tree.
     """
     env_home = os.environ.get("MATHDX_HOME")
     if env_home:
@@ -433,10 +430,6 @@ def get_mathdx_root() -> Optional[pathlib.Path]:
     if pkg is not None and (pkg / "include").exists():
         return pkg
 
-    bundled = KERNEL_PATH / "lplb" / "resources" / "mathdx"
-    if (bundled / "include").exists():
-        return bundled.resolve()
-
     return None
 
 
@@ -445,10 +438,10 @@ def get_mathdx_include_paths() -> List[str]:
     root = get_mathdx_root()
     if root is None:
         raise RuntimeError(
-            "Cannot find NVIDIA Math-DX (cuBLASDx + cuSolverDx) headers. "
-            "Set MATHDX_HOME to the extracted Math-DX archive, install the "
-            "`nvidia-mathdx` package, or run "
-            "python/sglang/jit_kernel/lplb/resources/download-mathdx.sh."
+            "Cannot find NVIDIA Math-DX (cuBLASDx) headers. "
+            "Install the `nvidia-mathdx` package "
+            "(`pip install nvidia-mathdx`) or set MATHDX_HOME to an "
+            "extracted Math-DX archive root."
         )
     candidates = [root / "include"]
     cutlass = root / "external" / "cutlass" / "include"
