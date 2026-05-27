@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import time
-from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -18,7 +17,7 @@ class SharedHiCachePendingFetch:
     plan_offset: int
     target_start_block: int
     expected_hashes: tuple[int, ...]
-    future: Future
+    transfer: Any
     device_indices: Optional[torch.Tensor] = None
     locked_node: Optional[TreeNode] = None
     backend: str = "unknown"
@@ -39,7 +38,7 @@ def pending_wait_ms(pending: SharedHiCachePendingFetch) -> Optional[float]:
 
 
 def pending_ready_wait_ms(pending: SharedHiCachePendingFetch) -> Optional[float]:
-    done_at = pending.done_at
+    done_at = pending.done_at or float(getattr(pending.transfer, "done_at", 0.0))
     if done_at <= 0:
         return None
     return max(0.0, (time.perf_counter() - done_at) * 1000)

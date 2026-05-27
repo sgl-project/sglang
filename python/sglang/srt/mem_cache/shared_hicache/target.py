@@ -7,7 +7,6 @@ from typing import Optional
 import numpy as np
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.shared_hicache.control import (
     is_indeterminate_direct_transfer_reason,
@@ -46,11 +45,9 @@ class SharedHiCacheTarget:
         allocator = self.tree_cache.cache_controller.mem_pool_device_allocator
         device_indices = allocator.alloc(token_count)
         if device_indices is None:
-            self.tree_cache.evict(EvictParams(num_tokens=token_count))
-            device_indices = allocator.alloc(token_count)
-        if device_indices is None:
-            logger.warning(
-                "Shared HiCache failed to allocate %d device tokens", token_count
+            logger.debug(
+                "Shared HiCache skipped direct transfer; failed to allocate %d free device tokens",
+                token_count,
             )
         return device_indices
 

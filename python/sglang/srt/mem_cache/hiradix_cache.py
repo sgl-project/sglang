@@ -801,8 +801,30 @@ class HiRadixCache(RadixCache):
                 assert len(self.ongoing_write_through) == 0
             return
 
-        # NOTE: all ranks has the same ongoing_write_through, can skip sync if empty
-        if len(self.ongoing_write_through) == 0:
+        if self.enable_shared_hicache:
+            finish_count = 0
+            for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
+                if not finish_event.query():
+                    break
+                finish_count += 1
+
+            while finish_count > 0:
+                _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
+                finish_event.synchronize()
+                for ack_id in ack_list:
+                    backuped_node = self.ongoing_write_through.pop(ack_id)
+                    # DMA confirmed -- block is now on host.
+                    self._record_store_event(backuped_node, medium=StorageMedium.CPU)
+                    self.dec_lock_ref(backuped_node)
+                    if self.enable_storage:
+                        self.write_backup_storage(backuped_node)
+                finish_count -= 1
+            return
+
+        if (
+            len(self.ongoing_write_through) == 0
+            and len(self.cache_controller.ack_write_queue) == 0
+        ):
             return
 
         finish_count = 0
@@ -811,7 +833,6 @@ class HiRadixCache(RadixCache):
                 break
             finish_count += 1
         queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        # Keep cache state transitions identical across CPxTP participants.
         self._all_reduce_attn_groups(queue_size, torch.distributed.ReduceOp.MIN)
 
         finish_count = int(queue_size.item())

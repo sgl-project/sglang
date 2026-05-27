@@ -59,8 +59,7 @@ class SharedHiCacheSchedulerMixin:
             self._sync_shared_hicache_bool_batch(local_has_plan)
         )
 
-        prepared_reqs: list[tuple["Req", SharedHiCacheResult | None]] = []
-        pending_values = []
+        local_reqs: list[tuple["Req", int]] = []
         pending_rids: set[str] = set()
 
         for req, any_has_plan, all_have_plan in zip(
@@ -78,12 +77,43 @@ class SharedHiCacheSchedulerMixin:
                 self._release_shared_hicache_request(req.rid)
                 continue
 
-            pending = False
-            result = None
-            req.shared_hicache_max_prefix_len = 0
+            local_prefix_len = 0
             try:
                 # Probe the current local prefix without taking COW allocations.
-                # The final schedule path below recomputes the prefix after remote pages land.
+                req.init_next_round_input(self.tree_cache, cow_mamba=False)
+                local_prefix_len = len(req.prefix_indices) + int(
+                    getattr(req, "host_hit_length", 0) or 0
+                )
+            except Exception:
+                logger.exception(
+                    "SharedHiCache failed while probing local prefix for rid=%s; "
+                    "continuing with local prefill",
+                    req.rid,
+                )
+                req.shared_hicache_plan = None
+                self._release_shared_hicache_request(req.rid)
+                continue
+            local_reqs.append((req, local_prefix_len))
+
+        if not local_reqs:
+            return pending_rids
+
+        common_local_prefix_lens = self._sync_shared_hicache_int_min_batch(
+            [local_prefix_len for _, local_prefix_len in local_reqs]
+        )
+
+        prepared_reqs: list[tuple["Req", SharedHiCacheResult | None, int]] = []
+        pending_values = []
+
+        for (req, _), common_local_prefix_len in zip(
+            local_reqs, common_local_prefix_lens
+        ):
+            pending = False
+            result = None
+            try:
+                req.shared_hicache_max_prefix_len = common_local_prefix_len
+                # Recompute using the TP-common local prefix before side-effecting
+                # SharedHiCache prepare, so all ranks fetch/insert the same suffix.
                 req.init_next_round_input(self.tree_cache, cow_mamba=False)
                 result = shared_hicache_manager.prepare_reuse(req)
                 pending = result.pending
@@ -95,21 +125,21 @@ class SharedHiCacheSchedulerMixin:
                 req.shared_hicache_plan = None
                 self._release_shared_hicache_request(req.rid)
 
-            prepared_reqs.append((req, result))
+            prepared_reqs.append((req, result, common_local_prefix_len))
             pending_values.append(pending)
-
-        if not prepared_reqs:
-            return pending_rids
 
         any_rank_pending, _ = self._sync_shared_hicache_bool_batch(pending_values)
         ready_reqs = []
         local_prefix_lens = []
-        for (req, result), pending in zip(prepared_reqs, any_rank_pending):
+        for (req, result, local_prefix_len), pending in zip(
+            prepared_reqs, any_rank_pending
+        ):
             if pending:
                 pending_rids.add(str(req.rid))
                 continue
             ready_reqs.append(req)
-            local_prefix_lens.append(int(getattr(result, "prefix_len", 0)))
+            shared_prefix_len = int(getattr(result, "prefix_len", 0))
+            local_prefix_lens.append(max(local_prefix_len, shared_prefix_len))
 
         common_prefix_lens = self._sync_shared_hicache_int_min_batch(local_prefix_lens)
         for req, local_prefix_len, common_prefix_len in zip(

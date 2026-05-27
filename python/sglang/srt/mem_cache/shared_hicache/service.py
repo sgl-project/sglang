@@ -4,24 +4,14 @@ import logging
 import threading
 from string import Formatter
 from typing import Any, Callable, Mapping, Optional
-from urllib.parse import urlparse
 
-from sglang.srt.mem_cache.shared_hicache.control import start_source_transfer_server
+import zmq
+
+from sglang.srt.mem_cache.shared_hicache.control import endpoint_to_zmq
 from sglang.srt.mem_cache.shared_hicache.plan import normalize_endpoint
-
+from sglang.srt.utils.network import config_socket
 
 logger = logging.getLogger(__name__)
-
-
-def endpoint_to_bind(endpoint: str) -> tuple[str, int]:
-    parsed = urlparse(normalize_endpoint(endpoint))
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError(f"unsupported shared HiCache endpoint scheme: {parsed.scheme}")
-    if parsed.hostname is None or parsed.port is None:
-        raise ValueError(
-            f"shared HiCache endpoint must include host and port: {endpoint}"
-        )
-    return parsed.hostname, parsed.port
 
 
 def endpoint_format_fields(endpoint_spec: object) -> set[str]:
@@ -56,78 +46,128 @@ def format_control_endpoint(
 
 
 class SharedHiCacheSourceService:
+    """ZMQ control plane matching disagg's push/pull transfer metadata path."""
+
     def __init__(
         self,
         *,
         endpoint: str,
         worker_id: Optional[int],
-        worker_limit: int,
-        max_body_bytes: Callable[[], int],
-        direct_transfer_enabled: Callable[[], bool],
-        handle_source_transfer: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+        handle_control_message: Callable[[Mapping[str, Any]], None],
     ):
         self.endpoint = endpoint
         self.worker_id = worker_id
-        self.max_body_bytes = max_body_bytes
-        self.direct_transfer_enabled = direct_transfer_enabled
-        self.handle_source_transfer = handle_source_transfer
-        self._source_server: Optional[Any] = None
-        self._source_thread: Optional[threading.Thread] = None
+        self.handle_control_message = handle_control_message
+        self._context = zmq.Context()
+        self._pull_socket = None
+        self._poller = None
+        self._thread: Optional[threading.Thread] = None
+        self._shutdown = threading.Event()
+        self._send_lock = threading.Lock()
+        self._send_sockets: dict[str, zmq.Socket] = {}
         self._activity_lock = threading.Lock()
         self._active_ops = 0
-        self._resolver_semaphore = threading.BoundedSemaphore(worker_limit)
 
     def start(self) -> None:
-        host, port = endpoint_to_bind(self.endpoint)
-        self._source_server, self._source_thread = start_source_transfer_server(
-            host=host,
-            port=port,
-            endpoint=self.endpoint,
-            worker_id=self.worker_id,
-            max_body_bytes=self.max_body_bytes,
-            try_enter=self.try_enter,
-            exit_resolver=self.exit,
-            direct_transfer_enabled=self.direct_transfer_enabled,
-            handle_source_transfer=self.handle_source_transfer,
+        endpoint = endpoint_to_zmq(self.endpoint)
+        socket = self._context.socket(zmq.PULL)
+        config_socket(socket, zmq.PULL)
+        socket.bind(endpoint)
+        self._pull_socket = socket
+        poller = zmq.Poller()
+        poller.register(socket, zmq.POLLIN)
+        self._poller = poller
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"shared_hicache-zmq-{endpoint}",
+            daemon=True,
+        )
+        self._thread.start()
+        logger.info(
+            "Shared HiCache ZMQ control listening on %s for worker_id=%s",
+            endpoint,
+            self.worker_id,
         )
 
-    def try_enter(self) -> bool:
-        if not self._resolver_semaphore.acquire(blocking=False):
-            return False
-        with self._activity_lock:
-            self._active_ops += 1
-        return True
-
-    def exit(self) -> None:
-        with self._activity_lock:
-            self._active_ops -= 1
-        self._resolver_semaphore.release()
+    def send(self, endpoint: str, payload: Mapping[str, Any]) -> None:
+        endpoint = endpoint_to_zmq(endpoint)
+        with self._send_lock:
+            socket = self._send_sockets.get(endpoint)
+            if socket is None:
+                socket = self._context.socket(zmq.PUSH)
+                config_socket(socket, zmq.PUSH)
+                socket.connect(endpoint)
+                self._send_sockets[endpoint] = socket
+            socket.send_pyobj(dict(payload))
 
     def active_count(self) -> int:
         with self._activity_lock:
             return int(self._active_ops)
 
     def shutdown(self) -> None:
-        server = self._source_server
-        self._source_server = None
-        if server is not None:
+        self._shutdown.set()
+        poller = self._poller
+        socket = self._pull_socket
+        if poller is not None and socket is not None:
             try:
-                server.shutdown()
-                server.server_close()
+                poller.unregister(socket)
             except Exception:
-                logger.debug(
-                    "Shared HiCache source resolver shutdown failed", exc_info=True
-                )
+                pass
+        self._poller = None
+        self._pull_socket = None
+        if socket is not None:
+            try:
+                socket.close(linger=0)
+            except Exception:
+                logger.debug("Shared HiCache ZMQ pull close failed", exc_info=True)
+        with self._send_lock:
+            sockets = list(self._send_sockets.values())
+            self._send_sockets.clear()
+        for send_socket in sockets:
+            try:
+                send_socket.close(linger=0)
+            except Exception:
+                logger.debug("Shared HiCache ZMQ push close failed", exc_info=True)
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread is not threading.current_thread():
+            try:
+                thread.join(timeout=1)
+            except Exception:
+                logger.debug("Shared HiCache ZMQ control join failed", exc_info=True)
+        try:
+            self._context.term()
+        except Exception:
+            logger.debug("Shared HiCache ZMQ context termination failed", exc_info=True)
 
-        source_thread = self._source_thread
-        self._source_thread = None
-        if (
-            source_thread is not None
-            and source_thread is not threading.current_thread()
-        ):
+    def _run(self) -> None:
+        while not self._shutdown.is_set():
+            socket = self._pull_socket
+            poller = self._poller
+            if socket is None or poller is None:
+                break
             try:
-                source_thread.join(timeout=1)
+                events = dict(poller.poll(100))
+            except zmq.ZMQError:
+                if self._shutdown.is_set():
+                    break
+                logger.debug("Shared HiCache ZMQ poll failed", exc_info=True)
+                continue
+            if socket not in events:
+                continue
+            with self._activity_lock:
+                self._active_ops += 1
+            try:
+                payload = socket.recv_pyobj()
+                if not isinstance(payload, Mapping):
+                    logger.warning("Ignoring malformed Shared HiCache ZMQ payload")
+                    continue
+                self.handle_control_message(payload)
+            except zmq.ZMQError:
+                if not self._shutdown.is_set():
+                    logger.debug("Shared HiCache ZMQ receive failed", exc_info=True)
             except Exception:
-                logger.debug(
-                    "Shared HiCache source resolver join failed", exc_info=True
-                )
+                logger.exception("Shared HiCache ZMQ control handler failed")
+            finally:
+                with self._activity_lock:
+                    self._active_ops -= 1

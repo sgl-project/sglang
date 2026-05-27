@@ -21,7 +21,9 @@ def normalize_endpoint(endpoint: str) -> str:
     if not endpoint:
         return endpoint
     if "://" not in endpoint:
-        endpoint = f"http://{endpoint}"
+        endpoint = f"tcp://{endpoint}"
+    if not endpoint.startswith("tcp://"):
+        raise ValueError("shared HiCache control endpoint must use tcp://")
     return endpoint.rstrip("/")
 
 
@@ -148,9 +150,7 @@ class SharedHiCachePlan:
                     data["source_worker_id"], "source_worker_id"
                 ),
                 source_endpoint=source_endpoint,
-                source_medium=_canonical_source_medium(
-                    data["source_medium"]
-                ),
+                source_medium=_canonical_source_medium(data["source_medium"]),
                 block_hashes=block_hashes,
                 planned_prefix_blocks=min(planned_prefix_blocks, len(block_hashes)),
                 block_size_tokens=_coerce_int(

@@ -7,17 +7,23 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 import numpy as np
 
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
-from sglang.srt.environ import default_shared_hicache_transfer_parallelism, envs
+from sglang.srt.environ import (
+    default_shared_hicache_transfer_parallelism,
+    envs,
+)
 from sglang.srt.mem_cache.shared_hicache.config import (
     shared_hicache_transfer_backend_name,
 )
 
 logger = logging.getLogger(__name__)
+
+SHARED_HICACHE_NIXL_NOTIFICATION_PREFIX = "shared_hicache:"
 
 if TYPE_CHECKING:
     import torch
@@ -64,6 +70,7 @@ class SharedHiCacheTransferBackend(ABC):
         target_kv_ptrs: list[int],
         target_kv_item_lens: list[int],
         target_metadata: Optional[Mapping[str, Any]] = None,
+        notification: Optional[str] = None,
     ) -> None: ...
 
     def shutdown(self) -> None:
@@ -176,7 +183,9 @@ def _create_nixl_agent(*, transfer_parallelism: int):
     backend = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get()
     backend_params = _nixl_backend_params(backend, transfer_parallelism)
     agent_config = nixl_agent_config(
-        backends=[], num_threads=max(0, int(transfer_parallelism))
+        backends=[],
+        capture_telemetry=envs.SGLANG_SHARED_HICACHE_NIXL_TELEMETRY.get(),
+        num_threads=max(0, int(transfer_parallelism)),
     )
     agent_name = f"shared_hicache_nixl_{uuid.uuid4()}"
     agent = nixl_agent(agent_name, agent_config)
@@ -187,6 +196,52 @@ def _create_nixl_agent(*, transfer_parallelism: int):
             f"NIXL backend {backend!r} not found. Available: {available_plugins}"
         )
     return agent, agent_name, backend
+
+
+def build_shared_hicache_transfer_notification(
+    *,
+    transfer_id: str,
+    transferred_blocks: int,
+    reason: str,
+) -> str:
+    payload = {
+        "transfer_id": str(transfer_id),
+        "transferred_blocks": int(transferred_blocks),
+        "reason": str(reason),
+    }
+    return SHARED_HICACHE_NIXL_NOTIFICATION_PREFIX + json.dumps(
+        payload, separators=(",", ":")
+    )
+
+
+def parse_shared_hicache_transfer_notification(
+    message: bytes | str,
+) -> Optional[tuple[str, int, str]]:
+    if isinstance(message, bytes):
+        try:
+            message = message.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(message, str) or not message.startswith(
+        SHARED_HICACHE_NIXL_NOTIFICATION_PREFIX
+    ):
+        return None
+    try:
+        payload = json.loads(message[len(SHARED_HICACHE_NIXL_NOTIFICATION_PREFIX) :])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    transfer_id = str(payload.get("transfer_id") or "")
+    if not transfer_id:
+        return None
+    try:
+        transferred_blocks = int(payload.get("transferred_blocks", 0))
+    except (TypeError, ValueError):
+        return None
+    if transferred_blocks < 0:
+        return None
+    return transfer_id, transferred_blocks, str(payload.get("reason", "ok"))
 
 
 def _source_host_buf_infos(tree_cache) -> tuple[list[int], list[int]]:
@@ -290,6 +345,14 @@ def _nixl_req_array(addrs: np.ndarray, lengths: np.ndarray, gpu_id: int) -> np.n
     )
 
 
+@dataclass
+class _NixlSourceWorkerState:
+    agent: Any
+    agent_name: str
+    backend_name: str
+    remote_agents: set[str] = field(default_factory=set)
+
+
 class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
     """NIXL-backed source-HiCache-host to target-GPU-device transfer helper."""
 
@@ -320,14 +383,17 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         self.backend_name = backend_name
         self.tree_cache = tree_cache
         self._target_registered = bool(target_registered)
-        self._source_registered = False
+        self._source_pool_ready = False
         self._source_registered_ptrs: list[int] = []
-        self._remote_agents: set[str] = set()
-        self._transfer_lock = threading.Lock()
+        self._source_worker_states: dict[int, _NixlSourceWorkerState] = {}
+        self._source_worker_lock = threading.Lock()
+        self._target_notification_lock = threading.Lock()
+        self._target_notifications: dict[str, tuple[int, str]] = {}
         self._gpu_id = int(gpu_id)
         if transfer_parallelism is None:
             transfer_parallelism = default_shared_hicache_transfer_parallelism()
         self._transfer_parallelism = max(1, int(transfer_parallelism))
+        self._capture_telemetry = envs.SGLANG_SHARED_HICACHE_NIXL_TELEMETRY.get()
         self._shutdown = False
 
     @classmethod
@@ -404,7 +470,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
 
     @property
     def enabled(self) -> bool:
-        return self._target_registered and self._source_registered
+        return self._target_registered and self._source_pool_ready
 
     def target_descriptor(self) -> dict[str, Any]:
         descriptor = super().target_descriptor()
@@ -453,19 +519,68 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         except RuntimeError as err:
             logger.info("SharedHiCache NIXL direct transfer disabled: %s", err)
             return
-        source_descs = self.agent.register_memory(
-            [(int(host_pool.kv_buffer.data_ptr()), int(host_pool.kv_buffer.nbytes), 0, "")],
+        self._source_pool_ready = True
+        self._source_registered_ptrs = [int(host_pool.kv_buffer.data_ptr())]
+
+    def _create_source_worker_state(self) -> _NixlSourceWorkerState:
+        host_pool = self.tree_cache.cache_controller.mem_pool_host
+        agent, agent_name, backend_name = _create_nixl_agent(
+            transfer_parallelism=self._transfer_parallelism
+        )
+        source_descs = agent.register_memory(
+            [
+                (
+                    int(host_pool.kv_buffer.data_ptr()),
+                    int(host_pool.kv_buffer.nbytes),
+                    0,
+                    "",
+                )
+            ],
             "DRAM",
         )
         if not source_descs:
-            logger.warning(
-                "SharedHiCache NIXL direct transfer disabled: host registration failed"
+            raise RuntimeError(
+                "SharedHiCache NIXL source host registration failed"
             )
-            return
-        self._source_registered = True
-        self._source_registered_ptrs = [int(host_pool.kv_buffer.data_ptr())]
+        logger.info(
+            "SharedHiCache NIXL source transfer worker enabled agent=%s backend=%s "
+            "thread=%d parallelism=%d",
+            agent_name,
+            backend_name,
+            threading.get_ident(),
+            self._transfer_parallelism,
+        )
+        return _NixlSourceWorkerState(
+            agent=agent,
+            agent_name=agent_name,
+            backend_name=backend_name,
+        )
 
-    def _add_remote_target(self, target_metadata: Optional[Mapping[str, Any]]) -> tuple[str, int]:
+    def _source_worker_state(self) -> _NixlSourceWorkerState:
+        thread_id = threading.get_ident()
+        with self._source_worker_lock:
+            state = self._source_worker_states.get(thread_id)
+        if state is not None:
+            return state
+
+        state = self._create_source_worker_state()
+        with self._source_worker_lock:
+            existing = self._source_worker_states.get(thread_id)
+            if existing is not None:
+                return existing
+            self._source_worker_states[thread_id] = state
+            return state
+
+    def prepare_source_worker(self) -> None:
+        if self._shutdown or not self.enabled:
+            raise RuntimeError("NIXL direct KV transfer backend is not enabled")
+        self._source_worker_state()
+
+    def _add_remote_target(
+        self,
+        state: _NixlSourceWorkerState,
+        target_metadata: Optional[Mapping[str, Any]],
+    ) -> tuple[str, int]:
         if not isinstance(target_metadata, Mapping):
             raise RuntimeError("NIXL target metadata must be an object")
         target_agent_name = str(target_metadata.get("agent_name") or "")
@@ -474,21 +589,76 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             raise RuntimeError("NIXL target metadata missing agent_name")
         if not isinstance(encoded_metadata, str) or not encoded_metadata:
             raise RuntimeError("NIXL target metadata missing agent_metadata")
-        if target_agent_name not in self._remote_agents:
-            self.agent.add_remote_agent(base64.b64decode(encoded_metadata))
-            self._remote_agents.add(target_agent_name)
+        if target_agent_name not in state.remote_agents:
+            state.agent.add_remote_agent(base64.b64decode(encoded_metadata))
+            state.remote_agents.add(target_agent_name)
         return target_agent_name, int(target_metadata.get("gpu_id", 0))
 
-    def _wait_for_transfer(self, handle) -> None:
-        state = self.agent.transfer(handle)
-        while state != "DONE":
-            if state == "ERR":
+    def _wait_for_transfer(
+        self, agent, handle
+    ) -> Optional[tuple[int, int, int, int]]:
+        transfer_state = agent.transfer(handle)
+        while transfer_state != "DONE":
+            if transfer_state == "ERR":
                 raise RuntimeError("NIXL direct KV transfer failed")
-            state = self.agent.check_xfer_state(handle)
+            transfer_state = agent.check_xfer_state(handle)
             time.sleep(0.0001)
-        release = getattr(self.agent, "release_xfer_handle", None)
+        telemetry = self._get_xfer_telemetry(agent, handle)
+        release = getattr(agent, "release_xfer_handle", None)
         if callable(release):
             release(handle)
+        return telemetry
+
+    def _drain_target_notifications_locked(self) -> None:
+        get_new_notifs = getattr(self.agent, "get_new_notifs", None)
+        if not callable(get_new_notifs):
+            return
+        try:
+            notif_map = get_new_notifs()
+        except Exception:
+            logger.debug(
+                "SharedHiCache NIXL target notification poll failed", exc_info=True
+            )
+            return
+        if not isinstance(notif_map, Mapping):
+            return
+        for messages in notif_map.values():
+            for message in messages or ():
+                parsed = parse_shared_hicache_transfer_notification(message)
+                if parsed is None:
+                    continue
+                transfer_id, transferred_blocks, reason = parsed
+                self._target_notifications[transfer_id] = (
+                    transferred_blocks,
+                    reason,
+                )
+
+    def pop_target_transfer_notification(
+        self, transfer_id: str
+    ) -> Optional[tuple[int, str]]:
+        with self._target_notification_lock:
+            self._drain_target_notifications_locked()
+            return self._target_notifications.pop(str(transfer_id), None)
+
+    def _get_xfer_telemetry(
+        self, agent, handle
+    ) -> Optional[tuple[int, int, int, int]]:
+        if not self._capture_telemetry:
+            return None
+        get_telemetry = getattr(agent, "get_xfer_telemetry", None)
+        if not callable(get_telemetry):
+            return None
+        try:
+            telemetry = get_telemetry(handle)
+            return (
+                int(getattr(telemetry, "postDuration")),
+                int(getattr(telemetry, "xferDuration")),
+                int(getattr(telemetry, "totalBytes")),
+                int(getattr(telemetry, "descCount")),
+            )
+        except Exception:
+            logger.debug("SharedHiCache NIXL transfer telemetry unavailable", exc_info=True)
+            return None
 
     def _source_host_buf_infos(self) -> tuple[list[int], list[int]]:
         return _source_host_buf_infos(self.tree_cache)
@@ -502,54 +672,86 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         target_kv_ptrs: list[int],
         target_kv_item_lens: list[int],
         target_metadata: Optional[Mapping[str, Any]] = None,
+        notification: Optional[str] = None,
     ) -> None:
-        with self._transfer_lock:
-            target_agent_name, target_gpu_id = self._add_remote_target(target_metadata)
-            source_kv_ptrs, source_kv_item_lens = self._source_host_buf_infos()
-            src_addrs, dst_addrs, lengths, num_blocks = _build_grouped_transfer_arrays(
-                source_page_indices=source_page_indices,
-                target_page_indices=target_page_indices,
-                source_kv_ptrs=source_kv_ptrs,
-                target_kv_ptrs=target_kv_ptrs,
-                source_kv_item_lens=source_kv_item_lens,
-                target_kv_item_lens=target_kv_item_lens,
-            )
-            if src_addrs.size == 0:
-                return
-
-            src_descs = self.agent.get_xfer_descs(
-                _nixl_req_array(src_addrs, lengths, 0), "DRAM"
-            )
-            dst_descs = self.agent.get_xfer_descs(
-                _nixl_req_array(dst_addrs, lengths, target_gpu_id), "VRAM"
-            )
-            if src_descs is None or dst_descs is None:
-                raise RuntimeError("NIXL direct KV transfer descriptor creation failed")
-            start = time.perf_counter()
-            handle = self.agent.initialize_xfer(
-                "WRITE",
-                src_descs,
-                dst_descs,
-                target_agent_name,
-            )
-            if not handle:
-                raise RuntimeError("NIXL direct KV transfer initialization failed")
-            self._wait_for_transfer(handle)
-            transfer_ms = (time.perf_counter() - start) * 1000
-        logger.info(
-            "SharedHiCache NIXL transferred blocks=%d slices=%d bytes=%d ms=%.3f",
-            num_blocks,
-            len(src_addrs),
-            int(lengths.sum()),
-            transfer_ms,
+        if self._shutdown or not self.enabled:
+            raise RuntimeError("NIXL direct KV transfer backend is not enabled")
+        setup_start = time.perf_counter()
+        source_state = self._source_worker_state()
+        target_agent_name, target_gpu_id = self._add_remote_target(
+            source_state, target_metadata
         )
+        source_kv_ptrs, source_kv_item_lens = self._source_host_buf_infos()
+        src_addrs, dst_addrs, lengths, num_blocks = _build_grouped_transfer_arrays(
+            source_page_indices=source_page_indices,
+            target_page_indices=target_page_indices,
+            source_kv_ptrs=source_kv_ptrs,
+            target_kv_ptrs=target_kv_ptrs,
+            source_kv_item_lens=source_kv_item_lens,
+            target_kv_item_lens=target_kv_item_lens,
+        )
+        if src_addrs.size == 0:
+            return
+
+        src_descs = source_state.agent.get_xfer_descs(
+            _nixl_req_array(src_addrs, lengths, 0), "DRAM"
+        )
+        dst_descs = source_state.agent.get_xfer_descs(
+            _nixl_req_array(dst_addrs, lengths, target_gpu_id), "VRAM"
+        )
+        if src_descs is None or dst_descs is None:
+            raise RuntimeError("NIXL direct KV transfer descriptor creation failed")
+        xfer_args = [
+            "WRITE",
+            src_descs,
+            dst_descs,
+            target_agent_name,
+        ]
+        if notification:
+            xfer_args.append(str(notification).encode("utf-8"))
+        handle = source_state.agent.initialize_xfer(*xfer_args)
+        if not handle:
+            raise RuntimeError("NIXL direct KV transfer initialization failed")
+        setup_ms = (time.perf_counter() - setup_start) * 1000
+        start = time.perf_counter()
+        telemetry = self._wait_for_transfer(source_state.agent, handle)
+        transfer_ms = (time.perf_counter() - start) * 1000
+        if telemetry is None:
+            logger.info(
+                "SharedHiCache NIXL transferred blocks=%d slices=%d bytes=%d "
+                "ms=%.3f setup_ms=%.3f source_agent=%s",
+                num_blocks,
+                len(src_addrs),
+                int(lengths.sum()),
+                transfer_ms,
+                setup_ms,
+                source_state.agent_name,
+            )
+        else:
+            post_us, xfer_us, nixl_bytes, desc_count = telemetry
+            logger.info(
+                "SharedHiCache NIXL transferred blocks=%d slices=%d bytes=%d "
+                "ms=%.3f setup_ms=%.3f source_agent=%s "
+                "nixl_post_us=%d nixl_xfer_us=%d nixl_bytes=%d nixl_descs=%d",
+                num_blocks,
+                len(src_addrs),
+                int(lengths.sum()),
+                transfer_ms,
+                setup_ms,
+                source_state.agent_name,
+                post_us,
+                xfer_us,
+                nixl_bytes,
+                desc_count,
+            )
 
     def shutdown(self) -> None:
         if self._shutdown:
             return
         self._shutdown = True
         self._source_registered_ptrs = []
-        self._source_registered = False
+        self._source_pool_ready = False
+        self._source_worker_states = {}
         self._target_registered = False
 
 

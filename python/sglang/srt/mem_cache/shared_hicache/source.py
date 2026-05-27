@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Optional
 
@@ -10,6 +11,7 @@ import torch
 
 from sglang.srt.mem_cache.shared_hicache.transfer import (
     SharedHiCacheTransferBackend,
+    build_shared_hicache_transfer_notification,
     shared_hicache_parallel_rejection,
 )
 from sglang.srt.mem_cache.radix_cache import TreeNode
@@ -34,6 +36,22 @@ class ResolvedHostPageLocation:
     block_hash: int
     hash_value: str
     host_index: int
+
+
+@dataclass(frozen=True)
+class SourceTransferRequest:
+    transfer_id: str
+    target_control_endpoint: str
+    plan: SharedHiCachePlan
+    start_block: int
+    max_blocks: int
+    target_session_id: str
+    target_kv_ptrs: list[int]
+    target_kv_item_lens: list[int]
+    target_metadata: Any
+    target_tp_rank: Optional[int]
+    target_tp_size: Optional[int]
+    target_page_indices: list[int]
 
 
 def _tensor_to_bytes(tensor: torch.Tensor) -> bytes:
@@ -209,7 +227,9 @@ def release_protected_host_nodes(nodes: Iterable[TreeNode]) -> None:
         try:
             node.release_host()
         except RuntimeError:
-            logger.exception("Failed to release shared HiCache source host page protection")
+            logger.exception(
+                "Failed to release shared HiCache source host page protection"
+            )
 
 
 def _coerce_int(value: Any, field_name: str) -> int:
@@ -277,8 +297,7 @@ def _source_rank_rejection(
     local_tp_rank = int(tp_rank)
     if plan.source_tp_size != local_tp_size:
         return (
-            "wrong_source_tp_size:"
-            f"plan={plan.source_tp_size}:local={local_tp_size}"
+            "wrong_source_tp_size:" f"plan={plan.source_tp_size}:local={local_tp_size}"
         )
     if target_tp_size is None:
         if local_tp_size > 1:
@@ -297,10 +316,7 @@ def _source_rank_rejection(
             f"plan={plan.target_tp_size}:target={target_tp_size}"
         )
     if target_tp_size != local_tp_size:
-        return (
-            "incompatible_tp_size:"
-            f"source={local_tp_size}:target={target_tp_size}"
-        )
+        return "incompatible_tp_size:" f"source={local_tp_size}:target={target_tp_size}"
     if target_tp_rank != local_tp_rank:
         return (
             "wrong_source_tp_rank_for_target:"
@@ -331,9 +347,7 @@ def _parse_target_kv_metadata(
             return None, None, None, "target_session_id_mismatch"
 
     try:
-        target_kv_ptrs = _coerce_transfer_int_list(
-            target_kv_ptrs_raw, "target_kv_ptrs"
-        )
+        target_kv_ptrs = _coerce_transfer_int_list(target_kv_ptrs_raw, "target_kv_ptrs")
         target_kv_item_lens = _coerce_transfer_int_list(
             target_kv_item_lens_raw, "target_kv_item_lens"
         )
@@ -378,27 +392,22 @@ def _parse_target_kv_metadata(
     return target_session_id, target_kv_ptrs, target_kv_item_lens, None
 
 
-def handle_source_transfer(
+def parse_source_transfer_request(
     *,
     payload: Mapping[str, Any],
     transfer_backend: Optional[SharedHiCacheTransferBackend],
     tree_cache,
-    worker_id: Optional[int],
-    tp_rank: int = 0,
-    tp_size: int = 1,
-    pp_size: int = 1,
-    attn_cp_size: int = 1,
-) -> Mapping[str, Any]:
+) -> tuple[Optional[SourceTransferRequest], Optional[Mapping[str, Any]]]:
     if transfer_backend is None or not getattr(transfer_backend, "enabled", False):
-        return {"ok": False, "reason": "direct_transfer_unavailable"}
+        return None, {"ok": False, "reason": "direct_transfer_unavailable"}
     if "transfer_backend" not in payload:
-        return {
+        return None, {
             "ok": False,
             "reason": "malformed_transfer_request:missing_transfer_backend",
         }
     requested_backend = str(payload["transfer_backend"]).lower()
     if requested_backend != transfer_backend.name:
-        return {
+        return None, {
             "ok": False,
             "reason": (
                 f"unsupported_transfer_backend:{requested_backend}:"
@@ -406,6 +415,15 @@ def handle_source_transfer(
             ),
         }
 
+    transfer_id = str(payload.get("transfer_id") or uuid.uuid4().hex)
+    target_control_endpoint = str(payload.get("target_control_endpoint") or "")
+    if not target_control_endpoint:
+        return None, {
+            "ok": False,
+            "reason": "malformed_transfer_request:missing_target_control_endpoint",
+            "transfer_id": transfer_id,
+            "block_size_tokens": tree_cache.page_size,
+        }
     try:
         plan = SharedHiCachePlan.from_dict(payload["plan"])
         start_block = _coerce_int(payload.get("start_block", 0), "start_block")
@@ -413,7 +431,7 @@ def handle_source_transfer(
             payload.get("max_blocks", len(plan.block_hashes)), "max_blocks"
         )
     except (KeyError, ValueError) as err:
-        return {
+        return None, {
             "ok": False,
             "reason": f"malformed_transfer_request:plan:{err}",
         }
@@ -425,21 +443,17 @@ def handle_source_transfer(
         target_kv_metadata_error,
     ) = _parse_target_kv_metadata(payload, transfer_backend)
     if target_kv_metadata_error is not None:
-        return {
+        return None, {
             "ok": False,
             "reason": f"malformed_transfer_request:{target_kv_metadata_error}",
             "block_size_tokens": tree_cache.page_size,
         }
     target_metadata = payload.get("target_metadata")
     try:
-        target_tp_rank = _target_metadata_int(
-            target_metadata, "tp_rank"
-        )
-        target_tp_size = _target_metadata_int(
-            target_metadata, "tp_size"
-        )
+        target_tp_rank = _target_metadata_int(target_metadata, "tp_rank")
+        target_tp_size = _target_metadata_int(target_metadata, "tp_size")
     except ValueError as err:
-        return {
+        return None, {
             "ok": False,
             "reason": f"malformed_transfer_request:{err}",
             "block_size_tokens": tree_cache.page_size,
@@ -449,39 +463,69 @@ def handle_source_transfer(
             payload["target_page_indices"], "target_page_indices"
         )
     except KeyError as err:
-        return {
+        return None, {
             "ok": False,
             "reason": f"malformed_transfer_request:target_page_indices_missing:{err}",
             "block_size_tokens": tree_cache.page_size,
         }
     except ValueError as err:
-        return {
+        return None, {
             "ok": False,
             "reason": f"malformed_transfer_request:{err}",
             "block_size_tokens": tree_cache.page_size,
         }
     max_int32 = np.iinfo(np.int32).max
     if any(idx < 0 or idx > max_int32 for idx in target_page_indices_list):
-        return {
+        return None, {
             "ok": False,
             "reason": "malformed_transfer_request:target_page_index_out_of_range",
             "block_size_tokens": tree_cache.page_size,
         }
 
+    return (
+        SourceTransferRequest(
+            transfer_id=transfer_id,
+            target_control_endpoint=target_control_endpoint,
+            plan=plan,
+            start_block=start_block,
+            max_blocks=max_blocks,
+            target_session_id=target_session_id,
+            target_kv_ptrs=target_kv_ptrs,
+            target_kv_item_lens=target_kv_item_lens,
+            target_metadata=target_metadata,
+            target_tp_rank=target_tp_rank,
+            target_tp_size=target_tp_size,
+            target_page_indices=target_page_indices_list,
+        ),
+        None,
+    )
+
+
+def execute_source_transfer_request(
+    *,
+    request: SourceTransferRequest,
+    transfer_backend: SharedHiCacheTransferBackend,
+    tree_cache,
+    worker_id: Optional[int],
+    tp_rank: int = 0,
+    tp_size: int = 1,
+    pp_size: int = 1,
+    attn_cp_size: int = 1,
+) -> Mapping[str, Any]:
     total_start = time.perf_counter()
     resolve_start = total_start
     pages, reason, protected_nodes = resolve_host_page_locations(
         tree_cache,
-        plan,
-        start_block=start_block,
-        max_blocks=max_blocks,
+        request.plan,
+        start_block=request.start_block,
+        max_blocks=request.max_blocks,
         worker_id=worker_id,
         tp_rank=tp_rank,
         tp_size=tp_size,
         pp_size=pp_size,
         attn_cp_size=attn_cp_size,
-        target_tp_rank=target_tp_rank,
-        target_tp_size=target_tp_size,
+        target_tp_rank=request.target_tp_rank,
+        target_tp_size=request.target_tp_size,
     )
     resolve_ms = (time.perf_counter() - resolve_start) * 1000
     transfer_ms = 0.0
@@ -514,24 +558,32 @@ def handle_source_transfer(
                     }
                 source_page_indices_list.append(page_index)
             source_page_indices = np.array(source_page_indices_list, dtype=np.int32)
-            transfer_bytes = len(pages) * sum(int(x) for x in target_kv_item_lens)
-            if len(target_page_indices_list) < len(pages):
+            transfer_bytes = len(pages) * sum(
+                int(x) for x in request.target_kv_item_lens
+            )
+            if len(request.target_page_indices) < len(pages):
                 return {
                     "ok": False,
                     "reason": "malformed_transfer_request:target_page_indices_too_short",
                     "block_size_tokens": tree_cache.page_size,
                 }
-            target_page_indices_list = target_page_indices_list[: len(pages)]
+            target_page_indices_list = request.target_page_indices[: len(pages)]
             target_page_indices = np.array(target_page_indices_list, dtype=np.int32)
             transfer_start = time.perf_counter()
             try:
+                notification = build_shared_hicache_transfer_notification(
+                    transfer_id=request.transfer_id,
+                    transferred_blocks=len(pages),
+                    reason=reason,
+                )
                 transfer_backend.transfer_pages(
-                    target_session_id=target_session_id,
+                    target_session_id=request.target_session_id,
                     source_page_indices=source_page_indices,
                     target_page_indices=target_page_indices,
-                    target_kv_ptrs=target_kv_ptrs,
-                    target_kv_item_lens=target_kv_item_lens,
-                    target_metadata=payload.get("target_metadata"),
+                    target_kv_ptrs=request.target_kv_ptrs,
+                    target_kv_item_lens=request.target_kv_item_lens,
+                    target_metadata=request.target_metadata,
+                    notification=notification,
                 )
             except Exception as err:
                 transfer_ms = (time.perf_counter() - transfer_start) * 1000

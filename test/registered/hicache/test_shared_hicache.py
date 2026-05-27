@@ -1,12 +1,14 @@
 import time
+import threading
 import unittest
 from array import array
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.hicache_host_index import HiCacheHostBlockIndex
@@ -23,13 +25,15 @@ from sglang.srt.mem_cache.shared_hicache.scheduler_mixin import (
 )
 from sglang.srt.mem_cache.shared_hicache.source import (
     ResolvedHostPage,
-    handle_source_transfer,
+    execute_source_transfer_request,
+    parse_source_transfer_request,
     resolve_host_pages,
 )
 from sglang.srt.mem_cache.shared_hicache.target import SharedHiCacheTarget
 from sglang.srt.mem_cache.shared_hicache.transfer import (
     NixlSharedHiCacheTransferBackend,
     SharedHiCacheTransferBackend,
+    build_shared_hicache_transfer_notification,
 )
 from sglang.srt.mem_cache.utils import block_hash_aliases, hash_str_to_int64
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
@@ -53,18 +57,40 @@ def _make_plan(block_hashes, **overrides):
     return plan
 
 
-def _completed_future(result):
-    future = Future()
-    future.set_result(result)
-    return future
+class FakeTransferHandle:
+    def __init__(self, result, status=KVPoll.Success, pending_polls=0):
+        self._result = result
+        self._status = status
+        self._pending_polls = pending_polls
+        self.done_at = time.perf_counter() if pending_polls == 0 else 0.0
+
+    def poll(self):
+        if self._pending_polls > 0:
+            self._pending_polls -= 1
+            if self._pending_polls == 0:
+                self.done_at = time.perf_counter()
+            return KVPoll.Transferring
+        if self.done_at <= 0:
+            self.done_at = time.perf_counter()
+        return self._status
+
+    def done(self):
+        return self.poll() in (KVPoll.Success, KVPoll.Failed)
+
+    def result(self):
+        self.done()
+        return self._result
 
 
 class FakeDeviceAllocator:
     def __init__(self):
         self.next_index = 200
         self.freed = []
+        self.fail_alloc = False
 
     def alloc(self, need_size):
+        if self.fail_alloc:
+            return None
         indices = torch.arange(self.next_index, self.next_index + need_size)
         self.next_index += need_size
         return indices
@@ -97,6 +123,7 @@ class FakeTree:
         self.insert_calls = []
         self.locked_nodes = []
         self.unlocked_nodes = []
+        self.evict_count = 0
 
     def insert_shared_hicache_device_blocks(self, *, key, value):
         self.insert_calls.append((key, value.clone()))
@@ -107,6 +134,7 @@ class FakeTree:
         return SimpleNamespace(prefix_len=self.insert_prefix_len)
 
     def evict(self, params):
+        self.evict_count += 1
         return SimpleNamespace(num_tokens_evicted=0)
 
     def inc_lock_ref(self, node):
@@ -129,13 +157,14 @@ class FakeDirectTransfer(SharedHiCacheTransferBackend):
             target_kv_ptrs=[1],
             target_kv_item_lens=[64],
         )
+        self.calls = []
 
     @property
     def enabled(self):
         return True
 
     def transfer_pages(self, **kwargs):
-        pass
+        self.calls.append(kwargs)
 
 
 class FakeNixlAgent:
@@ -148,11 +177,11 @@ class FakeNixlAgent:
         self.initialized = []
         self.transfers = []
         self.released = []
+        self.notifications = {}
 
     def register_memory(self, addrs, mem_type=None):
         normalized = [
-            tuple(int(x) if isinstance(x, int) else x for x in item)
-            for item in addrs
+            tuple(int(x) if isinstance(x, int) else x for x in item) for item in addrs
         ]
         self.registered.append((mem_type, normalized))
         return [("registered", mem_type, normalized)]
@@ -182,6 +211,11 @@ class FakeNixlAgent:
     def release_xfer_handle(self, handle):
         self.released.append(handle)
 
+    def get_new_notifs(self):
+        notifications = self.notifications
+        self.notifications = {}
+        return notifications
+
 
 class FakePrometheusMetric:
     def __init__(self):
@@ -200,10 +234,15 @@ class FakePrometheusMetric:
 
 
 class FakeSharedHiCacheReq:
-    def __init__(self, rid, shared_hicache_plan=True):
+    def __init__(
+        self, rid, shared_hicache_plan=True, local_prefix_len=0, host_hit_length=0
+    ):
         self.rid = rid
         self.shared_hicache_plan = shared_hicache_plan
         self.shared_hicache_max_prefix_len = None
+        self.local_prefix_len = local_prefix_len
+        self.host_hit_length = host_hit_length
+        self.prefix_indices = torch.arange(local_prefix_len, dtype=torch.int64)
         self.init_calls = []
 
     def init_next_round_input(self, tree_cache=None, cow_mamba=None):
@@ -214,6 +253,10 @@ class FakeSharedHiCacheReq:
                 "max_prefix_len": self.shared_hicache_max_prefix_len,
             }
         )
+        prefix_len = self.local_prefix_len
+        if self.shared_hicache_max_prefix_len is not None:
+            prefix_len = min(prefix_len, self.shared_hicache_max_prefix_len)
+        self.prefix_indices = torch.arange(prefix_len, dtype=torch.int64)
 
 
 class FakeSharedHiCacheScheduler(SharedHiCacheSchedulerMixin):
@@ -278,10 +321,14 @@ def _make_manager(tree=None):
     manager.prefetch_stop_policy = "timeout"
     manager.direct_transfer = FakeDirectTransfer()
     manager.metrics_collector = None
-    manager._fetch_executor = ThreadPoolExecutor(max_workers=1)
-    manager._fetch_semaphore = None
+    manager._source_transfer_executor = ThreadPoolExecutor(max_workers=1)
+    manager._source_transfer_capacity = threading.BoundedSemaphore(2)
+    manager._source_transfer_lock = threading.Lock()
+    manager._source_transfers = {}
+    manager._target_transfer_lock = threading.Lock()
+    manager._target_transfer_completions = {}
+    manager._target_transfer_capacity = None
     manager._pending_fetches = {}
-    manager._detached_fetches = set()
     manager._finished_plan_keys = set()
     manager._finished_plan_prefix_lens = {}
     manager.target_cache = SharedHiCacheTarget(tree_cache=tree, metrics_collector=None)
@@ -313,7 +360,7 @@ class TestSharedHiCache(unittest.TestCase):
         )
 
         self.assertEqual(plan.source_medium, StorageMedium.CPU.value)
-        self.assertEqual(plan.source_endpoint, "http://127.0.0.1:39007")
+        self.assertEqual(plan.source_endpoint, "tcp://127.0.0.1:39007")
         self.assertEqual(plan.block_hashes, (11,))
 
         with self.assertRaisesRegex(ValueError, "block_hash must be an integer"):
@@ -374,7 +421,9 @@ class TestSharedHiCache(unittest.TestCase):
         )
 
         self.assertEqual(reason, "ok")
-        self.assertEqual(pages, [ResolvedHostPage(identity_hash, "aa" * 32, bytes([1, 2, 3, 4]))])
+        self.assertEqual(
+            pages, [ResolvedHostPage(identity_hash, "aa" * 32, bytes([1, 2, 3, 4]))]
+        )
         self.assertEqual(calls, [({kv_hash}, True)])
         self.assertEqual(node.host_ref_counter, 0)
 
@@ -396,23 +445,39 @@ class TestSharedHiCache(unittest.TestCase):
         self.assertIsInstance(captured[0], InsertParams)
         self.assertTrue(captured[0].chunked)
 
+    def test_target_direct_transfer_allocation_does_not_evict(self):
+        tree = FakeTree()
+        tree.device_allocator.fail_alloc = True
+        target = SharedHiCacheTarget(tree_cache=tree, metrics_collector=None)
+
+        self.assertIsNone(target.alloc_device_indices(4))
+        self.assertEqual(tree.evict_count, 0)
+
     def test_manager_stages_direct_transfer_into_local_prefix(self):
         manager = _make_manager()
         req = _make_req(_make_plan([11, 22]))
 
-        def request_source_transfer(**kwargs):
-            self.assertEqual(kwargs["start_block"], 0)
-            self.assertEqual(kwargs["target_page_indices"], [100, 101])
-            return [
-                ResolvedHostPage(11, "", b""),
-                ResolvedHostPage(22, "", b""),
-            ], "ok"
+        def submit_direct_transfer(plan, *, start_block, max_blocks, token_count):
+            self.assertEqual(start_block, 0)
+            self.assertEqual(max_blocks, 2)
+            self.assertEqual(token_count, 4)
+            return (
+                FakeTransferHandle(
+                    (
+                        [
+                            ResolvedHostPage(11, "", b""),
+                            ResolvedHostPage(22, "", b""),
+                        ],
+                        "ok",
+                    )
+                ),
+                torch.arange(200, 204),
+            )
 
-        manager._request_source_transfer = request_source_transfer
+        manager._submit_direct_transfer = submit_direct_transfer
         try:
             first = manager.prepare_reuse(req)
             self.assertTrue(first.pending)
-            manager._pending_fetches[req.rid].future.result(timeout=1)
 
             second = manager.prepare_reuse(req)
             self.assertFalse(second.pending)
@@ -420,7 +485,7 @@ class TestSharedHiCache(unittest.TestCase):
             self.assertEqual(req.shared_hicache_hit_length, 4)
             self.assertEqual(len(manager.tree_cache.insert_calls), 1)
         finally:
-            manager._fetch_executor.shutdown(wait=False, cancel_futures=True)
+            manager._source_transfer_executor.shutdown(wait=False, cancel_futures=True)
 
     def test_manager_releases_failed_direct_transfer_target_pages(self):
         for reason, expected_freed, expect_quarantine in (
@@ -438,7 +503,7 @@ class TestSharedHiCache(unittest.TestCase):
                     plan_offset=0,
                     target_start_block=0,
                     expected_hashes=plan.planned_hashes,
-                    future=_completed_future(([], reason)),
+                    transfer=FakeTransferHandle(([], reason), status=KVPoll.Failed),
                     device_indices=device_indices,
                     backend="nixl",
                     submitted_at=time.perf_counter(),
@@ -453,13 +518,95 @@ class TestSharedHiCache(unittest.TestCase):
                     manager.target_cache.quarantined_device_indices,
                     [device_indices] if expect_quarantine else [],
                 )
+                manager._source_transfer_executor.shutdown(
+                    wait=False, cancel_futures=True
+                )
+
+    def test_manager_source_transfer_submit_returns_before_transfer_completes(self):
+        tree = FakeTree()
+        manager = _make_manager(tree)
+        plan = SharedHiCachePlan.from_dict(
+            _make_plan([11], source_worker_id=manager.worker_id)
+        )
+        node = TreeNode()
+        node.host_value = torch.tensor([0, 2], dtype=torch.int64)
+        node.hash_value = ["aa" * 32]
+        transfer_started = threading.Event()
+        release_transfer = threading.Event()
+
+        def lookup(wanted_hashes, *, protect=False):
+            node.protect_host()
+            return {11: (node, 0, "aa" * 32)}, [node]
+
+        def blocking_transfer(**kwargs):
+            transfer_started.set()
+            release_transfer.wait(timeout=2)
+            manager.direct_transfer.calls.append(kwargs)
+
+        tree.lookup_hicache_host_blocks = lookup
+        manager.direct_transfer.transfer_pages = blocking_transfer
+        sent_messages = []
+        manager.source_service = SimpleNamespace(
+            send=lambda endpoint, payload: sent_messages.append(
+                (endpoint, dict(payload))
+            )
+        )
+        payload = {
+            "kind": "shared_hicache_transfer_request",
+            "transfer_id": "transfer-1",
+            "target_control_endpoint": "tcp://127.0.0.1:49999",
+            "plan": plan.to_dict(),
+            "start_block": 0,
+            "max_blocks": 1,
+            "target_session_id": "target-session",
+            "transfer_backend": "nixl",
+            "target_metadata": {
+                "backend": "nixl",
+                "session_id": "target-session",
+                "tp_rank": 0,
+                "tp_size": 1,
+            },
+            "target_kv_ptrs": [1],
+            "target_kv_item_lens": [64],
+            "target_page_indices": [0],
+        }
+
+        try:
+            response = manager._handle_source_transfer(payload)
+
+            self.assertTrue(response["accepted"])
+            self.assertEqual(response["transfer_id"], "transfer-1")
+            self.assertTrue(transfer_started.wait(timeout=1))
+            with manager._source_transfer_lock:
+                self.assertIn("transfer-1", manager._source_transfers)
+
+            release_transfer.set()
+            for _ in range(100):
+                if sent_messages:
+                    break
+                time.sleep(0.01)
+
+            self.assertEqual(sent_messages[0][0], "tcp://127.0.0.1:49999")
+            status = sent_messages[0][1]
+            self.assertEqual(status["kind"], "shared_hicache_transfer_done")
+            self.assertTrue(status["ok"])
+            self.assertEqual(status["transferred_blocks"], 1)
+            self.assertEqual(len(manager.direct_transfer.calls), 1)
+            self.assertEqual(node.host_ref_counter, 0)
+            with manager._source_transfer_lock:
+                self.assertNotIn("transfer-1", manager._source_transfers)
+        finally:
+            release_transfer.set()
+            manager._source_transfer_executor.shutdown(wait=False, cancel_futures=True)
 
     def test_source_transfer_rejects_wrong_tp_rank_metadata(self):
         plan = SharedHiCachePlan.from_dict(
             _make_plan([11], source_tp_size=2, target_tp_size=2)
         )
-        response = handle_source_transfer(
+        request, error = parse_source_transfer_request(
             payload={
+                "transfer_id": "transfer-1",
+                "target_control_endpoint": "tcp://127.0.0.1:49999",
                 "plan": plan.to_dict(),
                 "start_block": 0,
                 "max_blocks": 1,
@@ -475,6 +622,13 @@ class TestSharedHiCache(unittest.TestCase):
                 "target_kv_item_lens": [64],
                 "target_page_indices": [0],
             },
+            transfer_backend=FakeDirectTransfer(),
+            tree_cache=FakeTree(),
+        )
+        self.assertIsNone(error)
+
+        response = execute_source_transfer_request(
+            request=request,
             transfer_backend=FakeDirectTransfer(),
             tree_cache=FakeTree(),
             worker_id=7,
@@ -505,8 +659,8 @@ class TestSharedHiCache(unittest.TestCase):
         source_agent = FakeNixlAgent("source-agent", b"source-metadata")
         target_agent = FakeNixlAgent("target-agent", b"target-metadata")
         source_backend = NixlSharedHiCacheTransferBackend(
-            agent=source_agent,
-            agent_name="source-agent",
+            agent=FakeNixlAgent("source-target-agent", b"source-target-metadata"),
+            agent_name="source-target-agent",
             backend_name="UCX",
             tree_cache=tree,
             target_kv_ptrs=[1_000_000, 2_000_000],
@@ -528,23 +682,241 @@ class TestSharedHiCache(unittest.TestCase):
         )
         source_backend._register_source_host_pool()
 
-        source_backend.transfer_pages(
-            target_session_id=target_backend.target_session_id,
-            source_page_indices=torch.tensor([1, 2], dtype=torch.int32).numpy(),
-            target_page_indices=torch.tensor([3, 4], dtype=torch.int32).numpy(),
-            target_kv_ptrs=target_backend.target_kv_ptrs,
-            target_kv_item_lens=target_backend.target_kv_item_lens,
-            target_metadata=target_backend.target_descriptor(),
-        )
+        with patch(
+            "sglang.srt.mem_cache.shared_hicache.transfer._create_nixl_agent",
+            return_value=(source_agent, "source-agent", "UCX"),
+        ):
+            source_backend.transfer_pages(
+                target_session_id=target_backend.target_session_id,
+                source_page_indices=torch.tensor([1, 2], dtype=torch.int32).numpy(),
+                target_page_indices=torch.tensor([3, 4], dtype=torch.int32).numpy(),
+                target_kv_ptrs=target_backend.target_kv_ptrs,
+                target_kv_item_lens=target_backend.target_kv_item_lens,
+                target_metadata=target_backend.target_descriptor(),
+                notification="shared-hicache-notification",
+            )
 
         self.assertTrue(source_backend.enabled)
+        self.assertEqual(source_agent.registered[0][0], "DRAM")
         self.assertEqual(source_agent.remote_agents, [b"target-metadata"])
         self.assertEqual(source_agent.xfer_desc_calls[0][0], "DRAM")
         self.assertEqual(source_agent.xfer_desc_calls[1][0], "VRAM")
         self.assertEqual(source_agent.initialized[0][0], "WRITE")
         self.assertEqual(source_agent.initialized[0][3], "target-agent")
+        self.assertEqual(source_agent.initialized[0][4], b"shared-hicache-notification")
         self.assertEqual(source_agent.transfers, ["handle-1"])
         self.assertEqual(source_agent.released, ["handle-1"])
+
+    def test_nixl_backend_polls_target_transfer_notifications(self):
+        page_size = 2
+        source_k = torch.zeros((20, 4), dtype=torch.uint8)
+        host_buffer = torch.zeros((64,), dtype=torch.uint8)
+        item_len = source_k[0].nbytes * page_size
+        tree = SimpleNamespace(
+            page_size=page_size,
+            cache_controller=SimpleNamespace(
+                mem_pool_host=SimpleNamespace(
+                    layout="layer_first",
+                    kv_buffer=host_buffer,
+                    k_data_refs=[source_k],
+                    v_data_refs=[source_k],
+                )
+            ),
+        )
+        target_agent = FakeNixlAgent("target-agent", b"target-metadata")
+        target_backend = NixlSharedHiCacheTransferBackend(
+            agent=target_agent,
+            agent_name="target-agent",
+            backend_name="UCX",
+            tree_cache=tree,
+            target_kv_ptrs=[1_000_000, 2_000_000],
+            target_kv_item_lens=[item_len, item_len],
+            target_registered=True,
+            gpu_id=2,
+            transfer_parallelism=1,
+        )
+        target_agent.notifications = {
+            "source-agent": [
+                build_shared_hicache_transfer_notification(
+                    transfer_id="transfer-1",
+                    transferred_blocks=3,
+                    reason="partial",
+                ).encode("utf-8")
+            ]
+        }
+
+        self.assertEqual(
+            target_backend.pop_target_transfer_notification("transfer-1"),
+            (3, "partial"),
+        )
+        self.assertIsNone(target_backend.pop_target_transfer_notification("transfer-1"))
+
+    def test_nixl_backend_uses_per_thread_source_agents_for_concurrent_transfers(self):
+        page_size = 2
+        source_k = torch.zeros((20, 4), dtype=torch.uint8)
+        source_v = torch.zeros((20, 4), dtype=torch.uint8)
+        host_buffer = torch.zeros((64,), dtype=torch.uint8)
+        item_len = source_k[0].nbytes * page_size
+        tree = SimpleNamespace(
+            page_size=page_size,
+            cache_controller=SimpleNamespace(
+                mem_pool_host=SimpleNamespace(
+                    layout="layer_first",
+                    kv_buffer=host_buffer,
+                    k_data_refs=[source_k],
+                    v_data_refs=[source_v],
+                )
+            ),
+        )
+        target_backend = NixlSharedHiCacheTransferBackend(
+            agent=FakeNixlAgent("target-agent", b"target-metadata"),
+            agent_name="target-agent",
+            backend_name="UCX",
+            tree_cache=tree,
+            target_kv_ptrs=[1_000_000, 2_000_000],
+            target_kv_item_lens=[item_len, item_len],
+            target_registered=True,
+            gpu_id=2,
+            transfer_parallelism=1,
+        )
+        shared_in_flight = {"current": 0, "max": 0}
+        shared_lock = threading.Lock()
+
+        class BlockingNixlAgent(FakeNixlAgent):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+
+            def transfer(self, handle):
+                with shared_lock:
+                    shared_in_flight["current"] += 1
+                    shared_in_flight["max"] = max(
+                        shared_in_flight["max"], shared_in_flight["current"]
+                    )
+                try:
+                    self.transfers.append(handle)
+                    time.sleep(0.05)
+                finally:
+                    with shared_lock:
+                        shared_in_flight["current"] -= 1
+                return "DONE"
+
+        source_backend = NixlSharedHiCacheTransferBackend(
+            agent=FakeNixlAgent("source-target-agent", b"source-target-metadata"),
+            agent_name="source-target-agent",
+            backend_name="UCX",
+            tree_cache=tree,
+            target_kv_ptrs=[1_000_000, 2_000_000],
+            target_kv_item_lens=[item_len, item_len],
+            target_registered=True,
+            gpu_id=1,
+            transfer_parallelism=1,
+        )
+        source_backend._register_source_host_pool()
+        self.assertTrue(source_backend.enabled)
+        source_agents = [
+            BlockingNixlAgent("source-agent-1", b"source-metadata-1"),
+            BlockingNixlAgent("source-agent-2", b"source-metadata-2"),
+        ]
+
+        def run_transfer():
+            source_backend.transfer_pages(
+                target_session_id=target_backend.target_session_id,
+                source_page_indices=torch.tensor([1, 2], dtype=torch.int32).numpy(),
+                target_page_indices=torch.tensor([3, 4], dtype=torch.int32).numpy(),
+                target_kv_ptrs=target_backend.target_kv_ptrs,
+                target_kv_item_lens=target_backend.target_kv_item_lens,
+                target_metadata=target_backend.target_descriptor(),
+            )
+
+        start = time.perf_counter()
+        with patch(
+            "sglang.srt.mem_cache.shared_hicache.transfer._create_nixl_agent",
+            side_effect=[
+                (source_agents[0], "source-agent-1", "UCX"),
+                (source_agents[1], "source-agent-2", "UCX"),
+            ],
+        ):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(run_transfer) for _ in range(2)]
+                for future in futures:
+                    future.result(timeout=3)
+        elapsed = time.perf_counter() - start
+
+        self.assertEqual(shared_in_flight["max"], 2)
+        self.assertLess(elapsed, 0.095)
+        for source_agent in source_agents:
+            self.assertEqual(source_agent.registered[0][0], "DRAM")
+            self.assertEqual(source_agent.remote_agents, [b"target-metadata"])
+            self.assertEqual(
+                [call[0] for call in source_agent.xfer_desc_calls],
+                ["DRAM", "VRAM"],
+            )
+            self.assertEqual(source_agent.transfers, ["handle-1"])
+            self.assertEqual(source_agent.released, ["handle-1"])
+
+    def test_hiradix_shared_hicache_write_check_skips_empty_local_queue(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache.enable_shared_hicache = True
+        cache.ongoing_write_through = {}
+        cache.cache_controller = SimpleNamespace(ack_write_queue=[])
+        cache._all_reduce_attn_groups = Mock(side_effect=AssertionError)
+
+        cache.writing_check()
+
+        cache._all_reduce_attn_groups.assert_not_called()
+
+    def test_hiradix_shared_hicache_write_check_does_not_drain_without_local_ack_queue(
+        self,
+    ):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache.enable_shared_hicache = True
+        cache.ongoing_write_through = {123: SimpleNamespace(id=123)}
+        cache.cache_controller = SimpleNamespace(ack_write_queue=[])
+        cache._all_reduce_attn_groups = Mock(side_effect=AssertionError)
+
+        cache.writing_check()
+
+        cache._all_reduce_attn_groups.assert_not_called()
+        self.assertEqual(list(cache.ongoing_write_through), [123])
+
+    def test_hiradix_shared_hicache_write_check_drains_local_queue(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache.enable_shared_hicache = True
+        cache.enable_storage = False
+        node = SimpleNamespace(id=123)
+        cache.ongoing_write_through = {node.id: node}
+
+        class DoneEvent:
+            def __init__(self):
+                self.synchronized = False
+
+            def query(self):
+                return True
+
+            def synchronize(self):
+                self.synchronized = True
+
+        finish_event = DoneEvent()
+        cache.cache_controller = SimpleNamespace(
+            ack_write_queue=[(None, finish_event, [node.id])]
+        )
+        stored = []
+        unlocked = []
+
+        cache._all_reduce_attn_groups = Mock(side_effect=AssertionError)
+        cache._record_store_event = lambda node, medium=None: stored.append(
+            (node, medium)
+        )
+        cache.dec_lock_ref = lambda node: unlocked.append(node)
+
+        cache.writing_check()
+
+        cache._all_reduce_attn_groups.assert_not_called()
+        self.assertTrue(finish_event.synchronized)
+        self.assertEqual(cache.cache_controller.ack_write_queue, [])
+        self.assertEqual(cache.ongoing_write_through, {})
+        self.assertEqual(stored, [(node, StorageMedium.CPU)])
+        self.assertEqual(unlocked, [node])
 
     def test_metrics_use_reason_code_labels(self):
         collector = SchedulerMetricsCollector.__new__(SchedulerMetricsCollector)
@@ -608,7 +980,7 @@ class TestSharedHiCache(unittest.TestCase):
             pending_rids = scheduler._prepare_shared_hicache_for_schedule_batch(reqs)
 
         self.assertEqual(pending_rids, {"rid-2"})
-        self.assertEqual(all_reduce_shapes, [(3,), (2,), (1,)])
+        self.assertEqual(all_reduce_shapes, [(3,), (2,), (2,), (1,)])
         self.assertEqual(manager.prepared, ["rid-1", "rid-2"])
         self.assertEqual(reqs[0].shared_hicache_max_prefix_len, 6)
 
@@ -639,6 +1011,21 @@ class TestSharedHiCache(unittest.TestCase):
         self.assertEqual([req.rid for req in candidates], ["rid-0", "rid-1", "rid-2"])
         self.assertEqual(bounded_manager.prepared, ["rid-0", "rid-1", "rid-2"])
         self.assertEqual(bounded_reqs[3].init_calls, [])
+
+    def test_scheduler_keeps_local_prefix_when_shared_hicache_prefix_is_shorter(self):
+        manager = FakeSharedHiCacheScheduleManager(
+            plans={"rid-1": True},
+            results={"rid-1": SimpleNamespace(pending=False, prefix_len=8)},
+        )
+        scheduler = FakeSharedHiCacheScheduler(manager, tp_size=1)
+        req = FakeSharedHiCacheReq("rid-1", local_prefix_len=24)
+
+        pending_rids = scheduler._prepare_shared_hicache_for_schedule_batch([req])
+
+        self.assertEqual(pending_rids, set())
+        self.assertEqual(manager.prepared, ["rid-1"])
+        self.assertEqual(req.init_calls[0]["max_prefix_len"], None)
+        self.assertEqual(req.shared_hicache_max_prefix_len, 24)
 
     def test_scheduler_falls_back_on_divergent_shared_hicache_plan(self):
         manager = FakeSharedHiCacheScheduleManager(

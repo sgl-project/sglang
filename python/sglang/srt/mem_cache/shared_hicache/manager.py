@@ -4,6 +4,7 @@ import atexit
 import logging
 import threading
 import time
+import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Mapping, Optional
@@ -11,14 +12,17 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.mem_cache.radix_cache import TreeNode
 from sglang.srt.mem_cache.shared_hicache.config import (
     SharedHiCacheConfig,
     shared_hicache_timeout_secs,
 )
 from sglang.srt.mem_cache.shared_hicache.control import (
+    SHARED_HICACHE_TRANSFER_DONE,
+    SHARED_HICACHE_TRANSFER_REQUEST,
+    SharedHiCacheTransferHandle,
     is_indeterminate_direct_transfer_reason,
-    request_source_transfer,
 )
 from sglang.srt.mem_cache.shared_hicache.pending import (
     SharedHiCachePendingFetch,
@@ -38,8 +42,8 @@ from sglang.srt.mem_cache.shared_hicache.service import (
     format_control_endpoint,
 )
 from sglang.srt.mem_cache.shared_hicache.source import (
-    ResolvedHostPage,
-    handle_source_transfer,
+    execute_source_transfer_request,
+    parse_source_transfer_request,
 )
 from sglang.srt.mem_cache.shared_hicache.target import SharedHiCacheTarget
 from sglang.srt.mem_cache.shared_hicache.transfer import (
@@ -54,8 +58,6 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
-
-SHARED_HICACHE_MAX_CONTROL_BODY_BYTES = 16 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -104,17 +106,24 @@ class SharedHiCacheManager:
         self.endpoint = self._format_local_control_endpoint(endpoint_spec)
         self.source_service: Optional[SharedHiCacheSourceService] = None
         self._shutdown = False
-        worker_limit = max(
+        fetch_worker_limit = max(
             1,
             int(envs.SGLANG_SHARED_HICACHE_FETCH_WORKERS.get()),
         )
-        self._fetch_semaphore = threading.BoundedSemaphore(worker_limit)
-        self._fetch_executor = ThreadPoolExecutor(
-            max_workers=worker_limit,
-            thread_name_prefix=f"shared_hicache-fetch-tp{self.tp_rank}",
+        self._target_transfer_capacity = threading.BoundedSemaphore(fetch_worker_limit)
+        source_worker_limit = 1
+        self._source_transfer_executor = ThreadPoolExecutor(
+            max_workers=source_worker_limit,
+            thread_name_prefix=f"shared_hicache-source-xfer-tp{self.tp_rank}",
         )
+        self._source_transfer_capacity = threading.BoundedSemaphore(
+            max(8, fetch_worker_limit * 2)
+        )
+        self._source_transfer_lock = threading.Lock()
+        self._source_transfers: dict[str, Future] = {}
+        self._target_transfer_lock = threading.Lock()
+        self._target_transfer_completions: dict[str, Mapping[str, Any]] = {}
         self._pending_fetches: dict[str, SharedHiCachePendingFetch] = {}
-        self._detached_fetches: set[Future] = set()
         self.target_cache = SharedHiCacheTarget(
             tree_cache=tree_cache,
             metrics_collector=metrics_collector,
@@ -129,21 +138,17 @@ class SharedHiCacheManager:
             self.source_service = SharedHiCacheSourceService(
                 endpoint=self.endpoint,
                 worker_id=self.worker_id,
-                worker_limit=worker_limit,
-                max_body_bytes=lambda: SHARED_HICACHE_MAX_CONTROL_BODY_BYTES,
-                direct_transfer_enabled=self._direct_transfer_enabled,
-                handle_source_transfer=self._handle_source_transfer,
+                handle_control_message=self._handle_control_message,
             )
             self.source_service.start()
+            self._prewarm_source_transfer_workers(source_worker_limit)
         atexit.register(self.shutdown)
 
     def _set_parallel_metadata(
         self,
         parallel_metadata: Optional[Mapping[str, int]],
     ) -> None:
-        metadata = {
-            key: int(value) for key, value in (parallel_metadata or {}).items()
-        }
+        metadata = {key: int(value) for key, value in (parallel_metadata or {}).items()}
         self.tp_rank = int(metadata.get("tp_rank", 0))
         self.tp_size = int(metadata.get("tp_size", 1))
         self.pp_rank = int(metadata.get("pp_rank", 0))
@@ -169,9 +174,7 @@ class SharedHiCacheManager:
         if endpoint is None:
             return None
         fields = endpoint_format_fields(endpoint_spec)
-        if self.tp_size > 1 and not fields.intersection(
-            {"tp_rank"}
-        ):
+        if self.tp_size > 1 and not fields.intersection({"tp_rank"}):
             logger.warning(
                 "SharedHiCache source resolver endpoint must include {tp_rank} "
                 "when tp_size=%d; not starting source resolver for this rank",
@@ -267,14 +270,40 @@ class SharedHiCacheManager:
             getattr(direct_transfer, "enabled", False)
         )
 
+    def _prewarm_source_transfer_workers(self, worker_limit: int) -> None:
+        direct_transfer = getattr(self, "direct_transfer", None)
+        prepare = getattr(direct_transfer, "prepare_source_worker", None)
+        if not self._direct_transfer_enabled() or not callable(prepare):
+            return
+        barrier = threading.Barrier(worker_limit) if int(worker_limit) > 1 else None
+
+        def _prepare() -> None:
+            if barrier is not None:
+                barrier.wait(timeout=30.0)
+            prepare()
+
+        futures = [
+            self._source_transfer_executor.submit(_prepare)
+            for _ in range(int(worker_limit))
+        ]
+        for future in futures:
+            try:
+                future.result(timeout=30.0)
+            except Exception:
+                logger.warning(
+                    "SharedHiCache source transfer worker prewarm failed",
+                    exc_info=True,
+                )
+                return
+
     def _try_acquire_fetch_worker(self) -> bool:
-        semaphore = getattr(self, "_fetch_semaphore", None)
+        semaphore = getattr(self, "_target_transfer_capacity", None)
         if semaphore is None:
             return True
         return semaphore.acquire(blocking=False)
 
     def _release_fetch_worker(self) -> None:
-        semaphore = getattr(self, "_fetch_semaphore", None)
+        semaphore = getattr(self, "_target_transfer_capacity", None)
         if semaphore is None:
             return
         try:
@@ -284,13 +313,8 @@ class SharedHiCacheManager:
                 "SharedHiCache fetch worker semaphore release ignored", exc_info=True
             )
 
-    def _on_pending_fetch_done(
-        self, pending: SharedHiCachePendingFetch, future: Future
-    ) -> None:
-        try:
-            pending.done_at = time.perf_counter()
-        finally:
-            self._release_fetch_worker()
+    def _finish_target_transfer_capacity(self) -> None:
+        self._release_fetch_worker()
 
     def _shutdown_direct_transfer_backend(self) -> None:
         direct_transfer = getattr(self, "direct_transfer", None)
@@ -348,7 +372,6 @@ class SharedHiCacheManager:
         for pending in self._pending_fetches.values():
             self._release_pending_fetch(pending)
         self._pending_fetches.clear()
-        self._fetch_executor.shutdown(wait=False, cancel_futures=True)
 
         timeout_secs = float(getattr(self, "timeout_secs", 0.0))
         deadline = time.monotonic() + min(max(timeout_secs, 0.0), 5.0)
@@ -359,9 +382,15 @@ class SharedHiCacheManager:
             logger.warning(
                 "Deferring direct transfer backend shutdown while SharedHiCache work is still pending"
             )
+            source_transfer_executor = getattr(self, "_source_transfer_executor", None)
+            if source_transfer_executor is not None:
+                source_transfer_executor.shutdown(wait=False, cancel_futures=True)
             self._defer_direct_transfer_shutdown()
             return
 
+        source_transfer_executor = getattr(self, "_source_transfer_executor", None)
+        if source_transfer_executor is not None:
+            source_transfer_executor.shutdown(wait=False, cancel_futures=True)
         self.target_cache.release_quarantined_device_indices()
         self._shutdown_direct_transfer_backend()
 
@@ -385,37 +414,159 @@ class SharedHiCacheManager:
             add(format_control_endpoint(plan.source_endpoint, values))
         return endpoints
 
-    def _request_source_transfer(
-        self,
-        *,
-        transfer_backend: SharedHiCacheTransferBackend,
-        endpoints: list[str],
-        plan: SharedHiCachePlan,
-        start_block: int,
-        max_blocks: int,
-        target_page_indices: list[int],
-    ) -> tuple[list[ResolvedHostPage], str]:
-        return request_source_transfer(
-            transfer_backend=transfer_backend,
-            endpoints=endpoints,
-            plan=plan,
-            start_block=start_block,
-            max_blocks=max_blocks,
-            target_page_indices=target_page_indices,
-            timeout_secs=self.timeout_secs,
-        )
+    def _send_control_message(self, endpoint: str, payload: Mapping[str, Any]) -> None:
+        source_service = getattr(self, "source_service", None)
+        if source_service is None:
+            raise RuntimeError("SharedHiCache ZMQ control service is not running")
+        source_service.send(endpoint, payload)
+
+    def _handle_control_message(self, payload: Mapping[str, Any]) -> None:
+        kind = str(payload.get("kind") or "")
+        if kind == SHARED_HICACHE_TRANSFER_REQUEST:
+            response = self._handle_source_transfer(payload)
+            if not response.get("accepted"):
+                target_endpoint = str(payload.get("target_control_endpoint") or "")
+                if target_endpoint:
+                    self._send_transfer_done(target_endpoint, response)
+            return
+        if kind == SHARED_HICACHE_TRANSFER_DONE:
+            self._handle_target_transfer_done(payload)
+            return
+        logger.warning("Ignoring unknown SharedHiCache control message kind=%s", kind)
+
+    def _send_transfer_done(self, endpoint: str, payload: Mapping[str, Any]) -> None:
+        message = dict(payload)
+        message["kind"] = SHARED_HICACHE_TRANSFER_DONE
+        message["pending"] = False
+        try:
+            self._send_control_message(endpoint, message)
+        except Exception:
+            logger.warning(
+                "SharedHiCache failed to send transfer completion endpoint=%s transfer_id=%s",
+                endpoint,
+                message.get("transfer_id"),
+                exc_info=True,
+            )
+
+    def _handle_target_transfer_done(self, payload: Mapping[str, Any]) -> None:
+        transfer_id = str(payload.get("transfer_id") or "")
+        if not transfer_id:
+            logger.warning("Ignoring SharedHiCache transfer_done without transfer_id")
+            return
+        with self._target_transfer_lock:
+            self._target_transfer_completions[transfer_id] = dict(payload)
+
+    def _pop_target_transfer_completion(
+        self, transfer_id: str
+    ) -> Optional[Mapping[str, Any]]:
+        with self._target_transfer_lock:
+            return self._target_transfer_completions.pop(str(transfer_id), None)
 
     def _handle_source_transfer(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
-        return handle_source_transfer(
+        transfer_id = str(payload.get("transfer_id") or uuid.uuid4().hex)
+        target_endpoint = str(payload.get("target_control_endpoint") or "")
+        payload = dict(payload)
+        payload["transfer_id"] = transfer_id
+        request, error = parse_source_transfer_request(
             payload=payload,
             transfer_backend=self.direct_transfer,
             tree_cache=getattr(self, "tree_cache", None),
-            worker_id=getattr(self, "worker_id", None),
-            tp_rank=getattr(self, "tp_rank", 0),
-            tp_size=getattr(self, "tp_size", 1),
-            pp_size=getattr(self, "pp_size", 1),
-            attn_cp_size=getattr(self, "attn_cp_size", 1),
         )
+        if error is not None:
+            response = dict(error)
+            response.setdefault("ok", False)
+            response["transfer_id"] = transfer_id
+            response["transferred_blocks"] = 0
+            return response
+        assert request is not None
+
+        source_transfer_lock = getattr(self, "_source_transfer_lock", None)
+        source_transfers = getattr(self, "_source_transfers", None)
+        if source_transfer_lock is None or source_transfers is None:
+            return {
+                "ok": False,
+                "reason": "source_transfer_queue_unavailable",
+                "transfer_id": transfer_id,
+                "transferred_blocks": 0,
+            }
+        capacity = getattr(self, "_source_transfer_capacity", None)
+        if capacity is None or not capacity.acquire(blocking=False):
+            return {
+                "ok": False,
+                "reason": "source_transfer_queue_full",
+                "transfer_id": transfer_id,
+                "transferred_blocks": 0,
+                "block_size_tokens": self.tree_cache.page_size,
+            }
+        with source_transfer_lock:
+            if transfer_id in source_transfers:
+                capacity.release()
+                return {
+                    "ok": False,
+                    "reason": "duplicate_transfer_id",
+                    "transfer_id": transfer_id,
+                    "transferred_blocks": 0,
+                    "block_size_tokens": self.tree_cache.page_size,
+                }
+        try:
+            future = self._source_transfer_executor.submit(
+                execute_source_transfer_request,
+                request=request,
+                transfer_backend=self.direct_transfer,
+                tree_cache=getattr(self, "tree_cache", None),
+                worker_id=getattr(self, "worker_id", None),
+                tp_rank=getattr(self, "tp_rank", 0),
+                tp_size=getattr(self, "tp_size", 1),
+                pp_size=getattr(self, "pp_size", 1),
+                attn_cp_size=getattr(self, "attn_cp_size", 1),
+            )
+        except Exception:
+            capacity.release()
+            raise
+
+        def _complete_source_transfer(done_future: Future) -> None:
+            response: Mapping[str, Any]
+            try:
+                response = dict(done_future.result())
+            except Exception:
+                logger.exception(
+                    "SharedHiCache source transfer job failed transfer_id=%s",
+                    transfer_id,
+                )
+                response = {
+                    "ok": False,
+                    "reason": "source_transfer_exception",
+                    "transferred_blocks": 0,
+                    "block_size_tokens": self.tree_cache.page_size,
+                }
+            response = dict(response)
+            response["transfer_id"] = transfer_id
+            self._send_transfer_done(
+                target_endpoint or request.target_control_endpoint, response
+            )
+            try:
+                capacity.release()
+            except ValueError:
+                logger.debug(
+                    "SharedHiCache source transfer capacity release ignored",
+                    exc_info=True,
+                )
+            with source_transfer_lock:
+                if source_transfers.get(transfer_id) is done_future:
+                    source_transfers.pop(transfer_id, None)
+
+        future.add_done_callback(_complete_source_transfer)
+        with source_transfer_lock:
+            source_transfers[transfer_id] = future
+
+        return {
+            "ok": True,
+            "accepted": True,
+            "pending": True,
+            "reason": "accepted",
+            "transfer_id": transfer_id,
+            "block_size_tokens": self.tree_cache.page_size,
+        }
 
     def _max_cacheable_blocks(self, req: "Req") -> int:
         max_prefix_len = max(len(req.fill_ids) - 1, 0)
@@ -469,17 +620,21 @@ class SharedHiCacheManager:
         return str(req.rid), plan.plan_id
 
     def has_pending(self) -> bool:
-        detached_fetches = getattr(self, "_detached_fetches", set())
-        for future in list(detached_fetches):
-            if future.done():
-                detached_fetches.discard(future)
+        source_transfer_count = 0
+        source_transfer_lock = getattr(self, "_source_transfer_lock", None)
+        source_transfers = getattr(self, "_source_transfers", {})
+        if source_transfer_lock is not None:
+            with source_transfer_lock:
+                source_transfer_count = sum(
+                    1 for future in source_transfers.values() if not future.done()
+                )
         source_service = getattr(self, "source_service", None)
         active_source_count = (
             source_service.active_count() if source_service is not None else 0
         )
         return (
             bool(getattr(self, "_pending_fetches", {}))
-            or bool(detached_fetches)
+            or source_transfer_count > 0
             or active_source_count > 0
         )
 
@@ -498,32 +653,27 @@ class SharedHiCacheManager:
         self.tree_cache.dec_lock_ref(locked_node)
 
     def _release_pending_fetch(self, pending: SharedHiCachePendingFetch) -> None:
-        cancelled = pending.future.cancel()
         self._unlock_pending_prefix(pending)
         if pending.device_indices is None:
+            self._finish_target_transfer_capacity()
             return
         backend = getattr(pending, "backend", self._current_backend_label())
-        if cancelled:
-            self.target_cache.free_device_indices(pending.device_indices)
-        elif pending.future.done():
-            self.target_cache.release_device_indices_after_fetch_done(
-                pending.future, pending.device_indices, backend=backend
-            )
+        transfer = pending.transfer
+        if transfer.done():
+            _, reason = transfer.result()
+            if is_indeterminate_direct_transfer_reason(reason):
+                self.target_cache.quarantine_device_indices(
+                    pending.device_indices, reason, backend=backend
+                )
+            else:
+                self.target_cache.free_device_indices(pending.device_indices)
         else:
-            detached_fetches = getattr(self, "_detached_fetches", None)
-            if detached_fetches is None:
-                detached_fetches = self._detached_fetches = set()
-            detached_fetches.add(pending.future)
-
-            def _free_detached_fetch(_future, device_indices=pending.device_indices):
-                try:
-                    self.target_cache.release_device_indices_after_fetch_done(
-                        _future, device_indices, backend=backend
-                    )
-                finally:
-                    detached_fetches.discard(_future)
-
-            pending.future.add_done_callback(_free_detached_fetch)
+            self.target_cache.quarantine_device_indices(
+                pending.device_indices,
+                SHARED_HICACHE_DIRECT_TIMEOUT_REASON,
+                backend=backend,
+            )
+        self._finish_target_transfer_capacity()
 
     def _submit_direct_transfer(
         self,
@@ -532,7 +682,7 @@ class SharedHiCacheManager:
         start_block: int,
         max_blocks: int,
         token_count: int,
-    ) -> tuple[Optional[Future], Optional[torch.Tensor]]:
+    ) -> tuple[Optional[SharedHiCacheTransferHandle], Optional[torch.Tensor]]:
         direct_transfer = getattr(self, "direct_transfer", None)
         if not self._direct_transfer_enabled():
             return None, None
@@ -557,21 +707,40 @@ class SharedHiCacheManager:
             self.target_cache.free_device_indices(device_indices)
             self._release_fetch_worker()
             return None, None
+        transfer_id = uuid.uuid4().hex
+        handle = SharedHiCacheTransferHandle(
+            transfer_backend=direct_transfer,
+            transfer_id=transfer_id,
+            plan=plan,
+            start_block=start_block,
+            max_blocks=max_blocks,
+            timeout_secs=self.timeout_secs,
+            pop_source_completion=self._pop_target_transfer_completion,
+        )
+        target_descriptor = direct_transfer.target_descriptor()
         try:
-            future = self._fetch_executor.submit(
-                self._request_source_transfer,
-                transfer_backend=direct_transfer,
-                endpoints=endpoints,
-                plan=plan,
-                start_block=start_block,
-                max_blocks=max_blocks,
-                target_page_indices=target_page_indices,
+            self._send_control_message(
+                endpoints[0],
+                {
+                    "kind": SHARED_HICACHE_TRANSFER_REQUEST,
+                    "transfer_id": transfer_id,
+                    "target_control_endpoint": self.endpoint,
+                    "plan": plan.to_dict(),
+                    "start_block": start_block,
+                    "max_blocks": max_blocks,
+                    "target_session_id": direct_transfer.target_session_id,
+                    "transfer_backend": direct_transfer.name,
+                    "target_metadata": target_descriptor,
+                    "target_kv_ptrs": direct_transfer.target_kv_ptrs,
+                    "target_kv_item_lens": direct_transfer.target_kv_item_lens,
+                    "target_page_indices": target_page_indices,
+                },
             )
         except Exception:
             self.target_cache.free_device_indices(device_indices)
             self._release_fetch_worker()
             raise
-        return future, device_indices
+        return handle, device_indices
 
     def has_reuse_plan(self, req: "Req") -> bool:
         plan = getattr(req, "shared_hicache_plan", None)
@@ -693,7 +862,7 @@ class SharedHiCacheManager:
             if pending.plan.plan_id != plan.plan_id:
                 self._pending_fetches.pop(str(req.rid), None)
                 self._release_pending_fetch(pending)
-            elif not pending.future.done():
+            elif pending.transfer.poll() not in (KVPoll.Success, KVPoll.Failed):
                 stop_waiting, reason = pending_should_stop_waiting(
                     pending,
                     policy=str(getattr(self, "prefetch_stop_policy", "timeout")),
@@ -731,7 +900,7 @@ class SharedHiCacheManager:
         expected_hashes = plan.planned_hashes[plan_offset:planned_blocks]
         max_blocks = planned_blocks - plan_offset
         token_count = max_blocks * page_size
-        future = None
+        transfer = None
         device_indices = None
         direct_transfer_enabled = self._direct_transfer_enabled()
         if not direct_transfer_enabled:
@@ -760,7 +929,7 @@ class SharedHiCacheManager:
             if direct_transfer_enabled:
                 locked_node = self._lock_request_prefix(req)
             try:
-                future, device_indices = self._submit_direct_transfer(
+                transfer, device_indices = self._submit_direct_transfer(
                     plan,
                     start_block=plan_offset,
                     max_blocks=max_blocks,
@@ -770,7 +939,7 @@ class SharedHiCacheManager:
                 if locked_node is not None:
                     self.tree_cache.dec_lock_ref(locked_node)
                 raise
-            if direct_transfer_enabled and future is None:
+            if direct_transfer_enabled and transfer is None:
                 if locked_node is not None:
                     self.tree_cache.dec_lock_ref(locked_node)
                 self._finished_plan_keys.add(plan_key)
@@ -797,7 +966,7 @@ class SharedHiCacheManager:
             plan_offset=plan_offset,
             target_start_block=plan.start_block_index + plan_offset,
             expected_hashes=expected_hashes,
-            future=future,
+            transfer=transfer,
             device_indices=device_indices,
             locked_node=locked_node,
             backend=backend,
@@ -805,11 +974,6 @@ class SharedHiCacheManager:
             submitted_at=time.perf_counter(),
         )
         self._pending_fetches[str(req.rid)] = pending
-        future.add_done_callback(
-            lambda done_future, pending=pending: self._on_pending_fetch_done(
-                pending, done_future
-            )
-        )
         return SharedHiCacheResult(pending=True)
 
     def _finish_pending_fetch(
@@ -818,10 +982,12 @@ class SharedHiCacheManager:
         self._pending_fetches.pop(str(req.rid), None)
         plan = pending.plan
         if pending.done_at <= 0:
-            pending.done_at = time.perf_counter()
+            pending.done_at = (
+                float(getattr(pending.transfer, "done_at", 0.0)) or time.perf_counter()
+            )
 
         try:
-            pages, reason = pending.future.result()
+            pages, reason = pending.transfer.result()
         except Exception:
             logger.exception(
                 "Shared HiCache fetch failed rid=%s plan_id=%s", req.rid, plan.plan_id
@@ -836,6 +1002,7 @@ class SharedHiCacheManager:
                 reason="fetch_exception",
                 wait_ms=pending_wait_ms(pending),
             )
+            self._finish_target_transfer_capacity()
             return SharedHiCacheResult()
 
         if not pages:
@@ -865,6 +1032,7 @@ class SharedHiCacheManager:
                 reason=reason,
                 wait_ms=pending_wait_ms(pending),
             )
+            self._finish_target_transfer_capacity()
             return SharedHiCacheResult()
 
         if len(pages) > len(pending.expected_hashes):
@@ -886,6 +1054,7 @@ class SharedHiCacheManager:
                 wait_ms=pending_wait_ms(pending),
                 transfer_bytes=transfer_bytes_for_pages(pending, pages),
             )
+            self._finish_target_transfer_capacity()
             return SharedHiCacheResult()
 
         expected_hashes = pending.expected_hashes[: len(pages)]
@@ -906,6 +1075,7 @@ class SharedHiCacheManager:
                 wait_ms=pending_wait_ms(pending),
                 transfer_bytes=transfer_bytes_for_pages(pending, pages),
             )
+            self._finish_target_transfer_capacity()
             return SharedHiCacheResult()
 
         insert_start = time.perf_counter()
@@ -921,6 +1091,7 @@ class SharedHiCacheManager:
                     reason="missing_target_device_indices",
                     wait_ms=pending_wait_ms(pending),
                 )
+                self._finish_target_transfer_capacity()
                 return SharedHiCacheResult()
             staged_tokens = self.target_cache.insert_device_pages(
                 req,
@@ -944,6 +1115,7 @@ class SharedHiCacheManager:
                 insert_ms=insert_ms,
                 transfer_bytes=transfer_bytes_for_pages(pending, pages),
             )
+            self._finish_target_transfer_capacity()
             return SharedHiCacheResult()
         finally:
             self._unlock_pending_prefix(pending)
@@ -959,7 +1131,7 @@ class SharedHiCacheManager:
             wait_ms = pending_wait_ms(pending)
             ready_wait_ms = pending_ready_wait_ms(pending)
             logger.info(
-                "Shared HiCache staged %d tokens rid=%s plan_id=%s source_worker=%s fetched_tokens=%d prefix_len=%d wait_ms=%s future_ready_wait_ms=%s insert_ms=%.3f direct=%s",
+                "Shared HiCache staged %d tokens rid=%s plan_id=%s source_worker=%s fetched_tokens=%d prefix_len=%d wait_ms=%s ready_wait_ms=%s insert_ms=%.3f direct=%s",
                 staged_tokens,
                 req.rid,
                 plan.plan_id,
@@ -984,4 +1156,5 @@ class SharedHiCacheManager:
             insert_ms=insert_ms,
             transfer_bytes=transfer_bytes_for_pages(pending, pages),
         )
+        self._finish_target_transfer_capacity()
         return SharedHiCacheResult(staged_tokens=staged_tokens, prefix_len=prefix_len)
