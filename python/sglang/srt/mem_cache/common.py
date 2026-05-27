@@ -428,14 +428,14 @@ def alloc_req_slots(
 
 def alloc_for_extend(
     batch: ScheduleBatch,
-) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Allocate KV cache for extend batch and write to req_to_token_pool.
 
     Returns:
         out_cache_loc: allocated cache locations
-        req_pool_indices_device: request pool indices at a device tensor
-        req_pool_indices: request pool indices as list
+        req_pool_indices_device: request pool indices as a device tensor
+        req_pool_indices_cpu: request pool indices as a CPU tensor (host mirror)
     """
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
@@ -489,7 +489,7 @@ def alloc_for_extend(
         batch.req_to_token_pool,
     )
 
-    return out_cache_loc, req_pool_indices_device, req_pool_indices
+    return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
 
 def alloc_paged_token_slots_decode(
@@ -531,7 +531,8 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     batch.maybe_evict_swa()
 
-    bs = batch.seq_lens.shape[0]
+    seq_lens_gpu = batch.seq_lens
+    bs = seq_lens_gpu.shape[0]
 
     if batch.tree_cache.page_size == 1:
         # Non-paged allocation
@@ -539,9 +540,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     else:
         # Paged allocation
         last_loc = batch.req_to_token_pool.req_to_token[
-            batch.req_pool_indices, batch.seq_lens - 1
+            batch.req_pool_indices, seq_lens_gpu - 1
         ]
-        seq_lens_next = batch.seq_lens + token_per_req
+        seq_lens_next = seq_lens_gpu + token_per_req
         out_cache_loc = alloc_paged_token_slots_decode(
             tree_cache=batch.tree_cache,
             seq_lens=seq_lens_next,
@@ -552,9 +553,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     # Write to req_to_token_pool
     if batch.model_config.is_encoder_decoder:
-        locs = batch.encoder_lens + batch.seq_lens
+        locs = batch.encoder_lens + seq_lens_gpu
     else:
-        locs = batch.seq_lens.clone()
+        locs = seq_lens_gpu.clone()
 
     batch.req_to_token_pool.write(
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
