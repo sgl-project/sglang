@@ -106,6 +106,14 @@ def _draw_random_verify_inputs(rng: random.Random) -> VerifyFuzzInputs:
             positions=positions,
         )
 
+    # Inject prev_slot == TOKEN_TO_KV_SLOT_PADDING into ~15% of entries so the differential
+    # harness exercises the chain-check-skip branch (added for SWA-evicted ancestor handling).
+    # Done AFTER stamp_clean_chain so the stored prev_hash on those slots is still chain-clean;
+    # the kernel must rely on prev_slot==padding (not on stored hash) to decide whether to skip.
+    for i in range(plan_size):
+        if rng.random() < 0.15:
+            prev_slot_indices[i] = consts.TOKEN_TO_KV_SLOT_PADDING
+
     check_verify_expected_token = rng.random() < 0.5
     expected_input_ids: list[int] = []
     for i in range(plan_size):

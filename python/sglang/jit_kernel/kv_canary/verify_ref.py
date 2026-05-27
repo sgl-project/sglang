@@ -108,7 +108,13 @@ def launch_canary_verify_kernel_torch_reference(
             buf_i64[slot_idx, consts.CANARY_FIELD_REAL_KV_HASH].item()
         )
 
-        expected_chain_hash = _to_signed_int64(compute_slot_hash(buf_i64, prev_slot))
+        prev_reachable = prev_slot != consts.TOKEN_TO_KV_SLOT_PADDING
+        if prev_reachable:
+            expected_chain_hash = _to_signed_int64(
+                compute_slot_hash(buf_i64, prev_slot)
+            )
+        else:
+            expected_chain_hash = stored_chain_hash
 
         expected_real_kv_hash_u64 = _compute_real_kv_hash_scalar(
             slot_idx=slot_idx,
@@ -119,7 +125,7 @@ def launch_canary_verify_kernel_torch_reference(
         expected_real_kv_hash = _to_signed_int64(expected_real_kv_hash_u64)
 
         fail_reason = consts.FailReason(0)
-        if stored_chain_hash != expected_chain_hash:
+        if prev_reachable and stored_chain_hash != expected_chain_hash:
             fail_reason |= consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH
         if check_verify_expected_token:
             if expected_input_id != -1 and stored_token != expected_input_id:

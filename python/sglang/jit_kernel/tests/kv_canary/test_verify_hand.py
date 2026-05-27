@@ -388,6 +388,48 @@ class TestChain:
                 _n_violations(cuda_log) == 0
             ), f"unexpected violation at iteration token={token} position={position} slot={slot_idx}"
 
+    def test_prev_slot_padding_skips_chain_check_arbitrary_stored_hash(self) -> None:
+        """prev_slot_idx == TOKEN_TO_KV_SLOT_PADDING → chain check is skipped, regardless of stored chain hash."""
+        buf_pair = _buf_pair()
+        # Stamp slot 5 with an arbitrary (non-anchor, non-derivable) prev_hash. Without the skip,
+        # the kernel would compute expected_chain_hash from slot 0's canary (all zeros = 0) and
+        # flag VERIFY_CHAIN_HASH_MISMATCH on every such row.
+        stamp_pair(
+            buf_pair,
+            slot_idx=5,
+            token=42,
+            position=0,
+            prev_hash=to_signed_int64(0xDEADBEEFCAFEBABE),
+        )
+
+        plan_pair = _plan_pair_single(
+            slot_idx=5, position=0, prev_slot_idx=consts.TOKEN_TO_KV_SLOT_PADDING
+        )
+        cuda_log, _ = run_verify_diff(buf_pair=buf_pair, plan_pair=plan_pair)
+        assert _n_violations(cuda_log) == 0
+
+    def test_prev_slot_padding_does_not_mask_position_check(self) -> None:
+        """prev_slot == padding skips ONLY the chain check; position mismatch still fires."""
+        buf_pair = _buf_pair()
+        stamp_pair(
+            buf_pair,
+            slot_idx=7,
+            token=11,
+            position=0,
+            prev_hash=to_signed_int64(0x12345678),
+        )
+
+        # Plan claims position 99 — chain check is skipped (prev=padding) but position must still fire.
+        plan_pair = _plan_pair_single(
+            slot_idx=7, position=99, prev_slot_idx=consts.TOKEN_TO_KV_SLOT_PADDING
+        )
+        cuda_log, _ = run_verify_diff(buf_pair=buf_pair, plan_pair=plan_pair)
+
+        assert _n_violations(cuda_log) == 1
+        assert_only_bits_set(
+            _fail_bits(cuda_log), consts.FailReason.VERIFY_POSITION_MISMATCH
+        )
+
 
 class TestViolationField:
     def test_violation_token_mismatch(self) -> None:
