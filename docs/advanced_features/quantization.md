@@ -68,20 +68,19 @@ Backend selection is supported only for **blockwise FP8** and **NVFP4** GEMM. Wh
 | `triton` | All | Fallback; widely compatible |
 | `aiter` | ROCm | AMD AITER backend |
 
-**`auto` selection order:** 1) DeepGEMM (SM90/SM100, installed); 2) FlashInfer TRTLLM (SM100, FlashInfer available); 3) CUTLASS (SM90/SM100/120); 4) AITER (AMD); 5) Triton. **Exception:** SM120 currently resolves to Triton by default; see `initialize_fp8_gemm_config()` in `python/sglang/srt/layers/quantization/fp8_utils.py`.
+**`auto` selection order:** 1) DeepGEMM (SM90/SM100, installed); 2) FlashInfer TRTLLM (SM100, FlashInfer available); 3) CUTLASS (SM90/SM100/120); 4) AITER (AMD); 5) Triton. **Exception:** SM120 always resolves to Triton.
 
 ### `--fp4-gemm-backend` (NVFP4 GEMM)
 
 | Backend | Hardware | Description |
 |---------|----------|-------------|
-| `auto` | SM100/120 | Auto-selects: `flashinfer_cudnn` on SM120; `flashinfer_cutedsl` on SM100; `flashinfer_cutlass` otherwise |
+| `auto` | SM100/120 | Auto-selects: `flashinfer_cudnn` on SM120; `flashinfer_cutlass` on SM100 |
 | `cutlass` | SM100/120 | SGLang CUTLASS kernel |
 | `flashinfer_cutlass` | SM100/120 | FlashInfer CUTLASS backend |
 | `flashinfer_cudnn` | SM100/120 (CUDA 13+, cuDNN 9.15+) | FlashInfer cuDNN backend; used on SM120 for performance |
 | `flashinfer_trtllm` | SM100 | FlashInfer TensorRT-LLM backend |
 
 When FlashInfer is unavailable for NVFP4, the SGLang CUTLASS kernel is used as an automatic fallback.
-On SM120 specifically, `auto` prefers `flashinfer_cudnn` because `flashinfer_cutlass` has produced NaNs in dense MLP layers with heterogeneous batches; see `initialize_fp4_gemm_config()` in `python/sglang/srt/layers/quantization/fp4_utils.py`.
 
 ## Offline Quantization
 
