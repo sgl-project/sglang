@@ -1049,7 +1049,7 @@ class SchedulerMetricsReporter:
             self.fwd_occupancy = float("nan")
 
     def _maybe_log_idle_metrics(self):
-        """Collect and log metrics on entry to idle, then every 30 s during idle.
+        """Flush on each active→idle transition, then throttle to 30 s during idle.
 
         The active path (report_prefill_stats / report_decode_stats) logs
         ``num_running_reqs = len(batch.reqs)`` *before* finished requests are
@@ -1057,8 +1057,10 @@ class SchedulerMetricsReporter:
         the gauge sits at the last batch size for up to 30 s after the server
         becomes idle, which trips clients that poll in-flight counters to
         detect server idleness. ``_idle_flush_pending`` is set by the active
-        path on every emit, so the first idle iteration after active work
-        bypasses the throttle; subsequent idle iterations throttle as before.
+        path on every emit and cleared here, so the first idle iteration
+        after each active→idle transition bypasses the throttle; subsequent
+        idle iterations throttle as before. The flag is single-writer /
+        single-reader on the scheduler main loop, so no lock is needed.
         """
         if not self.current_scheduler_metrics_enabled:
             return
