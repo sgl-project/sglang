@@ -756,3 +756,53 @@ def run_mamba2_eagle_draft_extend_case(
         actual = run_mamba2_forward(fixture, fixture.forward_batch, inputs)
 
     torch.testing.assert_close(actual, expected, atol=MAMBA2_ATOL, rtol=MAMBA2_RTOL)
+
+
+def run_gdn_eagle_draft_extend_case(
+    testcase,
+    case,
+    *,
+    head_k_dim: int = 32,
+    head_v_dim: int = 32,
+    max_context_len: int = 64,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+):
+    """GDN EAGLE DRAFT_EXTEND eager. Like Mamba2, GDN's recurrent
+    backend processes draft tokens linearly regardless of the
+    spec_info tree mask, so the existing EXTEND-style gated-delta
+    recurrence reference (`_pure_torch_gdn_reference`) doubles as the
+    DRAFT_EXTEND reference. CG is structurally blocked across the
+    HybridLinearAttn family
+    (`hybrid_linear_attn_backend.py:509,572`)."""
+    from ..attention_methods.gdn_attention import (
+        GDN_ATOL,
+        GDN_RTOL,
+        _clone_gdn_cache,
+        _pure_torch_gdn_reference,
+        build_gdn_attention_fixture,
+        run_gdn_fixture_eager,
+    )
+
+    if not case.forward_mode.is_draft_extend():
+        raise ValueError(
+            "GDN DRAFT_EXTEND coverage expects a DRAFT_EXTEND case."
+        )
+    fixture = build_gdn_attention_fixture(
+        testcase,
+        case,
+        head_k_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+    )
+    initial_state = _clone_gdn_cache(fixture)
+    fixture.forward_batch.spec_info = _make_eagle_draft_extend_input(
+        case,
+        fixture.forward_batch,
+        device=device,
+    )
+    actual = run_gdn_fixture_eager(fixture)
+    expected = _pure_torch_gdn_reference(fixture, initial_state[1]).output
+    torch.testing.assert_close(actual, expected, atol=GDN_ATOL, rtol=GDN_RTOL)
