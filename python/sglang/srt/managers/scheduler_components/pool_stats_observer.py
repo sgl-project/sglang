@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import dataclasses
-import logging
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -16,8 +15,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-
-logger = logging.getLogger(__name__)
 
 
 class SchedulerStats: ...  # type: ignore[no-redef]
@@ -292,28 +289,6 @@ class SchedulerPoolStatsObserver:
         if self.enable_hisparse:
             full_num_used = max(0, full_num_used)
             swa_num_used = max(0, swa_num_used)
-        elif swa_num_used < 0 or full_num_used < 0:
-            allocator_debug = (
-                self.token_to_kv_pool_allocator.debug_print()
-                if hasattr(self.token_to_kv_pool_allocator, "debug_print")
-                else ""
-            )
-            logger.error(
-                "Negative hybrid SWA token accounting detected: "
-                "full_num_used=%s swa_num_used=%s "
-                "full_tokens_per_layer=%s swa_tokens_per_layer=%s "
-                "full_available=%s full_evictable=%s "
-                "swa_available=%s swa_evictable=%s allocator=%s",
-                full_num_used,
-                swa_num_used,
-                self.full_tokens_per_layer,
-                self.swa_tokens_per_layer,
-                full_available_size,
-                full_evictable_size,
-                swa_available_size,
-                swa_evictable_size,
-                allocator_debug,
-            )
         full_token_usage = full_num_used / self.full_tokens_per_layer
         swa_token_usage = swa_num_used / self.swa_tokens_per_layer
 
