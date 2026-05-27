@@ -142,21 +142,23 @@ class EagleDraftInputV2Mixin:
         cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
         nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
 
+        # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
+        # barrier has chained to the prev forward -> host stalls a full forward.
+        cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+        nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
         if page_size == 1:
             out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
         else:
-            cur_kv_lens = cur_kv_lens_cpu.to(device=batch.device)
-            nxt_kv_lens = nxt_kv_lens_cpu.to(device=batch.device)
             last_loc = get_last_loc(
                 batch.req_to_token_pool.req_to_token,
                 batch.req_pool_indices,
-                cur_kv_lens,
+                cur_kv_lens_device,
             )
             out_cache_loc = alloc_paged_token_slots_extend(
                 batch.tree_cache,
-                cur_kv_lens,
+                cur_kv_lens_device,
                 cur_kv_lens_cpu,
-                nxt_kv_lens,
+                nxt_kv_lens_device,
                 nxt_kv_lens_cpu,
                 last_loc,
                 num_needed_tokens,
@@ -165,8 +167,8 @@ class EagleDraftInputV2Mixin:
         assign_req_to_token_pool_func(
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
-            cur_kv_lens_cpu.to(device=batch.device),
-            nxt_kv_lens_cpu.to(device=batch.device),
+            cur_kv_lens_device,
+            nxt_kv_lens_device,
             out_cache_loc,
             bs,
         )
