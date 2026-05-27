@@ -20,9 +20,13 @@ patches:
           spec_info.hidden_states = hidden_states
       - match: |
           hidden_states = logits_output.hidden_states
+          maybe_detect_nan(hidden_states, f"draft_forward step {i}: hidden_states")
+          maybe_detect_inf(hidden_states, f"draft_forward step {i}: hidden_states")
           forward_batch.positions.add_(1)
         replacement: |
           hidden_states = logits_output.hidden_states
+          maybe_detect_nan(hidden_states, f"draft_forward step {i}: hidden_states")
+          maybe_detect_inf(hidden_states, f"draft_forward step {i}: hidden_states")
 
   - target: sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker.draft_forward
     edits:
