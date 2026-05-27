@@ -125,6 +125,38 @@ class TestTritonLightningBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_lightning_attention_case(self, case)
 
+    # Layout-robustness. See dense/test_triton.py for the rationale.
+    LAYOUT_ROBUSTNESS_CASES = (
+        LightningAttentionCase(
+            name="layout_lightning_extend_two_request",
+            backend="triton",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=2,
+            page_size=16,
+            prefix_lens=(0, 0),
+            extend_lens=(16, 16),
+        ),
+        LightningAttentionCase(
+            name="layout_lightning_decode_page_boundary",
+            backend="triton",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=2,
+            page_size=16,
+            prefix_lens=(14, 15, 16),
+        ),
+    )
+
+    def test_layout_robustness_cases(self):
+        for case in self.LAYOUT_ROBUSTNESS_CASES:
+            for layout in ("interleaved_pages", "non_monotonic_extend"):
+                if (
+                    layout == "non_monotonic_extend"
+                    and case.forward_mode.is_decode()
+                ):
+                    continue
+                with self.subTest(case=case.name, layout=layout):
+                    run_lightning_attention_case(self, case, loc_layout=layout)
+
     def test_runner_mode_cuda_graph_decode_cases(self):
         for case in self.CUDA_GRAPH_CASES:
             with self.subTest(case=case.name, backend=case.backend):

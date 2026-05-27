@@ -156,6 +156,19 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_mamba2_attention_case(self, case)
 
+    # Layout-robustness. See dense/test_triton.py for the rationale.
+    # Reuse the case generator's first two cases to avoid duplicating
+    # all the Mamba2-specific config fields.
+    def test_layout_robustness_cases(self):
+        cases = [
+            self.CASES[0],  # extend exact-page (zero-prefix, multi-token)
+            self.CASES[3],  # extend with prefix (`prefix=16, extend=16`)
+        ]
+        for case in cases:
+            for layout in ("interleaved_pages", "non_monotonic_extend"):
+                with self.subTest(case=case.name, layout=layout):
+                    run_mamba2_attention_case(self, case, loc_layout=layout)
+
     def test_runner_mode_cuda_graph_decode_cases(self):
         for case in self.CUDA_GRAPH_CASES:
             with self.subTest(case=case.name, backend=case.backend):

@@ -41,6 +41,40 @@ class TestTorchNativeGDNBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_gdn_attention_case(self, case)
 
+    # Layout-robustness. See dense/test_triton.py for the rationale.
+    LAYOUT_ROBUSTNESS_CASES = (
+        GDNAttentionCase(
+            name="layout_gdn_extend_two_request",
+            backend="torch_native",
+            forward_mode=ForwardMode.EXTEND,
+            num_k_heads=4,
+            num_v_heads=4,
+            page_size=16,
+            prefix_lens=(0, 0),
+            extend_lens=(16, 16),
+        ),
+        GDNAttentionCase(
+            name="layout_gdn_decode_page_boundary",
+            backend="torch_native",
+            forward_mode=ForwardMode.DECODE,
+            num_k_heads=4,
+            num_v_heads=4,
+            page_size=16,
+            prefix_lens=(14, 15, 16),
+        ),
+    )
+
+    def test_layout_robustness_cases(self):
+        for case in self.LAYOUT_ROBUSTNESS_CASES:
+            for layout in ("interleaved_pages", "non_monotonic_extend"):
+                if (
+                    layout == "non_monotonic_extend"
+                    and case.forward_mode.is_decode()
+                ):
+                    continue
+                with self.subTest(case=case.name, layout=layout):
+                    run_gdn_attention_case(self, case, loc_layout=layout)
+
     def test_runner_mode_split_op_extend_cases(self):
         for case, static_num_tokens in self.SPLIT_OP_CASES:
             for breakable in (False, True):
