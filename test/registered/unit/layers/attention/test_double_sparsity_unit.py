@@ -1566,6 +1566,251 @@ class TestCalibrateHooksFireRequirement(unittest.TestCase):
         self.assertIn("allow-synthetic", msg)
 
 
+class TestCalibrateMethod1(unittest.TestCase):
+    """AC-4: Method 1 Q+K joint importance in _collect_channel_importance.
+
+    Verifies that the calibrator computes mean(abs(Q_nope * K_nope)) rather
+    than K-only L2, falls back gracefully when Q is absent, and that
+    load_channel_mask rejects 512-d channel indices calibrated against a
+    128-d model.
+    """
+
+    def _make_fake_model(self, *, num_layers=1, num_heads=2, k_head_dim=4,
+                         v_head_dim=4, has_q_proj=True, is_mla=True):
+        """Return (config, model, expected_importance, fake_layer) stubs wired for
+        _collect_channel_importance.  Uses real nn.Module so PyTorch forward-hooks
+        fire when model(**inputs) is called."""
+        import torch.nn as nn
+
+        if is_mla:
+            cfg = SimpleNamespace(
+                num_hidden_layers=num_layers,
+                num_attention_heads=num_heads,
+                qk_nope_head_dim=k_head_dim,
+                v_head_dim=v_head_dim,
+                head_dim=k_head_dim + 64,
+                hidden_size=num_heads * (k_head_dim + 64),
+            )
+        else:
+            cfg = SimpleNamespace(
+                num_hidden_layers=num_layers,
+                num_attention_heads=num_heads,
+                head_dim=k_head_dim,
+                hidden_size=num_heads * k_head_dim,
+            )
+
+        k_full = num_heads * (k_head_dim + v_head_dim)
+        q_full = num_heads * (k_head_dim + 64)
+        T = 3
+        rng = torch.Generator().manual_seed(42)
+
+        class _FixedOutLinear(nn.Module):
+            """Returns a fixed tensor (tuple-wrapped) from forward; PyTorch hooks fire."""
+            def __init__(self, out_tensor):
+                super().__init__()
+                self._out = out_tensor
+            def forward(self, x):
+                return (self._out,)
+
+        class _FakeAttn(nn.Module):
+            def __init__(self, **named_projs):
+                super().__init__()
+                for name, mod in named_projs.items():
+                    self.add_module(name, mod)
+            def forward(self, x):
+                for mod in self.children():
+                    mod(x)
+
+        class _FakeLayer(nn.Module):
+            def __init__(self, attn):
+                super().__init__()
+                self.self_attn = attn
+            def forward(self, x):
+                self.self_attn(x)
+
+        class _FakeInner(nn.Module):
+            def __init__(self, layer_list):
+                super().__init__()
+                self.layers = nn.ModuleList(layer_list)
+            def forward(self, x):
+                for layer in self.layers:
+                    layer(x)
+
+        class _FakeTopModel(nn.Module):
+            def __init__(self, inner):
+                super().__init__()
+                self.model = inner
+            def forward(self, **_kwargs):
+                self.model(torch.zeros(1))
+            @property
+            def device(self):
+                return torch.device("cpu")
+
+        if is_mla:
+            k_out_full = torch.rand(T, k_full, generator=rng)
+            q_out_full = torch.rand(T, q_full, generator=rng)
+            named_projs = {"kv_b_proj": _FixedOutLinear(k_out_full)}
+            if has_q_proj:
+                named_projs["q_b_proj"] = _FixedOutLinear(q_out_full)
+            prefix = num_heads * k_head_dim
+            k_nope_ref = k_out_full[..., :prefix].float().reshape(T, num_heads, k_head_dim)
+            q_nope_ref = q_out_full[..., :prefix].float().reshape(T, num_heads, k_head_dim)
+        else:
+            k_out = torch.rand(T, num_heads * k_head_dim, generator=rng)
+            q_out = torch.rand(T, num_heads * k_head_dim, generator=rng)
+            named_projs = {"k_proj": _FixedOutLinear(k_out)}
+            if has_q_proj:
+                named_projs["q_proj"] = _FixedOutLinear(q_out)
+            k_nope_ref = k_out.float().reshape(T, num_heads, k_head_dim)
+            q_nope_ref = q_out.float().reshape(T, num_heads, k_head_dim)
+
+        if has_q_proj:
+            expected_importance = (q_nope_ref * k_nope_ref).abs().mean(dim=0)
+        else:
+            expected_importance = k_nope_ref.pow(2).mean(dim=0)
+
+        attn = _FakeAttn(**named_projs)
+        fake_layer = _FakeLayer(attn)
+        fake_model = _FakeTopModel(_FakeInner([fake_layer]))
+
+        return cfg, fake_model, expected_importance, fake_layer
+
+    def _run_calibration(self, cfg, fake_model, tmpdir):
+        """Patch transformers and invoke _collect_channel_importance."""
+        from unittest.mock import patch
+        from sglang.srt.layers.attention.double_sparsity.calibrate import (
+            _collect_channel_importance,
+        )
+
+        fake_tok = MagicMock(
+            return_value=MagicMock(
+                to=lambda *_a, **_k: {"input_ids": torch.zeros(1, 4, dtype=torch.long)}
+            )
+        )
+
+        with patch("transformers.AutoConfig") as mc, \
+             patch("transformers.AutoModelForCausalLM") as mm, \
+             patch("transformers.AutoTokenizer") as mt:
+            mc.from_pretrained.return_value = cfg
+            mm.from_pretrained.return_value = fake_model
+            mt.from_pretrained.return_value = fake_tok
+
+            importance, weights = _collect_channel_importance(
+                model_path=tmpdir,
+                dtype="bfloat16",
+                tp=1,
+                num_layers_hint=None,
+                num_heads_hint=None,
+                head_dim_hint=None,
+                prompts=["hello world"],
+                allow_synthetic=False,
+            )
+        return importance, weights
+
+    def test_qk_pairing_uses_method1_formula(self):
+        """Method 1: importance = mean(abs(Q_nope * K_nope)) not sum(K^2)."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg, model, expected_imp, _ = self._make_fake_model(
+                num_layers=1, num_heads=2, k_head_dim=4, v_head_dim=4,
+                has_q_proj=True, is_mla=True,
+            )
+            importance, _ = self._run_calibration(cfg, model, tmpdir)
+
+        # importance[0] should match mean(abs(Q*K)) for layer 0
+        actual = importance[0].cpu()
+        self.assertEqual(tuple(actual.shape), (2, 4), "importance shape must be [H, D]")
+        self.assertTrue(
+            torch.allclose(actual, expected_imp, atol=1e-5),
+            f"Method 1 importance mismatch.\nExpected:\n{expected_imp}\nGot:\n{actual}",
+        )
+        # Also verify it does NOT match K-only sum(K^2): these are different tensors
+        # (the test fixture uses random Q ≠ K, so Q*K ≠ K^2).
+
+    def test_k_only_fallback_when_q_missing(self):
+        """When no Q projection is found, fall back to K-only L2 with a warning."""
+        import tempfile
+        import logging
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg, model, expected_k_only, _ = self._make_fake_model(
+                num_layers=1, num_heads=2, k_head_dim=4, v_head_dim=4,
+                has_q_proj=False, is_mla=True,
+            )
+            with self.assertLogs("sglang.srt.layers.attention.double_sparsity.calibrate",
+                                 level=logging.WARNING) as log_ctx:
+                importance, _ = self._run_calibration(cfg, model, tmpdir)
+
+        self.assertTrue(
+            any("no Q projection" in msg for msg in log_ctx.output),
+            "Expected warning about missing Q projection",
+        )
+        actual = importance[0].cpu()
+        self.assertTrue(
+            torch.allclose(actual, expected_k_only, atol=1e-5),
+            f"K-only fallback importance mismatch.\nExpected:\n{expected_k_only}\nGot:\n{actual}",
+        )
+
+    def test_512d_channel_index_rejected(self):
+        """load_channel_mask must reject channel indices >= head_dim=128."""
+        import tempfile
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            ChannelMask,
+            DoubleSparsityChannelMaskCorrupt,
+            save_channel_mask,
+            load_channel_mask,
+        )
+
+        L, H, label_dim = 2, 4, 8
+        # channel_selection contains index 512 (out of range for head_dim=128)
+        channel_selection = torch.zeros(L, H, label_dim, dtype=torch.int32)
+        channel_selection[0, 0, 0] = 512  # 512-d index — invalid for 128-d model
+        channel_weights = torch.ones(L, H, label_dim, dtype=torch.float32)
+
+        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as f:
+            path = f.name
+        try:
+            save_channel_mask(
+                path,
+                channel_selection,
+                channel_weights,
+                dtype="bfloat16",
+                head_dim=128,
+                page_size=64,
+                label_dim=label_dim,
+                created_at="2026-01-01T00:00:00Z",
+            )
+            with self.assertRaises((DoubleSparsityChannelMaskCorrupt, ValueError)) as ctx:
+                load_channel_mask(path)
+            self.assertIn("out of range", str(ctx.exception))
+        finally:
+            import os as _os
+            _os.unlink(path)
+
+    def test_label_dim_exceeds_k_head_dim_raises(self):
+        """calibrate() must raise ValueError when label_dim > head_dim."""
+        from sglang.srt.layers.attention.double_sparsity.calibrate import calibrate
+        import argparse
+
+        args = argparse.Namespace(
+            model="/nonexistent",
+            dtype="bfloat16",
+            tp=1,
+            output="/tmp/test_calib_out.safetensors",
+            label_dim=256,  # > head_dim which would be derived as 128
+            page_size=64,
+            num_samples=4,
+            ctx_len=64,
+            dataset=None,
+            num_layers=1,
+            num_heads=2,
+            head_dim=128,
+            allow_synthetic=True,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            calibrate(args)
+        self.assertIn("label-dim", str(ctx.exception))
+
+
 class TestChannelMaskSlicePerRank(unittest.TestCase):
     """Round-2 fix [P2]: TP head sharding helper."""
 

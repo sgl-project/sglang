@@ -113,17 +113,27 @@ def _collect_channel_importance(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the calibration forward pass and return ``(selection, weights)``.
 
-    The real path hooks K-projection layers, accumulates per-channel
-    L2-squared importance, and reduces to ``(num_layers, num_heads,
-    head_dim)``.
+    The real path implements **Method 1** from the original DoubleSparse paper:
+    ``mean(abs(Q_nope * K_nope))`` per channel, accumulated over tokens and
+    forward passes.  Both a Q-projection hook and a K-projection hook are
+    registered per layer.  When both fire for the same pass the element-wise
+    Q*K product is computed and added to the running importance tensor.  If a
+    layer's Q projection cannot be found the accumulator falls back to
+    K-only L2 (``sum(K^2)``) with a logged warning, preserving coverage for
+    architectures that do not expose a hookable Q projection.
+
+    For MLA layers (DeepSeek V3.2):
+    * K side — ``kv_b_proj`` output ``[T, H*(nope+v)]`` → slice noPE prefix
+      ``[..., :H*nope]`` → reshape ``[T, H, nope_dim]``.
+    * Q side — ``q_b_proj`` output ``[T, H*(nope+rope)]`` → slice noPE prefix
+      ``[..., :H*nope]`` → reshape ``[T, H, nope_dim]``.
+
+    For standard attention (Llama / GLM):
+    * K side — ``k_proj`` or ``wk`` output → reshape ``[T, H, head_dim]``.
+    * Q side — ``q_proj`` output → reshape ``[T, H, head_dim]``.
 
     The synthetic-statistics path is gated behind ``allow_synthetic=True``
-    and is reserved for CI fixtures + developer smoke tests. HuggingFace
-    repo IDs (e.g. ``deepseek-ai/DeepSeek-V3.2``) are NOT local directories,
-    so without the explicit opt-in this function must attempt the real
-    ``AutoModelForCausalLM.from_pretrained`` path (which fetches the repo if
-    it is a valid HF ID) rather than silently producing a behaviorally
-    invalid mask.
+    and is reserved for CI fixtures + developer smoke tests.
     """
 
     if allow_synthetic and (
@@ -142,9 +152,8 @@ def _collect_channel_importance(
         importance = torch.rand((L, H, D), generator=rng, dtype=torch.float32)
         return importance, importance / importance.sum(dim=-1, keepdim=True)
 
-    # Real forward-pass calibration: load the model + tokenizer, register a
-    # forward-hook on each K-projection, accumulate per-channel L2-squared
-    # importance, then reduce.
+    # Real forward-pass calibration: load the model + tokenizer, register
+    # Method 1 Q+K hooks per attention layer, accumulate importance, then reduce.
     try:
         from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
     except ImportError as exc:
@@ -154,7 +163,7 @@ def _collect_channel_importance(
         ) from exc
 
     logger.info(
-        "Loading %s for calibration (dtype=%s tp=%d num_prompts=%d).",
+        "Loading %s for calibration (dtype=%s tp=%d num_prompts=%d method=Method1_QK).",
         model_path,
         dtype,
         tp,
@@ -183,8 +192,7 @@ def _collect_channel_importance(
     num_heads = int(getattr(config, "num_attention_heads", num_heads_hint or 0))
     # For DeepSeek MLA the per-head K-noPE width is `qk_nope_head_dim`; for
     # plain Llama/GLM-style attention there is no such split and the per-head
-    # K width equals `head_dim`. The selector's channel mask must index K
-    # channels only, so use `qk_nope_head_dim` when present.
+    # K width equals `head_dim`.  The channel mask indices into K-noPE space.
     qk_nope_head_dim = int(getattr(config, "qk_nope_head_dim", 0))
     v_head_dim = int(getattr(config, "v_head_dim", 0))
     head_dim = int(getattr(config, "head_dim", head_dim_hint or 0)) or (
@@ -200,55 +208,135 @@ def _collect_channel_importance(
     importance = torch.zeros((num_layers, num_heads, k_head_dim), dtype=torch.float32)
     seen = [0] * num_layers
 
-    # Best-effort hook registration: try several common attribute names that
-    # DSV3.2 / GLM-5 / Llama might expose. When the K source is MLA's
-    # `kv_b_proj` we must slice the K-noPE prefix off the [K-noPE | V] output
-    # before reshaping, otherwise V channels leak into the K importance.
+    # Per-layer buffers for coordinating Q and K from the same forward pass.
+    # Both hooks write here; _accumulate fires once both are populated.
+    _q_buf: List[Optional[torch.Tensor]] = [None] * num_layers
+    _k_buf: List[Optional[torch.Tensor]] = [None] * num_layers
+
+    def _accumulate_method1(idx: int) -> None:
+        """Method 1: mean(abs(Q_nope * K_nope)) over tokens."""
+        q = _q_buf[idx]
+        k = _k_buf[idx]
+        if q is None or k is None:
+            return
+        _q_buf[idx] = None
+        _k_buf[idx] = None
+        # Both tensors are [T, H, k_head_dim] float32 at this point.
+        contrib = (q * k).abs().mean(dim=0).cpu()  # [H, k_head_dim]
+        importance[idx] += contrib
+        seen[idx] += 1
+
+    def _accumulate_k_only(idx: int, k: torch.Tensor) -> None:
+        """K-only L2 fallback when Q projection is not accessible."""
+        contrib = k.pow(2).mean(dim=0).cpu()  # [H, k_head_dim]
+        importance[idx] += contrib
+        seen[idx] += 1
+
+    # Best-effort hook registration.  For MLA layers (kv_b_proj / q_b_proj)
+    # the K-noPE and Q-noPE prefixes are sliced from the concatenated output
+    # before accumulation.  The Q projection prefix width equals the K prefix
+    # width (both == num_heads * k_head_dim) because Q_nope and K_nope share
+    # the same noPE dimension.
     handles = []
+    # noPE prefix width shared by K and Q in MLA, and equals full width in
+    # standard attention (qk_nope_head_dim==0 case).
+    nope_prefix_width = num_heads * k_head_dim
+    full_mla_k_width = num_heads * (k_head_dim + v_head_dim) if v_head_dim > 0 else None
+
     for layer_idx, layer in enumerate(getattr(model, "model", model).layers):
         attn = getattr(layer, "self_attn", layer)
+
+        # --- K projection ---
         k_proj = getattr(attn, "k_proj", None)
         kv_b_proj = getattr(attn, "kv_b_proj", None)
         wk = getattr(attn, "wk", None)
         if k_proj is not None:
-            kproj, source = k_proj, "k_proj"
+            kproj, k_source = k_proj, "k_proj"
         elif kv_b_proj is not None:
-            kproj, source = kv_b_proj, "kv_b_proj"
+            kproj, k_source = kv_b_proj, "kv_b_proj"
         elif wk is not None:
-            kproj, source = wk, "wk"
+            kproj, k_source = wk, "wk"
         else:
             continue
 
-        is_mla = source == "kv_b_proj"
-        # MLA's kv_b_proj output last-dim = num_heads * (qk_nope + v_head_dim).
-        k_prefix_width = num_heads * k_head_dim
-        full_mla_width = num_heads * (k_head_dim + v_head_dim) if is_mla else None
+        is_mla_k = k_source == "kv_b_proj"
 
-        def _make_hook(idx, is_mla=is_mla, k_prefix_width=k_prefix_width,
-                       full_mla_width=full_mla_width):
+        # --- Q projection (Method 1) ---
+        q_b_proj = getattr(attn, "q_b_proj", None)
+        q_proj_mod = getattr(attn, "q_proj", None)
+        wq = getattr(attn, "wq", None)
+        if q_b_proj is not None:
+            qproj: Optional[object] = q_b_proj
+        elif q_proj_mod is not None:
+            qproj = q_proj_mod
+        elif wq is not None:
+            qproj = wq
+        else:
+            qproj = None
+
+        has_q = qproj is not None
+        if not has_q:
+            logger.warning(
+                "Layer %d: no Q projection found (tried q_b_proj, q_proj, wq). "
+                "Falling back to K-only L2 importance for this layer.",
+                layer_idx,
+            )
+
+        def _make_k_hook(
+            idx,
+            is_mla=is_mla_k,
+            prefix=nope_prefix_width,
+            full_w=full_mla_k_width,
+            layer_has_q=has_q,
+        ):
             def _hook(_module, _inputs, output):
                 tensor = output[0] if isinstance(output, tuple) else output
                 if tensor.dim() < 2:
                     return
                 if is_mla:
-                    if v_head_dim > 0 and tensor.shape[-1] == full_mla_width:
-                        tensor = tensor[..., :k_prefix_width]
-                    elif tensor.shape[-1] != k_prefix_width:
-                        # Unexpected width — skip rather than mix V into K.
+                    if full_w is not None and tensor.shape[-1] == full_w:
+                        tensor = tensor[..., :prefix]
+                    elif tensor.shape[-1] != prefix:
                         logger.warning(
                             "kv_b_proj output last-dim=%d does not match expected "
-                            "K-noPE prefix=%d or [K|V] total=%s; skipping layer %d hook.",
-                            tensor.shape[-1], k_prefix_width, full_mla_width, idx,
+                            "K-noPE prefix=%d or [K|V] total=%s; skipping layer %d K hook.",
+                            tensor.shape[-1], prefix, full_w, idx,
                         )
                         return
-                squared = tensor.detach().to(torch.float32).pow(2)
-                squared = squared.reshape(-1, num_heads, k_head_dim).sum(dim=0)
-                importance[idx] += squared.cpu()
-                seen[idx] += 1
+                k_nope = tensor.detach().to(torch.float32).reshape(-1, num_heads, k_head_dim)
+                if layer_has_q:
+                    _k_buf[idx] = k_nope
+                    _accumulate_method1(idx)
+                else:
+                    _accumulate_k_only(idx, k_nope)
 
             return _hook
 
-        handles.append(kproj.register_forward_hook(_make_hook(layer_idx)))
+        def _make_q_hook(idx, prefix=nope_prefix_width):
+            def _hook(_module, _inputs, output):
+                tensor = output[0] if isinstance(output, tuple) else output
+                if tensor.dim() < 2:
+                    return
+                # Slice noPE prefix: works for both MLA (q_b_proj outputs
+                # [Q_noPE | Q_RoPE]) and standard attention (full == prefix).
+                if tensor.shape[-1] > prefix:
+                    tensor = tensor[..., :prefix]
+                elif tensor.shape[-1] < prefix:
+                    logger.warning(
+                        "q projection output last-dim=%d is narrower than expected "
+                        "Q-noPE prefix=%d; skipping layer %d Q hook.",
+                        tensor.shape[-1], prefix, idx,
+                    )
+                    return
+                q_nope = tensor.detach().to(torch.float32).reshape(-1, num_heads, k_head_dim)
+                _q_buf[idx] = q_nope
+                _accumulate_method1(idx)
+
+            return _hook
+
+        handles.append(kproj.register_forward_hook(_make_k_hook(layer_idx)))
+        if has_q:
+            handles.append(qproj.register_forward_hook(_make_q_hook(layer_idx)))
 
     try:
         for prompt in prompts:
