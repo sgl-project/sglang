@@ -20,13 +20,13 @@ def _hisparse_default_backend(kv_cache_dtype: str) -> str:
     return "flashmla_kv" if kv_cache_dtype == "fp8_e4m3" else "flashmla_sparse"
 
 
-def apply_hisparse_nsa_backend_defaults(
+def apply_hisparse_dsa_backend_defaults(
     server_args: "ServerArgs",
     user_set_prefill: bool,
     user_set_decode: bool,
     kv_cache_dtype: str,
 ) -> bool:
-    """Pick NSA backends for --enable-hisparse based on KV dtype.
+    """Pick DSA backends for --enable-hisparse based on KV dtype.
 
     BF16 KV -> flashmla_sparse, FP8 KV -> flashmla_kv. Returns True if hisparse
     handled backend selection (caller should skip its own default logic).
@@ -36,29 +36,29 @@ def apply_hisparse_nsa_backend_defaults(
 
     backend = _hisparse_default_backend(kv_cache_dtype)
     if not user_set_prefill:
-        server_args.nsa_prefill_backend = backend
+        server_args.dsa_prefill_backend = backend
     if not user_set_decode:
-        server_args.nsa_decode_backend = backend
+        server_args.dsa_decode_backend = backend
     logger.warning(
-        f"HiSparse enabled ({kv_cache_dtype}): using NSA backends "
-        f"prefill={server_args.nsa_prefill_backend}, decode={server_args.nsa_decode_backend}."
+        f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
+        f"prefill={server_args.dsa_prefill_backend}, decode={server_args.dsa_decode_backend}."
     )
     return True
 
 
 def validate_hisparse(server_args: "ServerArgs") -> None:
-    """Validate --enable-hisparse constraints (model class, radix cache, NSA backend)."""
+    """Validate --enable-hisparse constraints (model class, radix cache, DSA backend)."""
     if not server_args.enable_hisparse:
         return
 
     from sglang.srt.configs.model_config import (
-        is_deepseek_nsa,
+        is_deepseek_dsa,
         is_deepseek_v4,
     )
 
     hf_config = server_args.get_model_config().hf_config
     is_v4_hisparse = is_deepseek_v4(hf_config)
-    assert is_deepseek_nsa(hf_config) or is_v4_hisparse, (
+    assert is_deepseek_dsa(hf_config) or is_v4_hisparse, (
         "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) "
         "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
     )
@@ -83,13 +83,13 @@ def validate_hisparse(server_args: "ServerArgs") -> None:
         server_args.kv_cache_dtype, {"flashmla_sparse", "flashmla_kv"}
     )
     for attr, label in [
-        ("nsa_prefill_backend", "prefill"),
-        ("nsa_decode_backend", "decode"),
+        ("dsa_prefill_backend", "prefill"),
+        ("dsa_decode_backend", "decode"),
     ]:
         backend = getattr(server_args, attr)
         if backend is not None and backend not in allowed_backends:
             raise ValueError(
                 f"HiSparse with --kv-cache-dtype={server_args.kv_cache_dtype} requires "
-                f"--nsa-{label}-backend in {sorted(allowed_backends)}, "
+                f"--dsa-{label}-backend in {sorted(allowed_backends)}, "
                 f"but got {backend}."
             )

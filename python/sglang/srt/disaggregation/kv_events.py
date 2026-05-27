@@ -256,10 +256,15 @@ class ZmqEventPublisher(EventPublisher):
             self._pub = self._ctx.socket(zmq.PUB)
             self._pub.set_hwm(self._hwm)
             # Heuristic: bind if wildcard / * present, else connect.
-            # bind stable, connect volatile convention
+            # bind stable, connect volatile convention.
+            # ``0.0.0.0`` is the IPv4 bind-all wildcard alongside ``*``
+            # and ``::``; ``/server_info`` advertises it as a wildcard,
+            # so the publisher must bind it for the advertised endpoint
+            # to actually be listening.
             if (
                 "*" in self._endpoint
                 or "::" in self._endpoint
+                or "0.0.0.0" in self._endpoint
                 or self._endpoint.startswith("ipc://")
                 or self._endpoint.startswith("inproc://")
             ):
