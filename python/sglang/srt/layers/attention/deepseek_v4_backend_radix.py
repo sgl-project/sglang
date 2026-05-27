@@ -1171,14 +1171,17 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                         .unsqueeze(1)
                     )
 
+                    # FlashMLA receives q as [tokens, 1, heads, head_dim]; squeeze
+                    # the group dim so tilelang_sparse_fwd gets [tokens, heads, head_dim].
+                    q_3d = q.squeeze(1) if q.dim() == 4 else q
                     o = tilelang_sparse_fwd(
-                        q=q,
+                        q=q_3d,
                         kv=_kv_flat,
                         indices=extra_indices,
                         sm_scale=self.softmax_scale,
                         d_v=self.head_dim_v,
                     )
-                    o = o.squeeze(1)
+                    # tilelang_sparse_fwd already returns [tokens, heads, d_v] — no squeeze.
                     return o
                 except Exception:
                     import traceback
