@@ -20,11 +20,19 @@ import torch.nn.functional as F
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsv4.compressor import (
-    CompressorBackendMixin,
-    FusedCompressMetadata,
-    create_paged_compressor_data,
-)
+
+if envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
+    from sglang.srt.layers.attention.dsv4.compressor_v2 import (
+        CompressorBackendMixin,
+        FusedCompressMetadata,
+        create_paged_compressor_data,
+    )
+else:
+    from sglang.srt.layers.attention.dsv4.compressor import (
+        CompressorBackendMixin,
+        FusedCompressMetadata,
+        create_paged_compressor_data,
+    )
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
@@ -47,7 +55,7 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import ceil_align
 
 if TYPE_CHECKING:
-    from flash_mla.flash_mla_interface import FlashMLASchedMeta
+    from sgl_kernel.flash_mla import FlashMLASchedMeta
 
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -75,7 +83,7 @@ def _create_flashmla_metadata():
 
     if is_hip():
         return None
-    import flash_mla
+    import sgl_kernel.flash_mla as flash_mla
 
     return flash_mla.get_mla_metadata()[0]
 

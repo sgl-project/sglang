@@ -276,9 +276,12 @@ class TreeComponent(ABC):
 
     @abstractmethod
     def acquire_component_lock(
-        self, node: UnifiedTreeNode, result: IncLockRefResult
+        self,
+        node: UnifiedTreeNode,
+        result: IncLockRefResult,
+        lock_host: bool = False,
     ) -> IncLockRefResult:
-        """Increment lock_ref for this component, protecting nodes from
+        """Increment component lock refs, protecting nodes from
         eviction. Updates evictable → protected size on first lock.
         - Full: path-lock — walks from node up to root, incrementing
           lock_ref on every ancestor.
@@ -286,21 +289,31 @@ class TreeComponent(ABC):
           sliding window is filled; records a component_uuid at the
           boundary for release_component_lock to know where to stop.
         - Mamba: single-node lock — only increments lock_ref on the
-          node itself (mamba state is per-leaf, not per-path)."""
+          node itself (mamba state is per-leaf, not per-path).
+
+        When ``lock_host`` is True, the lock applies to host-side state:
+        - Full: single-node host lock.
+        - SWA: host window-lock with a dedicated host UUID boundary.
+        - Mamba: single-node host lock with host LRU detach."""
         ...
 
     @abstractmethod
     def release_component_lock(
-        self, node: UnifiedTreeNode, params: Optional[DecLockRefParams]
+        self,
+        node: UnifiedTreeNode,
+        params: Optional[DecLockRefParams],
+        lock_host: bool = False,
     ) -> None:
-        """Decrement lock_ref for this component, un-protecting nodes.
+        """Decrement component lock refs, un-protecting nodes.
         Updates protected → evictable size when lock_ref drops to 0.
         - Full: path-unlock — walks from node up to root, decrementing
           lock_ref on every ancestor.
         - SWA: path-unlock — walks upward, stopping at the node whose
           component_uuid matches the one recorded during acquire.
         - Mamba: single-node unlock — only decrements lock_ref on the
-          node itself."""
+          node itself.
+
+        When ``lock_host`` is True, the inverse host-side semantics apply."""
         ...
 
     def prepare_for_caching_req(
@@ -351,6 +364,7 @@ class TreeComponent(ABC):
         node: UnifiedTreeNode,
         phase: CacheTransferPhase,
         transfers: list[PoolTransfer] = (),
+        **kw,
     ) -> None:
         """Post-transfer bookkeeping: store host indices, update LRU, etc."""
         pass

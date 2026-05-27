@@ -22,14 +22,12 @@ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 import heapq
 from array import array
 from collections import defaultdict
-from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 from numpy import float64
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -148,7 +146,6 @@ class TreeNode:
             return None
         return self.hash_value[-1]
 
-    @lru_cache(maxsize=1)
     def get_prefix_hash_values(self, node: "TreeNode") -> List[str]:
         if node is None or node.hash_value is None:
             return []
@@ -428,6 +425,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         ) or isinstance(params.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator)
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
+        self.mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
 
         self.page_size = params.page_size
         self.disable = params.disable
@@ -639,7 +637,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         assert page_aligned_len == len(
             kv_indices
-        ), f"page_aligned_len != len(kv_indices), {page_aligned_len=}, {len(kv_indices)=}, {cache_len=}, {self.page_size=}, {FLA_CHUNK_SIZE=}"
+        ), f"page_aligned_len != len(kv_indices), {page_aligned_len=}, {len(kv_indices)=}, {cache_len=}, {self.page_size=}, {self.mamba_cache_chunk_size=}"
 
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
@@ -1043,14 +1041,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Calculate the branching point. It is defined as the last aligned position that
         # does not have a mamba value.
         if len(value) > best_value_len:
-            mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
-            mamba_cache_chunk_aligned_seqlen = (
-                sum(len(v) for v in value) // mamba_cache_chunk_size
-            ) * mamba_cache_chunk_size
+            chunk_aligned_seqlen = (
+                sum(len(v) for v in value) // self.mamba_cache_chunk_size
+            ) * self.mamba_cache_chunk_size
             mamba_branching_seqlen = (
-                mamba_cache_chunk_aligned_seqlen
-                if mamba_cache_chunk_aligned_seqlen > 0
-                else None
+                chunk_aligned_seqlen if chunk_aligned_seqlen > 0 else None
             )
         else:
             mamba_branching_seqlen = None
