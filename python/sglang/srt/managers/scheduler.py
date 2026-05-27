@@ -156,7 +156,6 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.managers.schedule_policy import (
-    CLIP_MAX_NEW_TOKENS,
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
@@ -2602,11 +2601,14 @@ class Scheduler(
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
-        # Chunked-resume admission: handled by the inline block below
-        # (`chunked_reqs()` filter + adder bookkeeping). The main
-        # waiting_queue loop further down admits ONLY truly-waiting reqs (no
-        # has_pending_chunk paths). See agent-drafts/
-        # 2026-05-25-waiting-queue-refactor-plan.md §C3.
+        # Chunked-resume admission: handled by the small block at the top of this
+        # method, which feeds the single chunked-resume req (if any) through
+        # `adder.add_one_req`. PrefillAdder.add_one_req detects chunked-resume via
+        # the `is_resume` flag (has_pending_chunk and not is_dllm) and handles all
+        # budget bookkeeping in one place — no special add_chunked_req method
+        # resurrected. The main waiting_queue loop below admits ONLY truly-waiting
+        # reqs. See agent-drafts/2026-05-25-waiting-queue-refactor-plan.md §C3 (and
+        # C9 follow-up).
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -2689,64 +2691,23 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
         )
 
-        # Inline chunked admission (Plan §C3, do NOT recreate
-        # PrefillAdder.add_chunked_req per §10 decision). The chunked-resume
-        # req keeps its row/KV/lock_ref from prior admission, so
-        # init_next_round_input must NOT re-match prefix (no tree_cache arg,
-        # H7 elimination). Budget bookkeeping is inlined here — minor LOC;
-        # intentionally not extracted. Mirrors the body of upstream/main
-        # PrefillAdder.add_chunked_req.
         if chunked_in_active:
             chunked_req = chunked_in_active[0]
+            # No tree_cache: chunked-resume MUST NOT re-match prefix (H7).
+            # Its row + KV + lock_ref are already held from prior admission.
             chunked_req.init_next_round_input()
-            if adder.dllm_config is not None:
-                _rem_tokens = adder._get_dllm_remain_tokens()
-            else:
-                _rem_tokens = min(adder.rem_chunk_tokens, int(adder.rem_total_tokens))
-                if adder.is_hybrid_swa:
-                    # alloc_extend needs extend_num_tokens + page_size per
-                    # request, so reserve one page here to avoid OOM.
-                    _rem_tokens = min(
-                        _rem_tokens, int(adder.rem_swa_tokens) - adder.page_size
-                    )
-                # The chunked_req must be added to the list; otherwise, it
-                # will cause a memory leak. Therefore, in certain cases where
-                # _rem_tokens <= 0, it should be replaced with
-                # rem_chunk_tokens. Under hybrid_swa with no room, skip this
-                # iter — the chunked req stays in active_reqs and is retried
-                # next iter (mirrors upstream `return req`).
-                if _rem_tokens <= 0:
-                    if adder.is_hybrid_swa:
-                        _rem_tokens = None
-                    else:
-                        _rem_tokens = adder.rem_chunk_tokens
-
-            if _rem_tokens is not None:
-                truncated = chunked_req.extend_input_len > _rem_tokens
-                chunked_req.set_extend_input_len(
-                    min(chunked_req.extend_input_len, _rem_tokens)
-                )
-                chunked_req.fill_ids = chunked_req.fill_ids[
-                    : len(chunked_req.prefix_indices) + chunked_req.extend_input_len
-                ]
-                adder.can_run_list.append(chunked_req)
-                adder._update_prefill_budget(
-                    0,
-                    chunked_req.extend_input_len,
-                    (
-                        min(
-                            chunked_req.sampling_params.max_new_tokens,
-                            CLIP_MAX_NEW_TOKENS,
-                        )
-                        if not truncated
-                        else 0
-                    ),
-                )
-                # has_pending_chunk: persistent flag carrying chunked-resume
-                # state across iters. When truncated=False, this was the last
-                # chunk — clear the flag so the req exits chunked_reqs().
-                if not chunked_req.is_dllm():
-                    chunked_req.has_pending_chunk = truncated
+            # Use the standard adder.add_one_req — its `is_resume` branch
+            # (schedule_policy.py:811) handles chunked-resume correctly:
+            # - budget_prefix=0 (don't double-count prefix)
+            # - skip _req_inc_lock_ref (already held)
+            # - update has_pending_chunk = truncated
+            # By running BEFORE the main waiting_queue loop, the chunked req
+            # also skips LoRA drainer / hicache prefetch checks that the
+            # main loop applies to fresh reqs.
+            adder.add_one_req(
+                chunked_req,
+                truncation_align_size=self.truncation_align_size,
+            )
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
