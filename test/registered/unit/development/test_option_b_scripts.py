@@ -159,6 +159,51 @@ class TestOptionBBenchmarkSweeps(unittest.TestCase):
         self.assertIn('WARMUP_SECONDS="${WARMUP_SECONDS:-120}"', text)
         self.assertIn('MEASUREMENT_WINDOW_S="${MEASUREMENT_WINDOW_S:-600}"', text)
 
+    # ---- Round 33: AC-11 producer-side timing enforcement -----------
+
+    def test_ds_bench_passes_warmup_seconds_flag(self):
+        text = _non_comment_lines(DS_BENCH)
+        self.assertIn('--warmup-seconds "${WARMUP_SECONDS}"', text,
+                      "benchmark.sh must pass --warmup-seconds to bench_serving "
+                      "so the AC-11 120s warmup is actually run, not just "
+                      "metadata.")
+
+    def test_dsa_bench_passes_warmup_seconds_flag(self):
+        text = _non_comment_lines(DSA_BENCH)
+        self.assertIn('--warmup-seconds "${WARMUP_SECONDS}"', text)
+
+    def test_ds_bench_passes_measurement_window_seconds_flag(self):
+        text = _non_comment_lines(DS_BENCH)
+        self.assertIn('--measurement-window-seconds "${MEASUREMENT_WINDOW_S}"',
+                      text,
+                      "benchmark.sh must pass --measurement-window-seconds "
+                      "to bench_serving so the AC-11 600s measured window "
+                      "is enforced at the producer, not just at the "
+                      "comparator.")
+
+    def test_dsa_bench_passes_measurement_window_seconds_flag(self):
+        text = _non_comment_lines(DSA_BENCH)
+        self.assertIn('--measurement-window-seconds "${MEASUREMENT_WINDOW_S}"',
+                      text)
+
+    def test_ds_bench_fails_on_short_observed_duration(self):
+        """benchmark.sh must refuse to publish an AC-11 artifact whose
+        observed JSONL `duration` falls short of MEASUREMENT_WINDOW_S —
+        guards against bench_serving bailing out before the time loop
+        met its threshold."""
+        text = _non_comment_lines(DS_BENCH)
+        self.assertIn("OBSERVED_DURATION", text,
+                      "benchmark.sh must inspect the JSONL duration.")
+        self.assertIn("MEASUREMENT_WINDOW_S", text)
+        self.assertIn("refusing to publish AC-11 artifact", text,
+                      "benchmark.sh must fail loudly when duration < window.")
+
+    def test_dsa_bench_fails_on_short_observed_duration(self):
+        text = _non_comment_lines(DSA_BENCH)
+        self.assertIn("OBSERVED_DURATION", text)
+        self.assertIn("MEASUREMENT_WINDOW_S", text)
+        self.assertIn("refusing to publish AC-11 artifact", text)
+
     def test_ds_bench_uses_meta_writer_helper(self):
         """The Round 23 inline heredoc spliced JSON as Python source and
         crashed on real `/get_server_info` `true`/`false`/`null`. Round 24

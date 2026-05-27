@@ -460,26 +460,54 @@ _DS_ONLY_SERVER_ARG_KEYS = frozenset({
 })
 
 
-# The stable launch-args projection the AC-11 comparator compares across
-# DSA and DS. Everything else in ``/get_server_info`` (``internal_states``,
+# The AC-11 comparator must compare every stable ``ServerArgs`` launch
+# field across DSA and DS — Codex Round 32 review showed that a hand-
+# curated 12-key whitelist silently dropped `disable_cuda_graph` /
+# `trust_remote_code` / `dtype` / `max_total_tokens` mismatches. Derive
+# the full set from ``dataclasses.fields(ServerArgs)`` so any new
+# launch flag added to sglang is automatically protected.
+#
+# Everything else in ``/get_server_info`` (``internal_states``,
 # ``kv_events``, ``step_time``, ``last_gen_throughput``,
-# ``gpu_memory_used_bytes`` …) is dynamic telemetry that drifts between
-# sequential trials and would otherwise self-refuse the comparator.
-# A whitelist is the only schema-safe filter — a blocklist would re-leak
-# every new dynamic field /server_info gains across sglang versions.
-_AC11_STABLE_LAUNCH_ARG_KEYS = frozenset({
+# ``gpu_memory_used_bytes``, scheduler capacity, …) is dynamic
+# telemetry that drifts between sequential trials — none of it is a
+# ``ServerArgs`` field, so it is excluded by construction.
+
+def _build_stable_launch_arg_keys() -> "frozenset[str]":
+    try:
+        # Import lazily so the module still loads in environments where
+        # sglang is not on sys.path (the failure is then surfaced
+        # loudly at AC-11 invocation rather than at import).
+        from dataclasses import fields as _dc_fields
+        from sglang.srt.server_args import ServerArgs as _ServerArgs
+    except Exception as exc:
+        raise RuntimeError(
+            "AC-11 comparator requires sglang.srt.server_args.ServerArgs to "
+            "derive the stable launch-args projection. Install sglang "
+            "(`pip install -e python/` or `PYTHONPATH=python ...`). "
+            f"Underlying import error: {exc}"
+        ) from exc
+    return frozenset(f.name for f in _dc_fields(_ServerArgs))
+
+
+_AC11_STABLE_LAUNCH_ARG_KEYS = _build_stable_launch_arg_keys()
+
+# Plan §13 (DEC-1): the locked Option B operating point. Both columns
+# must publish all of these launch fields — comparator refuses if any
+# are absent from the normalized projection. Missing fields would let a
+# misconfigured server (e.g. DS launched without the FP8 KV flag) pass
+# the comparator silently.
+_AC11_OPTION_B_LOCKED_FIELDS = frozenset({
+    "model_path",
     "tp_size",
     "page_size",
-    "model_path",
-    "chunked_prefill_size",
+    "kv_cache_dtype",
     "dsa_prefill_backend",
     "dsa_decode_backend",
     "disable_overlap_schedule",
     "disable_piecewise_cuda_graph",
-    "kv_cache_dtype",
-    "enable_double_sparsity",
-    "double_sparsity_config",
     "disable_radix_cache",
+    "disable_cuda_graph",
 })
 
 
@@ -575,24 +603,43 @@ def _read_ac11_meta(result_path: str, *, side: str = "?") -> Dict:
 
 
 def _normalize_ac11_server_args(meta: Dict) -> Dict:
-    """Project ``meta["server_args"]`` onto the stable launch-args whitelist
-    minus the DS-only keys.
+    """Project ``meta["server_args"]`` onto the full ``ServerArgs`` field
+    set minus the DS-only keys.
 
-    DS may legitimately differ from DSA on the DS-enablement flags only;
-    all other launch args (TP size, page size, dtype, backends, radix
-    cache …) must agree. Dynamic ``/get_server_info`` telemetry
-    (``internal_states``, ``kv_events``, ``last_gen_throughput``, …) is
-    dropped: it drifts between sequential trials and would self-refuse
-    the comparator. See ``_AC11_STABLE_LAUNCH_ARG_KEYS`` for the
-    whitelist rationale.
+    DS may legitimately differ from DSA on the DS-enablement flags only
+    (``enable_double_sparsity`` + ``double_sparsity_config``). All other
+    launch args — TP size, page size, dtype, backends, radix cache, CUDA
+    graph flag, mem fraction, max_total_tokens, attention_backend, etc.
+    — must agree. Dynamic ``/get_server_info`` telemetry
+    (``internal_states``, ``kv_events``, ``last_gen_throughput``,
+    scheduler capacity, …) is dropped: none of those keys are
+    ``ServerArgs`` fields so they are excluded by the projection.
     """
     sa = meta.get("server_args") or {}
     if not isinstance(sa, dict):
         return {}
     return {
-        k: sa[k] for k in _AC11_STABLE_LAUNCH_ARG_KEYS
-        if k in sa and k not in _DS_ONLY_SERVER_ARG_KEYS
+        k: sa[k] for k in sa.keys() & _AC11_STABLE_LAUNCH_ARG_KEYS
+        if k not in _DS_ONLY_SERVER_ARG_KEYS
     }
+
+
+def _require_option_b_locked_fields(
+    normalized: Dict, *, side: str, path: str,
+) -> None:
+    """Refuse normalized server_args projections that omit any of the
+    locked Option B launch fields (plan §13 / DEC-1).
+
+    Missing fields would let a misconfigured server (e.g. DS launched
+    without ``--kv-cache-dtype fp8_e4m3``) pass the comparator silently.
+    """
+    missing = sorted(_AC11_OPTION_B_LOCKED_FIELDS - normalized.keys())
+    if missing:
+        raise ValueError(
+            f"AC-11 sidecar {side}={path}: normalized server_args is "
+            f"missing locked Option B field(s) {missing!r}; the sidecar "
+            "must record every Option B launch flag (plan §13 / DEC-1)."
+        )
 
 
 def _validate_trial_metrics(metrics: RunMetrics, *, side: str, path: str) -> None:
@@ -624,6 +671,35 @@ def _validate_meta_floors(meta: Dict, *, side: str, path: str) -> None:
             f"does not meet the AC-11 minimum of "
             f"{AC11_MIN_MEASUREMENT_WINDOW_SECONDS}s."
         )
+
+
+def _validate_jsonl_workload_matches_sidecar(
+    metrics: RunMetrics, meta: Dict, *, side: str, path: str,
+) -> None:
+    """Refuse trials where the JSONL workload disagrees with the sidecar.
+
+    The sidecar is written from env vars before/after the bench run; the
+    JSONL is the canonical record of what actually executed. If they
+    disagree, the sidecar is lying about the workload that ran and
+    Round 31's per-side / cross-side agreement checks would be wrong.
+    """
+    pairs = (
+        ("num_prompts", metrics.num_prompts, meta.get("num_prompts")),
+        ("input_len", metrics.isl, meta.get("isl_total_tokens")),
+        ("output_len", metrics.osl, meta.get("osl_tokens")),
+    )
+    for field, jsonl_v, side_v in pairs:
+        # Treat 0 as "not emitted by the JSONL" — `_read_bench_jsonl`
+        # uses `int(...) or 0` as the default for missing summary keys.
+        if not jsonl_v:
+            continue
+        if side_v != jsonl_v:
+            raise ValueError(
+                f"AC-11 trial {side}={path}: JSONL summary {field}="
+                f"{jsonl_v!r} disagrees with sidecar="
+                f"{side_v!r}; the sidecar must reflect the workload "
+                "that actually ran."
+            )
 
 
 def _validate_jsonl_duration(
@@ -692,12 +768,16 @@ def _validate_cross_side_agreement(
     dsa_norm = _normalize_ac11_server_args(dsa_meta)
     ds_norm = _normalize_ac11_server_args(ds_meta)
     if dsa_norm != ds_norm:
+        diff = sorted(
+            (k, dsa_norm.get(k, "<missing>"), ds_norm.get(k, "<missing>"))
+            for k in dsa_norm.keys() | ds_norm.keys()
+            if dsa_norm.get(k) != ds_norm.get(k)
+        )
         raise ValueError(
             f"AC-11 conc={conc}: normalized launch-args server_args differ "
-            f"between DSA and DS — DSA={dsa_norm!r} DS={ds_norm!r}. The "
-            f"comparator projects /server_info onto "
-            f"{sorted(_AC11_STABLE_LAUNCH_ARG_KEYS)} and only "
-            f"{sorted(_DS_ONLY_SERVER_ARG_KEYS)} may differ between sides."
+            f"between DSA and DS on {[k for k, _, _ in diff]!r}: {diff!r}. "
+            f"Only {sorted(_DS_ONLY_SERVER_ARG_KEYS)} may differ between "
+            "sides (plan §AC-11)."
         )
 
 
@@ -918,7 +998,7 @@ def _run_ac11_mode(args) -> int:
             for m, p in zip(ds_trials, ds_by_conc[conc]):
                 _validate_trial_metrics(m, side="DS", path=p)
                 _validate_jsonl_duration(m, side="DS", path=p)
-            for meta, p in zip(dsa_metas, dsa_by_conc[conc]):
+            for meta, p, m in zip(dsa_metas, dsa_by_conc[conc], dsa_trials):
                 _validate_meta_floors(meta, side="DSA", path=p)
                 if meta.get("concurrency") != conc:
                     raise ValueError(
@@ -926,7 +1006,14 @@ def _run_ac11_mode(args) -> int:
                         f"concurrency={meta.get('concurrency')!r} does not "
                         f"match the grouping concurrency={conc}."
                     )
-            for meta, p in zip(ds_metas, ds_by_conc[conc]):
+                _validate_jsonl_workload_matches_sidecar(
+                    m, meta, side="DSA", path=p,
+                )
+                _require_option_b_locked_fields(
+                    _normalize_ac11_server_args(meta),
+                    side="DSA", path=p,
+                )
+            for meta, p, m in zip(ds_metas, ds_by_conc[conc], ds_trials):
                 _validate_meta_floors(meta, side="DS", path=p)
                 if meta.get("concurrency") != conc:
                     raise ValueError(
@@ -934,6 +1021,13 @@ def _run_ac11_mode(args) -> int:
                         f"concurrency={meta.get('concurrency')!r} does not "
                         f"match the grouping concurrency={conc}."
                     )
+                _validate_jsonl_workload_matches_sidecar(
+                    m, meta, side="DS", path=p,
+                )
+                _require_option_b_locked_fields(
+                    _normalize_ac11_server_args(meta),
+                    side="DS", path=p,
+                )
             # Per-side trial-set agreement.
             _validate_per_side_agreement(dsa_metas, dsa_by_conc[conc], side="DSA")
             _validate_per_side_agreement(ds_metas, ds_by_conc[conc], side="DS")

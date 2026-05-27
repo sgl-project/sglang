@@ -73,8 +73,26 @@ for CONCURRENCY in ${CONCURRENCIES}; do
       --gsp-range-ratio 1.0 \
       --num-prompts "${NUM_PROMPTS}" \
       --max-concurrency "${CONCURRENCY}" \
+      --warmup-seconds "${WARMUP_SECONDS}" \
+      --measurement-window-seconds "${MEASUREMENT_WINDOW_S}" \
       --output-file "${OUTPUT_FILE}" \
       --output-details
+
+    # Round 33 (AC-11): refuse the run if the observed JSONL `duration`
+    # is below MEASUREMENT_WINDOW_S — guards against bench_serving
+    # bailing out early before the time-based loop met its threshold.
+    OBSERVED_DURATION="$(python3 -c "
+import json,sys
+with open('${OUTPUT_FILE}') as fh:
+    last = [json.loads(l) for l in fh if l.strip()][-1]
+print(last.get('duration', 0.0))
+")"
+    if python3 -c "import sys; sys.exit(0 if float('${OBSERVED_DURATION}') >= float('${MEASUREMENT_WINDOW_S}') else 1)"; then
+      :
+    else
+      echo "FATAL: ${OUTPUT_FILE} duration=${OBSERVED_DURATION}s < MEASUREMENT_WINDOW_S=${MEASUREMENT_WINDOW_S}s — refusing to publish AC-11 artifact." >&2
+      exit 1
+    fi
 
     # Same env-var-data approach as benchmark.sh — see comment there.
     COMMIT_SHA="${COMMIT_SHA}" \

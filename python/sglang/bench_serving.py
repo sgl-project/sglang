@@ -1247,6 +1247,17 @@ async def benchmark(
         async with semaphore:
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
+    # Round 33 (AC-11): seconds-based warmup + measurement-window driver.
+    # The dispatch logic for one full pass over `input_requests` lives in
+    # `_dispatch_workload_once` below so both phases can reuse it. The
+    # legacy count-based warmup + single-pass measured run is preserved
+    # untouched when `--warmup-seconds` and `--measurement-window-seconds`
+    # are both 0 (default).
+    warmup_seconds = float(getattr(args, "warmup_seconds", 0.0) or 0.0)
+    measurement_window_s = float(
+        getattr(args, "measurement_window_seconds", 0.0) or 0.0
+    )
+
     # Warmup
     print(f"Starting warmup with {warmup_requests} sequences...")
 
@@ -1345,76 +1356,155 @@ async def benchmark(
             if profile_output.success:
                 print("Profiler started")
 
+    # Round 33 (AC-11): one full pass over `input_requests`. Reused by
+    # both the seconds-based warmup loop (outputs discarded) and the
+    # seconds-based measurement-window loop (outputs accumulated).
+    async def _dispatch_workload_once(
+        *, with_pbar: bool,
+    ) -> Tuple[List[RequestFuncOutput], float]:
+        epoch_tasks: List[asyncio.Task] = []
+        pbar_total = len(input_requests)
+        if (
+            backend == "sglang" and args.dataset_name == "mooncake"
+        ):  # Assuming mooncake is mainly for sglang or similar backends.
+            print(
+                "Using time-based Mooncake request scheduler, ignoring --request-rate."
+            )
+            epoch_request_generator = get_mooncake_request_over_time(
+                input_requests, tokenizer,
+                mooncake_slowdown_factor, mooncake_num_rounds,
+            )
+            print(
+                f"Starting Mooncake trace replay. Sessions: {len(input_requests)}, "
+                f"Rounds per session: {mooncake_num_rounds}. Slowdown factor: "
+                f"{mooncake_slowdown_factor}"
+            )
+            pbar_total *= args.mooncake_num_rounds
+        else:
+            epoch_request_generator = get_request(input_requests, request_rate)
+
+        # Prepare LoRA request distribution parameters
+        if lora_request_distribution == "distinct":
+            lora_idx = 0
+            lora_probs = None
+        elif lora_request_distribution == "skewed":
+            weights = np.array(
+                [lora_zipf_alpha**-i for i in range(len(lora_names))]
+            )
+            lora_idx = None
+            lora_probs = weights / np.sum(weights)
+        else:
+            lora_idx = None
+            lora_probs = None
+
+        pbar = None if (disable_tqdm or not with_pbar) else tqdm(total=pbar_total)
+        epoch_start = time.perf_counter()
+        async for request in epoch_request_generator:
+            if lora_names is not None and len(lora_names) != 0:
+                if lora_request_distribution == "uniform":
+                    lora_name = random.choice(lora_names)
+                elif lora_request_distribution == "distinct":
+                    lora_name = lora_names[lora_idx]
+                    lora_idx = (lora_idx + 1) % len(lora_names)
+                else:
+                    assert (
+                        lora_request_distribution == "skewed"
+                    ), (
+                        f"Unexpected lora_request_distribution: "
+                        f"{lora_request_distribution}. Expected 'skewed'."
+                    )
+                    lora_name = np.random.choice(lora_names, p=lora_probs)
+            else:
+                lora_name = None
+
+            # Merge global extra_request_body with per-request extras
+            # Per-request parameters take precedence over global ones
+            merged_extra_body = {
+                **extra_request_body, **request.extra_request_body,
+            }
+
+            request_func_input = RequestFuncInput(
+                model=model_id,
+                prompt=request.prompt,
+                api_url=api_url,
+                prompt_len=request.prompt_len,
+                output_len=request.output_len,
+                lora_name=lora_name,
+                image_data=request.image_data,
+                extra_request_body=merged_extra_body,
+                timestamp=request.timestamp,
+                routing_key=request.routing_key,
+            )
+
+            epoch_tasks.append(
+                asyncio.create_task(
+                    limited_request_func(
+                        request_func_input=request_func_input, pbar=pbar,
+                    )
+                )
+            )
+        epoch_outputs: List[RequestFuncOutput] = await asyncio.gather(*epoch_tasks)
+        if is_multi_turn:
+            epoch_outputs = [x for output in epoch_outputs for x in output]
+        if pbar is not None:
+            pbar.close()
+        return epoch_outputs, time.perf_counter() - epoch_start
+
+    # Round 33: seconds-based warmup (optional). Runs full epochs until
+    # `warmup_seconds` is reached, discards outputs, and resets the
+    # random + numpy seeds before the measured phase so warmup does not
+    # perturb the measured request-arrival process.
+    if warmup_seconds > 0:
+        print(
+            f"AC-11 time-based warmup: running full epochs until "
+            f">= {warmup_seconds:.1f}s elapsed (request-count warmup "
+            "was already run above)."
+        )
+        wu_start = time.perf_counter()
+        wu_epochs = 0
+        while time.perf_counter() - wu_start < warmup_seconds:
+            await _dispatch_workload_once(with_pbar=False)
+            wu_epochs += 1
+        wu_elapsed = time.perf_counter() - wu_start
+        print(
+            f"AC-11 warmup ran {wu_epochs} epoch(s) over {wu_elapsed:.1f}s. "
+            "Re-seeding random/np.random before measured phase."
+        )
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+
     # Run all requests
     benchmark_start_time = time.perf_counter()
-    tasks: List[asyncio.Task] = []
-    pbar_total = len(input_requests)
-    if (
-        backend == "sglang" and args.dataset_name == "mooncake"
-    ):  # Assuming mooncake is mainly for sglang or similar backends
-        print("Using time-based Mooncake request scheduler, ignoring --request-rate.")
-        request_generator = get_mooncake_request_over_time(
-            input_requests, tokenizer, mooncake_slowdown_factor, mooncake_num_rounds
-        )
+    if measurement_window_s > 0:
+        # Round 33: seconds-based measurement window. Accumulate outputs
+        # across full epochs until `measurement_window_seconds` is met.
+        # `benchmark_duration` is the accumulated measured wall-clock.
         print(
-            f"Starting Mooncake trace replay. Sessions: {len(input_requests)}, Rounds per session: {mooncake_num_rounds}. Slowdown factor: {mooncake_slowdown_factor}"
+            f"AC-11 time-based measurement: running full epochs until "
+            f"accumulated wall-clock >= {measurement_window_s:.1f}s."
         )
-        pbar_total *= args.mooncake_num_rounds
-    else:
-        request_generator = get_request(input_requests, request_rate)
-
-    # Prepare LoRA request distribution parameters
-    if lora_request_distribution == "distinct":
-        lora_idx = 0
-    elif lora_request_distribution == "skewed":
-        weights = np.array([lora_zipf_alpha**-i for i in range(len(lora_names))])
-        lora_probs = weights / np.sum(weights)
-    else:
-        lora_idx = None
-        lora_probs = None
-
-    pbar = None if disable_tqdm else tqdm(total=pbar_total)
-    async for request in request_generator:
-        if lora_names is not None and len(lora_names) != 0:
-            if lora_request_distribution == "uniform":
-                lora_name = random.choice(lora_names)
-            elif lora_request_distribution == "distinct":
-                lora_name = lora_names[lora_idx]
-                lora_idx = (lora_idx + 1) % len(lora_names)
-            else:
-                assert (
-                    lora_request_distribution == "skewed"
-                ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
-
-                lora_name = np.random.choice(lora_names, p=lora_probs)
-        else:
-            lora_name = None
-
-        # Merge global extra_request_body with per-request extras
-        # Per-request parameters take precedence over global ones
-        merged_extra_body = {**extra_request_body, **request.extra_request_body}
-
-        request_func_input = RequestFuncInput(
-            model=model_id,
-            prompt=request.prompt,
-            api_url=api_url,
-            prompt_len=request.prompt_len,
-            output_len=request.output_len,
-            lora_name=lora_name,
-            image_data=request.image_data,
-            extra_request_body=merged_extra_body,
-            timestamp=request.timestamp,
-            routing_key=request.routing_key,
-        )
-
-        tasks.append(
-            asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input, pbar=pbar)
+        outputs: List[RequestFuncOutput] = []
+        accumulated_s = 0.0
+        epoch_idx = 0
+        while accumulated_s < measurement_window_s:
+            epoch_outputs, epoch_s = await _dispatch_workload_once(
+                with_pbar=epoch_idx == 0,
             )
-        )
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
-    if is_multi_turn:
-        outputs = [x for output in outputs for x in output]
+            outputs.extend(epoch_outputs)
+            accumulated_s += epoch_s
+            epoch_idx += 1
+            print(
+                f"  epoch {epoch_idx}: {epoch_s:.1f}s "
+                f"({len(epoch_outputs)} requests); "
+                f"accumulated {accumulated_s:.1f}s / "
+                f"{measurement_window_s:.1f}s."
+            )
+        benchmark_duration_override = accumulated_s
+        measured_epochs = epoch_idx
+    else:
+        outputs, _ = await _dispatch_workload_once(with_pbar=True)
+        benchmark_duration_override = None
+        measured_epochs = 1
 
     # Stop profiler (only if profile_steps was not provided, as it auto-stops)
     if profile and not (
@@ -1432,8 +1522,8 @@ async def benchmark(
                 if profile_output.success:
                     print("Profiler stopped")
 
-    if pbar is not None:
-        pbar.close()
+    # Round 33: pbar is owned per-epoch by `_dispatch_workload_once`, so
+    # nothing to close here.
 
     if "sglang" in backend:
         server_info = requests.get(
@@ -1458,7 +1548,15 @@ async def benchmark(
         accept_length = None
 
     # Compute metrics and print results
-    benchmark_duration = time.perf_counter() - benchmark_start_time
+    # Round 33: in seconds-based measurement-window mode `duration` is
+    # the accumulated measured wall-clock across all epochs, not the
+    # outer wall-clock (which would include profiler-start / server_info
+    # overhead between epochs).
+    benchmark_duration = (
+        benchmark_duration_override
+        if benchmark_duration_override is not None
+        else time.perf_counter() - benchmark_start_time
+    )
     metrics, output_lens = calculate_metrics(
         input_requests=None if is_multi_turn else input_requests,
         outputs=outputs,
@@ -1581,6 +1679,26 @@ async def benchmark(
         and metrics.mean_itl_ms is not None
         and metrics.output_throughput is not None
     ):
+        # Round 33 (AC-11): derive an effective workload triple
+        # (num_prompts, input_len, output_len) that survives both
+        # `random` / `random-ids` / `image` (which use args.random_input_len)
+        # and `generated-shared-prefix` (which uses gsp_* knobs). The
+        # comparator side requires these fields to cross-check the
+        # sidecar's claim of what ran.
+        if args.dataset_name == "generated-shared-prefix":
+            effective_input_len = int(
+                getattr(args, "gsp_system_prompt_len", 0)
+                + getattr(args, "gsp_question_len", 0)
+            )
+            effective_output_len = int(
+                getattr(args, "gsp_output_len", args.random_output_len or 0)
+            )
+        else:
+            effective_input_len = int(args.random_input_len or 0)
+            effective_output_len = int(args.random_output_len or 0)
+        effective_num_prompts = int(
+            getattr(args, "num_prompts", 0) * measured_epochs
+        )
         result = {
             # Arguments
             "tag": getattr(args, "tag", None),
@@ -1592,6 +1710,13 @@ async def benchmark(
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
             "random_range_ratio": args.random_range_ratio,
+            # AC-11 workload triple (canonical record of what ran).
+            "num_prompts": effective_num_prompts,
+            "input_len": effective_input_len,
+            "output_len": effective_output_len,
+            "warmup_seconds": warmup_seconds,
+            "measurement_window_seconds": measurement_window_s,
+            "measured_epochs": measured_epochs,
             # Information
             "server_info": server_info,
             # Results
@@ -2286,6 +2411,33 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Number of warmup requests to run before the benchmark",
+    )
+    # Round 33 (AC-11): seconds-based warmup + measurement-window driver.
+    # When set, the benchmark runs full workload epochs over
+    # `--input-file` / `--num-prompts` until the elapsed wall-clock
+    # crosses the threshold (warmup outputs discarded; measurement
+    # outputs accumulated). Default 0 keeps legacy single-pass behavior.
+    parser.add_argument(
+        "--warmup-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Round 33 (AC-11): if > 0, run full workload epochs until "
+            "this many seconds elapsed before the measured phase. "
+            "Outputs are discarded; random/np.random seeds are reset "
+            "before the first measured epoch."
+        ),
+    )
+    parser.add_argument(
+        "--measurement-window-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Round 33 (AC-11): if > 0, accumulate measured outputs "
+            "across full workload epochs until this many seconds of "
+            "wall-clock have elapsed. `duration` in the JSONL is the "
+            "accumulated measured time."
+        ),
     )
     parser.add_argument(
         "--tokenize-prompt",

@@ -27,6 +27,44 @@ BC_PATH = REPO_ROOT / "development" / "benchmark_compare.py"
 _OMIT = object()  # sentinel: drop the field from a sidecar override
 
 
+def _option_b_sa(
+    *,
+    tp_size: int = 8,
+    page_size: int = 64,
+    disable_radix_cache: bool = True,
+    disable_cuda_graph: bool = False,
+    enable_ds: bool = False,
+    **overrides,
+) -> dict:
+    """Build a sidecar `server_args` dict carrying every Option B locked
+    launch field plus the surrounding ServerArgs fields the comparator
+    must compare. Matches the default ``_write_bench_jsonl`` fixture.
+    """
+    sa = {
+        "model_path": "/models/deepseek-v3.2",
+        "tp_size": tp_size,
+        "page_size": page_size,
+        "kv_cache_dtype": "fp8_e4m3",
+        "dsa_prefill_backend": "flashmla_kv",
+        "dsa_decode_backend": "flashmla_kv",
+        "disable_overlap_schedule": True,
+        "disable_piecewise_cuda_graph": True,
+        "disable_radix_cache": disable_radix_cache,
+        "disable_cuda_graph": disable_cuda_graph,
+        "chunked_prefill_size": 8192,
+        "attention_backend": "flashmla",
+        "dtype": "bfloat16",
+        "max_total_tokens": 65536,
+        "trust_remote_code": True,
+        "mem_fraction_static": 0.9,
+    }
+    if enable_ds:
+        sa["enable_double_sparsity"] = True
+        sa["double_sparsity_config"] = "/tmp/x.safetensors"
+    sa.update(overrides)
+    return sa
+
+
 def _load_bc():
     spec = importlib.util.spec_from_file_location("_bc", BC_PATH)
     mod = importlib.util.module_from_spec(spec)
@@ -105,12 +143,28 @@ def _write_bench_jsonl(
     if sidecar:
         # Both DSA and DS sidecars expose disable_radix_cache because the
         # /server_info endpoint always reports the launch flag — only its
-        # value differs (DSA: False, DS: True until AC-10 closes).
+        # value differs (DSA: False, DS: True until AC-10 closes). The
+        # comparator after Round 33 requires every Option B locked field
+        # to be present, so the fixture includes them all by default.
         sa = {
+            # Plan §13 Option B locked launch fields:
+            "model_path": "/models/deepseek-v3.2",
             "tp_size": tp_size,
             "page_size": page_size,
-            "chunked_prefill_size": 8192,
+            "kv_cache_dtype": "fp8_e4m3",
+            "dsa_prefill_backend": "flashmla_kv",
+            "dsa_decode_backend": "flashmla_kv",
+            "disable_overlap_schedule": True,
+            "disable_piecewise_cuda_graph": True,
             "disable_radix_cache": disable_radix_cache,
+            "disable_cuda_graph": False,
+            # Other launch fields the comparator widening protects:
+            "chunked_prefill_size": 8192,
+            "attention_backend": "flashmla",
+            "dtype": "bfloat16",
+            "max_total_tokens": 65536,
+            "trust_remote_code": True,
+            "mem_fraction_static": 0.9,
         }
         if mode == "double_sparsity":
             sa["enable_double_sparsity"] = True
@@ -600,11 +654,10 @@ class TestAC11EndToEnd(unittest.TestCase):
                     "timestamp_utc": "2026-05-27T12:00:00Z",
                     "chunked_prefill_size": 8192,
                     "warmup_seconds": 120.0, "measurement_window_seconds": 600.0,
-                    "trial_id": str(i), "server_args": {"tp_size": 8, "page_size": 64,
-                                                          "chunked_prefill_size": 8192,
-                                                          "enable_double_sparsity": True,
-                                                          "double_sparsity_config": "/tmp/x.safetensors",
-                                                          "disable_radix_cache": True},
+                    "trial_id": str(i),
+                    "server_args": _option_b_sa(
+                        enable_ds=True, disable_radix_cache=True,
+                    ),
                     "server_args_error": None,
                 }
                 with open(p + ".meta.json", "w") as fh:
@@ -729,35 +782,28 @@ class TestAC11EndToEnd(unittest.TestCase):
             self.assertEqual(self._ac11_main(dsa, ds), 2)
 
     def test_dynamic_server_info_drift_does_not_self_refuse(self):
-        """``/get_server_info`` emits dynamic telemetry
+        """``/get_server_info`` emits dynamic non-``ServerArgs`` telemetry
         (``internal_states``, ``kv_events``, ``last_gen_throughput``,
-        ``gpu_memory_used_bytes``, …) that drifts between sequential
-        trials. After Round 32 the comparator projects ``server_args``
-        onto a stable launch-args whitelist, so this drift must NOT
-        cause within-side or cross-side refusal."""
+        ``gpu_memory_used_bytes``, ``step_time``, scheduler capacity,
+        …) that drifts between sequential trials. After Round 33 the
+        comparator projects ``server_args`` onto the full ``ServerArgs``
+        field set, so this drift (none of those keys are ServerArgs
+        fields) must NOT cause within-side or cross-side refusal."""
         with tempfile.TemporaryDirectory() as tmp:
-            stable_dsa_sa = {
-                "tp_size": 8,
-                "page_size": 64,
-                "chunked_prefill_size": 8192,
-                "disable_radix_cache": True,
-            }
-            stable_ds_sa = {
-                **stable_dsa_sa,
-                "enable_double_sparsity": True,
-                "double_sparsity_config": "/tmp/x.safetensors",
-            }
+            stable_dsa_sa = _option_b_sa()
+            stable_ds_sa = _option_b_sa(enable_ds=True)
             dsa_paths = []
             ds_paths = []
             for i, drift in enumerate([100.0, 200.0, 300.0]):
-                # Per-trial dynamic telemetry that drifts. Identical
-                # whitelist fields, distinct telemetry.
+                # Per-trial dynamic non-ServerArgs telemetry that drifts.
                 dyn = {
                     "internal_states": [{"last_gen_throughput": drift}],
                     "kv_events": [{"step": i, "type": "alloc"}],
                     "last_gen_throughput": drift,
                     "gpu_memory_used_bytes": 12345 + i,
                     "step_time": 0.01 * (i + 1),
+                    "scheduler_load": [0.5 + 0.1 * i, 0.6 + 0.1 * i],
+                    "future_unknown_endpoint_field": f"trial_{i}",
                 }
                 p_dsa = os.path.join(tmp, f"dsa_c64_t{i}.jsonl")
                 _write_bench_jsonl(
@@ -774,6 +820,94 @@ class TestAC11EndToEnd(unittest.TestCase):
                 )
                 ds_paths.append(p_ds)
             self.assertEqual(self._ac11_main(dsa_paths, ds_paths), 0)
+
+    # ---- Round 33: full ServerArgs projection + workload cross-check ----
+
+    def test_server_args_non_ds_launch_flag_mismatch_refused(self):
+        """Codex Round 32 review reproducer: ANY non-DS launch flag
+        mismatch between DSA and DS must refuse, not silently pass.
+
+        The Round 32 hand-list dropped these mismatches; Round 33 widens
+        the projection to the full ``dataclasses.fields(ServerArgs)``
+        set, so every real launch flag is now compared.
+        """
+        cases = [
+            ("disable_cuda_graph", False, True),
+            ("trust_remote_code", True, False),
+            ("dtype", "bfloat16", "float16"),
+            ("max_total_tokens", 65536, 32768),
+            ("attention_backend", "flashmla", "fa3"),
+            ("mem_fraction_static", 0.9, 0.85),
+        ]
+        for field, dsa_v, ds_v in cases:
+            with self.subTest(field=field):
+                with tempfile.TemporaryDirectory() as tmp:
+                    dsa = self._make_trials(
+                        tmp, "dsa", 64, [100, 100, 100], [10, 10, 10],
+                        sidecar_overrides={
+                            "server_args": _option_b_sa(**{field: dsa_v}),
+                        },
+                    )
+                    ds = self._make_trials(
+                        tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                        sidecar_overrides={
+                            "server_args": _option_b_sa(
+                                enable_ds=True, **{field: ds_v},
+                            ),
+                        },
+                    )
+                    self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_server_args_locked_option_b_field_missing_refused(self):
+        """Plan §13 (DEC-1) locks the Option B operating point: every
+        locked launch field must be in the sidecar. A sidecar missing
+        any of them is structurally unsafe for AC-11."""
+        for field in (
+            "model_path", "tp_size", "page_size", "kv_cache_dtype",
+            "dsa_prefill_backend", "dsa_decode_backend",
+            "disable_overlap_schedule", "disable_piecewise_cuda_graph",
+            "disable_radix_cache", "disable_cuda_graph",
+        ):
+            with self.subTest(field=field):
+                with tempfile.TemporaryDirectory() as tmp:
+                    # Drop the locked field from BOTH sides so the failure
+                    # is the locked-field rule, not a mismatch.
+                    dsa_sa = _option_b_sa()
+                    ds_sa = _option_b_sa(enable_ds=True)
+                    dsa_sa.pop(field, None)
+                    ds_sa.pop(field, None)
+                    dsa = self._make_trials(
+                        tmp, "dsa", 64, [100, 100, 100], [10, 10, 10],
+                        sidecar_overrides={"server_args": dsa_sa},
+                    )
+                    ds = self._make_trials(
+                        tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                        sidecar_overrides={"server_args": ds_sa},
+                    )
+                    self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_jsonl_workload_disagrees_with_sidecar_refused(self):
+        """The sidecar records the workload from env vars before the
+        bench run; the JSONL is what actually ran. A disagreement means
+        the sidecar is lying about the workload, so every later cross-
+        side workload-agreement check is wrong."""
+        for jsonl_field, sidecar_field, jsonl_v, side_v in [
+            ("num_prompts", "num_prompts", 160, 320),
+            ("input_len", "isl_total_tokens", 2048, 4096),
+            ("output_len", "osl_tokens", 256, 512),
+        ]:
+            with self.subTest(field=jsonl_field):
+                with tempfile.TemporaryDirectory() as tmp:
+                    dsa = self._make_trials(
+                        tmp, "dsa", 64, [100, 100, 100], [10, 10, 10],
+                    )
+                    # DS JSONL summary differs from sidecar.
+                    ds = self._make_trials(
+                        tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                        extra_summary={jsonl_field: jsonl_v},
+                        sidecar_overrides={sidecar_field: side_v},
+                    )
+                    self.assertEqual(self._ac11_main(dsa, ds), 2)
 
     def test_chunked_prefill_size_unknown_string_allowed_when_consistent(self):
         """``_bench_meta_writer.py`` falls back to the string
