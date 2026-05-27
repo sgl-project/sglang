@@ -481,6 +481,13 @@ class SchedulerDisaggregationPrefillMixin:
         if self.server_args.enable_dp_attention:
             return 0
 
+        # EPLB (Expert Parallelism Load Balancing) requires the forward pass to be
+        # wrapped with expert_distribution_recorder.with_forward_pass() context and
+        # experts_capturer.on_forward_end() call, which forward_split_prefill bypasses.
+        # Without this, EPLB loses routing statistics and makes suboptimal decisions.
+        if self.server_args.enable_eplb:
+            return 0
+
         # Speculative decoding (EAGLE) appends draft-model KV layers beyond
         # num_hidden_layers. Pipelined mode only iterates target layers, so
         # draft KV would never be transferred to the decode side.
