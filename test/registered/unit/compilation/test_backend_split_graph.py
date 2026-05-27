@@ -33,9 +33,7 @@ def _make_graph(nodes):
 
 def _call_targets(graph_module):
     return [
-        node.target
-        for node in graph_module.graph.nodes
-        if node.op == "call_function"
+        node.target for node in graph_module.graph.nodes if node.op == "call_function"
     ]
 
 
