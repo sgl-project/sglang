@@ -1187,6 +1187,9 @@ def biased_grouped_topk_gpu(
             and num_experts <= 256
             and topk <= 8
         ):
+            if not apply_routed_scaling_factor_on_output:
+                scaling = 1.0
+
             num_tokens = gating_output.shape[0]
 
             topk_values = torch.empty(
