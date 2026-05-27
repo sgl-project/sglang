@@ -2115,25 +2115,37 @@ class DeepseekV2AttentionMLA(
                 # to latent q_lora only for the placeholder path (unit tests).
                 queries_for_ds = q_nope if q_nope is not None else q_lora
 
-                # Allocation-free graph-safe path: when the DSA metadata has
+                # Allocation-free graph-safe path: when the DSA backend has
                 # preallocated ds_graph_state and the selector is bound on
                 # CUDA, route through retrieve_topk_graph_safe (Triton kernel +
                 # in-place topk pipeline). The captured graph stays 0-alloc
                 # after warmup.
-                _attn_backend = getattr(forward_batch, "attn_backend", None)
-                _dsa_metadata = (
-                    getattr(_attn_backend, "forward_metadata", None)
-                    if _attn_backend is not None
-                    else None
-                )
-                _ds_graph_state = (
-                    getattr(_dsa_metadata, "ds_graph_state", None)
-                    if _dsa_metadata is not None
-                    else None
-                )
+                #
+                # Source-of-truth resolution mirrors the AC-7 MHA bypass above:
+                #   (1) `forward_batch.ds_graph_state` — set by
+                #       `dsa_backend.init_forward_metadata` for dynamic
+                #       non-graph forwards. Production ForwardBatch has no
+                #       `attn_backend` field so this is the eager source.
+                #   (2) `ForwardContext`-published `attn_backend
+                #       .forward_metadata.ds_graph_state` — for the CUDA-graph
+                #       capture/replay path, where the capture initializer
+                #       gets no `forward_batch`.
                 _selector = self.double_sparsity_selector
                 _seq_lens = getattr(forward_batch, "seq_lens", None)
                 _sparse_mask = getattr(forward_batch, "sparse_mask", None)
+                _ds_graph_state = getattr(forward_batch, "ds_graph_state", None)
+                _dsa_metadata = None
+                if _ds_graph_state is None and _has_forward_context():
+                    _fc_backend2 = _get_attn_backend()
+                    if isinstance(_fc_backend2, _TboAttnBackend):
+                        _fc_backend2 = _fc_backend2.primary
+                    _dsa_metadata = getattr(
+                        _fc_backend2, "forward_metadata", None
+                    )
+                    if _dsa_metadata is not None:
+                        _ds_graph_state = getattr(
+                            _dsa_metadata, "ds_graph_state", None
+                        )
                 _use_graph_safe = (
                     _ds_graph_state is not None
                     and _ds_graph_state.scratch_scores is not None
@@ -2152,6 +2164,28 @@ class DeepseekV2AttentionMLA(
                     _max_seq_len = _ds_graph_state.max_seq_len
                     if _max_seq_len <= 0:
                         _max_seq_len = int(req_to_token.shape[1])
+
+                    # Production `req_pool_indices` is int64
+                    # (schedule_batch / cuda_graph_runner). The captured
+                    # selector region requires int32. copy_() casts
+                    # int64 → int32 in-place against pre-allocated
+                    # scratch (no new allocation per call).
+                    _rpi_scratch = _ds_graph_state.scratch_req_pool_indices[:_bs]
+                    _rpi_scratch.copy_(forward_batch.req_pool_indices)
+                    # Prefer `DSAMetadata.cache_seqlens_int32` when the
+                    # metadata-owned int32 view is available; otherwise
+                    # copy_() into the `scratch_seq_lens` int32 view.
+                    _seq_lens_i32 = None
+                    if _dsa_metadata is not None:
+                        _seq_lens_i32 = getattr(
+                            _dsa_metadata, "cache_seqlens_int32", None
+                        )
+                        if _seq_lens_i32 is not None:
+                            _seq_lens_i32 = _seq_lens_i32[:_bs]
+                    if _seq_lens_i32 is None:
+                        _seq_lens_i32 = _ds_graph_state.scratch_seq_lens[:_bs]
+                        _seq_lens_i32.copy_(_seq_lens)
+
                     retrieve_topk_graph_safe(
                         queries=queries_for_ds,
                         token_signatures=_selector.token_label_table.signatures,
@@ -2159,9 +2193,9 @@ class DeepseekV2AttentionMLA(
                         channel_selection=_selector.channel_mask.channel_selection,
                         channel_weights=_selector.channel_mask.channel_weights,
                         layer_id=layer_id,
-                        req_pool_indices=forward_batch.req_pool_indices,
+                        req_pool_indices=_rpi_scratch,
                         req_to_token=req_to_token,
-                        seq_lens=_seq_lens,
+                        seq_lens=_seq_lens_i32,
                         max_seq_len=_max_seq_len,
                         max_top_k=_selector.max_top_k,
                         out_indices=_ds_graph_state.selected_indices,
@@ -2215,22 +2249,36 @@ class DeepseekV2AttentionMLA(
                     ds_out = ds_out[:bs]
                 _rpi = getattr(forward_batch, "req_pool_indices", None)
                 if req_to_token is not None and _rpi is not None:
+                    _lp_err = (
+                        _ds_graph_state.lp_error_scratch
+                        if _ds_graph_state is not None
+                        else None
+                    )
                     error_count = logical_to_physical(
                         selected_indices=selected_indices,
                         req_pool_indices=_rpi,
                         req_to_token=req_to_token,
                         out=ds_out,
+                        error_scratch=_lp_err,
                     )
                 else:
                     ds_out.fill_(-1)
                     error_count = 0
-                self._publish_ds_request_summary(
-                    forward_batch=forward_batch,
-                    selected_indices=selected_indices,
-                    valid_lengths=valid_lengths,
-                    error_count=error_count,
-                    layer_id=layer_id,
-                )
+                # Skip the per-request CPU-side summary while CUDA capture
+                # is recording the stream; the host syncs (.to('cpu') and
+                # .item()) inside _publish_ds_request_summary are illegal
+                # during capture and not needed for the captured replay.
+                if not (
+                    torch.cuda.is_available()
+                    and torch.cuda.is_current_stream_capturing()
+                ):
+                    self._publish_ds_request_summary(
+                        forward_batch=forward_batch,
+                        selected_indices=selected_indices,
+                        valid_lengths=valid_lengths,
+                        error_count=error_count,
+                        layer_id=layer_id,
+                    )
                 return ds_out
 
             error_state: Dict[str, Any] = {}

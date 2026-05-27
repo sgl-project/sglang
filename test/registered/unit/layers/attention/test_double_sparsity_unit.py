@@ -3381,19 +3381,42 @@ class TestCUDAGraphCapture(unittest.TestCase):
             f"unexpected: {state.selected_indices[0, :2].tolist()}",
         )
 
-    def test_select_topk_indices_uses_graph_safe_when_metadata_state_present(self):
-        """Production `_select_topk_indices` routes through retrieve_topk_graph_safe.
+    def _make_production_forward_batch(self, device, *, req_to_token, bs=1, max_seq_len=4):
+        """Production-shaped forward_batch: int64 req_pool_indices + int64 seq_lens.
 
-        Drives the actual `_select_topk_indices` method (the production
-        DS branch in deepseek_v2.py).  Mocks `forward_batch.attn_backend`
-        so its `forward_metadata.ds_graph_state` is a real
-        :class:`DSGraphState`, then spies the dynamic import of
-        `retrieve_topk_graph_safe` at the kernel module to prove the
-        graph-safe entry point is taken on CUDA-resident tensors.
+        Mirrors what `schedule_batch.py` and `cuda_graph_runner.py` publish.
+        Does NOT carry a synthetic ``attn_backend`` attribute; the DS gate
+        resolves the backend through ``ForwardContext`` in production.
+        """
+        return SimpleNamespace(
+            req_pool_indices=torch.zeros(bs, dtype=torch.int64, device=device),
+            seq_lens=torch.full(
+                (bs,), max_seq_len, dtype=torch.int64, device=device,
+            ),
+            sparse_mask=torch.ones(bs, max_seq_len, dtype=torch.int32, device=device),
+            out_cache_loc=None,
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            batch_size=bs,
+        )
+
+    def test_select_topk_indices_uses_graph_safe_via_forward_context(self):
+        """Production `_select_topk_indices` resolves DS metadata via
+        ForwardContext (not via a synthetic forward_batch.attn_backend)
+        and calls retrieve_topk_graph_safe.
+
+        Publishes a real :class:`ForwardContext` carrying an
+        ``attn_backend.forward_metadata`` namespace with `ds_graph_state`,
+        leaves `ForwardBatch` without an ``attn_backend`` field, and
+        passes production-dtype int64 ``req_pool_indices`` / ``seq_lens``.
+        Spies the dynamic import of ``retrieve_topk_graph_safe`` and
+        asserts it is called exactly once.
         """
         import sglang.srt.layers.attention.double_sparsity.selection_kernel as _sk
         from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
             allocate_graph_state,
+        )
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext, forward_context,
         )
         from unittest.mock import patch as _patch
 
@@ -3401,51 +3424,139 @@ class TestCUDAGraphCapture(unittest.TestCase):
             "cuda" if torch.cuda.is_available() else "cpu"
         )
         attn = TestSelectTopkIndicesHookBranch()._make_attn(use_ds=True)
-        # Replace the placeholder selector with our bound real-mode selector.
-        sel, req_to_token, queries = self._make_bound_selector_cuda_fp16(
-            device, q_dtype=torch.float32,
-        ) if device.type == "cuda" else (None, None, None)
-        if device.type != "cuda":
+        if device.type == "cuda":
+            sel, req_to_token, _q = self._make_bound_selector_cuda_fp16(
+                device, q_dtype=torch.float32,
+            )
+        else:
             sel, req_to_token = self._make_bound_selector_with_known_sigs()
-            queries = torch.ones(1, 1, 1, dtype=torch.float32)
+            _q = torch.ones(1, 1, 1, dtype=torch.float32)
         attn.double_sparsity_selector = sel
 
         state = allocate_graph_state(
             max_bs=1, max_top_k=2, max_seq_len=4, device=device,
         )
-        # Synthesize forward_batch wired to drive the new graph-safe gate.
-        forward_batch = SimpleNamespace(
-            req_pool_indices=torch.zeros(1, dtype=torch.int32, device=device),
-            seq_lens=torch.tensor([4], dtype=torch.int32, device=device),
-            sparse_mask=torch.ones(1, 4, dtype=torch.int32, device=device),
-            out_cache_loc=None,
-            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
-            batch_size=1,
-            attn_backend=SimpleNamespace(
-                forward_metadata=SimpleNamespace(
-                    ds_graph_state=state,
-                    ds_topk_indices_out=None,
+        forward_batch = self._make_production_forward_batch(
+            device, req_to_token=req_to_token, bs=1, max_seq_len=4,
+        )
+
+        # Real ForwardContext: the production source of attn_backend.
+        attn_backend_stub = SimpleNamespace(
+            forward_metadata=SimpleNamespace(
+                ds_graph_state=state,
+                cache_seqlens_int32=torch.full(
+                    (1,), 4, dtype=torch.int32, device=device,
                 ),
             ),
         )
-
-        # Spy: when the dynamic import inside _select_topk_indices resolves
-        # `retrieve_topk_graph_safe` on the module, it gets the wrapped spy.
         spy = MagicMock(wraps=_sk.retrieve_topk_graph_safe)
-        with _patch.object(_sk, "retrieve_topk_graph_safe", new=spy):
+        with _patch.object(_sk, "retrieve_topk_graph_safe", new=spy), \
+             forward_context(ForwardContext(attn_backend=attn_backend_stub)):
             attn._select_topk_indices(
                 x=torch.zeros(1, 1, 1, device=device),
                 q_lora=torch.zeros(1, 1, 1, dtype=torch.float32, device=device),
-                q_nope=queries,
+                q_nope=_q,
                 positions=torch.zeros(1, dtype=torch.int32, device=device),
                 forward_batch=forward_batch,
                 layer_id=0,
             )
         self.assertEqual(
             spy.call_count, 1,
-            "graph-safe entry point was not taken — production path still "
-            "allocating via retrieve_topk_via_labels.",
+            "ForwardContext-resolved graph-safe entry was not taken — "
+            "production path still allocating via retrieve_topk_via_labels.",
         )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_select_topk_indices_zero_allocs_production_path(self):
+        """`_select_topk_indices` is replay-safe under CUDA graph capture
+        at production dtypes (int64 ``req_pool_indices``, int64 ``seq_lens``,
+        fp16 sig, bf16 queries, int32 sparse_mask, ForwardContext-published
+        attention backend).
+
+        Captures one `_select_topk_indices` call into a CUDA graph, then
+        replays it 5 times wrapped in ``assert_no_alloc_in_region``. Replay
+        must register 0 new CUDA allocations (the captured region's tensors
+        live in the graph's private pool; only the host bookkeeping runs
+        on replay). This mirrors what ``cuda_graph_runner.py`` does for the
+        whole decode forward in production.
+        """
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            allocate_graph_state, assert_no_alloc_in_region,
+        )
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext, forward_context,
+        )
+
+        device = torch.device("cuda")
+        attn = TestSelectTopkIndicesHookBranch()._make_attn(use_ds=True)
+        sel, req_to_token, queries_bf16 = self._make_bound_selector_cuda_fp16(
+            device, q_dtype=torch.bfloat16,
+        )
+        attn.double_sparsity_selector = sel
+
+        state = allocate_graph_state(
+            max_bs=1, max_top_k=2, max_seq_len=4, device=device,
+        )
+        # ds_topk_indices_out + ds_per_request_summary must be pre-set so
+        # the captured body has stable buffers (matches what
+        # init_forward_metadata does in production).
+        ds_topk_out = torch.empty(1, 2, dtype=torch.int32, device=device)
+        forward_batch = self._make_production_forward_batch(
+            device, req_to_token=req_to_token, bs=1, max_seq_len=4,
+        )
+        forward_batch.ds_topk_indices_out = ds_topk_out
+        forward_batch.ds_per_request_summary = {}
+        attn_backend_stub = SimpleNamespace(
+            forward_metadata=SimpleNamespace(
+                ds_graph_state=state,
+                cache_seqlens_int32=torch.full(
+                    (1,), 4, dtype=torch.int32, device=device,
+                ),
+            ),
+        )
+
+        x = torch.zeros(1, 1, 1, device=device)
+        q_lora = torch.zeros(1, 1, 1, dtype=torch.float32, device=device)
+        positions = torch.zeros(1, dtype=torch.int32, device=device)
+
+        with forward_context(ForwardContext(attn_backend=attn_backend_stub)):
+            # Warmup on a side stream (capture must run with the kernels
+            # already JIT-compiled and the caching allocator primed).
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(2):
+                    attn._select_topk_indices(
+                        x=x, q_lora=q_lora, q_nope=queries_bf16,
+                        positions=positions, forward_batch=forward_batch,
+                        layer_id=0,
+                    )
+            torch.cuda.current_stream().wait_stream(stream)
+            torch.cuda.synchronize()
+
+            # Capture.
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                attn._select_topk_indices(
+                    x=x, q_lora=q_lora, q_nope=queries_bf16,
+                    positions=positions, forward_batch=forward_batch,
+                    layer_id=0,
+                )
+
+            # Replay 5x — must be 0-alloc on every replay.
+            for step in range(5):
+                with assert_no_alloc_in_region(f"production-path-replay-{step}"):
+                    graph.replay()
+                torch.cuda.synchronize()
+
+            # Correctness sanity: the captured region wrote the expected
+            # top-2 physical slots into ds_topk_indices_out via
+            # logical_to_physical. logical [2,3] → physical [req_to_token[0,2], req_to_token[0,3]] = [0, 1].
+            self.assertEqual(
+                sorted(ds_topk_out[0, :2].tolist()),
+                [0, 1],
+                f"expected physical slots [0, 1]; got {ds_topk_out[0, :2].tolist()}",
+            )
 
 
 _CUDA_AVAILABLE = torch.cuda.is_available()

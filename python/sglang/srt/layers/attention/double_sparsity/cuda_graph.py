@@ -67,6 +67,15 @@ class DSGraphState:
     scratch_valid_i64: Optional[torch.Tensor] = None      # int64 [max_bs, 1]
     scratch_pv_mask: Optional[torch.Tensor] = None        # bool [max_bs, max_seq_len]
     scratch_throwaway_idx: Optional[torch.Tensor] = None  # int64 [max_bs, max_top_k]
+    # Production input scratch — `forward_batch.req_pool_indices` is int64 in
+    # production (scheduler + cuda_graph_runner.py:178) but the captured
+    # selector region requires int32. `_select_topk_indices` does an in-place
+    # copy_() into these views before calling retrieve_topk_graph_safe.
+    scratch_req_pool_indices: Optional[torch.Tensor] = None  # int32 [max_bs]
+    scratch_seq_lens: Optional[torch.Tensor] = None          # int32 [max_bs]
+    # logical_to_physical's Triton kernel atomically accumulates the
+    # bad-req_pool count here. Zeroed on every call.
+    lp_error_scratch: Optional[torch.Tensor] = None          # int32 [1]
 
 
 def allocate_graph_state(
@@ -140,6 +149,9 @@ def allocate_graph_state(
     scratch_valid_i64 = None
     scratch_pv_mask = None
     scratch_throwaway_idx = None
+    scratch_req_pool_indices = None
+    scratch_seq_lens = None
+    lp_error_scratch = None
     if max_seq_len > 0:
         scratch_scores = torch.zeros(
             (max_bs, max_seq_len), dtype=torch.float32, device=device,
@@ -168,6 +180,13 @@ def allocate_graph_state(
         scratch_throwaway_idx = torch.zeros(
             (max_bs, max_top_k), dtype=torch.int64, device=device,
         )
+        scratch_req_pool_indices = torch.zeros(
+            (max_bs,), dtype=torch.int32, device=device,
+        )
+        scratch_seq_lens = torch.zeros(
+            (max_bs,), dtype=torch.int32, device=device,
+        )
+        lp_error_scratch = torch.zeros((1,), dtype=torch.int32, device=device)
 
     return DSGraphState(
         selected_indices=selected,
@@ -184,6 +203,9 @@ def allocate_graph_state(
         scratch_valid_i64=scratch_valid_i64,
         scratch_pv_mask=scratch_pv_mask,
         scratch_throwaway_idx=scratch_throwaway_idx,
+        scratch_req_pool_indices=scratch_req_pool_indices,
+        scratch_seq_lens=scratch_seq_lens,
+        lp_error_scratch=lp_error_scratch,
     )
 
 

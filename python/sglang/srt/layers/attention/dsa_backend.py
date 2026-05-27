@@ -781,6 +781,13 @@ class DeepseekSparseAttnBackend(
             # `_select_topk_indices` can write into it via `out=` without
             # per-step allocation.
             forward_batch.ds_topk_indices_out = ds_topk_indices_out
+        if ds_graph_state is not None:
+            # Same convention for the allocation-free graph-safe scratch.
+            # `ForwardBatch` is the only object both eager-decode and the
+            # dynamic non-graph forward path reliably see; the CUDA-graph
+            # capture path resolves this same field through ForwardContext
+            # (`get_attn_backend().forward_metadata.ds_graph_state`).
+            forward_batch.ds_graph_state = ds_graph_state
 
     def _cal_indexer_k_start_end(
         self,

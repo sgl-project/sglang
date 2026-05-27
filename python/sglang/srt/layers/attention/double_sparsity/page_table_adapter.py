@@ -22,26 +22,96 @@ when ``req_pool_indices`` values are out of range for ``req_to_token``.
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
+
+_TRITON_AVAILABLE = False
+try:
+    import triton
+    import triton.language as tl
+
+    _TRITON_AVAILABLE = True
+except ImportError:
+    _TRITON_AVAILABLE = False
 
 
 class DSAdapterError(Exception):
     """Base class for Double Sparsity adapter errors."""
 
 
+if _TRITON_AVAILABLE:
+
+    @triton.jit
+    def _logical_to_physical_kernel(
+        selected_ptr,       # [bs, max_top_k] int32 (logical positions, -1 padded)
+        rpi_ptr,            # [bs] int32 OR int64 (Triton casts on load)
+        rtt_ptr,            # [num_pools, max_seqlen] int32
+        out_ptr,            # [bs, max_top_k] int32 — written in place
+        err_ptr,            # [1] int32 — atomically accumulated error count
+        num_pools: tl.constexpr,
+        max_seqlen: tl.constexpr,
+        bs: tl.constexpr,
+        max_top_k: tl.constexpr,
+        sel_stride_b: tl.constexpr,
+        rtt_stride_p: tl.constexpr,
+        out_stride_b: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        b = tl.program_id(0)
+        kb = tl.program_id(1)
+        k_offs = kb * BLOCK_K + tl.arange(0, BLOCK_K)
+        k_in_range = k_offs < max_top_k
+
+        s = tl.load(
+            selected_ptr + b * sel_stride_b + k_offs,
+            mask=k_in_range, other=-1,
+        ).to(tl.int32)
+        is_pad = s < 0
+
+        pool = tl.load(rpi_ptr + b).to(tl.int64)
+        bad_pool = (pool < 0) | (pool >= num_pools)
+        if (kb == 0) & bad_pool:
+            tl.atomic_add(err_ptr, 1)
+        safe_pool = tl.minimum(tl.maximum(pool, 0), num_pools - 1)
+        safe_s = tl.maximum(s, 0).to(tl.int64)
+        phys = tl.load(
+            rtt_ptr + safe_pool * rtt_stride_p + safe_s,
+            mask=k_in_range, other=-1,
+        ).to(tl.int32)
+        result = tl.where(is_pad | bad_pool, tl.full(phys.shape, -1, tl.int32), phys)
+        tl.store(
+            out_ptr + b * out_stride_b + k_offs,
+            result, mask=k_in_range,
+        )
+
+
+def _next_pow2(n: int) -> int:
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
 def logical_to_physical(
     selected_indices: torch.Tensor,    # int32 [bs, max_top_k] logical positions, -1 padded
-    req_pool_indices: torch.Tensor,    # int32 [bs]
+    req_pool_indices: torch.Tensor,    # int32 or int64 [bs]
     req_to_token: torch.Tensor,        # int32 [num_pools, max_seqlen]
     out: torch.Tensor,                 # int32 [bs, max_top_k]  pre-allocated output
+    *,
+    error_scratch: Optional[torch.Tensor] = None,  # int32 [1] — required for CUDA fast path
 ) -> int:
     """Convert logical token positions to physical KV-cache slot indices.
 
     Writes into the pre-allocated ``out`` tensor (capture-safe, no allocation).
     Returns a scalar error count (rows where ``req_pool_indices`` was out of
     range for ``req_to_token``; typically 0 in production).
+
+    CUDA fast path: when Triton is available, ``out`` is on CUDA, and
+    ``error_scratch`` is a pre-allocated int32 ``[1]`` tensor on the same
+    device, the function runs an allocation-free Triton kernel and returns
+    the error count via ``error_scratch.item()`` (one host-sync at the end,
+    safe outside graph capture).  Otherwise falls back to the original
+    torch-based path.
     """
 
     bs, max_top_k = selected_indices.shape
@@ -49,23 +119,49 @@ def logical_to_physical(
         out.fill_(-1)
         return 0
 
-    # is_valid: True for positions that are not the -1 padding sentinel.
-    is_valid = selected_indices >= 0  # [bs, max_top_k]
+    if (
+        _TRITON_AVAILABLE
+        and out.is_cuda
+        and error_scratch is not None
+        and error_scratch.is_cuda
+    ):
+        # Allocation-free Triton path.
+        error_scratch.zero_()
+        block_k = _next_pow2(max_top_k)
+        grid = (bs, (max_top_k + block_k - 1) // block_k)
+        num_pools = int(req_to_token.shape[0])
+        max_seqlen = int(req_to_token.shape[1])
+        _logical_to_physical_kernel[grid](
+            selected_indices,
+            req_pool_indices,
+            req_to_token,
+            out,
+            error_scratch,
+            num_pools=num_pools,
+            max_seqlen=max_seqlen,
+            bs=bs,
+            max_top_k=max_top_k,
+            sel_stride_b=selected_indices.stride(0),
+            rtt_stride_p=req_to_token.stride(0),
+            out_stride_b=out.stride(0),
+            BLOCK_K=block_k,
+        )
+        # Returning the error count requires a host sync. Skip the sync
+        # when capturing — callers that need the value will read it
+        # post-replay; here we return 0 conservatively to keep capture safe.
+        if torch.cuda.is_current_stream_capturing():
+            return 0
+        return int(error_scratch.item())
 
-    # Clamp padding positions to 0 so the gather doesn't OOB on the seqlen dim.
-    safe_positions = selected_indices.clamp(min=0)  # [bs, max_top_k]
-
-    # Clamp pool indices to valid range for error containment.
+    # Torch fallback (allocating; used on CPU + when scratch is missing).
+    is_valid = selected_indices >= 0
+    safe_positions = selected_indices.clamp(min=0)
     num_pools = req_to_token.shape[0]
-    bad_pool = (req_pool_indices < 0) | (req_pool_indices >= num_pools)  # [bs]
+    bad_pool = (req_pool_indices < 0) | (req_pool_indices >= num_pools)
     error_count = int(bad_pool.to(torch.int32).sum().item())
-    safe_pool = req_pool_indices.clamp(0, max(num_pools - 1, 0)).long()  # [bs]
-
-    # Gather physical slots: req_to_token[safe_pool[b], safe_positions[b, k]]
-    pool_expanded = safe_pool.unsqueeze(1).expand(-1, max_top_k)       # [bs, max_top_k]
-    physical = req_to_token[pool_expanded, safe_positions.long()]       # [bs, max_top_k] int32
-
-    # Restore -1 for padding and for rows with bad pool indices.
-    pad_mask = ~is_valid | bad_pool.unsqueeze(1)                        # [bs, max_top_k]
+    safe_pool = req_pool_indices.clamp(0, max(num_pools - 1, 0)).long()
+    pool_expanded = safe_pool.unsqueeze(1).expand(-1, max_top_k)
+    physical = req_to_token[pool_expanded, safe_positions.long()]
+    pad_mask = ~is_valid | bad_pool.unsqueeze(1)
     out.copy_(torch.where(pad_mask, torch.full_like(physical, -1), physical))
     return error_count
