@@ -100,6 +100,56 @@ def _read_corpus_file(path: str, num_samples: int) -> List[str]:
     return lines[:num_samples]
 
 
+def _extract_mla_nope_prefix(
+    tensor: torch.Tensor,
+    num_heads: int,
+    nope_dim: int,
+    suffix_dim: int,
+) -> torch.Tensor:
+    """Extract the noPE prefix from an MLA projection output by reshaping first.
+
+    MLA projections interleave per-head blocks:
+    ``kv_b_proj`` → ``[K_nope_h0 | V_h0 | K_nope_h1 | V_h1 | ...]``
+    ``q_b_proj``  → ``[Q_nope_h0 | Q_rope_h0 | Q_nope_h1 | Q_rope_h1 | ...]``
+
+    Flat-slicing the first ``H * nope_dim`` columns before reshape selects V or
+    RoPE columns from later heads.  The correct approach: reshape to
+    ``[-1, H, nope_dim + suffix_dim]`` first, then slice ``[..., :nope_dim]``.
+    """
+    T = tensor.shape[0]
+    return tensor.reshape(T, num_heads, nope_dim + suffix_dim)[..., :nope_dim].contiguous()
+
+
+def _pile_val_blocks(num_blocks: int, block_size: int, seed: int) -> List[str]:
+    """Load Pile validation split, shuffle with ``seed``, return ``num_blocks`` text examples.
+
+    Each returned string is one Pile document; the caller's tokenizer will
+    truncate to ``block_size`` tokens during the forward-pass loop.
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise RuntimeError(
+            "Pile-val calibration requires the `datasets` library. "
+            "Install via 'pip install datasets'."
+        ) from exc
+
+    ds = load_dataset("mit-han-lab/pile-val-backup", split="validation")
+    ds = ds.shuffle(seed=seed)
+    texts: List[str] = []
+    for example in ds:
+        text = example.get("text", "")
+        if text.strip():
+            texts.append(text)
+        if len(texts) >= num_blocks:
+            break
+    if not texts:
+        raise RuntimeError(
+            "mit-han-lab/pile-val-backup returned no non-empty text examples."
+        )
+    return texts[:num_blocks]
+
+
 def _collect_channel_importance(
     *,
     model_path: str,
@@ -110,8 +160,9 @@ def _collect_channel_importance(
     head_dim_hint: Optional[int],
     prompts: List[str],
     allow_synthetic: bool,
+    block_size: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the calibration forward pass and return ``(selection, weights)``.
+    """Run the calibration forward pass and return ``(importance, weights)``.
 
     The real path implements **Method 1** from the original DoubleSparse paper:
     ``mean(abs(Q_nope * K_nope))`` per channel, accumulated over tokens and
@@ -119,14 +170,17 @@ def _collect_channel_importance(
     registered per layer.  When both fire for the same pass the element-wise
     Q*K product is computed and added to the running importance tensor.  If a
     layer's Q projection cannot be found the accumulator falls back to
-    K-only L2 (``sum(K^2)``) with a logged warning, preserving coverage for
-    architectures that do not expose a hookable Q projection.
+    K-only L2 with a logged warning.
 
     For MLA layers (DeepSeek V3.2):
-    * K side — ``kv_b_proj`` output ``[T, H*(nope+v)]`` → slice noPE prefix
-      ``[..., :H*nope]`` → reshape ``[T, H, nope_dim]``.
-    * Q side — ``q_b_proj`` output ``[T, H*(nope+rope)]`` → slice noPE prefix
-      ``[..., :H*nope]`` → reshape ``[T, H, nope_dim]``.
+    * K side — ``kv_b_proj`` output ``[T, H*(nope+v)]``; reshape to
+      ``[T, H, nope+v]`` FIRST, then slice ``[..., :nope_dim]``.
+    * Q side — ``q_b_proj`` output ``[T, H*(nope+rope)]``; reshape to
+      ``[T, H, nope+rope]`` FIRST, then slice ``[..., :nope_dim]``.
+
+    The reshape-before-slice order is critical: flat-slicing first picks V or
+    RoPE columns from later heads (the exact bug fixed in dsa_backend.py
+    Round 3).
 
     For standard attention (Llama / GLM):
     * K side — ``k_proj`` or ``wk`` output → reshape ``[T, H, head_dim]``.
@@ -199,6 +253,9 @@ def _collect_channel_importance(
         getattr(config, "hidden_size", 0) // max(num_heads, 1)
     )
     k_head_dim = qk_nope_head_dim if qk_nope_head_dim > 0 else head_dim
+    # For MLA, Q_nope occupies the first qk_nope_head_dim columns per head;
+    # the remaining (head_dim - qk_nope_head_dim) columns are Q_RoPE.
+    qk_rope_head_dim = (head_dim - qk_nope_head_dim) if qk_nope_head_dim > 0 else 0
     if num_layers <= 0 or num_heads <= 0 or k_head_dim <= 0:
         raise RuntimeError(
             f"Could not derive calibration shape from {model_path!r}: "
@@ -232,16 +289,12 @@ def _collect_channel_importance(
         importance[idx] += contrib
         seen[idx] += 1
 
-    # Best-effort hook registration.  For MLA layers (kv_b_proj / q_b_proj)
-    # the K-noPE and Q-noPE prefixes are sliced from the concatenated output
-    # before accumulation.  The Q projection prefix width equals the K prefix
-    # width (both == num_heads * k_head_dim) because Q_nope and K_nope share
-    # the same noPE dimension.
     handles = []
-    # noPE prefix width shared by K and Q in MLA, and equals full width in
-    # standard attention (qk_nope_head_dim==0 case).
-    nope_prefix_width = num_heads * k_head_dim
+    # Expected flat output widths for MLA projections.
     full_mla_k_width = num_heads * (k_head_dim + v_head_dim) if v_head_dim > 0 else None
+    full_mla_q_width = num_heads * (k_head_dim + qk_rope_head_dim) if qk_rope_head_dim > 0 else None
+    # Standard-attention path: no per-head suffix, full output = noPE width.
+    std_k_width = num_heads * k_head_dim
 
     for layer_idx, layer in enumerate(getattr(model, "model", model).layers):
         attn = getattr(layer, "self_attn", layer)
@@ -267,12 +320,16 @@ def _collect_channel_importance(
         wq = getattr(attn, "wq", None)
         if q_b_proj is not None:
             qproj: Optional[object] = q_b_proj
+            is_mla_q = True
         elif q_proj_mod is not None:
             qproj = q_proj_mod
+            is_mla_q = False
         elif wq is not None:
             qproj = wq
+            is_mla_q = False
         else:
             qproj = None
+            is_mla_q = False
 
         has_q = qproj is not None
         if not has_q:
@@ -285,25 +342,31 @@ def _collect_channel_importance(
         def _make_k_hook(
             idx,
             is_mla=is_mla_k,
-            prefix=nope_prefix_width,
             full_w=full_mla_k_width,
+            std_w=std_k_width,
             layer_has_q=has_q,
         ):
             def _hook(_module, _inputs, output):
                 tensor = output[0] if isinstance(output, tuple) else output
                 if tensor.dim() < 2:
                     return
+                t = tensor.detach().to(torch.float32)
                 if is_mla:
-                    if full_w is not None and tensor.shape[-1] == full_w:
-                        tensor = tensor[..., :prefix]
-                    elif tensor.shape[-1] != prefix:
+                    if full_w is not None and t.shape[-1] == full_w:
+                        # Reshape per-head first, then slice K_nope prefix.
+                        k_nope = _extract_mla_nope_prefix(t, num_heads, k_head_dim, v_head_dim)
+                    elif t.shape[-1] == std_w:
+                        # kv_b_proj already outputs noPE-only (e.g. model variant).
+                        k_nope = t.reshape(-1, num_heads, k_head_dim)
+                    else:
                         logger.warning(
                             "kv_b_proj output last-dim=%d does not match expected "
-                            "K-noPE prefix=%d or [K|V] total=%s; skipping layer %d K hook.",
-                            tensor.shape[-1], prefix, full_w, idx,
+                            "[K|V] total=%s or K-only=%d; skipping layer %d K hook.",
+                            t.shape[-1], full_w, std_w, idx,
                         )
                         return
-                k_nope = tensor.detach().to(torch.float32).reshape(-1, num_heads, k_head_dim)
+                else:
+                    k_nope = t.reshape(-1, num_heads, k_head_dim)
                 if layer_has_q:
                     _k_buf[idx] = k_nope
                     _accumulate_method1(idx)
@@ -312,23 +375,30 @@ def _collect_channel_importance(
 
             return _hook
 
-        def _make_q_hook(idx, prefix=nope_prefix_width):
+        def _make_q_hook(
+            idx,
+            is_mla=is_mla_q,
+            full_w=full_mla_q_width,
+            std_w=std_k_width,
+        ):
             def _hook(_module, _inputs, output):
                 tensor = output[0] if isinstance(output, tuple) else output
                 if tensor.dim() < 2:
                     return
-                # Slice noPE prefix: works for both MLA (q_b_proj outputs
-                # [Q_noPE | Q_RoPE]) and standard attention (full == prefix).
-                if tensor.shape[-1] > prefix:
-                    tensor = tensor[..., :prefix]
-                elif tensor.shape[-1] < prefix:
+                t = tensor.detach().to(torch.float32)
+                if is_mla and full_w is not None and t.shape[-1] == full_w:
+                    # Reshape per-head first, then slice Q_nope prefix.
+                    q_nope = _extract_mla_nope_prefix(t, num_heads, k_head_dim, qk_rope_head_dim)
+                elif t.shape[-1] == std_w:
+                    # Standard attention or already-noPE-only output.
+                    q_nope = t.reshape(-1, num_heads, k_head_dim)
+                else:
                     logger.warning(
-                        "q projection output last-dim=%d is narrower than expected "
-                        "Q-noPE prefix=%d; skipping layer %d Q hook.",
-                        tensor.shape[-1], prefix, idx,
+                        "q projection output last-dim=%d does not match expected "
+                        "[Q_noPE|Q_RoPE] total=%s or Q-only=%d; skipping layer %d Q hook.",
+                        t.shape[-1], full_w, std_w, idx,
                     )
                     return
-                q_nope = tensor.detach().to(torch.float32).reshape(-1, num_heads, k_head_dim)
                 _q_buf[idx] = q_nope
                 _accumulate_method1(idx)
 
@@ -338,9 +408,14 @@ def _collect_channel_importance(
         if has_q:
             handles.append(qproj.register_forward_hook(_make_q_hook(layer_idx)))
 
+    tok_kwargs: dict = {"return_tensors": "pt"}
+    if block_size is not None:
+        tok_kwargs["max_length"] = block_size
+        tok_kwargs["truncation"] = True
+
     try:
         for prompt in prompts:
-            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+            inputs = tokenizer(prompt, **tok_kwargs).to(model.device)
             with torch.no_grad():
                 model(**inputs)
     finally:
@@ -379,10 +454,19 @@ def calibrate(args: argparse.Namespace) -> str:
     if args.tp <= 0:
         raise ValueError(f"--tp must be positive, got {args.tp}.")
 
+    block_size = args.block_size
+    seed = args.seed
+
     if args.dataset:
         prompts = _read_corpus_file(args.dataset, args.num_samples)
-    else:
+        dataset_source = f"file:{args.dataset}"
+    elif args.allow_synthetic:
         prompts = _niah_synthetic_prompts(args.num_samples, args.ctx_len)
+        dataset_source = "niah_synthetic"
+    else:
+        # Production path: Pile validation, seed=42, 256 × block_size tokens.
+        prompts = _pile_val_blocks(args.num_samples, block_size, seed)
+        dataset_source = "mit-han-lab/pile-val-backup"
 
     importance, weights = _collect_channel_importance(
         model_path=args.model,
@@ -393,6 +477,7 @@ def calibrate(args: argparse.Namespace) -> str:
         head_dim_hint=args.head_dim,
         prompts=prompts,
         allow_synthetic=args.allow_synthetic,
+        block_size=block_size,
     )
 
     L, H, head_dim = importance.shape
@@ -412,8 +497,10 @@ def calibrate(args: argparse.Namespace) -> str:
     used_synthetic = args.allow_synthetic and not os.path.exists(args.model)
     extra = {
         "calibration_source": "synthetic" if used_synthetic else "real",
+        "dataset_source": dataset_source,
+        "seed": str(seed),
         "num_samples": str(len(prompts)),
-        "ctx_len": str(args.ctx_len),
+        "block_size": str(block_size),
     }
     content_hash = save_channel_mask(
         args.output,
@@ -459,17 +546,26 @@ def _make_parser() -> argparse.ArgumentParser:
     p.add_argument("--label-dim", type=int, default=16)
     p.add_argument("--page-size", type=int, default=64)
     p.add_argument(
-        "--num-samples", type=int, default=64, help="Calibration prompts."
+        "--num-samples", type=int, default=256,
+        help="Number of calibration prompts/blocks (Pile-val default: 256).",
     )
     p.add_argument(
-        "--ctx-len", type=int, default=4096, help="Approx token length per prompt."
+        "--block-size", type=int, default=512,
+        help="Token count per block when using Pile-val (default: 512).",
+    )
+    p.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for Pile-val shuffle (default: 42).",
+    )
+    p.add_argument(
+        "--ctx-len", type=int, default=4096, help="Approx token length per prompt (NIAH synthetic only)."
     )
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument(
         "--dataset",
         type=str,
         default=None,
-        help="External corpus path (newline-delimited prompts). Defaults to NIAH synthetic.",
+        help="External corpus path (newline-delimited prompts). Overrides Pile-val default.",
     )
     p.add_argument(
         "--num-layers",

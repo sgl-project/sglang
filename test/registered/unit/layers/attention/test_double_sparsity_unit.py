@@ -1652,9 +1652,11 @@ class TestCalibrateMethod1(unittest.TestCase):
             named_projs = {"kv_b_proj": _FixedOutLinear(k_out_full)}
             if has_q_proj:
                 named_projs["q_b_proj"] = _FixedOutLinear(q_out_full)
-            prefix = num_heads * k_head_dim
-            k_nope_ref = k_out_full[..., :prefix].float().reshape(T, num_heads, k_head_dim)
-            q_nope_ref = q_out_full[..., :prefix].float().reshape(T, num_heads, k_head_dim)
+            # Correct extraction: reshape per-head first, then slice noPE prefix.
+            # head_dim = k_head_dim + 64 (rope), so qk_rope_head_dim = 64.
+            qk_rope_head_dim = 64
+            k_nope_ref = k_out_full.float().reshape(T, num_heads, k_head_dim + v_head_dim)[..., :k_head_dim].contiguous()
+            q_nope_ref = q_out_full.float().reshape(T, num_heads, k_head_dim + qk_rope_head_dim)[..., :k_head_dim].contiguous()
         else:
             k_out = torch.rand(T, num_heads * k_head_dim, generator=rng)
             q_out = torch.rand(T, num_heads * k_head_dim, generator=rng)
@@ -1750,6 +1752,148 @@ class TestCalibrateMethod1(unittest.TestCase):
             f"K-only fallback importance mismatch.\nExpected:\n{expected_k_only}\nGot:\n{actual}",
         )
 
+    def test_mla_k_extraction_ignores_v_columns(self):
+        """K hook must reshape per-head before slicing; V columns must not pollute K_nope."""
+        import tempfile
+        import torch.nn as nn
+
+        num_heads, k_head_dim, v_head_dim = 2, 4, 4
+        T = 3
+        k_full = num_heads * (k_head_dim + v_head_dim)  # 16
+        q_full = num_heads * (k_head_dim + 64)          # 136
+
+        # K output: K_nope = 1.0, V = 100.0 (sentinel poison value).
+        # Layout per-head: [K_nope_h0(0:4), V_h0(4:8), K_nope_h1(8:12), V_h1(12:16)]
+        k_out = torch.ones(T, k_full)
+        k_out[:, 4:8] = 100.0   # V for head 0
+        k_out[:, 12:16] = 100.0 # V for head 1
+
+        # Q output: all 1.0 (isolates K extraction as the variable under test)
+        q_out = torch.ones(T, q_full)
+
+        cfg = SimpleNamespace(
+            num_hidden_layers=1, num_attention_heads=num_heads,
+            qk_nope_head_dim=k_head_dim, v_head_dim=v_head_dim,
+            head_dim=k_head_dim + 64, hidden_size=num_heads * (k_head_dim + 64),
+        )
+
+        class _Fixed(nn.Module):
+            def __init__(self, out): super().__init__(); self._out = out
+            def forward(self, x): return (self._out,)
+
+        class _Attn(nn.Module):
+            def __init__(self, **p):
+                super().__init__()
+                for n, m in p.items(): self.add_module(n, m)
+            def forward(self, x):
+                for m in self.children(): m(x)
+
+        class _Layer(nn.Module):
+            def __init__(self, a): super().__init__(); self.self_attn = a
+            def forward(self, x): self.self_attn(x)
+
+        class _Inner(nn.Module):
+            def __init__(self, ls):
+                super().__init__(); import torch.nn as nn2; self.layers = nn2.ModuleList(ls)
+            def forward(self, x):
+                for l in self.layers: l(x)
+
+        class _Top(nn.Module):
+            def __init__(self, i): super().__init__(); self.model = i
+            def forward(self, **_kw): self.model(torch.zeros(1))
+            @property
+            def device(self): return torch.device("cpu")
+
+        attn = _Attn(kv_b_proj=_Fixed(k_out), q_b_proj=_Fixed(q_out))
+        fake_model = _Top(_Inner([_Layer(attn)]))
+
+        importance, _ = self._run_calibration(cfg, fake_model, tempfile.mkdtemp())
+
+        # Under correct extraction: both heads see K_nope = 1.0, Q = 1.0 → importance = 1.0
+        # Under wrong flat-slice: head 1 sees V_h0 = 100.0 → importance ≈ 100.0
+        actual = importance[0].cpu()
+        self.assertLess(
+            actual.max().item(), 10.0,
+            f"K extraction appears to include V columns (max={actual.max():.1f}). "
+            f"Expected all values near 1.0 (K_nope=1.0 × Q=1.0).\nActual:\n{actual}",
+        )
+        self.assertTrue(
+            torch.allclose(actual, torch.ones(num_heads, k_head_dim), atol=1e-5),
+            f"K importance must be 1.0 for all heads/channels.\nActual:\n{actual}",
+        )
+
+    def test_mla_q_extraction_ignores_rope_columns(self):
+        """Q hook must reshape per-head before slicing; RoPE columns must not pollute Q_nope."""
+        import tempfile
+        import torch.nn as nn
+
+        num_heads, k_head_dim, v_head_dim, qk_rope_head_dim = 2, 4, 4, 64
+        T = 3
+        k_full = num_heads * (k_head_dim + v_head_dim)   # 16
+        q_full = num_heads * (k_head_dim + qk_rope_head_dim)  # 136
+
+        # Q output: Q_nope = 1.0, Q_rope = 100.0 (sentinel poison value).
+        # Per-head layout: [Q_nope_h0(0:4), Q_rope_h0(4:68), Q_nope_h1(68:72), Q_rope_h1(72:136)]
+        q_out = torch.ones(T, q_full)
+        q_out[:, 4:68] = 100.0    # Q_rope for head 0
+        q_out[:, 72:136] = 100.0  # Q_rope for head 1
+
+        # K output: K_nope = 1.0, V = 0.0 (V excluded by correct extraction)
+        k_out = torch.zeros(T, k_full)
+        k_out[:, 0:4] = 1.0   # K_nope head 0
+        k_out[:, 8:12] = 1.0  # K_nope head 1
+
+        cfg = SimpleNamespace(
+            num_hidden_layers=1, num_attention_heads=num_heads,
+            qk_nope_head_dim=k_head_dim, v_head_dim=v_head_dim,
+            head_dim=k_head_dim + qk_rope_head_dim, hidden_size=num_heads * (k_head_dim + qk_rope_head_dim),
+        )
+
+        class _Fixed(nn.Module):
+            def __init__(self, out): super().__init__(); self._out = out
+            def forward(self, x): return (self._out,)
+
+        class _Attn(nn.Module):
+            def __init__(self, **p):
+                super().__init__()
+                for n, m in p.items(): self.add_module(n, m)
+            def forward(self, x):
+                for m in self.children(): m(x)
+
+        class _Layer(nn.Module):
+            def __init__(self, a): super().__init__(); self.self_attn = a
+            def forward(self, x): self.self_attn(x)
+
+        class _Inner(nn.Module):
+            def __init__(self, ls):
+                super().__init__(); import torch.nn as nn2; self.layers = nn2.ModuleList(ls)
+            def forward(self, x):
+                for l in self.layers: l(x)
+
+        class _Top(nn.Module):
+            def __init__(self, i): super().__init__(); self.model = i
+            def forward(self, **_kw): self.model(torch.zeros(1))
+            @property
+            def device(self): return torch.device("cpu")
+
+        attn = _Attn(kv_b_proj=_Fixed(k_out), q_b_proj=_Fixed(q_out))
+        fake_model = _Top(_Inner([_Layer(attn)]))
+
+        importance, _ = self._run_calibration(cfg, fake_model, tempfile.mkdtemp())
+
+        # Under correct extraction: both heads see Q_nope=1.0 × K_nope=1.0 → importance = 1.0
+        # Under wrong flat-slice: head 1 gets Q_rope_h0 (100.0) → importance ≈ 100.0
+        actual = importance[0].cpu()
+        self.assertLess(
+            actual.max().item(), 10.0,
+            f"Q extraction appears to include RoPE columns (max={actual.max():.1f}). "
+            f"Expected all values near 1.0.\nActual:\n{actual}",
+        )
+        self.assertTrue(
+            torch.allclose(actual, torch.ones(num_heads, k_head_dim), atol=1e-5),
+            f"Q importance must be 1.0 for all heads/channels.\nActual:\n{actual}",
+        )
+
     def test_512d_channel_index_rejected(self):
         """load_channel_mask must reject channel indices >= head_dim=128."""
         import tempfile
@@ -1800,6 +1944,8 @@ class TestCalibrateMethod1(unittest.TestCase):
             page_size=64,
             num_samples=4,
             ctx_len=64,
+            block_size=512,
+            seed=42,
             dataset=None,
             num_layers=1,
             num_heads=2,
