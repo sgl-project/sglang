@@ -416,7 +416,98 @@ Deferred follow-ups:
 - Keep additional backend expansion deferred until representative Phase 3 and
   Phase 4 tests are passing for the local matrix.
 
+Layout-robustness deferred items:
+- **DSV4 layout-robustness threading.** DSV4's fixture has its own
+  `_token_loc` plus multiple cache populators (`_populate_swa_kv_cache`,
+  `_populate_extra_kv_cache`) and several speculative-mode runners that
+  each call `_token_loc` directly (~6-8 call sites total). Threading
+  `loc_fn` through all of them is the same mechanical refactor that
+  was done for DSA, just spread across more sites. The
+  `shuffled_pages` default doesn't break DSV4 today because its
+  fallback `_token_loc` keeps the original contiguous formula; this is
+  purely a coverage extension, not a correctness gap. To pick up,
+  mirror the DSA pattern.
+- **Production-side bugs surfaced by layout-robustness.** These are
+  documented as `LAYOUT_KNOWN_FAILURES` (with `skipTest` gates) on the
+  affected backend test files. Fixing them requires production-side
+  changes outside test-PR scope; the test-side records the cause so
+  the next person doesn't re-discover them:
+  - **FA3 + FA4 dense EXTEND** under `non_monotonic_extend`: prefill
+    metadata assumes monotonic `out_cache_loc` within an extend.
+  - **FlashInfer MLA EXTEND** under `interleaved_pages` and
+    `non_monotonic_extend`: illegal memory access in paged-prefill.
+  - **FlashInfer MLA DECODE** under `interleaved_pages`:
+    `CUBLAS_STATUS_EXECUTION_FAILED` in paged-decode.
+  - **FlashMLA EXTEND** under both non-tidy layouts: illegal memory
+    access.
+  - **FlashMLA DECODE** under `interleaved_pages`: page-index shape
+    mismatch.
+  - **dual_chunk_flash_attn EXTEND** under `non_monotonic_extend`:
+    `cu_seqlens_*` indexing assumes contiguous K slots within an
+    extend.
+
 Latest verification:
+- **Layout-robustness arc complete.** Surfaced and addressed a major
+  Phase 2 blind spot: the fixture's `_token_loc(req_idx, pos) =
+  page_size + req_idx * max_ctx + pos` formula gave each request a
+  strictly contiguous block of cache slots, with `out_cache_loc`
+  monotonic within each request by construction. Production allocators
+  routinely produce non-tidy layouts after fragmentation, so the
+  tidy-only fixture silently hid a class of backend bugs in page-table
+  derivation.
+
+  New infrastructure in `common/attention_methods/dense_attention.py`:
+  `make_loc_fn(layout=...)` produces a `(req_idx, pos) -> physical_loc`
+  callable for four layouts:
+  - `contiguous` — the original tidy mapping (kept as a baseline /
+    regression case).
+  - `shuffled_pages` — within each request, page order is randomly
+    permuted; **this is now the DEFAULT for every test**, so every
+    existing case exercises non-monotonic page assignments.
+  - `interleaved_pages` — pages from different requests interleaved in
+    physical-slot order (`req 0 → pages [0, 2, 4, ...]`, `req 1 → [1,
+    3, 5, ...]`); exercised by per-backend `test_layout_robustness_cases`.
+  - `non_monotonic_extend` — extend-token slots scattered within each
+    request; exercised by per-backend `test_layout_robustness_cases`.
+
+  Threaded `loc_layout` through `build_*_attention_fixture` and
+  `run_*_attention_case` for dense, SWA, MLA, GDN, KDA, Lightning,
+  Mamba2, DSA (dense fallback + sparse top-k), and dual_chunk. DSV4
+  layout-robustness intentionally deferred (its fixture has a custom
+  `_token_loc` plus multiple cache populators that each call it; a
+  ~6-8-site refactor outside this phase's scope).
+
+  Real production bugs surfaced and recorded as `LAYOUT_KNOWN_FAILURES`
+  with `skipTest` gates on the affected backend test files:
+
+  | Backend | Failure | Mode | Production cause |
+  |---|---|---|---|
+  | FA3 dense | non_monotonic_extend | EXTEND | Prefill metadata assumes out_cache_loc is monotonic within an extend (`flashattention_backend.py` prefill init). |
+  | FA4 dense | non_monotonic_extend | EXTEND | Inherits FA3's assumption. |
+  | FlashInfer MLA | interleaved_pages, non_monotonic_extend | EXTEND | `AcceleratorError: illegal memory access` inside paged-prefill metadata. |
+  | FlashInfer MLA | interleaved_pages | DECODE | `CUBLAS_STATUS_EXECUTION_FAILED` inside paged-decode metadata. |
+  | FlashMLA | interleaved_pages, non_monotonic_extend | EXTEND | `AcceleratorError: illegal memory access`. |
+  | FlashMLA | interleaved_pages | DECODE | `shape '[-1, 64, 1, 32]' is invalid for input of size N` — page-index shape mismatch. |
+  | dual_chunk_flash_attn | non_monotonic_extend | EXTEND | ~67% mismatch; `_dual_chunk_flash_attn_prefill_func` uses `cu_seqlens_*` indexing into contiguous K slots within an extend (`dual_chunk_flashattention_backend.py:834+`). |
+
+  Backends that pass all layouts cleanly: dense Triton, dense FlashInfer,
+  Flex, torch_native, SWA Triton, SWA torch_native, MLA Triton, GDN
+  (Triton, FlashInfer, torch_native), KDA, Lightning, Mamba2, DSA dense
+  fallback, DSA sparse top-k.
+
+  Default change to `shuffled_pages` for every fixture means **every
+  existing test case now also verifies non-monotonic page handling for
+  the backend it targets**, raising the bug-finding floor across the
+  whole matrix.
+
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
+  - Ran 176 tests in 39.906s (30 skipped) after the layout-robustness
+    arc. Test count grew from 155 → 176 (+21 new test methods covering
+    every method × backend combination). Skip count grew from 21 → 30
+    (+9 LAYOUT_KNOWN_FAILURES skips with documented production-side
+    causes). 0 regressions: all previously-passing tests still pass
+    with `shuffled_pages` as the new default.
+
 - Recorded the DSV4 Compressor / C4Indexer design decision in PLAN.md
   "Deferred follow-ups" and in `dsv4/README.md`. Both flag the bypass
   as intentional (not a Phase 2 gap) and point at the natural
