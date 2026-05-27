@@ -168,6 +168,21 @@ class DoubleSparsitySelector:
                 channel_weights=channel_mask.channel_weights.to(target_device),
             )
 
+        # The CUDA graph-safe fast path assumes int32 selection + fp32 weights
+        # so it can avoid host-side `.to(...)` casts (which would allocate
+        # inside captured / replay-stable regions). Refuse to bind a mask that
+        # would force per-call conversion.
+        if channel_mask.channel_selection.dtype != torch.int32:
+            raise ValueError(
+                "channel_mask.channel_selection must be int32, got "
+                f"{channel_mask.channel_selection.dtype}."
+            )
+        if channel_mask.channel_weights.dtype != torch.float32:
+            raise ValueError(
+                "channel_mask.channel_weights must be float32, got "
+                f"{channel_mask.channel_weights.dtype}."
+            )
+
         self.token_label_table = token_label_table
         self.channel_mask = channel_mask
         self.process_group = process_group

@@ -728,32 +728,40 @@ def retrieve_topk_graph_safe(
         return out_indices, out_lengths
 
     # Triton fast path — zero-allocation after warmup.
+    # Contract (caller responsibility — bind_runtime_data enforces it for the
+    # channel-mask tensors): channel_selection int32, channel_weights fp32,
+    # req_pool_indices / req_to_token / seq_lens int32. queries and sig_layer
+    # may be fp32 / fp16 / bf16 — the kernel casts via tl.load(...).to(tl.float32).
     sel_layer = channel_selection[layer_id]
     w_layer = channel_weights[layer_id]
     sig_layer = token_signatures[layer_id]
     written_layer = written[layer_id]
-
-    if sig_layer.dtype != torch.float32:
-        sig_layer = sig_layer.to(torch.float32)
-    if queries.dtype != torch.float32:
-        queries_f32 = queries.to(torch.float32)
-    else:
-        queries_f32 = queries
-    if w_layer.dtype != torch.float32:
-        w_layer = w_layer.to(torch.float32)
-    if sel_layer.dtype != torch.int32:
-        sel_layer = sel_layer.to(torch.int32)
+    assert sel_layer.dtype == torch.int32, (
+        f"channel_selection must be int32, got {sel_layer.dtype}"
+    )
+    assert w_layer.dtype == torch.float32, (
+        f"channel_weights must be float32, got {w_layer.dtype}"
+    )
+    assert req_pool_indices.dtype == torch.int32, (
+        f"req_pool_indices must be int32, got {req_pool_indices.dtype}"
+    )
+    assert req_to_token.dtype == torch.int32, (
+        f"req_to_token must be int32, got {req_to_token.dtype}"
+    )
+    assert seq_lens.dtype == torch.int32, (
+        f"seq_lens must be int32, got {seq_lens.dtype}"
+    )
 
     scores_view = scratch_scores[:bs, :max_seq_len]
     _logical_score_triton(
-        q_proj_input=queries_f32,
+        q_proj_input=queries,
         channel_selection_layer=sel_layer,
         channel_weights_layer=w_layer,
         sig_layer=sig_layer,
         written_layer=written_layer,
-        req_pool_indices=req_pool_indices.to(torch.int32) if req_pool_indices.dtype != torch.int32 else req_pool_indices,
-        req_to_token=req_to_token.to(torch.int32) if req_to_token.dtype != torch.int32 else req_to_token,
-        seq_lens=seq_lens.to(torch.int32) if seq_lens.dtype != torch.int32 else seq_lens,
+        req_pool_indices=req_pool_indices,
+        req_to_token=req_to_token,
+        seq_lens=seq_lens,
         out=scores_view,
         max_seq_len=max_seq_len,
     )

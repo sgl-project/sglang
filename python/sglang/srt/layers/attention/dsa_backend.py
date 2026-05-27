@@ -12,6 +12,10 @@ from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+    DSGraphState,
+    allocate_graph_state,
+)
 from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
@@ -166,6 +170,16 @@ class DSAMetadata:
     # allocation-free. Shape: int32 [bs, max_top_k=2048]. None when DS is
     # not in use.
     ds_topk_indices_out: Optional[torch.Tensor] = None
+
+    # Double Sparsity allocation-free graph-safe scratch (preallocated by
+    # init_forward_metadata when DS is enabled). Routes the production
+    # `_select_topk_indices` call through `retrieve_topk_graph_safe`, which
+    # writes its outputs into `ds_graph_state.selected_indices` /
+    # `ds_graph_state.valid_lengths` and uses the nine scratch tensors for
+    # an allocation-free Triton + topk + searchsorted pipeline. None when
+    # DS is not in use (the path falls back to the allocating
+    # `DoubleSparsitySelector.retrieve_topk`).
+    ds_graph_state: Optional["DSGraphState"] = None
 
 
 class TopkTransformMethod(IntEnum):
@@ -713,10 +727,17 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_schedule_metadata = None
 
         ds_topk_indices_out = None
+        ds_graph_state: Optional[DSGraphState] = None
         if self.enable_double_sparsity:
             ds_topk_indices_out = torch.empty(
                 (int(forward_batch.batch_size), self.ds_max_top_k),
                 dtype=torch.int32,
+                device=cache_seqlens_int32.device,
+            )
+            ds_graph_state = allocate_graph_state(
+                max_bs=int(forward_batch.batch_size),
+                max_top_k=self.ds_max_top_k,
+                max_seq_len=int(self.req_to_token.shape[1]),
                 device=cache_seqlens_int32.device,
             )
 
@@ -752,6 +773,7 @@ class DeepseekSparseAttnBackend(
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
             ds_topk_indices_out=ds_topk_indices_out,
+            ds_graph_state=ds_graph_state,
         )
         self.forward_metadata = metadata
         if ds_topk_indices_out is not None:
@@ -1013,10 +1035,17 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_schedule_metadata = None
 
         ds_topk_indices_out = None
+        ds_graph_state: Optional[DSGraphState] = None
         if self.enable_double_sparsity:
             ds_topk_indices_out = torch.empty(
                 (bs, self.ds_max_top_k),
                 dtype=torch.int32,
+                device=cache_seqlens_int32.device,
+            )
+            ds_graph_state = allocate_graph_state(
+                max_bs=bs,
+                max_top_k=self.ds_max_top_k,
+                max_seq_len=int(self.req_to_token.shape[1]),
                 device=cache_seqlens_int32.device,
             )
 
@@ -1037,6 +1066,7 @@ class DeepseekSparseAttnBackend(
             real_page_table=real_page_table,
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
             ds_topk_indices_out=ds_topk_indices_out,
+            ds_graph_state=ds_graph_state,
         )
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata

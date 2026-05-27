@@ -2114,16 +2114,83 @@ class DeepseekV2AttentionMLA(
                 # Use projected Q-noPE for DS selector when available; fall back
                 # to latent q_lora only for the placeholder path (unit tests).
                 queries_for_ds = q_nope if q_nope is not None else q_lora
-                selected_indices, valid_lengths = (
-                    self.double_sparsity_selector.retrieve_topk(
+
+                # Allocation-free graph-safe path: when the DSA metadata has
+                # preallocated ds_graph_state and the selector is bound on
+                # CUDA, route through retrieve_topk_graph_safe (Triton kernel +
+                # in-place topk pipeline). The captured graph stays 0-alloc
+                # after warmup.
+                _attn_backend = getattr(forward_batch, "attn_backend", None)
+                _dsa_metadata = (
+                    getattr(_attn_backend, "forward_metadata", None)
+                    if _attn_backend is not None
+                    else None
+                )
+                _ds_graph_state = (
+                    getattr(_dsa_metadata, "ds_graph_state", None)
+                    if _dsa_metadata is not None
+                    else None
+                )
+                _selector = self.double_sparsity_selector
+                _seq_lens = getattr(forward_batch, "seq_lens", None)
+                _sparse_mask = getattr(forward_batch, "sparse_mask", None)
+                _use_graph_safe = (
+                    _ds_graph_state is not None
+                    and _ds_graph_state.scratch_scores is not None
+                    and _selector.token_label_table is not None
+                    and _selector.channel_mask is not None
+                    and queries_for_ds.device.type == "cuda"
+                    and _seq_lens is not None
+                    and req_to_token is not None
+                )
+                if _use_graph_safe:
+                    from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+                        retrieve_topk_graph_safe,
+                    )
+
+                    _bs = int(forward_batch.req_pool_indices.shape[0])
+                    _max_seq_len = _ds_graph_state.max_seq_len
+                    if _max_seq_len <= 0:
+                        _max_seq_len = int(req_to_token.shape[1])
+                    retrieve_topk_graph_safe(
                         queries=queries_for_ds,
+                        token_signatures=_selector.token_label_table.signatures,
+                        written=_selector.token_label_table.written,
+                        channel_selection=_selector.channel_mask.channel_selection,
+                        channel_weights=_selector.channel_mask.channel_weights,
                         layer_id=layer_id,
                         req_pool_indices=forward_batch.req_pool_indices,
-                        sparse_mask=getattr(forward_batch, "sparse_mask", None),
-                        seq_lens=getattr(forward_batch, "seq_lens", None),
                         req_to_token=req_to_token,
+                        seq_lens=_seq_lens,
+                        max_seq_len=_max_seq_len,
+                        max_top_k=_selector.max_top_k,
+                        out_indices=_ds_graph_state.selected_indices,
+                        out_lengths=_ds_graph_state.valid_lengths,
+                        scratch_scores=_ds_graph_state.scratch_scores,
+                        scratch_topk_values=_ds_graph_state.scratch_topk_values,
+                        scratch_topk_indices=_ds_graph_state.scratch_topk_indices,
+                        scratch_invalid_mask=_ds_graph_state.scratch_invalid_mask,
+                        scratch_sorted_vals=_ds_graph_state.scratch_sorted_vals,
+                        scratch_boundary=_ds_graph_state.scratch_boundary,
+                        scratch_valid_i64=_ds_graph_state.scratch_valid_i64,
+                        per_request_valid=_sparse_mask,
+                        scratch_pv_mask=_ds_graph_state.scratch_pv_mask,
+                        scratch_throwaway_idx=_ds_graph_state.scratch_throwaway_idx,
+                        process_group=getattr(_selector, "process_group", None),
                     )
-                )
+                    selected_indices = _ds_graph_state.selected_indices[:_bs]
+                    valid_lengths = _ds_graph_state.valid_lengths[:_bs]
+                else:
+                    selected_indices, valid_lengths = (
+                        self.double_sparsity_selector.retrieve_topk(
+                            queries=queries_for_ds,
+                            layer_id=layer_id,
+                            req_pool_indices=forward_batch.req_pool_indices,
+                            sparse_mask=_sparse_mask,
+                            seq_lens=_seq_lens,
+                            req_to_token=req_to_token,
+                        )
+                    )
                 # AC-8: prefer the NSA-metadata-owned buffer, allocated
                 # once per batch in init_forward_metadata (also for
                 # capture/replay). Fall back to per-batch lazy alloc on

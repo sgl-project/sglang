@@ -3273,6 +3273,180 @@ class TestCUDAGraphCapture(unittest.TestCase):
         self.assertEqual(int(state.valid_lengths[0].item()), 2)
         self.assertEqual(sorted(result), [1, 3])
 
+    def _make_bound_selector_cuda_fp16(self, device, q_dtype=torch.bfloat16):
+        """Production-dtype fixture: fp16 TokenLabelTable + bf16/fp16 queries.
+
+        Same numeric fixture as `_make_bound_selector_cuda` (sigs [9, 8, 1, 2],
+        req_to_token [[2, 3, 0, 1]] → top-2 logical = [2, 3]), but the
+        TokenLabelTable is allocated with `dtype=torch.float16` (default
+        production binding from deepseek_v2.py) and queries default to
+        bf16 (the model_runner Q-noPE dtype).
+        """
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import ChannelMask
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+        L, T, H, Ld, hd = 1, 4, 1, 1, 1
+        cfg_str = (
+            '{"top_k": 2, "page_size": 64, '
+            '"channel_mask_path": "/tmp/x.safetensors", "device_buffer_size": 4096}'
+        )
+        cfg = parse_double_sparsity_config(cfg_str)
+        sel = DoubleSparsitySelector(
+            config=cfg, num_local_heads=H, head_dim=hd, device=device,
+        )
+        table = allocate_token_label_table(
+            num_layers_local=L, max_tokens=T, num_heads_local=H, label_dim=Ld,
+            page_size=64, dtype=torch.float16, device=device,
+        )
+        table.signatures[0, :, 0, 0] = torch.tensor(
+            [9.0, 8.0, 1.0, 2.0], dtype=torch.float16, device=device,
+        )
+        table.written[0, :] = True
+        mask = ChannelMask(
+            channel_selection=torch.zeros(L, H, Ld, dtype=torch.int32, device=device),
+            channel_weights=torch.ones(L, H, Ld, dtype=torch.float32, device=device),
+            schema_version='1', dtype='fp8_e4m3', head_dim=hd, page_size=64,
+            label_dim=Ld, content_sha256='test',
+        )
+        sel.bind_runtime_data(table, mask)
+        req_to_token = torch.tensor([[2, 3, 0, 1]], dtype=torch.int32, device=device)
+        queries = torch.ones(1, 1, 1, dtype=q_dtype, device=device)
+        return sel, req_to_token, queries
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_retrieve_topk_graph_safe_zero_allocs_production_dtypes(self):
+        """0-alloc after warmup with production dtypes: fp16 sig + bf16 queries + int32 mask."""
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            allocate_graph_state, assert_no_alloc_in_region,
+        )
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            retrieve_topk_graph_safe,
+        )
+        device = torch.device("cuda")
+        sel, req_to_token, queries = self._make_bound_selector_cuda_fp16(
+            device, q_dtype=torch.bfloat16,
+        )
+        state = allocate_graph_state(
+            max_bs=1, max_top_k=2, max_seq_len=4,
+            num_local_heads=1, label_dim=1, device=device,
+        )
+        req_pool = torch.zeros(1, dtype=torch.int32, device=device)
+        seq_lens = torch.tensor([4], dtype=torch.int32, device=device)
+        sparse_mask = torch.ones(1, 4, dtype=torch.int32, device=device)
+
+        kwargs = dict(
+            queries=queries,
+            token_signatures=sel.token_label_table.signatures,
+            written=sel.token_label_table.written,
+            channel_selection=sel.channel_mask.channel_selection,
+            channel_weights=sel.channel_mask.channel_weights,
+            layer_id=0,
+            req_pool_indices=req_pool,
+            req_to_token=req_to_token,
+            seq_lens=seq_lens,
+            max_seq_len=4,
+            max_top_k=2,
+            out_indices=state.selected_indices,
+            out_lengths=state.valid_lengths,
+            scratch_scores=state.scratch_scores,
+            scratch_topk_values=state.scratch_topk_values,
+            scratch_topk_indices=state.scratch_topk_indices,
+            scratch_invalid_mask=state.scratch_invalid_mask,
+            scratch_sorted_vals=state.scratch_sorted_vals,
+            scratch_boundary=state.scratch_boundary,
+            scratch_valid_i64=state.scratch_valid_i64,
+            scratch_throwaway_idx=state.scratch_throwaway_idx,
+            per_request_valid=sparse_mask,
+            scratch_pv_mask=state.scratch_pv_mask,
+        )
+
+        # Warmup
+        retrieve_topk_graph_safe(**kwargs)
+        torch.cuda.synchronize()
+
+        # 2nd call: zero allocs
+        with assert_no_alloc_in_region("prod-dtype-graph-safe-second-call"):
+            retrieve_topk_graph_safe(**kwargs)
+        torch.cuda.synchronize()
+
+        # Correctness: even with fp16 sigs and bf16 queries, the simple fixture
+        # (sigs 9/8/1/2 representable in fp16) still gives top-2 logical = [2, 3].
+        self.assertEqual(int(state.valid_lengths[0].item()), 2)
+        self.assertTrue(
+            torch.equal(
+                state.selected_indices[0, :2],
+                torch.tensor([2, 3], dtype=torch.int32, device=device),
+            ),
+            f"unexpected: {state.selected_indices[0, :2].tolist()}",
+        )
+
+    def test_select_topk_indices_uses_graph_safe_when_metadata_state_present(self):
+        """Production `_select_topk_indices` routes through retrieve_topk_graph_safe.
+
+        Drives the actual `_select_topk_indices` method (the production
+        DS branch in deepseek_v2.py).  Mocks `forward_batch.attn_backend`
+        so its `forward_metadata.ds_graph_state` is a real
+        :class:`DSGraphState`, then spies the dynamic import of
+        `retrieve_topk_graph_safe` at the kernel module to prove the
+        graph-safe entry point is taken on CUDA-resident tensors.
+        """
+        import sglang.srt.layers.attention.double_sparsity.selection_kernel as _sk
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            allocate_graph_state,
+        )
+        from unittest.mock import patch as _patch
+
+        device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        attn = TestSelectTopkIndicesHookBranch()._make_attn(use_ds=True)
+        # Replace the placeholder selector with our bound real-mode selector.
+        sel, req_to_token, queries = self._make_bound_selector_cuda_fp16(
+            device, q_dtype=torch.float32,
+        ) if device.type == "cuda" else (None, None, None)
+        if device.type != "cuda":
+            sel, req_to_token = self._make_bound_selector_with_known_sigs()
+            queries = torch.ones(1, 1, 1, dtype=torch.float32)
+        attn.double_sparsity_selector = sel
+
+        state = allocate_graph_state(
+            max_bs=1, max_top_k=2, max_seq_len=4, device=device,
+        )
+        # Synthesize forward_batch wired to drive the new graph-safe gate.
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.zeros(1, dtype=torch.int32, device=device),
+            seq_lens=torch.tensor([4], dtype=torch.int32, device=device),
+            sparse_mask=torch.ones(1, 4, dtype=torch.int32, device=device),
+            out_cache_loc=None,
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            batch_size=1,
+            attn_backend=SimpleNamespace(
+                forward_metadata=SimpleNamespace(
+                    ds_graph_state=state,
+                    ds_topk_indices_out=None,
+                ),
+            ),
+        )
+
+        # Spy: when the dynamic import inside _select_topk_indices resolves
+        # `retrieve_topk_graph_safe` on the module, it gets the wrapped spy.
+        spy = MagicMock(wraps=_sk.retrieve_topk_graph_safe)
+        with _patch.object(_sk, "retrieve_topk_graph_safe", new=spy):
+            attn._select_topk_indices(
+                x=torch.zeros(1, 1, 1, device=device),
+                q_lora=torch.zeros(1, 1, 1, dtype=torch.float32, device=device),
+                q_nope=queries,
+                positions=torch.zeros(1, dtype=torch.int32, device=device),
+                forward_batch=forward_batch,
+                layer_id=0,
+            )
+        self.assertEqual(
+            spy.call_count, 1,
+            "graph-safe entry point was not taken — production path still "
+            "allocating via retrieve_topk_via_labels.",
+        )
+
 
 _CUDA_AVAILABLE = torch.cuda.is_available()
 
