@@ -2,18 +2,6 @@
 
 Fuses standard RMSNorm + residual-add (+ optional scalar multiply) into
 a single kernel pass to reduce kernel launch overhead.
-
-Also provides a single-launch fused router for Gemma4 MoE (PR #26120 in
-pyc96/sglang fork): replaces the per-layer ``torch.topk`` ->
-``softmax`` -> ``per_expert_scale[ids]`` -> ``mul`` -> ``cast`` chain in
-``Gemma4MoE.routing_function`` with one Triton kernel.
-
-The reference design comes from vLLM PR #39083
-(``_gemma4_routing_kernel`` / ``gemma4_fused_routing_kernel_triton``),
-which is apache-2.0.  Our kernel is rewritten in SGLang style and uses
-the identity ``softmax(all)[topk] / sum(softmax(all)[topk]) =
-softmax(topk_logits)`` already exploited by SGLang's torch routing
-function, so the math is bitwise-comparable to the prior fp32 path.
 """
 
 from typing import Optional
@@ -297,47 +285,6 @@ def gemma_dual_rmsnorm_residual_scalar(
     return out
 
 
-# ---------------------------------------------------------------------------
-# Fused Gemma4 routing kernel (one launch per layer)
-# ---------------------------------------------------------------------------
-#
-# Equivalent to:
-#
-#     topk_logits, topk_ids = torch.topk(gating_output, k=topk, dim=-1)
-#     topk_weights = torch.nn.functional.softmax(topk_logits, dim=-1)
-#     topk_weights = topk_weights * per_expert_scale[topk_ids]
-#     return topk_weights.float(), topk_ids.int()
-#
-# but completes the entire computation in one Triton program per token.
-#
-# Algorithm notes:
-#   * Loads all E logits per token into one program; for Gemma4
-#     ``E = num_experts = 128`` so ``BLOCK_E = next_pow2(E) = 128`` and the
-#     work fits in a single warp with `num_warps=1`.
-#   * Computes ``softmax-of-topk`` by:
-#       - building a bijection (logit_bits -> int32 key) that is anti-monotone
-#         on the float value, then packing ``(key, expert_id)`` into int64.
-#         After the ``<<32`` shift, the int32 key's high bit lands in bit 63
-#         of the int64, so Triton's signed ascending ``tl.sort`` yields the
-#         logits in *descending* float order without a K-step loop or a
-#         separate index scatter.
-#       - taking the largest K via a mask on positions 0..K-1 of the sorted
-#         output
-#       - normalizing in fp32 (matches ``softmax`` default dtype)
-#       - multiplying by ``per_expert_scale[topk_ids]``
-#   * Writes ``topk_weights`` (fp32) and ``topk_ids`` (int32) in one
-#     pass, matching the output dtypes the SGLang MoE topk wrapper
-#     expects.
-#   * Compatibility with quantized MoE backends: this fast path runs whenever
-#     the model calls ``Gemma4MoE.routing_function`` via
-#     ``select_experts``. That covers unquantized BF16/FP16, FP8/W8A8 (where
-#     the standard topk path is used), and the ``flashinfer_trtllm_routed``
-#     NVFP4 path. The default ``flashinfer_trtllm`` NVFP4 backend uses a
-#     BypassedTopKOutput and does routing inside the trtllm kernel, so this
-#     function is neither called nor needed there.
-#
-# Reference algorithm: vLLM PR #39083 ``_gemma4_routing_kernel`` (apache-2.0).
-# Our independent implementation follows the same sort+mask+softmax scheme.
 @triton.jit
 def _gemma4_routing_kernel(
     gating_ptr,  # [T, E] router logits, any float dtype
@@ -368,8 +315,7 @@ def _gemma4_routing_kernel(
     # *descending* float order.  Ties are broken by expert id ascending
     # (lower id wins), which is a stable choice but not guaranteed to
     # match ``torch.topk``'s tie-break (torch.topk's order is
-    # implementation-defined).  Random fp inputs effectively never collide,
-    # so the test compares as sets when IDs differ.
+    # implementation-defined).
     MIN32 = -2147483648
     logit_bits = logits.to(tl.int32, bitcast=True)
     sign = logit_bits >> 31
