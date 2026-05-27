@@ -242,7 +242,7 @@ def build_kv_cache(
     embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
     init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
-    def _infer_embedding_dims(self) -> dict:
+    def _infer_embedding_dims(model_config) -> dict:
         """Infer per-modality embedding dimensions from hf_config."""
         from sglang.srt.managers.schedule_batch import Modality
 
@@ -288,7 +288,7 @@ def build_kv_cache(
             EmbeddingCacheController,
         )
 
-        hidden_dims = _infer_embedding_dims()
+        hidden_dims = _infer_embedding_dims(model_config)
         global_cache = EmbeddingCacheController(
             tp_rank=ps.tp_rank,
             tp_size=ps.tp_size,
