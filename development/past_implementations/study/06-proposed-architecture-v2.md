@@ -2,7 +2,7 @@
 
 **Status:** as-built design synthesized from `development/loop{1,2,3}/` + the in-tree DS package at `python/sglang/srt/layers/attention/double_sparsity/`, **plus the minimal-viable roadmap to a DSv3.2 deployment that matches/beats the default DSA + radix-cache + CUDA-graph baseline** (§9–§11).
 
-**v2 changes vs v1:** added §9 (MVP roadmap, Phases A/B/C), §10 (calibration recipe — reused from references), §11 (kernel-fusion roadmap — deferred until MVP works), §12 (deferred items + ongoing issues bucketed must-address / should-address / defer). The relaxed performance target lives in §9.2.
+**v2 changes vs v1:** added §9 (MVP roadmap, Phases A/B/C), §10 (calibration recipe — reused from references), §11 (kernel-fusion roadmap — deferred until MVP works), §12 (deferred items + ongoing issues bucketed must-address / should-address / defer, plus §12.7 already-resolved items). The relaxed performance target lives in §9.2.
 
 **Audience:** anyone reviewing the design or picking up the standalone-DS branch (`dev/double-sparsity-standalone`).
 
@@ -561,20 +561,37 @@ These are not code items — they are operating-process bookkeeping that the MVP
 
 ### 12.6 Summary — what must be in the MVP
 
-Filtering the above to the 🛑 **must address** items:
+**🛑 Must address in MVP (6 items) — blocks boot, blocks any DS forward, or would be silently-wrong-at-scale:**
 
-1. **M1** — `page_signature_write` hook (12.4 #4.1 = Loop 3 M1).
-2. **M2** — `sparse_mask` on `ForwardBatch` (Loop 3 M2).
+1. **M1** — `page_signature_write` hook (12.4 #4.1 = Loop 3 M1). Verified with `grep`: zero hits in `nsa_backend.py` today → `valid_mask` is all-False at serve time.
+2. **M2** — `sparse_mask` on `ForwardBatch` (Loop 3 M2). Without it, requests in a batch score against each other's pages.
 3. **M3** — end-to-end V3.2 FP8 `bench_serving` run (Loop 3 M3).
-4. **Real V3.2 calibration** (12.2 #2.6 — operator phases 2-3 now in scope).
-5. **Two-rank TP multi-process harness** (12.2 #2.4 / 12.4 #4.6) — non-negotiable at TP=8.
-6. **Hardware CUDA-graph capture at conc=64** (12.4 #4.5) — AC-6 positive test on real hardware.
+4. **Real V3.2 calibration** (12.2 #2.6 — operator phases 2-3 now in scope). `calibrate.py` works on tiny CI fixture; V3.2 MLA layer enumeration path is untested.
+5. **Two-rank TP multi-process harness** (12.2 #2.4 / 12.4 #4.6). AC-7 is single-rank today; at TP=8, rank-divergent `selected_indices` produces silently wrong attention. Non-negotiable.
+6. **Hardware CUDA-graph capture at conc=64** (12.4 #4.5) — Loop 1's AC-6 positive test on real hardware, still owed.
 
-And the ⚠ **should address** items, cheap to include while we're here:
+**⚠ Should address in MVP (4 items) — cheap silent-bug guards:**
 
-7. **DEC-2 flip** after Phase 5 (12.1 #1.9) — gates radix cache in the baseline comparison.
-8. **Placeholder-mode boot trip-wire** (12.4 #4.2) — verify boot logs match RUNBOOK Phase 2 expectations.
-9. **`transform_index_page_table_decode_fast` device assert at `max_top_k=2048`** (12.2 #2.5) — make silent overflow loud.
-10. **M3-B hardware run** (12.4 #4.7) — gates #7.
+7. **DEC-2 radix-cache default flip** after Phase 5 (12.1 #1.9) — gates radix-on in the §9.5 B5 baseline comparison.
+8. **Placeholder-mode boot trip-wire** (12.4 #4.2). `bind_runtime_data` IS wired at `deepseek_v2.py:1541`, but it depends on the validator pre-populating `server_args._double_sparsity_channel_mask`. Verify boot logs match RUNBOOK Phase 2.
+9. **`transform_index_page_table_decode_fast` device assert at `max_top_k=2048`** (12.2 #2.5) — Loop 2 caught this in review but never gated by test; make silent overflow loud.
+10. **M3-B hardware fixture run** (12.4 #4.7) — synthetic CI exists; real run gates #7.
 
-Everything else (Triton ports, AC-8 device-assert kernel, M3-B perturbation negative, GLM-5.1, 128K, FP4, DP Attention, Twilight pruner, CPU offload, PD-Disagg, Extensions) is **defer past MVP** unless Phase B evidence elevates an item.
+**🟰 Defer past MVP — explicit not-in-scope list:**
+
+- **Loop 1 deferred client requirements:** GLM-5.1 (1.1), 128K ISL (1.2), nvfp4 / mxfp4 (1.3), DP Attention (1.4).
+- **Downstream features:** Twilight / top-p (1.5), "Extensions" engine knob (1.6), PD-Disagg / HiCache (1.7), CPU offload / paper §DS-Offload (1.8).
+- **Phase C kernel ports (gated on Phase B evidence):** Triton port of `compute_page_scores` (4.3), Triton port of `page_signature_write` (4.4), fused FP8-dequant + projection, fused score + top-K via `raft_topk`, etc. — full catalog in §11.
+- **Test gaps that aren't runtime gaps:** AC-8 captured-path zero-allocation device-side assert kernel (2.1), AC-8 multi-step backend metadata fixup (2.2 — V3.2 doesn't use overlap-scheduling by default), M3-B perturbation negative (2.3).
+- **Operator knob kept on purpose:** `SGLANG_DS_RADIX_OVERRIDE` env var (4.8) — Loop 2 explicitly kept this.
+
+Any of these gets elevated to MVP only if Phase B5 evidence promotes it.
+
+### 12.7 Already addressed (do not re-do)
+
+Two items from earlier loop discussions are **already closed in the current code state** — listed so future readers don't re-open them:
+
+- **`skip_topk` gate fix in `forward_absorb_prepare`** (12.4 #4.9). Loop 2 R0 closed this; gate is `or not self.skip_topk or prev_topk_indices is None` at `models/deepseek_common/attention_forward_methods/forward_mla.py:245-277`. The fix lives in `forward_absorb_prepare`, not inside `_select_topk_indices` (which is the resolved disagreement from Loop 2's plan).
+- **Unified `page_table_1` return type from DS branch** (12.4 #4.10). Loop 2's Design C resolution: both DS and NSA branches of `_select_topk_indices` return the same `page_table_1` Tensor type; the downstream `_forward_flashmla_kv` call has no `isinstance` branch. Lives at `deepseek_v2.py:2060`.
+
+Both of these were live debates in the Loop 2 plan deliberations; both are now resolved structurally. Reviewers picking up the branch should treat them as load-bearing invariants, not open design questions.
