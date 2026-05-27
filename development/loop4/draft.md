@@ -8,14 +8,14 @@ Loop 3 set the scope at 3 items (M1/M2/M3) and never ran. The structural plumbin
 
 Loop 4 makes two changes at once:
 
-1. **Rotates the architecture to token-level signatures at page_size=64** (per `06-proposed-architecture-v2.md` §13). Selection is per-token, storage is per-token (slot-indexed by `out_cache_loc` exactly like K and V), FlashMLA still reads at page granularity via NSA's existing `transform_index_page_table_decode`. This deletes the custom page adapter, the page lifecycle hooks, and the within-page averaging quality delta — all in one move, by becoming the same shape sglang-last had.
+1. **Rotates the architecture to token-level signatures at page_size=64** (per `07-mvp-proposed-architecture.md` §13). Selection is per-token, storage is per-token (slot-indexed by `out_cache_loc` exactly like K and V), FlashMLA still reads at page granularity via NSA's existing `transform_index_page_table_decode`. This deletes the custom page adapter, the page lifecycle hooks, and the within-page averaging quality delta — all in one move, by becoming the same shape sglang-last had.
 2. **Reaches the MVP at the Option B operating point** (FP8 + `flashmla_kv` + overlap off + piecewise off, both DSA baseline and DS at the same operating point): DS-on matches or beats DSA-on TPS at conc=64 with NIAH-Δ ≤ 5 pp and MMLU-Δ ≤ 1 pp.
 
 **Chunked prefill is *probed*, not actively supported.** sglang-last got chunked prefill for free because its K_label cache was slot-indexed by `out_cache_loc`. The token-level rotation preserves that property, so chunked prefill *should* work implicitly. **Phase A includes a probe test** that asserts implicit support. **If the probe fails**, the Phase B comparison disables chunked prefill on both DSA and DS (`--chunked-prefill-size -1`) and chunked-prefill explicit support becomes Loop 5 scope. **No explicit chunked-prefill code lands in Loop 4 regardless of the probe outcome** — either it works implicitly and we leave it alone, or it doesn't and the baseline gets adjusted.
 
 **Anchor:** start from `dev/double-sparsity-standalone` at the head with §13 committed.
 
-## Hard scope — Phase A (8 ACs, must close)
+## Hard scope — Phase A (9 ACs: AC-0 through AC-8, must close; AC-1b is a one-time probe)
 
 ### AC-0 — Architecture rotation: token-level signatures, page_size=64 stays
 
@@ -66,7 +66,7 @@ This matches all three reference impls' "prefill dense, decode sparse" pattern. 
 
 The **done criterion for Phase A.** Boot DSv3.2 FP8 on 8×H200 at the Option B operating point with `--enable-double-sparsity --double-sparsity-config '{"top_k":2048,"page_size":64,"channel_mask_path":"/models/dsv32-fp8-channel-mask.safetensors","device_buffer_size":4096}'`. Run `bench_serving` against it: ≥ 64 requests, ISL ≈ 4096, mixed lengths, conc 16/32/64. Then run the lightweight quality smoke (see AC-8).
 
-## Stretch scope — Phase B (5 ACs, attempted if Phase A closes early)
+## Stretch scope — Phase B (4 ACs: AC-9 through AC-12, attempted if Phase A closes early)
 
 The "MVP done if possible" arc — match or beat DSA at the Option B operating point with quality deltas inside budget.
 
@@ -109,7 +109,7 @@ Re-run `bench_serving` at the same Option B operating point but with radix cache
   - DS-on does not crash for the duration of the benchmark.
   - `selected_tokens.shape[1] < total_seq_len` on at least 90 % of decode steps (non-trivial selection).
   - `dense_fallback_total` matches the `error_containment` counter accounting (no silent fallback).
-  - **Lightweight quality smoke** (per `06-proposed-architecture-v2.md` §9.4): ~20 deterministic prompts (5 short QA, 5 code completion, 5 summarization, 5 NIAH-mini), `temperature=0`, reference outputs cached from DSA-on. DS-on candidates must satisfy: prefix-match ≥ 80 %, mean ROUGE-L ≥ 0.85, NIAH-mini needle recall ≥ 4/5, no first-8-tokens-entirely-different prompt.
+  - **Lightweight quality smoke** (per `07-mvp-proposed-architecture.md` §9.4): ~20 deterministic prompts (5 short QA, 5 code completion, 5 summarization, 5 NIAH-mini), `temperature=0`, reference outputs cached from DSA-on. DS-on candidates must satisfy: prefix-match ≥ 80 %, mean ROUGE-L ≥ 0.85, NIAH-mini needle recall ≥ 4/5, no first-8-tokens-entirely-different prompt.
 
 - **AC-9 (Phase B baseline) — STRETCH:** DSA baseline run committed at the Option B operating point, conc=16/32/64; comparator JSON produced.
 
@@ -123,7 +123,7 @@ Re-run `bench_serving` at the same Option B operating point but with radix cache
 
 ## Explicit non-goals
 
-These are deferred per `06-proposed-architecture-v2.md` §12 and the cookbook-scoping decisions in this loop's planning conversation:
+These are deferred per `07-mvp-proposed-architecture.md` §12 and the cookbook-scoping decisions in this loop's planning conversation:
 
 - **Default cookbook bf16 path** (`flashmla_sparse` prefill + `fa3` decode). Stays at Option A scope, future loop.
 - **Piecewise CUDA graphs and overlap scheduler** under DS. Both default-on in V3.2 but require AC-8 multi-step backend metadata fixup work that Loop 2 deferred. Phase B explicitly disables both.
@@ -172,12 +172,12 @@ Phase A: a committed round summary showing successful end-to-end DSv3.2 FP8 `ben
 - **ForwardBatch (M2 attachment):** `python/sglang/srt/model_executor/forward_batch_info.py`.
 - **Existing 150-test suite (subject to AC-0 shape updates):** `test/registered/unit/layers/attention/test_double_sparsity_unit.py`.
 - **Bench harness:** `development/serve_double_sparsity.sh`, `development/serve_native_nsa.sh`, `development/benchmark.sh`, `development/benchmark_baseline.sh`, `development/benchmark_compare.py`.
-- **Calibration recipe (V3.2-only adaptation):** `python/sglang/srt/layers/attention/double_sparsity/calibrate.py` + the Pile-val-256x512-Method-1 contract from `06-proposed-architecture-v2.md` §10.
+- **Calibration recipe (V3.2-only adaptation):** `python/sglang/srt/layers/attention/double_sparsity/calibrate.py` + the Pile-val-256x512-Method-1 contract from `07-mvp-proposed-architecture.md` §10.
 - **Quality smoke fixture (new, AC-8):** `test/manual/test_dsv32_quality_smoke.py` + the 20-prompt deterministic fixture inline in the test.
 - **Full quality suite (existing, AC-12):** `test/manual/test_double_sparsity_v32.py`.
 - **M3-B hardware fixture (AC-10):** `python -m sglang.srt.layers.attention.double_sparsity.token_label_write --m3b-fixture-hardware-run` (renamed from `page_signature_write`).
 - **Validator (DEC-2 gate to flip):** `python/sglang/srt/layers/attention/double_sparsity/validator.py` + `_double_sparsity_radix_fixture_passed` server-args attribute.
-- **Design intent + §13 rotation note:** `development/past_implementations/study/06-proposed-architecture-v2.md`.
+- **Design intent + §13 rotation note:** `development/past_implementations/study/07-mvp-proposed-architecture.md`.
 - **Client SLOs:** `development/CLIENT_SLOS.md`.
 
 ## RLCR loop configuration
