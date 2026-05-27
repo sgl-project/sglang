@@ -1754,6 +1754,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if isinstance(val, torch.Tensor):
                         val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
                     meta_info["indexer_topk"] = val
+                    if (
+                        n := getattr(recv_obj, "indexer_topk_num_layers", None)
+                    ) is not None:
+                        meta_info["indexer_topk_num_layers"] = n
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
                     meta_info[k] = v[i]
