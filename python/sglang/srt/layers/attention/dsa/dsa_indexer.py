@@ -352,6 +352,11 @@ class Indexer(MultiPlatformOp):
     def _mqa_logits_free_mem_fraction() -> float:
         return envs.SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION.get()
 
+    def enter_torch_compile(self, num_tokens: int):
+        # Keep the platform forward selected at init. On CUDA this lets PCG
+        # prefill reach the DSA custom-op path instead of forward_native().
+        return
+
     def __init__(
         self,
         hidden_size: int,

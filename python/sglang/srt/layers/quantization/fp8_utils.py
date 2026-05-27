@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.utils.common import torch_release
@@ -16,6 +17,7 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 from sglang.srt.layers.quantization.fp8_kernel import (
+    deep_gemm_fp8_linear_with_quant,
     fp8_dtype,
     fp8_max,
     fp8_min,
@@ -669,6 +671,24 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             )
         return triton_w8a8_block_fp8_linear(
             input, weight, block_size, weight_scale, input_scale, bias
+        )
+
+    # Keep quantization and DeepGEMM opaque to PCG Inductor. If Inductor sees
+    # them as separate custom ops, it may materialize an intermediate transpose
+    # between the FP8 quant output and DeepGEMM. The custom op also owns the
+    # input flatten and output view so Inductor does not materialize those
+    # layout-only shape changes at the op boundary.
+    if (
+        torch.compiler.is_compiling()
+        and is_in_piecewise_cuda_graph()
+        and not _is_musa
+        and bias is None
+    ):
+        return deep_gemm_fp8_linear_with_quant(
+            input,
+            weight,
+            weight_scale,
+            block_size[1],
         )
 
     input_2d = input.view(-1, input.shape[-1])

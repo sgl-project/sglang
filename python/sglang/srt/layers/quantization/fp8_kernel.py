@@ -143,6 +143,49 @@ def deep_gemm_fp8_fp8_bf16_nt(
     deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
 
 
+def _deep_gemm_fp8_linear_with_quant_fake_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    return torch.empty(
+        (*input.shape[:-1], weight.shape[0]),
+        device=input.device,
+        dtype=torch.bfloat16,
+    )
+
+
+@register_custom_op(fake_impl=_deep_gemm_fp8_linear_with_quant_fake_impl)
+def deep_gemm_fp8_linear_with_quant(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    input_2d = input.reshape(-1, input.shape[-1])
+    if not input_2d.is_contiguous():
+        input_2d = input_2d.contiguous()
+
+    input_fp8, input_scale = sglang_per_token_group_quant_fp8(
+        input_2d,
+        group_size,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
+    output = input.new_empty(
+        (input_2d.shape[0], weight.shape[0]),
+        dtype=torch.bfloat16,
+    )
+    deep_gemm_wrapper.gemm_nt_f8f8bf16(
+        (input_fp8, input_scale),
+        (weight, weight_scale),
+        output,
+    )
+    return output.view(*input.shape[:-1], weight.shape[0])
+
+
 @triton.jit
 def _per_token_group_quant_8bit(
     # Pointers to inputs and output
