@@ -42,6 +42,13 @@ class TestTritonKDABackendCorrectness(CustomTestCase):
             prefix_lens=(14, 15, 16),
         ),
     )
+    # KDA verify is scoped to EAGLE chain/tree. The non-EAGLE chain
+    # spec kinds (frozen_kv_mtp, dflash, ngram) produce a slightly
+    # different draft-token mask layout, and the KDA recurrent
+    # reference's per-token state replay accumulates enough drift that
+    # 1 / 384 elements lands at ~0.11 max diff against a 0.1 tolerance —
+    # borderline rather than structurally wrong. Add a kind-specific
+    # reference tweak before enabling.
     EAGLE_VERIFY_CASES = (
         (
             KDAAttentionCase(
@@ -55,6 +62,7 @@ class TestTritonKDABackendCorrectness(CustomTestCase):
                 extend_lens=(3, 3),
             ),
             1,
+            "eagle",
         ),
         (
             KDAAttentionCase(
@@ -68,6 +76,7 @@ class TestTritonKDABackendCorrectness(CustomTestCase):
                 extend_lens=(3, 3),
             ),
             2,
+            "eagle",
         ),
     )
     EAGLE_VERIFY_CUDA_GRAPH_CASES = (
@@ -110,9 +119,16 @@ class TestTritonKDABackendCorrectness(CustomTestCase):
                 run_kda_cuda_graph_decode_case(self, case)
 
     def test_runner_mode_eagle_verify_cases(self):
-        for case, topk in self.EAGLE_VERIFY_CASES:
-            with self.subTest(case=case.name, backend=case.backend, topk=topk):
-                run_kda_eagle_verify_case(self, case, topk=topk)
+        for case, topk, spec_kind in self.EAGLE_VERIFY_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                topk=topk,
+                spec_kind=spec_kind,
+            ):
+                run_kda_eagle_verify_case(
+                    self, case, topk=topk, spec_kind=spec_kind
+                )
 
     def test_runner_mode_eagle_verify_cuda_graph_cases(self):
         for case, topk in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:

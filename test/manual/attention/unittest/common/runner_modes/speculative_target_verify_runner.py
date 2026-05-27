@@ -891,6 +891,7 @@ def run_kda_eagle_verify_case(
     case: KDAAttentionCase,
     *,
     topk: int,
+    spec_kind: SpecVerifyKind = "eagle",
     head_k_dim: int = KDA_DEFAULT_HEAD_K_DIM,
     head_v_dim: int = KDA_DEFAULT_HEAD_V_DIM,
     max_context_len: int = KDA_DEFAULT_MAX_CONTEXT_LEN,
@@ -918,11 +919,12 @@ def run_kda_eagle_verify_case(
         device=device,
     )
     _prepare_target_verify_batch(fixture.forward_batch, case, device)
-    fixture.forward_batch.spec_info = _make_eagle_verify_input(
+    fixture.forward_batch.spec_info = _make_spec_verify_input(
         case,
         fixture.forward_batch,
         topk=topk,
         device=device,
+        spec_kind=spec_kind,
     )
     inputs = kda_fixture_inputs(fixture)
     initial_state = _clone_kda_cache(fixture)
@@ -1029,6 +1031,7 @@ def run_lightning_eagle_verify_case(
     case: LightningAttentionCase,
     *,
     topk: int,
+    spec_kind: SpecVerifyKind = "eagle",
     head_dim: int = LIGHTNING_DEFAULT_HEAD_DIM,
     max_context_len: int = LIGHTNING_DEFAULT_MAX_CONTEXT_LEN,
     dtype: torch.dtype = LIGHTNING_DEFAULT_DTYPE,
@@ -1048,11 +1051,12 @@ def run_lightning_eagle_verify_case(
         device=device,
     )
     _prepare_target_verify_batch(fixture.forward_batch, case, device)
-    fixture.forward_batch.spec_info = _make_eagle_verify_input(
+    fixture.forward_batch.spec_info = _make_spec_verify_input(
         case,
         fixture.forward_batch,
         topk=topk,
         device=device,
+        spec_kind=spec_kind,
     )
     inputs = lightning_fixture_inputs(fixture)
     initial_state = _clone_lightning_cache(fixture)

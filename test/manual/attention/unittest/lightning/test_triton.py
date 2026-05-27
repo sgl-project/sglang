@@ -44,7 +44,9 @@ class TestTritonLightningBackendCorrectness(CustomTestCase):
     # has no parent-indices / retrieve-index plumbing for tree-shaped
     # drafts (see `linear/seg_la.py`). Tree verify (topk>1) is therefore
     # structurally unsupported and intentionally omitted; only the
-    # chain (topk=1) shape is covered.
+    # chain (topk=1) shape is covered. The non-EAGLE chain spec kinds
+    # (frozen_kv_mtp, dflash, ngram) match the chain-only contract and
+    # pass against the seg_la recurrence reference.
     EAGLE_VERIFY_CASES = (
         (
             LightningAttentionCase(
@@ -57,6 +59,46 @@ class TestTritonLightningBackendCorrectness(CustomTestCase):
                 extend_lens=(3, 3),
             ),
             1,
+            "eagle",
+        ),
+        (
+            LightningAttentionCase(
+                name="runner_frozen_kv_mtp_verify_lightning_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "frozen_kv_mtp",
+        ),
+        (
+            LightningAttentionCase(
+                name="runner_dflash_verify_lightning_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "dflash",
+        ),
+        (
+            LightningAttentionCase(
+                name="runner_ngram_verify_lightning_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "ngram",
         ),
     )
     EAGLE_VERIFY_CUDA_GRAPH_CASES = (
@@ -71,6 +113,7 @@ class TestTritonLightningBackendCorrectness(CustomTestCase):
                 extend_lens=(3, 3),
             ),
             1,
+            "eagle",
         ),
     )
 
@@ -85,13 +128,25 @@ class TestTritonLightningBackendCorrectness(CustomTestCase):
                 run_lightning_cuda_graph_decode_case(self, case)
 
     def test_runner_mode_eagle_verify_cases(self):
-        for case, topk in self.EAGLE_VERIFY_CASES:
-            with self.subTest(case=case.name, backend=case.backend, topk=topk):
-                run_lightning_eagle_verify_case(self, case, topk=topk)
+        for case, topk, spec_kind in self.EAGLE_VERIFY_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                topk=topk,
+                spec_kind=spec_kind,
+            ):
+                run_lightning_eagle_verify_case(
+                    self, case, topk=topk, spec_kind=spec_kind
+                )
 
     def test_runner_mode_eagle_verify_cuda_graph_cases(self):
-        for case, topk in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:
-            with self.subTest(case=case.name, backend=case.backend, topk=topk):
+        for case, topk, spec_kind in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                topk=topk,
+                spec_kind=spec_kind,
+            ):
                 run_lightning_eagle_verify_cuda_graph_case(self, case, topk=topk)
 
     # PCG/BCG split-op extend is deliberately NOT covered. Lightning's
