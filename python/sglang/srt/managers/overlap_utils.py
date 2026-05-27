@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_npu = is_npu()
 
 # Token-buf consume tracking: init to -1, assert non-negative on gather,
 # write -1 back. Catches "gather without intermediate stash" bugs. CI enables
@@ -23,7 +24,7 @@ _is_hip = is_hip()
 _DEBUG_ASSERT = os.getenv("SGLANG_IS_IN_CI", "").lower() == "true"
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=_is_npu)
 def _assert_nonneg_and_invalidate(
     values: torch.Tensor, buf: torch.Tensor, indices: torch.Tensor
 ) -> None:
@@ -33,7 +34,7 @@ def _assert_nonneg_and_invalidate(
     buf[indices] = -1
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=_is_npu)
 def _gather_spec_extras(
     indices: torch.Tensor,
     topk_p_buf: torch.Tensor,
@@ -104,6 +105,16 @@ class FutureMap:
         self.new_seq_lens_buf = torch.empty(
             (self.req_pool_size,), dtype=torch.int64, device=self.device
         )
+        # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
+        # D2H pulls (gated only on publish, off the schedule stream).
+        if _is_cuda or _is_hip:
+            self.new_seq_lens_cpu_pinned = torch.empty(
+                (self.req_pool_size,), dtype=torch.int64, pin_memory=True
+            )
+            self.fwd_prepare_d2h_stream = torch.get_device_module(self.device).Stream()
+        else:
+            self.new_seq_lens_cpu_pinned = None
+            self.fwd_prepare_d2h_stream = None
         if self.spec_algo.is_some():
             self._forward_buf_initialized = False
 
@@ -193,9 +204,20 @@ class FutureMap:
             return
         if self.publish_ready is not None:
             self.publish_ready.wait()
-        new_seq_lens = self.new_seq_lens_buf[fi]
-        batch.seq_lens = new_seq_lens
-        batch.seq_lens_cpu = new_seq_lens.cpu()
+        batch.seq_lens = self.new_seq_lens_buf[fi]
+
+        if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
+            batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            return
+
+        # seq_lens_cpu off the schedule stream: D2H the relay buf on a private
+        # stream (gated on publish), host-select via req_pool_indices_cpu.
+        self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
+        with torch.get_device_module(self.device).stream(self.fwd_prepare_d2h_stream):
+            self.new_seq_lens_cpu_pinned.copy_(self.new_seq_lens_buf, non_blocking=True)
+        self.fwd_prepare_d2h_stream.synchronize()
+        batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
     def publish(self, future_indices: torch.Tensor, new_seq_lens: torch.Tensor) -> None:
