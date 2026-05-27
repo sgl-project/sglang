@@ -241,10 +241,15 @@ class Gemma4Router(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Returns raw router logits [T, E]."""
-        x = self.norm(x)
         if self._fused_scale is None:
             self.fuse_scale()
-        x = x * self._fused_scale.to(x.dtype)
+        if x.is_cuda and x.dim() == 2 and x.stride(-1) == 1:
+            from sglang.srt.layers.layernorm import rmsnorm
+
+            x = rmsnorm(x, self._fused_scale.to(x.dtype), self.norm.eps)
+        else:
+            x = self.norm(x)
+            x = x * self._fused_scale.to(x.dtype)
         router_logits, _ = self.proj(x)
         return router_logits
 
