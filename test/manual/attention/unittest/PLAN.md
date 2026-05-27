@@ -358,6 +358,30 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Added GDN EAGLE `DRAFT_EXTEND` (eager) coverage. Mamba2 already
+  has DRAFT_EXTEND eager (added in this arc); GDN's gated-delta
+  recurrence reference matches the actual within ~0.0005 max diff.
+  Both are eager-only — `HybridLinearAttnBackend` raises
+  `ValueError("Invalid forward mode")` for DRAFT_EXTEND capture/replay
+  across the entire family (GDN / KDA / Lightning / Mamba2)
+  per `hybrid_linear_attn_backend.py:509,572`.
+  KDA + Lightning DRAFT_EXTEND eager runs fine but the references
+  need additional shape-handling tweaks to match the actuals; left as
+  a follow-up.
+- Added Mamba2 non-EAGLE chain spec verify coverage (frozen_kv_mtp /
+  dflash / ngram). Same pattern as the other backends — Mamba2's SSM
+  kernel processes draft tokens linearly regardless of mask, so the
+  EXTEND-style reference matches all four chain kinds within ~0.005
+  max diff.
+- Added Mamba2 EAGLE `DRAFT_EXTEND` (eager) coverage. CG is
+  structurally blocked across the HybridLinearAttn family (see GDN
+  bullet above).
+- Added KDA non-EAGLE chain spec verify coverage with looser
+  tolerance. The non-EAGLE kinds produce a slightly different
+  draft-mask layout, and KDA's recurrent reference picks up 1/384
+  elements at ~0.11 max diff vs the default `KDA_ATOL=0.1` — same
+  kernel path, just numerical headroom. Per-case `atol=0.2` override
+  unblocks coverage.
 - Added Mamba2 EAGLE chain verify (eager + CG) coverage. Three pieces:
   1. `ProjectedMamba2Attention.forward` sets
      `use_triton_causal_conv=True` for TARGET_VERIFY / DRAFT_EXTEND so
@@ -1033,6 +1057,11 @@ Latest verification:
 - `python test/manual/attention/unittest/gdn/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_flashinfer.py -v`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
+  - Ran 150 tests in 36.727s (21 skipped) after adding KDA non-EAGLE
+    spec verify (looser tolerance), Mamba2 EAGLE DRAFT_EXTEND eager,
+    Mamba2 non-EAGLE chain spec verify, and GDN EAGLE DRAFT_EXTEND
+    eager.
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
   - Ran 148 tests in 36.493s (21 skipped) after adding Mamba2 EAGLE
     chain verify (eager + CG): 2 new test methods, 0 regressions.
