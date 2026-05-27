@@ -2,7 +2,7 @@
 
 **Status:** as-built design synthesized from `development/loop{1,2,3}/` + the in-tree DS package at `python/sglang/srt/layers/attention/double_sparsity/`, **plus the minimal-viable roadmap to a DSv3.2 deployment that matches/beats the default DSA + radix-cache + CUDA-graph baseline** (§9–§11).
 
-**v2 changes vs v1:** added §9 (MVP roadmap, Phases A/B/C), §10 (calibration recipe — reused from references), §11 (kernel-fusion roadmap — deferred until MVP works), §12 (deferred items + ongoing issues bucketed must-address / should-address / defer, plus §12.7 already-resolved items), **§13 (architecture rotation: token-level signatures at page_size=64 — supersedes page-level signatures in §3.3 and §3.5)**. The relaxed performance target lives in §9.2.
+**v2 changes vs v1:** added §9 (MVP roadmap, Phases A/B/C), §10 (calibration recipe — reused from references), §11 (kernel-fusion roadmap — deferred until MVP works), §12 (deferred items + ongoing issues bucketed must-address / should-address / defer, plus §12.7 already-resolved items), **§13 (architecture rotation: token-level signatures at page_size=64 — supersedes page-level signatures in §3.3 and §3.5)**, **§14 (support matrix — confirms the "sglang-last DS but modern + sglang-native" framing per-knob)**. The relaxed performance target lives in §9.2.
 
 > **⚠ §13 supersedes the page-level design in §3.3, §3.4 G6, and §3.5.** Read §13 before applying any decision from §3 — page-level signatures are no longer the design point. The rest of §3 (hook site, selector ABI shape, FP8 dequant, TP sync, CUDA-graph contract) is unchanged.
 
@@ -731,3 +731,144 @@ If a future client ask brings 1M context into scope, the page-level design from 
 3. At init, route to one or the other based on `max_context_length * H_local * label_dim * 2 < SIGNATURE_BUDGET_BYTES`.
 
 The token-level design doesn't preclude the page-level one — it just defers it until somebody actually needs it.
+
+---
+
+## 14. Support matrix
+
+This section confirms what Loop 4 ships explicitly. The framing is: **sglang-last's DS algorithm at the modern sglang-native operating point.** Algorithm and data layout are unchanged from sglang-last; the wins are all infrastructure.
+
+A ✅ in the Loop 4 column means "supported and verified in this loop." A ⚠ means "ships in code but with a caveat noted." A 🟰 means "deferred, with a tracked plan." An ❌ means "explicitly out of scope, not on the roadmap."
+
+### 14.1 Model + hardware
+
+| Knob | sglang-last (B) | **Loop 4 MVP** | Deferred to | Where |
+|---|---|---|---|---|
+| DeepSeek-V3.2 (FP8 weights) | ❌ no MLA support | ✅ | — | hook at `_select_topk_indices` in `deepseek_v2.py:2060` |
+| DeepSeek-V3.2 (BF16 weights) | ❌ | 🟰 Loop with Option A scope | future loop (default cookbook bf16 path) | validator pairs `bfloat16 ↔ flashmla_sparse / fa3` (AC-3 in Loop 1) — code present, not exercised |
+| GLM-5.1 | ❌ | 🟰 Loop 5+ | client deferral (CLIENT_SLOS.md #1) | §12.1 #1.1 |
+| LLaMA / Mistral / others | ✅ any standard `q_proj`/`k_proj` model | ❌ not in v1 | future loop | DEC-10 capability check is V3.2-specific |
+| H200 (Hopper SM90) | ✅ | ✅ — primary target | — | DEC-1 |
+| B200 (Blackwell SM100) | ✅ | 🟰 — kernels work, calibration untested on B200 weights | future loop | — |
+| H100 | ✅ | 🟰 — likely works, untested | future loop | — |
+| MI300/MI350 (AMD HIP) | ✅ HIP path | ❌ not in v1 | future loop | DS validator does not gate HIP |
+| NPU (Ascend) | ❌ | ❌ | — | orthogonal |
+
+### 14.2 Attention backend + KV cache
+
+| Knob | sglang-last (B) | **Loop 4 MVP** | Deferred to | Where |
+|---|---|---|---|---|
+| FP8 KV cache (`fp8_e4m3`) | ❌ BF16 only | ✅ — page_signature_write reads inline FP8 scales | — | §3.4 G4 |
+| BF16 KV cache | ✅ default | 🟰 — validator + kernels exist, not exercised in Loop 4 | future Option-A loop | AC-3 in Loop 1 |
+| FP4 (nvfp4 / mxfp4) | ❌ | 🟰 | client deferral #3 | §12.1 #1.3 |
+| FlashMLA `flashmla_kv` kernel | ❌ Triton-only | ✅ | — | DS produces FlashMLA `block_table` via NSA's `transform_index_page_table_decode` |
+| FlashMLA `flashmla_sparse` kernel | ❌ | 🟰 | Option-A future loop | validator pairs with bf16 (untested) |
+| `fa3` decode kernel | ❌ | 🟰 | Option-A future loop | validator pairs with bf16 (untested) |
+| `trtllm` (Blackwell) | ❌ | 🟰 | future loop | — |
+| `tilelang` (AMD / NPU) | ✅ on HIP | 🟰 | — | not on V3.2 H200 path |
+| Triton-only fallback | ✅ forced | ❌ — never forced | — | sglang-last G2 closed |
+
+### 14.3 Page size + sequence layout
+
+| Knob | sglang-last (B) | **Loop 4 MVP** | Deferred to | Where |
+|---|---|---|---|---|
+| `page_size=1` | ✅ implicit (token KV pool) | ❌ V3.2 forces 64 | — | NSA requirement |
+| `page_size=64` | ❌ | ✅ — FlashMLA layout requirement | — | §13.8 |
+| `page_size=32` | ❌ | ✅ — covered by AC-3 (Loop 1) | — | tested via `transform_index_page_table_decode` with `page_size=32` |
+| Other page sizes | ❌ | 🟰 — algorithm is page-size-agnostic | future loop | not in CI matrix |
+| Token range up to 4K ISL (client target) | ✅ | ✅ | — | 120 MB / rank label cache |
+| Token range up to 128K ISL | ✅ | 🟰 — schema fine, perf untested | client deferral #2 | §13.6 |
+| Token range to 1M | ✅ (with enough HBM) | ❌ — 30 GB / rank infeasible | future loop with `signature_granularity=page` knob | §13.11 |
+
+### 14.4 Selection behavior
+
+| Knob | sglang-last (B) | **Loop 4 MVP** | Deferred to | Where |
+|---|---|---|---|---|
+| **Selection granularity: token** | ✅ | ✅ | — | §13 rotation |
+| **Selection granularity: page** | ❌ | ❌ (architecture parked) | future loop (1M ctx) | §13.11 |
+| **Prefill: always dense** | ✅ | ✅ | — | mirrors sglang-last; matches paper |
+| **Prefill: writes labels** | ✅ K_label via `forward_extend` | ✅ via M1 hook | — | AC-1 |
+| **Decode: sparse via DS selector** | ✅ via 3-stage Triton | ✅ via DS scoring + FlashMLA | — | AC-8 |
+| **Short-seq MHA bypass at prefill** | N/A (sglang-last had no MHA fallback) | ✅ — selector bypassed below `SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD`; labels still written | — | AC-7 |
+| **Hot-token rule** (force-include last N) | ❌ implicit (no need at per-token) | ✅ — N tokens, default last 64 (one page worth) | — | §13.7 |
+| **`top_k` mode** | ✅ flat `--ds-heavy-token-num` | ✅ flat `top_k=2048`, asserted = V3.2 `index_topk` at boot | — | AC-0 validator assert |
+| **`top_p` / threshold (Twilight)** | ❌ | ❌ in v1 | downstream | DEC-6 / AC-11 |
+| **Selector framework (Quest/SparQ/StreamingLLM)** | ❌ | ❌ | downstream | Twilight feature |
+| **Per-request mixed batches** (DS + dense in one batch) | ❌ per-batch routing | ✅ via per-request token range mask + error_containment per-request abort | — | AC-3 |
+| **Adaptive `top_k` per request** | ❌ static | ❌ in v1 | downstream | AC-11 ABI rejects this |
+
+### 14.5 Performance knobs (the "modern + sglang-native" piece)
+
+| Knob | sglang-last (B) | **Loop 4 MVP** | Deferred to | Where |
+|---|---|---|---|---|
+| **CUDA graphs (full-graph)** | ❌ forced off | ✅ — `DSGraphState` + `assert_no_alloc_in_region` | — | AC-6 |
+| **CUDA graphs (piecewise)** | ❌ | 🟰 — disabled in Option B; design-compatible | Option-A future loop | §12.2 #2.2 |
+| **Radix cache** | ⚠ technically off; per-layer re-extract broke prefix reuse | ✅ — content-derived labels, M3-B hardware fixture validates cold/warm equality, DEC-2 flip after AC-10 | — | AC-10 |
+| **Overlap scheduler (`disable_overlap_schedule=False`)** | ❌ untested | 🟰 — disabled in Option B | Option-A future loop | §12.2 #2.2 |
+| **Chunked prefill** | ✅ implicit (per-token slot indexing) | ⚠ probed (AC-1b); if probe fails, disabled on both DSA and DS | Loop 5 if probe fails | AC-1b |
+| **TP=N (`--tp` ≥ 2)** | ⚠ transparent but untested | ✅ — TP=8 + multi-process two-rank validator | — | AC-5 |
+| **DP attention (`--enable-dp-attention`)** | ❌ | ❌ in v1 | client deferral #4 | §12.1 #1.4 |
+| **EP (`--ep`)** | ❌ | 🟰 — orthogonal to attention (MoE); should work but untested | future loop | — |
+| **MTP / EAGLE speculative** | ❌ | ❌ in Loop 4 (locked) | future loop | conversation decision |
+| **Index cache (cross-layer indexer reuse)** | ❌ | ❌ — Loop 2 R0 closed `skip_topk` so DS runs every layer | future loop if needed for perf | §12.7 4.9 |
+| **Torch compile** | ❌ | 🟰 — orthogonal; untested with DS | future loop | — |
+
+### 14.6 Operational + safety
+
+| Knob | sglang-last (B) | **Loop 4 MVP** | Deferred to | Where |
+|---|---|---|---|---|
+| **Channel mask validation** | ⚠ schema-naive JSON | ✅ — dtype/shape/page_size/label_dim + content_sha256 + startup sanity probe | — | AC-4 from Loop 1; channel_mask.py |
+| **Calibration script** | ⚠ external (paper authors' repo) | ✅ — `calibrate.py` ships, V3.2 path adapts Pile-val-256x512-Method-1 recipe | — | AC-4 |
+| **`bind_runtime_data` per-layer init** | N/A | ✅ — wired at `deepseek_v2.py:1541` (Loop 2) | — | §12.4 #4.2 |
+| **Validator boot-time fail-fast** | ❌ | ✅ — page-size + dtype + backend + sanity probe + top_k assert | — | validator.py |
+| **`top_k == index_topk` apples-to-apples gate** | N/A | ✅ — `SGLANG_DS_ALLOW_TOPK_MISMATCH=1` override | — | AC-0 |
+| **Per-request abort containment** | ❌ batch-wide dense fallback | ✅ — typed exception aborts one request; batch continues; counter increments | — | error_containment.py |
+| **Prometheus metrics** (`sglang_double_sparsity_*`) | ❌ | ✅ — channel_mask_valid, dense_fallback_total, selected_tokens histogram | — | metrics.py |
+| **Per-request `meta_info`** (sparsity_rate, etc.) | ❌ | ✅ | — | AC-10 from Loop 1 |
+| **HiSparse coexistence** | N/A | ❌ runtime-mutex (DEC-8) | — | validator.py |
+| **PD-Disagg coexistence** | ❌ untested | 🟰 — should work since DS doesn't gate on disaggregation mode | downstream | §12.1 #1.7 |
+
+### 14.7 Quality validation
+
+| Knob | sglang-last (B) | **Loop 4 MVP** | Deferred to | Where |
+|---|---|---|---|---|
+| **MMLU regression test** | ✅ tiny (64 examples, accept ≥ 0.65) | ✅ — Phase B AC-12: ≤ 1.0 pp delta vs DSA | — | test/manual/test_double_sparsity_v32.py |
+| **NIAH retrieval @ 4K/16K/64K** | ❌ | ✅ — Phase B AC-12: ≤ 5 pp delta at each length | — | AC-12 |
+| **NIAH @ 128K** | ❌ | 🟰 — schema supports it; not in Loop 4 CI | client deferral #2 | — |
+| **Lightweight quality smoke** (20 prompts, ROUGE-L, prefix-match) | ❌ | ✅ — Phase A AC-8 | — | test/manual/test_dsv32_quality_smoke.py |
+| **Cold-vs-warm prefix bit-stability (M3-B)** | ❌ | ✅ — hardware run AC-10 | — | RUNBOOK Phase 5 |
+| **GPQA-Diamond** | ❌ | 🟰 — cookbook benchmark; not in MVP gates | future loop | — |
+| **AIME** | ❌ | 🟰 — cookbook benchmark; not in MVP gates | future loop | — |
+
+### 14.8 Hardware-feature defaults at the Option B operating point (Loop 4 baseline)
+
+Both DSA baseline and DS use this — apples-to-apples in Phase B.
+
+| Cookbook knob | Default in vanilla `--tp 8` | Loop 4 Option B (both sides) | Why deviation from default |
+|---|---|---|---|
+| `kv_cache_dtype` | `bfloat16` (auto on H200) | **`fp8_e4m3`** | DS's FP8 path is validated; bf16 path stays Option-A future-loop |
+| `dsa_prefill_backend` | `flashmla_sparse` (bf16 default) | **`flashmla_kv`** | FP8 forces flashmla_kv on Hopper |
+| `dsa_decode_backend` | `fa3` (bf16 default) | **`flashmla_kv`** | FP8 forces flashmla_kv on Hopper |
+| `attention_backend` | `dsa` | `dsa` | unchanged |
+| `page_size` | 64 (auto for V3.2) | 64 | unchanged |
+| Full CUDA graphs | ON | ON | unchanged |
+| `disable_piecewise_cuda_graph` | False (piecewise ON) | **True (piecewise OFF)** | DS not yet validated under piecewise capture (§12.2 #2.2) |
+| `disable_overlap_schedule` | False (overlap ON) | **True (overlap OFF)** | DS not yet validated under multi-step backend metadata fixup (§12.2 #2.2) |
+| Radix cache | ON | ON (after AC-10 M3-B passes) | DS-on Phase A keeps `--disable-radix-cache` until M3-B; DSA-on always ON |
+| `chunked_prefill_size` | 8192 (auto on H200) | **8192 if AC-1b probe passes; -1 (disabled) if it fails** | AC-1b probe determines this |
+| `enable_dp_attention` | False | False | not deferred per Option B; default already |
+| MTP (`--speculative-algorithm`) | none | none | out of scope decision |
+
+### 14.9 Summary — what makes this "sglang-native"
+
+The implementation reuses existing sglang infrastructure rather than building parallel structures:
+
+- **KV pool allocator** — token-label cache slot-indexed by `out_cache_loc`, same lifecycle.
+- **`transform_index_page_table_decode`** — NSA's existing token-indices-to-block-table converter is the page-table adapter.
+- **`forward_absorb_prepare` / `_select_topk_indices`** — single hook site, no monkey-patching, no model fork.
+- **CUDA graph capture machinery** — `cuda_graph.py::DSGraphState` is a static-buffer-holder; capture itself uses `torch.cuda.CUDAGraph` directly.
+- **Prometheus + meta_info plumbing** — `customized_info_for_request` glue at the existing `customized_info` hook in `tokenizer_manager.py`.
+- **`req_to_token_pool` / `req_pool_indices`** — request ownership comes from existing tracking; nothing new for M2.
+- **Calibration recipe** — Pile val 256×512 Method 1, byte-identical to DoubleSparse / sglang-last / Twilight.
+
+Nothing in DS is forking, monkey-patching, or shadowing sglang infrastructure. It is **a selector that swaps for NSA's indexer**, and nothing else.
