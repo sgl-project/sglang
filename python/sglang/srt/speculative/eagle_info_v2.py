@@ -142,11 +142,8 @@ class EagleDraftInputV2Mixin:
         cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
         nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
 
-        # non_blocking H2D: a plain .to() does cudaMemcpyAsync + cudaStreamSynchronize.
-        # On the schedule stream the sync drains the stream, which the overlap WAR
-        # barrier (schedule_stream.wait_stream(forward_stream)) has chained to the
-        # previous forward -> the host blocks for a full forward and the schedule
-        # pipeline can no longer run ahead. non_blocking drops the stream sync.
+        # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
+        # barrier has chained to the prev forward -> host stalls a full forward.
         cur_kv_lens_dev = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
         nxt_kv_lens_dev = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
         if page_size == 1:
