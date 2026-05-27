@@ -584,6 +584,7 @@ def run_mla_eagle_draft_extend_case(
     testcase,
     case: MLAAttentionCase,
     *,
+    spec_kind: DraftExtendKind = "eagle",
     kv_lora_rank: int = DEFAULT_KV_LORA_RANK,
     qk_rope_head_dim: int = DEFAULT_QK_ROPE_HEAD_DIM,
     hidden_size: int = MLA_DEFAULT_HIDDEN_SIZE,
@@ -603,10 +604,11 @@ def run_mla_eagle_draft_extend_case(
         dtype=dtype,
         device=device,
     )
-    fixture.forward_batch.spec_info = _make_eagle_draft_extend_input(
+    fixture.forward_batch.spec_info = _make_draft_extend_input(
         case,
         fixture.forward_batch,
         device=device,
+        spec_kind=spec_kind,
     )
     inputs = mla_fixture_inputs(fixture)
     expected = expected_mla_output_from_inputs(fixture, case, inputs, None)
@@ -712,6 +714,7 @@ def run_mamba2_eagle_draft_extend_case(
     testcase,
     case: Mamba2AttentionCase,
     *,
+    spec_kind: DraftExtendKind = "eagle",
     max_context_len: int = MAMBA2_DEFAULT_MAX_CONTEXT_LEN,
     dtype: torch.dtype = MAMBA2_DEFAULT_DTYPE,
     device: str = MAMBA2_DEFAULT_DEVICE,
@@ -735,10 +738,11 @@ def run_mamba2_eagle_draft_extend_case(
         dtype=dtype,
         device=device,
     )
-    fixture.forward_batch.spec_info = _make_eagle_draft_extend_input(
+    fixture.forward_batch.spec_info = _make_draft_extend_input(
         case,
         fixture.forward_batch,
         device=device,
+        spec_kind=spec_kind,
     )
     inputs = mamba2_fixture_inputs(fixture)
     # Capture the cache state before forward (the `state` arg passed to
@@ -762,6 +766,7 @@ def run_gdn_eagle_draft_extend_case(
     testcase,
     case,
     *,
+    spec_kind: DraftExtendKind = "eagle",
     head_k_dim: int = 32,
     head_v_dim: int = 32,
     max_context_len: int = 64,
@@ -798,10 +803,11 @@ def run_gdn_eagle_draft_extend_case(
         device=device,
     )
     initial_state = _clone_gdn_cache(fixture)
-    fixture.forward_batch.spec_info = _make_eagle_draft_extend_input(
+    fixture.forward_batch.spec_info = _make_draft_extend_input(
         case,
         fixture.forward_batch,
         device=device,
+        spec_kind=spec_kind,
     )
     actual = run_gdn_fixture_eager(fixture)
     expected = _pure_torch_gdn_reference(fixture, initial_state[1]).output
@@ -812,6 +818,7 @@ def run_kda_eagle_draft_extend_case(
     testcase,
     case,
     *,
+    spec_kind: DraftExtendKind = "eagle",
     head_k_dim: int = 32,
     head_v_dim: int = 32,
     max_context_len: int = 64,
@@ -849,10 +856,11 @@ def run_kda_eagle_draft_extend_case(
     )
     initial_state = _clone_kda_cache(fixture)
     inputs = kda_fixture_inputs(fixture)
-    fixture.forward_batch.spec_info = _make_eagle_draft_extend_input(
+    fixture.forward_batch.spec_info = _make_draft_extend_input(
         case,
         fixture.forward_batch,
         device=device,
+        spec_kind=spec_kind,
     )
     actual = run_kda_fixture_eager(fixture)
     expected = expected_kda_output_from_inputs(fixture, case, inputs, initial_state)
@@ -863,6 +871,7 @@ def run_lightning_eagle_draft_extend_case(
     testcase,
     case,
     *,
+    spec_kind: DraftExtendKind = "eagle",
     head_dim: int = 128,
     max_context_len: int = 64,
     dtype: torch.dtype = torch.bfloat16,
@@ -898,10 +907,11 @@ def run_lightning_eagle_draft_extend_case(
     )
     initial_state = _clone_lightning_cache(fixture)
     inputs = lightning_fixture_inputs(fixture)
-    fixture.forward_batch.spec_info = _make_eagle_draft_extend_input(
+    fixture.forward_batch.spec_info = _make_draft_extend_input(
         case,
         fixture.forward_batch,
         device=device,
+        spec_kind=spec_kind,
     )
     actual = run_lightning_fixture_eager(fixture)
     expected = expected_lightning_output_from_inputs(

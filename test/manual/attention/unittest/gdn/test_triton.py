@@ -258,29 +258,47 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
                     self, case, topk=topk, spec_kind=spec_kind
                 )
 
-    # EAGLE DRAFT_EXTEND eager — `HybridLinearAttnBackend` raises
-    # `ValueError("Invalid forward mode")` for DRAFT_EXTEND CG capture
-    # (`hybrid_linear_attn_backend.py:509,572`), so CG is structurally
-    # blocked across the family (GDN/KDA/Lightning/Mamba2). The
-    # EXTEND-style gated-delta recurrence reference doubles as the
-    # DRAFT_EXTEND reference.
+    # EAGLE / Frozen-KV MTP DRAFT_EXTEND eager — `HybridLinearAttnBackend`
+    # raises `ValueError("Invalid forward mode")` for DRAFT_EXTEND CG
+    # capture (`hybrid_linear_attn_backend.py:509,572`), so CG is
+    # structurally blocked across the family (GDN/KDA/Lightning/Mamba2).
+    # The EXTEND-style gated-delta recurrence reference doubles as the
+    # DRAFT_EXTEND reference across both spec kinds.
     EAGLE_DRAFT_EXTEND_CASES = (
-        GDNAttentionCase(
-            name="runner_eagle_draft_extend_gdn",
-            backend="triton",
-            forward_mode=ForwardMode.DRAFT_EXTEND,
-            num_k_heads=2,
-            num_v_heads=2,
-            page_size=16,
-            prefix_lens=(4, 7),
-            extend_lens=(3, 3),
+        (
+            GDNAttentionCase(
+                name="runner_eagle_draft_extend_gdn",
+                backend="triton",
+                forward_mode=ForwardMode.DRAFT_EXTEND,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            "eagle",
+        ),
+        (
+            GDNAttentionCase(
+                name="runner_frozen_kv_mtp_draft_extend_gdn",
+                backend="triton",
+                forward_mode=ForwardMode.DRAFT_EXTEND,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            "frozen_kv_mtp",
         ),
     )
 
     def test_runner_mode_eagle_draft_extend_cases(self):
-        for case in self.EAGLE_DRAFT_EXTEND_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_gdn_eagle_draft_extend_case(self, case)
+        for case, spec_kind in self.EAGLE_DRAFT_EXTEND_CASES:
+            with self.subTest(
+                case=case.name, backend=case.backend, spec_kind=spec_kind
+            ):
+                run_gdn_eagle_draft_extend_case(self, case, spec_kind=spec_kind)
 
     # Spy directly on each sub-backend's `init_forward_metadata*` so
     # dispatch-layer slice mutations show up as a missing call, which

@@ -152,24 +152,43 @@ class TestTritonLightningBackendCorrectness(CustomTestCase):
             ):
                 run_lightning_eagle_verify_cuda_graph_case(self, case, topk=topk)
 
-    # EAGLE DRAFT_EXTEND eager — CG is structurally blocked across the
-    # HybridLinearAttn family.
+    # EAGLE / Frozen-KV MTP DRAFT_EXTEND eager — CG is structurally
+    # blocked across the HybridLinearAttn family.
     EAGLE_DRAFT_EXTEND_CASES = (
-        LightningAttentionCase(
-            name="runner_eagle_draft_extend_lightning",
-            backend="triton",
-            forward_mode=ForwardMode.DRAFT_EXTEND,
-            num_heads=2,
-            page_size=16,
-            prefix_lens=(4, 7),
-            extend_lens=(3, 3),
+        (
+            LightningAttentionCase(
+                name="runner_eagle_draft_extend_lightning",
+                backend="triton",
+                forward_mode=ForwardMode.DRAFT_EXTEND,
+                num_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            "eagle",
+        ),
+        (
+            LightningAttentionCase(
+                name="runner_frozen_kv_mtp_draft_extend_lightning",
+                backend="triton",
+                forward_mode=ForwardMode.DRAFT_EXTEND,
+                num_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            "frozen_kv_mtp",
         ),
     )
 
     def test_runner_mode_eagle_draft_extend_cases(self):
-        for case in self.EAGLE_DRAFT_EXTEND_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_lightning_eagle_draft_extend_case(self, case)
+        for case, spec_kind in self.EAGLE_DRAFT_EXTEND_CASES:
+            with self.subTest(
+                case=case.name, backend=case.backend, spec_kind=spec_kind
+            ):
+                run_lightning_eagle_draft_extend_case(
+                    self, case, spec_kind=spec_kind
+                )
 
     # PCG/BCG split-op extend is deliberately NOT covered. Lightning's
     # backend `forward_extend` flattens the output via `o.view(-1,

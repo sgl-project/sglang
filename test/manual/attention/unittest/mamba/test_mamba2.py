@@ -123,28 +123,32 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
             1,
         ),
     )
-    # EAGLE DRAFT_EXTEND eager — `HybridLinearAttnBackend` raises
-    # `ValueError("Invalid forward mode")` for DRAFT_EXTEND CG capture
-    # (`hybrid_linear_attn_backend.py:509,572`), so CG is structurally
-    # blocked; only eager is exercised. Same EXTEND-style chunked-scan
-    # recurrence reference doubles as the DRAFT_EXTEND reference, like
-    # the verify path.
-    EAGLE_DRAFT_EXTEND_CASES = (
-        Mamba2AttentionCase(
-            name="runner_eagle_draft_extend_mamba2",
-            backend="triton",
-            forward_mode=ForwardMode.DRAFT_EXTEND,
-            num_heads=DEFAULT_NUM_HEADS,
-            head_dim=DEFAULT_HEAD_DIM,
-            state_size=DEFAULT_STATE_SIZE,
-            n_groups=DEFAULT_N_GROUPS,
-            conv_kernel=DEFAULT_CONV_KERNEL,
-            mamba_chunk_size=DEFAULT_MAMBA_CHUNK_SIZE,
-            hidden_size=DEFAULT_HIDDEN_SIZE,
-            page_size=16,
-            prefix_lens=(4, 7),
-            extend_lens=(3, 3),
-        ),
+    # EAGLE / Frozen-KV MTP DRAFT_EXTEND eager — `HybridLinearAttnBackend`
+    # raises `ValueError("Invalid forward mode")` for DRAFT_EXTEND CG
+    # capture (`hybrid_linear_attn_backend.py:509,572`), so CG is
+    # structurally blocked; only eager is exercised. Same EXTEND-style
+    # chunked-scan recurrence reference doubles as the DRAFT_EXTEND
+    # reference, like the verify path.
+    EAGLE_DRAFT_EXTEND_CASES = tuple(
+        (
+            Mamba2AttentionCase(
+                name=f"runner_{spec_kind}_draft_extend_mamba2",
+                backend="triton",
+                forward_mode=ForwardMode.DRAFT_EXTEND,
+                num_heads=DEFAULT_NUM_HEADS,
+                head_dim=DEFAULT_HEAD_DIM,
+                state_size=DEFAULT_STATE_SIZE,
+                n_groups=DEFAULT_N_GROUPS,
+                conv_kernel=DEFAULT_CONV_KERNEL,
+                mamba_chunk_size=DEFAULT_MAMBA_CHUNK_SIZE,
+                hidden_size=DEFAULT_HIDDEN_SIZE,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            spec_kind,
+        )
+        for spec_kind in ("eagle", "frozen_kv_mtp")
     )
 
     def test_projected_mamba2_attention_cases(self):
@@ -175,9 +179,13 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
                 run_mamba2_eagle_verify_cuda_graph_case(self, case, topk=topk)
 
     def test_runner_mode_eagle_draft_extend_cases(self):
-        for case in self.EAGLE_DRAFT_EXTEND_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_mamba2_eagle_draft_extend_case(self, case)
+        for case, spec_kind in self.EAGLE_DRAFT_EXTEND_CASES:
+            with self.subTest(
+                case=case.name, backend=case.backend, spec_kind=spec_kind
+            ):
+                run_mamba2_eagle_draft_extend_case(
+                    self, case, spec_kind=spec_kind
+                )
 
     # PCG/BCG split-op extend is deliberately NOT covered. The
     # `MambaMixer2.forward` asserts `num_actual_tokens ==

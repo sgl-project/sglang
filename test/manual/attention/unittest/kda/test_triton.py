@@ -202,25 +202,44 @@ class TestTritonKDABackendCorrectness(CustomTestCase):
             32,
         ),
     )
-    # EAGLE DRAFT_EXTEND eager. CG is structurally blocked across the
-    # HybridLinearAttn family (`hybrid_linear_attn_backend.py:509,572`).
+    # EAGLE / Frozen-KV MTP DRAFT_EXTEND eager. CG is structurally
+    # blocked across the HybridLinearAttn family
+    # (`hybrid_linear_attn_backend.py:509,572`).
     EAGLE_DRAFT_EXTEND_CASES = (
-        KDAAttentionCase(
-            name="runner_eagle_draft_extend_kda",
-            backend="triton",
-            forward_mode=ForwardMode.DRAFT_EXTEND,
-            num_k_heads=2,
-            num_v_heads=2,
-            page_size=16,
-            prefix_lens=(4, 7),
-            extend_lens=(3, 3),
+        (
+            KDAAttentionCase(
+                name="runner_eagle_draft_extend_kda",
+                backend="triton",
+                forward_mode=ForwardMode.DRAFT_EXTEND,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            "eagle",
+        ),
+        (
+            KDAAttentionCase(
+                name="runner_frozen_kv_mtp_draft_extend_kda",
+                backend="triton",
+                forward_mode=ForwardMode.DRAFT_EXTEND,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            "frozen_kv_mtp",
         ),
     )
 
     def test_runner_mode_eagle_draft_extend_cases(self):
-        for case in self.EAGLE_DRAFT_EXTEND_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_kda_eagle_draft_extend_case(self, case)
+        for case, spec_kind in self.EAGLE_DRAFT_EXTEND_CASES:
+            with self.subTest(
+                case=case.name, backend=case.backend, spec_kind=spec_kind
+            ):
+                run_kda_eagle_draft_extend_case(self, case, spec_kind=spec_kind)
 
     def test_runner_mode_split_op_extend_cases(self):
         for case, static_num_tokens in self.SPLIT_OP_CASES:
