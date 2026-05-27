@@ -519,6 +519,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 global_num_tokens = batch.global_num_tokens
                 global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
 
+            # Copy into independent lists: original_* is the pre-DP-padding
+            # snapshot, while global_num_tokens_cpu may be padded in place later
+            # (prepare_mlp_sync_batch). Without the copy both would alias the same
+            # schedule-batch list and the snapshot would be lost.
             ret.original_global_num_tokens_cpu = list(batch.global_num_tokens)
             ret.global_num_tokens_cpu = list(global_num_tokens)
             ret.global_num_tokens_gpu = torch.tensor(

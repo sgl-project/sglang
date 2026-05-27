@@ -619,37 +619,36 @@ class NemotronHAttention(nn.Module):
             output, _ = self.o_proj(attn_output)
             return output
 
+        # DP attention pads each rank's batch to a common size for collective
+        # alignment. Those padding rows are fake: they must not write KV cache and
+        # must leave the layer as zeros. Prefill runs a varlen kernel keyed on the
+        # real cu_seqlens, so Q/K/V are trimmed to the real tokens; decode runs a
+        # wrapper captured at the padded batch size, so Q stays padded while K/V
+        # and the cache-write locations are trimmed.
         padded_shape = hidden_states.shape[0]
         real_tokens = _get_real_num_tokens(hidden_states, forward_batch)
+        has_padding = real_tokens < padded_shape
+        keep_q_padded = forward_batch.forward_mode.is_decode()
         original_out_cache_loc = forward_batch.out_cache_loc
-        trim_for_attention = real_tokens < padded_shape
-        trim_q_for_attention = trim_for_attention and not forward_batch.forward_mode.is_decode()
-        if trim_for_attention and original_out_cache_loc is not None:
-            # Fake DP padding rows must not write KV cache. Decode wrappers are
-            # still built for the padded batch, so keep Q padded for decode but
-            # trim K/V and cache locations to real rows.
-            forward_batch.out_cache_loc = original_out_cache_loc[:real_tokens]
 
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if trim_for_attention:
-            k = k[:real_tokens]
-            v = v[:real_tokens]
-            if trim_q_for_attention:
+        if has_padding:
+            k, v = k[:real_tokens], v[:real_tokens]
+            if original_out_cache_loc is not None:
+                forward_batch.out_cache_loc = original_out_cache_loc[:real_tokens]
+            if not keep_q_padded:
                 q = q[:real_tokens]
-        attn_output = self.attn.forward(q, k, v, forward_batch)
-        # out_cache_loc is only consumed by self.attn.forward (KV write); restore
-        # it right after so the rest of the forward sees the original batch.
-        forward_batch.out_cache_loc = original_out_cache_loc
-        if trim_q_for_attention:
-            padded_attn_output = attn_output.new_zeros(
-                (padded_shape, attn_output.shape[1])
-            )
-            padded_attn_output[:real_tokens].copy_(attn_output)
-            attn_output = padded_attn_output
-        output, _ = self.o_proj(attn_output)
 
-        if output.shape[0] > real_tokens:
+        attn_output = self.attn.forward(q, k, v, forward_batch)
+        # out_cache_loc is only consumed by self.attn.forward (KV write); restore it now.
+        forward_batch.out_cache_loc = original_out_cache_loc
+
+        # Restore the padded row count (padding rows zeroed) before o_proj so the
+        # next collective sees the same shape as the layer input.
+        attn_output = _pad_to_original_num_tokens(attn_output, padded_shape)
+        output, _ = self.o_proj(attn_output)
+        if has_padding:
             output[real_tokens:].zero_()
         return output
 
