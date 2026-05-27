@@ -211,6 +211,7 @@ class DoubleSparsitySelector:
         req_pool_indices: torch.Tensor,
         sparse_mask: torch.Tensor,
         seq_lens: Optional[torch.Tensor] = None,
+        req_to_token: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return ``(selected_indices, valid_lengths)``.
 
@@ -244,6 +245,9 @@ class DoubleSparsitySelector:
                 max_top_k=self.max_top_k,
                 process_group=self.process_group,
                 per_request_valid=sparse_mask,
+                req_pool_indices=req_pool_indices,
+                req_to_token=req_to_token,
+                seq_lens=seq_lens,
             )
 
         batch_size = req_pool_indices.shape[0]

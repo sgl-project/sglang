@@ -645,9 +645,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.elastic_ep_backend:
             ElasticEPStateManager.init(self.server_args)
-        # Expose the pool to model __init__ so DS bind can derive max_tokens.
-        if self.req_to_token_pool is not None:
-            self.server_args._ds_req_to_token_pool = self.req_to_token_pool
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
@@ -750,6 +747,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
+
+        # Bind DS attention modules now that the KV pool is sized.
+        if getattr(self.server_args, "enable_double_sparsity", False) and self.req_to_token_pool is not None:
+            self.server_args._ds_req_to_token_pool = self.req_to_token_pool
+            for module in self.model.modules():
+                if hasattr(module, "finalize_double_sparsity_bind"):
+                    module.finalize_double_sparsity_bind()
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()

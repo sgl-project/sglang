@@ -473,7 +473,7 @@ def startup_sanity_probe(
         return SanityProbeResult(
             passed=False,
             score=0.0,
-            needle_position=needle_page,
+            needle_position=needle_page * page_size,
             selected_indices=None,
             skipped_reason="placeholder_selector",
         )
@@ -497,7 +497,7 @@ def startup_sanity_probe(
         return SanityProbeResult(
             passed=False,
             score=0.0,
-            needle_position=needle_page,
+            needle_position=needle_page * page_size,
             selected_indices=None,
             skipped_reason="no_token_label_table",
         )

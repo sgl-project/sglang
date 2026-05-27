@@ -336,6 +336,72 @@ def select_topk_sequence_order(
     return selected, valid_lengths.to(torch.int32)
 
 
+def _compute_logical_token_scores(
+    queries: torch.Tensor,
+    token_signatures: torch.Tensor,
+    written: torch.Tensor,
+    channel_selection: torch.Tensor,
+    channel_weights: torch.Tensor,
+    layer_id: int,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> torch.Tensor:
+    """Score tokens in logical-sequence-position space.
+
+    Gathers physical KV-cache labels for each request's logical positions
+    0..seq_len-1 via ``req_to_token``, then scores each logical position
+    against the projected query. Returns ``[bs, max_seq_len]`` fp32 scores,
+    masked to ``-inf`` for positions >= seq_len and for unwritten slots.
+
+    This keeps the top-K output in logical-position domain so that
+    ``logical_to_physical`` can convert it correctly.
+    """
+    bs = queries.shape[0]
+    max_seq_len = int(seq_lens.max().item()) if bs > 0 else 0
+    device = queries.device
+
+    if max_seq_len == 0:
+        return torch.full((bs, 1), float("-inf"), dtype=torch.float32, device=device)
+
+    sel_layer = channel_selection[layer_id]  # [H, label_dim]
+    w_layer = channel_weights[layer_id]      # [H, label_dim]
+    q_proj = project_query_onto_channels(queries, sel_layer, w_layer)  # [bs, H, D]
+
+    num_pools = req_to_token.shape[0]
+    max_seqlen_in_pool = req_to_token.shape[1]
+    safe_pool = req_pool_indices.clamp(0, max(num_pools - 1, 0)).long()  # [bs]
+
+    # logical_positions[b, i] = i (0-indexed position within each request)
+    logical_positions = torch.arange(max_seq_len, device=device).unsqueeze(0).expand(bs, -1)  # [bs, max_seq_len]
+    safe_positions = logical_positions.clamp(0, max(max_seqlen_in_pool - 1, 0))  # [bs, max_seq_len]
+
+    # physical_slots[b, i] = req_to_token[safe_pool[b], safe_positions[b, i]]
+    pool_expanded = safe_pool.unsqueeze(1).expand(-1, max_seq_len)         # [bs, max_seq_len]
+    physical_slots = req_to_token[pool_expanded, safe_positions.long()]    # [bs, max_seq_len] int32
+
+    # Gather label signatures for each logical position's physical slot.
+    sig_layer = token_signatures[layer_id]  # [max_tokens, H, label_dim]
+    max_tokens = sig_layer.shape[0]
+    safe_phys = physical_slots.long().clamp(0, max(max_tokens - 1, 0))     # [bs, max_seq_len]
+    gathered_sig = sig_layer[safe_phys]                                     # [bs, max_seq_len, H, label_dim]
+
+    # scores[b, i] = max_over_heads(q_proj[b] · sig[b, i])
+    # q_proj: [bs, H, D] → [bs, 1, H, D]; gathered_sig: [bs, max_seq_len, H, D]
+    dot = (q_proj.unsqueeze(1).to(torch.float32) * gathered_sig.to(torch.float32)).sum(-1)  # [bs, max_seq_len, H]
+    scores = dot.amax(dim=-1)  # [bs, max_seq_len]
+
+    # Mask: unwritten physical slots and positions >= seq_len
+    written_layer = written[layer_id]  # [max_tokens] bool
+    written_gathered = written_layer[safe_phys]  # [bs, max_seq_len] bool
+    scores = scores.masked_fill(~written_gathered, float("-inf"))
+
+    seq_len_mask = logical_positions < seq_lens.unsqueeze(1).to(device)  # [bs, max_seq_len]
+    scores = scores.masked_fill(~seq_len_mask, float("-inf"))
+
+    return scores
+
+
 def retrieve_topk_via_labels(
     *,
     queries: torch.Tensor,
@@ -347,27 +413,60 @@ def retrieve_topk_via_labels(
     max_top_k: int,
     process_group=None,
     per_request_valid: Optional[torch.Tensor] = None,
+    req_pool_indices: Optional[torch.Tensor] = None,
+    req_to_token: Optional[torch.Tensor] = None,
+    seq_lens: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """End-to-end selector flow: score → all-reduce → per-request mask → top-K → ascend.
 
-    ``per_request_valid``: optional ``[bs, max_tokens]`` bool/int tensor flagging
-    the tokens each request actually owns. Without a per-row mask a request could
-    pick globally-written tokens owned by other requests in a mixed batch.
-    ``None`` disables the per-row gate (single-request / unit-test paths).
+    **Logical-domain mode** (when ``req_pool_indices``, ``req_to_token``, and
+    ``seq_lens`` are all provided): gathers physical labels per-request using
+    ``req_to_token``, scores in the ``[bs, max_seq_len]`` logical-position
+    domain, and returns logical positions (0-indexed). This is the correct
+    production path — ``logical_to_physical`` can then map the returned
+    positions to physical KV slots.
 
-    Returns ``(selected_indices, valid_lengths)`` where ``selected_indices``
-    contains logical token positions (sequence-ascending, -1 padded).
+    **Physical-domain mode** (when those three are absent, default): scores
+    over all physical slots in ``token_signatures`` directly. Used by the
+    sanity probe and unit tests that construct labels at known physical slot
+    indices without a per-request ``req_to_token`` mapping.
+
+    ``per_request_valid``: optional ``[bs, max_tokens/max_seq_len]`` bool mask
+    applied after scoring. ``None`` disables the gate.
+
+    Returns ``(selected_indices, valid_lengths)`` — sequence-ascending, -1 padded.
     """
 
-    scores = compute_token_scores(
-        queries=queries,
-        token_signatures=token_signatures,
-        written=written,
-        channel_selection=channel_selection,
-        channel_weights=channel_weights,
-        layer_id=layer_id,
+    use_logical = (
+        req_pool_indices is not None
+        and req_to_token is not None
+        and seq_lens is not None
     )
-    scores = all_reduce_token_scores(scores, process_group=process_group)
+
+    if use_logical:
+        scores = _compute_logical_token_scores(
+            queries=queries,
+            token_signatures=token_signatures,
+            written=written,
+            channel_selection=channel_selection,
+            channel_weights=channel_weights,
+            layer_id=layer_id,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            seq_lens=seq_lens,
+        )
+        scores = all_reduce_token_scores(scores, process_group=process_group)
+    else:
+        scores = compute_token_scores(
+            queries=queries,
+            token_signatures=token_signatures,
+            written=written,
+            channel_selection=channel_selection,
+            channel_weights=channel_weights,
+            layer_id=layer_id,
+        )
+        scores = all_reduce_token_scores(scores, process_group=process_group)
+
     if per_request_valid is not None:
         if per_request_valid.shape != scores.shape:
             raise ValueError(
@@ -389,3 +488,7 @@ def retrieve_topk_via_labels(
             total_valid_pages=total_valid_tokens,
         )
     return indices, valid_lengths
+
+
+# Public alias for the end-to-end selector pipeline.
+retrieve_topk = retrieve_topk_via_labels

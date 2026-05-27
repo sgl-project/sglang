@@ -228,12 +228,14 @@ class DeepseekMLAForwardMixin:
                 if q_lora is None:
                     q_lora = q
 
-            # overlap q_b_proj and indexer during decode
+            # overlap q_b_proj and indexer during decode (NSA-only; DS must
+            # wait for q_b_proj to compute projected Q-noPE for selection)
             if (
                 self.alt_stream is not None
                 and get_is_capture_mode()
                 and forward_batch.forward_mode.is_decode_or_idle()
                 and q_lora is not None
+                and not self.use_double_sparsity
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
@@ -242,10 +244,6 @@ class DeepseekMLAForwardMixin:
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                # Gate skip_topk on `not use_double_sparsity`: the DS
-                # selector is per-step (channel-mask scores depend on the
-                # current query) and must not be short-circuited by
-                # prev_topk_indices reuse. NSA's skip_topk reuse stays.
                 if (
                     self.use_double_sparsity
                     or not self.skip_topk
@@ -268,9 +266,15 @@ class DeepseekMLAForwardMixin:
             else:
                 k_nope = k_nope.unsqueeze(1)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                # DS selector requires projected Q-noPE [bs, H, qk_nope_head_dim].
+                q_nope_for_ds = (
+                    q[..., : self.qk_nope_head_dim]
+                    if self.use_double_sparsity
+                    else None
+                )
                 if q_lora is not None:
-                    # See alt-stream branch above: DS selector is per-step
-                    # and must run even when skip_topk is set.
+                    # Gate skip_topk on `not use_double_sparsity`: DS selection
+                    # is per-step and must not be short-circuited by reuse.
                     if (
                         self.use_double_sparsity
                         or not self.skip_topk
@@ -282,6 +286,7 @@ class DeepseekMLAForwardMixin:
                             positions=positions,
                             forward_batch=forward_batch,
                             layer_id=self.layer_id,
+                            q_nope=q_nope_for_ds,
                         )
                     else:
                         topk_indices = maybe_capture_indexer_topk(

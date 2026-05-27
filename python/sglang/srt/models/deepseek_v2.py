@@ -1538,7 +1538,11 @@ class DeepseekV2AttentionMLA(
                     head_dim=self.qk_head_dim,
                 )
                 self.use_double_sparsity = True
-                self._bind_double_sparsity_runtime_data(
+                # Store bind args; actual table allocation deferred to
+                # finalize_double_sparsity_bind() which is called after
+                # ModelRunner.init_memory_pool() so that max_tokens comes
+                # from req_to_token_pool.size, not device_buffer_size.
+                self._ds_deferred_bind_args = dict(
                     server_args=_global_server_args,
                     ds_parsed=ds_parsed,
                     config=config,
@@ -1829,6 +1833,21 @@ class DeepseekV2AttentionMLA(
         else:
             raise NotImplementedError
 
+    def finalize_double_sparsity_bind(self) -> None:
+        """Complete DS selector binding using the real KV pool (post-pool-init).
+
+        Called by ModelRunner after init_memory_pool() so that
+        ``max_tokens = req_to_token_pool.size`` rather than ``device_buffer_size``.
+        Idempotent: no-op if already bound or DS not enabled.
+        """
+        if not self.use_double_sparsity:
+            return
+        args = getattr(self, "_ds_deferred_bind_args", None)
+        if args is None:
+            return
+        self._bind_double_sparsity_runtime_data(**args)
+        self._ds_deferred_bind_args = None
+
     def _bind_double_sparsity_runtime_data(
         self,
         *,
@@ -1838,7 +1857,7 @@ class DeepseekV2AttentionMLA(
         attn_tp_rank: int,
         attn_tp_size: int,
     ) -> None:
-        """Wire the DS selector out of placeholder mode at attention init.
+        """Wire the DS selector out of placeholder mode.
 
         Reads the validator-loaded channel mask off ``server_args``,
         slices it for this rank's heads, allocates a shared per-model
@@ -1884,12 +1903,15 @@ class DeepseekV2AttentionMLA(
         table = getattr(server_args, "_double_sparsity_token_label_table", None)
         if table is None:
             num_layers_local = int(getattr(config, "num_hidden_layers", 1))
-            # Derive max_tokens from the KV pool so the label table is
-            # slot-consistent with the allocator (AC-0: not device_buffer_size).
             ds_pool = getattr(server_args, "_ds_req_to_token_pool", None)
-            max_tokens = ds_pool.size if ds_pool is not None else int(
-                getattr(ds_parsed, "device_buffer_size", 4096)
-            )
+            if ds_pool is None:
+                raise RuntimeError(
+                    "Double Sparsity: req_to_token_pool is not available at bind time. "
+                    "finalize_double_sparsity_bind() must be called after "
+                    "ModelRunner.init_memory_pool() so that TokenLabelTable is sized "
+                    "from the real KV pool, not device_buffer_size."
+                )
+            max_tokens = ds_pool.size
             label_dim = int(local_mask.label_dim)
             page_size = int(ds_parsed.page_size)
             try:
@@ -2000,6 +2022,7 @@ class DeepseekV2AttentionMLA(
         forward_batch: ForwardBatch,
         layer_id: int,
         return_indices: bool = True,
+        q_nope: Optional[torch.Tensor] = None,
     ):
         """The one config-gated branch: Double Sparsity selector OR NSA Indexer.
 
@@ -2029,24 +2052,29 @@ class DeepseekV2AttentionMLA(
                 assert_real_selector_or_placeholder_allowed,
             )
 
+            req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
+            req_to_token = (
+                req_to_token_pool.req_to_token
+                if req_to_token_pool is not None
+                else None
+            )
+
             def _run() -> torch.Tensor:
                 assert_real_selector_or_placeholder_allowed(
                     self.double_sparsity_selector
                 )
+                # Use projected Q-noPE for DS selector when available; fall back
+                # to latent q_lora only for the placeholder path (unit tests).
+                queries_for_ds = q_nope if q_nope is not None else q_lora
                 selected_indices, valid_lengths = (
                     self.double_sparsity_selector.retrieve_topk(
-                        queries=q_lora,
+                        queries=queries_for_ds,
                         layer_id=layer_id,
                         req_pool_indices=forward_batch.req_pool_indices,
                         sparse_mask=getattr(forward_batch, "sparse_mask", None),
                         seq_lens=getattr(forward_batch, "seq_lens", None),
+                        req_to_token=req_to_token,
                     )
-                )
-                req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
-                req_to_token = (
-                    req_to_token_pool.req_to_token
-                    if req_to_token_pool is not None
-                    else None
                 )
                 # AC-8: prefer the NSA-metadata-owned buffer, allocated
                 # once per batch in init_forward_metadata (also for

@@ -237,8 +237,8 @@ class TestValidator(unittest.TestCase):
                 double_sparsity_config=_valid_payload(path),
                 page_size=64,
                 kv_cache_dtype="fp8_e4m3",
-                nsa_prefill_backend="flashmla_kv",
-                nsa_decode_backend="flashmla_kv",
+                dsa_prefill_backend="flashmla_kv",
+                dsa_decode_backend="flashmla_kv",
                 disable_radix_cache=True,
             )
             os.environ["SGLANG_DS_ALLOW_PLACEHOLDER"] = "1"
@@ -280,8 +280,8 @@ class TestValidator(unittest.TestCase):
                 double_sparsity_config=_valid_payload(path),
                 page_size=64,
                 kv_cache_dtype="fp8_e4m3",
-                nsa_prefill_backend="flashmla_kv",
-                nsa_decode_backend="flashmla_kv",
+                dsa_prefill_backend="flashmla_kv",
+                dsa_decode_backend="flashmla_kv",
                 disable_radix_cache=True,
             )
             os.environ["SGLANG_DS_ALLOW_PLACEHOLDER"] = "1"
@@ -364,10 +364,13 @@ class TestSelectTopkIndicesHookBranch(unittest.TestCase):
         """The DS branch returns a token-level ``topk_indices`` tensor —
         the same shape NSA returns — via the page-table adapter."""
         attn = self._make_attn_real()
+        # Identity req_to_token: logical position i → physical slot i.
+        req_to_token = torch.arange(256, dtype=torch.int32).unsqueeze(0).expand(2, -1).contiguous()
         forward_batch = SimpleNamespace(
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
             seq_lens=torch.tensor([128, 256], dtype=torch.int32),
             sparse_mask=None,
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
         )
         result = attn._select_topk_indices(
             x=torch.zeros(2, 16, 128),
@@ -381,7 +384,8 @@ class TestSelectTopkIndicesHookBranch(unittest.TestCase):
         self.assertEqual(result.dim(), 2)
         self.assertEqual(result.shape[0], 2)
         self.assertGreaterEqual(result.shape[1], 1)
-        # The first valid entry of row 0 must be 0 * page_size = 0.
+        # Placeholder returns ascending logical positions 0,1,2,...
+        # After logical_to_physical with identity req_to_token: physical slot 0.
         self.assertEqual(int(result[0, 0].item()), 0)
         # Padding past valid_lengths must be -1.
         self.assertEqual(int(result[0, -1].item()), -1)
@@ -1711,8 +1715,9 @@ class TestSanityProbeRealSelector(unittest.TestCase):
         sel = DoubleSparsitySelector(
             config=cfg, num_local_heads=2, head_dim=64, device=torch.device("cpu"),
         )
+        # haystack_pages=8, page_size=64 → needs 512 token slots
         table = allocate_token_label_table(
-            num_layers_local=1, max_tokens=16, num_heads_local=2, label_dim=4,
+            num_layers_local=1, max_tokens=512, num_heads_local=2, label_dim=4,
             page_size=64, dtype=torch.float32, device=torch.device("cpu"),
         )
         # A deterministic non-trivial channel mask: heads point at distinct
@@ -1742,7 +1747,7 @@ class TestSanityProbeRealSelector(unittest.TestCase):
         self.assertTrue(result.passed,
                         f"probe should find planted needle; got {result}")
         self.assertEqual(result.score, 1.0)
-        self.assertEqual(result.needle_position, 4)
+        self.assertEqual(result.needle_position, 4 * 64)  # needle_token = needle_page * page_size
         # The probe must restore the table after running.
         self.assertTrue(torch.equal(
             table.signatures[0, :8],
@@ -3724,7 +3729,7 @@ class TestR6Coverage(unittest.TestCase):
         """AC-8: NSAMetadata exposes the DS-owned output buffer field
         with a None default for non-DS configurations.
         """
-        from sglang.srt.layers.attention.nsa_backend import NSAMetadata
+        from sglang.srt.layers.attention.dsa_backend import DSAMetadata as NSAMetadata
 
         # The field exists on the dataclass.
         self.assertIn("ds_topk_indices_out", NSAMetadata.__dataclass_fields__)
@@ -3744,9 +3749,9 @@ class TestR6Coverage(unittest.TestCase):
         import os
         from unittest.mock import patch
 
-        from sglang.srt.layers.attention.nsa_backend import (
+        from sglang.srt.layers.attention.dsa_backend import (
             NativeSparseAttnBackend,
-            NSAMetadata,
+            DSAMetadata as NSAMetadata,
         )
         from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
             logical_to_physical,
@@ -3782,15 +3787,16 @@ class TestR6Coverage(unittest.TestCase):
             cu_seqlens_k=torch.tensor([0, 128], dtype=torch.int32),
             page_table_1=page_table_1,
             real_page_table=page_table_1,
-            nsa_cache_seqlens_int32=torch.tensor([2], dtype=torch.int32),
-            nsa_cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
-            nsa_cu_seqlens_k=torch.tensor([0, 2], dtype=torch.int32),
-            nsa_extend_seq_lens_list=[1],
-            nsa_seqlens_expanded=torch.tensor([2], dtype=torch.int32),
+            dsa_cache_seqlens_int32=torch.tensor([2], dtype=torch.int32),
+            dsa_cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
+            dsa_cu_seqlens_k=torch.tensor([0, 2], dtype=torch.int32),
+            dsa_extend_seq_lens_list=[1],
+            dsa_seqlens_expanded=torch.tensor([2], dtype=torch.int32),
         )
 
         backend = object.__new__(NativeSparseAttnBackend)
         backend.nsa_decode_impl = "flashmla_kv"
+        backend.dsa_decode_impl = "flashmla_kv"
         backend.use_mha = False
         backend.forward_metadata = metadata
         backend.enable_double_sparsity = True
@@ -3818,6 +3824,11 @@ class TestR6Coverage(unittest.TestCase):
             out_cache_loc=None,
             encoder_out_cache_loc=None,
         )
+
+        # forward_decode reads self.token_to_kv_pool and self.hisparse_coordinator
+        # directly on the backend instance (not on forward_batch).
+        backend.token_to_kv_pool = forward_batch.token_to_kv_pool
+        backend.hisparse_coordinator = None
 
         # Patch the instance's `_forward_flashmla_kv` to capture args.
         call_records = []
