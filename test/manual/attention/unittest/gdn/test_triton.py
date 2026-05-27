@@ -56,6 +56,10 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
             32,
         ),
     )
+    # GDN verify covers EAGLE chain/tree plus the non-EAGLE chain spec
+    # kinds (frozen_kv_mtp, dflash, ngram). All three pass against the
+    # pure-PyTorch gated-delta recurrence reference; the GDN backend
+    # treats them uniformly via the spec_info custom/tree mask.
     EAGLE_VERIFY_CASES = (
         (
             GDNAttentionCase(
@@ -69,6 +73,7 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
                 extend_lens=(3, 3),
             ),
             1,
+            "eagle",
         ),
         (
             GDNAttentionCase(
@@ -82,6 +87,49 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
                 extend_lens=(3, 3),
             ),
             2,
+            "eagle",
+        ),
+        (
+            GDNAttentionCase(
+                name="runner_frozen_kv_mtp_verify_gdn_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "frozen_kv_mtp",
+        ),
+        (
+            GDNAttentionCase(
+                name="runner_dflash_verify_gdn_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "dflash",
+        ),
+        (
+            GDNAttentionCase(
+                name="runner_ngram_verify_gdn_chain",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+            "ngram",
         ),
     )
     EAGLE_VERIFY_CUDA_GRAPH_CASES = (
@@ -97,6 +145,7 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
                 extend_lens=(3, 3),
             ),
             1,
+            "eagle",
         ),
         (
             GDNAttentionCase(
@@ -110,6 +159,7 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
                 extend_lens=(3, 3),
             ),
             2,
+            "eagle",
         ),
     )
 
@@ -140,13 +190,25 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
                     )
 
     def test_runner_mode_eagle_verify_cases(self):
-        for case, topk in self.EAGLE_VERIFY_CASES:
-            with self.subTest(case=case.name, backend=case.backend, topk=topk):
-                run_gdn_eagle_verify_case(self, case, topk=topk)
+        for case, topk, spec_kind in self.EAGLE_VERIFY_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                topk=topk,
+                spec_kind=spec_kind,
+            ):
+                run_gdn_eagle_verify_case(
+                    self, case, topk=topk, spec_kind=spec_kind
+                )
 
     def test_runner_mode_eagle_verify_cuda_graph_cases(self):
-        for case, topk in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:
-            with self.subTest(case=case.name, backend=case.backend, topk=topk):
+        for case, topk, spec_kind in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                topk=topk,
+                spec_kind=spec_kind,
+            ):
                 run_gdn_eagle_verify_cuda_graph_case(self, case, topk=topk)
 
     # Spy directly on each sub-backend's `init_forward_metadata*` so
