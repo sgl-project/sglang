@@ -2,34 +2,40 @@
 
 ## Why this loop exists
 
-Loop 3 set the scope at 3 items (M1/M2/M3) and never ran. The structural plumbing landed in Loops 1–2 (3,887 LOC, 150 unit tests, ABI locked, `bind_runtime_data` wired at `deepseek_v2.py:1541`), but the **data isn't flowing through it on real V3.2**:
+Loop 3 set the scope at 3 items (M1/M2/M3) and never ran. The structural plumbing landed in Loops 1–2 (3,887 LOC, 150 unit tests, ABI locked, `bind_runtime_data` wired at `deepseek_v2.py:1541`), but the **data isn't flowing through it on real V3.2** and the **selection granularity was page-level, paying complexity for memory savings that only matter at 1M context** (no client ask).
 
-- `page_signature_write` is never called from a live KV-write site (`grep` in `nsa_backend.py` returns zero hits).
-- `sparse_mask` is not attached to `ForwardBatch`.
-- No calibrated channel mask exists for DSv3.2 — `calibrate.py` works on tiny CI fixtures only.
-- No multi-process TP harness — single-rank simulations only.
-- No hardware-level CUDA-graph capture against a real V3.2 batch.
-- Zero `bench_serving` runs against a real V3.2 model.
+Loop 4 makes two changes at once:
 
-This loop closes those gaps and **reaches the MVP defined in [`development/past_implementations/study/06-proposed-architecture-v2.md`](../past_implementations/study/06-proposed-architecture-v2.md) §9.2**: DS-on matches or beats DSA-on at the **Option B operating point** (FP8 + flashmla_kv + overlap off + piecewise off + radix cache, both runs), with NIAH-Δ ≤ 5 pp and MMLU-Δ ≤ 1.0 pp.
+1. **Rotates the architecture to token-level signatures at page_size=64** (per `06-proposed-architecture-v2.md` §13). Selection is per-token, storage is per-token, FlashMLA still reads at page granularity via NSA's existing `transform_index_page_table_decode`. This deletes the custom page adapter, the chunked-prefill page accumulation logic, the page lifecycle hooks, and the within-page averaging quality delta — all in one move. It is the design point sglang-last incidentally got right and the paper proposed.
+2. **Reaches the MVP at the Option B operating point** (FP8 + `flashmla_kv` + overlap off + piecewise off, both DSA baseline and DS at the same operating point): DS-on matches or beats DSA-on TPS at conc=64 with NIAH-Δ ≤ 5 pp and MMLU-Δ ≤ 1 pp.
 
-The default cookbook bf16 / flashmla_sparse / fa3 / overlap / piecewise variant is **deferred** to a later loop — that's Option A scope, separately budgeted.
+**Anchor:** start from `dev/double-sparsity-standalone` at the head with §13 committed.
 
-**Anchor:** start from `dev/double-sparsity-standalone` at the post-`06-v2` head (currently `627e7be2b`).
+## Hard scope — Phase A (8 ACs, must close)
 
-## Hard scope — Phase A (7 ACs, must close)
+### AC-0 — Architecture rotation: token-level signatures, page_size=64 stays
 
-These are the items §12.6 of the v2 design doc classifies as 🛑 must-address, plus the cookbook-derived items confirmed in this loop's scoping (chunked prefill, short-seq MHA bypass).
+The first round closes the rotation. Subsequent ACs assume token-level.
 
-### M1 — Live PageSignatureTable population from the KV-write path
+- Rename `page_signature_table.py` → `token_label_table.py`. Shape changes from `[L_local, max_pages, H_local, label_dim]` to `[L_local, max_tokens, H_local, label_dim]`. The "max_tokens" is the KV pool's slot count — no separate lifecycle (the KV allocator already manages it).
+- Rename `page_signature_write.py` → `token_label_write.py`. Per-token FP8 dequant + channel projection — no page-mean reduction. Slot-indexed by `out_cache_loc`, exactly parallel to K/V writes.
+- `selection_kernel.py`: `compute_page_scores` → `compute_token_scores` (BGEMV `Q_label · K_label_bufferᵀ`). `select_topk_sequence_order` operates on tokens.
+- `page_table_adapter.py`: collapse to a thin wrapper around NSA's existing `transform_index_page_table_decode` (the same helper NSA uses). Most of the 404 LOC deletes.
+- `selector.py::retrieve_topk` return type: `(selected_token_indices: int32[bs, max_top_k_tokens], valid_lengths: int32[bs])`, sequence-ascending with `-1` padding.
+- `cuda_graph.py::DSGraphState`: static `selected_token_indices: int32[max_bs, max_top_k_tokens]`. Shape change only; same machinery.
+- `config.py`: `top_k` semantics now max **tokens** per request (matches sglang-last's `--ds-heavy-token-num`; same name kept). Default 2048.
 
-`page_signature_write` API exists (498 LOC torch reference, FP8-scale-aware) but is never called from the live KV-write sites. Hook it at `set_mla_kv_buffer` call sites in `python/sglang/srt/layers/attention/nsa_backend.py` (Codex flagged ~L1383, ~L1583, ~L2108 in Loop 2). Retract entries on KV-free in `req_to_token_pool` deallocation.
+Note: page_size=64 is **unchanged**. It is FlashMLA's KV layout requirement; selection granularity is orthogonal.
 
-**Chunked prefill awareness:** the same logical page is written across multiple chunks when `chunked_prefill_size < page_size * tokens_per_chunk`. The write hook must accumulate into the same signature slot (re-project on each chunk, write to the same `signature_table[L, p, h, d]` row), not overwrite.
+### M1 — Live token-label cache population from the KV-write path
 
-### M2 — Per-request page ownership mask attached to ForwardBatch
+Hook the per-token write at `set_mla_kv_buffer` call sites in `python/sglang/srt/layers/attention/nsa_backend.py` (Codex flagged ~L1383, ~L1583, ~L2108 in Loop 2). The hook writes one label row per token slot, indexed by `out_cache_loc`. **Chunked prefill is implicit** because the write fires once per chunk and writes the chunk's own slots — no cross-chunk accumulation needed (this is exactly what sglang-last got for free).
 
-Build `sparse_mask: [bs, max_pages]` from `req_to_token_pool.req_to_token`, `req_pool_indices`, `seq_lens`. Attach to `ForwardBatch.sparse_mask`. `retrieve_topk` consumes the mask before argmax so picks never escape the request's own KV range.
+The token-label cache shares the KV pool's allocator lifetime — when a slot is freed/evicted/reused on the KV side, the label slot follows automatically. No explicit retract code.
+
+### M2 — Per-request token range mask attached to ForwardBatch
+
+Build a per-request token range `(req_start[r], req_end[r])` from `req_to_token_pool.req_to_token`, `req_pool_indices`, `seq_lens`. The selector's score reduction masks tokens outside the request's own range to `-inf` before top-K, so picks never escape the request's KV range. This is the token-level equivalent of the page-level `sparse_mask` from earlier scope — cheaper to express because it's a range, not a bitmask over pages.
 
 ### V3.2 calibration code path
 
@@ -37,29 +43,31 @@ Adapt `python/sglang/srt/layers/attention/double_sparsity/calibrate.py` to walk 
 
 ### Multi-process two-rank TP harness
 
-Loop 2 closed a single-process synthetic two-rank fixture; the real multi-process harness was deferred. With TP=8 in production, rank-divergent `selected_indices` produces silently-wrong attention output. Add `test/registered/integration/test_double_sparsity_tp_multiprocess.py` that spawns 2 processes via `torch.multiprocessing`, initializes a process group, runs the DEC-9 `all_reduce(SUM)` path, and asserts bit-equal `selected_indices` across ranks. Also detects a no-op all-reduce by deliberately perturbing one rank's local scores pre-reduce.
+Loop 2 closed a single-process synthetic two-rank fixture; the real multi-process harness was deferred. With TP=8 in production, rank-divergent `selected_token_indices` produces silently-wrong attention. Add `test/registered/integration/test_double_sparsity_tp_multiprocess.py` that spawns 2 processes via `torch.multiprocessing`, initializes a process group, runs the DEC-9 `all_reduce(SUM)` over `[max_tokens]` scores, and asserts bit-equal `selected_token_indices` across ranks. Includes a negative test that deliberately perturbs one rank's pre-reduce scores and confirms post-reduce equality (catches a no-op all-reduce).
 
 ### Hardware CUDA-graph capture at conc=64
 
-`cuda_graph.py::capture_decode_step` (full-graph capture path) is exercised only on synthetic shapes. Capture against a real V3.2 conc=64 decode batch (Option B operating point, piecewise off per scope decision). `assert_no_alloc_in_region` does not trip. Replay 100 steps without `CUDA error: launch failed`. Eager and graph outputs match on a deterministic fixture.
+`cuda_graph.py::capture_decode_step` (full-graph capture) is exercised only on synthetic shapes. Capture against a real V3.2 conc=64 decode batch at the Option B operating point (piecewise off). `assert_no_alloc_in_region` does not trip. Replay 100 steps without `CUDA error: launch failed`. Eager and graph outputs match on a deterministic fixture (`max_abs_diff <= 1e-6`).
 
 ### Short-sequence MHA bypass for DS
 
-DSA falls back to MHA for prefills below `SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD` (model's `index_topk`, ≈ 2048 for V3.2). DS must mirror this: for prefills below the threshold, the DS selector **does not run at prefill** — the path goes straight to MHA. Decode after a short prefill still runs DS (the dense prefill path has already written page signatures via the M1 hook, so the first decode step sees a populated table). This matches all three reference impls' "prefill dense, decode sparse" pattern.
+DSA falls back to MHA for prefills below `SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD` (model's `index_topk`, ≈ 2048 for V3.2). DS mirrors this: for prefills below the threshold, the DS selector **does not run at prefill** — the path goes straight to MHA. Decode after a short prefill still runs DS (the dense prefill path has already written per-token labels via the M1 hook, so the first decode step sees a populated buffer).
+
+This matches all three reference impls' "prefill dense, decode sparse" pattern. **Prefill always writes labels; selection only runs at decode.**
 
 ### M3 — End-to-end DeepSeek-V3.2 (FP8) bench_serving with DS enabled
 
-The **done criterion for Phase A.** Boot DSv3.2 FP8 on 8×H200 at the Option B operating point with `--enable-double-sparsity --double-sparsity-config '{"top_k":2048,"page_size":64,"channel_mask_path":"/models/dsv32-fp8-channel-mask.safetensors","device_buffer_size":4096}'`. Run `bench_serving` against it: ≥ 64 requests, ISL ≈ 4096, mixed lengths, conc 16/32/64. Then run the lightweight quality smoke (see Acceptance Criteria AC-7).
+The **done criterion for Phase A.** Boot DSv3.2 FP8 on 8×H200 at the Option B operating point with `--enable-double-sparsity --double-sparsity-config '{"top_k":2048,"page_size":64,"channel_mask_path":"/models/dsv32-fp8-channel-mask.safetensors","device_buffer_size":4096}'`. Run `bench_serving` against it: ≥ 64 requests, ISL ≈ 4096, mixed lengths, conc 16/32/64. Then run the lightweight quality smoke (see AC-8).
 
 ## Stretch scope — Phase B (5 ACs, attempted if Phase A closes early)
 
-Phase B is the "MVP done if possible" arc — match or beat DSA at the Option B operating point with quality deltas inside budget.
+The "MVP done if possible" arc — match or beat DSA at the Option B operating point with quality deltas inside budget.
 
 ### B1 — DSA baseline run at the Option B operating point
 DSv3.2 default, TP=8, FP8 explicit (`--kv-cache-dtype fp8_e4m3 --dsa-prefill-backend flashmla_kv --dsa-decode-backend flashmla_kv`), `--disable-overlap-schedule --disable-piecewise-cuda-graph`, radix cache ON, full-graph CUDA graphs ON. Save TPS / TTFT / TPOT / goodput at conc 16/32/64 to `development/results/native_dsa_<timestamp>.json`.
 
 ### B2 — Radix cache ON under DS
-Run the M3-B hardware fixture (`page_signature_write --m3b-fixture-hardware-run` against real V3.2 weights + the generated mask). Cold-prefix vs warm-prefix signatures must be bit-stable. On pass, flip `_double_sparsity_radix_fixture_passed = True` in the operator config (RUNBOOK Phase 5; DEC-2). Remove `--disable-radix-cache` from `serve_double_sparsity.sh`.
+Run the M3-B hardware fixture (`token_label_write --m3b-fixture-hardware-run` against real V3.2 weights + the generated mask). Cold-prefix vs warm-prefix labels must be bit-stable. On pass, flip `_double_sparsity_radix_fixture_passed = True` in the operator config (RUNBOOK Phase 5; DEC-2). Remove `--disable-radix-cache` from `serve_double_sparsity.sh`. (The cold/warm equality is even more robust at token level than page level — each token's label is a pure function of its K bytes; no within-page-mean to disturb.)
 
 ### B3 — DS bench_serving with CUDA graphs + radix cache ON
 Re-run `bench_serving` at the same Option B operating point but with radix cache ON and CUDA graphs ON, conc 16/32/64. JSON to `development/results/double_sparsity_<timestamp>.json`.
@@ -72,23 +80,25 @@ Re-run `bench_serving` at the same Option B operating point but with radix cache
 
 ## Acceptance Criteria
 
-- **AC-1 (M1):** `PageSignatureTable.valid_mask` transitions False→True for newly written pages within the same forward step. Verified by both (a) a hardware-level test in `test/registered/integration/...` that runs a real forward pass and inspects the mask, and (b) the M3 benchmark not crashing on selector reads. **Chunked-prefill positive test:** a prefill of 8192 tokens at `chunked_prefill_size=4096` writes the same logical page twice (across the chunk boundary); the test asserts the signature is the cumulative-mean projection over both chunks (not the second chunk only).
+- **AC-0 (architecture rotation):** Token-level signatures land. `python -c "from sglang.srt.layers.attention.double_sparsity import TokenLabelTable, retrieve_topk; ..."` works. The selector's `retrieve_topk` returns `(selected_token_indices: int32[bs, max_top_k_tokens], valid_lengths: int32[bs])`, sequence-ascending. `page_table_adapter.py` is < 150 LOC (down from 404). The renamed files preserve `__init__.py` re-exports.
 
-- **AC-2 (M1 retract):** Running 2× the page budget of requests through the same server doesn't leak signatures — `valid_mask.sum()` stays bounded.
+- **AC-1 (M1):** Token-label cache slots transition from default to populated for newly written tokens within the same forward step. Verified by (a) a hardware-level test that runs a real forward pass and inspects the slots at the request's `out_cache_loc`, and (b) the M3 benchmark not crashing on selector reads. **Chunked-prefill positive test:** a prefill of 8192 tokens at `chunked_prefill_size=4096` writes labels to chunk 1's slots and chunk 2's slots independently; the test asserts no chunk's labels overwrite the other's.
 
-- **AC-3 (M2):** `sparse_mask` correctly excludes pages outside the per-request seq range. Verified with a multi-request batch test where requests have disjoint KV regions. `retrieve_topk` picks never land outside the request's KV range — verified with a kernel-level test.
+- **AC-2 (M1 cleanup):** Token-label cache shares the KV pool's allocator lifetime. Running 2× the slot budget of requests through the same server doesn't leak labels — the slot count consumed never exceeds the KV pool's slot count.
+
+- **AC-3 (M2):** Per-request token range mask correctly excludes tokens outside the request's seq range. Verified with a multi-request batch test where requests have disjoint KV regions. `retrieve_topk` picks never land outside the request's KV range — verified with a kernel-level test that submits a fixture with known cross-request boundaries.
 
 - **AC-4 (calibration):** `python -m sglang.srt.layers.attention.double_sparsity.calibrate --model /cluster-storage/models/deepseek-ai/DeepSeek-V3.2 --model-arch deepseek_v3 --output /models/dsv32-fp8-channel-mask.safetensors --dtype fp8_e4m3 --page-size 64 --label-dim 16` runs to completion on the H200 cluster and writes a file that `channel_mask.py::load_channel_mask` accepts (passes shape, content-hash, and AC-4 sanity probe checks against the real V3.2 model). The tiny-CI-fixture path stays green. **The generated mask file is NOT committed to git.**
 
-- **AC-5 (TP rank sync):** Multi-process two-rank harness spawns TP=2 processes, runs the DS path through the DEC-9 `all_reduce(SUM)` path on a deterministic fixture, asserts bit-equal `selected_indices` on both ranks. Includes a negative test that deliberately perturbs one rank's pre-reduce scores and confirms post-reduce equality (catches a no-op all-reduce).
+- **AC-5 (TP rank sync):** Multi-process two-rank harness spawns TP=2 processes, runs the DS path through the DEC-9 `all_reduce(SUM)` on `[max_tokens]`-shaped scores on a deterministic fixture, asserts bit-equal `selected_token_indices` on both ranks. Includes a negative test that deliberately perturbs one rank's pre-reduce scores and confirms post-reduce equality.
 
-- **AC-6 (CUDA graph hardware):** Decode-path full-graph CUDA capture at conc=64 against a real V3.2 batch (Option B operating point, piecewise off). Captures without `CUDA error: launch failed` and replays for at least 100 steps on a fixed batch. `assert_no_alloc_in_region` does not trip. Eager path produces identical output to graph replay on a deterministic fixture (`max_abs_diff <= 1e-6`).
+- **AC-6 (CUDA graph hardware):** Decode-path full-graph CUDA capture at conc=64 against a real V3.2 batch (Option B operating point, piecewise off). Captures without `CUDA error: launch failed` and replays for at least 100 steps on a fixed batch. `assert_no_alloc_in_region` does not trip. Eager path produces identical output to graph replay on a deterministic fixture.
 
-- **AC-7 (short-seq MHA bypass):** For a prefill of length below `SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD`, DS does not call the selector during prefill — the path goes straight to MHA. Verified by a forward-pass hook test that asserts `DoubleSparsitySelector.retrieve_topk` is not invoked at prefill below the threshold. Decode after the short prefill **does** run DS (asserted by the same test on the first decode step).
+- **AC-7 (short-seq MHA bypass):** For a prefill of length below `SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD`, DS does not call the selector during prefill — the path goes straight to MHA. Verified by a forward-pass hook test that asserts `DoubleSparsitySelector.retrieve_topk` is not invoked at prefill below the threshold. **However**, the token-label write hook (M1) still fires at the dense prefill path, so the labels for those tokens are populated. Decode after the short prefill **does** run DS — asserted by the same test on the first decode step.
 
 - **AC-8 (M3 end-to-end):** `bench_serving` against the booted V3.2 FP8 server at the Option B operating point, conc=16/32/64, ≥ 64 requests, ISL ≈ 4096, mixed lengths. **Must hold:**
   - DS-on does not crash for the duration of the benchmark.
-  - `selected_pages < total_pages` on at least 90 % of decode steps (non-trivial selection).
+  - `selected_tokens.shape[1] < total_seq_len` on at least 90 % of decode steps (non-trivial selection).
   - `dense_fallback_total` matches the `error_containment` counter accounting (no silent fallback).
   - **Lightweight quality smoke** (per `06-proposed-architecture-v2.md` §9.4): ~20 deterministic prompts (5 short QA, 5 code completion, 5 summarization, 5 NIAH-mini), `temperature=0`, reference outputs cached from DSA-on. DS-on candidates must satisfy: prefix-match ≥ 80 %, mean ROUGE-L ≥ 0.85, NIAH-mini needle recall ≥ 4/5, no first-8-tokens-entirely-different prompt.
 
@@ -100,69 +110,72 @@ Re-run `bench_serving` at the same Option B operating point but with radix cache
 
 - **AC-12 (Phase B quality) — STRETCH:** NIAH @ 4K / 16K / 64K within 5 pp of DSA baseline at each length; MMLU 5-shot within 1.0 pp.
 
-- **AC-13 (regression):** All 150 Loop-2 unit tests continue to pass.
+- **AC-13 (regression):** All 150 Loop-2 unit tests continue to pass (with shape updates for the page → token rename — same test count after migration).
 
 ## Explicit non-goals
 
 These are deferred per `06-proposed-architecture-v2.md` §12 and the cookbook-scoping decisions in this loop's planning conversation:
 
-- **Default cookbook bf16 path** (`flashmla_sparse` prefill + `fa3` decode). Stays at the Option A scope, future loop. DS validator's fp8_e4m3-only check is fine for this loop.
+- **Default cookbook bf16 path** (`flashmla_sparse` prefill + `fa3` decode). Stays at Option A scope, future loop.
 - **Piecewise CUDA graphs and overlap scheduler** under DS. Both default-on in V3.2 but require AC-8 multi-step backend metadata fixup work that Loop 2 deferred. Phase B explicitly disables both.
-- **MTP / EAGLE speculative decoding** under DS. Out of scope — accepted that DS-on Phase B numbers will be at a lower-TPS operating point than the cookbook's MTP-on flavor.
+- **MTP / EAGLE speculative decoding** under DS. Out of scope.
 - **GLM-5.1, 128K ISL, FP4 weights, DP Attention.** Loop 1 client deferrals.
 - **Twilight top-p selection, Extensions, PD-Disagg, HiCache, CPU offload.** Downstream features.
-- **Phase C kernel ports** (Triton ports of `compute_page_scores` / `page_signature_write`; fused FP8-dequant + projection; `raft_topk` adoption). Gated on Phase B5 profile evidence — only fires if Phase B shows DS-on < DSA-on TPS by > 5 % AND profile names a specific DS kernel as bottleneck.
+- **Phase C kernel ports** (Triton ports of `compute_token_scores` / `token_label_write`; fused FP8-dequant + projection; `raft_topk` adoption). Gated on Phase B5 profile evidence — only fires if Phase B shows DS-on < DSA-on TPS by > 5 % AND profile names a specific DS kernel as bottleneck.
 - **AC-8 device-side value-domain assertion kernel; M3-B perturbation negative.** Test gaps, not runtime gaps.
-- **`transform_index_page_table_decode_fast` 2048 hard-assert.** Should-address-in-MVP per §12.6 #9, cheap. Pulled in as a sub-task under AC-3 implementation if convenient; otherwise lands in a follow-on.
+- **Page-level signature design at 1M context.** Documented in §3.3 and recoverable from git history; not in scope until a client asks for 256K+ context.
 - **`SGLANG_DS_RADIX_OVERRIDE` env var.** Intentionally kept (Loop 2 task 11 deliberation).
 
 ## "Done" definition for the loop (single sentence)
 
-Phase A: a committed round summary showing successful end-to-end DSv3.2 FP8 `bench_serving` with DS-on at the Option B operating point on 8×H200, AC-1 through AC-8 closed; **plus**, if Phase A closes by round 7, a committed comparator row from AC-11 (positive or negative) so we know whether MVP is hit.
+Phase A: a committed round summary showing successful end-to-end DSv3.2 FP8 `bench_serving` with DS-on at the Option B operating point on 8×H200, AC-0 through AC-8 closed; **plus**, if Phase A closes by round 8, a committed comparator row from AC-11 (positive or negative) so we know whether MVP is hit.
 
-## Carry-forward lessons from Loop 2 and Loop 3
+## Carry-forward lessons from Loops 1–3
 
 - **BL-20260520-read-fields-before-abort-mutation:** capture batch-wide cursor spans BEFORE invoking abort helpers (`set_finish_with_abort` rewrites `req.origin_input_ids = [0]`). Relevant to AC-8 if any prompt triggers per-request abort via the `error_containment` path.
 - **BL-20260520-symbol-vs-test-fixture-drift:** test fixtures must reference live dataclass field names (use `forward_batch.rids` not `req_ids`; verify with `dataclasses.fields(ForwardBatch)`). Relevant to AC-3 and AC-8 fixtures.
-- **Loop 2 2-vs-6 budget mismatch:** if 2 consecutive rounds open more gaps than they close, **stop the loop manually** with `/humanize:cancel-rlcr-loop` and reassess scope. Don't wait for the circuit breaker. Phase A is 7 ACs across ~5 bench-days; if Day 3 closes < 2 ACs with > 2 new gaps open, that's the cancel signal.
-- **Loop 3 lesson:** Loop 3 was budgeted at 3 ACs and never ran. The diagnosis was lack of hardware urgency. Loop 4 makes hardware verification a first-class AC criterion (AC-1b, AC-5, AC-6, AC-8); unit tests are necessary but not sufficient.
+- **Loop 2 2-vs-6 budget mismatch:** if 2 consecutive rounds open more gaps than they close, **stop the loop manually** with `/humanize:cancel-rlcr-loop` and reassess scope. Phase A is 9 ACs (including AC-0) across ~5 bench-days; if Day 3 closes < 2 ACs with > 2 new gaps open, that's the cancel signal.
+- **Loop 3 lesson:** Loop 3 was budgeted at 3 ACs and never ran. The diagnosis was lack of hardware urgency. Loop 4 makes hardware verification a first-class AC criterion (AC-1 hw test, AC-4 real calibration, AC-5 multi-process, AC-6 conc=64 capture, AC-8 bench_serving); unit tests are necessary but not sufficient.
+- **AC-0 risk:** the architecture rotation is the first AC because it's load-bearing for all the others. If AC-0 takes more than 2 rounds to close, that's a signal the rotation is harder than estimated and Phase B should be cut from scope.
 
 ## Hardware available
 
 - **Pod 1 (this node, rank-0):** 8× H200, `/cluster-storage/models/deepseek-ai/DeepSeek-V3.2` available.
 - **Pod 2 (rank-1, reachable via `ssh double-sparsity` or `rx devbox run --rank 1`):** another 8× H200, same model storage.
-- **Both pods in sync on `dev/double-sparsity-standalone @ 627e7be2b`** at loop start.
-- **For Phase A:** single 8×H200 node is sufficient. The multi-process TP harness (AC-5) uses TP=2 within a single node, not cross-node TP.
-- **For Phase B:** still single-node; the Option B operating point is pure TP=8. Cross-node 16-way TP stays deferred per DEC-9 cost analysis.
+- **Both pods in sync on `dev/double-sparsity-standalone @ <head with §13>`** at loop start.
+- **For Phase A:** single 8×H200 node is sufficient. The multi-process TP harness (AC-5) uses TP=2 within a single node.
+- **For Phase B:** still single-node; Option B is pure TP=8. Cross-node 16-way TP stays deferred per DEC-9.
 
 ## Files of interest (so plan generation doesn't re-derive them)
 
-- **DS package:** `python/sglang/srt/layers/attention/double_sparsity/` (13 files, 3,887 LOC).
-- **Page signature API (already exists, just unused at serve time):** `python/sglang/srt/layers/attention/double_sparsity/page_signature_write.py`, `page_signature_table.py`.
+- **DS package (subject to AC-0 rename):** `python/sglang/srt/layers/attention/double_sparsity/`
+  - `page_signature_table.py` → `token_label_table.py`
+  - `page_signature_write.py` → `token_label_write.py`
+  - `page_table_adapter.py` → mostly deleted; thin wrapper around NSA's `transform_index_page_table_decode`
+  - `selection_kernel.py`, `selector.py`, `cuda_graph.py`, `config.py` → in-place shape updates
+- **NSA helper to reuse (AC-0):** `python/sglang/srt/layers/attention/nsa/nsa_indexer.py` and the `transform_index_page_table_decode` helper (search for the symbol; it converts token indices to page-aligned block tables).
 - **KV-write sites for AC-1 hook:** `python/sglang/srt/layers/attention/nsa_backend.py` — search for `set_mla_kv_buffer` (Codex flagged ~L1383, ~L1583, ~L2108).
-- **DS selector + adapter:** `python/sglang/srt/layers/attention/double_sparsity/selector.py`, `page_table_adapter.py`, `cuda_graph.py`.
-- **DSv3.2 attention hook (already wired):** `python/sglang/srt/models/deepseek_v2.py::DeepseekV2AttentionMLA._select_topk_indices` (line 2060) + `_bind_double_sparsity_runtime_data` (line 1832).
+- **DS attention hook (already wired):** `python/sglang/srt/models/deepseek_v2.py::DeepseekV2AttentionMLA._select_topk_indices` (line 2060) + `_bind_double_sparsity_runtime_data` (line 1832).
 - **`forward_absorb_prepare` (DS path skip-topk gate, Loop 2 R0):** `python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py:245-277`.
 - **Short-seq MHA threshold (AC-7 reference):** `SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD` env (set in `server_args.py:1808`); model's `index_topk` from `configs/model_config.py::get_dsa_index_topk`.
-- **Chunked prefill (AC-1):** `server_args.py:1467-1468` (default 8192 on H200); chunk write happens via the existing prefill path that already calls `set_mla_kv_buffer`.
 - **ForwardBatch (M2 attachment):** `python/sglang/srt/model_executor/forward_batch_info.py`.
-- **Existing 150-test suite:** `test/registered/unit/layers/attention/test_double_sparsity_unit.py`.
+- **Existing 150-test suite (subject to AC-0 shape updates):** `test/registered/unit/layers/attention/test_double_sparsity_unit.py`.
 - **Bench harness:** `development/serve_double_sparsity.sh`, `development/serve_native_nsa.sh`, `development/benchmark.sh`, `development/benchmark_baseline.sh`, `development/benchmark_compare.py`.
-- **Calibration recipe (V3.2-only fixture):** `python/sglang/srt/layers/attention/double_sparsity/calibrate.py` + the Pile-val-256x512-Method-1 contract from `06-proposed-architecture-v2.md` §10.
+- **Calibration recipe (V3.2-only adaptation):** `python/sglang/srt/layers/attention/double_sparsity/calibrate.py` + the Pile-val-256x512-Method-1 contract from `06-proposed-architecture-v2.md` §10.
 - **Quality smoke fixture (new, AC-8):** `test/manual/test_dsv32_quality_smoke.py` + the 20-prompt deterministic fixture inline in the test.
 - **Full quality suite (existing, AC-12):** `test/manual/test_double_sparsity_v32.py`.
-- **M3-B hardware fixture (AC-10):** `python -m sglang.srt.layers.attention.double_sparsity.page_signature_write --m3b-fixture-hardware-run`.
+- **M3-B hardware fixture (AC-10):** `python -m sglang.srt.layers.attention.double_sparsity.token_label_write --m3b-fixture-hardware-run` (renamed from `page_signature_write`).
 - **Validator (DEC-2 gate to flip):** `python/sglang/srt/layers/attention/double_sparsity/validator.py` + `_double_sparsity_radix_fixture_passed` server-args attribute.
-- **Design intent and §12 deferred inventory:** `development/past_implementations/study/06-proposed-architecture-v2.md`.
+- **Design intent + §13 rotation note:** `development/past_implementations/study/06-proposed-architecture-v2.md`.
 - **Client SLOs:** `development/CLIENT_SLOS.md`.
 
 ## RLCR loop configuration
 
-- **Anchor base branch:** `loop4-base` (create at `627e7be2b` at loop start).
+- **Anchor base branch:** `loop4-base` (create at the §13-committed head at loop start).
 - **Working branch:** `dev/double-sparsity-standalone` (continues).
-- **Plan budget cap (advisory):** if a round closes < 2 ACs AND opens > 2 new gaps, escalate immediately. The Loop-2 R9 stagnation pattern was a slow-burn version of this.
-- **Round budget:** ≤ 14 rounds. Phase A is 7 ACs; Phase B is 5 stretch. With strict per-AC hardware verification, 14 is the realistic budget — anything less is the Loop 2 mistake repeated.
-- **Cancel signal:** if Day 5 of the loop hasn't closed AC-1 (M1), the design assumption about the KV-write hook sites is wrong; stop and re-survey `nsa_backend.py` before continuing.
+- **Plan budget cap (advisory):** if a round closes < 2 ACs AND opens > 2 new gaps, escalate immediately.
+- **Round budget:** ≤ 14 rounds. Phase A is 9 ACs (including AC-0); Phase B is 5 stretch.
+- **Cancel signal:** if Day 3 of the loop hasn't closed AC-0 (the rotation), the rename + reshape estimate is wrong; stop and re-scope before continuing.
 
 ## Operating-point cheatsheet (Option B, locked)
 
@@ -198,4 +211,6 @@ python -m sglang.launch_server \
   # Phase B (after AC-10): remove --disable-radix-cache; radix cache ON.
 ```
 
-CUDA graphs are ON by default in both (full-graph; piecewise off per `--disable-piecewise-cuda-graph`). Overlap scheduler is OFF in both. Radix cache is ON in DSA baseline; ON in DS after AC-10 lands.
+CUDA graphs are ON by default in both (full-graph; piecewise off per `--disable-piecewise-cuda-graph`). Overlap scheduler OFF in both. Radix cache ON in DSA baseline; ON in DS after AC-10.
+
+Note: `top_k=2048` in the DS config is now **max tokens** (matches sglang-last's `--ds-heavy-token-num` semantics post-AC-0), not max pages. At page_size=64, that's at most 32 pages of FlashMLA `block_table` after `transform_index_page_table_decode` (in the worst case where each of the 2048 tokens lands in a distinct page — typically fewer pages because tokens cluster).

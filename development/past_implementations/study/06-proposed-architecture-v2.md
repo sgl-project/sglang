@@ -2,7 +2,9 @@
 
 **Status:** as-built design synthesized from `development/loop{1,2,3}/` + the in-tree DS package at `python/sglang/srt/layers/attention/double_sparsity/`, **plus the minimal-viable roadmap to a DSv3.2 deployment that matches/beats the default DSA + radix-cache + CUDA-graph baseline** (§9–§11).
 
-**v2 changes vs v1:** added §9 (MVP roadmap, Phases A/B/C), §10 (calibration recipe — reused from references), §11 (kernel-fusion roadmap — deferred until MVP works), §12 (deferred items + ongoing issues bucketed must-address / should-address / defer, plus §12.7 already-resolved items). The relaxed performance target lives in §9.2.
+**v2 changes vs v1:** added §9 (MVP roadmap, Phases A/B/C), §10 (calibration recipe — reused from references), §11 (kernel-fusion roadmap — deferred until MVP works), §12 (deferred items + ongoing issues bucketed must-address / should-address / defer, plus §12.7 already-resolved items), **§13 (architecture rotation: token-level signatures at page_size=64 — supersedes page-level signatures in §3.3 and §3.5)**. The relaxed performance target lives in §9.2.
+
+> **⚠ §13 supersedes the page-level design in §3.3, §3.4 G6, and §3.5.** Read §13 before applying any decision from §3 — page-level signatures are no longer the design point. The rest of §3 (hook site, selector ABI shape, FP8 dequant, TP sync, CUDA-graph contract) is unchanged.
 
 **Audience:** anyone reviewing the design or picking up the standalone-DS branch (`dev/double-sparsity-standalone`).
 
@@ -595,3 +597,137 @@ Two items from earlier loop discussions are **already closed in the current code
 - **Unified `page_table_1` return type from DS branch** (12.4 #4.10). Loop 2's Design C resolution: both DS and NSA branches of `_select_topk_indices` return the same `page_table_1` Tensor type; the downstream `_forward_flashmla_kv` call has no `isinstance` branch. Lives at `deepseek_v2.py:2060`.
 
 Both of these were live debates in the Loop 2 plan deliberations; both are now resolved structurally. Reviewers picking up the branch should treat them as load-bearing invariants, not open design questions.
+
+---
+
+## 13. Architecture rotation — token-level signatures at page_size=64
+
+This section supersedes the page-level design in §3.3 ("Two-artifact design / Page signature table"), §3.4 G6 (Page size), and §3.5 (Selection math). The rest of §3 — hook site, selector ABI shape, FP8 dequant approach, TP `all_reduce(SUM)`, CUDA-graph contract — is unchanged.
+
+### 13.1 The rotation in one paragraph
+
+**Selection is token-level. Storage is token-level. FlashMLA still reads at page granularity (page_size=64).** A per-(layer, token, head) label cache holds the offline-calibrated channel projection of K. The selector scores tokens, picks the top-K **tokens**, then hands the token indices to NSA's existing `transform_index_page_table_decode` helper, which emits the page-aligned `block_table` FlashMLA needs. Page_size=64 is FlashMLA's KV layout requirement — not a selection-granularity choice.
+
+This is exactly what NSA's `Indexer` does today: token-level top-K → page-table conversion. DS swaps NSA's lightning indexer for an offline-calibrated channel projection, but the surrounding pipeline (selection unit, table conversion, FlashMLA call) stays identical.
+
+### 13.2 Why this matters for the MVP
+
+The page-level design was chosen for memory budget at 1M context (~30 GB/rank per-token vs ~480 MB/rank per-page). Token-level memory at the client workloads:
+
+| Context | Per-token cache / rank (60 layers × H_local=16 × label_dim=16 × 2 B) |
+|---|---|
+| 4K ISL (client target) | **120 MB** |
+| 32K | 960 MB |
+| 128K (deferred client) | 3.8 GB |
+| 256K | 7.6 GB |
+| 1M (no client ask) | 30 GB ← only here does page-level help |
+
+At every context length the client has asked for, token-level is comfortable.
+
+The page-level memory win was paying for itself with complexity nobody asked for: custom `page_table_adapter` (404 LOC), chunked-prefill multi-chunk-per-page accumulation, page-granularity quality artifacts, custom hot-page rule, custom page lifecycle hooks.
+
+### 13.3 What changes in the package
+
+| File | Before (page-level) | After (token-level) | Net LOC |
+|---|---|---|---|
+| `page_signature_table.py` → `token_label_table.py` (185 LOC) | `[L_local, max_pages, H_local, label_dim]`, allocator-owned page lifecycle | `[L_local, max_tokens, H_local, label_dim]`, slot-indexed by `out_cache_loc` exactly like K/V — no separate lifecycle | similar size, simpler internals |
+| `page_signature_write.py` → `token_label_write.py` (498 LOC) | FP8 dequant per page → mean across 64 tokens → write 1 row | FP8 dequant per token → write 1 row, no page reduction | **smaller** (~300 LOC est.) |
+| `selection_kernel.py` (488 LOC) | `compute_page_scores` over `[bs, max_pages]`, page top-K | `compute_token_scores` (BGEMV Q_label · K_label_bufferᵀ) over `[bs, max_tokens]`, token top-K | similar LOC; uses the sglang-last 3-stage Triton pattern directly |
+| `page_table_adapter.py` (404 LOC) | Custom logical_page → physical_page → FlashMLA block_table | **Mostly deleted** — call NSA's existing `transform_index_page_table_decode` from `nsa_indexer.py` neighborhood | **~100 LOC** (the call wrapper) |
+| `cuda_graph.py` (221 LOC) | Static `selected_indices: [max_bs, max_top_k_pages]` | Static `selected_token_indices: [max_bs, max_top_k_tokens]`. Same machinery. | unchanged |
+| `selector.py` (327 LOC) | Returns `(selected_page_indices, valid_lengths)` | Returns `(selected_token_indices, valid_lengths)` — matches NSA's existing return shape | unchanged |
+| `config.py` (107 LOC) | `top_k` interpreted as max pages | `top_k` interpreted as max tokens (matches sglang-last's `--ds-heavy-token-num` semantics) | unchanged |
+| `validator.py`, `channel_mask.py`, `calibrate.py`, `metrics.py`, `error_containment.py` | unchanged | unchanged | — |
+
+**Net effect: ~1500 LOC reshape, but more deletion than addition** because the custom adapter collapses.
+
+### 13.4 Why chunked prefill becomes implicit
+
+sglang's chunked prefill already routes each chunk's `out_cache_loc` to fresh token slots in the KV pool. The token-label cache slots in by the same `out_cache_loc` lookup. Each chunk writes its own token slots; **no cross-chunk accumulation needed.**
+
+The DS write hook (the §3.4 G9 / Loop 3 M1 hook) becomes a per-chunk per-layer call:
+
+```python
+# At each chunk's set_mla_kv_buffer site:
+token_label_buffer[layer.layer_id, forward_batch.out_cache_loc, :, :] = \
+    project_k_to_label(k, channel_selection[layer.layer_id], channel_weights[layer.layer_id])
+```
+
+That's the entire M1 hook. No multi-chunk-per-page accumulation. No partial-page state. No "is this page complete yet" bookkeeping.
+
+This is the design point sglang-last incidentally got right by using per-token slot indexing. We're back-porting that observation.
+
+### 13.5 Selection math (replaces §3.5)
+
+For request `r`, layer `l`, head `h`, decode-step query `q`:
+
+```
+label[l, t, h, d] = K[l, t, h, channel_selection[l, h, d]] * channel_weights[l, h, d]
+                  (written once per token at KV-write time; per-tile FP8 dequant inline)
+
+q_label[r, l, h, d] = q[r, l, h, channel_selection[l, h, d]] * channel_weights[l, h, d]
+
+token_score[r, l, t] = max over h of (
+    sum over d of q_label[r, l, h, d] * label[l, t, h, d]
+)
+
+token_score_reduced[r, l, t] = all_reduce_SUM_TP(token_score[r, l, t])
+
+selected_tokens[r, l] = ascending(topk(token_score_reduced[r, l, ·], max_top_k_tokens))
+                      ∪ hot_tokens[r]    # local-window: last N tokens
+```
+
+The TP `all_reduce(SUM)` (DEC-9) reduces a `[max_tokens]` scalar tensor per request per layer — bigger than `[max_pages]` (factor of 64) but still tiny: at 128K context that's 128K × 4 B = 512 KB / request / layer. Acceptable.
+
+The output `selected_tokens[r, l]` is **token indices**, sorted ascending. These feed `transform_index_page_table_decode(selected_tokens, page_size=64)` (the existing NSA helper at `nsa/utils.py` or `nsa_indexer.py` neighborhood — same one NSA uses) to produce the page-aligned block_table FlashMLA reads.
+
+### 13.6 Memory budget summary (replaces §3.3's page table block)
+
+**Token-label cache** (per TP rank, head-sharded):
+- Shape: `[num_layers, max_tokens, H_local, label_dim]`, dtype fp16.
+- At V3.2 with 60 layers, H=128, TP=8 → H_local=16, label_dim=16, fp16: **30 KB / token / rank**.
+- Budget at client workloads: 120 MB at 4K, 3.8 GB at 128K. Documented; not estimated at boot.
+- Lifetime is identical to the KV cache — slot-indexed by `out_cache_loc`, no separate lifecycle hooks. Free-on-evict is handled by the existing KV allocator.
+
+### 13.7 Hot-token rule (replaces page-level hot-page rule)
+
+Force-include the last N tokens of the request (default N = 64, i.e. one page worth) regardless of score. This is the token-level equivalent of NSA's local-window override and matches the "recent context is always relevant" inductive bias.
+
+No "active page is partially filled" edge case — at the token granularity, the active token is just the most recent index.
+
+### 13.8 Where page_size=64 still matters
+
+Only at the FlashMLA boundary:
+1. `transform_index_page_table_decode(selected_tokens, page_size=64)` rounds token indices up to page boundaries for the `block_table`. Per the conversation: page_size=64 is preferred but not hard-required; the helper supports other sizes.
+2. The KV pool itself stores K and V in pages of 64. The token-label buffer is allocated *parallel to* this pool, slot-indexed identically — but its conceptual unit is one token, not one page.
+
+No DS code "knows about" pages. The page concept lives entirely in FlashMLA's KV layout and the existing NSA helper.
+
+### 13.9 What this rotation deletes from earlier scope
+
+These problems **disappear** with the rotation:
+
+| Problem (page-level) | Disposition (token-level) |
+|---|---|
+| Chunked-prefill multi-chunk-per-page accumulation | ✂ Gone — per-token slot indexing inherits sglang's existing chunked prefill |
+| Custom `page_table_adapter.py` (404 LOC) | ✂ Mostly deleted — call NSA's `transform_index_page_table_decode` |
+| Page lifecycle hooks (`on_assign`/`on_free`/`on_evict`/`on_reuse`) | ✂ Gone — token-label cache shares the KV cache's allocator lifecycle |
+| `valid_mask` per-page invalidation | ✂ Gone — KV pool's free-list is the truth |
+| Within-page averaging quality delta (kernel_audit_memo §"Page granularity delta") | ✂ Gone — selection is at paper's natural granularity |
+| Custom hot-page rule + "page partially filled" state | ✂ Simplified — hot-token rule mirrors NSA |
+| Loop 2 Design C "unified page_table_1 Tensor" return-type contract | Replaced by token-indices return; both DS and NSA produce token indices, both go through `transform_index_page_table_decode` |
+
+These were real engineering items in earlier scope. They become free-or-deleted with the rotation.
+
+### 13.10 What this rotation adds back
+
+Nothing major. The only new thing vs sglang-last is that DS still has to **write the token-label cache from FP8 KV inputs** (sglang-last's K was BF16). The FP8-aware write kernel from the page-level design (§3.4 G4) ports directly — it's per-page-mean code minus the page-mean reduction. Strictly simpler.
+
+### 13.11 1M-context recoverability
+
+If a future client ask brings 1M context into scope, the page-level design from §3.3 is recoverable from git history. The token-level → page-level migration would be:
+1. Add the page-aware signature table (the §3.3 design).
+2. Add a config knob `signature_granularity = "token" | "page"`.
+3. At init, route to one or the other based on `max_context_length * H_local * label_dim * 2 < SIGNATURE_BUDGET_BYTES`.
+
+The token-level design doesn't preclude the page-level one — it just defers it until somebody actually needs it.
