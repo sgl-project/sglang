@@ -430,10 +430,14 @@ class SchedulerMetricsReporter:
         if tokens == 0:
             return 0.0, 0.0, 0.0
 
-        seq_lens = (
-            batch.seq_lens_cpu if batch.seq_lens_cpu is not None else batch.seq_lens
+        # Read only the CPU mirror; falling back to batch.seq_lens.sum().item()
+        # would force a per-iter D2H sync on the no-verify-sync path (where
+        # seq_lens_cpu is None). MFU est. is best-effort, so degrade to 0 there.
+        total_context = (
+            float(batch.seq_lens_cpu.sum().item())
+            if batch.seq_lens_cpu is not None
+            else 0.0
         )
-        total_context = float(seq_lens.sum().item()) if seq_lens is not None else 0.0
         flops = (
             tokens * self._linear_flops_per_token
             + self._attn_dot_flops_coeff * total_context
@@ -739,13 +743,12 @@ class SchedulerMetricsReporter:
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.cache_hit_rate = cache_hit_rate
-            # No-verify-sync path keeps neither CPU nor SB GPU seq_lens; this is
-            # a best-effort observability stat, so don't force a sync for it.
-            decode_seq_lens = (
-                batch.seq_lens_cpu if batch.seq_lens_cpu is not None else batch.seq_lens
-            )
+            # No-verify-sync path keeps no seq_lens_cpu; reading the GPU
+            # seq_lens via .sum().item() would reintroduce a per-iter D2H sync
+            # (the very stall this path removes). Report 0 for this best-effort
+            # observability stat instead of forcing the sync.
             self.stats.decode_sum_seq_lens = (
-                decode_seq_lens.sum().item() if decode_seq_lens is not None else 0
+                batch.seq_lens_cpu.sum().item() if batch.seq_lens_cpu is not None else 0
             )
 
             # Memory pool usage ratios / Absolute token counts
