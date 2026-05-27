@@ -22,6 +22,25 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def invalidate_token_label_slots(
+    written: torch.Tensor,    # bool [L, T]  (table.written)
+    layer_id: int,
+    cache_loc: torch.Tensor,  # int64/int32 [num_tokens]  (out_cache_loc)
+) -> None:
+    """Mark token-label slots as invalid before a KV-slot is reused.
+
+    Sets ``written[layer_id, cache_loc] = False`` so that newly-allocated
+    physical slots cannot be selected by ``retrieve_topk`` based on stale
+    labels left by a previously-freed request.  Must be called from
+    ``_select_topk_indices`` *before* ``selector.retrieve_topk``; the
+    companion ``token_label_write`` call later in the same forward step
+    restores ``written = True`` once fresh labels are available.
+    """
+    if cache_loc.numel() == 0:
+        return
+    written[layer_id].index_fill_(0, cache_loc.long(), False)
+
+
 def token_label_write(
     signatures: torch.Tensor,   # [L, T, H_local, label_dim]  (table.signatures)
     written: torch.Tensor,       # bool [L, T]                 (table.written)

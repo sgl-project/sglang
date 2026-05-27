@@ -1939,6 +1939,16 @@ class DeepseekV2AttentionMLA(
             # Publish channel selection and nope_dim for the KV-write hook in dsa_backend.
             setattr(server_args, "_ds_channel_selection", local_mask.channel_selection)
             setattr(server_args, "_ds_qk_nope_head_dim", self.qk_nope_head_dim)
+        else:
+            # Table already allocated by an earlier layer's init. Guard that it was
+            # sized correctly for this KV pool — a mis-sized reuse would cause
+            # out_cache_loc writes to go out-of-bounds or leave untracked slots.
+            kv_pool = getattr(server_args, "_ds_token_to_kv_pool", None)
+            if kv_pool is not None:
+                from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+                    validate_table_covers_kv_pool,
+                )
+                validate_table_covers_kv_pool(table, kv_pool.size, kv_pool.page_size)
 
         # Pick the attn TP process group when world > 1; otherwise leave None.
         process_group = None
@@ -2069,6 +2079,18 @@ class DeepseekV2AttentionMLA(
                 assert_real_selector_or_placeholder_allowed(
                     self.double_sparsity_selector
                 )
+                # Invalidate newly-allocated slots before scoring so that a
+                # reused KV slot cannot be selected based on a stale label
+                # left by the previously-evicted request.  The companion
+                # _write_token_labels call later in dsa_backend.py restores
+                # written=True once fresh labels are available.
+                _out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+                _tlt = getattr(self.double_sparsity_selector, "token_label_table", None)
+                if _out_cache_loc is not None and _tlt is not None:
+                    from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+                        invalidate_token_label_slots,
+                    )
+                    invalidate_token_label_slots(_tlt.written, layer_id, _out_cache_loc)
                 # Use projected Q-noPE for DS selector when available; fall back
                 # to latent q_lora only for the placeholder path (unit tests).
                 queries_for_ds = q_nope if q_nope is not None else q_lora

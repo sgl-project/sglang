@@ -126,6 +126,27 @@ def allocate_token_label_table(
     return table
 
 
+def validate_table_covers_kv_pool(
+    table: "TokenLabelTable",
+    kv_pool_size: int,
+    page_size: int,
+) -> None:
+    """Raise ValueError if ``table.max_tokens != kv_pool_size + page_size``.
+
+    Called at bind time when reusing a pre-existing table to guard against
+    a mis-sized table that would allow ``out_cache_loc`` writes to go
+    out-of-bounds or leave un-tracked physical slots.
+    """
+    expected = kv_pool_size + page_size
+    if table.max_tokens != expected:
+        raise ValueError(
+            f"token_label_table.max_tokens={table.max_tokens} does not match "
+            f"kv_pool.size + kv_pool.page_size={expected} "
+            f"(size={kv_pool_size}, page_size={page_size}). "
+            "The table must be sized from the physical KV slot address space."
+        )
+
+
 def estimate_hbm_bytes(
     *,
     num_layers_local: int,

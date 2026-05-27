@@ -5077,6 +5077,149 @@ class TestAC2Lifetime(unittest.TestCase):
             "written flag not set after first write",
         )
 
+    def test_invalidate_makes_stale_slot_unselectable(self):
+        """Without invalidation a reused slot with written=True is selected;
+        after invalidation it is not — confirms the invariant is enforced."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            invalidate_token_label_slots,
+            token_label_write,
+        )
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            retrieve_topk_via_labels,
+        )
+        # Physical slot 7 holds a stale label from a previous request.
+        num_layers, max_tokens, num_heads, label_dim, head_dim = 1, 20, 2, 4, 8
+        signatures = torch.zeros(num_layers, max_tokens, num_heads, label_dim)
+        written = torch.zeros(num_layers, max_tokens, dtype=torch.bool)
+        channel_sel = torch.zeros(num_layers, num_heads, label_dim, dtype=torch.int32)
+        channel_wts = torch.ones(num_layers, num_heads, label_dim, dtype=torch.float32)
+
+        # Write a high-score stale label at physical slot 7.
+        old_cache_loc = torch.tensor([7], dtype=torch.int64)
+        old_k_nope = torch.full((1, num_heads, 8), 1000.0)
+        token_label_write(
+            signatures, written, layer_id=0,
+            cache_loc=old_cache_loc, k_nope=old_k_nope,
+            channel_selection_layer=channel_sel[0],
+        )
+        # Slot 7 is now written=True with a high-score label.
+        self.assertTrue(written[0, 7].item(), "slot 7 must be written before test")
+
+        # New request has req_to_token[0, 0] = 7 (logical pos 0 → physical slot 7).
+        req_to_token = torch.tensor([[7, 0, 0, 0, 0]], dtype=torch.int32)  # [1, 5]
+        req_pool_indices = torch.tensor([0], dtype=torch.int32)
+        seq_lens = torch.tensor([1], dtype=torch.int32)
+        queries = torch.ones(1, num_heads, head_dim)
+
+        # WITHOUT invalidation: stale slot 7 is selectable (the bug).
+        before_idx, before_len = retrieve_topk_via_labels(
+            queries=queries,
+            token_signatures=signatures,
+            written=written,
+            channel_selection=channel_sel,
+            channel_weights=channel_wts,
+            layer_id=0,
+            max_top_k=2,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            seq_lens=seq_lens,
+        )
+        self.assertGreater(
+            before_len[0].item(), 0,
+            "stale slot should be selectable before invalidation (showing the bug)",
+        )
+
+        # WITH invalidation: stale slot is unselectable.
+        invalidate_token_label_slots(written, layer_id=0, cache_loc=old_cache_loc)
+        self.assertFalse(written[0, 7].item(), "invalidation must clear written flag")
+
+        after_idx, after_len = retrieve_topk_via_labels(
+            queries=queries,
+            token_signatures=signatures,
+            written=written,
+            channel_selection=channel_sel,
+            channel_weights=channel_wts,
+            layer_id=0,
+            max_top_k=2,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            seq_lens=seq_lens,
+        )
+        self.assertEqual(
+            after_len[0].item(), 0,
+            "invalidated slot must not be selectable before new write",
+        )
+
+    def test_after_invalidation_new_write_restores_selectability(self):
+        """After invalidation, writing a new label re-enables selection."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            invalidate_token_label_slots,
+            token_label_write,
+        )
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            retrieve_topk_via_labels,
+        )
+        num_layers, max_tokens, num_heads, label_dim, head_dim = 1, 20, 2, 4, 8
+        signatures = torch.zeros(num_layers, max_tokens, num_heads, label_dim)
+        written = torch.zeros(num_layers, max_tokens, dtype=torch.bool)
+        channel_sel = torch.zeros(num_layers, num_heads, label_dim, dtype=torch.int32)
+        channel_wts = torch.ones(num_layers, num_heads, label_dim, dtype=torch.float32)
+
+        cache_loc = torch.tensor([7], dtype=torch.int64)
+        # Invalidate first (simulating the pre-selection invalidation step).
+        invalidate_token_label_slots(written, layer_id=0, cache_loc=cache_loc)
+        self.assertFalse(written[0, 7].item())
+
+        # New write restores the slot.
+        new_k_nope = torch.full((1, num_heads, 8), 5.0)
+        token_label_write(
+            signatures, written, layer_id=0,
+            cache_loc=cache_loc, k_nope=new_k_nope,
+            channel_selection_layer=channel_sel[0],
+        )
+        self.assertTrue(written[0, 7].item(), "new write must restore written=True")
+
+        req_to_token = torch.tensor([[7, 0, 0, 0, 0]], dtype=torch.int32)
+        req_pool_indices = torch.tensor([0], dtype=torch.int32)
+        seq_lens = torch.tensor([1], dtype=torch.int32)
+        queries = torch.ones(1, num_heads, head_dim)
+
+        idx, lengths = retrieve_topk_via_labels(
+            queries=queries,
+            token_signatures=signatures,
+            written=written,
+            channel_selection=channel_sel,
+            channel_weights=channel_wts,
+            layer_id=0,
+            max_top_k=2,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            seq_lens=seq_lens,
+        )
+        self.assertGreater(
+            lengths[0].item(), 0,
+            "new write must restore selectability after invalidation",
+        )
+
+    def test_validate_table_size_rejects_wrong_max_tokens(self):
+        """validate_table_covers_kv_pool raises when max_tokens does not match."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+            validate_table_covers_kv_pool,
+        )
+        table = allocate_token_label_table(
+            num_layers_local=1, max_tokens=100, num_heads_local=2, label_dim=4,
+            page_size=64, dtype=torch.float32, device=torch.device("cpu"),
+        )
+        # Correct size: 100 = 36 + 64
+        validate_table_covers_kv_pool(table, kv_pool_size=36, page_size=64)
+
+        # Wrong size: 100 != 64 + 64 = 128
+        with self.assertRaises(ValueError) as ctx:
+            validate_table_covers_kv_pool(table, kv_pool_size=64, page_size=64)
+        self.assertIn("max_tokens=100", str(ctx.exception))
+        self.assertIn("128", str(ctx.exception))
+
 
 class TestAC3RangeMask(unittest.TestCase):
     """AC-3: per-request token range ownership prevents cross-request picks.
@@ -5170,6 +5313,75 @@ class TestAC3RangeMask(unittest.TestCase):
             any(s >= 10 for s in row0),
             f"expected cross-request contamination without mask, but row0={row0}",
         )
+
+    def test_logical_domain_req_to_token_isolates_per_request(self):
+        """Production-path: logical-domain mode with req_to_token confines each
+        request's physical output to its own KV-slot range via logical_to_physical."""
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            retrieve_topk_via_labels,
+        )
+        from sglang.srt.layers.attention.double_sparsity.page_table_adapter import (
+            logical_to_physical,
+        )
+        bs = 2
+        seq_len = 10       # each request has 10 logical positions
+        max_tokens = 20    # physical slots 0..19
+        num_layers, num_heads, label_dim, head_dim = 1, 2, 4, 8
+
+        # req_to_token[0, 0..9] = physical slots 0..9   (req-0's range)
+        # req_to_token[1, 0..9] = physical slots 10..19 (req-1's range)
+        req_to_token = torch.zeros(bs, seq_len, dtype=torch.int32)
+        req_to_token[0] = torch.arange(0, 10, dtype=torch.int32)
+        req_to_token[1] = torch.arange(10, 20, dtype=torch.int32)
+        req_pool_indices = torch.tensor([0, 1], dtype=torch.int32)
+        seq_lens = torch.tensor([seq_len, seq_len], dtype=torch.int32)
+
+        # Signatures: req-1's physical slots (10..19) have extremely high scores.
+        # Without req_to_token isolation req-0 would pick these; with it, it cannot.
+        signatures = torch.zeros(num_layers, max_tokens, num_heads, label_dim)
+        signatures[0, 10:20] = 1000.0
+        signatures[0, 0:10] = 0.0
+        written = torch.ones(num_layers, max_tokens, dtype=torch.bool)
+        channel_sel = torch.zeros(num_layers, num_heads, label_dim, dtype=torch.int32)
+        channel_wts = torch.ones(num_layers, num_heads, label_dim, dtype=torch.float32)
+        queries = torch.ones(bs, num_heads, head_dim)
+
+        # Logical-domain mode: each request scores only its own req_to_token row.
+        logical_idx, valid_lengths = retrieve_topk_via_labels(
+            queries=queries,
+            token_signatures=signatures,
+            written=written,
+            channel_selection=channel_sel,
+            channel_weights=channel_wts,
+            layer_id=0,
+            max_top_k=5,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            seq_lens=seq_lens,
+        )
+
+        # Convert logical positions → physical slots via the adapter.
+        phys_out = torch.full_like(logical_idx, -1)
+        logical_to_physical(
+            selected_indices=logical_idx,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            out=phys_out,
+        )
+
+        row0_phys = [int(v) for v in phys_out[0].tolist() if v >= 0]
+        row1_phys = [int(v) for v in phys_out[1].tolist() if v >= 0]
+
+        self.assertTrue(
+            all(s < 10 for s in row0_phys),
+            f"req-0 leaked into foreign physical range [10,20): {row0_phys}",
+        )
+        self.assertTrue(
+            all(s >= 10 for s in row1_phys),
+            f"req-1 leaked into foreign physical range [0,10): {row1_phys}",
+        )
+        self.assertGreater(len(row0_phys), 0, "req-0 produced no valid physical picks")
+        self.assertGreater(len(row1_phys), 0, "req-1 produced no valid physical picks")
 
 
 if __name__ == "__main__":
