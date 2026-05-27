@@ -4464,6 +4464,7 @@ class TestAC1HookUnit(unittest.TestCase):
         layer = SimpleNamespace(
             layer_id=0,
             kv_b_proj=_FakeProj(),
+            v_head_dim=nope_dim,  # proj_out_dim = H * (nope_dim + v_head_dim)
         )
 
         # k: [3 tokens, 1, kv_lora_rank] with known values
@@ -4517,6 +4518,84 @@ class TestAC1HookUnit(unittest.TestCase):
         # Nothing should be written
         self.assertFalse(table.written[0, 5].item())
         self.assertFalse(table.written[0, 6].item())
+
+    def test_write_token_labels_extracts_k_nope_not_v_columns(self):
+        """Regression: per-head reshape must precede the K-noPE slice.
+
+        kv_b_proj output layout per head is [K_nope | V]. A flat slice of
+        H_local * nope_dim from the beginning will pick V columns of early
+        heads as K labels. This test places sentinel values (999.0) in all
+        V positions and asserts they never appear in the written signatures.
+        """
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+        from sglang.srt.layers.attention.dsa_backend import NativeSparseAttnBackend
+        from types import SimpleNamespace
+
+        V_SENTINEL = 999.0
+        nope_dim = 4
+        v_head_dim = 4
+        num_heads = 2
+        label_dim = nope_dim  # select all K-noPE channels
+        T = 1
+
+        table = allocate_token_label_table(
+            num_layers_local=1,
+            max_tokens=16,
+            num_heads_local=num_heads,
+            label_dim=label_dim,
+            page_size=64,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        # channel_selection: select all nope_dim channels [0,1,2,3] for each head
+        channel_sel = torch.arange(label_dim, dtype=torch.int32)
+        channel_sel_all = channel_sel.unsqueeze(0).unsqueeze(0).expand(1, num_heads, -1).contiguous()
+
+        backend = object.__new__(NativeSparseAttnBackend)
+        backend.enable_double_sparsity = True
+        backend._ds_token_label_table = table
+        backend._ds_channel_selection = channel_sel_all
+        backend._ds_qk_nope_head_dim = nope_dim
+
+        # kv_b_proj produces per-head layout [K_nope | V] with known values:
+        # head 0: K=[1,2,3,4], V=[SENTINEL, SENTINEL, SENTINEL, SENTINEL]
+        # head 1: K=[5,6,7,8], V=[SENTINEL, SENTINEL, SENTINEL, SENTINEL]
+        # Flat: [1,2,3,4, SENT,SENT,SENT,SENT, 5,6,7,8, SENT,SENT,SENT,SENT]
+        proj_output = torch.tensor(
+            [[1.0, 2.0, 3.0, 4.0,
+              V_SENTINEL, V_SENTINEL, V_SENTINEL, V_SENTINEL,
+              5.0, 6.0, 7.0, 8.0,
+              V_SENTINEL, V_SENTINEL, V_SENTINEL, V_SENTINEL]],
+            dtype=torch.float32,
+        )  # shape [T=1, num_heads * (nope_dim + v_head_dim) = 16]
+
+        class _SentinelProj:
+            def __call__(self, x):
+                return (proj_output.clone(),)
+
+        layer = SimpleNamespace(
+            layer_id=0,
+            kv_b_proj=_SentinelProj(),
+            v_head_dim=v_head_dim,
+        )
+
+        k = torch.zeros(T, 1, nope_dim)
+        cache_loc = torch.tensor([3], dtype=torch.int64)
+
+        backend._write_token_labels(layer, cache_loc, k)
+
+        sigs = table.signatures[0, 3]  # [num_heads, label_dim]
+        # Sentinel must not appear in any signature entry
+        self.assertFalse(
+            (sigs == V_SENTINEL).any().item(),
+            f"Sentinel {V_SENTINEL} found in signatures — V columns leaked into K labels: {sigs}",
+        )
+        # Head 0 K-noPE must be [1,2,3,4]
+        torch.testing.assert_close(sigs[0], torch.tensor([1.0, 2.0, 3.0, 4.0]))
+        # Head 1 K-noPE must be [5,6,7,8]
+        torch.testing.assert_close(sigs[1], torch.tensor([5.0, 6.0, 7.0, 8.0]))
 
 
 if __name__ == "__main__":

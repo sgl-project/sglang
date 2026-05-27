@@ -1430,7 +1430,10 @@ class DeepseekSparseAttnBackend(
 
         H_local = self._ds_token_label_table.num_heads_local
         nope_dim = self._ds_qk_nope_head_dim
-        k_nope = kv_proj_out[:, : H_local * nope_dim].view(T, H_local, nope_dim)
+        # kv_b_proj output is per-head [K_nope | V]; reshape first so that
+        # slicing [:nope_dim] picks K-noPE columns, not V columns of earlier heads.
+        head_width = nope_dim + layer.v_head_dim
+        k_nope = kv_proj_out.view(T, H_local, head_width)[..., :nope_dim].contiguous()
 
         layer_id = layer.layer_id
         token_label_write(
@@ -2191,6 +2194,9 @@ class DeepseekSparseAttnBackend(
         metadata = self.forward_metadata
 
         merge_query = q_rope is not None
+        # Preserve the original latent K before any FP8 quantization so that
+        # _write_token_labels receives the correct tensor regardless of dtype path.
+        k_for_labels = k
         if self.kv_cache_dtype == torch.float8_e4m3fn:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
@@ -2224,7 +2230,7 @@ class DeepseekSparseAttnBackend(
                 else forward_batch.encoder_out_cache_loc
             )
             self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
-            self._write_token_labels(layer, cache_loc, k)
+            self._write_token_labels(layer, cache_loc, k_for_labels)
 
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)
