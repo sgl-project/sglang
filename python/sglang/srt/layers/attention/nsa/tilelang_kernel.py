@@ -1348,7 +1348,7 @@ def tilelang_sparse_fwd(
         "[FlyDSL-DBG] tilelang_sparse_fwd called: q=%s kv=%s indices=%s d_v=%d tail_dim=%d kv_dtype=%s flydsl_mode=%s",
         q.shape, kv.shape, indices.shape, d_v, tail_dim, kv.dtype, os.environ.get("SGLANG_FLYDSL_PREFILL", "auto")
     )
-    assert topk == 2048
+    assert topk % 32 == 0, f"topk must be a multiple of 32, got {topk}"
 
     if _is_hip:
         is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)

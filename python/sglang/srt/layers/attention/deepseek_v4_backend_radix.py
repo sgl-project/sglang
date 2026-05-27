@@ -38,9 +38,13 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import logging
+import os
 import warnings
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Dict, List, Literal, Optional, Tuple, Union
+
+logger = logging.getLogger(__name__)
 
 import torch
 
@@ -1098,6 +1102,51 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 extra_indices_in_kvcache=extra_indices,
                 extra_topk_length=extra_topk_lengths,
             )
+
+            # ---- FlyDSL NSA prefill dispatch ----
+            if (
+                os.environ.get("SGLANG_FLYDSL_PREFILL", "0") == "1"
+                and compress_ratio == 4
+                and extra_k_cache is not None
+                and extra_indices is not None
+                and forward_batch.forward_mode == ForwardMode.EXTEND
+            ):
+                logger.warning(
+                    "[FlyDSL] dispatching prefill kernel q=%s kv=%s indices=%s",
+                    q.shape,
+                    extra_k_cache.shape,
+                    extra_indices.shape,
+                )
+                try:
+                    from sglang.srt.layers.attention.nsa.tilelang_kernel import (
+                        tilelang_sparse_fwd,
+                    )
+
+                    # Flatten the paged C4 cache:
+                    # [num_c4_pages, page_size_c4, kv_group, head_dim]
+                    # -> [total_c4_slots, kv_group, head_dim]
+                    kv_flat = extra_k_cache.view(
+                        -1,
+                        extra_k_cache.shape[-2],
+                        extra_k_cache.shape[-1],
+                    )
+                    o = tilelang_sparse_fwd(
+                        q=q,
+                        kv=kv_flat,
+                        indices=extra_indices,
+                        sm_scale=self.softmax_scale,
+                        d_v=self.head_dim_v,
+                    )
+                    o = o.squeeze(1)
+                    return o
+                except Exception:
+                    import traceback
+
+                    logger.warning(
+                        "[FlyDSL] prefill kernel failed, falling back to FlashMLA:\n%s",
+                        traceback.format_exc(),
+                    )
+            # ---- end FlyDSL dispatch ----
 
             backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
             o = flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
