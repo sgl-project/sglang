@@ -358,6 +358,22 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Added Frozen-KV MTP DRAFT_EXTEND coverage across multiple
+  backends. Threaded `spec_kind` through `run_*_eagle_draft_extend_case`
+  for the HybridLinearAttn family (GDN/KDA/Lightning/Mamba2) and MLA,
+  using the shared `_make_draft_extend_input` factory. Added cases:
+  - FA3, FA4: frozen_kv_mtp eager + CG.
+  - GDN, KDA, Lightning, Mamba2: frozen_kv_mtp eager
+    (CG remains blocked at `hybrid_linear_attn_backend.py:509,572`).
+  - MLA FlashInfer/FlashMLA stay EAGLE-only — `forward_extend` reads
+    EAGLE-specific spec_info attrs and trips a CUDA illegal-memory
+    access on `FrozenKVMTPDraftExtendInput`.
+- Added KDA + Lightning EAGLE `DRAFT_EXTEND` (eager) coverage. The
+  earlier probe failure was a wrong reference helper (the split-op
+  reference expects a different per-head shape); switching to the
+  standard `expected_*_output_from_inputs` references unblocks
+  matching. KDA at ~0.004 max diff, Lightning at ~0.031 (just above
+  `LIGHTNING_ATOL=3e-2`, so the runner uses a slightly looser `5e-2`).
 - Added GDN EAGLE `DRAFT_EXTEND` (eager) coverage. Mamba2 already
   has DRAFT_EXTEND eager (added in this arc); GDN's gated-delta
   recurrence reference matches the actual within ~0.0005 max diff.
@@ -1057,6 +1073,10 @@ Latest verification:
 - `python test/manual/attention/unittest/gdn/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_flashinfer.py -v`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
+  - Ran 152 tests in 36.668s (21 skipped) after adding KDA + Lightning
+    EAGLE DRAFT_EXTEND eager and Frozen-KV MTP DRAFT_EXTEND across the
+    hybrid-linear family + FA3/FA4 dense.
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
   - Ran 150 tests in 36.727s (21 skipped) after adding KDA non-EAGLE
     spec verify (looser tolerance), Mamba2 EAGLE DRAFT_EXTEND eager,
