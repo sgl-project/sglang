@@ -73,8 +73,10 @@ class KimiK2Detector(BaseFormatDetector):
             re.DOTALL,
         )
 
+        # function_arguments stops at the next tool-call boundary so a buffer
+        # holding multiple calls doesn't bleed call N+1's header into call N.
         self.stream_tool_call_portion_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[^\s<|]+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*)",
+            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[^\s<|]+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*?(?=<\|tool_call_begin\|>|\Z))",
             re.DOTALL,
         )
 
@@ -217,7 +219,10 @@ class KimiK2Detector(BaseFormatDetector):
         )
 
         if not has_tool_call:
-            self._buffer = ""
+            if self.eot_token in new_text:
+                self._reset_streaming_state()
+            else:
+                self._buffer = ""
             normal_text = _strip_special_tokens(new_text)
             return StreamingParseResult(normal_text=normal_text)
 
@@ -315,10 +320,13 @@ class KimiK2Detector(BaseFormatDetector):
                             self._buffer = ""
 
                         result = StreamingParseResult(normal_text="", calls=calls)
-                        self.current_tool_id += 1
-                        self._last_arguments = ""
-                        self.current_tool_name_sent = False
-                        self._current_stream_function_name = None
+                        if self.eot_token in self._buffer:
+                            self._reset_streaming_state()
+                        else:
+                            self.current_tool_id += 1
+                            self._last_arguments = ""
+                            self.current_tool_name_sent = False
+                            self._current_stream_function_name = None
                         return result
 
             return StreamingParseResult(normal_text="", calls=calls)
@@ -326,6 +334,22 @@ class KimiK2Detector(BaseFormatDetector):
         except Exception as e:
             logger.error("Error in parse_streaming_increment: %s", e, exc_info=True)
             return StreamingParseResult(normal_text=_strip_special_tokens(current_text))
+
+    def _reset_streaming_state(self) -> None:
+        """Reset per-request streaming state when the tool-call section ends.
+
+        Detector instances are reused across requests; without this, state
+        from a prior request can leak into the next and corrupt parsing.
+        """
+        self.current_tool_id = -1
+        self.current_tool_name_sent = False
+        self.prev_tool_call_arr = []
+        self.streamed_args_for_tool = []
+        self._last_arguments = ""
+        self._current_stream_function_name = None
+        self._buffer = ""
+        if hasattr(self, "_tool_indices"):
+            del self._tool_indices
 
     def structure_info(self) -> _GetInfoFunc:
         """Return function that creates StructureInfo for guided generation."""
