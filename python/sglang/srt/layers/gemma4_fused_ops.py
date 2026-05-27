@@ -191,6 +191,52 @@ def _gemma_qkv_rmsnorm_kernel(
             tl.store(V_ptr + off, out.to(V_ptr.dtype.element_ty), mask=mask)
 
 
+@triton.jit
+def _gemma_qkv_rmsnorm_by_head_kernel(
+    Q_ptr,
+    K_ptr,
+    V_ptr,
+    Q_w_ptr,
+    K_w_ptr,
+    stride_q_m,
+    stride_k_m,
+    stride_v_m,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    eps,
+    HAS_KV: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    m = tl.program_id(0)
+    h_all = tl.program_id(1)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < HEAD_DIM
+
+    if h_all < NUM_Q_HEADS:
+        off = m * stride_q_m + h_all * HEAD_DIM + cols
+        x = tl.load(Q_ptr + off, mask=mask, other=0.0).to(tl.float32)
+        qw = tl.load(Q_w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        rrms = tl.rsqrt(tl.sum(x * x, axis=0) / HEAD_DIM + eps)
+        out = x * rrms * qw
+        tl.store(Q_ptr + off, out.to(Q_ptr.dtype.element_ty), mask=mask)
+    elif HAS_KV and h_all < NUM_Q_HEADS + NUM_KV_HEADS:
+        h = h_all - NUM_Q_HEADS
+        off = m * stride_k_m + h * HEAD_DIM + cols
+        x = tl.load(K_ptr + off, mask=mask, other=0.0).to(tl.float32)
+        kw = tl.load(K_w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        rrms = tl.rsqrt(tl.sum(x * x, axis=0) / HEAD_DIM + eps)
+        out = x * rrms * kw
+        tl.store(K_ptr + off, out.to(K_ptr.dtype.element_ty), mask=mask)
+    elif HAS_KV:
+        h = h_all - NUM_Q_HEADS - NUM_KV_HEADS
+        off = m * stride_v_m + h * HEAD_DIM + cols
+        x = tl.load(V_ptr + off, mask=mask, other=0.0).to(tl.float32)
+        rrms = tl.rsqrt(tl.sum(x * x, axis=0) / HEAD_DIM + eps)
+        out = x * rrms
+        tl.store(V_ptr + off, out.to(V_ptr.dtype.element_ty), mask=mask)
+
+
 def gemma_qkv_rmsnorm(
     q: torch.Tensor,
     k: Optional[torch.Tensor],
@@ -226,6 +272,26 @@ def gemma_qkv_rmsnorm(
         assert k.is_cuda and v.is_cuda
         assert k.stride(-1) == 1 and v.stride(-1) == 1
         assert k_weight is not None and k_weight.shape[-1] == head_dim
+
+    if M <= 256:
+        total_heads = num_q_heads + (2 * num_kv_heads if has_kv else 0)
+        _gemma_qkv_rmsnorm_by_head_kernel[(M, total_heads)](
+            q,
+            k if has_kv else q,
+            v if has_kv else q,
+            q_weight,
+            k_weight if has_kv else q_weight,
+            q.stride(0),
+            k.stride(0) if has_kv else 0,
+            v.stride(0) if has_kv else 0,
+            NUM_Q_HEADS=num_q_heads,
+            NUM_KV_HEADS=num_kv_heads if has_kv else 0,
+            HEAD_DIM=head_dim,
+            eps=eps,
+            HAS_KV=has_kv,
+            BLOCK=BLOCK,
+        )
+        return
 
     _gemma_qkv_rmsnorm_kernel[(M,)](
         q,
