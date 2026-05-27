@@ -34,6 +34,7 @@ from common.runner_modes.cuda_graph_decode_runner import (
 )
 from common.runner_modes.eagle_draft_runner import (
     run_dsa_eagle_draft_cuda_graph_runner_case,
+    run_dsa_eagle_draft_extend_cuda_graph_runner_case,
 )
 
 
@@ -294,6 +295,29 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
         for case in self.EAGLE_DRAFT_CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_dsa_eagle_draft_cuda_graph_runner_case(self, case)
+
+    # EAGLE production draft-extend CUDA-graph runner. Routes through
+    # `DraftBackendFactory._create_dsa_prefill_backend` which returns a
+    # single `DeepseekSparseAttnBackend` (not multi-step); the forward
+    # goes through `forward_extend` with `dsa_decode_impl` selected via
+    # `is_draft_extend(include_v2=True)`.
+    EAGLE_DRAFT_EXTEND_CASES = (
+        DSAAttentionCase(
+            name="runner_eagle_draft_extend_cuda_graph_dsa",
+            backend="dsa",
+            forward_mode=ForwardMode.DRAFT_EXTEND,
+            num_heads=4,
+            num_kv_heads=1,
+            page_size=DSA_PAGE_SIZE,
+            prefix_lens=(128, 192),
+            extend_lens=(2, 3),
+        ),
+    )
+
+    def test_runner_mode_eagle_draft_extend_cuda_graph_runner_cases(self):
+        for case in self.EAGLE_DRAFT_EXTEND_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_dsa_eagle_draft_extend_cuda_graph_runner_case(self, case)
 
     # CG decode replay with FP8 KV cache. Captures and replays through
     # `flashmla_kv` (the only FP8-compatible decode kernel). The

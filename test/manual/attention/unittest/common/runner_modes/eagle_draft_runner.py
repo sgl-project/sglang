@@ -2870,3 +2870,261 @@ def run_dsa_eagle_draft_cuda_graph_runner_case(
         ),
         settings=settings,
     )
+
+
+# ---------------------------------------------------------------------------
+# DSA EAGLE draft-extend CUDA-graph runner adapter
+# ---------------------------------------------------------------------------
+#
+# Draft-extend differs from draft-decode in three ways for DSA:
+#   1. Multi-query-per-request: `num_input_tokens = sum(input_lens)`.
+#   2. Routes through `forward_extend` rather than `forward_decode`.
+#      Production picks `dsa_decode_impl` (default `flashmla_kv`)
+#      because `is_draft_extend(include_v2=True)` is in the
+#      decode-impl branch (`dsa_backend.py:1352-1358`).
+#   3. DraftBackendFactory returns a single `DeepseekSparseAttnBackend`
+#      (not a multi-step wrapper) via `_create_dsa_prefill_backend`.
+#
+# The topk_indices synthesis uses `batch.positions` to compute the
+# absolute key_count per query token; same trailing-topk shape as the
+# draft-decode synthesis. Built entirely on-GPU.
+
+
+class _DSAEagleDraftExtendForward(nn.Module):
+    """DSA draft-extend forward. Like `_DSAEagleDraftForward` but the
+    hidden_states / input_ids carry `num_input_tokens` rows (one per
+    accepted draft token), and the trailing logits are selected per
+    request via `_select_logits_positions`."""
+
+    def __init__(
+        self,
+        *,
+        module,
+        hidden_size: int,
+        vocab_size: int,
+        dtype: torch.dtype,
+        device: str,
+    ):
+        super().__init__()
+        self.module = module
+        self.token_embed = nn.Embedding(
+            vocab_size, hidden_size, dtype=dtype, device=device
+        )
+        self.lm_head = nn.Linear(
+            hidden_size, vocab_size, bias=False, dtype=dtype, device=device
+        )
+
+    def _synthesize_topk_indices(
+        self, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        """Trailing-topk indices per query token, derived from
+        `forward_batch.positions`. `positions[i]` is the absolute
+        position of token `i` in its request, so `key_count[i] =
+        positions[i] + 1`."""
+        positions = forward_batch.positions.to(torch.int32)
+        device = positions.device
+        topk = DSA_SPARSE_INDEX_TOPK
+        key_counts = positions + 1
+        key_starts = torch.clamp(key_counts - topk, min=0)
+        offsets = torch.arange(topk, dtype=torch.int32, device=device)
+        indices = key_starts[:, None] + offsets[None, :]
+        mask = indices < key_counts[:, None]
+        return torch.where(
+            mask,
+            indices,
+            torch.full_like(indices, -1),
+        )
+
+    def _select_logits_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        if forward_batch.forward_mode.is_draft_extend_v2():
+            return torch.arange(
+                forward_batch.input_ids.shape[0],
+                dtype=torch.int64,
+                device=forward_batch.input_ids.device,
+            )
+        extend_lens = forward_batch.extend_seq_lens.to(torch.int64)
+        starts = torch.zeros_like(extend_lens)
+        if extend_lens.numel() > 1:
+            starts[1:] = torch.cumsum(extend_lens[:-1], dim=0)
+        return starts + forward_batch.spec_info.num_accept_tokens.to(torch.int64) - 1
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        del positions
+        spec_info = forward_batch.spec_info
+        hidden_states = spec_info.hidden_states
+        if hidden_states is None:
+            raise ValueError(
+                "EAGLE draft-extend runner tests expect hidden states."
+            )
+
+        hidden_states = hidden_states + self.token_embed(input_ids)
+
+        q_nope, q_rope = self.module.project_q(hidden_states)
+        k_nope, k_rope = self.module.project_k(hidden_states)
+        topk_indices = self._synthesize_topk_indices(forward_batch)
+
+        attn_output = self.module.attn(
+            q_nope,
+            k_nope,
+            k_nope,
+            forward_batch,
+            k_rope=k_rope,
+            q_rope=q_rope,
+            topk_indices=topk_indices,
+        )
+        attn_output = attn_output.reshape(
+            -1, self.module.num_heads * self.module.qk_nope_head_dim
+        )
+        hidden_states = self.module.o_proj(attn_output)
+        logits = self.lm_head(hidden_states).float()
+        select_index = self._select_logits_positions(forward_batch)
+        return LogitsProcessorOutput(
+            next_token_logits=logits[select_index],
+            hidden_states=hidden_states[select_index],
+        )
+
+
+def _make_dsa_draft_extend_model_forward(
+    fixture,
+    settings: EagleDraftRunnerSettings,
+):
+    return _DSAEagleDraftExtendForward(
+        module=fixture.actual_module,
+        hidden_size=settings.hidden_size,
+        vocab_size=settings.vocab_size,
+        dtype=settings.dtype,
+        device=settings.device,
+    )
+
+
+def _make_dsa_draft_extend_inputs(
+    case: DSAAttentionCase,
+    settings: EagleDraftRunnerSettings,
+) -> dict[str, torch.Tensor]:
+    with _seeded_rng(9480 + len(case.name), device=settings.device):
+        return {
+            "hidden_states": torch.randn(
+                case.num_input_tokens,
+                settings.hidden_size,
+                dtype=settings.dtype,
+                device=settings.device,
+            ),
+        }
+
+
+def _prepare_dsa_draft_extend_replay_state(
+    fixture,
+    case: DSAAttentionCase,
+    _draft_inputs,
+    settings: EagleDraftRunnerSettings,
+) -> None:
+    """Populate req_to_token mappings for prefix + extend. Mirrors the
+    decode replay-state setup but covers the extend region too."""
+    runner = fixture.runner
+    max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
+    for req_idx, prefix_len in enumerate(case.prefix_lens):
+        extend_len = case.input_lens[req_idx]
+        for pos in range(prefix_len + extend_len):
+            runner.req_to_token_pool.req_to_token[req_idx, pos] = _dsa_token_loc(
+                req_idx,
+                pos,
+                page_size=case.page_size,
+                max_context_len=max_context_len,
+            )
+
+
+def _check_dsa_draft_extend_layout(
+    case: DSAAttentionCase,
+    settings: EagleDraftRunnerSettings,
+) -> None:
+    if settings.topk != 1:
+        raise ValueError(
+            "DSA EAGLE draft-extend runner coverage is chain-only (topk=1). "
+            "Tree draft-extend would require parent-indices plumbing through "
+            "the topk_indices synthesis; deferred."
+        )
+    if case.page_size != DSA_PAGE_SIZE:
+        raise ValueError(
+            f"DSA backend requires page_size == {DSA_PAGE_SIZE} (got {case.page_size})."
+        )
+
+
+def _make_dsa_eagle_draft_extend_forward_batch(
+    fixture,
+    case: DSAAttentionCase,
+    draft_inputs: dict[str, torch.Tensor],
+    settings: EagleDraftRunnerSettings,
+) -> ForwardBatch:
+    from ..attention_methods.dsa_attention import _make_forward_batch as _make_dsa_forward_batch
+
+    batch = _make_dsa_forward_batch(
+        case,
+        fixture.runner,
+        max_context_len=settings.max_context_len,
+        device=fixture.runner.device,
+    )
+    batch.spec_info = _make_eagle_draft_extend_input(
+        case,
+        batch,
+        draft_inputs,
+        settings,
+    )
+    return batch
+
+
+def run_dsa_eagle_draft_extend_cuda_graph_runner_case(
+    testcase,
+    case: DSAAttentionCase,
+    *,
+    topk: int = 1,
+    speculative_num_steps: int = 2,
+    speculative_num_draft_tokens: int = 3,
+    cuda_graph_capture_batch_size: int = 2,
+    hidden_size: int = 64,
+    max_context_len: int = 256,
+    vocab_size: int = 64,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+):
+    """DSA EAGLE draft-extend CUDA-graph runner coverage. Chain-only.
+    Routes through `DraftBackendFactory._create_dsa_prefill_backend`
+    which returns a single `DeepseekSparseAttnBackend` (not multi-step),
+    and the forward goes through `forward_extend` with
+    `dsa_decode_impl` selected via `is_draft_extend(include_v2=True)`."""
+    settings = EagleDraftRunnerSettings(
+        topk=topk,
+        speculative_num_steps=speculative_num_steps,
+        speculative_num_draft_tokens=speculative_num_draft_tokens,
+        capture_batch_size=cuda_graph_capture_batch_size,
+        hidden_size=hidden_size,
+        vocab_size=vocab_size,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        atol=DSA_SPARSE_ATOL,
+        rtol=DSA_SPARSE_RTOL,
+    )
+    adapter = EagleDraftExtendCudaGraphRunnerAdapter(
+        build_fixture=build_dsa_sparse_attention_fixture,
+        make_model_forward=_make_dsa_draft_extend_model_forward,
+        make_draft_inputs=_make_dsa_draft_extend_inputs,
+        prepare_replay_state=_prepare_dsa_draft_extend_replay_state,
+        make_forward_batch=_make_dsa_eagle_draft_extend_forward_batch,
+        check_case=_check_dsa_draft_extend_layout,
+    )
+    run_eagle_draft_extend_cuda_graph_runner_case(
+        testcase,
+        case,
+        adapter=adapter,
+        build_kwargs=dict(
+            max_context_len=max_context_len,
+            dtype=dtype,
+            device=device,
+        ),
+        settings=settings,
+    )
