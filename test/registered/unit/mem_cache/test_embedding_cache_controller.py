@@ -7,7 +7,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 import threading
 import time
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 
@@ -15,9 +15,7 @@ from sglang.srt.mem_cache.storage.mooncake_store.embedding_cache_controller impo
     ContiguousMemoryAllocator,
     EmbeddingCacheController,
     EmbeddingInsertOperation,
-    EmbeddingPrefetchOperation,
 )
-
 
 # ---------------------------------------------------------------------------
 # ContiguousMemoryAllocator tests
@@ -87,8 +85,9 @@ class TestContiguousMemoryAllocator(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-def _make_controller(pool_mb=1.0, enable_eviction=True, hidden_dims=None,
-                     max_eviction_batch=10):
+def _make_controller(
+    pool_mb=1.0, enable_eviction=True, hidden_dims=None, max_eviction_batch=10
+):
     """Create an EmbeddingCacheController with a mocked MooncakeEmbeddingStore."""
     ctrl = EmbeddingCacheController.__new__(EmbeddingCacheController)
     ctrl.tp_world_size = 1
@@ -627,7 +626,9 @@ class TestGetEmbeddingsViewSafety(unittest.TestCase):
             offset = ctrl.allocator.allocate(size)
             ctrl.hash_to_metadata["h1"] = (offset, 1, dim, size)
             ctrl._update_access_time("h1")
-            view = ctrl.cpu_pool[offset : offset + size].view(torch.float32).view(1, dim)
+            view = (
+                ctrl.cpu_pool[offset : offset + size].view(torch.float32).view(1, dim)
+            )
             view.copy_(torch.ones(1, dim))
 
         # Read via get_embeddings (holds ref)

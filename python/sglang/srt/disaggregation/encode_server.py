@@ -800,9 +800,7 @@ class MMEncoder:
             cache_miss_indices = []
             if prefetch_status.item() == 1 and hit_indices:
                 hit_hashes = [mm_hashes[i] for i in hit_indices]
-                cached_slices = self.mm_global_cache.get_embeddings(
-                    hit_hashes
-                )
+                cached_slices = self.mm_global_cache.get_embeddings(hit_hashes)
                 for i, idx in enumerate(hit_indices):
                     if cached_slices[i] is not None:
                         final_slices[idx] = cached_slices[i]
