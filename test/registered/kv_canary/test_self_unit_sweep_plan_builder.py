@@ -72,8 +72,8 @@ class TestSelfUnitSweepPlanBuilder(CustomTestCase):
         )
         self.assertEqual(int(out.verify_num_valid.item()), 0)
 
-    def test_swa_translate_drops_evicted_rows(self) -> None:
-        """SWA LUT-evicted (=0) slots and their dependents are filtered out of the sweep plan."""
+    def test_swa_translate_preserves_evicted_as_padding_sentinel(self) -> None:
+        """Evicted (LUT=0) slots stay in the plan as the padding sentinel; the kernel does the skipping."""
         cache = make_radix_cache([[], [100, 101, 102]], device=self.device)
         cache.req_to_token_pool = make_req_to_token_pool(self.device)
 
@@ -88,10 +88,10 @@ class TestSelfUnitSweepPlanBuilder(CustomTestCase):
             full_to_swa_index_mapping=lut,
         )
         num_valid = int(out.verify_num_valid.item())
-        self.assertEqual(num_valid, 1)
-        self.assertEqual(out.verify_slot_indices[:num_valid].tolist(), [500])
-        self.assertEqual(out.verify_prev_slot_indices[:num_valid].tolist(), [-1])
-        self.assertEqual(out.verify_expected_positions[:num_valid].tolist(), [0])
+        self.assertEqual(num_valid, 3)
+        self.assertEqual(out.verify_slot_indices[:num_valid].tolist(), [500, 0, 502])
+        self.assertEqual(out.verify_prev_slot_indices[:num_valid].tolist(), [-1, 500, 0])
+        self.assertEqual(out.verify_expected_positions[:num_valid].tolist(), [0, 1, 2])
 
 
 if __name__ == "__main__":
