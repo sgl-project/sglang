@@ -1,11 +1,13 @@
 import json
+import sys
 
-from sglang.test.ci.ci_register import register_cpu_ci
+import pytest
 from sglang.srt.environ import envs, temp_set_env
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
     DEFAULT_LOCAL_BUFFER_SIZE,
     MooncakeStoreConfig,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -57,3 +59,7 @@ def test_mooncake_local_buffer_size_loads_from_extra_config():
     )
 
     assert config.local_buffer_size == 0
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
