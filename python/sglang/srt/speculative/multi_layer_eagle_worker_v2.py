@@ -49,13 +49,16 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     fast_sample,
-    maybe_detect_nan,
-    maybe_detect_oob,
     record_stream_each,
     record_stream_for_v2_verify,
     select_top_k_tokens,
 )
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.async_probe import (
+    maybe_detect_inf,
+    maybe_detect_nan,
+    maybe_detect_oob,
+)
 from sglang.srt.utils.common import empty_context, fast_topk
 
 if TYPE_CHECKING:
@@ -445,6 +448,10 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 output.logits_output.next_token_logits,
                 f"draft_extend_for_prefill step {step}",
             )
+            maybe_detect_inf(
+                output.logits_output.next_token_logits,
+                f"draft_extend_for_prefill step {step}",
+            )
             probs = self._renorm_draft_probs(
                 output.logits_output.next_token_logits, batch.sampling_info
             )
@@ -790,6 +797,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
 
         # Sample
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
+        maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
         (
             predict,
             accept_lens,

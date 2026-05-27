@@ -32,11 +32,14 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.spec_utils import fast_sample, fast_topk
 from sglang.srt.utils import (
+    is_hip,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
@@ -465,13 +468,19 @@ class EAGLEDraftExtendCudaGraphRunner:
                 forward_batch.positions,
                 forward_batch,
             )
-            probs = self.eagle_worker._renorm_draft_probs(
-                ret.next_token_logits, forward_batch.sampling_info
-            )
             if self.eagle_worker.server_args.speculative_use_rs:
+                probs = self.eagle_worker._renorm_draft_probs(
+                    ret.next_token_logits, forward_batch.sampling_info
+                )
                 ret.topk_p, ret.topk_index = fast_sample(probs, num_samples=1)
                 ret.draft_probs = probs
+            elif self.topk == 1 and not _is_hip:
+                ret.topk_index = torch.argmax(
+                    ret.next_token_logits, dim=-1, keepdim=True
+                )
+                ret.topk_p = torch.ones_like(ret.topk_index, dtype=torch.float32)
             else:
+                probs = torch.softmax(ret.next_token_logits, dim=-1)
                 ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
@@ -524,6 +533,9 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.out_cache_loc.zero_()
             buffers.positions.zero_()
+            # Pair with seq_lens fill: padded rows must point at reserved
+            # req_pool slot 0 (req_to_token[0, :] is all zeros from init).
+            buffers.req_pool_indices.zero_()
             buffers.num_correct_drafts.fill_(self.num_tokens_per_bs)
             buffers.num_accept_tokens.fill_(self.num_tokens_per_bs)
             buffers.extend_seq_lens.fill_(self.num_tokens_per_bs)

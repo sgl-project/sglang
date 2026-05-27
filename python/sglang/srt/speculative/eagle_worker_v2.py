@@ -64,11 +64,14 @@ from sglang.srt.speculative.spec_utils import (
     fast_sample,
     generate_token_bitmask,
     load_token_map,
-    maybe_detect_nan,
-    maybe_detect_oob,
     record_stream_each,
     record_stream_for_v2_verify,
     select_top_k_tokens,
+)
+from sglang.srt.utils.async_probe import (
+    maybe_detect_inf,
+    maybe_detect_nan,
+    maybe_detect_oob,
 )
 from sglang.srt.utils.common import (
     MultiprocessingSerializer,
@@ -492,14 +495,22 @@ class EagleDraftWorker(BaseDraftWorker):
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
-            probs = self._renorm_draft_probs(
-                logits_output.next_token_logits, forward_batch.sampling_info
-            )
-
+            maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
             if self.server_args.speculative_use_rs:
+                probs = self._renorm_draft_probs(
+                    logits_output.next_token_logits, forward_batch.sampling_info
+                )
                 topk_p, topk_index = fast_sample(probs, num_samples=1)
                 draft_probs_list.append(probs)
+            elif self.topk == 1 and not _is_hip:
+                topk_index = torch.argmax(
+                    logits_output.next_token_logits, dim=-1, keepdim=True
+                )
+                topk_p = torch.ones_like(topk_index, dtype=torch.float32)
             else:
+                probs = self._renorm_draft_probs(
+                    logits_output.next_token_logits, forward_batch.sampling_info
+                )
                 topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             maybe_detect_oob(
                 topk_index,
@@ -604,6 +615,7 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch.mm_input_embeds = mm_input_embeds
         logits_output = self.draft_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
+        maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 
         # Update spec_info for the next draft step
         probs = self._renorm_draft_probs(
@@ -672,6 +684,10 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_logits_output.next_token_logits,
             f"draft_extend_for_decode (cuda_graph={can_cuda_graph})",
         )
+        maybe_detect_inf(
+            draft_logits_output.next_token_logits,
+            f"draft_extend_for_decode (cuda_graph={can_cuda_graph})",
+        )
 
         # Reorganize the spec info for the next batch
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
@@ -681,13 +697,22 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                 select_index
             ]
-        probs = self._renorm_draft_probs(
-            draft_logits_output.next_token_logits, batch.sampling_info
-        )
         if self.server_args.speculative_use_rs:
+            probs = self._renorm_draft_probs(
+                draft_logits_output.next_token_logits, batch.sampling_info
+            )
             ret_topk_p, ret_topk_index = fast_sample(probs, num_samples=1)
             ret_draft_probs = probs
+        elif self.topk == 1 and not _is_hip:
+            ret_topk_index = torch.argmax(
+                draft_logits_output.next_token_logits, dim=-1, keepdim=True
+            )
+            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            ret_draft_probs = None
         else:
+            probs = self._renorm_draft_probs(
+                draft_logits_output.next_token_logits, batch.sampling_info
+            )
             ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
             ret_draft_probs = None
         ret_hidden_states = draft_logits_output.hidden_states
@@ -1112,6 +1137,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Sample
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
+        maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
         (
             predict,
             accept_lens,
@@ -1123,6 +1149,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None
             or self.target_worker.model_runner.mamba2_config is not None
+            or self.target_worker.model_runner.hybrid_lightning_config is not None
         ):
             self._mamba_verify_update(
                 batch, verify_input, accept_lens, accept_index, bs
@@ -1243,6 +1270,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
         """
         bs = len(batch.seq_lens)
         size = bs * self.speculative_num_draft_tokens
+
+        # fill_accepted_out_cache_loc reads out_cache_loc[accept_index]; -1 sentinel ok.
+        maybe_detect_oob(
+            accept_index,
+            -1,
+            batch.out_cache_loc.size(0),
+            "eagle v2 move_accepted_tokens accept_index",
+        )
 
         tgt_cache_loc = torch.zeros(
             size,
