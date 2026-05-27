@@ -476,6 +476,23 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return 0
 
+        # DP attention requires prepare_mlp_sync_batch() which forward_split_prefill
+        # bypasses — DP buffers would be uninitialized, causing incorrect results.
+        if self.server_args.enable_dp_attention:
+            return 0
+
+        # Speculative decoding (EAGLE) appends draft-model KV layers beyond
+        # num_hidden_layers. Pipelined mode only iterates target layers, so
+        # draft KV would never be transferred to the decode side.
+        if self.draft_worker is not None:
+            return 0
+
+        # input_embeds (custom embeddings via API) are not forwarded through
+        # forward_split_prefill — it always calls embed_tokens(input_ids).
+        # Fall back to normal path to avoid silently ignoring user embeddings.
+        if any(req.input_embeds is not None for req in batch.reqs):
+            return 0
+
         # If user explicitly set group_size, it takes priority over all heuristics.
         if envs.SGLANG_PIPELINE_GROUP_SIZE.is_set():
             return envs.SGLANG_PIPELINE_GROUP_SIZE.get()
