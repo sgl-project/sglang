@@ -431,11 +431,16 @@ fi
 echo "=========================================="
 
 echo "Launching container: ci_sglang"
+# EXPERIMENT: --network=host to bypass Docker bridge NAT overhead.
+# Previous in-container TLS handshake to huggingface.co was ~2x slower than host
+# (228ms vs 107ms), suggesting NAT/bridge adds ~120ms latency. Disagg variant
+# (amd_ci_start_container_disagg.sh) already uses --network=host as precedent.
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   --ulimit nofile=65536:65536 \
   -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
   $CACHE_VOLUME \
   --privileged \
+  --network=host \
   --group-add video \
   --shm-size 32g \
   --cap-add=SYS_PTRACE \
@@ -474,39 +479,6 @@ docker exec ci_sglang bash -lc '
   fi
 
   echo "kernel.numa_balancing=$(cat "${numa_balancing_path}")"
-'
-
-docker exec ci_sglang bash -lc '
-  # EXPERIMENT: Override TCP sysctl inside privileged container to match MI325 baseline.
-  # MI300 host inherits CUBIC + 6MB rmem -> ~20 MB/s on HF CDN.
-  # MI325 host already uses BBR + 16MB rmem -> ~76 MB/s on the same destination.
-  # This override only affects container-initiated TCP connections (HF / pip downloads).
-  # docker pull runs in host network namespace and is NOT affected by this.
-
-  apply_sysctl() {
-    local key="$1"
-    local val="$2"
-    local before after
-    before=$(sysctl -n "$key" 2>/dev/null || echo "(unavailable)")
-    if sysctl -w "${key}=${val}" >/dev/null 2>&1; then
-      after=$(sysctl -n "$key" 2>/dev/null || echo "(unavailable)")
-      printf "  %-40s before=%-25s after=%s\n" "$key" "$before" "$after"
-    else
-      printf "  %-40s FAILED to set (was=%s; target=%s)\n" "$key" "$before" "$val"
-    fi
-  }
-
-  echo "=========================================="
-  echo "Apply TCP sysctl override (privileged container)"
-  echo "=========================================="
-  apply_sysctl net.ipv4.tcp_congestion_control bbr
-  apply_sysctl net.core.default_qdisc fq
-  apply_sysctl net.core.rmem_max 67108864
-  apply_sysctl net.core.wmem_max 67108864
-  apply_sysctl net.ipv4.tcp_rmem "4096 87380 67108864"
-  apply_sysctl net.ipv4.tcp_wmem "4096 87380 67108864"
-  apply_sysctl net.ipv4.tcp_mtu_probing 1
-  echo "=========================================="
 '
 
 docker exec ci_sglang bash -lc '
