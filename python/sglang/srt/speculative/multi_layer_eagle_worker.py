@@ -54,10 +54,10 @@ from sglang.srt.speculative.spec_utils import (
     fast_topk,
     generate_token_bitmask,
     load_token_map,
-    maybe_detect_nan,
     select_top_k_tokens,
 )
 from sglang.srt.utils import empty_context, get_available_gpu_memory, is_cuda, is_npu
+from sglang.srt.utils.async_probe import maybe_detect_nan
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
