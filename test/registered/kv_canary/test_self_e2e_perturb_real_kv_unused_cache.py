@@ -34,6 +34,15 @@ class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
             "SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB": "0.1",
             "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": str(cls.target_group),
             "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
+            # The violation ring is fill-once (writes beyond ring_capacity are
+            # dropped). In SWA mode the SWA-side sweep fires ~1k chain-hash
+            # violations within the first second of the test (window-shift
+            # natural noise), which fills the default 1024-entry ring before
+            # any FULL-side perturb has a chance to record its real-kv-hash
+            # mismatch. Bumping the ring to 64K keeps every group's
+            # violations visible to the reporter through the full test
+            # window.
+            "SGLANG_KV_CANARY_RING_CAPACITY": "65536",
         }
         super().setUpClass()
 
