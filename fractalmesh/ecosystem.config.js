@@ -1194,6 +1194,7 @@ module.exports = {
             ['fm-search',         'fm_search_engine',   '30M'],
             ['fm-scheduler-pro',  'fm_scheduler_pro',   '30M'],
             ['fm-payments-hub',   'fm_payments_hub',    '30M'],
+            ['fm-ai-assistant',   'fm_ai_assistant',    '35M'],
         ].map(([name, script, mem]) => ({
             name,
             script:            `agents/${script}.py`,

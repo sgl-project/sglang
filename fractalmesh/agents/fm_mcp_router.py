@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     110,
+        "agents":     111,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -224,6 +224,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "search_engine":     7862,
             "scheduler_pro":     7863,
             "payments_hub":      7864,
+            "ai_assistant":      7865,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -535,6 +536,7 @@ _INTENTS = {
     "web_search":              lambda a, k: {"action": "web_search_queued", "query": k.get("query", ""), "backends": k.get("backends", "all"), "limit": k.get("limit", 10)},
     "schedule_job":            lambda a, k: {"action": "schedule_job_queued", "name": k.get("name", ""), "schedule": k.get("schedule", ""), "job_type": k.get("job_type", "http")},
     "charge_payment":          lambda a, k: {"action": "charge_payment_queued", "amount": k.get("amount", 0), "currency": k.get("currency", "AUD"), "gateway": k.get("gateway", "auto")},
+    "ai_chat":                 lambda a, k: {"action": "ai_chat_queued", "message": k.get("message", ""), "model": k.get("model", "claude-sonnet-4-6"), "thread_id": k.get("thread_id", "")},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
