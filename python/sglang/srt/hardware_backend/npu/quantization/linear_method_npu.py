@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -9,6 +10,8 @@ from sglang.srt.layers.quantization.base_config import LinearMethodBase
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+
+logger = logging.getLogger(__name__)
 
 MXFP8_BLOCK_SIZE = 32
 _FLOAT8_E8M0FNU_DTYPE = getattr(
@@ -161,6 +164,11 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight_fp = layer.weight.data
         if weight_fp.dtype not in (torch.float16, torch.bfloat16):
+            logger.warning(
+                "NPUMXFP8LinearMethod: weight dtype %s is not float16/bfloat16; "
+                "casting to bfloat16 before MXFP8 quantisation.",
+                weight_fp.dtype,
+            )
             weight_fp = weight_fp.to(torch.bfloat16)
 
         # Move weight to NPU if needed (cpu offload may have moved it back to CPU)
