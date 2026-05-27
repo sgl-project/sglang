@@ -1,10 +1,13 @@
 import json
 
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.srt.environ import envs, temp_set_env
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
     DEFAULT_LOCAL_BUFFER_SIZE,
     MooncakeStoreConfig,
 )
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def test_mooncake_local_buffer_size_loads_from_env():
