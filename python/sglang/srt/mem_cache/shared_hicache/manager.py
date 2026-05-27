@@ -32,7 +32,10 @@ from sglang.srt.mem_cache.shared_hicache.pending import (
     pending_wait_ms,
     transfer_bytes_for_pages,
 )
-from sglang.srt.mem_cache.shared_hicache.plan import SharedHiCachePlan
+from sglang.srt.mem_cache.shared_hicache.plan import (
+    SHARED_HICACHE_DIRECT_TIMEOUT_REASON,
+    SharedHiCachePlan,
+)
 from sglang.srt.mem_cache.shared_hicache.service import (
     SharedHiCacheSourceService,
 )
@@ -497,20 +500,24 @@ class SharedHiCacheManager:
         start_block: int,
         max_blocks: int,
         token_count: int,
-    ) -> tuple[Optional[SharedHiCacheTransferHandle], Optional[torch.Tensor]]:
+    ) -> tuple[
+        Optional[SharedHiCacheTransferHandle],
+        Optional[torch.Tensor],
+        Optional[str],
+    ]:
         direct_transfer = getattr(self, "direct_transfer", None)
         if not self._direct_transfer_enabled():
-            return None, None
+            return None, None, "direct_transfer_unavailable"
         endpoints = self._candidate_endpoints_for_plan(plan)
         if not endpoints:
-            return None, None
+            return None, None, "source_endpoint_unavailable"
         if not self._try_acquire_fetch_worker():
-            return None, None
+            return None, None, "fetch_worker_unavailable"
 
         device_indices = self.target_cache.alloc_device_indices(token_count)
         if device_indices is None:
             self._release_fetch_worker()
-            return None, None
+            return None, None, "target_staging_alloc_failed"
 
         target_page_indices = self.target_cache.device_indices_to_page_indices(
             device_indices
@@ -521,7 +528,7 @@ class SharedHiCacheManager:
             )
             self.target_cache.free_device_indices(device_indices)
             self._release_fetch_worker()
-            return None, None
+            return None, None, "target_page_alignment_failed"
         transfer_id = uuid.uuid4().hex
         handle = SharedHiCacheTransferHandle(
             transfer_backend=direct_transfer,
@@ -564,8 +571,15 @@ class SharedHiCacheManager:
             self._finish_target_transfer(transfer_id)
             self.target_cache.free_device_indices(device_indices)
             self._release_fetch_worker()
-            raise
-        return handle, device_indices
+            logger.warning(
+                "Shared HiCache direct transfer control send failed plan_id=%s source_worker=%s endpoint=%s",
+                plan.plan_id,
+                plan.source_worker_id,
+                endpoints[0],
+                exc_info=True,
+            )
+            return None, None, "control_send_failed"
+        return handle, device_indices, None
 
     def has_reuse_plan(self, req: "Req") -> bool:
         plan = getattr(req, "shared_hicache_plan", None)
@@ -727,6 +741,7 @@ class SharedHiCacheManager:
         token_count = max_blocks * page_size
         transfer = None
         device_indices = None
+        direct_submit_reason = None
         direct_transfer_enabled = self._direct_transfer_enabled()
         if not direct_transfer_enabled:
             logger.debug(
@@ -754,11 +769,13 @@ class SharedHiCacheManager:
             if direct_transfer_enabled:
                 locked_node = self._lock_request_prefix(req)
             try:
-                transfer, device_indices = self._submit_direct_transfer(
-                    plan,
-                    start_block=plan_offset,
-                    max_blocks=max_blocks,
-                    token_count=token_count,
+                transfer, device_indices, direct_submit_reason = (
+                    self._submit_direct_transfer(
+                        plan,
+                        start_block=plan_offset,
+                        max_blocks=max_blocks,
+                        token_count=token_count,
+                    )
                 )
             except Exception:
                 if locked_node is not None:
@@ -768,10 +785,24 @@ class SharedHiCacheManager:
                 if locked_node is not None:
                     self.tree_cache.dec_lock_ref(locked_node)
                 self._finished_plan_keys.add(plan_key)
+                direct_submit_reason = (
+                    direct_submit_reason or "direct_submit_unavailable"
+                )
+                logger.info(
+                    "Shared HiCache direct submit unavailable rid=%s plan_id=%s reason=%s source_worker=%s start_block=%d max_blocks=%d token_count=%d host_hit_length=%d",
+                    req.rid,
+                    plan.plan_id,
+                    direct_submit_reason,
+                    plan.source_worker_id,
+                    plan_offset,
+                    max_blocks,
+                    token_count,
+                    req.host_hit_length,
+                )
                 self._observe_reuse(
                     backend=self._current_backend_label(),
                     outcome="miss",
-                    reason="direct_submit_unavailable",
+                    reason=direct_submit_reason,
                 )
                 return SharedHiCacheResult()
         backend = "none"

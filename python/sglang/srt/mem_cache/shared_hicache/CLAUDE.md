@@ -223,7 +223,8 @@ Important labels:
 - `backend`: current transfer backend, usually `nixl`.
 - `outcome`: `hit`, `miss`, `skip`, or `error`.
 - `reason_code`: detailed reason such as `ok`, `insert_returned_zero`,
-  `missing_first_block`, `direct_submit_unavailable`, or timeout/error codes.
+  `missing_first_block`, `target_staging_alloc_failed`, `fetch_worker_unavailable`,
+  `source_endpoint_unavailable`, or timeout/error codes.
 - `tp_rank`: local TP rank.
 
 Successful Shared HiCache transfer hits use:
