@@ -1,13 +1,14 @@
-"""Manual unit test for _maybe_log_idle_metrics idle-flush behavior.
+"""Unit tests for SchedulerMetricsReporter._maybe_log_idle_metrics idle flush.
 
 Verifies that the active→idle transition flush bypasses the 30 s idle
 throttle on the first idle iteration, but subsequent idle iterations
-still throttle as before. Pure mock-based (no GPU, no scheduler loop).
-
-Usage:
-    python3 -m unittest test/manual/test_metrics_reporter_idle_flush.py
-    python3 test/manual/test_metrics_reporter_idle_flush.py
+still throttle as before. Mock-based — no scheduler loop, no GPU,
+no server process.
 """
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import time
 import unittest
@@ -16,6 +17,7 @@ from unittest.mock import MagicMock
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 def _make_reporter():
@@ -41,7 +43,7 @@ def _make_reporter():
     return r
 
 
-class TestIdleMetricFlush(unittest.TestCase):
+class TestIdleMetricFlush(CustomTestCase):
     def test_throttle_blocks_when_no_flush_pending(self):
         r = _make_reporter()
         r._idle_flush_pending = False
