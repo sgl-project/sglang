@@ -396,6 +396,51 @@ Deferred follow-ups:
   Phase 4 tests are passing for the local matrix.
 
 Latest verification:
+- Phase 2 input-config audit completed across all attention methods.
+  Two parallel audit agents compared every method's case generator and
+  test file against PLAN.md's "Required input cases" list and landed the
+  tractable gaps. Method-specific blockers (page-size hard-pin,
+  production sparse-kernel edges, hardware gating) stay documented in
+  the per-method READMEs, not pursued as fixture work.
+
+  Cases added this audit pass (per backend / method):
+  - **Mamba2 (triton)** — 5 new EXTEND cases: zero-prefix input-page
+    edges (extend=(15,16,17)), prefix exact-page (prefix=8,extend=8),
+    cross-page (prefix=15,extend=2), ragged page-boundary
+    (prefix=(0,8,16),extend=(15,8,1)), page_size=32 cross.
+  - **FlashMLA (mla/test_flashmla.py)** — 4 new cases at the forced
+    page_size=64: zero-prefix input-page edges (extend=(63,64,65)),
+    prefix exact-page (prefix=64), total exact-page (prefix=32,extend=32),
+    bsz=1 decode with nonzero prefix.
+  - **DSA dense fallback** — 2 new EXTEND cases at the forced page_size=64:
+    no-prefix seq-below-page (extend=63), ragged below/at/above page
+    (extend=(63,64,65)).
+  - **DSV4 SWA-only** — 6 new EXTEND cases at the forced page_size=256:
+    seq_len exactly equal to window (=128), and the page-boundary
+    triplet (seq=255 / 256 / 257) plus prefix-exact-page (=256) and
+    total-exact-page (prefix=240,extend=16). Also fixed
+    `build_dsv4_attention_fixture` to auto-scale `max_context_len` from
+    `max(case.seq_lens)`.
+  - **dual_chunk** — no new cases needed; existing matrix covered every
+    required input. Sub-context-window sparse pruning surfaced two
+    production bugs (vertical_buffer overflow at line 1132 for
+    `vertical_size <= 5`; `cudaErrorIllegalAddress` inside
+    `_vertical_slash_sparse_attention` for sub-window configs). The
+    smoke helper `run_dual_chunk_sparse_sub_window_case` is wired but
+    no test invokes it until the production bugs are fixed. See
+    `dual_chunk/README.md` for engineering paths.
+
+  PLAN.md addition: new "Method-specific page-size and boundary scaling"
+  subsection (after "Required input cases") explains that methods with
+  hard-pinned `page_size` (DSA at 64, DSV4 at 256, FlashMLA at 64,
+  cutlass_mla at 128) treat the generic "page size 1" requirement as
+  production-unsupported and scale page-boundary lengths accordingly.
+
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py'`
+  - Ran 155 tests in 37.831s (21 skipped). Same totals before and after
+    the audit pass — `subTest` keeps the test-method count flat while
+    the per-method case counts grew significantly.
+
 - Added DSA non-trailing index-layout coverage. Generalized
   `_make_dsa_sparse_topk_rows` to take `pattern in {"trailing", "strided",
   "head_tail"}` and threaded `index_pattern` through
