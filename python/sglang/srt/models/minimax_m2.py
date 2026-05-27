@@ -90,6 +90,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
+    cpu_has_amx_support,
     get_bool_env_var,
     get_compiler_backend,
     is_cpu,
@@ -103,6 +104,7 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 _is_cpu = is_cpu()
+_is_amx_available = cpu_has_amx_support()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
@@ -315,7 +317,7 @@ class MiniMaxM2RMSNormTP(nn.Module):
         shard_id = self.attn_tp_rank // self.num_head_replicas
         shard_size = param.data.shape[0]
 
-        if _is_cpu:
+        if _is_cpu and _is_amx_available:
             # Handle uneven TP sharding on CPU
             param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 param.data,
@@ -411,7 +413,7 @@ class MiniMaxM2QKRMSNorm:
             if counter is not None:
                 self._counter = counter
                 self._forward_impl = self._forward_fused
-        elif _is_cpu:
+        elif _is_cpu and _is_amx_available:
             self._forward_impl = self._forward_cpu
 
     @lru_cache

@@ -65,7 +65,7 @@ from sglang.srt.utils.common import (
 
 logger = logging.getLogger(__name__)
 
-_is_cpu = is_cpu()
+_is_pin_memory_available = is_pin_memory_available()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 
