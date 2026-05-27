@@ -179,6 +179,7 @@ class LoRAInfo:
     max_lora_rank: int  # Maximum LoRA rank across all adapters
 
     num_experts: int
+    has_active_lora: bool = True
     experts_shared_outer_loras: bool = False
     cg_buffers: dict | None = None
 
@@ -335,14 +336,9 @@ def _add_lora_gate_up_delta(
         merged_experts_fused_moe_lora_add,
     )
 
-    if get_is_capture_mode():
-        from sglang.srt.model_executor.cuda_graph_runner import get_capture_lora_variant
-
-        # Record LoRA kernels for lora graph; skip for nolora graph.
-        if get_capture_lora_variant() == "nolora":
-            return
-
     if lora_info is None or lora_info.max_lora_rank == 0:
+        return
+    if not get_is_capture_mode() and not lora_info.has_active_lora:
         return
 
     M, top_k, gate_up_dim = intermediate_cache.shape
@@ -436,12 +432,6 @@ def _add_lora_down_delta(
     if lora_info.max_lora_rank == 0:
         return
 
-    if get_is_capture_mode():
-        from sglang.srt.model_executor.cuda_graph_runner import get_capture_lora_variant
-
-        if get_capture_lora_variant() == "nolora":
-            return
-
     M, top_k, hidden_dim = intermediate_cache.shape
 
     down_lora_a = lora_info.down_lora_a_weights
@@ -516,12 +506,11 @@ def build_lora_hooks(
     """
     if lora_info is None or lora_info.max_lora_rank == 0:
         return LoRAHooks()
-
-    if get_is_capture_mode():
-        from sglang.srt.model_executor.cuda_graph_runner import get_capture_lora_variant
-
-        if get_capture_lora_variant() == "nolora":
-            return LoRAHooks()
+    # Skip alignment/mapping work entirely when the batch has no active adapter.
+    # During CUDA graph capture we still need to record the kernels into the
+    # graph (adapter_enabled is all-zero, kernels early-exit on GPU).
+    if not get_is_capture_mode() and not lora_info.has_active_lora:
+        return LoRAHooks()
 
     # Compute alignment / mapping (once, shared by both hooks)
     token_lora_mapping: torch.Tensor | None = None

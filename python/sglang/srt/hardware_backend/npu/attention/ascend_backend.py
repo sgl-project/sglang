@@ -20,7 +20,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
@@ -208,7 +208,9 @@ class AscendAttnMaskBuilder:
         return attn_mask
 
 
-def _cp_allgather_and_save_kv_npu(forward_batch, layer, k, v, cp_size):
+def _cp_allgather_and_save_kv_npu(
+    forward_batch, layer, k, v, cp_size, token_to_kv_pool
+):
     """NPU-compatible CP KV all-gather with merged K/V communication.
 
     Merges K and V along the feature dimension so only one all-gather is
@@ -243,7 +245,7 @@ def _cp_allgather_and_save_kv_npu(forward_batch, layer, k, v, cp_size):
     key_cache_full = kv_full[..., :k_feat_size].reshape(-1, *k_tail)
     value_cache_full = kv_full[..., k_feat_size:].reshape(-1, *v_tail)
 
-    forward_batch.token_to_kv_pool.set_kv_buffer(
+    token_to_kv_pool.set_kv_buffer(
         layer,
         cache_loc,
         key_cache_full,
@@ -287,6 +289,10 @@ class AscendAttnBackend(AttentionBackend):
         self.native_attn = AscendTorchNativeAttnBackend()
         self.graph_metadata = {}
         self.max_context_len = model_runner.model_config.context_len
+        # Pool refs — captured at construction so they survive deletion of the
+        # corresponding ForwardBatch fields.
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.graph_mode = False
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
@@ -357,7 +363,7 @@ class AscendAttnBackend(AttentionBackend):
         ):
             seq_lens_max += self.speculative_step_id + 1
         self.forward_metadata.block_tables = (
-            forward_batch.req_to_token_pool.req_to_token[
+            self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, :seq_lens_max
             ][:, :: self.page_size]
             // self.page_size
@@ -366,7 +372,7 @@ class AscendAttnBackend(AttentionBackend):
             self.forward_metadata.block_tables_swa = (
                 (
                     self.full_to_swa_index_mapping[
-                        forward_batch.req_to_token_pool.req_to_token[
+                        self.req_to_token_pool.req_to_token[
                             forward_batch.req_pool_indices, :seq_lens_max
                         ]
                     ][:, :: self.page_size]
@@ -421,7 +427,7 @@ class AscendAttnBackend(AttentionBackend):
             for req_idx, seq_len in zip(
                 forward_batch.req_pool_indices.tolist(), seq_prefix_lens
             ):
-                req_indices = forward_batch.req_to_token_pool.req_to_token[req_idx]
+                req_indices = self.req_to_token_pool.req_to_token[req_idx]
                 req_prefix_block_tables = (
                     req_indices[:seq_len][:: self.page_size] // self.page_size
                 )
@@ -883,11 +889,11 @@ class AscendAttnBackend(AttentionBackend):
         if save_kv_cache:
             k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
             k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
-            forward_batch.token_to_kv_pool.set_kv_buffer(
+            self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
         q_nope, q_pe = q, q_rope
-        k_nope, k_pe = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
         if is_prefill:
             if self.forward_metadata.actual_seq_lengths_q is not None:
@@ -932,7 +938,7 @@ class AscendAttnBackend(AttentionBackend):
 
         if (
             is_prefill
-            and is_nsa_enable_prefill_cp()
+            and is_dsa_enable_prefill_cp()
             and forward_batch.attn_cp_metadata is not None
         ):
             attn_out = self.do_cp_balance_attn(
@@ -1041,7 +1047,12 @@ class AscendAttnBackend(AttentionBackend):
                 if is_cp_mode:
                     # All-gather K/V from all CP ranks and write full sequence to KV pool
                     _cp_allgather_and_save_kv_npu(
-                        forward_batch, layer, k, v, self.attn_cp_size
+                        forward_batch,
+                        layer,
+                        k,
+                        v,
+                        self.attn_cp_size,
+                        self.token_to_kv_pool,
                     )
                 else:
                     # support cross attention
@@ -1050,10 +1061,10 @@ class AscendAttnBackend(AttentionBackend):
                         if not layer.is_cross_attention
                         else forward_batch.encoder_out_cache_loc
                     )
-                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                    self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
-            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
             if sinks is not None:
                 # Use SWA block tables if hybrid SWA is enabled for this layer
@@ -1089,34 +1100,48 @@ class AscendAttnBackend(AttentionBackend):
                 return attn_output
 
             if self.use_fia:
-                """FIA will support multi-bs in the later version of CANN"""
+                """FIA supports multi-bs in the current version of CANN"""
                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-                attn_output = torch.empty(
-                    (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
-                    device=q.device,
-                    dtype=q.dtype,
+                num_token_padding = q.shape[0]
+                if num_token_padding > forward_batch.num_token_non_padded_cpu:
+                    q, k, v = [
+                        data[: forward_batch.num_token_non_padded_cpu]
+                        for data in [q, k, v]
+                    ]
+                attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+                    query=q,
+                    key=k_cache.view(
+                        -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+                    ),
+                    value=v_cache.view(
+                        -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
+                    ),
+                    block_table=self.forward_metadata.block_tables,
+                    block_size=self.page_size,
+                    atten_mask=self.fia_mask,
+                    input_layout="TND",
+                    actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
+                    actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    num_heads=layer.tp_q_head_num,
+                    scale=layer.scaling,
+                    sparse_mode=3,
                 )
-                q_len_offset = 0
-                for q_len in forward_batch.extend_seq_lens_cpu:
-                    attn_output[q_len_offset : q_len_offset + q_len] = (
-                        torch.ops.npu.npu_fused_infer_attention_score(
-                            q[None, q_len_offset : q_len_offset + q_len],
-                            k[None, q_len_offset : q_len_offset + q_len],
-                            v[None, q_len_offset : q_len_offset + q_len],
-                            num_heads=layer.tp_q_head_num,
-                            num_key_value_heads=layer.tp_k_head_num,
-                            input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
-                            atten_mask=self.fia_mask.unsqueeze(0),
-                            sparse_mode=3 if q_len != 1 else 0,
-                            scale=layer.scaling,
-                            next_tokens=0,
-                        )[0]
-                    )
-                    q_len_offset += q_len
                 attn_output = attn_output.view(
                     -1, layer.tp_q_head_num * layer.v_head_dim
                 )
 
+                if num_token_padding != forward_batch.num_token_non_padded_cpu:
+                    attn_output = torch.cat(
+                        [
+                            attn_output,
+                            attn_output.new_zeros(
+                                num_token_padding - attn_output.shape[0],
+                                *attn_output.shape[1:],
+                            ),
+                        ],
+                        dim=0,
+                    )
             else:
                 causal = True
                 if (
@@ -1186,7 +1211,7 @@ class AscendAttnBackend(AttentionBackend):
                         o_,
                         k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
                         v_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
-                        forward_batch.req_to_token_pool.req_to_token,
+                        self.req_to_token_pool.req_to_token,
                         forward_batch.req_pool_indices,
                         forward_batch.seq_lens,
                         forward_batch.extend_prefix_lens,
@@ -1209,10 +1234,8 @@ class AscendAttnBackend(AttentionBackend):
             if layer.qk_head_dim == layer.v_head_dim:
                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
-                k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(
-                    layer.layer_id
-                )
+                k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
                 kv_cached = torch.index_select(
                     k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
                 )
@@ -1321,10 +1344,8 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
                 # 2nd, load history kvcache(kv_a and k_pe) and calculate k_nope
-                k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(
-                    layer.layer_id
-                )
+                k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
                 kv_cached = torch.index_select(
                     k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
                 )
@@ -1413,7 +1434,7 @@ class AscendAttnBackend(AttentionBackend):
                 kv_lora_rank = k.shape[-1] - self.qk_rope_head_dim
                 kv_c, k_rope = k.split([kv_lora_rank, self.qk_rope_head_dim], dim=-1)
                 if save_kv_cache:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                    self.token_to_kv_pool.set_kv_buffer(
                         layer, forward_batch.out_cache_loc, kv_c, k_rope
                     )
                 attn_output = q.new_empty(
@@ -1421,17 +1442,15 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
-                k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
-                    layer.layer_id
-                )
+                k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
                 kv_cache = torch.cat([k_cache, v_cache], dim=-1)
                 attn_output = self.native_attn.run_sdpa_forward_extend(
                     q,
                     attn_output,
                     kv_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
                     k_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
-                    forward_batch.req_to_token_pool.req_to_token,
+                    self.req_to_token_pool.req_to_token,
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
                     forward_batch.extend_prefix_lens,
@@ -1500,12 +1519,12 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
     ):
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
+            self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
 
-        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
         query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
         if self.forward_metadata.seq_lens_cpu_int is None:
@@ -1560,21 +1579,21 @@ class AscendAttnBackend(AttentionBackend):
             if self.use_mla:
                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
                 k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, k_rope
                 )
             else:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, v
                 )
 
         if not self.use_mla:
-            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(
-                layer.layer_id
-            ).view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
-            v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
-                layer.layer_id
-            ).view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
+            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+                -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+            )
+            v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
+                -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
+            )
             query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
             if not self.graph_mode:
                 num_token_padding = query.shape[0]
@@ -1628,7 +1647,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
             return attn_output
         else:
-            c_kv, k_rope = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            c_kv, k_rope = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             if is_fia_nz():
                 k_rope_cache = _reshape_kv_for_fia_nz(
                     k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
@@ -1742,17 +1761,17 @@ class AscendAttnBackend(AttentionBackend):
             if self.use_mla:
                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
                 k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, k_rope
                 )
             else:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, v
                 )
 
         if sinks is not None:
-            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
             # Use SWA block tables if hybrid SWA is enabled for this layer
             if self.is_hybrid_swa and layer.sliding_window_size != -1:
@@ -1774,12 +1793,12 @@ class AscendAttnBackend(AttentionBackend):
             return attn_out
 
         if not self.use_mla:
-            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(
-                layer.layer_id
-            ).view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
-            v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
-                layer.layer_id
-            ).view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
+            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+                -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+            )
+            v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
+                -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
+            )
             query = q.reshape(-1, 1, layer.tp_q_head_num * layer.qk_head_dim)
             if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
@@ -1822,7 +1841,7 @@ class AscendAttnBackend(AttentionBackend):
             )
             return output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:
-            c_kv, k_rope = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            c_kv, k_rope = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             if is_fia_nz():
                 k_rope_cache = _reshape_kv_for_fia_nz(
                     k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
@@ -1962,10 +1981,10 @@ class AscendAttnBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
             num_tokens = q.shape[0]
-            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
             if sinks is not None:
                 # Use SWA block tables if hybrid SWA is enabled for this layer
@@ -1994,10 +2013,13 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_len_kv = (
                         self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                     )
+                num_token_padding = q.shape[0]
+                actual_bs = self.forward_metadata.block_tables.shape[0]
+                q = q[:actual_bs]
                 attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                     q.view(
-                        forward_batch.batch_size,
                         -1,
+                        1,
                         layer.tp_q_head_num,
                         layer.qk_head_dim,
                     ),
@@ -2016,6 +2038,17 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_kv=actual_seq_len_kv,
                     scale=layer.scaling,
                 )
+                if actual_bs != num_token_padding:
+                    attn_output = torch.cat(
+                        [
+                            attn_output,
+                            attn_output.new_zeros(
+                                num_token_padding - actual_bs,
+                                *attn_output.shape[1:],
+                            ),
+                        ],
+                        dim=0,
+                    )
             # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
             # forward_batch.encoder_lens is not None in cross attention scend, we add native attn to solve accuracy issues
             elif forward_batch.encoder_lens is None and layer.logit_cap == 0:
@@ -2070,7 +2103,7 @@ class AscendAttnBackend(AttentionBackend):
                     o_,
                     k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
                     v_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
-                    forward_batch.req_to_token_pool.req_to_token,
+                    self.req_to_token_pool.req_to_token,
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
                     forward_batch.encoder_lens,
@@ -2084,12 +2117,12 @@ class AscendAttnBackend(AttentionBackend):
             return attn_output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, k_rope
                 )
             num_tokens = q.shape[0]
-            kv_c = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            k_pe = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            kv_c = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            k_pe = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
             if self.use_fia and (layer.tp_q_head_num // layer.tp_k_head_num) >= 8:
                 """layer.tp_q_head_num // layer.tp_k_head_num < 8 will support in the later version of CANN"""
@@ -2190,11 +2223,11 @@ class AscendAttnBackend(AttentionBackend):
                 "3. When the environment variable ASCEND_USE_FIA is set to 0 and qk_head_dim exceeds 128 on Ascend NPU devices."
             )
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
+            self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
-        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
         num_block, block_size, _, _ = k_cache.shape
         key = k_cache.view(num_block, block_size, -1)
         value = v_cache.view(num_block, block_size, -1)
