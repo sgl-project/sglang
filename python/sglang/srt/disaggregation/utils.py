@@ -25,7 +25,7 @@ from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
 )
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -350,8 +350,14 @@ class MetadataBuffers:
         elif self.custom_mem_pool:
             # TODO(shangming): Fix me (use 'cuda') when nvlink_transport of Mooncake is bug-free
             device = "cpu"
-        elif envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() == "INTRA_NODE_NVLINK":
+        elif (
+            envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() == "INTRA_NODE_NVLINK"
+            and is_cuda()
+        ):
             device = "cuda"
+
+        # custom_mem_pool is a torch.cuda.MemPool, so the use_mem_pool context
+        # must open on torch.cuda even when the tensors below live on cpu.
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool

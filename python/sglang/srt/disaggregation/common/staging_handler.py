@@ -20,6 +20,7 @@ import torch
 from sglang.srt.runtime_context import (
     get_schedule,
 )
+from sglang.srt.utils import create_device_event, device_stream_context
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,16 @@ class DecodeStagingHandler:
         # room -> chunk_idx -> [(page_start, num_pages, writer_id)] fan-in
         # arrivals; handler-owned so room teardown can purge them.
         self._writer_counts: dict = {}
+
+        k_buffers = kv_buffer_info["k_buffers"]
+        assert k_buffers, "k_buffers must not be empty"
+        self.device = k_buffers[0].device
+        assert self.device.index is not None, (
+            f"KV buffers must be on an indexed device, got {self.device}; "
+            f"scatter would otherwise default to device 0."
+        )
+        self.device_module = torch.get_device_module(self.device)
+        self.gpu_id = self.device.index
 
     def register_wm_subscriber(self, receiver, session_id: str) -> None:
         """Register a prefill's bootstrap connection for watermark broadcasts."""
@@ -204,14 +215,15 @@ class DecodeStagingHandler:
     def release_room(self, room: int, decode_req: DecodeRequest, receiver) -> None:
         """Free outstanding staging allocations of a room; no-op after a
         clean Success, releases watermark-pinning leaks on failure/abort."""
-        # Drain in-flight scatters before freeing anything, including one whose
-        # event is not yet in _chunk_events (submit_chunk_scatter records it
-        # after launching the kernel), so no scatter reads a freed staging slot
-        # or writes into KV-pool pages the failure path frees for reuse.
-        stream = self.staging_allocator._scatter_stream
-        if stream is not None:
-            stream.synchronize()
         chunk_infos = receiver.chunk_staging_infos if receiver is not None else []
+        # Drain in-flight scatters first, so none reads a freed staging slot or
+        # writes KV pages the failure path recycles. A live scatter is always
+        # reachable from one of these two lists (submit_chunk_scatter appends its
+        # event before clearing the slot); the scatter stream is shared by all
+        # rooms, so draining unconditionally would stall the scheduler thread
+        # behind unrelated rooms on the Success path.
+        if decode_req._chunk_events or any(info[0] >= 0 for info in chunk_infos):
+            self.staging_allocator._scatter_stream.synchronize()
         unscattered_allocs = []
         for chunk_idx, info in enumerate(chunk_infos):
             if info[0] >= 0:
@@ -264,7 +276,7 @@ class DecodeStagingHandler:
             staging_offset, page_start, num_pages, decode_req, receiver
         )
         if ok:
-            event = torch.cuda.Event()
+            event = create_device_event(self.device)
             event.record(self.staging_allocator._scatter_stream)
             # Append before zeroing so the completion check always sees either
             # the slot or the event.
@@ -397,9 +409,9 @@ class DecodeStagingHandler:
     ) -> bool:
         """Submit scatter kernels for a staging region to scatter_stream.
 
-        May be called from the decode_thread (background).  All GPU work
-        runs on scatter_stream so that the decode_thread never blocks on
-        the default stream (which carries the main-thread forward pass).
+        May be called from the decode_thread (background). All device work runs
+        on scatter_stream so the decode_thread never serializes behind the
+        scheduler's streams, which carry the main-thread forward pass.
         """
         from sglang.srt.disaggregation.common.staging_buffer import (
             scatter_staging_to_kv,
@@ -410,13 +422,14 @@ class DecodeStagingHandler:
         page_size = self.kv_buffer_info["page_size"]
         dst_tp_rank = self.kv_manager.kv_args.engine_rank % self.decode_tp
 
-        device = k_buffers[0].device
-        torch.cuda.set_device(device)
-
-        if self.staging_allocator._scatter_stream is None:
-            self.staging_allocator._scatter_stream = torch.cuda.Stream(device=device)
-
+        # set_device takes an int index, not a device object.
+        self.device_module.set_device(self.gpu_id)
         scatter_stream = self.staging_allocator._scatter_stream
+        # Order the scatter after the req_to_token row it is about to read. That
+        # row is written by the scheduler main thread, whose current stream is
+        # schedule_stream, so the edge must be explicit: XPU has no default
+        # stream, and a dedicated CUDA stream inherits no implicit sync either.
+        scatter_stream.wait_stream(self.scheduler.schedule_stream)
 
         staging_view = self.staging_allocator.buffer.buffer[staging_offset:]
 
@@ -428,7 +441,7 @@ class DecodeStagingHandler:
         token_end = token_start + num_pages * page_size
         prefill_tp = receiver.prefill_info.attn_tp_size
 
-        with torch.cuda.stream(scatter_stream):
+        with device_stream_context(scatter_stream):
             kv_indices = self.scheduler.req_to_token_pool.req_to_token[
                 req_pool_idx, token_start:token_end
             ]
@@ -710,8 +723,18 @@ def _get_custom_mem_pool(device: str):
     return custom_mem_pool, pool_type
 
 
+def _bare_device_type(device_type: str) -> str:
+    """Strip any index, so server_args.device="cuda:0" cannot yield "cuda:0:0"."""
+    return torch.device(device_type).type
+
+
 def init_staging_buffers(
-    register_fn, kv_args, count: int, chunked_prefill_size: int
+    register_fn,
+    kv_args,
+    count: int,
+    chunked_prefill_size: int,
+    *,
+    device_type: str,
 ) -> list:
     """Create prefill-side staging buffers, each sized to one prefill chunk.
 
@@ -723,7 +746,7 @@ def init_staging_buffers(
     full_chunk_pages = max(1, chunked_prefill_size // kv_args.page_size)
     size_bytes = full_chunk_pages * sum(kv_args.kv_item_lens)
     gpu_id = kv_args.gpu_id
-    device = f"cuda:{gpu_id}"
+    device = f"{_bare_device_type(device_type)}:{gpu_id}"
 
     custom_mem_pool, _ = _get_custom_mem_pool(device)
 
@@ -735,15 +758,11 @@ def init_staging_buffers(
     return buffers
 
 
-def init_staging_allocator(register_fn, kv_args):
+def init_staging_allocator(register_fn, kv_args, *, device_type: str):
     """Create decode-side staging ring-buffer allocator and register with transport.
 
-    Args:
-        register_fn: callable(ptr: int, size: int) that registers a memory
-            region with the transport backend.
-        kv_args: KVArgs with gpu_id.
-
-    Returns a StagingAllocator instance.
+    ``register_fn`` is called as ``register_fn(ptr, size)`` to hand the region to
+    the transport backend. Returns a StagingAllocator.
     """
     from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
     from sglang.srt.environ import envs
@@ -751,7 +770,7 @@ def init_staging_allocator(register_fn, kv_args):
     pool_size_mb = envs.SGLANG_DISAGG_STAGING_POOL_SIZE_MB.get()
     pool_size_bytes = pool_size_mb * 1024 * 1024
     gpu_id = kv_args.gpu_id
-    device = f"cuda:{gpu_id}"
+    device = f"{_bare_device_type(device_type)}:{gpu_id}"
 
     custom_mem_pool, _ = _get_custom_mem_pool(device)
     allocator = StagingAllocator(pool_size_bytes, device, gpu_id, custom_mem_pool)

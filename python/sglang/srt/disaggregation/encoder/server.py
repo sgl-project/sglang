@@ -68,7 +68,7 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import configure_media_url_security
+from sglang.srt.utils import configure_media_url_security, current_device_stream
 from sglang.srt.utils.network import (
     NetworkAddress,
     config_socket,
@@ -398,7 +398,7 @@ class TensorWrapper:
 
     def __init__(self, tensor):
         # Ensure tensor is on CPU and contiguous
-        if tensor.is_cuda:
+        if tensor.device.type != "cpu":
             tensor = tensor.cpu()
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
@@ -1555,7 +1555,7 @@ class MMEncoder:
                         copied += n
                 offset += num_tokens
 
-            torch.cuda.current_stream(self.device).synchronize()
+            current_device_stream(self.device).synchronize()
             return mm_embedding
         finally:
             if hit_view_hashes:
@@ -1605,7 +1605,7 @@ class MMEncoder:
             offset += num_tokens
 
         self.mm_global_cache.wait_load_to_device(copy_handles)
-        torch.cuda.current_stream(mm_embedding.device).synchronize()
+        current_device_stream(mm_embedding.device).synchronize()
         return mm_embedding
 
     async def _compute_global_cache_embedding(
@@ -2174,10 +2174,10 @@ class MMEncoder:
                 item_offset = item_end
                 token_offset += num_tokens
 
-            # transfer_sync bypasses CUDA streams, so GPU writes (forward and the
-            # per-request clones) must land before /send reads the buffers.
-            if keep_on_gpu and mm_embedding.is_cuda:
-                torch.cuda.current_stream(mm_embedding.device).synchronize()
+            # transfer_sync bypasses device streams, so device writes (forward and
+            # the per-request clones) must land before /send reads the buffers.
+            if keep_on_gpu and mm_embedding.device.type != "cpu":
+                current_device_stream(mm_embedding.device).synchronize()
             self._stage_embedding_batch(staged_embeddings)
             return results
         except BaseException:
