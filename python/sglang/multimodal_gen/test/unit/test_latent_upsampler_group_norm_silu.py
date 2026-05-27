@@ -31,9 +31,11 @@ import pytest
 import torch
 
 import sglang.multimodal_gen.runtime.models.upsampler.latent_upsampler as lu_mod
+from sglang.jit_kernel.diffusion.group_norm_silu import apply_group_norm_silu
 from sglang.multimodal_gen.runtime.models.upsampler.latent_upsampler import (
     LatentUpsampler,
     ResBlock,
+    SpatialRationalResampler,
 )
 
 
@@ -79,9 +81,16 @@ def _latent_upsampler_eager_reference(
         x = upsampler.initial_activation(upsampler.initial_norm(x))  # fused site
         for block in upsampler.res_blocks:
             x = _resblock_eager_reference(block, x)
+        # Mirror the three-branch dispatch in production
+        # ``LatentUpsampler.forward`` (3D path): temporal_upsample uses a
+        # 5D upsampler + temporal slice; SpatialRationalResampler is invoked
+        # directly on the 5D tensor (its own forward flattens internally);
+        # otherwise we flatten temporal-into-batch around a 4D upsampler.
         if upsampler.temporal_upsample:
             x = upsampler.upsampler(x)
             x = x[:, :, 1:, :, :]
+        elif isinstance(upsampler.upsampler, SpatialRationalResampler):
+            x = upsampler.upsampler(x)
         else:
             x = rearrange(x, "b c f h w -> (b f) c h w")
             x = upsampler.upsampler(x)
@@ -122,18 +131,26 @@ def test_resblock_forward_parity(batch, channels, dims, spatial):
 
 
 @pytest.mark.parametrize(
-    "dims,latent_shape,mid_channels,num_blocks_per_stage",
+    "dims,latent_shape,mid_channels,num_blocks_per_stage,rational_resampler",
     [
-        # 2D conv path
-        (2, (1, 32, 2, 16, 16), 64, 2),
-        # 3D conv path with spatial upsample
-        (3, (1, 32, 2, 16, 16), 64, 2),
+        # 2D conv path (rational_resampler=True is invalid for dims=2: the
+        # 2D forward flattens before calling self.upsampler, but
+        # SpatialRationalResampler.forward expects 5D input, so production
+        # only supports rational_resampler with dims=3).
+        (2, (1, 32, 2, 16, 16), 64, 2, False),
+        # 3D conv path with Conv3d + PixelShuffleND spatial upsampler
+        (3, (1, 32, 2, 16, 16), 64, 2, False),
+        # 3D conv path with SpatialRationalResampler -- production loader
+        # exposes rational_resampler=True via LTX-2 spatial upscaler configs,
+        # and this branch hits a different upsampler dispatch in the forward.
+        (3, (1, 32, 2, 16, 16), 64, 2, True),
     ],
 )
 def test_latent_upsampler_forward_parity(
-    dims, latent_shape, mid_channels, num_blocks_per_stage
+    dims, latent_shape, mid_channels, num_blocks_per_stage, rational_resampler
 ):
-    """LatentUpsampler.forward matches explicit eager across 2D / 3D paths."""
+    """LatentUpsampler.forward matches explicit eager across 2D / 3D paths
+    and across the rational vs non-rational spatial upsampler dispatch."""
     _seed(2)
     upsampler = LatentUpsampler(
         in_channels=latent_shape[1],
@@ -143,7 +160,7 @@ def test_latent_upsampler_forward_parity(
         spatial_upsample=True,
         temporal_upsample=False,
         spatial_scale=2.0,
-        rational_resampler=False,
+        rational_resampler=rational_resampler,
     ).eval()
 
     _seed(3)
@@ -177,16 +194,19 @@ def test_resblock_fuses_exactly_one_site():
 
 
 @pytest.mark.parametrize(
-    "dims,num_blocks_per_stage,expected_calls",
+    "dims,num_blocks_per_stage,rational_resampler,expected_calls",
     [
-        # 1 initial site + (num_blocks_per_stage * 2 ResBlocks, 1 each)
-        (2, 2, 1 + 2 * 2),
-        (2, 4, 1 + 4 * 2),
-        (3, 2, 1 + 2 * 2),
+        # 1 initial site + (num_blocks_per_stage * 2 ResBlocks, 1 each).
+        # Site count is invariant under rational_resampler -- the upsampler
+        # itself has no GroupNorm sites -- but we explicitly verify that.
+        (2, 2, False, 1 + 2 * 2),
+        (2, 4, False, 1 + 4 * 2),
+        (3, 2, False, 1 + 2 * 2),
+        (3, 2, True, 1 + 2 * 2),
     ],
 )
 def test_latent_upsampler_fuses_expected_sites(
-    dims, num_blocks_per_stage, expected_calls
+    dims, num_blocks_per_stage, rational_resampler, expected_calls
 ):
     """LatentUpsampler.forward fuses 1 initial site + 1 per ResBlock (pre
     + post upsample). The 2nd norm in each ResBlock stays eager."""
@@ -199,7 +219,7 @@ def test_latent_upsampler_fuses_expected_sites(
         spatial_upsample=True,
         temporal_upsample=False,
         spatial_scale=2.0,
-        rational_resampler=False,
+        rational_resampler=rational_resampler,
     ).eval()
     latent = torch.randn(1, 32, 2, 16, 16, dtype=torch.float32)
 
@@ -293,22 +313,31 @@ def test_resblock_forward_parity_cuda(dtype, batch, channels, dims, spatial):
 @requires_cuda
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
-    "dims,latent_shape,mid_channels,num_blocks_per_stage",
+    "dims,latent_shape,mid_channels,num_blocks_per_stage,rational_resampler",
     [
         # 2D conv path
-        (2, (1, 32, 2, 16, 16), 64, 2),
-        # 3D conv path with spatial upsample (the production LTX-2 path)
-        (3, (1, 32, 2, 16, 16), 64, 2),
+        (2, (1, 32, 2, 16, 16), 64, 2, False),
+        # 3D conv path with Conv3d + PixelShuffleND spatial upsampler
+        (3, (1, 32, 2, 16, 16), 64, 2, False),
+        # 3D conv path with SpatialRationalResampler (different upsampler
+        # dispatch; production LTX-2 spatial upscaler configs use this).
+        (3, (1, 32, 2, 16, 16), 64, 2, True),
     ],
 )
 def test_latent_upsampler_forward_parity_cuda(
-    dtype, dims, latent_shape, mid_channels, num_blocks_per_stage
+    dtype,
+    dims,
+    latent_shape,
+    mid_channels,
+    num_blocks_per_stage,
+    rational_resampler,
 ):
     """LatentUpsampler.forward on CUDA bf16/fp16 end-to-end parity. Each
     forward fires the Triton kernel 1 + 2 * num_blocks_per_stage times
     (initial + pre/post-upsample ResBlocks). The fp16 tolerance is looser
     than ResBlock's because 8+ conv layers downstream amplify fp16
-    quantization (see _UPSAMPLER_TOL comment above)."""
+    quantization (see _UPSAMPLER_TOL comment above); the localized
+    fused-site test below gives the precise per-kernel signal."""
     _seed(2)
     device = torch.device("cuda")
     upsampler = (
@@ -320,7 +349,7 @@ def test_latent_upsampler_forward_parity_cuda(
             spatial_upsample=True,
             temporal_upsample=False,
             spatial_scale=2.0,
-            rational_resampler=False,
+            rational_resampler=rational_resampler,
         )
         .to(device=device, dtype=dtype)
         .eval()
@@ -362,3 +391,72 @@ def test_resblock_actually_uses_triton_kernel_cuda():
         "Expected the Triton fused kernel to fire at least once on CUDA bf16; "
         f"got call_count={mock_triton.call_count} (helper fell back to eager?)"
     )
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "dims,latent_shape,mid_channels",
+    [
+        (2, (1, 32, 2, 16, 16), 64),
+        (3, (1, 32, 2, 16, 16), 64),
+    ],
+)
+def test_initial_groupnorm_silu_parity_cuda_local(
+    dtype, dims, latent_shape, mid_channels
+):
+    """Local CUDA parity at the *boundary* of the fused initial GroupNorm
+    + SiLU site, before any downstream conv can amplify differences.
+
+    The end-to-end ``test_latent_upsampler_forward_parity_cuda`` necessarily
+    uses a looser tolerance on fp16 because 8+ conv layers downstream
+    accumulate quantization drift between the fused and eager paths -- which
+    is honest about the e2e numerics but loose enough that a real kernel
+    regression could slip through. This test isolates the fused site so we
+    get a precise per-kernel signal: build the upsampler, run only the prefix
+    of the forward up to (and including) the fused site, and compare the
+    fused vs eager outputs of ``apply_group_norm_silu`` at the same tolerance
+    the kernel-level test in
+    ``jit_kernel/tests/diffusion/test_group_norm_silu.py`` uses
+    (``_RESBLOCK_TOL`` -- bf16: 7e-2/2e-2; fp16: 3e-3/3e-3).
+    """
+    _seed(2)
+    device = torch.device("cuda")
+    upsampler = (
+        LatentUpsampler(
+            in_channels=latent_shape[1],
+            mid_channels=mid_channels,
+            num_blocks_per_stage=2,
+            dims=dims,
+            spatial_upsample=True,
+            temporal_upsample=False,
+            spatial_scale=2.0,
+            rational_resampler=False,
+        )
+        .to(device=device, dtype=dtype)
+        .eval()
+    )
+
+    _seed(3)
+    latent = torch.randn(*latent_shape, device=device, dtype=dtype)
+
+    # Mirror the prefix of LatentUpsampler.forward up to the fused site.
+    with torch.no_grad():
+        if dims == 2:
+            b, _, f, _, _ = latent.shape
+            from einops import rearrange
+
+            x_in = rearrange(latent, "b c f h w -> (b f) c h w")
+        else:
+            x_in = latent
+        x_after_conv = upsampler.initial_conv(x_in)
+
+        out_fused = apply_group_norm_silu(
+            x_after_conv, upsampler.initial_norm, upsampler.initial_activation
+        )
+        out_eager = upsampler.initial_activation(
+            upsampler.initial_norm(x_after_conv)
+        )
+
+    atol, rtol = _RESBLOCK_TOL[dtype]
+    torch.testing.assert_close(out_fused, out_eager, atol=atol, rtol=rtol)
