@@ -13,7 +13,6 @@ import torch
 from sglang.srt.managers.cache_controller import CacheOperation as BaseCacheOperation
 from sglang.srt.managers.cache_controller import (
     HiCacheAck,
-    make_timing_event,
 )
 from sglang.srt.managers.cache_controller import (
     HiCacheController as BaseHiCacheController,
@@ -23,6 +22,9 @@ from sglang.srt.managers.cache_controller import (
 )
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
+)
+from sglang.srt.managers.cache_controller import (
+    make_timing_event,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
@@ -494,10 +496,11 @@ class HybridCacheController(BaseHiCacheController):
 
         ack_start_event = make_timing_event()
         ack_finish_event = make_timing_event()
-        ack_start_event.record()
 
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
+            if ack_start_event is not None:
+                ack_start_event.record()
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
@@ -520,7 +523,8 @@ class HybridCacheController(BaseHiCacheController):
                         self.io_backend,
                     )
                 producer_event.complete(i)
-            ack_finish_event.record()
+            if ack_finish_event is not None:
+                ack_finish_event.record()
             self._record_transfer_indices_on_stream(
                 self.load_stream,
                 host_indices,
@@ -530,9 +534,13 @@ class HybridCacheController(BaseHiCacheController):
         self.ack_load_queue.append(
             HiCacheAck(
                 ack_start_event,
-                ack_finish_event,
+                (
+                    ack_finish_event
+                    if ack_finish_event is not None
+                    else producer_event.finish_event
+                ),
                 op.node_ids,
-                num_tokens=len(op.host_indices),
+                num_tokens=len(op.device_indices),
             )
         )
         return producer_id
