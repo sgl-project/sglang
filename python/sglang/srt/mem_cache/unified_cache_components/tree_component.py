@@ -115,6 +115,24 @@ class TreeComponent(ABC):
         value = node.component_data[self.component_type].value
         return len(value) if value is not None else 0
 
+    def refresh_lru_on_walkdown(self, node: UnifiedTreeNode) -> None:
+        cd = node.component_data[self.component_type]
+        if cd.value is None:
+            return
+        self.cache.lru_lists[self.component_type].reset_node_mru(node)
+
+    def refresh_lru_on_match_end(
+        self, last_node: UnifiedTreeNode, root_node: UnifiedTreeNode
+    ) -> None:
+        self.cache.lru_lists[self.component_type].reset_node_and_parents_mru(
+            last_node, root_node, self.node_has_component_data
+        )
+
+    def refresh_lru_on_insert_end(
+        self, target_node: UnifiedTreeNode, root_node: UnifiedTreeNode
+    ) -> None:
+        return
+
     @abstractmethod
     def create_match_validator(
         self, match_device_only: bool = False

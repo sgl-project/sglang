@@ -179,6 +179,24 @@ class UnifiedLRUList:
                 prev_node = node
             node = node.parent
 
+    def reset_node_and_window_ancestors_mru(
+        self,
+        node: UnifiedTreeNode,
+        root_node: UnifiedTreeNode,
+        window_size: int,
+        should_include,
+    ):
+        prev_node = self.head
+        accumulated = 0
+        while node != root_node and accumulated < window_size:
+            if should_include(node):
+                assert node.id in self.cache
+                self._remove_node(node)
+                self._add_node_after(prev_node, node)
+                prev_node = node
+            accumulated += len(node.key)
+            node = node.parent
+
     def in_list(self, node: Optional[UnifiedTreeNode]):
         return node is not None and node.id in self.cache
 
@@ -779,9 +797,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue  # Full uses last_access_time, not LRU
-            self.lru_lists[comp.component_type].reset_node_and_parents_mru(
-                node_update, self.root_node, comp.node_has_component_data
-            )
+            comp.refresh_lru_on_match_end(node_update, self.root_node)
 
         cur_time = get_and_increase_time_counter()
         while node_update:
@@ -855,7 +871,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def _touch_node(self, node: UnifiedTreeNode):
         node.last_access_time = get_and_increase_time_counter()
         if node != self.root_node:
-            self._for_each_component_lru(node, UnifiedLRUList.reset_node_mru)
+            for comp in self._components_tuple:
+                if comp.component_type == BASE_COMPONENT_TYPE:
+                    continue
+                comp.refresh_lru_on_walkdown(node)
 
     def _add_new_node(
         self,
@@ -985,6 +1004,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 params=params,
                 result=result,
             )
+
+        if target_node is not self.root_node:
+            for component in self._components_tuple:
+                if component.component_type == BASE_COMPONENT_TYPE:
+                    continue
+                component.refresh_lru_on_insert_end(target_node, self.root_node)
+
         if is_new_leaf:
             self._inc_hit_count(target_node, params.chunked)
         return result

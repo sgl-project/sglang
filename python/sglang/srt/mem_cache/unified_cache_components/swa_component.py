@@ -60,6 +60,29 @@ class SWAComponent(TreeComponent):
             full_indices
         )
 
+    def refresh_lru_on_walkdown(self, node: UnifiedTreeNode) -> None:
+        return
+
+    def _bounded_refresh(
+        self, last_node: UnifiedTreeNode, root_node: UnifiedTreeNode
+    ) -> None:
+        self.cache.lru_lists[self.component_type].reset_node_and_window_ancestors_mru(
+            last_node,
+            root_node,
+            self.sliding_window_size + self.cache.page_size,
+            self.node_has_component_data,
+        )
+
+    def refresh_lru_on_match_end(
+        self, last_node: UnifiedTreeNode, root_node: UnifiedTreeNode
+    ) -> None:
+        self._bounded_refresh(last_node, root_node)
+
+    def refresh_lru_on_insert_end(
+        self, target_node: UnifiedTreeNode, root_node: UnifiedTreeNode
+    ) -> None:
+        self._bounded_refresh(target_node, root_node)
+
     def _restore_device_value(self, node: UnifiedTreeNode, value: torch.Tensor) -> None:
         ct = self.component_type
         node.component_data[ct].value = value

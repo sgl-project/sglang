@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
 )
 from sglang.srt.mem_cache.unified_radix_cache import (
+    UnifiedLRUList,
     UnifiedRadixCache,
     UnifiedTreeNode,
 )
@@ -1061,6 +1062,192 @@ class UnifiedRadixCacheSuite:
             DecLockRefParams(swa_uuid_for_lock=lock_result.swa_uuid_for_lock),
         )
         tree.sanity_check()
+
+    def _swa_lru_order(self, tree):
+        lru = tree.lru_lists[ComponentType.SWA]
+        pt = lru._pt
+        nodes: list = []
+        cur = lru.head.lru_next[pt]
+        while cur is not lru.tail:
+            nodes.append(cur)
+            cur = cur.lru_next[pt]
+        return nodes
+
+    def _swa_pinning_cfg_supported(self) -> bool:
+        return (
+            self.cfg.has_swa
+            and not self.cfg.has_mamba
+            and self.cfg.page_size == 1
+            and self.cfg.sliding_window_size == 4
+        )
+
+    def test_swa_lru_walk_down_does_not_refresh_ancestors_during_insert(self):
+        if not self._swa_pinning_cfg_supported():
+            self.skipTest("requires page_size=1, sliding_window_size=4, SWA, no Mamba")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        seq_a = self._make_seq(1, 8)
+        seq_ab = seq_a + self._make_seq(100, 8)
+        seq_abc = seq_ab + self._make_seq(200, 8)
+        self._insert(tree, allocator, req_to_token_pool, seq_a)
+        self._insert(tree, allocator, req_to_token_pool, seq_ab)
+        self._insert(tree, allocator, req_to_token_pool, seq_abc)
+
+        seq_side = self._make_seq(900, 5)
+        self._insert(tree, allocator, req_to_token_pool, seq_side)
+
+        pre = self._swa_lru_order(tree)
+        self.assertEqual(len(pre), 4)
+        side_node, c_node, b_node, a_node = pre
+
+        seq_abcd = seq_abc + self._make_seq(300, 8)
+        self._insert(tree, allocator, req_to_token_pool, seq_abcd)
+
+        post = self._swa_lru_order(tree)
+        # new leaf E exists now, length 5
+        self.assertEqual(len(post), 5)
+        # side branch must still appear BEFORE B and A in MRU->LRU order:
+        # bounded refresh on new leaf E (size=8 >= cushion=5) refreshes only E.
+        side_pos = post.index(side_node)
+        b_pos = post.index(b_node)
+        a_pos = post.index(a_node)
+        self.assertLess(
+            side_pos,
+            b_pos,
+            f"side branch must remain ahead of B (no walk-down refresh); "
+            f"post={[n.id for n in post]}, side={side_node.id}, B={b_node.id}",
+        )
+        self.assertLess(
+            side_pos,
+            a_pos,
+            f"side branch must remain ahead of A (no walk-down refresh); "
+            f"post={[n.id for n in post]}, side={side_node.id}, A={a_node.id}",
+        )
+        tree.sanity_check()
+
+    def test_swa_lru_match_only_refreshes_window_cushion(self):
+        if not self._swa_pinning_cfg_supported():
+            self.skipTest("requires page_size=1, sliding_window_size=4, SWA, no Mamba")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        seq_a = self._make_seq(1, 8)
+        seq_ab = seq_a + self._make_seq(100, 8)
+        seq_abc = seq_ab + self._make_seq(200, 8)
+        self._insert(tree, allocator, req_to_token_pool, seq_a)
+        self._insert(tree, allocator, req_to_token_pool, seq_ab)
+        self._insert(tree, allocator, req_to_token_pool, seq_abc)
+
+        seq_side = self._make_seq(900, 5)
+        self._insert(tree, allocator, req_to_token_pool, seq_side)
+
+        pre = self._swa_lru_order(tree)
+        self.assertEqual(len(pre), 4)
+        side_node, c_node, b_node, a_node = pre
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq_abc)))
+        self.assertEqual(len(m.device_indices), len(seq_abc))
+
+        post = self._swa_lru_order(tree)
+        self.assertIs(post[0], c_node, "C (last matched node) must be MRU")
+        self.assertIs(
+            post[-1],
+            a_node,
+            "Oldest out-of-cushion ancestor A must remain at LRU tail; "
+            f"got post={[n.id for n in post]}, "
+            f"pre={[n.id for n in pre]}",
+        )
+        self.assertIn(
+            side_node,
+            post[:2],
+            "Side branch must NOT be pushed below ancestors after deep match; "
+            f"got post={[n.id for n in post]}",
+        )
+        tree.sanity_check()
+
+    def test_swa_lru_old_ancestors_evict_first_under_pressure(self):
+        if not self._swa_pinning_cfg_supported():
+            self.skipTest("requires page_size=1, sliding_window_size=4, SWA, no Mamba")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        seq_a = self._make_seq(1, 8)
+        seq_ab = seq_a + self._make_seq(100, 8)
+        seq_abc = seq_ab + self._make_seq(200, 8)
+        self._insert(tree, allocator, req_to_token_pool, seq_a)
+        self._insert(tree, allocator, req_to_token_pool, seq_ab)
+        self._insert(tree, allocator, req_to_token_pool, seq_abc)
+
+        seq_side = self._make_seq(900, 5)
+        self._insert(tree, allocator, req_to_token_pool, seq_side)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq_abc)))
+        self.assertEqual(len(m.device_indices), len(seq_abc))
+
+        m_side_before = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq_side)))
+        self.assertEqual(len(m_side_before.device_indices), len(seq_side))
+
+        tree.evict(EvictParams(num_tokens=0, swa_num_tokens=4))
+
+        m_side_after = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq_side)))
+        self.assertEqual(
+            len(m_side_after.device_indices),
+            len(seq_side),
+            "Side branch SWA must survive eviction; oldest ancestors (A) "
+            "should be evicted first under bounded SWA LRU refresh.",
+        )
+        tree.sanity_check()
+
+    def test_swa_lru_cushion_bound_is_sliding_window_plus_page_size(self):
+        if not self._swa_pinning_cfg_supported():
+            self.skipTest("requires page_size=1, sliding_window_size=4, SWA, no Mamba")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        seq_a = self._make_seq(1, 8)
+        seq_ab = seq_a + self._make_seq(100, 8)
+        seq_abc = seq_ab + self._make_seq(200, 8)
+        self._insert(tree, allocator, req_to_token_pool, seq_a)
+        self._insert(tree, allocator, req_to_token_pool, seq_ab)
+        self._insert(tree, allocator, req_to_token_pool, seq_abc)
+
+        seq_side = self._make_seq(900, 5)
+        self._insert(tree, allocator, req_to_token_pool, seq_side)
+
+        pre = self._swa_lru_order(tree)
+        self.assertEqual(len(pre), 4)
+        side_node, c_node, b_node, a_node = pre
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq_abc)))
+        self.assertEqual(len(m.device_indices), len(seq_abc))
+        post = self._swa_lru_order(tree)
+
+        cushion = self.cfg.sliding_window_size + self.cfg.page_size
+        self.assertEqual(cushion, 5)
+        self.assertGreaterEqual(len(c_node.key), cushion)
+        self.assertIs(post[0], c_node, "C alone exhausts cushion → only C refreshed")
+        # B and A: untouched ordering relative to each other AND to side_node
+        b_pos = post.index(b_node)
+        a_pos = post.index(a_node)
+        side_pos = post.index(side_node)
+        self.assertLess(side_pos, b_pos, "B was below side in pre, must stay below")
+        self.assertLess(b_pos, a_pos, "A was below B in pre, must stay below")
+        tree.sanity_check()
+
+    def test_swa_sanity_check_passes_after_deep_match(self):
+        if not self._swa_pinning_cfg_supported():
+            self.skipTest("requires page_size=1, sliding_window_size=4, SWA, no Mamba")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        seq_a = self._make_seq(1, 8)
+        seq_ab = seq_a + self._make_seq(100, 8)
+        seq_abc = seq_ab + self._make_seq(200, 8)
+        self._insert(tree, allocator, req_to_token_pool, seq_a)
+        self._insert(tree, allocator, req_to_token_pool, seq_ab)
+        self._insert(tree, allocator, req_to_token_pool, seq_abc)
+        self._insert(tree, allocator, req_to_token_pool, self._make_seq(900, 5))
+
+        for _ in range(3):
+            m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq_abc)))
+            self.assertEqual(len(m.device_indices), len(seq_abc))
+            tree.sanity_check()
 
     def test_tombstone_cleanup_respects_locked_parent(self):
         tree, _, _ = build_fixture(self.cfg)
@@ -2780,6 +2967,108 @@ class UnifiedRadixCacheSuite:
         )
 
         tree.sanity_check()
+
+
+class UnifiedLRUListBoundedRefreshTest(CustomTestCase):
+
+    components = (ComponentType.FULL, ComponentType.SWA)
+
+    def _make_node(self, key_len: int) -> UnifiedTreeNode:
+        n = UnifiedTreeNode(self.components)
+        n.key = RadixKey(list(range(key_len)))
+        return n
+
+    def _build_chain(self, key_lens: list[int]) -> tuple:
+        root = self._make_node(0)
+        nodes = []
+        parent = root
+        for kl in key_lens:
+            n = self._make_node(kl)
+            n.parent = parent
+            nodes.append(n)
+            parent = n
+        return root, nodes
+
+    def _lru_order(self, lru: UnifiedLRUList) -> list:
+        pt = lru._pt
+        out = []
+        cur = lru.head.lru_next[pt]
+        while cur is not lru.tail:
+            out.append(cur)
+            cur = cur.lru_next[pt]
+        return out
+
+    def test_bounded_refresh_stops_after_accumulated_meets_window(self):
+        root, [a, b, c, d] = self._build_chain([2, 2, 2, 2])
+        lru = UnifiedLRUList(ComponentType.SWA, self.components)
+        for n in (a, b, c, d):
+            lru.insert_mru(n)
+        self.assertEqual(self._lru_order(lru), [d, c, b, a])
+
+        # window=5, page_size=1 implicit; nodes are size 2 each
+        # Walking up from D: visit D(acc=2<5) -> visit C(acc=4<5) -> visit
+        # B(acc=6>=5, refresh and stop). A is NOT touched.
+        lru.reset_node_and_window_ancestors_mru(
+            d, root, window_size=5, should_include=lambda _n: True
+        )
+        # Expected MRU->LRU: D, C, B (refreshed in walk-up order), A (untouched)
+        self.assertEqual(self._lru_order(lru), [d, c, b, a])
+
+    def test_bounded_refresh_skips_non_included(self):
+        root, [a, b, c, d] = self._build_chain([2, 2, 2, 2])
+        lru = UnifiedLRUList(ComponentType.SWA, self.components)
+        for n in (a, c, d):  # b excluded from LRU (simulated tombstone)
+            lru.insert_mru(n)
+        self.assertEqual(self._lru_order(lru), [d, c, a])
+
+        included = {a, c, d}
+        lru.reset_node_and_window_ancestors_mru(
+            d, root, window_size=5, should_include=lambda n: n in included
+        )
+        # D, C refreshed; B contributes 2 to acc (now 6 >= 5) but is skipped;
+        # A is not visited because the walk stops at B.
+        self.assertEqual(self._lru_order(lru), [d, c, a])
+
+    def test_bounded_refresh_visits_only_until_window_filled(self):
+        root, [a, b, c, d] = self._build_chain([3, 3, 3, 3])
+        lru = UnifiedLRUList(ComponentType.SWA, self.components)
+        # MRU->LRU: A, B, C, D (deepest is at the LRU tail, oldest)
+        for n in (d, c, b, a):
+            lru.insert_mru(n)
+        self.assertEqual(self._lru_order(lru), [a, b, c, d])
+
+        # window=5: walking up from D visits D(acc=3<5) and C(acc=6>=5, stop).
+        # Order expected: [D, C, A, B]. Why: D and C move to head in that
+        # order (D first, then C right after D). A and B keep their relative
+        # positions (they were the surviving prefix [A, B] before).
+        lru.reset_node_and_window_ancestors_mru(
+            d, root, window_size=5, should_include=lambda _n: True
+        )
+        self.assertEqual(self._lru_order(lru), [d, c, a, b])
+
+    def test_bounded_refresh_stops_at_root(self):
+        root, [a, b] = self._build_chain([1, 1])
+        lru = UnifiedLRUList(ComponentType.SWA, self.components)
+        for n in (a, b):
+            lru.insert_mru(n)
+        self.assertEqual(self._lru_order(lru), [b, a])
+
+        # Big window — refresh walks A and B both, then hits root and stops.
+        lru.reset_node_and_window_ancestors_mru(
+            b, root, window_size=1000, should_include=lambda _n: True
+        )
+        self.assertEqual(self._lru_order(lru), [b, a])
+
+    def test_bounded_refresh_window_zero_is_noop(self):
+        root, [a, b, c] = self._build_chain([2, 2, 2])
+        lru = UnifiedLRUList(ComponentType.SWA, self.components)
+        for n in (a, b, c):
+            lru.insert_mru(n)
+        before = self._lru_order(lru)
+        lru.reset_node_and_window_ancestors_mru(
+            c, root, window_size=0, should_include=lambda _n: True
+        )
+        self.assertEqual(self._lru_order(lru), before)
 
 
 _CONFIGS: list[CacheConfig] = [
