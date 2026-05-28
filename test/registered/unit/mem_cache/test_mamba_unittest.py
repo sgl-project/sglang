@@ -6,7 +6,6 @@ import torch
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -411,12 +410,9 @@ class TestMamba(unittest.TestCase):
 
     def _setup_tree_and_allocator(self, enable_kv_cache_events=False):
         """Helper to create a MambaRadixCache with allocator for testing."""
-        server_args = ServerArgs(model_path="dummy", page_size=1)
-        # MambaRadixCache reads mamba_cache_chunk_size, whose property otherwise
-        # loads the HF config for self.model_path — impossible for the dummy model.
-        # Mirror the property's default for a dummy HF config: FLA_CHUNK_SIZE.
-        server_args._mamba_cache_chunk_size = FLA_CHUNK_SIZE
-        set_global_server_args_for_scheduler(server_args)
+        set_global_server_args_for_scheduler(
+            ServerArgs(model_path="dummy", page_size=1)
+        )
         size = 128
         dtype = torch.bfloat16
         head_num = 2

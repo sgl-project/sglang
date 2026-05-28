@@ -424,7 +424,6 @@ class NemotronHMambaDecoderLayer(nn.Module):
             layer_id=self.layer_id,
             hidden_states=hidden_states,
             output=output,
-            forward_batch=forward_batch,
             use_triton_causal_conv=True,
         )
         return output
