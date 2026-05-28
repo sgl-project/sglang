@@ -18,21 +18,21 @@ __device__ __forceinline__ float sigmoid_accurate(float x) {
 
 template <int N>
 struct GateConfig {
-  static_assert(N == 256 || N == 384,
-                "kimi_k2_moe_fused_gate currently only supports "
-                "NUM_EXPERTS == 256 or 384");
+  static_assert(
+      N == 256 || N == 384,
+      "kimi_k2_moe_fused_gate currently only supports "
+      "NUM_EXPERTS == 256 or 384");
   static constexpr int NUM_EXPERTS = N;
   static constexpr int WARP_SIZE = 32;
-  static constexpr int WARPS_PER_CTA = 6;          // only used by the large-token kernel
-  static constexpr int VPT = N / 32;               // 8 (256) or 12 (384)
+  static constexpr int WARPS_PER_CTA = 6;  // only used by the large-token kernel
+  static constexpr int VPT = N / 32;       // 8 (256) or 12 (384)
   static constexpr int VEC_SIZE = 4;
-  static constexpr int VEC_PER_LANE = VPT / VEC_SIZE;          // 2 or 3
-  static constexpr int WARPS_PER_TOKEN_SMALL = N / 32;         // 8 or 12
-  static constexpr int THREADS_PER_BLOCK_SMALL = N;            // 256 or 384
+  static constexpr int VEC_PER_LANE = VPT / VEC_SIZE;   // 2 or 3
+  static constexpr int WARPS_PER_TOKEN_SMALL = N / 32;  // 8 or 12
+  static constexpr int THREADS_PER_BLOCK_SMALL = N;     // 256 or 384
   static constexpr int SMALL_TOKEN_THRESHOLD = 512;
-  static constexpr int MAX_TOPK = 8;               // must match TORCH_CHECK(topk <= 8) at the host launcher
-  static_assert(VPT % VEC_SIZE == 0,
-                "VPT must be a multiple of VEC_SIZE for the float4 vec load");
+  static constexpr int MAX_TOPK = 8;  // must match TORCH_CHECK(topk <= 8) at the host launcher
+  static_assert(VPT % VEC_SIZE == 0, "VPT must be a multiple of VEC_SIZE for the float4 vec load");
 };
 
 // Small-token kernel: 1 block per token, NUM_EXPERTS threads (1 thread = 1 expert).
@@ -316,15 +316,10 @@ std::vector<at::Tensor> kimi_k2_moe_fused_gate(
   int64_t num_rows = input.size(0);
   int32_t num_experts = input.size(1);
 
-  TORCH_CHECK(input.dtype() == bias.dtype(),
-              "input and bias should have the same dtype");
-  TORCH_CHECK(input.scalar_type() == at::kFloat,
-              "kimi_k2_moe_fused_gate only supports float32 input");
-  TORCH_CHECK(bias.scalar_type() == at::kFloat,
-              "kimi_k2_moe_fused_gate only supports float32 bias");
-  TORCH_CHECK(topk <= 8,
-              "kimi_k2_moe_fused_gate only supports topk <= 8 (got ",
-              topk, ")");
+  TORCH_CHECK(input.dtype() == bias.dtype(), "input and bias should have the same dtype");
+  TORCH_CHECK(input.scalar_type() == at::kFloat, "kimi_k2_moe_fused_gate only supports float32 input");
+  TORCH_CHECK(bias.scalar_type() == at::kFloat, "kimi_k2_moe_fused_gate only supports float32 bias");
+  TORCH_CHECK(topk <= 8, "kimi_k2_moe_fused_gate only supports topk <= 8 (got ", topk, ")");
 
   auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
   auto output = torch::empty({num_rows, topk}, options);
@@ -334,19 +329,35 @@ std::vector<at::Tensor> kimi_k2_moe_fused_gate(
 
   switch (num_experts) {
     case 256:
-      launch_for_n<256>(input, bias, output, indices, topk, renormalize,
-                        routed_scaling_factor, apply_routed_scaling_factor_on_output,
-                        stream);
+      launch_for_n<256>(
+          input,
+          bias,
+          output,
+          indices,
+          topk,
+          renormalize,
+          routed_scaling_factor,
+          apply_routed_scaling_factor_on_output,
+          stream);
       break;
     case 384:
-      launch_for_n<384>(input, bias, output, indices, topk, renormalize,
-                        routed_scaling_factor, apply_routed_scaling_factor_on_output,
-                        stream);
+      launch_for_n<384>(
+          input,
+          bias,
+          output,
+          indices,
+          topk,
+          renormalize,
+          routed_scaling_factor,
+          apply_routed_scaling_factor_on_output,
+          stream);
       break;
     default:
-      TORCH_CHECK(false,
-                  "kimi_k2_moe_fused_gate only supports num_experts in "
-                  "{256, 384}, got ", num_experts);
+      TORCH_CHECK(
+          false,
+          "kimi_k2_moe_fused_gate only supports num_experts in "
+          "{256, 384}, got ",
+          num_experts);
   }
 
   return {output, indices};

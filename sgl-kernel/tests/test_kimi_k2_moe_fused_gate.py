@@ -6,11 +6,10 @@ from sgl_kernel import kimi_k2_moe_fused_gate
 
 from sglang.srt.layers.moe.topk import kimi_k2_biased_topk_impl
 
-
 # (num_experts, topk, routed_scaling_factor)
 _CONFIGS = [
     (384, 6, 2.872),  # Kimi K2
-    (256, 8, 1.0),    # MiMo V2.5
+    (256, 8, 1.0),  # MiMo V2.5
 ]
 
 
