@@ -308,7 +308,7 @@ class AutoRoundConfig(QuantizationConfig):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization.gptq import (
-            GPTQConfig,
+            GPTQAscendConfig,
             GPTQLinearAscendMethod,
             GPTQMoEAscendMethod,
         )
@@ -335,7 +335,7 @@ class AutoRoundConfig(QuantizationConfig):
             sym,
         )
         if _is_npu:
-            quant_args = GPTQConfig(
+            quant_args = GPTQAscendConfig(
                 weight_bits=weight_bits,
                 group_size=group_size,
                 lm_head_quantized=False,
