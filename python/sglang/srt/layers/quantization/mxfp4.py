@@ -1787,17 +1787,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_scale_f32 = torch.exp2(
                     (layer.w2_weight_scale.to(torch.int32) - 127).to(torch.float32)
                 )
-                # gemm1_alpha / gemm1_clamp_limit are per-expert Parameters;
-                # extract scalar (all experts share the same value).
-                gemm1_alpha = 1.702
-                gemm1_limit = 7.0
+                # Read activation and gemm1 scaling params from the layer's
+                # MoeRunnerConfig so this path is not hardcoded to GPT-OSS-20b.
+                # For GPT-OSS: activation="silu" + gemm1_alpha set → sgl_fused_experts
+                # selects ACT_SWIGLU_GPT_OSS (type=2) internally.
+                # For other MXFP4 MoE models: activation comes from model config,
+                # gemm1_alpha/gemm1_clamp_limit are None → standard silu/gelu path.
+                activation = layer.moe_runner_config.activation
+                gemm1_alpha = layer.moe_runner_config.gemm1_alpha
+                gemm1_clamp_limit = layer.moe_runner_config.gemm1_clamp_limit
+                # Also check for per-expert Parameter tensors on the layer
+                # (loaded from checkpoint); prefer those over runner config scalars.
                 if hasattr(layer, "gemm1_alpha") and layer.gemm1_alpha is not None:
                     gemm1_alpha = float(layer.gemm1_alpha.flatten()[0].item())
                 if (
                     hasattr(layer, "gemm1_clamp_limit")
                     and layer.gemm1_clamp_limit is not None
                 ):
-                    gemm1_limit = float(layer.gemm1_clamp_limit.flatten()[0].item())
+                    gemm1_clamp_limit = float(
+                        layer.gemm1_clamp_limit.flatten()[0].item()
+                    )
                 output = sgl_fused_experts(
                     hidden_states=x,
                     w1=layer.w13_weight.view(torch.int8),
@@ -1806,10 +1815,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     topk_ids=topk_ids,
                     b1=getattr(layer, "w13_weight_bias", None),
                     b2=getattr(layer, "w2_weight_bias", None),
-                    # GPT-OSS MXFP4 weights use interleaved [g0,u0,g1,u1,...] layout;
-                    # ACT_SWIGLU_GPT_OSS=2 is required.  "silu" (ActType=0)
-                    # assumes block-split layout and produces garbage for this model.
-                    activation="silu",
+                    activation=activation,
                     use_mxfp4_w4a16=True,
                     w1_scale=w1_scale_f32,
                     w2_scale=w2_scale_f32,
@@ -1817,7 +1823,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         self.runner.config, "routed_scaling_factor", None
                     ),
                     gemm1_alpha=gemm1_alpha,
-                    gemm1_limit=gemm1_limit,
+                    gemm1_limit=gemm1_clamp_limit,
                 )
                 return StandardCombineInput(hidden_states=output)
             quant_info = TritonMoeQuantInfo(

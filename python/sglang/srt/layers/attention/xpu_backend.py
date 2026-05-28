@@ -104,6 +104,44 @@ class XPUAttentionBackend(AttentionBackend):
         )
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
 
+        # Mirror buffers: lazily allocated bf16 copies of fp8 KV cache per layer.
+        # Avoids re-creating a full bf16 tensor on every prefill/decode step;
+        # only newly written pages are copied incrementally.
+        self._kv_mirror_key: dict = {}
+        self._kv_mirror_val: dict = {}
+        self._kv_mirror_num_pages: dict = {}
+
+    def _get_kv_mirror(self, layer_id, key_cache_fp8, value_cache_fp8, compute_dtype):
+        """Return lazily-allocated bf16 mirrors of fp8 KV cache tensors.
+
+        Only pages beyond the previously synced count are copied, so the cost
+        per step is proportional to newly-written pages rather than the full
+        cache size.
+        """
+        num_pages = key_cache_fp8.shape[0]
+        synced = self._kv_mirror_num_pages.get(layer_id, 0)
+        if (
+            layer_id not in self._kv_mirror_key
+            or self._kv_mirror_key[layer_id].shape != key_cache_fp8.shape
+            or self._kv_mirror_key[layer_id].dtype != compute_dtype
+        ):
+            self._kv_mirror_key[layer_id] = torch.empty_like(
+                key_cache_fp8, dtype=compute_dtype
+            )
+            self._kv_mirror_val[layer_id] = torch.empty_like(
+                value_cache_fp8, dtype=compute_dtype
+            )
+            synced = 0
+        if num_pages > synced:
+            self._kv_mirror_key[layer_id][synced:num_pages].copy_(
+                key_cache_fp8[synced:num_pages]
+            )
+            self._kv_mirror_val[layer_id][synced:num_pages].copy_(
+                value_cache_fp8[synced:num_pages]
+            )
+            self._kv_mirror_num_pages[layer_id] = num_pages
+        return self._kv_mirror_key[layer_id], self._kv_mirror_val[layer_id]
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()
@@ -563,15 +601,17 @@ class XPUAttentionBackend(AttentionBackend):
             value_cache = value_cache.view(
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             )
-            # XPU flash-attn does not support fp8 inputs; cast fp8 kv cache
-            # back to the compute dtype (bf16/fp16) before calling flash_attn.
+            # XPU flash-attn does not support fp8 inputs; use a lazy mirror
+            # buffer to avoid re-allocating and copying the full KV cache on
+            # every prefill step.  Only newly-written pages are copied.
             # This only fires when kv_cache_quant_algo=FP8 is set in the model
             # config (e.g. nvidia/Llama-3.3-70B-Instruct-FP8).  All other models
             # have key_cache.dtype == q.dtype already so the branch is skipped.
             _prefill_compute_dtype = q.dtype
             if key_cache.dtype != _prefill_compute_dtype:
-                key_cache = key_cache.to(_prefill_compute_dtype)
-                value_cache = value_cache.to(_prefill_compute_dtype)
+                key_cache, value_cache = self._get_kv_mirror(
+                    layer.layer_id, key_cache, value_cache, _prefill_compute_dtype
+                )
             if layer.is_cross_attention:
                 page_table = metadata.encoder_page_table
                 cache_seqlens = metadata.encoder_lens_int32
@@ -865,13 +905,16 @@ class XPUAttentionBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             )
 
-            # XPU flash-attn does not support fp8 inputs; cast fp8 kv cache
-            # and q back to compute dtype before any flash_attn call.
-            # compute_dtype was saved before q was cast to kv_cache_dtype above.
+            # XPU flash-attn does not support fp8 inputs; use a lazy mirror
+            # buffer to avoid re-allocating and copying the full KV cache on
+            # every decode step.  Only newly-written pages are copied.
+            # q is cast directly (.to()) since it is a small per-step tensor.
             # Only fires for models with kv_cache_quant_algo=FP8 (e.g. Llama-3.3-FP8).
-            if key_cache.dtype != compute_dtype or q.dtype != compute_dtype:
-                key_cache = key_cache.to(compute_dtype)
-                value_cache = value_cache.to(compute_dtype)
+            if key_cache.dtype != compute_dtype:
+                key_cache, value_cache = self._get_kv_mirror(
+                    layer.layer_id, key_cache, value_cache, compute_dtype
+                )
+            if q.dtype != compute_dtype:
                 q = q.to(compute_dtype)
 
             if layer.is_cross_attention:
