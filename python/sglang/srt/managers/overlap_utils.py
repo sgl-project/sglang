@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_npu = is_npu()
 
 # Token-buf consume tracking: init to -1, assert non-negative on gather,
 # write -1 back. Catches "gather without intermediate stash" bugs. CI enables
@@ -33,7 +34,7 @@ def _assert_nonneg_and_invalidate(
     buf[indices] = -1
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=_is_npu)
 def _gather_spec_extras(
     indices: torch.Tensor,
     topk_p_buf: torch.Tensor,
