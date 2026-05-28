@@ -353,9 +353,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ct: UnifiedLRUList(ct, self.tree_components, use_host_ptr=True)
             for ct in self.tree_components
         }
+        # Keyed by a monotonic op_id (not node.id) so concurrent partial
+        # backups on the same node each register a distinct in-flight entry
+        # without colliding. Each entry's lock_params is released when the
+        # matching ack arrives, regardless of arrival order.
         self.ongoing_write_through: dict[
             int, tuple[UnifiedTreeNode, Optional[DecLockRefParams]]
         ] = {}
+        self._next_write_op_id: int = 0
         self.ongoing_load_back: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
@@ -1389,9 +1394,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         an evict-then-restore path reinstates an aux device value while
         FULL.host_value still exists.
 
-        Returns the number of newly backed-up tokens (FULL + aux). 0 means
-        nothing was backed up (already complete, conditions not met, or a
-        backup for this node is already in flight).
+        Reentry on the same node is supported: each call allocates a fresh
+        op_id and registers an independent entry in ``ongoing_write_through``,
+        so its lock is released independently when the matching ack arrives.
+
+        Returns the number of newly backed-up tokens (FULL + aux); 0 means
+        nothing was backed up (already complete or controller refused).
         """
         if self.cache_controller is None:
             return 0
@@ -1402,13 +1410,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         ):
             if self.write_backup(node.parent) <= 0:
                 return 0
-
-        # Same-node reentry: bail out. Re-issuing while a previous backup is
-        # still in flight would overwrite ongoing_write_through[node.id] and
-        # lose the first lock, leaving the node permanently locked. Commit 2
-        # will lift this restriction.
-        if node.id in self.ongoing_write_through:
-            return 0
 
         cd_full = node.component_data[BASE_COMPONENT_TYPE]
         full_needs_backup = cd_full.value is not None and cd_full.host_value is None
@@ -1457,9 +1458,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 (0,), dtype=torch.int64, device=self.token_to_kv_pool_allocator.device
             )
         )
+        # Allocate a fresh op_id so concurrent partial backups on the same
+        # node never collide on the same dict key.
+        op_id = self._next_write_op_id
+        self._next_write_op_id = (self._next_write_op_id + 1) & 0x3FFFFFFF
         host_indices = self.cache_controller.write(
             write_device_indices,
-            node_id=node.id,
+            node_id=op_id,
             extra_pools=aux_xfers or None,
         )
         if host_indices is None:
@@ -1483,7 +1488,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         lock_params = None
         if not write_back:
             lock_params = self.inc_lock_ref(node).to_dec_params()
-        self.ongoing_write_through[node.id] = (node, lock_params)
+        self.ongoing_write_through[op_id] = (node, lock_params)
 
         backed_up = len(host_indices)
         for xfers in comp_xfers.values():
@@ -2665,12 +2670,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
 
         # ── PART 5: Ongoing Operations ──
-        for nid, (n, _) in self.ongoing_write_through.items():
+        for op_id, (n, _) in self.ongoing_write_through.items():
             if n not in all_node_set:
-                E(f"[Ongoing] write_through node {nid} not in tree")
+                E(f"[Ongoing] write_through op {op_id} (node {n.id}) not in tree")
             elif n.component_data[FCT].lock_ref <= 0:
                 E(
-                    f"[Ongoing] write_through node {nid} lock_ref={n.component_data[FCT].lock_ref}"
+                    f"[Ongoing] write_through op {op_id} (node {n.id}) "
+                    f"lock_ref={n.component_data[FCT].lock_ref}"
                 )
         for nid, (n, _) in self.ongoing_load_back.items():
             if n not in all_node_set:
