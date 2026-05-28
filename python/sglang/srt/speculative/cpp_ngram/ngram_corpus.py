@@ -34,7 +34,6 @@ class NgramCorpus:
             external_sam_budget=external_sam_budget,
             external_corpus_max_tokens=external_corpus_max_tokens,
         )
-        self.default_mask = np.ones((1, 1), dtype=np.int64)
         self.draft_token_num = draft_token_num
         self.external_corpus_max_tokens = external_corpus_max_tokens
         self._req_id_to_state_id: Dict[str, int] = {}
@@ -90,7 +89,7 @@ class NgramCorpus:
         old_count = self._corpus_token_counts.pop(corpus_id, 0)
         self._total_loaded_tokens -= old_count
 
-    def list_external_corpora(self) -> List[str]:
+    def list_external_corpora(self) -> Dict[str, int]:
         return self._obj.list_corpora()
 
     def reset(self):

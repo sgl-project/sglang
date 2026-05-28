@@ -7,6 +7,7 @@ from sglang.srt.parser.reasoning_parser import (
     DeepSeekR1Detector,
     Gemma4Detector,
     Glm45Detector,
+    HunyuanDetector,
     KimiDetector,
     KimiK2Detector,
     Nemotron3Detector,
@@ -17,7 +18,7 @@ from sglang.srt.parser.reasoning_parser import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 class TestStreamingParseResult(CustomTestCase):
@@ -519,6 +520,99 @@ class TestGlm45Detector(CustomTestCase):
         self.assertEqual(result.normal_text, "<tool_call>tool call")
 
 
+class TestHunyuanDetector(CustomTestCase):
+    """Test cases for Hunyuan detector with tool interruption support."""
+
+    def setUp(self):
+        self.detector = HunyuanDetector()
+
+    def test_init(self):
+        """Test HunyuanDetector initialization."""
+        self.assertEqual(self.detector.think_start_token, "<think>")
+        self.assertEqual(self.detector.think_end_token, "</think>")
+        self.assertEqual(self.detector.tool_start_token, "<tool_calls>")
+        self.assertFalse(self.detector._in_reasoning)
+        self.assertTrue(self.detector.stream_reasoning)
+
+    def test_detect_and_parse_normal_reasoning(self):
+        """Test parsing normal reasoning block without tool interruption."""
+        text = "<think>Let me think about this</think>The answer is 42."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Let me think about this")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_detect_and_parse_without_thinking(self):
+        """Test parsing without thinking tokens (no_think mode)."""
+        text = "Direct answer without thinking."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_detect_and_parse_tool_interrupt(self):
+        """Test parsing with tool call interruption during reasoning."""
+        text = "<think>I need to check<tool_calls><tool_call>get_weather<tool_sep></tool_call></tool_calls>"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "I need to check")
+        self.assertIn("<tool_calls>", result.normal_text)
+
+    def test_streaming_normal_reasoning(self):
+        """Test streaming parse of normal reasoning block."""
+        self.detector.parse_streaming_increment("<think>")
+        result1 = self.detector.parse_streaming_increment("reasoning content")
+        self.assertEqual(result1.reasoning_text, "reasoning content")
+
+        result2 = self.detector.parse_streaming_increment("</think>answer")
+        self.assertEqual(result2.normal_text, "answer")
+        self.assertFalse(self.detector._in_reasoning)
+
+    def test_streaming_tool_interrupt(self):
+        """Test streaming parse interrupted by tool call section."""
+        self.detector.parse_streaming_increment("<think>")
+        result1 = self.detector.parse_streaming_increment("thinking")
+        self.assertEqual(result1.reasoning_text, "thinking")
+
+        result2 = self.detector.parse_streaming_increment("<tool_calls>")
+        self.assertEqual(result2.reasoning_text, "")
+        self.assertEqual(result2.normal_text, "<tool_calls>")
+        self.assertFalse(self.detector._in_reasoning)
+
+    def test_streaming_after_interrupt_is_normal(self):
+        """After tool interruption, subsequent chunks should be normal text."""
+        self.detector.parse_streaming_increment("<think>")
+        self.detector.parse_streaming_increment("reasoning<tool_calls>")
+        result = self.detector.parse_streaming_increment("<tool_call>data")
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "<tool_call>data")
+
+    def test_reasoning_parser_integration(self):
+        """Test Hunyuan through ReasoningParser API."""
+        parser = ReasoningParser("hunyuan")
+        self.assertIsInstance(parser.detector, HunyuanDetector)
+
+        # Non-streaming
+        reasoning, normal = parser.parse_non_stream(
+            "<think>thinking<tool_calls><tool_call>func<tool_sep></tool_call></tool_calls>"
+        )
+        self.assertEqual(reasoning, "thinking")
+        self.assertIn("<tool_calls>", normal)
+
+    def test_reasoning_parser_streaming(self):
+        """Test Hunyuan streaming through ReasoningParser API."""
+        parser = ReasoningParser("hunyuan")
+        chunks = ["<think>", "reasoning", "<tool_calls>", "<tool_call>func"]
+        all_reasoning = ""
+        all_normal = ""
+        for chunk in chunks:
+            reasoning, normal = parser.parse_stream_chunk(chunk)
+            if reasoning:
+                all_reasoning += reasoning
+            if normal:
+                all_normal += normal
+
+        self.assertEqual(all_reasoning, "reasoning")
+        self.assertIn("<tool_calls>", all_normal)
+
+
 class TestNemotron3Detector(CustomTestCase):
     def setUp(self):
         self.detector = Nemotron3Detector()
@@ -740,6 +834,9 @@ class TestReasoningParser(CustomTestCase):
         parser = ReasoningParser("glm45")
         self.assertIsInstance(parser.detector, Glm45Detector)
 
+        parser = ReasoningParser("hunyuan")
+        self.assertIsInstance(parser.detector, HunyuanDetector)
+
         parser = ReasoningParser("gemma4")
         self.assertIsInstance(parser.detector, Gemma4Detector)
 
@@ -763,6 +860,37 @@ class TestReasoningParser(CustomTestCase):
         )
         self.assertEqual(reasoning, "Let me think")
         self.assertEqual(normal, "The answer is 42.")
+
+    def test_parse_non_stream_preserves_payload_whitespace(self):
+        """Non-streaming parsing must not rewrite text inside or after reasoning."""
+        parser = ReasoningParser("qwen3")
+        reasoning, normal = parser.parse_non_stream(
+            "<think>\nLet me think\n</think>\n\nThe answer is 42.\n"
+        )
+        self.assertEqual(reasoning, "\nLet me think\n")
+        self.assertEqual(normal, "\n\nThe answer is 42.\n")
+
+    def test_parse_non_stream_strips_repeated_leading_start_tokens(self):
+        """Repeated leading start tokens are markers, not reasoning payload."""
+        parser = ReasoningParser("qwen3")
+        reasoning, normal = parser.parse_non_stream(
+            "<think><think>Let me think</think>The answer is 42."
+        )
+        self.assertEqual(reasoning, "Let me think")
+        self.assertEqual(normal, "The answer is 42.")
+
+    def test_parse_stream_chunk_preserves_payload_whitespace(self):
+        """Streaming parsing preserves the same generated payload whitespace."""
+        parser = ReasoningParser("qwen3")
+        reasoning, normal = parser.parse_stream_chunk("<think>")
+        self.assertEqual(reasoning, "")
+        self.assertEqual(normal, "")
+
+        reasoning, normal = parser.parse_stream_chunk(
+            "\nLet me think\n</think>\n\nThe answer is 42.\n"
+        )
+        self.assertEqual(reasoning, "\nLet me think\n")
+        self.assertEqual(normal, "\n\nThe answer is 42.\n")
 
     def test_parse_stream_chunk(self):
         """Test streaming chunk parsing."""
@@ -1400,6 +1528,22 @@ class TestGptOssDetectorToolCall(CustomTestCase):
             all_normal += result.normal_text
         self.assertIn("reason", all_reasoning)
         self.assertIn("done", all_normal)
+
+
+class TestPoolsideV1Registered(CustomTestCase):
+    """poolside_v1 (Laguna-XS.2) reuses the Qwen3 `<think>...</think>` envelope.
+    Request dispatch differs (Mimo-style explicit `enable_thinking=True`,
+    asserted in test_serving_chat.py), driven by
+    `reasoning_default = "explicit_enable_thinking"` on the detector."""
+
+    def test_registered_to_qwen3_subclass(self):
+        cls = ReasoningParser.DetectorMap["poolside_v1"]
+        self.assertTrue(issubclass(cls, Qwen3Detector))
+
+    def test_explicit_enable_thinking_default(self):
+        rp = ReasoningParser("poolside_v1", stream_reasoning=True)
+        self.assertEqual(rp.detector.reasoning_default, "explicit_enable_thinking")
+        self.assertTrue(rp.detector.thinks_internally)
 
 
 if __name__ == "__main__":

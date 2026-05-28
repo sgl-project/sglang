@@ -79,6 +79,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_cuda_version,
     is_blackwell_supported,
     is_cuda,
     is_flashinfer_available,
@@ -96,7 +97,7 @@ _is_tinygemm_supported = (
     and (is_sm90_supported() or is_blackwell_supported())
 )
 
-if _is_tinygemm_supported:
+if _is_tinygemm_supported and get_cuda_version()[0] < 13:
     try:
         from flashinfer.gemm import tinygemm_bf16
     except ImportError:
@@ -104,6 +105,7 @@ if _is_tinygemm_supported:
         _is_tinygemm_supported = False
 else:
     tinygemm_bf16 = None
+    _is_tinygemm_supported = False
 
 
 class GptOssConfig(PretrainedConfig):
@@ -217,7 +219,7 @@ class GptOssSparseMoeBlock(nn.Module):
             bias=True,
             quant_config=None,
             prefix=add_prefix("gate", prefix),
-            params_dtype=config.torch_dtype,
+            params_dtype=config.dtype,
         )
 
     def forward(
@@ -466,7 +468,7 @@ class GptOssDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             sliding_window_size=self.sliding_window_size,
             layer_type=config.layer_types[layer_id],
-            params_dtype=config.torch_dtype,
+            params_dtype=config.dtype,
         )
 
         self.layer_id = layer_id

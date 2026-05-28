@@ -52,7 +52,7 @@ def cache_once(fn: F) -> F:
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        key = (args, tuple(sorted(kwargs.items(), key=lambda x: x[0])))
+        key = (args, tuple(sorted(kwargs.items())))
         if key not in result_map:
             result_map[key] = fn(*args, **kwargs)
         return result_map[key]
@@ -90,7 +90,7 @@ KERNEL_PATH = _resolve_kernel_path()
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_LDFLAGS = []
-CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool, torch.dtype]
+CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, str, bool, torch.dtype]
 
 
 class CPPArgList(list[str]):
@@ -119,7 +119,7 @@ def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
     def _convert(arg: CPP_TEMPLATE_TYPE) -> str:
         if isinstance(arg, bool):
             return "true" if arg else "false"
-        if isinstance(arg, (int, float)):
+        if isinstance(arg, (int, str, float)):
             return str(arg)
         if isinstance(arg, torch.dtype):
             return CPP_DTYPE_MAP[arg]
@@ -277,7 +277,18 @@ def _jit_compile_context():
 # NOTE: this might also be used in __main__.py for compile flags export
 def _get_default_target_flags() -> List[str]:
     if is_hip_runtime():
-        return ["-DUSE_ROCM", "-std=c++20", "-O3"]
+        flags = ["-DUSE_ROCM", "-std=c++20", "-O3"]
+        # Detect FP8 type based on GPU architecture
+        try:
+            device = torch.cuda.current_device()
+            gcn_arch = torch.cuda.get_device_properties(device).gcnArchName
+            if "gfx942" in gcn_arch:
+                flags.append("-DHIP_FP8_TYPE_FNUZ=1")
+            else:
+                flags.append("-DHIP_FP8_TYPE_E4M3=1")
+        except Exception:
+            flags.append("-DHIP_FP8_TYPE_E4M3=1")
+        return flags
     else:
         return [
             get_jit_cuda_arch().jit_flag,
@@ -305,6 +316,7 @@ def get_jit_cuda_arch() -> ArchInfo:
     return _CUDA_ARCH
 
 
+@cache_once
 def is_arch_support_pdl() -> bool:
     if is_hip_runtime():
         return False

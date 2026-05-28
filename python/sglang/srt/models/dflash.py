@@ -163,8 +163,8 @@ class DFlashAttention(nn.Module):
         return k_by_head.view_as(k)
 
     def apply_k_rope(self, positions: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-        # Use a minimal dummy query (1 head) to avoid doing full-Q work.
-        dummy_q = k.new_empty((k.shape[0], self.head_dim))
+        # Match K shape so RoPE kernel head-count check passes on all backends.
+        dummy_q = k.new_empty(k.shape)
         _, k = self.rotary_emb(positions, dummy_q, k)
         return k
 
