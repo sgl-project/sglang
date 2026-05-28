@@ -133,13 +133,10 @@ class PrefillBootstrapQueue:
             )
         self.kv_manager = self._init_kv_manager()
 
-        if (
-            self.scheduler.tp_worker.is_hybrid_swa
-            and getattr(
-                self.token_to_kv_pool,
-                "pd_prefill_swa_pool_holds_full_prompt",
-                True,
-            )
+        if self.scheduler.tp_worker.is_hybrid_swa and getattr(
+            self.token_to_kv_pool,
+            "pd_prefill_swa_pool_holds_full_prompt",
+            True,
         ):
             # If SWA stores every prompt token, its pool size caps admission.
             self.max_total_num_tokens = min(
