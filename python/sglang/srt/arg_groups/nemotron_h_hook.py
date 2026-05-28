@@ -39,7 +39,6 @@ def apply_nemotron_h_defaults(server_args: "ServerArgs", model_arch: str) -> Non
             else:
                 server_args.moe_runner_backend = "flashinfer_cutlass"
     elif model_config.quantization is None:
-        # Unquantized (e.g. bf16) NemotronH: use flashinfer_trtllm on sm100.
         if (
             server_args.moe_runner_backend == "auto"
             and is_sm100_supported()
