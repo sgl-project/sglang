@@ -27,6 +27,17 @@ sys.path.insert(
 
 from ci_register import CIRegistry, HWBackend, ut_parse_one_file
 
+# Display order for backend tables / sections. The list is sourced from
+# HWBackend so a newly-added enum member can never be silently dropped from
+# the report -- if the assert below fires, add the new backend name here in
+# the right display slot. Order isn't alphabetical: CUDA/AMD/NPU/CPU lead
+# (highest test volume historically), then accelerators that have been
+# wired into the registry more recently (XPU, MUSA).
+BACKEND_DISPLAY_ORDER = ("CUDA", "AMD", "NPU", "CPU", "XPU", "MUSA")
+assert set(BACKEND_DISPLAY_ORDER) == {
+    b.name for b in HWBackend
+}, "BACKEND_DISPLAY_ORDER is out of sync with HWBackend"
+
 
 def collect_all_tests(registered_dir: str) -> list[CIRegistry]:
     """Collect all CI registrations from registered directory."""
@@ -113,7 +124,7 @@ def generate_summary_section(data: dict) -> str:
     lines.append("| Backend | Total | Enabled | Disabled | Per-Commit | Nightly |")
     lines.append("|---------|-------|---------|----------|------------|---------|")
 
-    for backend in ["CUDA", "AMD", "NPU", "CPU"]:
+    for backend in BACKEND_DISPLAY_ORDER:
         backend_tests = by_backend.get(backend, [])
         if not backend_tests:
             continue
@@ -128,21 +139,25 @@ def generate_summary_section(data: dict) -> str:
 
     lines.append("\n</details>\n")
 
-    # Folder summary (collapsible)
+    # Folder summary (collapsible). Only show columns for backends that
+    # have at least one registered test across the whole report -- otherwise
+    # adding scaffolding for an unused backend would widen every row with a
+    # column of zeros.
+    active_backends = [b for b in BACKEND_DISPLAY_ORDER if by_backend.get(b)]
     lines.append("<details>")
     lines.append("<summary><h2>Folder Summary</h2></summary>\n")
-    lines.append("| Folder | CUDA | AMD | NPU | CPU | Total |")
-    lines.append("|--------|------|-----|-----|-----|-------|")
+    header_cells = ["Folder", *active_backends, "Total"]
+    lines.append("| " + " | ".join(header_cells) + " |")
+    lines.append("|" + "|".join(["-" * max(len(c), 3) for c in header_cells]) + "|")
 
     for folder in sorted(by_folder.keys()):
         folder_tests = by_folder[folder]
-        cuda = sum(1 for t in folder_tests if t.backend == HWBackend.CUDA)
-        amd = sum(1 for t in folder_tests if t.backend == HWBackend.AMD)
-        npu = sum(1 for t in folder_tests if t.backend == HWBackend.NPU)
-        cpu = sum(1 for t in folder_tests if t.backend == HWBackend.CPU)
-        lines.append(
-            f"| {folder} | {cuda} | {amd} | {npu} | {cpu} | {len(folder_tests)} |"
-        )
+        backend_counts = {b.name: 0 for b in HWBackend}
+        for t in folder_tests:
+            backend_counts[t.backend.name] += 1
+        row = [folder] + [str(backend_counts[b]) for b in active_backends]
+        row.append(str(len(folder_tests)))
+        lines.append("| " + " | ".join(row) + " |")
 
     lines.append("\n</details>\n")
 
@@ -182,7 +197,7 @@ def generate_by_folder_section(data: dict) -> str:
         for t in folder_tests:
             folder_by_backend[t.backend.name].append(t)
 
-        for backend in ["CUDA", "AMD", "NPU", "CPU"]:
+        for backend in BACKEND_DISPLAY_ORDER:
             backend_tests = folder_by_backend.get(backend, [])
             if not backend_tests:
                 continue
@@ -216,7 +231,7 @@ def generate_by_suite_section(data: dict) -> str:
 
     lines.append("# All Tests by Test Suite\n")
 
-    for backend in ["CUDA", "AMD", "NPU", "CPU"]:
+    for backend in BACKEND_DISPLAY_ORDER:
         backend_tests = by_backend.get(backend, [])
         if not backend_tests:
             continue
@@ -332,7 +347,7 @@ def generate_json_report(tests: list[CIRegistry]) -> str:
             "backends": {},
         }
 
-        for backend in ["CUDA", "AMD", "NPU", "CPU"]:
+        for backend in BACKEND_DISPLAY_ORDER:
             backend_tests = folder_by_backend.get(backend, [])
             if backend_tests:
                 data["tests_by_folder"][folder]["backends"][backend] = [
@@ -350,7 +365,7 @@ def generate_json_report(tests: list[CIRegistry]) -> str:
                 ]
 
     # Section 2: Tests by Suite (Backend -> Suite)
-    for backend in ["CUDA", "AMD", "NPU", "CPU"]:
+    for backend in BACKEND_DISPLAY_ORDER:
         backend_tests = by_backend.get(backend, [])
         if not backend_tests:
             continue
@@ -393,7 +408,7 @@ def generate_json_report(tests: list[CIRegistry]) -> str:
             }
 
     # Backend summary
-    for backend in ["CUDA", "AMD", "NPU", "CPU"]:
+    for backend in BACKEND_DISPLAY_ORDER:
         backend_tests = by_backend.get(backend, [])
         if backend_tests:
             data["backend_summary"][backend] = {
@@ -408,14 +423,16 @@ def generate_json_report(tests: list[CIRegistry]) -> str:
                 ),
             }
 
-    # Folder summary
+    # Folder summary -- one count per backend in HWBackend, in display
+    # order, so every registered backend shows up regardless of whether
+    # this folder has tests for it.
     for folder in sorted(by_folder.keys()):
         folder_tests = by_folder[folder]
+        backend_counts = {b: 0 for b in BACKEND_DISPLAY_ORDER}
+        for t in folder_tests:
+            backend_counts[t.backend.name] += 1
         data["folder_summary"][folder] = {
-            "CUDA": sum(1 for t in folder_tests if t.backend == HWBackend.CUDA),
-            "AMD": sum(1 for t in folder_tests if t.backend == HWBackend.AMD),
-            "NPU": sum(1 for t in folder_tests if t.backend == HWBackend.NPU),
-            "CPU": sum(1 for t in folder_tests if t.backend == HWBackend.CPU),
+            **backend_counts,
             "total": len(folder_tests),
         }
 
