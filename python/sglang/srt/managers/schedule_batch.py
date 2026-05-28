@@ -270,16 +270,20 @@ class OutputProcessMode(Enum):
     DLLM_INTERMEDIATE = "dllm_intermediate"
     DLLM_FINAL = "dllm_final"
 
+    def is_intermediate(self) -> bool:
+        """True if this mode's forward result is NOT decode-ready —
+        a middle prefill chunk or an intermediate DLLM denoising step.
 
-# Modes that are safe to merge into the running_batch (which executes
-# decode forward). All others must be filtered out before merge.
-_DECODE_READY_OUTPUT_PROCESS_MODES = frozenset(
-    {
-        OutputProcessMode.EXTEND_LAST_CHUNK,
-        OutputProcessMode.DECODE,
-        OutputProcessMode.DLLM_FINAL,
-    }
-)
+        Filter / merge predicates use this to drop in-flight reqs before
+        folding them into the decode running_batch. The complement
+        (EXTEND_LAST_CHUNK / DECODE / DLLM_FINAL) is "decode-ready":
+        the req's sample (if any) is committed and the next forward, if
+        any, can safely be a decode.
+        """
+        return self in (
+            OutputProcessMode.EXTEND_MIDDLE_CHUNK,
+            OutputProcessMode.DLLM_INTERMEDIATE,
+        )
 
 
 @dataclasses.dataclass
@@ -2632,17 +2636,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 .to(device=self.device, non_blocking=True)
             )
 
-    def _mode_is_intermediate(self, i: int) -> bool:
-        """True if the i-th req's output_process_mode is not decode-ready.
-
-        Used by `filter_batch(only_decode_ready=True)` to drop reqs that
-        cannot safely be merged into the decode running_batch (mid-prefill
-        chunks and DLLM intermediate denoising steps).
-        """
-        if not self.output_process_mode:
-            return False
-        return self.output_process_mode[i] not in _DECODE_READY_OUTPUT_PROCESS_MODES
-
     def filter_batch(
         self,
         keep_indices: Optional[List[int]] = None,
@@ -2665,11 +2658,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 `scheduler_pp_mixin`; no cross-mb scan is needed here.
         """
         if keep_indices is None:
+            modes = self.output_process_mode
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
-                and not (only_decode_ready and self._mode_is_intermediate(i))
+                and not (only_decode_ready and modes and modes[i].is_intermediate())
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -2748,8 +2742,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # DLLM intermediate reqs are also caught here.
         if other.output_process_mode:
             assert all(
-                mode in _DECODE_READY_OUTPUT_PROCESS_MODES
-                for mode in other.output_process_mode
+                not mode.is_intermediate() for mode in other.output_process_mode
             ), (
                 "merge_batch requires the other batch to be decode-ready; "
                 f"got modes={other.output_process_mode}"
