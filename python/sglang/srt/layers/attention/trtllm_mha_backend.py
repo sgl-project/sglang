@@ -324,6 +324,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
                     "cache_seqlens"
                 ][:bs]
+                # Mirror the replay-time copy so the captured kernel sees
+                # cache_seqlens > 0; otherwise softmax over an empty KV set
+                # produces NaN during warmup.
+                metadata.cache_seqlens_int32.copy_(
+                    seq_lens[:bs].to(torch.int32) + self.speculative_step_id + 1
+                )
                 metadata.max_seq_len_k = seq_lens.max().item() + (
                     self.speculative_step_id + 1
                 )
