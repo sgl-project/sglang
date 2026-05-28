@@ -528,6 +528,21 @@ def expand_glob_spec(file_part):
         for root in ("test/registered", MULTIMODAL_TEST_DIR):
             matches.update(glob.glob(os.path.join(root, "**", pat), recursive=True))
 
+    # If the literal glob matched any directories — e.g. `unittest/*` matching
+    # subdirs `dense/`, `dsa/`, … — descend recursively into them for
+    # test_*.py. glob's `*` doesn't cross `/`, so without this a tree of
+    # subdirs containing tests would return only the top-level entries (and
+    # then get filtered out as non-test files).
+    expanded = set()
+    for p in matches:
+        if os.path.isdir(p):
+            expanded.update(
+                glob.glob(os.path.join(p, "**", "test_*.py"), recursive=True)
+            )
+        else:
+            expanded.add(p)
+    matches = expanded
+
     def _under_test_root(path):
         return path.startswith("test/registered/") or path.startswith(
             MULTIMODAL_TEST_DIR + "/"
