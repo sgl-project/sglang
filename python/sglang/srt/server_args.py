@@ -246,7 +246,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "flashinfer_trtllm",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
+RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority", "wlfu"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -4673,7 +4673,7 @@ class ServerArgs:
             type=str,
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
-            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, 'slru' stands for Segmented Least Recently Used, and 'priority' evicts lower-priority requests first.",
+            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, 'slru' stands for Segmented Least Recently Used, 'priority' evicts lower-priority requests first, and 'wlfu' applies a frequency age penalty to LRU.",
         )
         parser.add_argument(
             "--enable-prefill-delayer",

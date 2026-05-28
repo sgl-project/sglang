@@ -56,6 +56,7 @@ from sglang.srt.mem_cache.evict_policy import (
     MRUStrategy,
     PriorityStrategy,
     SLRUStrategy,
+    WLFUStrategy,
 )
 from sglang.srt.mem_cache.utils import split_node_hash_value
 
@@ -306,10 +307,12 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self.eviction_strategy: EvictionStrategy = PriorityStrategy()
         elif self.eviction_policy == "slru":
             self.eviction_strategy: EvictionStrategy = SLRUStrategy()
+        elif self.eviction_policy == "wlfu":
+            self.eviction_strategy: EvictionStrategy = WLFUStrategy()
 
         else:
             raise ValueError(
-                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru'."
+                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru', 'wlfu'."
             )
 
         self.evictable_leaves = set()
