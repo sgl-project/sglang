@@ -1,34 +1,35 @@
 import unittest
 
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
-from sglang.test.ascend.test_ascend_utils import QWEN3_235B_A22B_W8A8_WEIGHTS_PATH
+from sglang.test.ascend.test_ascend_utils import DEEPSEEK_V3_2_W8A8_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=400, suite="nightly-8-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="nightly-16-npu-a3", nightly=True)
 
 
-class TestQwen3235BA22BW8A8(GSM8KAscendMixin, CustomTestCase):
-    """Testcase: Verify that the inference accuracy of the vllm-ascend/Qwen3-235B-A22B-W8A8 model on the GSM8K dataset is no less than 0.94.
+class TestDeepSeekV32(GSM8KAscendMixin, CustomTestCase):
+    """Testcase: Verify that the inference accuracy of the vllm-ascend/DeepSeek-V3.2-W8A8 model on the GSM8K dataset is no less than 0.95.
 
     [Test Category] Model
-    [Test Target] vllm-ascend/Qwen3-235B-A22B-W8A8
+    [Test Target] vllm-ascend/DeepSeek-V3.2-W8A8
     """
 
-    model = QWEN3_235B_A22B_W8A8_WEIGHTS_PATH
-    accuracy = 0.94
+    model = DEEPSEEK_V3_2_W8A8_WEIGHTS_PATH
+    accuracy = 0.95
     timeout_for_server_launch = 3000
     other_args = [
         "--trust-remote-code",
         "--mem-fraction-static",
-        "0.8",
+        "0.9",
         "--attention-backend",
         "ascend",
         "--disable-cuda-graph",
         "--tp-size",
-        "8",
+        "16",
         "--quantization",
         "modelslim",
+        "--disable-radix-cache",
     ]
 
 
