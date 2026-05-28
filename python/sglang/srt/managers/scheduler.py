@@ -674,6 +674,14 @@ class Scheduler(
             )
             if len(think_end_ids) == 1:
                 self.model_config.think_end_id = think_end_ids[0]
+            elif self.server_args.enable_strict_thinking:
+                raise ValueError(
+                    f"--enable-strict-thinking requires think_end_token "
+                    f"'{reasoning_parser.detector.think_end_token}' to encode "
+                    f"to exactly one token, but this tokenizer produces "
+                    f"{len(think_end_ids)}. Use a model whose tokenizer has "
+                    f"the think_end_token as a single vocabulary entry."
+                )
             else:
                 logger.warning(
                     "think_end_token '%s' encodes to %d tokens (expected 1). "
