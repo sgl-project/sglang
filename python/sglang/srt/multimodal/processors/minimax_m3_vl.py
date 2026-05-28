@@ -310,9 +310,9 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
         self.VIDEO_TOKEN_ID = self._token_id(tokenizer, self.VIDEO_TOKEN)
         self.IM_START_TOKEN_ID = self._token_id(tokenizer, self.IMAGE_START_TOKEN)
         self.IM_END_TOKEN_ID = self._token_id(tokenizer, self.IMAGE_END_TOKEN)
-        self.video_fps = self.video_config.get("fps")
-        self.video_frame_max_size = self.video_config.get("frame_max_size")
-        self.video_max_frames = self.video_config.get("max_frames")
+        self.video_fps = self.video_config.pop("fps", None)
+        self.video_frame_max_size = self.video_config.pop("frame_max_size", None)
+        self.video_max_frames = self.video_config.pop("max_frames", None)
 
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=self.IMAGE_TOKEN,
