@@ -820,7 +820,9 @@ class PrefillAdder:
 
         return self.budget_state()
 
-    def add_first_chunk_req(self, req: Req, truncation_align_size: Optional[int]) -> AddReqResult:
+    def add_first_chunk_req(
+        self, req: Req, truncation_align_size: Optional[int]
+    ) -> AddReqResult:
         # Scheduler-side dispatch invariant: chunked-resume reqs are routed
         # to `add_non_first_chunk_req`. This function only admits fresh
         # reqs (and DLLM, whose `has_pending_chunk` is always False).
