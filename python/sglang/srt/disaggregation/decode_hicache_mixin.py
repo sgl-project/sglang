@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, List, Optional
@@ -15,6 +16,8 @@ from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
     from sglang.srt.managers.schedule_batch import Req
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -55,9 +58,7 @@ class HiCacheRestoreResult(Enum):
 class DecodeHiCachePreallocMixin:
     """HiCache hooks for ``DecodePreallocQueue``: issue prefetch + reserve tokens."""
 
-    def _build_decode_prefix_match(
-        self, req: "Req", result: Any
-    ) -> DecodePrefixMatch:
+    def _build_decode_prefix_match(self, req: "Req", result: Any) -> DecodePrefixMatch:
         """Convert a ``match_prefix_for_req`` result into ``DecodePrefixMatch``.
 
         Performs the optional L3 storage hit length query when decode-side
@@ -98,28 +99,42 @@ class DecodeHiCachePreallocMixin:
     def _start_hicache_prefetch(
         self, req: "Req", prefix_match: Optional["DecodePrefixMatch"]
     ) -> None:
-        """Issue L3 storage prefetch after admission succeeds."""
+        """Issue L3 storage prefetch after admission succeeds.
+
+        On failure, degrades to L2-only restore by clearing l3 fields.
+        """
         if (
             prefix_match is None
             or prefix_match.l3_storage_hit_length <= 0
             or prefix_match.last_host_node is None
         ):
             return
-        node = prefix_match.last_host_node
-        matched_len = prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
-        suffix = req.origin_input_ids[
-            matched_len : matched_len + prefix_match.l3_storage_hit_length
-        ]
-        last_hash = node.get_last_hash_value()
-        prefix_keys = (
-            node.get_prefix_hash_values(node.parent)
-            if self.tree_cache.hicache_storage_pass_prefix_keys
-            else None
-        )
-        self.tree_cache.prefetch_from_storage(
-            req.rid, node, suffix, last_hash, prefix_keys
-        )
-        prefix_match.prefetch_registered = req.rid in self.tree_cache.ongoing_prefetch
+        try:
+            node = prefix_match.last_host_node
+            matched_len = prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
+            suffix = req.origin_input_ids[
+                matched_len : matched_len + prefix_match.l3_storage_hit_length
+            ]
+            last_hash = node.get_last_hash_value()
+            prefix_keys = (
+                node.get_prefix_hash_values(node.parent)
+                if self.tree_cache.hicache_storage_pass_prefix_keys
+                else None
+            )
+            self.tree_cache.prefetch_from_storage(
+                req.rid, node, suffix, last_hash, prefix_keys
+            )
+            prefix_match.prefetch_registered = (
+                req.rid in self.tree_cache.ongoing_prefetch
+            )
+        except Exception as e:
+            logger.warning(
+                "HiCache L3 prefetch failed for rid=%s: %s; falling back to L2-only LoadingBack",
+                req.rid,
+                e,
+            )
+            prefix_match.l3_storage_hit_length = 0
+            prefix_match.prefetch_registered = False
 
     def _hicache_pending_restore_tokens(self) -> int:
         """Total device tokens reserved for pending HiCache L2/L3 load_back."""
@@ -148,6 +163,7 @@ class HiCacheRestoreGatedKVReceiver:
         ):
             return KVPoll.Transferring
         return poll
+
 
 class DecodeHiCacheTransferMixin:
     """HiCache hooks for ``DecodeTransferQueue``: drive restore state machine."""
@@ -249,7 +265,8 @@ class DecodeHiCacheTransferMixin:
         queued = [
             dr
             for dr in active
-            if dr.hicache_restored_node is None and self._try_hicache_queue_load_back(dr)
+            if dr.hicache_restored_node is None
+            and self._try_hicache_queue_load_back(dr)
         ]
         if not queued:
             return
@@ -263,9 +280,7 @@ class DecodeHiCacheTransferMixin:
         for dr in queued:
             dr.hicache_load_consumer_index = consumer_index
 
-    def _commit_hicache_local_restore_to_req(
-        self, decode_req: "DecodeRequest"
-    ) -> None:
+    def _commit_hicache_local_restore_to_req(self, decode_req: "DecodeRequest") -> None:
         prefix_match = decode_req.prefix_match
         if prefix_match is None or not prefix_match.needs_local_restore:
             return
