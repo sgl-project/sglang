@@ -169,3 +169,103 @@ def clear_log() -> None:
     requests and at test setup."""
     with _LOCK:
         _LOG.clear()
+
+
+def build_request_capture(
+    *,
+    signatures: torch.Tensor,
+    written: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> List[Dict[str, Any]]:
+    """Build per-request post-forward capture records.
+
+    For each request ``b`` in the batch, compute
+    ``slots = req_to_token[req_pool_indices[b], :seq_lens[b]]`` and
+    return per-layer SHA256 hashes of ``signatures[L, slots]`` and
+    ``written[L, slots]``. The cold-pass and warm-pass records over
+    the SAME prompt should produce identical ``slots_sha`` (radix
+    cache reused the same physical slots) and identical
+    ``per_layer_label_sha`` (the labels for those slots are bit-stable).
+
+    Pure function: no IO, no globals, no env reads — safe to call
+    from the production per-request finalization site. The env-gated
+    branch lives at the call site so the production hot path stays
+    zero-cost when capture is off.
+
+    Parameters
+    ----------
+    signatures: ``[num_layers_local, max_tokens, num_heads_local, label_dim]``
+        The DS token label table's ``signatures`` buffer.
+    written: ``[num_layers_local, max_tokens]`` bool
+        The DS token label table's ``written`` buffer.
+    req_to_token: ``[max_requests, max_seq_len]`` int
+        The request-pool's physical-slot map for each request row.
+    req_pool_indices: ``[batch_size]`` int
+        Per-batch request-pool row index.
+    seq_lens: ``[batch_size]`` int
+        Per-batch sequence length (the prompt + already-generated
+        token count).
+
+    Returns
+    -------
+    list of length ``batch_size``. Each record carries:
+        ``prompt_len`` (int), ``slots_sha`` (str),
+        ``per_layer_label_sha`` (list[str]),
+        ``per_layer_written_sha`` (list[str]),
+        ``per_layer_written_all_true`` (list[bool]).
+    """
+    bs = int(req_pool_indices.shape[0])
+    if bs == 0:
+        return []
+    if signatures.dim() != 4 or written.dim() != 2:
+        raise ValueError(
+            "build_request_capture: expected signatures[L,T,H,D] + "
+            f"written[L,T]; got {tuple(signatures.shape)} + "
+            f"{tuple(written.shape)}."
+        )
+    if req_to_token.dim() != 2:
+        raise ValueError(
+            "build_request_capture: expected req_to_token[R,S]; got "
+            f"{tuple(req_to_token.shape)}."
+        )
+
+    L = signatures.shape[0]
+    rpi = req_pool_indices.long().to(req_to_token.device)
+    sl = seq_lens.long().to(req_to_token.device)
+
+    records: List[Dict[str, Any]] = []
+    for b in range(bs):
+        prompt_len = int(sl[b].item())
+        slots = req_to_token[int(rpi[b].item()), :prompt_len]
+        slots_long = slots.long().to(signatures.device)
+        if prompt_len == 0 or slots_long.numel() == 0:
+            records.append({
+                "prompt_len": prompt_len,
+                "slots_sha": _tensor_bytes_sha(slots_long),
+                "per_layer_label_sha": ["<empty>"] * L,
+                "per_layer_written_sha": ["<empty>"] * L,
+                "per_layer_written_all_true": [True] * L,
+            })
+            continue
+        per_layer_label_sha: List[str] = []
+        per_layer_written_sha: List[str] = []
+        per_layer_written_all_true: List[bool] = []
+        for layer_id in range(L):
+            per_layer_label_sha.append(
+                _tensor_bytes_sha(signatures[layer_id, slots_long])
+            )
+            written_slice = written[layer_id, slots_long].to(torch.bool)
+            per_layer_written_sha.append(_tensor_bytes_sha(written_slice))
+            per_layer_written_all_true.append(
+                bool(written_slice.all().item())
+            )
+        records.append({
+            "prompt_len": prompt_len,
+            "slots_sha": _tensor_bytes_sha(slots_long),
+            "per_layer_label_sha": per_layer_label_sha,
+            "per_layer_written_sha": per_layer_written_sha,
+            "per_layer_written_all_true": per_layer_written_all_true,
+        })
+    return records

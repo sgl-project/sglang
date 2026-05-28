@@ -2069,6 +2069,48 @@ class DeepseekV2AttentionMLA(
             setattr(forward_batch, "ds_per_request_summary", summary)
         summary["double_sparsity"] = records
 
+        # AC-10 M3-B fixture capture: when env-gated, attach per-request
+        # post-forward snapshots of the prompt-range label rows so the
+        # fixture can compare cold-vs-warm hashes via response
+        # `meta_info`. Default (env unset) path pays one
+        # `os.environ.get` lookup.
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as _ds_radix_capture,
+        )
+        if _ds_radix_capture.is_capture_enabled():
+            selector = getattr(self, "double_sparsity_selector", None)
+            table = getattr(selector, "token_label_table", None) if selector else None
+            req_pool = getattr(forward_batch, "req_to_token_pool", None)
+            req_to_token = (
+                req_pool.req_to_token if req_pool is not None else None
+            )
+            req_pool_indices = getattr(
+                forward_batch, "req_pool_indices", None,
+            )
+            if (
+                table is not None
+                and req_to_token is not None
+                and req_pool_indices is not None
+                and seq_lens is not None
+            ):
+                try:
+                    summary["double_sparsity_radix_capture"] = (
+                        _ds_radix_capture.build_request_capture(
+                            signatures=table.signatures,
+                            written=table.written,
+                            req_to_token=req_to_token,
+                            req_pool_indices=req_pool_indices,
+                            seq_lens=seq_lens,
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 — fixture-only
+                    # Capture must NEVER break production. Record the
+                    # failure shape so the operator sees it in the
+                    # artifact, but do not raise.
+                    summary["double_sparsity_radix_capture_error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
     def _select_topk_indices(
         self,
         x: torch.Tensor,

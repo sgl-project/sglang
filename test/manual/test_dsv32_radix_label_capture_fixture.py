@@ -1,43 +1,42 @@
-"""AC-10 M3-B label-capture fixture (DIRECT EVIDENCE).
+"""AC-10 M3-B label-capture fixture (DIRECT EVIDENCE via meta_info).
 
 This is the fixture the AC-10 (DEC-2) guard flip requires. It verifies
 that for two requests sharing the same prompt, the DS label rows
-written for the cold pass equal the DS label rows present when the
-warm pass reuses those same physical KV slots via the radix cache.
+written for the cold pass are bit-equal to the DS label rows present
+when the warm pass reuses those same physical KV slots via the radix
+cache.
 
 How the proof works
 -------------------
 
-Round 36 added a server-side capture primitive
-(``python/sglang/srt/layers/attention/double_sparsity/
-radix_fixture_capture.py``) that, when
-``SGLANG_DS_RADIX_FIXTURE_CAPTURE=1`` is set in the server process,
-appends a per-write record to an in-process log every time
-``_write_token_labels`` fires. Each record carries:
+The DS request path on the server side, when launched with
+``SGLANG_DS_RADIX_FIXTURE_CAPTURE=1``, attaches a per-request snapshot
+record to ``meta_info["double_sparsity_radix_capture"]``. Each record
+contains the prompt-range physical slot SHA, per-layer SHA256 of
+``signatures[L, slots]``, and per-layer ``written`` reachability
+flags (see
+``python/sglang/srt/layers/attention/double_sparsity/radix_fixture_capture.py``
+::``build_request_capture``).
 
-* ``layer_id``
-* ``cache_loc_sha`` — SHA256 of the int64 slot indices.
-* ``k_nope_sha`` — SHA256 of the fp32 projected K-noPE bytes.
-* ``written_after_sha`` + ``written_after_all_true`` — proof every
-  slot is reachable after the write.
+The fixture issues two identical-prompt requests, reads the snapshot
+records straight off the responses, and asserts via the pure verdict
+helper that:
 
-The fixture compares the per-layer write records between the cold
-pass and the warm pass. The bit-equality property is:
+  1. Both snapshots are present and non-empty.
+  2. ``cached_tokens > 0`` on the warm pass — proves the radix cache
+     actually reused slots, not just that two identical writes
+     produce identical labels.
+  3. ``slots_sha`` matches between cold and warm — same physical
+     slots.
+  4. ``per_layer_label_sha`` matches between cold and warm — label
+     bytes for the shared prefix are bit-stable.
+  5. ``per_layer_written_all_true`` on both sides.
 
-* For every write (layer, cache_loc), if the warm pass produces a
-  record with the same ``cache_loc_sha`` as a cold-pass record, then
-  ``k_nope_sha`` must match — i.e. the K-noPE that the labeling
-  kernel sees is bit-equal between the cold (fresh write) and warm
-  (radix-cache-reused) paths.
-
-A WARM pass that did not exercise the radix cache (e.g. radix cache
-disabled, or no overlap) shows up either as (a) no cache_loc overlap
-between passes, or (b) ``meta_info.cached_tokens == 0``. Either case
-fails the test loudly.
-
-The fixture also records ``commit_sha`` (local + server) into the
-artifact so the audit trail names exactly which build authorized the
-flip.
+The verdict helper is pure and CPU-unit-tested in
+``test/registered/unit/manual/test_m3b_label_capture_verdict.py``, so
+the false-pass classes (empty captures + ``cached_tokens > 0``,
+``slots_sha`` mismatch, per-layer divergence, unwritten slots) are
+all locked under registered CI.
 
 Operator runbook
 ----------------
@@ -46,27 +45,25 @@ Operator runbook
   SGLANG_DS_RADIX_OVERRIDE=1 \\
     SGLANG_DS_RADIX_FIXTURE_CAPTURE=1 \\
     bash development/serve_double_sparsity.sh
-  # 2. (Optional) Run the continuation smoke first:
+  # 2. (Optional) Run the continuation smoke as a pre-flight check.
   DS_BASE_URL=http://localhost:30000 \\
     pytest test/manual/test_dsv32_radix_cache_fixture.py -v
-  # 3. Run THIS fixture against the same server. The server-side
-  #    capture log is what we read; the test runs in-process by
-  #    importing ``radix_fixture_capture`` from the server's Python
-  #    when this client is co-located with the server. For remote
-  #    servers, point ``SGLANG_DS_RADIX_CAPTURE_LOG_URL`` at the
-  #    server's capture-log endpoint (operator-provided helper).
+  # 3. Run THIS fixture against the same server. The capture data
+  #    arrives in the response's meta_info, so the fixture works
+  #    against remote servers without any extra wiring.
   DS_BASE_URL=http://localhost:30000 \\
-    SGLANG_DS_RADIX_FIXTURE_CAPTURE=1 \\
     pytest test/manual/test_dsv32_radix_label_capture_fixture.py -v
 """
 
 from __future__ import annotations
 
 import datetime
+import importlib.util
 import json
 import os
 import pathlib
 import subprocess
+import sys
 import unittest
 import urllib.error
 import urllib.request
@@ -76,6 +73,23 @@ from typing import Any, Dict, List, Optional
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 RESULTS_DIR = REPO_ROOT / "development" / "results"
+_VERDICT_HELPER_PATH = (
+    pathlib.Path(__file__).resolve().parent
+    / "_m3b_label_capture_verdict.py"
+)
+
+
+def _load_verdict_helper():
+    spec = importlib.util.spec_from_file_location(
+        "_m3b_label_capture_verdict", str(_VERDICT_HELPER_PATH),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["_m3b_label_capture_verdict"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_verdict_mod = _load_verdict_helper()
 
 
 def _env(name: str) -> Optional[str]:
@@ -98,8 +112,7 @@ def _post_json(
 def _generate(
     base_url: str, prompt: str, *, max_new_tokens: int = 128,
 ) -> Dict[str, Any]:
-    """Return the full /generate response so the test can inspect
-    ``meta_info.cached_tokens`` etc."""
+    """Return the full /generate response (includes ``meta_info``)."""
     body = {
         "text": prompt,
         "sampling_params": {
@@ -153,49 +166,31 @@ def _local_commit_sha() -> Optional[str]:
     return None
 
 
-def _read_capture_log_in_process() -> List[Dict[str, Any]]:
-    """Read the capture log via in-process import.
-
-    This works when the fixture runs in the same Python process as
-    the sglang server (the typical operator setup: a launcher script
-    that boots the server then drives the fixture as part of its
-    workflow). For a remote server, the operator wires
-    ``SGLANG_DS_RADIX_CAPTURE_LOG_URL`` and the test reads the log
-    over HTTP instead (see ``_read_capture_log_via_http``).
-    """
-    from sglang.srt.layers.attention.double_sparsity import (
-        radix_fixture_capture as cap,
-    )
-    return cap.get_log()
+def _meta_info(resp: Dict[str, Any]) -> Dict[str, Any]:
+    mi = resp.get("meta_info")
+    return mi if isinstance(mi, dict) else {}
 
 
-def _read_capture_log_via_http(url: str) -> List[Dict[str, Any]]:
-    """Fallback for remote-server operation. The operator stands up a
-    minimal HTTP endpoint that returns ``get_log()`` as JSON; the URL
-    is provided via ``SGLANG_DS_RADIX_CAPTURE_LOG_URL``."""
-    with urllib.request.urlopen(url, timeout=10.0) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict) and "log" in data:
-        return data["log"]
-    raise ValueError(
-        f"capture-log endpoint at {url} returned unexpected shape: "
-        f"{type(data).__name__}"
-    )
+def _capture_records(resp: Dict[str, Any]) -> Any:
+    """Read the per-request capture from meta_info. May be a list
+    (server emitted it), missing key (capture env not set on the
+    server), or other shape (protocol broken). The verdict helper
+    treats anything non-list as missing."""
+    return _meta_info(resp).get("double_sparsity_radix_capture")
 
 
-def _clear_capture_log_in_process() -> None:
-    from sglang.srt.layers.attention.double_sparsity import (
-        radix_fixture_capture as cap,
-    )
-    cap.clear_log()
+def _cached_tokens(resp: Dict[str, Any]) -> int:
+    val = _meta_info(resp).get("cached_tokens", 0)
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return 0
 
 
-# Same identical prompt as the smoke fixture so both tests can be run
-# back-to-back against the same warm radix cache. The prompt is long
-# enough to allocate multiple physical KV slots, and identical between
-# cold and warm passes so the radix cache can actually reuse slots.
+# Identical prompt across both passes so the radix cache can reuse
+# the shared-prefix slots. The continuation smoke fixture uses the
+# same constant; both manual fixtures can run back-to-back against
+# the same warm cache.
 _SHARED_PREFIX_PROMPT = (
     "You are a careful technical reviewer. The following document "
     "describes a distributed key-value cache used by a large language "
@@ -216,21 +211,19 @@ _SHARED_PREFIX_PROMPT = (
 
 
 _ENV_DS_URL = "DS_BASE_URL"
-_ENV_CAPTURE = "SGLANG_DS_RADIX_FIXTURE_CAPTURE"
-_ENV_CAPTURE_LOG_URL = "SGLANG_DS_RADIX_CAPTURE_LOG_URL"
 
 
 @unittest.skipUnless(
-    _env(_ENV_DS_URL) and _env(_ENV_CAPTURE) == "1",
-    f"{_ENV_DS_URL} must point at a running DS server AND "
-    f"{_ENV_CAPTURE}=1 must be set in the server process so the "
-    "capture log is populated. Otherwise the fixture has no direct "
-    "label evidence to compare.",
+    _env(_ENV_DS_URL),
+    f"{_ENV_DS_URL} must point at a running DS server. The server "
+    "process itself must also have been launched with "
+    "SGLANG_DS_RADIX_FIXTURE_CAPTURE=1 so the per-request capture "
+    "snapshots reach the response meta_info. Without that, the "
+    "fixture's verdict helper FAILS the run rather than silently "
+    "scoring it as a pass.",
 )
 class TestDSv32RadixLabelCaptureFixture(unittest.TestCase):
-    """Direct cold/warm label SHA bit-equality fixture (AC-10 M3-B
-    evidence). Compares per-write SHA256 fingerprints from the
-    server-side capture log."""
+    """Cold-vs-warm DS label SHA equality via response meta_info."""
 
     @classmethod
     def setUpClass(cls):
@@ -242,77 +235,32 @@ class TestDSv32RadixLabelCaptureFixture(unittest.TestCase):
             raise unittest.SkipTest(
                 "DS server reports disable_radix_cache=True; the M3-B "
                 "label-capture fixture requires radix cache ENABLED "
-                "(set SGLANG_DS_RADIX_OVERRIDE=1 in the server env and "
-                "remove --disable-radix-cache for this one-shot run)."
+                "(set SGLANG_DS_RADIX_OVERRIDE=1 + remove the flag for "
+                "this one-shot run)."
             )
-
-    @staticmethod
-    def _collect_log() -> List[Dict[str, Any]]:
-        url = _env(_ENV_CAPTURE_LOG_URL)
-        if url:
-            return _read_capture_log_via_http(url)
-        return _read_capture_log_in_process()
 
     def test_cold_warm_label_shas_bit_equal(self):
         run_id = uuid.uuid4().hex[:12]
-
         _flush_cache(self.ds_url)
-        # In-process operators must clear before the cold pass; remote
-        # operators are responsible for clearing on the server side.
-        if not _env(_ENV_CAPTURE_LOG_URL):
-            _clear_capture_log_in_process()
 
         cold_resp = _generate(
             self.ds_url, _SHARED_PREFIX_PROMPT, max_new_tokens=128,
         )
-        cold_log = self._collect_log()
-        cold_writes = [r for r in cold_log if r.get("kind") == "write"]
-
-        # IMPORTANT: do NOT flush_cache between passes — the radix
-        # cache MUST retain the shared-prefix slots for the warm pass
-        # to exercise reuse.
+        # No flush between passes — the radix cache MUST retain the
+        # shared-prefix slots for the warm pass to exercise reuse.
         warm_resp = _generate(
             self.ds_url, _SHARED_PREFIX_PROMPT, max_new_tokens=128,
         )
-        full_log = self._collect_log()
-        warm_writes = [
-            r for r in full_log[len(cold_log):]
-            if r.get("kind") == "write"
-        ]
 
-        cached_tokens = 0
-        if isinstance(warm_resp.get("meta_info"), dict):
-            cached_tokens = int(
-                warm_resp["meta_info"].get("cached_tokens", 0)
-            )
+        cold_capture = _capture_records(cold_resp)
+        warm_capture = _capture_records(warm_resp)
+        cached_tokens = _cached_tokens(warm_resp)
 
-        # Group writes by (layer_id, cache_loc_sha). Same slots
-        # written with the same K-noPE produce the same cache_loc_sha
-        # AND the same k_nope_sha; the radix-cache reuse path skips
-        # writes entirely (cache hit), so we expect the warm-pass
-        # write set to be a STRICT SUBSET of the cold-pass write set
-        # for the shared-prefix range.
-        def _key(r: Dict[str, Any]):
-            return (int(r["layer_id"]), r["cache_loc_sha"])
-
-        cold_by_key: Dict[Any, Dict[str, Any]] = {
-            _key(r): r for r in cold_writes
-        }
-        # Every warm-pass write whose (layer, cache_loc_sha) overlaps
-        # with the cold-pass writes must agree on k_nope_sha.
-        mismatches: List[Dict[str, Any]] = []
-        overlap_keys = []
-        for r in warm_writes:
-            k = _key(r)
-            if k in cold_by_key:
-                overlap_keys.append(k)
-                if cold_by_key[k]["k_nope_sha"] != r["k_nope_sha"]:
-                    mismatches.append({
-                        "layer_id": k[0],
-                        "cache_loc_sha": k[1],
-                        "cold_k_nope_sha": cold_by_key[k]["k_nope_sha"],
-                        "warm_k_nope_sha": r["k_nope_sha"],
-                    })
+        result = _verdict_mod.evaluate_m3b_label_capture_verdict(
+            cold_capture=cold_capture,
+            warm_capture=warm_capture,
+            cached_tokens=cached_tokens,
+        )
 
         sa = (self.server_info.get("server_args")
               if isinstance(self.server_info, dict) else None)
@@ -326,37 +274,20 @@ class TestDSv32RadixLabelCaptureFixture(unittest.TestCase):
             "server_args": sa,
             "prompt": _SHARED_PREFIX_PROMPT,
             "cached_tokens_warm_pass": cached_tokens,
-            "num_cold_writes": len(cold_writes),
-            "num_warm_writes": len(warm_writes),
-            "num_overlap_keys": len(overlap_keys),
-            "num_mismatches": len(mismatches),
-            "mismatches": mismatches[:32],
-            "verdict": "PASS" if (
-                not mismatches and cached_tokens > 0
-            ) else "FAIL",
+            "cold_capture": cold_capture,
+            "warm_capture": warm_capture,
+            "verdict": result["verdict"],
+            "verdict_reasons": result["reasons"],
         }
         _record_artifact(payload, suffix="label_equality")
 
-        # Assertion 1: the warm pass actually used the radix cache.
-        self.assertGreater(
-            cached_tokens, 0,
-            "Warm pass reports cached_tokens=0; the radix cache was "
-            "not exercised. Either the cache is disabled, or the cold "
-            "pass evicted before the warm pass ran. Without reuse, "
-            "the fixture would only test 'two identical writes produce "
-            "identical labels', which the CPU unit test already "
-            f"establishes. Diagnostic artifact: {RESULTS_DIR}/.",
-        )
-        # Assertion 2: every overlap is bit-equal.
-        self.assertFalse(
-            mismatches,
-            "AC-10 M3-B label-capture fixture FAILED: at least one "
-            "(layer, cache_loc) pair produced different K-noPE SHAs "
-            "between cold and warm passes. Labels are NOT bit-stable "
-            "across the radix-cache reuse path. Keep "
-            "--disable-radix-cache in the DS launcher; do NOT call "
-            "record_radix_fixture_passed. First 32 mismatches:\n"
-            + json.dumps(mismatches[:32], indent=2),
+        self.assertEqual(
+            result["verdict"], "PASS",
+            "AC-10 M3-B label-capture fixture FAILED. Reasons:\n  "
+            + "\n  ".join(result["reasons"]) +
+            f"\nDiagnostic artifact written under {RESULTS_DIR}/. "
+            "Do NOT call record_radix_fixture_passed and KEEP "
+            "--disable-radix-cache in the DS launcher.",
         )
 
 

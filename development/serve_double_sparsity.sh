@@ -71,8 +71,21 @@ exec python3 -m sglang.launch_server \
   2>&1 | tee "${LOG_FILE}"
 # --disable-radix-cache is required by the DS validator (DEC-2): radix cache
 # is gated until the M3-B page-stability fixture has been recorded as passing
-# for this configuration. The operator flips the gate by calling
-# `record_radix_fixture_passed(server_args)` after the fixture
-# (`test/manual/test_dsv32_radix_cache_fixture.py`) passes against this
-# hardware + configuration. SGLANG_DS_RADIX_OVERRIDE=1 is a developer
+# for this configuration. The flip requires BOTH of these fixtures to pass
+# on this hardware (the continuation-only smoke at
+# test/manual/test_dsv32_radix_cache_fixture.py is a pre-flight check, not
+# the M3-B evidence):
+#   1. test/manual/test_dsv32_radix_label_capture_fixture.py — direct
+#      cold-vs-warm DS label SHA bit-equality via response meta_info.
+#      Launch the server with SGLANG_DS_RADIX_FIXTURE_CAPTURE=1 so the
+#      per-request snapshot is attached.
+#   2. test/manual/test_dsv32_fp8_scale_stability.py — singleton vs
+#      packed-page FP8 scale-byte equality via the production
+#      fused_store_index_k_cache kernel. Set SGLANG_DS_FP8_SCALE_PROOF=1.
+# On BOTH passing, the operator calls
+#   record_radix_fixture_passed(server_args, artifact_path="<label-
+#     capture-artifact.json>")
+# from a launcher init module BEFORE validate_double_sparsity runs, and
+# removes the --disable-radix-cache line below (AC-10-FIXTURE-MARKER
+# names the exact line). SGLANG_DS_RADIX_OVERRIDE=1 is a developer
 # escape hatch only.

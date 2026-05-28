@@ -8209,5 +8209,177 @@ class TestRadixFixtureCapture(unittest.TestCase):
         self.assertEqual(cap.get_log(), [])
 
 
+class TestBuildRequestCapture(unittest.TestCase):
+    """AC-10 M3-B per-request snapshot helper.
+
+    ``build_request_capture`` is the pure function that the server-side
+    capture path calls to produce the per-request snapshot record
+    ferried to the client via ``meta_info["double_sparsity_radix_capture"]``.
+    Same physical slots + same label bytes → same SHAs across cold and
+    warm passes; the capture-aware fixture compares the SHAs to prove
+    label bit-stability.
+    """
+
+    def _build_table(self, *, L=2, T=64, H=2, D=4):
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+        return allocate_token_label_table(
+            num_layers_local=L, max_tokens=T, num_heads_local=H,
+            label_dim=D, page_size=64, dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+
+    def _populate(self, table, slots, k_nope_seed=7):
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
+        )
+        torch.manual_seed(k_nope_seed)
+        nope_dim = 16
+        k_nope = torch.randn(
+            slots.shape[0], table.num_heads_local, nope_dim,
+        )
+        sel = (
+            torch.arange(table.label_dim, dtype=torch.int32)
+            .unsqueeze(0)
+            .expand(table.num_heads_local, -1)
+            .contiguous()
+        )
+        for layer_id in range(table.num_layers_local):
+            token_label_write(
+                table.signatures, table.written, layer_id=layer_id,
+                cache_loc=slots, k_nope=k_nope,
+                channel_selection_layer=sel,
+            )
+
+    def test_single_request_snapshot_matches_manual_hash(self):
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as cap,
+        )
+        import hashlib
+
+        table = self._build_table()
+        # request 0 owns physical slots [10, 11, 12, 13, 14].
+        slots = torch.tensor([10, 11, 12, 13, 14], dtype=torch.int64)
+        self._populate(table, slots)
+
+        # req_to_token has shape [num_requests, max_seq_len]. Fill row
+        # 3 with our prompt slots; the rest is irrelevant.
+        req_to_token = torch.zeros(8, 16, dtype=torch.int64)
+        req_to_token[3, :5] = slots
+        req_pool_indices = torch.tensor([3], dtype=torch.int64)
+        seq_lens = torch.tensor([5], dtype=torch.int64)
+
+        records = cap.build_request_capture(
+            signatures=table.signatures, written=table.written,
+            req_to_token=req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+        )
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec["prompt_len"], 5)
+        # Manually compute per-layer label SHA for slots [10..14].
+        for layer_id in range(table.num_layers_local):
+            expected_bytes = (
+                table.signatures[layer_id, slots]
+                .contiguous().numpy().tobytes()
+            )
+            self.assertEqual(
+                rec["per_layer_label_sha"][layer_id],
+                hashlib.sha256(expected_bytes).hexdigest(),
+            )
+            self.assertTrue(rec["per_layer_written_all_true"][layer_id])
+
+    def test_identical_calls_produce_identical_records(self):
+        """Foundation of the cold/warm equality assertion: two calls
+        against the same table + same slots produce bit-equal records."""
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as cap,
+        )
+
+        table = self._build_table()
+        slots = torch.tensor([20, 21, 22], dtype=torch.int64)
+        self._populate(table, slots, k_nope_seed=11)
+
+        req_to_token = torch.zeros(4, 8, dtype=torch.int64)
+        req_to_token[2, :3] = slots
+        req_pool_indices = torch.tensor([2], dtype=torch.int64)
+        seq_lens = torch.tensor([3], dtype=torch.int64)
+
+        a = cap.build_request_capture(
+            signatures=table.signatures, written=table.written,
+            req_to_token=req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+        )
+        b = cap.build_request_capture(
+            signatures=table.signatures, written=table.written,
+            req_to_token=req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+        )
+        self.assertEqual(a, b)
+
+    def test_two_request_batch_per_request_records_independent(self):
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as cap,
+        )
+
+        table = self._build_table()
+        slots_a = torch.tensor([5, 6, 7], dtype=torch.int64)
+        slots_b = torch.tensor([30, 31, 32, 33], dtype=torch.int64)
+        self._populate(table, slots_a, k_nope_seed=1)
+        self._populate(table, slots_b, k_nope_seed=2)
+
+        req_to_token = torch.zeros(8, 16, dtype=torch.int64)
+        req_to_token[1, :3] = slots_a
+        req_to_token[5, :4] = slots_b
+        req_pool_indices = torch.tensor([1, 5], dtype=torch.int64)
+        seq_lens = torch.tensor([3, 4], dtype=torch.int64)
+
+        records = cap.build_request_capture(
+            signatures=table.signatures, written=table.written,
+            req_to_token=req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+        )
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["prompt_len"], 3)
+        self.assertEqual(records[1]["prompt_len"], 4)
+        # Different prompts → different slot SHAs.
+        self.assertNotEqual(records[0]["slots_sha"], records[1]["slots_sha"])
+        # Different K-noPE → different label SHAs.
+        self.assertNotEqual(
+            records[0]["per_layer_label_sha"],
+            records[1]["per_layer_label_sha"],
+        )
+
+    def test_unwritten_slots_flag_not_all_true(self):
+        """When a request's prompt slots are NOT all written, the
+        per-layer `written_all_true` flag must catch it. The
+        capture-aware fixture refuses any side where this is False."""
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as cap,
+        )
+        table = self._build_table()
+        # Populate slots 0..2 only; query slots 0..4 — slots 3,4 stay
+        # unwritten.
+        self._populate(table, torch.tensor([0, 1, 2], dtype=torch.int64))
+        req_to_token = torch.zeros(2, 8, dtype=torch.int64)
+        req_to_token[0, :5] = torch.tensor(
+            [0, 1, 2, 3, 4], dtype=torch.int64,
+        )
+        records = cap.build_request_capture(
+            signatures=table.signatures, written=table.written,
+            req_to_token=req_to_token,
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([5], dtype=torch.int64),
+        )
+        self.assertEqual(len(records), 1)
+        for v in records[0]["per_layer_written_all_true"]:
+            self.assertFalse(v)
+
+
 if __name__ == "__main__":
     unittest.main()
