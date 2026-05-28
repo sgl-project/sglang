@@ -1635,29 +1635,6 @@ def release_req(
     req.reset_for_retract()
 
 
-def retract_all(
-    *,
-    reqs: List[Req],
-    server_args: ServerArgs,
-    req_to_token_pool: ReqToTokenPool,
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-    tree_cache: BasePrefixCache,
-    hisparse_coordinator: Optional[HiSparseCoordinator],
-) -> List[Req]:
-    retracted_reqs = reqs
-    for idx in range(len(reqs)):
-        release_req(
-            req=reqs[idx],
-            remaing_req_count=len(reqs) - idx,
-            server_args=server_args,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-            tree_cache=tree_cache,
-            hisparse_coordinator=hisparse_coordinator,
-        )
-    return retracted_reqs
-
-
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -2482,18 +2459,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
-
-    def retract_all(self, server_args: ServerArgs):
-        retracted_reqs = retract_all(
-            reqs=self.reqs,
-            server_args=server_args,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            tree_cache=self.tree_cache,
-            hisparse_coordinator=self.hisparse_coordinator,
-        )
-        self.reqs = []
-        return retracted_reqs
 
     def retract_decode(
         self, server_args: ServerArgs
