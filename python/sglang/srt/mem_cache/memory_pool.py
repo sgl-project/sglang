@@ -40,12 +40,12 @@ from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa import index_buf_accessor
-from sglang.srt.layers.attention.nsa.quant_k_cache import (
+from sglang.srt.layers.attention.dsa import index_buf_accessor
+from sglang.srt.layers.attention.dsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
-from sglang.srt.layers.attention.nsa.utils import aiter_can_use_preshuffle_paged_mqa
+from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
@@ -64,6 +64,7 @@ from sglang.srt.utils import (
     is_npu,
     next_power_of_2,
 )
+from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -109,6 +110,16 @@ def _set_kv_buffer_impl(
             v_cache.view(-1, row_dim),
             indices,
             row_bytes=row_bytes,
+        )
+
+    if _is_cpu and _cpu_has_amx_support:
+        return torch.ops.sgl_kernel.store_cache_cpu(
+            k,
+            v,
+            k_cache,
+            v_cache,
+            indices,
+            row_dim,
         )
 
     from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
@@ -289,6 +300,13 @@ class MambaPool:
                 device=device,
             )
             if speculative_num_draft_tokens is not None:
+                if _is_npu:
+                    temporal_state = temporal_state.transpose(-1, -2)
+                    temporal_state_shape = (
+                        *temporal_state_shape[:-2],
+                        temporal_state_shape[-1],
+                        temporal_state_shape[-2],
+                    )
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
                 intermediate_ssm_state_cache = torch.zeros(
@@ -731,13 +749,13 @@ class KVCache(abc.ABC):
             k_size_GB = k_size / GB
             v_size_GB = v_size / GB
             logger.info(
-                f"KV Cache is allocated. #tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB"
+                f"KV Cache is allocated. dtype: {self.dtype}, #tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB"
             )
             self.mem_usage = k_size_GB + v_size_GB
         else:
             kv_size_GB = kv_size_bytes / GB
             logger.info(
-                f"KV Cache is allocated. #tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB"
+                f"KV Cache is allocated. dtype: {self.dtype}, #tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB"
             )
             self.mem_usage = kv_size_GB
 
@@ -1074,6 +1092,11 @@ class MHATokenToKVPool(KVCache):
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # Catch stale indices here instead of as illegal-addr or silent KV corruption.
+        size_limit = self.size + self.page_size
+        maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
+        maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
+
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
             return
@@ -1618,7 +1641,7 @@ class MLATokenToKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
-        use_nsa: bool = False,
+        use_dsa: bool = False,
         override_kv_cache_dim: Optional[int] = None,
     ):
         super().__init__(
@@ -1634,17 +1657,17 @@ class MLATokenToKVPool(KVCache):
 
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
-        self.use_nsa = use_nsa
-        self.nsa_kv_cache_store_fp8 = (
-            use_nsa
+        self.use_dsa = use_dsa
+        self.dsa_kv_cache_store_fp8 = (
+            use_dsa
             and dtype == torch.float8_e4m3fn
             and override_kv_cache_dim is not None
         )
-        # When override_kv_cache_dim is provided with nsa model, we assume the
+        # When override_kv_cache_dim is provided with dsa model, we assume the
         # override kv cache dim is correct and use it directly.
         self.kv_cache_dim = (
             override_kv_cache_dim
-            if self.nsa_kv_cache_store_fp8
+            if self.dsa_kv_cache_store_fp8
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
@@ -1655,8 +1678,8 @@ class MLATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
-        if not use_nsa:
-            # NSA will allocate indexer KV cache later and then log the total size
+        if not use_dsa:
+            # DSA will allocate indexer KV cache later and then log the total size
             self._finalize_allocation_log(size)
 
     def _create_buffers(self):
@@ -1726,7 +1749,7 @@ class MLATokenToKVPool(KVCache):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        assert not self.nsa_kv_cache_store_fp8
+        assert not self.dsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
@@ -1746,7 +1769,7 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
 
-        if _is_hip and self.use_nsa and self.dtype == fp8_dtype:
+        if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
             set_mla_kv_buffer_triton_fp8_quant(
@@ -1756,7 +1779,7 @@ class MLATokenToKVPool(KVCache):
                 cache_k_rope,
                 fp8_dtype,
             )
-        elif self.nsa_kv_cache_store_fp8:
+        elif self.dsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
             # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
@@ -1905,7 +1928,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        assert not self.nsa_kv_cache_store_fp8
+        assert not self.dsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
             from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
 
@@ -1930,7 +1953,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
     ):
         layer_id = layer.layer_id
 
-        if self.nsa_kv_cache_store_fp8:
+        if self.dsa_kv_cache_store_fp8:
             # original cache_k: (num_tokens, num_heads 1, hidden 576); we unsqueeze the page_size=1 dim here
             # TODO no need to cat
             cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
@@ -1968,7 +1991,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             )
 
 
-class NSATokenToKVPool(MLATokenToKVPool):
+class DSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
@@ -2005,7 +2028,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             enable_memory_saver,
             start_layer,
             end_layer,
-            use_nsa=True,
+            use_dsa=True,
             override_kv_cache_dim=override_dim,
         )
         # self.index_k_dtype = torch.float8_e4m3fn
@@ -2013,7 +2036,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         self.index_head_dim = index_head_dim
         if index_buf_size is None:
             index_buf_size = size
-        # num head == 1 and head dim == 128 for index_k in NSA
+        # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
 
         if _is_hip:
@@ -2024,7 +2047,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             else:
                 assert (
                     self.page_size == 1
-                ), f"HIP legacy NSA path requires page_size == 1, got {self.page_size}"
+                ), f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
         else:
             assert self.page_size == 64
         with (
@@ -2133,11 +2156,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
         )
 
     def get_cpu_copy(self, indices):
-        # NSA keeps a page-indexed index_k_with_scale_buffer alongside kv_buffer.
+        # DSA keeps a page-indexed index_k_with_scale_buffer alongside kv_buffer.
         # Retract frees the slots/pages and they get reused by other reqs'
         # set_index_k_scale_buffer, so we must offload it here too -- otherwise
         # resume restores kv_buffer but leaves foreign index/scale in place and
-        # NSA attention reads garbage at those token positions.
+        # DSA attention reads garbage at those token positions.
         kv_cache_cpu = super().get_cpu_copy(indices)
 
         page_indices = indices[:: self.page_size] // self.page_size

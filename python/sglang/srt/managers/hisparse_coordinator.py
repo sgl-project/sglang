@@ -9,7 +9,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     DeepSeekV4SingleKVPoolHost,
-    HiSparseNSATokenToKVPool,
+    HiSparseDSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
@@ -79,7 +79,7 @@ class HiSparseCoordinator:
             assert isinstance(
                 self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
             )
-            self.mem_pool_device: HiSparseNSATokenToKVPool = (
+            self.mem_pool_device: HiSparseDSATokenToKVPool = (
                 self.token_to_kv_pool_allocator.get_kvcache()
             )
             self.mem_pool_host = MLATokenToKVPoolHost(
@@ -444,9 +444,8 @@ class HiSparseCoordinator:
         out_cache_loc: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
     ) -> None:
-        req_pool_indices_cpu = req_pool_indices.cpu()
-
         self._eager_backup_previous_token(
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
         )
