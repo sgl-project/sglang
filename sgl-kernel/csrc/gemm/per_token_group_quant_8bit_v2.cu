@@ -255,7 +255,7 @@ template <
     bool IS_COLUMN_MAJOR = false,
     bool SCALE_UE8M0 = false,
     bool FUSE_SILU_AND_MUL = false,
-    typename scale_packed_t = std::conditional_t<SCALE_UE8M0, uint32_t, float>>
+    typename scale_packed_t = std::conditional_t<SCALE_UE8M0 && IS_COLUMN_MAJOR, uint32_t, float>>
 __global__ void per_token_group_quant_8bit_kernel(
     const T* __restrict__ input,
     DST_DTYPE* __restrict__ output_q,
@@ -268,7 +268,8 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int scale_hidden_stride,
     const int num_tokens_per_expert) {
   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
-  using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
+  // When row-major + SCALE_UE8M0, scale is still stored as float (value is power-of-2)
+  using scale_element_t = std::conditional_t<SCALE_UE8M0 && IS_COLUMN_MAJOR, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
@@ -327,8 +328,8 @@ __global__ void per_token_group_quant_8bit_kernel(
                           hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
                           token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
         } else {
-          static_assert(!SCALE_UE8M0);
-          scale_output = output_s + offset_num_groups;
+          static_assert(!SCALE_UE8M0 || std::is_same_v<scale_packed_t, float>);
+          scale_output = reinterpret_cast<scale_element_t*>(output_s) + offset_num_groups;
         }
 
         // can speed up if too slow
@@ -362,12 +363,25 @@ __global__ void per_token_group_quant_8bit_kernel(
         local_absmax = GroupReduceMax<THREADS_PER_SUBWARP>(local_absmax, lane_id);
 
         float y_scale, y_scale_inv;
-        calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
-        float2 y_scale_repeated = {y_scale, y_scale};
-
-        if (lane_id == 0) {
-          *scale_output = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
+        // For row-major + UE8M0: quantize with exact scale, but output rounded scale_inv
+        // This is equivalent to the original two-step approach (quant then ceil_to_ue8m0)
+        if constexpr (SCALE_UE8M0 && !IS_COLUMN_MAJOR) {
+          // Exact scale for quantization
+          constexpr float MAX_8BIT_INV = 1.0f / dst_dtype_info::MAX;
+          y_scale_inv = local_absmax * MAX_8BIT_INV;
+          y_scale = dst_dtype_info::MAX / local_absmax;
+          // Rounded scale_inv for output
+          float rounded_scale_inv = fast_pow2(fast_log2_ceil(y_scale_inv));
+          if (lane_id == 0) {
+            *scale_output = rounded_scale_inv;
+          }
+        } else {
+          calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
+          if (lane_id == 0) {
+            *scale_output = extract_required_scale_format < SCALE_UE8M0 && IS_COLUMN_MAJOR > (y_scale_inv);
+          }
         }
+        float2 y_scale_repeated = {y_scale, y_scale};
 
         int4 output_buf;
         static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE * sizeof(DST_DTYPE));
@@ -503,7 +517,11 @@ void sgl_per_token_group_quant_8bit_v2(
         LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, true);            \
       }                                                                                                             \
     } else {                                                                                                        \
-      LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false);             \
+      if (scale_ue8m0) {                                                                                            \
+        LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false, true);     \
+      } else {                                                                                                      \
+        LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false);           \
+      }                                                                                                             \
     }                                                                                                               \
   } while (0)
 
