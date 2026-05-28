@@ -1513,7 +1513,7 @@ class DeepseekV2AttentionMLA(
 
         self.double_sparsity_selector = None
         self.use_double_sparsity = False
-        if self.use_nsa:
+        if self.use_dsa:
             _global_server_args = get_global_server_args()
             if getattr(_global_server_args, "enable_double_sparsity", False):
                 from sglang.srt.layers.attention.double_sparsity import (
@@ -1976,7 +1976,13 @@ class DeepseekV2AttentionMLA(
                 raise
             setattr(server_args, "_double_sparsity_token_label_table", table)
             # Publish channel selection and nope_dim for the KV-write hook in dsa_backend.
-            setattr(server_args, "_ds_channel_selection", local_mask.channel_selection)
+            # The mask loads on CPU but the KV-write hook gathers GPU-resident K_nope
+            # with it as the index, so it must live on the label table's device.
+            setattr(
+                server_args,
+                "_ds_channel_selection",
+                local_mask.channel_selection.to(self.double_sparsity_selector.device),
+            )
             setattr(server_args, "_ds_qk_nope_head_dim", self.qk_nope_head_dim)
         else:
             # Table already allocated by an earlier layer's init. Guard that it was

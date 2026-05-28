@@ -15,7 +15,7 @@ Enforces, at server startup:
   ``bfloat16 ↔ flashmla_sparse``,
 * unsupported page-size rejection (page must be in ``{32, 64, 128}``),
 * capability check (DEC-10): the running model must expose the ``nsa.Indexer``
-  hook surface — proxied via :func:`is_deepseek_nsa` so GLM-5.1 falls in for
+  hook surface — proxied via :func:`is_deepseek_dsa` so GLM-5.1 falls in for
   free once it ships the same indexer interface,
 * channel-mask file existence + content-hash verification (delegates to
   :func:`channel_mask.load_channel_mask`),
@@ -141,13 +141,13 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
             )
             hf_config = None
         if hf_config is not None:
-            from sglang.srt.configs.model_config import is_deepseek_nsa
+            from sglang.srt.configs.model_config import is_deepseek_dsa
 
-            if not is_deepseek_nsa(hf_config):
+            if not is_deepseek_dsa(hf_config):
                 raise ValueError(
                     "Double Sparsity currently requires a model that exposes the DSA "
                     "Indexer hook surface (e.g. DeepSeek V3.2). The capability check "
-                    "via is_deepseek_nsa(hf_config) returned False for this model."
+                    "via is_deepseek_dsa(hf_config) returned False for this model."
                 )
 
     # top_k == get_dsa_index_topk(hf_config) boot assert.

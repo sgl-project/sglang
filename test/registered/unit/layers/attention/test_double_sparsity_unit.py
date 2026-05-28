@@ -253,6 +253,33 @@ class TestValidator(unittest.TestCase):
                 os.environ.pop("SGLANG_DS_ALLOW_PLACEHOLDER", None)
                 os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
 
+    def test_capability_check_uses_existing_model_config_symbol(self):
+        """Regression: the DS validator's capability check imported a stale
+        `is_deepseek_nsa` after model_config renamed it to `is_deepseek_dsa`,
+        raising ImportError at server startup (DS boot crashed before model
+        load). Lock that the validator references the existing symbol and that
+        the symbol classifies DeepSeek-V3.2 as a DSA model."""
+        import inspect
+
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+        from sglang.srt.layers.attention.double_sparsity import validator as _v
+
+        src = inspect.getsource(_v)
+        self.assertNotIn("is_deepseek_nsa", src)
+        self.assertIn("is_deepseek_dsa", src)
+        self.assertTrue(
+            is_deepseek_dsa(
+                SimpleNamespace(
+                    architectures=["DeepseekV32ForCausalLM"], index_topk=2048
+                )
+            )
+        )
+        self.assertFalse(
+            is_deepseek_dsa(
+                SimpleNamespace(architectures=["LlamaForCausalLM"], index_topk=None)
+            )
+        )
+
     def test_record_radix_fixture_passed_logs_artifact_sha(self):
         """The audit log line names the artifact path + its SHA256 so
         a server-log grep surfaces both the flip event AND the
@@ -6840,6 +6867,23 @@ class TestAC1CallSites(unittest.TestCase):
         # With save_kv_cache=False, the KV-write block is skipped; table must remain zero
         self.assertFalse(table.written[0, 5].item(), "slot 5 written despite save_kv_cache=False")
         self.assertFalse(table.written[0, 10].item(), "slot 10 written despite save_kv_cache=False")
+
+
+class TestDeepseekV2DSEnablementAttribute(unittest.TestCase):
+    """Regression: the DS-enablement branch in DeepseekV2AttentionMLA.__init__
+    gated on a stale `self.use_nsa` after the attribute was renamed to
+    `self.use_dsa` (assigned from `is_deepseek_dsa(config)`), raising
+    AttributeError at model construction and crashing the DS server boot before
+    weight load. Lock that the branch references the attribute that is set."""
+
+    def test_ds_enablement_uses_use_dsa_not_use_nsa(self):
+        import inspect
+
+        from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+        src = inspect.getsource(DeepseekV2AttentionMLA.__init__)
+        self.assertNotIn("self.use_nsa", src)
+        self.assertIn("self.use_dsa", src)
 
 
 class TestRadixCaptureExtendSnapshotProducer(unittest.TestCase):

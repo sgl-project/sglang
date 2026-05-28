@@ -34,6 +34,13 @@ PAGE_SIZE="${PAGE_SIZE:-64}"
 CHANNEL_MASK_PATH="${CHANNEL_MASK_PATH:-/models/dsv32-fp8-channel-mask.safetensors}"
 TOP_K="${TOP_K:-2048}"
 DEVICE_BUFFER_SIZE="${DEVICE_BUFFER_SIZE:-4096}"
+# Double Sparsity allocates a per-rank TokenLabelTable (sized from the KV pool,
+# tens of GiB on V3.2) AFTER the static weight+KV pool is reserved, and also
+# needs headroom for the regular CUDA-graph capture set plus per-request decode
+# activations. The stock default (0.897) OOMs at boot; 0.7 boots but OOMs during
+# generation on V3.2/H200. 0.6 boots and serves stably (verified): weights are
+# ~80 GB/rank, leaving a small KV pool plus ~38 GB of runtime headroom.
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.6}"
 LOG_DIR="${LOG_DIR:-$(pwd)/development/logs}"
 mkdir -p "${LOG_DIR}"
 
@@ -57,6 +64,7 @@ exec python3 -m sglang.launch_server \
   --port "${PORT}" \
   --tp-size "${TP_SIZE}" \
   --kv-cache-dtype "${KV_CACHE_DTYPE}" \
+  --mem-fraction-static "${MEM_FRACTION_STATIC}" \
   --page-size "${PAGE_SIZE}" \
   --dsa-prefill-backend flashmla_kv \
   --dsa-decode-backend flashmla_kv \
