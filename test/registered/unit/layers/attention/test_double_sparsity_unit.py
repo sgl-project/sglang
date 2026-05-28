@@ -2390,6 +2390,194 @@ class TestCalibrateMethod1(unittest.TestCase):
         self.assertIn("label-dim", str(ctx.exception))
 
 
+class TestCalibrationLoaderV32Remap(unittest.TestCase):
+    """DeepSeek-V3.2 calibration loader: config remap + fail-closed dry-run.
+
+    transformers has no `deepseek_v32` config/modeling and the checkpoint ships
+    no remote code, so the loader remaps the config to `deepseek_v3` (V3.2 = V3 +
+    the DSA indexer, irrelevant to channel-importance calibration). The dry-run
+    placement validator is fail-closed so a degraded load (off-GPU offload,
+    single-GPU, or a silent bf16 upcast) never reaches the full calibration.
+    """
+
+    def test_resolve_config_remaps_deepseek_v32(self):
+        import json
+        import os as _os
+        import tempfile
+
+        from sglang.srt.layers.attention.double_sparsity.calibrate import (
+            _config_is_fp8,
+            _resolve_calibration_config,
+        )
+
+        cfg_dict = {
+            "model_type": "deepseek_v32",
+            "architectures": ["DeepseekV32ForCausalLM"],
+            "num_hidden_layers": 61,
+            "num_attention_heads": 128,
+            "hidden_size": 7168,
+            "qk_nope_head_dim": 128,
+            "qk_rope_head_dim": 64,
+            "v_head_dim": 128,
+            "kv_lora_rank": 512,
+            "quantization_config": {
+                "quant_method": "fp8",
+                "fmt": "e4m3",
+                "weight_block_size": [128, 128],
+            },
+        }
+        with tempfile.TemporaryDirectory() as d:
+            with open(_os.path.join(d, "config.json"), "w") as f:
+                json.dump(cfg_dict, f)
+            cfg = _resolve_calibration_config(d)
+
+        self.assertEqual(type(cfg).__name__, "DeepseekV3Config")
+        self.assertEqual(cfg.model_type, "deepseek_v3")
+        self.assertEqual(cfg.architectures, ["DeepseekV3ForCausalLM"])
+        self.assertEqual(cfg.num_hidden_layers, 61)
+        self.assertEqual(cfg.qk_nope_head_dim, 128)
+        self.assertEqual(cfg.qk_rope_head_dim, 64)
+        self.assertEqual(cfg.v_head_dim, 128)
+        self.assertEqual(cfg.kv_lora_rank, 512)
+        self.assertTrue(_config_is_fp8(cfg))
+
+    def test_load_calibration_model_passes_remapped_config_and_auto_args(self):
+        import sglang.srt.layers.attention.double_sparsity.calibrate as calib
+
+        sentinel_cfg = object()
+        fake_model = MagicMock()
+        with mock.patch.object(
+            calib, "_resolve_calibration_config", return_value=sentinel_cfg
+        ), mock.patch("transformers.AutoModelForCausalLM") as mm, mock.patch(
+            "transformers.AutoTokenizer"
+        ) as mt:
+            mm.from_pretrained.return_value = fake_model
+            mt.from_pretrained.return_value = MagicMock()
+            model, _tok, cfg = calib._load_calibration_model(
+                "/fake/path", use_cuda=True
+            )
+
+        self.assertIs(cfg, sentinel_cfg)
+        self.assertIs(model, fake_model)
+        _args, kwargs = mm.from_pretrained.call_args
+        self.assertIs(kwargs["config"], sentinel_cfg)
+        self.assertEqual(kwargs["torch_dtype"], "auto")
+        self.assertEqual(kwargs["device_map"], "auto")
+        fake_model.eval.assert_called_once()
+
+    def test_load_calibration_model_cpu_device_map_when_no_cuda(self):
+        import sglang.srt.layers.attention.double_sparsity.calibrate as calib
+
+        with mock.patch.object(
+            calib, "_resolve_calibration_config", return_value=object()
+        ), mock.patch("transformers.AutoModelForCausalLM") as mm, mock.patch(
+            "transformers.AutoTokenizer"
+        ) as mt:
+            mm.from_pretrained.return_value = MagicMock()
+            mt.from_pretrained.return_value = MagicMock()
+            calib._load_calibration_model("/fake/path", use_cuda=False)
+
+        _args, kwargs = mm.from_pretrained.call_args
+        self.assertEqual(kwargs["device_map"], {"": "cpu"})
+
+    def test_enforce_dry_run_rejects_off_gpu_placement(self):
+        from sglang.srt.layers.attention.double_sparsity.calibrate import (
+            _enforce_dry_run_placement,
+        )
+
+        report = {
+            "device_counts": {"cuda:0": 10, "cpu": 2},
+            "dtype_counts": {"torch.float8_e4m3fn": 8},
+            "has_float8": True,
+        }
+        with self.assertRaises(RuntimeError):
+            _enforce_dry_run_placement(report)
+
+    def test_enforce_dry_run_rejects_single_gpu(self):
+        from sglang.srt.layers.attention.double_sparsity.calibrate import (
+            _enforce_dry_run_placement,
+        )
+
+        report = {
+            "device_counts": {"cuda:0": 12},
+            "dtype_counts": {"torch.float8_e4m3fn": 8},
+            "has_float8": True,
+        }
+        with self.assertRaises(RuntimeError):
+            _enforce_dry_run_placement(report)
+
+    def test_enforce_dry_run_rejects_bf16_upcast(self):
+        from sglang.srt.layers.attention.double_sparsity.calibrate import (
+            _enforce_dry_run_placement,
+        )
+
+        report = {
+            "device_counts": {"cuda:0": 6, "cuda:1": 6},
+            "dtype_counts": {"torch.bfloat16": 12},
+            "has_float8": False,
+        }
+        with self.assertRaises(RuntimeError):
+            _enforce_dry_run_placement(report)
+
+    def test_enforce_dry_run_passes_good_sharded_fp8(self):
+        from sglang.srt.layers.attention.double_sparsity.calibrate import (
+            _enforce_dry_run_placement,
+        )
+
+        report = {
+            "device_counts": {"cuda:0": 6, "cuda:1": 6, "cuda:2": 6},
+            "dtype_counts": {"torch.float8_e4m3fn": 12, "torch.bfloat16": 6},
+            "has_float8": True,
+        }
+        # Must not raise.
+        _enforce_dry_run_placement(report)
+
+    def test_config_is_fp8_detection(self):
+        from sglang.srt.layers.attention.double_sparsity.calibrate import (
+            _config_is_fp8,
+        )
+
+        self.assertFalse(_config_is_fp8(SimpleNamespace()))
+        self.assertFalse(_config_is_fp8(SimpleNamespace(quantization_config=None)))
+        self.assertTrue(
+            _config_is_fp8(SimpleNamespace(quantization_config={"quant_method": "fp8"}))
+        )
+        self.assertTrue(
+            _config_is_fp8(
+                SimpleNamespace(quantization_config=SimpleNamespace(quant_method="fp8"))
+            )
+        )
+
+    def test_force_triton_skips_deepgemm_with_importerror(self):
+        import types
+
+        import transformers.integrations as _ti
+
+        import sglang.srt.layers.attention.double_sparsity.calibrate as calib
+
+        fake = types.ModuleType("finegrained_fp8")
+        called = {"orig": False}
+
+        def _orig():
+            called["orig"] = True
+            raise ValueError("would fetch the deep-gemm cutlass tree (429 storm)")
+
+        fake._load_deepgemm_kernel = _orig
+        with mock.patch.object(_ti, "finegrained_fp8", fake, create=True):
+            calib._force_triton_fp8_for_calibration()
+            self.assertTrue(getattr(fake, "_ds_calib_force_triton", False))
+            # DeepGEMM must be reported unavailable as ImportError immediately,
+            # WITHOUT invoking the original (no slow/unreliable hub fetch), so
+            # transformers' w8a8_fp8_matmul falls straight through to Triton.
+            with self.assertRaises(ImportError):
+                fake._load_deepgemm_kernel()
+            self.assertFalse(called["orig"])
+            # Idempotent: a second call does not re-wrap.
+            wrapped = fake._load_deepgemm_kernel
+            calib._force_triton_fp8_for_calibration()
+            self.assertIs(fake._load_deepgemm_kernel, wrapped)
+
+
 class TestChannelMaskSlicePerRank(unittest.TestCase):
     """Round-2 fix [P2]: TP head sharding helper."""
 

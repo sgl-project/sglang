@@ -40,7 +40,7 @@ import datetime
 import logging
 import os
 import sys
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -180,14 +180,8 @@ def _build_pile_val_token_blocks(
     return blocks
 
 
-def _log_param_dtype_device_report(model) -> None:
-    """Log a parameter dtype + device-placement histogram for the loaded model.
-
-    Surfaces (a) whether the FP8 block-quantized checkpoint stayed FP8 or was
-    silently upcast to bf16/fp16, and (b) how Accelerate dispatched modules
-    across the visible GPUs. This is the evidence the one-block dry-run checks
-    before a full multi-block calibration is started.
-    """
+def _summarize_param_placement(model) -> Dict[str, Any]:
+    """Collect a dtype + device histogram across the model's parameters."""
     from collections import Counter
 
     dtype_counts: "Counter[str]" = Counter()
@@ -197,25 +191,189 @@ def _log_param_dtype_device_report(model) -> None:
         dtype_counts[str(p.dtype)] += 1
         device_counts[str(p.device)] += 1
         total += 1
+    hf_device_map = getattr(model, "hf_device_map", None)
+    map_devices = (
+        sorted({str(v) for v in hf_device_map.values()})
+        if hf_device_map is not None
+        else []
+    )
+    return {
+        "total": total,
+        "dtype_counts": dict(dtype_counts),
+        "device_counts": dict(device_counts),
+        "has_float8": any("float8" in d for d in dtype_counts),
+        "hf_device_map_devices": map_devices,
+    }
 
-    has_float8 = any("float8" in d for d in dtype_counts)
+
+def _log_param_dtype_device_report(model) -> Dict[str, Any]:
+    """Log and return the parameter dtype + device-placement report.
+
+    Surfaces (a) whether the FP8 block-quantized checkpoint stayed FP8 or was
+    silently upcast to bf16/fp16, and (b) how Accelerate dispatched modules
+    across the visible GPUs. This is the evidence the one-block dry-run checks
+    before a full multi-block calibration is started.
+    """
+    report = _summarize_param_placement(model)
     logger.info(
         "Loaded model parameter report: %d tensors; dtype histogram=%s; "
         "device histogram=%s; float8_present=%s.",
-        total,
-        dict(dtype_counts),
-        dict(device_counts),
-        has_float8,
+        report["total"],
+        report["dtype_counts"],
+        report["device_counts"],
+        report["has_float8"],
     )
-    hf_device_map = getattr(model, "hf_device_map", None)
-    if hf_device_map is not None:
-        placed_devices = sorted({str(v) for v in hf_device_map.values()})
+    if report["hf_device_map_devices"]:
         logger.info(
-            "hf_device_map spans %d device(s): %s (%d module entries).",
-            len(placed_devices),
-            placed_devices,
-            len(hf_device_map),
+            "hf_device_map spans %d device(s): %s.",
+            len(report["hf_device_map_devices"]),
+            report["hf_device_map_devices"],
         )
+    return report
+
+
+def _enforce_dry_run_placement(report: Dict[str, Any]) -> None:
+    """Fail-closed validation of a dry-run load on CUDA for an FP8 checkpoint.
+
+    Raises ``RuntimeError`` on a silently-degraded load — an off-GPU placement
+    (cpu/disk/meta offload), a single-GPU placement that did not shard, or a
+    bf16/fp16 upcast (no float8 parameters) — so the operator never proceeds to a
+    full multi-block calibration from a bad load. The caller logs the full
+    histogram before this runs.
+    """
+    param_devices = set(report["device_counts"])
+    off_gpu = sorted(
+        d for d in param_devices if any(x in d for x in ("cpu", "meta", "disk"))
+    )
+    if off_gpu:
+        raise RuntimeError(
+            f"Dry-run rejected: parameters placed off-GPU on {off_gpu} (device "
+            f"histogram {report['device_counts']}). A sharded FP8 load must keep "
+            "every parameter on CUDA; cpu/disk/meta means Accelerate offloaded, "
+            "which breaks the calibration forward."
+        )
+    cuda_devices = sorted(d for d in param_devices if "cuda" in d)
+    if len(cuda_devices) < 2:
+        raise RuntimeError(
+            f"Dry-run rejected: parameters span only {cuda_devices}; the V3.2 "
+            "load must dispatch across multiple GPUs (device histogram "
+            f"{report['device_counts']})."
+        )
+    if not report["has_float8"]:
+        raise RuntimeError(
+            "Dry-run rejected: the FP8-quantized checkpoint loaded with NO float8 "
+            f"parameters (dtype histogram {report['dtype_counts']}) — a silent "
+            "bf16/fp16 upcast. Calibration must run on the native FP8 weights."
+        )
+
+
+def _config_is_fp8(config) -> bool:
+    """True when the model config declares FP8 quantization."""
+    qc = getattr(config, "quantization_config", None)
+    if qc is None:
+        return False
+    method = getattr(qc, "quant_method", None)
+    if method is not None:
+        return "fp8" in str(method).lower()
+    return "fp8" in str(qc).lower()
+
+
+def _resolve_calibration_config(model_path: str):
+    """Resolve the HF config for calibration, remapping the unregistered V3.2.
+
+    transformers has no ``deepseek_v32`` config/modeling and the checkpoint ships
+    no remote code, so ``AutoModelForCausalLM`` cannot load it directly.
+    DeepSeek-V3.2 is DeepSeek-V3 plus the DSA sparse-attention indexer, which is
+    irrelevant to channel-importance calibration (only the MLA ``kv_b_proj`` /
+    ``q_b_proj`` projections matter, and they are identical to V3). So when the
+    on-disk ``model_type`` is ``deepseek_v32`` we remap it to ``deepseek_v3`` and
+    load the FP8 weights under the transformers V3 modeling. If the raw config
+    cannot be read (e.g. unit fakes with no ``config.json``), fall back to the
+    plain ``AutoConfig.from_pretrained`` path.
+    """
+    from transformers import AutoConfig, PretrainedConfig
+
+    try:
+        config_dict, _ = PretrainedConfig.get_config_dict(model_path)
+    except Exception:
+        return AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+
+    if config_dict.get("model_type") == "deepseek_v32":
+        logger.warning(
+            "Remapping unregistered model_type 'deepseek_v32' -> 'deepseek_v3' "
+            "for the calibration load: the V3.2 DSA indexer is irrelevant to "
+            "channel-importance calibration (only MLA kv_b_proj/q_b_proj matter)."
+        )
+        remapped = {k: v for k, v in config_dict.items() if k != "model_type"}
+        remapped["architectures"] = ["DeepseekV3ForCausalLM"]
+        return AutoConfig.for_model("deepseek_v3", **remapped)
+
+    return AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+
+
+def _force_triton_fp8_for_calibration() -> None:
+    """Skip the DeepGEMM hub kernel and use transformers' finegrained-fp8 Triton path.
+
+    transformers' ``w8a8_fp8_matmul`` prefers the ``kernels-community/deep-gemm``
+    hub kernel for 128x128 block FP8 and otherwise (on ``ImportError``) falls back
+    to the ``kernels-community/finegrained-fp8`` Triton kernel. DeepGEMM is a JIT
+    kernel whose hub repo carries a large cutlass source tree; fetching it is
+    unreliable under HF Hub rate limiting (429 storms with multi-minute backoffs)
+    and the cached build's metadata schema is rejected by the installed
+    ``kernels`` package — either way it raises a non-``ImportError`` deep inside
+    the fetch, which escapes transformers' ``except ImportError`` and crashes the
+    forward. The finegrained-fp8 Triton kernel is small, loads cleanly, and is
+    numerically equivalent — the right choice for a one-time calibration. Force
+    DeepGEMM to report ``ImportError`` immediately (no fetch attempted) so the
+    forward goes straight to the Triton path. Idempotent.
+    """
+    try:
+        from transformers.integrations import finegrained_fp8 as _fgfp8
+    except Exception:
+        return
+    if getattr(_fgfp8, "_ds_calib_force_triton", False):
+        return
+
+    def _skip_deepgemm():
+        raise ImportError(
+            "DeepGEMM kernel skipped for calibration (its hub fetch pulls a large "
+            "cutlass source tree that is unreliable under HF Hub rate limiting); "
+            "using the finegrained-fp8 Triton fallback instead."
+        )
+
+    _fgfp8._load_deepgemm_kernel = _skip_deepgemm
+    _fgfp8._ds_calib_force_triton = True
+
+
+def _load_calibration_model(model_path: str, use_cuda: bool):
+    """Load the calibration model + tokenizer + resolved config.
+
+    Loads the checkpoint in its native dtype (no bf16/fp16 upcast) and lets
+    HF/Accelerate shard modules across the visible GPUs. DeepSeek-V3.2 is FP8
+    block-quantized on disk (~671GB); a bf16 load would roughly double the
+    footprint and pin the model to one device, neither of which fits one H200.
+    ``--dtype`` is the recorded forward-stability hint and no longer feeds the load.
+    """
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except ImportError as exc:
+        raise RuntimeError(
+            "Calibration requires the `transformers` library. Install via "
+            "'pip install transformers' or run on the deployed image."
+        ) from exc
+
+    config = _resolve_calibration_config(model_path)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        torch_dtype="auto",
+        device_map="auto" if use_cuda else {"": "cpu"},
+        trust_remote_code=True,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    model.eval()
+    _force_triton_fp8_for_calibration()
+    return model, tokenizer, config
 
 
 def _collect_channel_importance(
@@ -279,14 +437,6 @@ def _collect_channel_importance(
 
     # Real forward-pass calibration: load the model + tokenizer, register
     # Method 1 Q+K hooks per attention layer, accumulate importance, then reduce.
-    try:
-        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-    except ImportError as exc:
-        raise RuntimeError(
-            "Calibration requires the `transformers` library. Install via "
-            "'pip install transformers' or run on the deployed image."
-        ) from exc
-
     logger.info(
         "Loading %s for calibration (dtype=%s tp=%d num_prompts=%d method=Method1_QK).",
         model_path,
@@ -302,25 +452,14 @@ def _collect_channel_importance(
             tp,
         )
 
-    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    # Load the checkpoint in its native dtype (no bf16/fp16 upcast) and let
-    # HF/Accelerate shard the modules across all visible GPUs. DeepSeek-V3.2 is
-    # FP8 block-quantized on disk (~671GB); forcing a bf16 load would roughly
-    # double the footprint and pin the whole model to one device, neither of
-    # which fits one H200. ``device_map="auto"`` dispatches modules across the
-    # node's GPUs; ``torch_dtype="auto"`` preserves the on-disk dtype so FP8
-    # weights stay FP8. ``--dtype`` remains the recorded forward-stability hint
-    # and feeds nothing into the load anymore.
     use_cuda = torch.cuda.is_available()
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype="auto",
-        device_map="auto" if use_cuda else {"": "cpu"},
-        trust_remote_code=True,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model.eval()
-    _log_param_dtype_device_report(model)
+    model, tokenizer, config = _load_calibration_model(model_path, use_cuda)
+    report = _log_param_dtype_device_report(model)
+    # Fail-closed dry-run gate: on CUDA with an FP8 checkpoint, reject a load that
+    # offloaded off-GPU, did not shard across GPUs, or silently upcast away the
+    # FP8 weights — before spending a full multi-block calibration on it.
+    if dry_run_blocks > 0 and use_cuda and _config_is_fp8(config):
+        _enforce_dry_run_placement(report)
 
     num_layers = int(getattr(config, "num_hidden_layers", num_layers_hint or 0))
     num_heads = int(getattr(config, "num_attention_heads", num_heads_hint or 0))
