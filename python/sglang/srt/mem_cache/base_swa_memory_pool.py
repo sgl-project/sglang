@@ -14,8 +14,8 @@ class BaseSWAKVPool(KVCache):
     handle SWA state separately from the full KV state.
     """
 
-    # Whether PD prefill should cap prompt length by the SWA pool size.
-    # Generic SWA pools allocate full-prompt SWA KV; specialized pools may not.
+    # By default, PD prefill assumes the SWA pool stores KV for every prompt
+    # token. Pools that use SWA only for window state should override this.
     pd_prefill_swa_pool_holds_full_prompt: bool = True
 
     swa_kv_pool: KVCache

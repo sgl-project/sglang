@@ -141,7 +141,7 @@ class PrefillBootstrapQueue:
                 True,
             )
         ):
-            # Generic SWA pools allocate full-prompt SWA KV in PD prefill.
+            # If SWA stores every prompt token, its pool size caps admission.
             self.max_total_num_tokens = min(
                 self.max_total_num_tokens,
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
