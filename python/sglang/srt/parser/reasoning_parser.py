@@ -597,6 +597,171 @@ class _PoolsideV1Detector(Qwen3Detector):
         self.reasoning_default = "explicit_enable_thinking"
 
 
+class CohereCommand4Detector(BaseReasoningFormatDetector):
+    """Detector for Cohere Command4 / Command-A family (incl. cohere2_moe and
+    cohere2_vision Command-A-Plus).
+
+    Generated format (the assistant prefix in the chat template already emits
+    ``<|START_THINKING|>`` when ``reasoning=True``, so the *generated* text
+    typically begins inside the thinking block):
+
+        thinking_content<|END_THINKING|><|START_TEXT|>final_answer<|END_TEXT|>
+
+    When ``reasoning=False`` the chat template emits both START/END_THINKING
+    in the prefix and the generated text is just::
+
+        <|START_TEXT|>final_answer<|END_TEXT|>
+
+    This detector returns:
+      - ``reasoning_text`` = the thinking block (between START_THINKING and
+        END_THINKING, with the START tag stripped if the model echoed it).
+      - ``normal_text`` = the content between ``<|START_TEXT|>`` and
+        ``<|END_TEXT|>``, with both markers stripped. If no ``<|START_TEXT|>``
+        appears (the model exhausted max_new_tokens still inside thinking),
+        ``normal_text`` is the empty string -- mirrors what vLLM's
+        ``cohere_command4`` reasoning parser produces.
+
+    Matches the public token names from the model's
+    ``special_tokens_map.json`` (``<|START_THINKING|>`` etc.).
+    """
+
+    TEXT_START_TOKEN = "<|START_TEXT|>"
+    TEXT_END_TOKEN = "<|END_TEXT|>"
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
+        # The chat template puts <|START_THINKING|> in the assistant prefix
+        # when reasoning is enabled, so the *generated* text usually starts
+        # already inside thinking. ``force_reasoning=True`` makes the base
+        # detector treat the leading bytes as reasoning even though the
+        # generated stream typically does not echo <|START_THINKING|>.
+        super().__init__(
+            think_start_token="<|START_THINKING|>",
+            think_end_token="<|END_THINKING|>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+        )
+        # Streaming state for the final-text block: once we've stepped past
+        # <|END_THINKING|> we still need to strip the surrounding
+        # <|START_TEXT|>...<|END_TEXT|> markers from the normal-text stream.
+        self._saw_text_start = False
+        self._saw_text_end = False
+        self._normal_buffer = ""
+
+    @classmethod
+    def _strip_text_markers(cls, raw: str) -> str:
+        """Extract the substring between ``<|START_TEXT|>`` and
+        ``<|END_TEXT|>``. If ``<|START_TEXT|>`` is absent (model never
+        produced a final text block, e.g. ran out of tokens still thinking)
+        return ``""``. If ``<|END_TEXT|>`` is absent (stop token or
+        max_new_tokens cut the stream off inside the text block) return
+        everything after ``<|START_TEXT|>``.
+        """
+        if not raw:
+            return ""
+        s = raw.find(cls.TEXT_START_TOKEN)
+        if s == -1:
+            return ""
+        s += len(cls.TEXT_START_TOKEN)
+        tail = raw[s:]
+        e = tail.find(cls.TEXT_END_TOKEN)
+        if e == -1:
+            return tail
+        return tail[:e]
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        # Direct parse: split on the (single) ``<|END_THINKING|>`` token if
+        # present. Anything before is reasoning, anything after is the
+        # final-text block. If no END_THINKING but a START_TEXT exists,
+        # we're in the reasoning=False case (chat template emitted both
+        # START/END thinking in the prefix; the model only generated the
+        # text block). Otherwise the model exhausted tokens still thinking
+        # and ``normal_text`` ends up empty -- matching the convention of
+        # the other detectors in this module (DeepSeekR1, Qwen3, ...). The
+        # empty content is propagated as ``message.content = None`` by
+        # serving_chat, and downstream code is expected to treat that as
+        # "no answer" rather than falling back to ``reasoning_content``.
+        end_think_idx = text.find(self.think_end_token)
+        text_start_idx = text.find(self.TEXT_START_TOKEN)
+        if end_think_idx != -1:
+            reasoning = text[:end_think_idx]
+            rest = text[end_think_idx + len(self.think_end_token) :]
+        elif text_start_idx != -1:
+            reasoning = text[:text_start_idx]
+            rest = text[text_start_idx:]
+        else:
+            reasoning = text
+            rest = ""
+
+        # Some checkpoints echo the START_THINKING token even though the
+        # chat template put it in the prefix; drop it if so.
+        think_start_text = self.think_start_token + self.think_start_self_label
+        if reasoning.startswith(think_start_text):
+            reasoning = reasoning[len(think_start_text) :]
+
+        return StreamingParseResult(
+            normal_text=self._strip_text_markers(rest),
+            reasoning_text=reasoning,
+        )
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        # Let the base detector route bytes into reasoning vs normal first.
+        result = super().parse_streaming_increment(new_text)
+        # While we're still inside the reasoning block (or the base detector
+        # decided this chunk is purely reasoning) nothing to strip.
+        if result.reasoning_text and not result.normal_text:
+            return result
+
+        normal_inc = result.normal_text or ""
+        if not normal_inc:
+            return result
+
+        out_normal = ""
+        # Append the new normal-stream slice to our buffer and walk through
+        # the START_TEXT / END_TEXT markers.
+        self._normal_buffer += normal_inc
+
+        if not self._saw_text_start:
+            s = self._normal_buffer.find(self.TEXT_START_TOKEN)
+            if s == -1:
+                # The buffer may contain a partial START_TEXT marker at the
+                # tail; keep the last (len-1) chars in case the next chunk
+                # completes the marker.
+                keep = len(self.TEXT_START_TOKEN) - 1
+                if len(self._normal_buffer) > keep:
+                    self._normal_buffer = self._normal_buffer[-keep:]
+                result.normal_text = ""
+                return result
+            # Drop everything up to and including the START_TEXT marker.
+            self._normal_buffer = self._normal_buffer[s + len(self.TEXT_START_TOKEN) :]
+            self._saw_text_start = True
+
+        if self._saw_text_start and not self._saw_text_end:
+            e = self._normal_buffer.find(self.TEXT_END_TOKEN)
+            if e == -1:
+                # Emit everything except possible partial END_TEXT tail.
+                keep = len(self.TEXT_END_TOKEN) - 1
+                if len(self._normal_buffer) > keep:
+                    out_normal = self._normal_buffer[:-keep]
+                    self._normal_buffer = self._normal_buffer[-keep:]
+                else:
+                    out_normal = ""
+            else:
+                out_normal = self._normal_buffer[:e]
+                self._normal_buffer = self._normal_buffer[e + len(self.TEXT_END_TOKEN) :]
+                self._saw_text_end = True
+
+        result.normal_text = out_normal
+        return result
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -629,6 +794,7 @@ class ReasoningParser:
         "nemotron_3": Nemotron3Detector,
         "interns1": Qwen3Detector,
         "gemma4": Gemma4Detector,
+        "cohere_command4": CohereCommand4Detector,
     }
 
     def __init__(
