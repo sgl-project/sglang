@@ -650,7 +650,7 @@ class PrefillAdder:
         # property short-circuits is_dllm()), so this only affects audit
         # views. Snapshot the post-admit position the same way as
         # add_one_req.
-        req.scheduled_extend_len = len(req.prefix_indices) + req.extend_input_len
+        req.set_scheduled_extend_len(len(req.prefix_indices) + req.extend_input_len)
         self.can_run_list.append(req)
 
         # Update budget: reserve max_new_tokens only if not truncated
@@ -780,7 +780,7 @@ class PrefillAdder:
         # Plan-time advance: snapshot how far fill_ids has been scheduled.
         # See add_one_req for the rationale (prefix_indices + admitted
         # tokens yields the right last-vs-middle comparison).
-        req.scheduled_extend_len = len(req.prefix_indices) + req.extend_input_len
+        req.set_scheduled_extend_len(len(req.prefix_indices) + req.extend_input_len)
 
         return self.budget_state()
 
@@ -960,7 +960,7 @@ class PrefillAdder:
         # original "truncated" flag semantics (last chunk admit yields
         # scheduled_extend_len == len(origin_input_ids), middle chunk
         # yields strictly less).
-        req.scheduled_extend_len = len(req.prefix_indices) + req.extend_input_len
+        req.set_scheduled_extend_len(len(req.prefix_indices) + req.extend_input_len)
 
         return self.budget_state()
 

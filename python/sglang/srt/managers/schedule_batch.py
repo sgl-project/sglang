@@ -1054,6 +1054,22 @@ class Req(ReqDllmMixin):
         n = len(self.origin_input_ids)
         return 0 < self.scheduled_extend_len < n
 
+    def set_scheduled_extend_len(self, value: int) -> None:
+        """Update `scheduled_extend_len` with a bounds check.
+
+        Plan-time prefill progress must stay within
+        `[0, len(origin_input_ids)]`. Overshoot would silently break the
+        `has_pending_chunk` derivation (which relies on `SE < N` as the
+        upper bound) and indicates a truncation/admission bug worth
+        catching at the source.
+        """
+        n = len(self.origin_input_ids)
+        assert 0 <= value <= n, (
+            f"scheduled_extend_len {value} out of bounds [0, {n}] "
+            f"for req {self.rid}"
+        )
+        self.scheduled_extend_len = value
+
     @property
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
