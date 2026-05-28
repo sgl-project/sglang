@@ -108,25 +108,26 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
                 envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
             )
 
-        if input_embeds is None:
-            input_embeds = self.model.embed_tokens(input_ids)
+        try:
+            if input_embeds is None:
+                input_embeds = self.model.embed_tokens(input_ids)
 
-        hidden_states = forward_batch.spec_info.hidden_states
-        # Some idle batch has 0 batch size. GemmaRMSNorm.forward would fail due to bs=0.
-        if not forward_batch.forward_mode.is_idle():
-            input_embeds = self.pre_fc_norm_embedding(input_embeds)
-            hidden_states = self.pre_fc_norm_hidden(hidden_states)
-        hidden_states = self.fc(torch.cat((input_embeds, hidden_states), dim=-1))
+            hidden_states = forward_batch.spec_info.hidden_states
+            # Some idle batch has 0 batch size. GemmaRMSNorm.forward would fail due to bs=0.
+            if not forward_batch.forward_mode.is_idle():
+                input_embeds = self.pre_fc_norm_embedding(input_embeds)
+                hidden_states = self.pre_fc_norm_hidden(hidden_states)
+            hidden_states = self.fc(torch.cat((input_embeds, hidden_states), dim=-1))
 
-        with get_global_expert_distribution_recorder().disable_this_region():
-            hidden_states = self.model(
-                input_ids,
-                positions,
-                forward_batch,
-                hidden_states,
-            )
-
-        exit_stack.close()
+            with get_global_expert_distribution_recorder().disable_this_region():
+                hidden_states = self.model(
+                    input_ids,
+                    positions,
+                    forward_batch,
+                    hidden_states,
+                )
+        finally:
+            exit_stack.close()
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

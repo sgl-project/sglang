@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -437,7 +436,7 @@ class _DeepEPDispatcherImplBase:
             # NVFP4 is supported on GPU, no adjustment needed
 
     def _update_int8_quant_env(self) -> None:
-        """TODO adapt different quantization schemes for base model and draft model"""
+        """TODO adapt different quantization schemes for base model and draft model on NPU"""
         pass
 
     def set_overlap_args(
