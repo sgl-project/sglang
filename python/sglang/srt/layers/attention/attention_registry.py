@@ -270,7 +270,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.srt.utils import (
             is_blackwell,
             is_npu,
-            is_sm100_supported,
+            is_sm120_supported,
         )
 
         if not is_npu():
@@ -294,10 +294,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         initialize_linear_attn_config(runner.server_args)
         if runner.hybrid_gdn_config is not None:
             if is_blackwell():
-                if is_sm100_supported():
-                    allowed = {"triton", "trtllm_mha"}
+                if is_sm120_supported():
+                    allowed = {"triton", "trtllm_mha", "flashinfer"}
                 else:
-                    allowed = {"triton", "trtllm_mha", "fa4", "flashinfer"}
+                    allowed = {"triton", "trtllm_mha", "fa4"}
                 attn_be = runner.server_args.attention_backend
                 prefill_be = runner.server_args.prefill_attention_backend
                 decode_be = runner.server_args.decode_attention_backend
