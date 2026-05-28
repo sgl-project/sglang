@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import os
 import time
@@ -26,6 +27,85 @@ if _is_npu:
     torch_npu._apply_patches(patches)
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def profile_startup_region(label: str, snapshot_path: str, enabled: bool):
+    """Wrap a one-shot startup region with a torch profiler trace and a CUDA
+    memory history snapshot.
+
+    Mirrors :class:`CudaGraphRunner._init_profile_context_and_memory_record`
+    / ``_post_process_after_profile``. Currently used to instrument the
+    FlashInfer autotune kernel warmup, but the helper itself is general and
+    can wrap any short-lived region whose allocations go through PyTorch's
+    CUDA caching allocator.
+
+    On exit, this dumps a CUDA memory history pickle (open at
+    https://pytorch.org/memory_viz) and logs four ranked tables: top ops by
+    ``self_cuda_memory_usage`` and ``self_cpu_memory_usage`` (primary signal
+    for memory-attribution questions), followed by ``cuda_time_total`` and
+    ``cpu_time_total`` (secondary signal for kernel-bound regions like
+    autotune).
+
+    Limitation: ``_record_memory_history`` and ``profile_memory=True`` only
+    instrument PyTorch's CUDA caching allocator. Allocations made directly
+    via the CUDA driver API (e.g. ``cuMemCreate`` for FlashInfer's symmetric
+    workspaces or NCCL symmetric memory pools) are invisible to this
+    instrumentation. For those regions, ``torch.cuda.mem_get_info()`` deltas
+    are the right primitive instead.
+
+    When ``enabled`` is ``False`` this is a zero-overhead no-op.
+
+    Args:
+        label: Short identifier used in the log header (e.g.
+            ``"flashinfer_autotune"``). Each region inside one process should
+            use a unique label.
+        snapshot_path: Path the CUDA memory snapshot pickle is dumped to. If
+            relative, it is resolved against the process cwd.
+        enabled: Master switch. When ``False`` the helper yields immediately
+            without touching the profiler or memory history APIs.
+    """
+    if not enabled:
+        yield
+        return
+
+    # stacks="python" attaches Python frames (instead of degraded C++ unwinder
+    # frames) to each alloc event, which makes blocks clickable in
+    # https://pytorch.org/memory_viz with their actual SGLang/FlashInfer call
+    # sites. max_entries is bumped well above the 64 K default so long
+    # autotune runs don't evict early events from the trace ring buffer.
+    torch.cuda.memory._record_memory_history(stacks="python", max_entries=100_000)
+    try:
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+            profile_memory=True,
+        ) as prof:
+            yield
+        torch.cuda.memory._dump_snapshot(snapshot_path)
+        # Memory-sorted views are the primary signal for workspace allocations;
+        # time-sorted views are kept as a secondary signal (useful for
+        # kernel-bound regions like FlashInfer autotune). row_limit is bumped
+        # to 15 because workspace regions tend to have a long tail of small
+        # allocations worth seeing.
+        avgs = prof.key_averages(group_by_input_shape=True)
+        log_message = (
+            f"[{label}] Sorted by Self CUDA Memory Usage:\n"
+            + avgs.table(sort_by="self_cuda_memory_usage", row_limit=15)
+            + f"\n\n[{label}] Sorted by Self CPU Memory Usage:\n"
+            + avgs.table(sort_by="self_cpu_memory_usage", row_limit=15)
+            + f"\n\n[{label}] Sorted by CUDA Time:\n"
+            + avgs.table(sort_by="cuda_time_total", row_limit=10)
+            + f"\n\n[{label}] Sorted by CPU Time:\n"
+            + avgs.table(sort_by="cpu_time_total", row_limit=10)
+            + f"\n\n[{label}] Memory snapshot saved to {snapshot_path}\n"
+        )
+        logger.info(log_message)
+    finally:
+        torch.cuda.memory._record_memory_history(enabled=None)
 
 
 class ProfileManager:
