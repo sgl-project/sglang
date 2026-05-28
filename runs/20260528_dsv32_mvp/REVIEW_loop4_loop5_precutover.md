@@ -74,3 +74,40 @@ The loop4 unit tests pass (253) but mock the decode path with `SimpleNamespace`/
 `object.__new__` fixtures that mirror the decode batch shape — so they never caught the
 prefill batch mismatch. Future DS tests should include a prefill-shaped batch
 (num_tokens > num_reqs) to lock the #18 fix and prevent regression.
+
+## Loops 1-3 (foundational DS modules) — review
+
+Reviewed: `channel_mask.py`, `token_label_table.py`, `selector.py`, `config.py`, the
+calibrate channel-importance core, and the MLA noPE extraction in `dsa_backend.py`.
+
+### Verdict: foundations are sound and NOW hardware-validated
+Unlike the loop4 integration code, the loops 1-3 data structures held up — and this
+session's working end-to-end DS run exercised them for the first time on hardware:
+- **channel_mask.py**: `load_channel_mask` validation is robust (3-D shape, label_dim
+  match, channel indices in `[0, head_dim)`, content-SHA recompute) — validated on the
+  real generated mask. TP head-sharding `slice_per_rank` (contiguous
+  `[rank*num_local_heads : +num_local_heads]`, with `h_full == num_local_heads*tp_size`
+  check) — exercised correctly at the TP=8 boot (num_local_heads=16 = 128/8).
+- **token_label_table.py**: correctly sized by the KV-slot address space
+  (`max_tokens = pool.size + page_size`), with an explicit note on why the
+  req-row count would under-size and OOB — allocated + written + read this session.
+- **config.py**: narrow, strict validation (positive top_k/page_size; rejects the
+  legacy top-p ABI) — exercised via the launcher JSON.
+- **selector.py / selection core**: the decode-path selection produced correct genuine
+  sparsity (0<rate<1) once the loop4 integration bugs were fixed.
+- **MLA noPE extraction** (BL-20260527-reshape-before-slice-mla, round 3): the
+  reshape-before-slice fix is present and correct; the round-2 `head_width` fix
+  (derive from projection output, not `layer.v_head_dim`) hardened it further.
+
+### Caveats / not-yet-exercised in loops 1-3 foundations
+- The **FP8 scale-stability fixture** (AC-10 radix gate) and the **radix label-capture
+  fixture** are not yet run on hardware (M3-B; needed for AC-10).
+- **Multi-request batched decode** (bs>1) selection not yet stress-tested on hardware
+  (smoke used bs=1); the per-request batch path should be exercised before AC-11.
+- **Chunked prefill** (AC-1b) interaction with the now-dense DS prefill not yet tested.
+
+### Net
+The "never ran on hardware" defects were almost entirely in the loop4 runtime
+integration (selection batch shape, attention-layer attribute binding, NSA→DSA rename
+stragglers, ForwardContext metadata) and the loop5 calibrate load path — NOT in the
+loops 1-3 foundational data structures, which are correct and now validated end-to-end.
