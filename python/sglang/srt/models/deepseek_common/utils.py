@@ -57,11 +57,15 @@ NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
 
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "fa3",
-    "nsa",
+    "dsa",
+    "nsa",  # Deprecated alias for "dsa"
     "flashinfer",
     "cutlass_mla",
     "trtllm_mla",
+    "cutedsl_mla",
+    "tokenspeed_mla",
     "ascend",
+    "intel_xpu",
 ]
 
 
@@ -79,14 +83,14 @@ def awq_dequantize_func():
         return awq_dequantize
     elif _is_hip:
         from sglang.kernel_api_logging import debug_kernel_api
-        from sglang.srt.layers.quantization.awq_triton import (
+        from sglang.srt.layers.quantization.awq.awq_triton import (
             awq_dequantize_triton as awq_dequantize,
         )
 
         return debug_kernel_api(awq_dequantize, op_name="DeepseekCommon.awq_dequantize")
     elif _is_npu:
         from sglang.kernel_api_logging import debug_kernel_api
-        from sglang.srt.layers.quantization.awq_triton import (
+        from sglang.srt.layers.quantization.awq.awq_triton import (
             awq_dequantize_decomposition as awq_dequantize,
         )
 

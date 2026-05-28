@@ -115,6 +115,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>slow</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>` --tokenizer-backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Tokenizer backend. 'huggingface' uses the default HuggingFace tokenizers library; 'fastokens' uses the <a href="https://github.com/crusoecloud/fastokens">fastokens</a> library for faster tokenization. Requires the <code>fastokens</code> package to be installed.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>` huggingface`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>huggingface</code>, <code>fastokens</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>` --tokenizer-worker-num`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The worker num of the tokenizer manager.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>` 1`</td>
@@ -327,6 +333,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Path to the FlashRL quantization profile. Required when using --load-format flash_rl.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-quant-communications`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable INT8 quantization of TP communications (Supported only for NPU for Qwen3 series).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
   </tbody>
 </table>
@@ -1120,6 +1132,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`16`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>16</code>, <code>32</code>, <code>64</code>, <code>128</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--lora-drain-wait-threshold`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
+    </tr>
   </tbody>
 </table>
 
@@ -1144,19 +1162,19 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--attention-backend`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choose the kernels for attention layers.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>triton</code>, <code>torch_native</code>, <code>flex_attention</code>, <code>nsa</code>, <code>cutlass_mla</code>, <code>fa3</code>, <code>fa4</code>, <code>flashinfer</code>, <code>flashmla</code>, <code>trtllm_mla</code>, <code>trtllm_mha</code>, <code>dual_chunk_flash_attn</code>, <code>aiter</code>, <code>wave</code>, <code>intel_amx</code>, <code>ascend</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>triton</code>, <code>torch_native</code>, <code>flex_attention</code>, <code>dsa</code>, <code>cutlass_mla</code>, <code>fa3</code>, <code>fa4</code>, <code>flashinfer</code>, <code>flashmla</code>, <code>trtllm_mla</code>, <code>trtllm_mha</code>, <code>dual_chunk_flash_attn</code>, <code>aiter</code>, <code>wave</code>, <code>intel_amx</code>, <code>ascend</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--prefill-attention-backend`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choose the kernels for prefill attention layers (have priority over --attention-backend).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>triton</code>, <code>torch_native</code>, <code>flex_attention</code>, <code>nsa</code>, <code>cutlass_mla</code>, <code>fa3</code>, <code>fa4</code>, <code>flashinfer</code>, <code>flashmla</code>, <code>trtllm_mla</code>, <code>trtllm_mha</code>, <code>dual_chunk_flash_attn</code>, <code>aiter</code>, <code>wave</code>, <code>intel_amx</code>, <code>ascend</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>triton</code>, <code>torch_native</code>, <code>flex_attention</code>, <code>dsa</code>, <code>cutlass_mla</code>, <code>fa3</code>, <code>fa4</code>, <code>flashinfer</code>, <code>flashmla</code>, <code>trtllm_mla</code>, <code>trtllm_mha</code>, <code>dual_chunk_flash_attn</code>, <code>aiter</code>, <code>wave</code>, <code>intel_amx</code>, <code>ascend</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--decode-attention-backend`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choose the kernels for decode attention layers (have priority over --attention-backend).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>triton</code>, <code>torch_native</code>, <code>flex_attention</code>, <code>nsa</code>, <code>cutlass_mla</code>, <code>fa3</code>, <code>fa4</code>, <code>flashinfer</code>, <code>flashmla</code>, <code>trtllm_mla</code>, <code>trtllm_mha</code>, <code>dual_chunk_flash_attn</code>, <code>aiter</code>, <code>wave</code>, <code>intel_amx</code>, <code>ascend</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>triton</code>, <code>torch_native</code>, <code>flex_attention</code>, <code>dsa</code>, <code>cutlass_mla</code>, <code>fa3</code>, <code>fa4</code>, <code>flashinfer</code>, <code>flashmla</code>, <code>trtllm_mla</code>, <code>trtllm_mha</code>, <code>dual_chunk_flash_attn</code>, <code>aiter</code>, <code>wave</code>, <code>intel_amx</code>, <code>ascend</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--sampling-backend`</td>
@@ -1177,16 +1195,22 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>sdpa</code>, <code>fa3</code>, <code>fa4</code>, <code>triton_attn</code>, <code>ascend_attn</code>, <code>aiter_attn</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--nsa-prefill-backend`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choose the NSA backend for the prefill stage (overrides `--attention-backend` when running DeepSeek NSA-style attention).</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dsa-prefill-backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DSA backend for the prefill stage (overrides `--attention-backend` when running DeepSeek DSA-style attention).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`flashmla_sparse`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>flashmla_sparse</code>, <code>flashmla_kv</code>, <code>flashmla_auto</code>, <code>fa3</code>, <code>tilelang</code>, <code>aiter</code>, <code>trtllm</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--nsa-decode-backend`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choose the NSA backend for the decode stage when running DeepSeek NSA-style attention. Overrides `--attention-backend` for decoding.</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dsa-decode-backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DSA backend for the decode stage when running DeepSeek DSA-style attention. Overrides `--attention-backend` for decoding.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`fa3`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>flashmla_sparse</code>, <code>flashmla_kv</code>, <code>fa3</code>, <code>tilelang</code>, <code>aiter</code>, <code>trtllm</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dsa-topk-backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choose the DSA indexer top-k backend. The `torch` backend currently requires `SGLANG_DSA_FUSE_TOPK=false`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`sgl-kernel`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>sgl-kernel</code>, <code>torch</code>, <code>flashinfer</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--fp8-gemm-backend`</td>
@@ -1196,9 +1220,9 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--fp4-gemm-backend`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choose the runner backend for NVFP4 GEMM operations. Options: 'flashinfer_cutlass' (default), 'auto' (auto-selects between flashinfer_cudnn/flashinfer_cutlass based on CUDA/cuDNN version), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). All backends are from FlashInfer; when FlashInfer is unavailable, sgl-kernel CUTLASS is used as an automatic fallback.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>flashinfer_cutlass</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>flashinfer_cudnn</code>, <code>flashinfer_cutlass</code>, <code>flashinfer_trtllm</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects <code>flashinfer_cudnn</code> on SM120, <code>flashinfer_cutedsl</code> on SM100, <code>flashinfer_cutlass</code> otherwise), 'cutlass' (SGLang CUTLASS kernel), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). All FlashInfer backends fall back to sgl-kernel CUTLASS when FlashInfer is unavailable.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>auto</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>cutlass</code>, <code>flashinfer_cudnn</code>, <code>flashinfer_cutedsl</code>, <code>flashinfer_cutlass</code>, <code>flashinfer_trtllm</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disable-flashinfer-autotune`</td>
@@ -1455,6 +1479,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>normal</code>, <code>low_latency</code>, <code>auto</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--deepep-dispatcher-output-dtype</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select DeepEP dispather output dtype, could be <code>bf16</code>, <code>fp8</code>, <code>int8</code> (only Ascend A2/A3 NPU), <code>nvfp4</code> or <code>auto</code>. Default is <code>auto</code>, which follows a priority order (server argument → deprecated env var → input_global_scale check → dispatcher_output_dtype from quant_config → flashinfer/cutlass backend → NPU BF16 default → GPU FP8 default).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>auto</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>bf16</code>, <code>fp8</code>, <code>int8</code>, <code>nvfp4</code>, <code>auto</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--ep-num-redundant-experts</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Allocate this number of redundant experts in expert parallel.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
@@ -1665,7 +1695,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-storage-prefetch-policy`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Control when prefetching from the storage backend should stop.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`best_effort`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`timeout`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`best_effort`, `wait_complete`, `timeout`</td>
     </tr>
     <tr>
@@ -1725,6 +1755,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Using LMCache as an alternative hierarchical cache solution</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--lmcache-config-file`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Path to the LMCache YAML configuration file</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>
   </tbody>
 </table>
@@ -2254,13 +2290,13 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
 <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--enable-nsa-prefill-context-parallel</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--enable-dsa-prefill-context-parallel</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable context parallelism used in the long sequence prefill phase of DeepSeek v3.2.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>False</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
 <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--nsa-prefill-cp-mode</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--dsa-prefill-cp-mode</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: <code>round-robin-split</code>(default),<code>in-seq-split</code>. <code>round-robin-split</code> distributes tokens across ranks based on <code>token_idx % cp_size</code>. It supports multi-batch prefill, fused MoE, and FP8 KV cache.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>in-seq-split</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>in-seq-split</code>, <code>round-robin-split</code></td>
@@ -2529,9 +2565,9 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--remote-instance-weight-loader-backend</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The backend for loading weights from remote instance. Can be 'transfer_engine' or 'nccl'. Default is 'nccl'.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The backend for loading weights from remote instance. Can be 'transfer_engine', 'nccl', or 'modelexpress'. Default is 'nccl'.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>nccl</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>transfer_engine</code>, <code>nccl</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>transfer_engine</code>, <code>nccl</code>, <code>modelexpress</code></td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--remote-instance-weight-loader-start-seed-via-transfer-engine</code></td>
@@ -2817,13 +2853,13 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--nsa-prefill`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choose the NSA backend for the prefill stage (overrides `--attention-backend` when running DeepSeek NSA-style attention).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Deprecated alias for `--dsa-prefill-backend`.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`flashmla_sparse`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`flashmla_sparse`, `flashmla_decode`, `fa3`, `tilelang`, `aiter`</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--nsa-decode`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choose the NSA backend for the decode stage when running DeepSeek NSA-style attention. Overrides `--attention-backend` for decoding.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Deprecated alias for `--dsa-decode-backend`.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`flashmla_kv`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`flashmla_prefill`, `flashmla_kv`, `fa3`, `tilelang`, `aiter`</td>
     </tr>

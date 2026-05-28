@@ -117,6 +117,11 @@ class WaveAttnBackend(AttentionBackend):
 
         self.skip_prefill = skip_prefill
 
+        # Pool refs — captured at construction so they survive deletion of the
+        # corresponding ForwardBatch fields.
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+
         max_bs = model_runner.req_to_token_pool.size
 
         if kv_indptr_buf is None:
@@ -293,9 +298,9 @@ class WaveAttnBackend(AttentionBackend):
             )
             mask_indptr = None
             # TODO(FIXME): This will trigger an invalid Eagle tree when using
-            # `max(spec_info.accept_length_cpu)`.
+            # `max(spec_info.num_accept_tokens_cpu)`.
             # It might have been forgotten to update somewhere.
-            max_extend_len = torch.max(spec_info.accept_length).item()
+            max_extend_len = torch.max(spec_info.num_accept_tokens).item()
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
@@ -556,7 +561,7 @@ class WaveAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
 
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
+            self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
 
@@ -571,8 +576,8 @@ class WaveAttnBackend(AttentionBackend):
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
             v.contiguous(),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
             self.forward_metadata.qo_indptr,
             self.forward_metadata.kv_indptr,
             self.forward_metadata.kv_indices,
@@ -606,14 +611,14 @@ class WaveAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
 
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
+            self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             self.forward_metadata.kv_indptr,
             self.forward_metadata.kv_indices,

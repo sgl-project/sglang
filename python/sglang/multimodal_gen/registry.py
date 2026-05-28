@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import Backend
 
 from sglang.multimodal_gen.configs.pipeline_configs import (
+    Cosmos3Config,
     FastHunyuanConfig,
     FluxPipelineConfig,
     HeliosDistilledConfig,
@@ -46,6 +47,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ernie_image import (
     ErnieImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    Flux2KleinBasePipelineConfig,
     Flux2KleinPipelineConfig,
     Flux2PipelineConfig,
 )
@@ -54,6 +56,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
+    JoyImageEditPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.mova import (
@@ -80,8 +85,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_T2V_A14B_Config,
     Wan2_2_TI2V_5B_Config,
 )
+from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.ernie_image import ErnieImageSamplingParams
 from sglang.multimodal_gen.configs.sample.flux import (
+    Flux2KleinBaseSamplingParams,
     Flux2KleinSamplingParams,
     Flux2SamplingParams,
     FluxSamplingParams,
@@ -97,6 +104,7 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
+from sglang.multimodal_gen.configs.sample.joy_image import JoyImageEditSamplingParams
 from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX2SamplingParams,
     LTX23HQSamplingParams,
@@ -733,7 +741,10 @@ def _register_configs():
     register_configs(
         sampling_param_cls=Wan2_2_T2V_A14B_SamplingParam,
         pipeline_config_cls=Wan2_2_T2V_A14B_Config,
-        hf_model_paths=["Wan-AI/Wan2.2-T2V-A14B-Diffusers"],
+        hf_model_paths=[
+            "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4",
+        ],
     )
     register_configs(
         sampling_param_cls=Wan2_2_I2V_A14B_SamplingParam,
@@ -779,8 +790,24 @@ def _register_configs():
             "black-forest-labs/FLUX.2-klein-9B",
         ],
         model_detectors=[
-            lambda hf_id: "flux.2-klein" in hf_id.lower()
-            or "flux2-klein" in hf_id.lower()
+            lambda hf_id: (
+                "flux.2-klein" in hf_id.lower() or "flux2-klein" in hf_id.lower()
+            )
+            and "base" not in hf_id.lower()
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Flux2KleinBaseSamplingParams,
+        pipeline_config_cls=Flux2KleinBasePipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.2-klein-base-4B",
+            "black-forest-labs/FLUX.2-klein-base-9B",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                "flux.2-klein" in hf_id.lower() or "flux2-klein" in hf_id.lower()
+            )
+            and "base" in hf_id.lower()
         ],
     )
     register_configs(
@@ -924,6 +951,20 @@ def _register_configs():
         ],
     )
 
+    # Cosmos3 — single checkpoint serves T2V, I2V, and T2I. Mode is dispatched
+    # per-request inside the pipeline from ``num_frames`` and ``image_path``.
+    # Both Nano (8B) and Super (32B) share the same pipeline; arch dimensions
+    # come from ``transformer/config.json`` via ``update_model_arch``.
+    register_configs(
+        sampling_param_cls=Cosmos3SamplingParams,
+        pipeline_config_cls=Cosmos3Config,
+        hf_model_paths=[
+            "nvidia/Cosmos3-Nano",
+            "nvidia/Cosmos3-Super",
+        ],
+        model_detectors=[lambda hf_id: "cosmos3omnidiffuserspipeline" in hf_id.lower()],
+    )
+
     # SANA
     register_configs(
         sampling_param_cls=SanaSamplingParams,
@@ -959,6 +1000,18 @@ def _register_configs():
         ],
         model_detectors=[
             lambda hf_id: "ernie-image" in hf_id.lower(),
+        ],
+    )
+
+    # JoyAI
+    register_configs(
+        sampling_param_cls=JoyImageEditSamplingParams,
+        pipeline_config_cls=JoyImageEditPipelineConfig,
+        hf_model_paths=[
+            "jdopensource/JoyAI-Image-Edit-Diffusers",
+        ],
+        model_detectors=[
+            lambda hf_id: "joyai-image-edit" in hf_id.lower(),
         ],
     )
 
