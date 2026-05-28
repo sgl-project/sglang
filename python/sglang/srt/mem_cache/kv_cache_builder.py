@@ -27,9 +27,8 @@ from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
-from sglang.srt.session.streaming_session import StreamingSession
 
 if TYPE_CHECKING:
 
@@ -160,6 +159,8 @@ def build_kv_cache(
         tp_worker.model_runner.hybrid_gdn_config is not None
         or tp_worker.model_runner.mamba2_config is not None
         or _registry_needs_mamba
+        or tp_worker.model_runner.kimi_linear_config is not None
+        or tp_worker.model_runner.hybrid_lightning_config is not None
     )
 
     sliding_window_size = None
@@ -223,84 +224,22 @@ def build_kv_cache(
         sliding_window_size=sliding_window_size,
     )
 
-    if effective_chunked_prefill_size is not None and disable_radix_cache:
-        if not is_hybrid_swa:
-            from sglang.srt.mem_cache.chunk_cache import ChunkCache
-
-            tree_cache = ChunkCache(params)
-        else:
-            from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
-
-            tree_cache = SWAChunkCache(params)
-    else:
-        if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
-            # lazy import to avoid JIT overhead
-            from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
-
-            logger.info("Using experimental C++ radix tree implementation.")
-            tree_cache = RadixCacheCpp(params=params, server_args=server_args)
-        elif envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
-            from sglang.srt.mem_cache.unified_cache_components import (
-                ComponentType,
-            )
-            from sglang.srt.mem_cache.unified_radix_cache import (
-                UnifiedRadixCache,
-            )
-
-            tree_components = [ComponentType.FULL]
-            if is_hybrid_swa or is_hybrid_ssm:
-                tree_components.append(
-                    ComponentType.SWA if is_hybrid_swa else ComponentType.MAMBA
-                )
-            params.tree_components = tuple(tree_components)
-            tree_cache = UnifiedRadixCache(params)
-            if enable_hierarchical_cache:
-                tree_cache.init_hicache(server_args, params)
-                tp_worker.register_hicache_layer_transfer_counter(
-                    tree_cache.cache_controller.layer_done_counter
-                )
-        elif enable_hierarchical_cache:
-            if is_hybrid_ssm:
-                from sglang.srt.mem_cache.hi_mamba_radix_cache import (
-                    HiMambaRadixCache,
-                )
-
-                tree_cache = HiMambaRadixCache(params=params, server_args=server_args)
-            else:
-                from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-
-                tree_cache = HiRadixCache(params=params, server_args=server_args)
-            tp_worker.register_hicache_layer_transfer_counter(
-                tree_cache.cache_controller.layer_done_counter
-            )
-        elif is_hybrid_swa:
-            from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-
-            tree_cache = SWARadixCache(params=params)
-        elif is_hybrid_ssm:
-            from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
-
-            tree_cache = MambaRadixCache(params)
-        elif server_args.enable_lmcache:
-            from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
-                LMCRadixCache,
-            )
-
-            tree_cache = LMCRadixCache(
-                params=params,
-                model_config=model_config,
-                tp_size=ps.tp_size,
-                rank=ps.tp_rank,
-                tp_group=tp_group,
-            )
-        else:
-            tree_cache = RadixCache(params)
-
-    if (
-        server_args.enable_streaming_session
-        and not tree_cache.supports_streaming_session()
-    ):
-        tree_cache = StreamingSession(tree_cache)
+    tree_cache = create_tree_cache(
+        TreeCacheBuildContext(
+            server_args=server_args,
+            params=params,
+            is_hybrid_swa=is_hybrid_swa,
+            is_hybrid_ssm=is_hybrid_ssm,
+            enable_hierarchical_cache=enable_hierarchical_cache,
+            disable_radix_cache=disable_radix_cache,
+            effective_chunked_prefill_size=effective_chunked_prefill_size,
+            tp_worker=tp_worker,
+            model_config=model_config,
+            tp_size=ps.tp_size,
+            tp_rank=ps.tp_rank,
+            tp_group=tp_group,
+        )
+    )
 
     embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
     init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)

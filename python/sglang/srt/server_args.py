@@ -46,8 +46,8 @@ from sglang.srt.utils.common import (
     cpu_has_amx_support,
     get_device,
     get_device_memory_capacity,
-    get_device_name,
     get_device_sm,
+    get_int_env_var,
     get_nvidia_driver_version,
     get_quantization_config,
     has_fp8_weights_in_checkpoint,
@@ -155,7 +155,8 @@ ATTENTION_BACKEND_CHOICES = [
     "triton",
     "torch_native",
     "flex_attention",
-    "nsa",
+    "dsa",
+    "nsa",  # Deprecated alias for "dsa"
     "dsv4",
     "compressed",  # Deprecated alias for "dsv4"
     # NVIDIA specific
@@ -165,6 +166,7 @@ ATTENTION_BACKEND_CHOICES = [
     "flashinfer",
     "flashmla",
     "trtllm_mla",
+    "cutedsl_mla",
     "tokenspeed_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
@@ -181,7 +183,14 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
-DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
+DISAGG_TRANSFER_BACKEND_CHOICES = [
+    "mooncake",
+    "nixl",
+    "ascend",
+    "fake",
+    "mori",
+    "mooncake_tcp",
+]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
@@ -246,13 +255,14 @@ LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
 ENCODER_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "mooncake"]
 
-NSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
+DSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
+NSA_PREFILL_CP_SPLIT_CHOICES = DSA_PREFILL_CP_SPLIT_CHOICES  # deprecated alias
 
 PREFILL_CP_SPLIT_CHOICES = ["in-seq-split"]
 
 DEFAULT_LORA_EVICTION_POLICY = "lru"
 
-NSA_CHOICES = [
+DSA_CHOICES = [
     "flashmla_sparse",
     "flashmla_kv",
     "flashmla_auto",
@@ -261,6 +271,9 @@ NSA_CHOICES = [
     "aiter",
     "trtllm",
 ]
+NSA_CHOICES = DSA_CHOICES  # deprecated alias
+
+DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
 
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
@@ -475,6 +488,14 @@ class ServerArgs:
     export_metrics_to_file: bool = False
     export_metrics_to_file_dir: Optional[str] = None
 
+    # Class-level DI for the five *MetricsCollector classes. Maps collector role
+    # (one of: "scheduler", "tokenizer", "storage", "radix_cache", "expert_dispatch")
+    # to a subclass of the matching base collector. The five instantiation sites
+    # read from this map and fall back to the base class. Class-object only (no
+    # CLI surface) since this exists for embedded use cases that pass a Python
+    # class directly. Default None preserves existing behavior.
+    stat_loggers: Optional[Dict[str, type]] = None
+
     # API related
     api_key: Optional[str] = None
     admin_api_key: Optional[str] = None
@@ -491,6 +512,8 @@ class ServerArgs:
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
     sampling_defaults: str = "model"
+    asr_max_buffer_seconds: int = 60
+    asr_max_concurrent_sessions: int = 32
 
     # Data parallelism
     dp_size: int = 1
@@ -532,15 +555,20 @@ class ServerArgs:
     prefill_attention_backend: Optional[str] = None
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
+    # Name of a custom radix-cache factory registered via
+    # register_radix_cache_backend. Leave unset (by default) to use the
+    # built-in default cache selection chain.
+    radix_cache_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
     fp8_gemm_runner_backend: str = "auto"
     fp4_gemm_runner_backend: str = "auto"
-    nsa_prefill_backend: Optional[str] = (
+    dsa_prefill_backend: Optional[str] = (
         None  # None = auto-detect based on hardware/kv_cache_dtype
     )
-    nsa_decode_backend: Optional[str] = (
+    dsa_decode_backend: Optional[str] = (
         None  # auto-detect based on hardware/kv_cache_dtype
     )
+    dsa_topk_backend: str = "sgl-kernel"
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
 
@@ -646,6 +674,7 @@ class ServerArgs:
 
     # LMCache
     enable_lmcache: bool = False
+    lmcache_config_file: Optional[str] = None
 
     # Ktransformers/AMX expert parallelism
     kt_weight_path: Optional[str] = None
@@ -713,7 +742,6 @@ class ServerArgs:
     piecewise_cuda_graph_tokens: Optional[List[int]] = None
     piecewise_cuda_graph_compiler: str = "eager"
     torchao_config: str = ""
-    enable_nan_detection: bool = False
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
     triton_attention_num_kv_splits: int = 8
@@ -739,10 +767,11 @@ class ServerArgs:
     enable_deterministic_inference: bool = False
     rl_on_policy_target: Optional[str] = None
     enable_attn_tp_input_scattered: bool = False
+    disable_attn_tp_gather: bool = False
     gc_threshold: Optional[List[int]] = None
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
-    enable_nsa_prefill_context_parallel: bool = False
-    nsa_prefill_cp_mode: str = "round-robin-split"
+    enable_dsa_prefill_context_parallel: bool = False
+    dsa_prefill_cp_mode: str = "round-robin-split"
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
     enable_fused_moe_sum_all_reduce: bool = False
@@ -838,9 +867,15 @@ class ServerArgs:
         self._handle_multimodal()
         # Validate SSL arguments early (before dummy-model short-circuit).
         self._handle_ssl_validation()
+        # Validate transcription/ASR-specific server args (model-independent).
+        self._handle_asr_validation()
 
         # Validate PD disaggregation flags early (before dummy-model short-circuit).
-        self._handle_pd_disaggregation()
+        from sglang.srt.arg_groups.pd_disaggregation_hook import (
+            handle_pd_disaggregation,
+        )
+
+        handle_pd_disaggregation(self)
 
         # Validate --prefill-only-disable-kv-cache args early (before dummy-model
         # short-circuit). The backend check is run later after backends settle.
@@ -1090,14 +1125,6 @@ class ServerArgs:
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
 
-        if self.enable_nan_detection:
-            logger.warning(
-                "--enable-nan-detection is deprecated. "
-                "Use SGLANG_SPEC_NAN_DETECTION=1 and SGLANG_SPEC_OOB_DETECTION=1 instead."
-            )
-            envs.SGLANG_SPEC_NAN_DETECTION.set(True)
-            envs.SGLANG_SPEC_OOB_DETECTION.set(True)
-
         # Deprecated attention-backend alias: "compressed" -> "dsv4".
         for attr in (
             "attention_backend",
@@ -1338,6 +1365,10 @@ class ServerArgs:
             self.disable_piecewise_cuda_graph = True
         # 18. CUDA Graph debug mode
         if self.debug_cuda_graph:
+            self.disable_piecewise_cuda_graph = True
+        # 19. DSA prefill context parallelism (attn_cp_size is set later in
+        # _handle_model_specific_adjustments, so check the flag directly here)
+        if self.enable_dsa_prefill_context_parallel:
             self.disable_piecewise_cuda_graph = True
 
     def _handle_multi_item_scoring(self):
@@ -1647,15 +1678,15 @@ class ServerArgs:
 
         return capture_sizes
 
-    def _set_default_nsa_kv_cache_dtype(self, major: int, quantization: str) -> str:
-        user_set_prefill = self.nsa_prefill_backend is not None
-        user_set_decode = self.nsa_decode_backend is not None
+    def _set_default_dsa_kv_cache_dtype(self, major: int, quantization: str) -> str:
+        user_set_prefill = self.dsa_prefill_backend is not None
+        user_set_decode = self.dsa_decode_backend is not None
 
         # If user specified a backend but didn't explicitly set kv_cache_dtype,
         # suggest them to be explicit about kv_cache_dtype to avoid surprises
         if (user_set_prefill or user_set_decode) and self.kv_cache_dtype == "auto":
             logger.warning(
-                "When specifying --nsa-prefill-backend or --nsa-decode-backend, "
+                "When specifying --dsa-prefill-backend or --dsa-decode-backend, "
                 "you should also explicitly set --kv-cache-dtype (e.g., 'fp8_e4m3' or 'bfloat16'). "
                 "DeepSeek V3.2 defaults to FP8 KV cache which may not be compatible with all backends."
             )
@@ -1675,56 +1706,56 @@ class ServerArgs:
             "fp8_e4m3",
         ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
 
-    def _set_default_nsa_backends(self, kv_cache_dtype: str, major: int) -> str:
+    def _set_default_dsa_backends(self, kv_cache_dtype: str, major: int) -> str:
         from sglang.srt.arg_groups.hisparse_hook import (
-            apply_hisparse_nsa_backend_defaults,
+            apply_hisparse_dsa_backend_defaults,
         )
 
-        user_set_prefill = self.nsa_prefill_backend is not None
-        user_set_decode = self.nsa_decode_backend is not None
+        user_set_prefill = self.dsa_prefill_backend is not None
+        user_set_decode = self.dsa_decode_backend is not None
 
-        if apply_hisparse_nsa_backend_defaults(
+        if apply_hisparse_dsa_backend_defaults(
             self, user_set_prefill, user_set_decode, kv_cache_dtype
         ):
             return
 
         if not user_set_prefill and not user_set_decode and is_hip():
-            self.nsa_prefill_backend = "tilelang"
-            self.nsa_decode_backend = "tilelang"
+            self.dsa_prefill_backend = "tilelang"
+            self.dsa_decode_backend = "tilelang"
         elif kv_cache_dtype == "fp8_e4m3":
             if major >= 10:
                 if not user_set_prefill:
-                    self.nsa_prefill_backend = "trtllm"
+                    self.dsa_prefill_backend = "trtllm"
                 if not user_set_decode:
-                    self.nsa_decode_backend = "trtllm"
+                    self.dsa_decode_backend = "trtllm"
             else:
                 # Hopper FP8 defaults to flashmla_kv for both prefill and decode.
                 if not user_set_prefill:
-                    self.nsa_prefill_backend = "flashmla_kv"
+                    self.dsa_prefill_backend = "flashmla_kv"
                 if not user_set_decode:
-                    self.nsa_decode_backend = "flashmla_kv"
+                    self.dsa_decode_backend = "flashmla_kv"
         else:
             # set prefill/decode backends based on hardware architecture.
             if major >= 10:
                 if not user_set_prefill:
-                    self.nsa_prefill_backend = "flashmla_sparse"
+                    self.dsa_prefill_backend = "flashmla_sparse"
                 if not user_set_decode:
-                    self.nsa_decode_backend = "trtllm"
+                    self.dsa_decode_backend = "trtllm"
             else:
                 # Hopper defaults for bfloat16
                 if not user_set_prefill:
-                    self.nsa_prefill_backend = "flashmla_sparse"
+                    self.dsa_prefill_backend = "flashmla_sparse"
                 if not user_set_decode:
-                    self.nsa_decode_backend = "fa3"
+                    self.dsa_decode_backend = "fa3"
 
         logger.warning(
-            f"Set NSA backends for {self.kv_cache_dtype} KV Cache: prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend}."
+            f"Set DSA backends for {self.kv_cache_dtype} KV Cache: prefill={self.dsa_prefill_backend}, decode={self.dsa_decode_backend}."
         )
 
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import (
             get_mimo_v2_fused_qkv_expected_tp_size,
-            is_deepseek_nsa,
+            is_deepseek_dsa,
         )
 
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
@@ -1765,37 +1796,37 @@ class ServerArgs:
             "GlmMoeDsaForCausalLM",
         ]:
             # Set attention backend for DeepSeek
-            if is_deepseek_nsa(hf_config):  # DeepSeek 3.2/GLM 5
+            if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
                 if model_arch == "GlmMoeDsaForCausalLM" and is_blackwell_supported():
-                    envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(0)
+                    envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(0)
                     logger.warning(
-                        "Force NSA prefill to use sparse MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on Blackwell."
+                        "Force DSA prefill to use sparse MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on Blackwell."
                     )
                 else:
-                    if envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.is_set():
+                    if envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.is_set():
                         logger.warning(
-                            f"Dense attention kv len threshold is manually set to {envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DSA. Caution: This may cause performance regression if the threshold is larger than the index topk of model."
+                            f"Dense attention kv len threshold is manually set to {envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DSA. Caution: This may cause performance regression if the threshold is larger than the index topk of model."
                         )
                     else:
                         # When threshold is not manually set, set it to the index topk of model
-                        from sglang.srt.configs.model_config import get_nsa_index_topk
+                        from sglang.srt.configs.model_config import get_dsa_index_topk
 
-                        envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(
-                            get_nsa_index_topk(hf_config)
+                        envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(
+                            get_dsa_index_topk(hf_config)
                         )
                         logger.warning(
-                            f"Set dense attention kv len threshold to model index_topk={envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DeepSeek with DSA."
+                            f"Set dense attention kv len threshold to model index_topk={envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DeepSeek with DSA."
                         )
                 if self.is_attention_backend_not_set():
-                    self.attention_backend = "nsa"
-                    logger.info("Use nsa attention backend for DeepSeek with DSA.")
+                    self.attention_backend = "dsa"
+                    logger.info("Use dsa attention backend for DeepSeek with DSA.")
 
                 if not is_npu() and not is_xpu():  # CUDA or ROCm GPU
-                    if self.enable_nsa_prefill_context_parallel:
+                    if self.enable_dsa_prefill_context_parallel:
                         logger.warning(
                             "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
                         )
-                        if self.nsa_prefill_cp_mode == "in-seq-split":
+                        if self.dsa_prefill_cp_mode == "in-seq-split":
                             # TODO Supports moe_dense_tp_size != 1, kv cache dtype = "fp8",moe_a2a_backend non-deepep and cross-machine operation .
                             self.enable_dp_attention = True
                             self.moe_dense_tp_size = 1
@@ -1813,13 +1844,23 @@ class ServerArgs:
                         assert (
                             self.tp_size <= 8
                         ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+                        # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
+                        # DSACPLayerCommunicator does not all-reduce attention-TP
+                        # partial o_proj outputs before replicated dense FFNs.
                         self.attn_cp_size = self.tp_size // self.dp_size
-
+                        self.disable_piecewise_cuda_graph = True
                         logger.warning(
-                            f"Enable Context Parallel opt for deeeseekv3.2-DSA, Setting dp_size == {self.dp_size} and moe_dense_tp_size == {self.moe_dense_tp_size}, ep_size == {self.ep_size}, tp_size == {self.tp_size}, kv_cache_dtype == {self.kv_cache_dtype}, moe_a2a_backend {self.moe_a2a_backend} "
+                            f"Enable DSA Context Parallel opt, "
+                            f"Setting dp_size == {self.dp_size} and "
+                            f"moe_dense_tp_size == {self.moe_dense_tp_size}, "
+                            f"ep_size == {self.ep_size}, "
+                            f"tp_size == {self.tp_size}, "
+                            f"kv_cache_dtype == {self.kv_cache_dtype}, "
+                            f"moe_a2a_backend {self.moe_a2a_backend}, "
+                            f"disable_piecewise_cuda_graph=True"
                         )
                     else:
-                        # Pure TP and partial DP Attention mode is active for NSA, logging a warning
+                        # Pure TP and partial DP Attention mode is active for DSA, logging a warning
                         if self.dp_size < self.tp_size:
                             logger.warning(
                                 f"DSA with TP mode is active, dp_size={self.dp_size}, tp_size={self.tp_size}, "
@@ -1827,15 +1868,15 @@ class ServerArgs:
                             )
 
                     # Deferred import to avoid a circular import at module-load
-                    # time (nsa.utils imports get_global_server_args).
-                    from sglang.srt.layers.attention.nsa.utils import (
+                    # time (dsa.utils imports get_global_server_args).
+                    from sglang.srt.layers.attention.dsa.utils import (
                         aiter_can_use_preshuffle_paged_mqa,
                     )
 
                     if is_hip() and not aiter_can_use_preshuffle_paged_mqa():
-                        # Legacy ROCm NSA path: aiter's gluon paged-MQA kernel is
+                        # Legacy ROCm DSA path: aiter's gluon paged-MQA kernel is
                         # unavailable (Triton<3.5 and AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS
-                        # not set, or SGLANG_NSA_HIP_DISABLE_PRESHUFFLE=1 / SGLANG_USE_AITER=0).
+                        # not set, or SGLANG_DSA_HIP_DISABLE_PRESHUFFLE=1 / SGLANG_USE_AITER=0).
                         self.page_size = 1
                         logger.warning(
                             "Setting page size to 1 for DeepSeek DSA on ROCm "
@@ -1849,16 +1890,16 @@ class ServerArgs:
                     import torch
 
                     major, _ = torch.cuda.get_device_capability()
-                    self._set_default_nsa_kv_cache_dtype(major, self.quantization)
-                    self._set_default_nsa_backends(self.kv_cache_dtype, major)
+                    self._set_default_dsa_kv_cache_dtype(major, self.quantization)
+                    self._set_default_dsa_backends(self.kv_cache_dtype, major)
 
-                if self.enable_nsa_prefill_context_parallel:
+                if self.enable_dsa_prefill_context_parallel:
                     assert (
                         self.disaggregation_mode != "decode"
-                    ), "CP is only supported for prefill when PD disaggregation, please remove --enable-nsa-prefill-context-parallel."
+                    ), "CP is only supported for prefill when PD disaggregation, please remove --enable-dsa-prefill-context-parallel."
 
             else:
-                # DeepSeek V3/R1/V3.1
+                # DeepSeek V3/R1/V3.1 and Kimi K2.5
                 if not self.disable_piecewise_cuda_graph:
                     logger.info("Piecewise CUDA graph is enabled, use MLA for prefill.")
 
@@ -1872,6 +1913,37 @@ class ServerArgs:
                         logger.info(
                             "Use trtllm_mla as attention backend on sm100 for DeepseekV3ForCausalLM"
                         )
+
+                # MLA prefill CP auto-config. Mirrors the NSA CP block above
+                # (minus the in-seq/round-robin mode split, which MLA CP does not support)
+                if self.enable_prefill_context_parallel and self.use_mla_backend():
+                    logger.warning(
+                        "MLA prefill context parallel is still experimental. "
+                        "Verified on Hopper with the fa3 backend."
+                    )
+                    self.enable_dp_attention = True
+                    # TODO(kpham-sgl) Supports moe_dense_tp_size != 1.
+                    self.moe_dense_tp_size = 1
+                    self.moe_a2a_backend = "deepep"
+                    self.ep_size = self.tp_size
+                    logger.warning(
+                        "For MLA CP, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, batch_size == 1"
+                    )
+                    # FIXME(kpham-sgl): Keep attn_tp_size == 1 under MLA CP.
+                    # DSACPLayerCommunicator does not all-reduce attention-TP
+                    # partial o_proj outputs before replicated dense FFNs.
+                    self.attn_cp_size = self.tp_size // self.dp_size
+                    self.disable_piecewise_cuda_graph = True
+                    logger.warning(
+                        f"Enable Context Parallel opt for MLA, "
+                        f"Setting dp_size == {self.dp_size} and "
+                        f"attn_cp_size == {self.attn_cp_size}, "
+                        f"moe_dense_tp_size == {self.moe_dense_tp_size}, "
+                        f"ep_size == {self.ep_size}, "
+                        f"tp_size == {self.tp_size}, "
+                        f"moe_a2a_backend {self.moe_a2a_backend}, "
+                        f"disable_piecewise_cuda_graph=True"
+                    )
 
             # Set moe backend for DeepSeek
             if is_sm100_supported():
@@ -2222,6 +2294,15 @@ class ServerArgs:
                 "Gemma4 only supports trtllm_mha or triton attention backend, "
                 f"got prefill={prefill_backend}, decode={decode_backend}"
             )
+
+            if is_sm100_supported() and self.moe_runner_backend == "auto":
+                if self.get_model_config().quantization == "modelopt_fp4":
+                    self.quantization = "modelopt_fp4"
+                    self.moe_runner_backend = "flashinfer_trtllm"
+                    logger.info(
+                        "Use flashinfer_trtllm as MoE runner backend on "
+                        "SM100 for Gemma-4 (modelopt_fp4)"
+                    )
         elif model_arch == "MossVLForConditionalGeneration":
             if self.is_attention_backend_not_set():
                 self.prefill_attention_backend = "flashinfer"
@@ -2269,12 +2350,18 @@ class ServerArgs:
             logger.info(
                 f"Using {self.attention_backend} as attention backend for {model_arch}."
             )
-        elif model_arch in ["KimiLinearForCausalLM", "BailingMoeV2_5ForCausalLM"]:
+        elif model_arch in ["KimiLinearForCausalLM"]:
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
                 support_mamba_cache=False,
             )
-        elif model_arch in ["NemotronHForCausalLM"]:
+        elif model_arch in ["BailingMoeV2_5ForCausalLM"]:
+            self._handle_mamba_radix_cache(
+                model_arch=model_arch,
+                support_mamba_cache=True,
+                support_mamba_cache_extra_buffer=True,
+            )
+        elif model_arch in ["NemotronHForCausalLM", "NemotronHPuzzleForCausalLM"]:
             from sglang.srt.arg_groups.nemotron_h_hook import (
                 apply_nemotron_h_defaults,
             )
@@ -2382,8 +2469,6 @@ class ServerArgs:
         ]:
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
-                support_mamba_cache=True,
-                support_mamba_cache_extra_buffer=False,
                 sm100_default_attention_backend="triton",
             )
 
@@ -2396,8 +2481,7 @@ class ServerArgs:
             if has_mamba:
                 self._handle_mamba_radix_cache(
                     model_arch=model_arch,
-                    support_mamba_cache_extra_buffer=False,
-                    sm100_default_attention_backend="triton",
+                    sm100_default_attention_backend="flashinfer",
                 )
 
         elif model_arch in ["Lfm2ForCausalLM"]:
@@ -2433,11 +2517,7 @@ class ServerArgs:
         # for models with explicit support (DeepseekV3, GptOss, Glm4Moe,
         # MistralLarge3, Qwen3/Qwen3Next/Qwen3.5 MoE families)
         # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
-        # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
-        device_name = get_device_name()
-        is_h20_device = (
-            device_name and "H20" in device_name and "H200" not in device_name
-        )
+
         if (
             not self.enable_flashinfer_allreduce_fusion
             and model_arch
@@ -2460,7 +2540,6 @@ class ServerArgs:
             and self.tp_size > 1
             and not self.enable_dp_attention
             and self.nnodes == 1
-            and not is_h20_device
             and self.moe_a2a_backend == "none"
         ):
             self.enable_flashinfer_allreduce_fusion = True
@@ -2482,6 +2561,7 @@ class ServerArgs:
         support_mamba_cache: bool = True,
         support_mamba_cache_extra_buffer: bool = True,
         sm100_default_attention_backend: str = None,
+        fallback_attention_backend: str = "triton",
     ):
         if (
             is_sm100_supported()
@@ -2508,7 +2588,7 @@ class ServerArgs:
         if self.enable_mamba_extra_buffer():  # extra_buffer
             if self.disable_radix_cache:
                 raise ValueError(
-                    "mamba extra_buffer is not compatible with --disable-radix-cache "
+                    "mamba extra_buffer is not compatible with --disable-radix-cache. "
                     "Overlap scheduling is already supported with no_buffer + disable_radix_cache. "
                     "Please use --mamba-scheduler-strategy no_buffer instead."
                 )
@@ -2525,11 +2605,7 @@ class ServerArgs:
                 assert (
                     self.mamba_track_interval % self.page_size == 0
                 ), f"mamba_track_interval {self.mamba_track_interval} must be divisible by page_size {self.page_size}"
-                assert (
-                    max(FLA_CHUNK_SIZE, self.page_size)
-                    % min(FLA_CHUNK_SIZE, self.page_size)
-                    == 0
-                ), f"For SSM models with extra buffer, either FLA_CHUNK_SIZE or page_size must be divisible by the other, got {FLA_CHUNK_SIZE=}, {self.page_size=}"
+                assert self.mamba_cache_chunk_size is not None
         elif not self.disable_radix_cache:  # no_buffer
             if self.page_size is not None and self.page_size != 1:
                 logger.warning(
@@ -2547,7 +2623,7 @@ class ServerArgs:
                 if self.attention_backend == "trtllm_mha":
                     logger.warning(
                         "Disabling radix cache since trtllm_mha does not support page_size = 1, which is required by MambaRadixCache. "
-                        "Try to use --attention-backend triton if radix cache is necessary."
+                        f"Try to use --attention-backend {fallback_attention_backend} if radix cache is necessary."
                     )
                     self.disable_radix_cache = True
                     self.disable_overlap_schedule = False
@@ -2746,6 +2822,35 @@ class ServerArgs:
                     "tokenspeed_mla backend requires kv-cache-dtype=fp8_e4m3, "
                     f"got {self.kv_cache_dtype}."
                 )
+
+        if (
+            self.attention_backend == "cutedsl_mla"
+            or self.decode_attention_backend == "cutedsl_mla"
+            or self.prefill_attention_backend == "cutedsl_mla"
+        ):
+            assert (
+                self.prefill_attention_backend != "cutedsl_mla"
+            ), "CuteDSL MLA only supports decoding for now"
+            if not is_sm100_supported():
+                raise ValueError(
+                    "CuteDSL MLA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
+                )
+            if self.page_size not in [32, 64]:
+                logger.warning(
+                    f"CuteDSL MLA only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
+                )
+                self.page_size = 64
+            if self.kv_cache_dtype not in [
+                "fp8_e4m3",
+                "bf16",
+                "bfloat16",
+                "auto",
+            ]:
+                raise ValueError(
+                    "CuteDSL MLA backend only supports kv-cache-dtype of fp8_e4m3, bf16, or auto."
+                )
+            if self.prefill_attention_backend is None:
+                self.prefill_attention_backend = "trtllm_mla"
 
         if (
             self.attention_backend == "trtllm_mha"
@@ -3019,7 +3124,36 @@ class ServerArgs:
                 f"got {self.mamba_ssm_dtype!r}"
             )
 
+        # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel)
+        # for correctness and best performance.
+        prefill = self.linear_attn_prefill_backend or self.linear_attn_backend
+        cuda_version = torch.version.cuda
+        cuda_major = int(cuda_version.split(".")[0]) if cuda_version is not None else 0
+        if (
+            prefill == "flashinfer"
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] >= 10
+            and cuda_major < 13
+        ):
+            raise ValueError(
+                "--linear-attn-prefill-backend flashinfer on SM100+ requires CUDA 13+, "
+                f"got CUDA {cuda_version or 'unknown'}"
+            )
+
     def _handle_context_parallelism(self):
+        if (
+            self.enable_prefill_context_parallel
+            and self.enable_dsa_prefill_context_parallel
+        ):
+            raise ValueError(
+                "--enable-prefill-context-parallel and "
+                "--enable-nsa-prefill-context-parallel are mutually "
+                "exclusive. Use --enable-nsa-prefill-context-parallel for "
+                "DeepSeek V3.2 (NSA) models and "
+                "--enable-prefill-context-parallel for MLA-based models "
+                "(DeepSeek V3/R1, Kimi K2.5) or MHA/GQA-based models."
+            )
+
         if self.attn_cp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size
             assert (
@@ -3114,9 +3248,10 @@ class ServerArgs:
             assert self.moe_a2a_backend in [
                 "none",
                 "deepep",
+                "flashinfer",
             ], (
-                f"flashinfer_cutedsl supports moe_a2a_backend='none' (standard path) "
-                f"or 'deepep' (DeepEP low-latency path), got '{self.moe_a2a_backend}'."
+                f"flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', or 'flashinfer', "
+                f"got '{self.moe_a2a_backend}'."
             )
             self.disable_shared_experts_fusion = True
             logger.warning(
@@ -3166,22 +3301,6 @@ class ServerArgs:
             assert (
                 self.ep_size == 1
             ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
-
-        # TODO(yuwei): Fix piecewise cuda graph support for bypassed topk MoE backends.
-        # Exception: GptOssForCausalLM wraps the entire MoE block in its own
-        # custom op (moe_impl), so bypassed topk is handled inside the op body.
-        if (
-            not self.enforce_piecewise_cuda_graph
-            and self.moe_runner_backend in ("flashinfer_trtllm", "flashinfer_mxfp4")
-            and self.get_model_config().hf_config.architectures[0]
-            != "GptOssForCausalLM"
-        ):
-            self.disable_piecewise_cuda_graph = True
-            logger.info(
-                f"Piecewise cuda graph is disabled for MoE runner backend "
-                f"'{self.moe_runner_backend}' (bypassed topk is incompatible "
-                f"with torch.compile)."
-            )
 
     def _handle_a2a_moe(self):
         if self.enable_deepep_waterfill and self.moe_a2a_backend != "deepep":
@@ -3256,6 +3375,9 @@ class ServerArgs:
                     self.quantization == "modelslim"
                 ), "When fuse_mode is set to 2, the NPU supports only ModelSlim quantization."
         if self.moe_a2a_backend == "flashinfer":
+            assert (
+                self.enable_dp_attention and self.dp_size == self.tp_size
+            ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
             self.ep_size = self.tp_size
             logger.warning(
                 f"Flashinfer MoE A2A is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
@@ -3272,8 +3394,40 @@ class ServerArgs:
                     "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
                 )
             assert self.moe_runner_backend in [
-                "flashinfer_cutlass"
-            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass moe runner backend"
+                "flashinfer_cutlass",
+                "flashinfer_cutedsl",
+            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass or flashinfer_cutedsl moe runner backend"
+            if (
+                self.moe_runner_backend == "flashinfer_cutedsl"
+                and self.max_prefill_tokens is not None
+                and self.max_prefill_tokens > 0
+                and self.disaggregation_mode != "decode"
+            ):
+                max_dispatch_tokens_per_rank = get_int_env_var(
+                    "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 1024
+                )
+                max_cutedsl_tokens = max_dispatch_tokens_per_rank * self.ep_size
+                if max_cutedsl_tokens < self.max_prefill_tokens:
+                    required_per_rank = (
+                        self.max_prefill_tokens + self.ep_size - 1
+                    ) // self.ep_size
+                    raise ValueError(
+                        "FlashInfer MoE A2A with flashinfer_cutedsl requires "
+                        "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK * "
+                        "ep_size to cover --max-prefill-tokens. Otherwise the "
+                        "FlashInfer dispatcher can crash at runtime with "
+                        "`ValueError: num_tokens (...) exceeds max_num_tokens (...)` "
+                        "when a local DP rank schedules too many prefill tokens. "
+                        "Current values: "
+                        f"SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
+                        f"{max_dispatch_tokens_per_rank}, ep_size={self.ep_size}, "
+                        f"capacity={max_cutedsl_tokens}, "
+                        f"max_prefill_tokens={self.max_prefill_tokens}. "
+                        f"Set `export "
+                        f"SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
+                        f"{required_per_rank}` or lower `--max-prefill-tokens` "
+                        f"to <= {max_cutedsl_tokens}."
+                    )
 
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size
@@ -3408,7 +3562,7 @@ class ServerArgs:
                 "the paged cache, which the no-op pool does not support."
             )
 
-        # HiSparse selects a different pool class (HiSparseNSATokenToKVPool /
+        # HiSparse selects a different pool class (HiSparseDSATokenToKVPool /
         # HiSparseTokenToKVPoolAllocator) that is not the no-op pool.
         if self.enable_hisparse:
             raise ValueError(
@@ -3655,66 +3809,6 @@ class ServerArgs:
             )
         except Exception:
             return False
-
-    def _handle_pd_disaggregation(self):
-        if self.disaggregation_mode == "decode":
-            if self.disaggregation_decode_enable_radix_cache:
-                if self.enable_hisparse:
-                    raise ValueError(
-                        "--disaggregation-decode-enable-radix-cache is incompatible "
-                        "with --enable-hisparse"
-                    )
-                if self.disaggregation_transfer_backend not in ("nixl", "mooncake"):
-                    raise ValueError(
-                        "--disaggregation-decode-enable-radix-cache currently "
-                        "requires --disaggregation-transfer-backend in "
-                        "('nixl', 'mooncake'), but got "
-                        f"{self.disaggregation_transfer_backend!r}"
-                    )
-                if self.speculative_algorithm is not None:
-                    raise ValueError(
-                        "--disaggregation-decode-enable-radix-cache is incompatible "
-                        "with speculative decoding "
-                        f"(--speculative-algorithm {self.speculative_algorithm})"
-                    )
-                if self.enable_dp_attention:
-                    logger.warning(
-                        "EXPERIMENTAL: Decode radix cache with DP attention. "
-                        "Requires prefix-aware DP rank routing for optimal cache hits."
-                    )
-                self.disable_radix_cache = False
-                logger.warning("EXPERIMENTAL: Radix cache is enabled for decode server")
-            else:
-                self.disable_radix_cache = True
-                logger.warning("KV cache is forced as chunk cache for decode server")
-                if self.enable_mamba_extra_buffer():
-                    logger.warning(
-                        "Mamba extra_buffer is disabled because decode disaggregation "
-                        "currently forces chunk cache. Falling back to no_buffer."
-                    )
-                    self.mamba_scheduler_strategy = "no_buffer"
-
-        elif self.disaggregation_mode == "prefill":
-            assert (
-                self.disaggregation_transfer_backend != "fake"
-            ), "Prefill server does not support 'fake' as the transfer backend"
-
-            if self.disable_piecewise_cuda_graph:
-                self.disable_cuda_graph = True
-                logger.warning(
-                    "Cuda graph is disabled for prefill server when piecewise cuda graph is not enabled."
-                )
-
-        if self.disaggregation_mode in ("prefill", "decode"):
-            if (
-                envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-                and self.disaggregation_transfer_backend not in ("mooncake", "nixl")
-            ):
-                raise ValueError(
-                    f"SGLANG_DISAGG_STAGING_BUFFER requires "
-                    f"disaggregation_transfer_backend='mooncake' or 'nixl', "
-                    f"got '{self.disaggregation_transfer_backend}'."
-                )
 
     def _handle_encoder_disaggregation(self):
         if self.enable_prefix_mm_cache and not self.encoder_only:
@@ -4093,6 +4187,19 @@ class ServerArgs:
                 "Mixed chunked prefill is disabled because of using diffusion LLM inference."
             )
             self.enable_mixed_chunk = False
+
+    def _handle_asr_validation(self):
+        """Validate transcription/ASR-specific server args."""
+        if self.asr_max_buffer_seconds <= 0:
+            raise ValueError(
+                f"--asr-max-buffer-seconds must be positive "
+                f"(got {self.asr_max_buffer_seconds})."
+            )
+        if self.asr_max_concurrent_sessions <= 0:
+            raise ValueError(
+                f"--asr-max-concurrent-sessions must be positive "
+                f"(got {self.asr_max_concurrent_sessions})."
+            )
 
     def _handle_other_validations(self):
         # Handle model inference tensor dump.
@@ -5143,6 +5250,24 @@ class ServerArgs:
             "'model' uses the model's generation_config.json to get the recommended "
             "sampling parameters if available. Default is 'model'.",
         )
+        parser.add_argument(
+            "--asr-max-buffer-seconds",
+            type=int,
+            default=ServerArgs.asr_max_buffer_seconds,
+            help="Maximum seconds of PCM audio the streaming ASR WebSocket handler "
+            "will accumulate before closing the session with a buffer_overflow "
+            "error. Guards against OOM when a client streams audio faster than "
+            "inference can consume it. Default 60s.",
+        )
+        parser.add_argument(
+            "--asr-max-concurrent-sessions",
+            type=int,
+            default=ServerArgs.asr_max_concurrent_sessions,
+            help="Maximum number of concurrent realtime ASR WebSocket sessions "
+            "served by /v1/realtime. New connections beyond this cap are "
+            "accepted, sent an error{code:too_many_sessions} frame, and closed. "
+            "Default 32.",
+        )
 
         # Data parallelism
         parser.add_argument(
@@ -5334,6 +5459,16 @@ class ServerArgs:
             help="Choose the backend for grammar-guided decoding.",
         )
         parser.add_argument(
+            "--radix-cache-backend",
+            type=str,
+            default=ServerArgs.radix_cache_backend,
+            help=(
+                "Name of a radix-cache backend previously registered via "
+                "register_radix_cache_backend. Omit this flag to use the "
+                "built-in default cache selection chain."
+            ),
+        )
+        parser.add_argument(
             "--mm-attention-backend",
             type=str,
             choices=[
@@ -5344,23 +5479,55 @@ class ServerArgs:
                 "ascend_attn",
                 "aiter_attn",
                 "flashinfer_cudnn",
+                "amx_attn",
             ],
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
         )
         parser.add_argument(
-            "--nsa-prefill-backend",
-            default=ServerArgs.nsa_prefill_backend,
+            "--dsa-prefill-backend",
+            dest="dsa_prefill_backend",
+            default=ServerArgs.dsa_prefill_backend,
             type=str,
-            choices=NSA_CHOICES,
-            help="NSA prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            choices=DSA_CHOICES,
+            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+        )
+        parser.add_argument(
+            "--nsa-prefill-backend",
+            dest="dsa_prefill_backend",
+            action=DeprecatedAliasStoreAction,
+            new_flag="--dsa-prefill-backend",
+            default=argparse.SUPPRESS,
+            type=str,
+            choices=DSA_CHOICES,
+            help="[Deprecated] Use --dsa-prefill-backend instead.",
+        )
+        parser.add_argument(
+            "--dsa-decode-backend",
+            dest="dsa_decode_backend",
+            default=ServerArgs.dsa_decode_backend,
+            type=str,
+            choices=DSA_CHOICES,
+            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
         )
         parser.add_argument(
             "--nsa-decode-backend",
-            default=ServerArgs.nsa_decode_backend,
+            dest="dsa_decode_backend",
+            action=DeprecatedAliasStoreAction,
+            new_flag="--dsa-decode-backend",
+            default=argparse.SUPPRESS,
             type=str,
-            choices=NSA_CHOICES,
-            help="NSA decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            choices=DSA_CHOICES,
+            help="[Deprecated] Use --dsa-decode-backend instead.",
+        )
+        parser.add_argument(
+            "--dsa-topk-backend",
+            dest="dsa_topk_backend",
+            default=ServerArgs.dsa_topk_backend,
+            type=str,
+            choices=DSA_TOPK_BACKEND_CHOICES,
+            help="DSA indexer top-k backend. Options: 'sgl-kernel', 'torch', 'flashinfer'. "
+            "The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
         )
         parser.add_argument(
             "--fp8-gemm-backend",
@@ -5951,6 +6118,12 @@ class ServerArgs:
             action="store_true",
             help="Using LMCache as an alternative hierarchical cache solution",
         )
+        parser.add_argument(
+            "--lmcache-config-file",
+            type=str,
+            default=ServerArgs.lmcache_config_file,
+            help="Path to the LMCache YAML configuration file",
+        )
 
         # Ktransformer server args
         parser.add_argument(
@@ -6250,11 +6423,6 @@ class ServerArgs:
             help="Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row",
         )
         parser.add_argument(
-            "--enable-nan-detection",
-            action="store_true",
-            help="[Deprecated] Use SGLANG_SPEC_NAN_DETECTION=1 and SGLANG_SPEC_OOB_DETECTION=1 instead.",
-        )
-        parser.add_argument(
             "--enable-p2p-check",
             action="store_true",
             help="Enable P2P check for GPU access, otherwise the p2p access is allowed by default.",
@@ -6396,15 +6564,46 @@ class ServerArgs:
             help="Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
         )
         parser.add_argument(
-            "--enable-nsa-prefill-context-parallel",
+            "--disable-attn-tp-gather",
+            action="store_true",
+            help="Disable scheduler-side attn_tp_gather (the upstream SP path "
+            "that pads num_tokens to attn_tp_size and pre-allocates a gathered "
+            "buffer). Use for models that manage SP scatter/gather at the "
+            "model level (e.g., perform their own all_gather/reduce_scatter "
+            "inside attention) and do not consume the upstream gathered_buffer. "
+            "Without this, the cuda graph runner pads num_tokens to attn_tp_size, "
+            "which can cause kernel autotuners to select wrong-sized variants "
+            "at small batches.",
+        )
+        parser.add_argument(
+            "--enable-dsa-prefill-context-parallel",
+            dest="enable_dsa_prefill_context_parallel",
             action="store_true",
             help="Enable context parallelism used in the long sequence prefill phase of DeepSeek v3.2.",
         )
         parser.add_argument(
-            "--nsa-prefill-cp-mode",
+            "--enable-nsa-prefill-context-parallel",
+            dest="enable_dsa_prefill_context_parallel",
+            action=DeprecatedStoreTrueAction,
+            new_flag="--enable-dsa-prefill-context-parallel",
+            help="[Deprecated] Use --enable-dsa-prefill-context-parallel instead.",
+        )
+        parser.add_argument(
+            "--dsa-prefill-cp-mode",
+            dest="dsa_prefill_cp_mode",
             type=str,
-            default=ServerArgs.nsa_prefill_cp_mode,
-            choices=NSA_PREFILL_CP_SPLIT_CHOICES,
+            default=ServerArgs.dsa_prefill_cp_mode,
+            choices=DSA_PREFILL_CP_SPLIT_CHOICES,
+            help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism.",
+        )
+        parser.add_argument(
+            "--nsa-prefill-cp-mode",
+            dest="dsa_prefill_cp_mode",
+            action=DeprecatedAliasStoreAction,
+            new_flag="--dsa-prefill-cp-mode",
+            default=argparse.SUPPRESS,
+            type=str,
+            choices=DSA_PREFILL_CP_SPLIT_CHOICES,
             help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: 'round-robin-split'(default), 'in-seq-split'  "
             "'round-robin-split' distributes tokens across ranks based on token_idx %% cp_size. It supports multi-batch prefill, fused MoE, and FP8 KV cache.",
         )
@@ -6763,7 +6962,12 @@ class ServerArgs:
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
 
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
+        # Some dataclass fields (e.g. stat_loggers) intentionally have no CLI
+        # surface and won't appear on the argparse Namespace. Skip them so the
+        # dataclass default applies.
+        attrs = [
+            attr.name for attr in dataclasses.fields(cls) if hasattr(args, attr.name)
+        ]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self, port: Optional[int] = None):
@@ -6867,9 +7071,17 @@ class ServerArgs:
 
     @property
     def mamba_cache_chunk_size(self) -> int:
-        # For mamba cache with extra buffer, the chunk size is the max of FLA_CHUNK_SIZE and page_size.
+        # For mamba cache with extra buffer, the chunk size is the max of FLA_CHUNK_SIZE
+        # (or mamba_chunk_size if it is defined in the model's config) and page_size.
         # It is used to determine the caching point in a sequence during prefill.
-        return max(FLA_CHUNK_SIZE, self.page_size)
+        if not hasattr(self, "_mamba_cache_chunk_size"):
+            hf_config = self.get_model_config().hf_config
+            chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
+            assert (
+                max(chunk_size, self.page_size) % min(chunk_size, self.page_size) == 0
+            ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {self.page_size=}"
+            self._mamba_cache_chunk_size = max(chunk_size, self.page_size)
+        return self._mamba_cache_chunk_size
 
     def check_server_args(self):
         # Check parallel size constraints
@@ -7331,6 +7543,92 @@ class ServerArgs:
             return True
         else:
             return False
+
+    def describe_kv_events_publisher(self) -> Optional[dict]:
+        """Return a structured description of this server's KV-event
+        publisher, or `None` if publishing is disabled / misconfigured.
+
+        This is the wire contract surfaced under the `kv_events` key on
+        `/server_info` so KV-aware routers (e.g. the SGLang model
+        gateway) can subscribe per-worker without operator-supplied port
+        coordination. The router constructs the per-DP-rank SUB endpoint
+        as ``tcp://<worker_host>:<endpoint_port_base + dp_rank>`` for
+        every rank reported in ``dp_size``.
+
+        Returned descriptor shape:
+
+            {
+                "publisher": "zmq",
+                "endpoint_host": "*",             # may be a ZMQ wildcard
+                                                  # ("*", "0.0.0.0", "::");
+                                                  # subscribers MUST substitute
+                                                  # the worker URL's host when
+                                                  # dialing
+                "endpoint_port_base": 5557,       # base TCP port; per-rank
+                                                  # port = base + dp_rank
+                "topic": "",                      # ZMQ topic prefix on the
+                                                  # SUB filter (empty =
+                                                  # subscribe-all)
+                "block_size": <page_size>,        # subscribers MUST hash
+                                                  # prompts at this size
+                "dp_size": <dp_size>,             # number of SUB sockets
+                                                  # to open
+            }
+
+        Returns ``None`` (i.e. "no publisher to describe") when any of:
+
+        * ``--kv-events-config`` is unset / empty / malformed JSON,
+        * the configured publisher is ``"null"``,
+        * ``page_size`` is missing or non-positive (a placeholder
+          ``block_size`` would cause silent KV-cache misses by hashing
+          prompts at the wrong granularity on the router side),
+        * the endpoint is not a routable TCP address (``inproc://`` /
+          ``ipc://``, missing port, non-integer port, or port outside
+          ``1..65535``).
+
+        Reuses ``KVEventsConfig.from_cli`` for JSON parsing; the inline
+        ``rfind(":")`` endpoint split mirrors
+        ``ZmqEventPublisher.offset_endpoint_port`` rather than adding a
+        new module-level helper.
+        """
+        # Lazy import so loading ``server_args`` doesn't pull in
+        # disaggregation / msgspec / zmq at module top level.
+        from sglang.srt.disaggregation.kv_events import KVEventsConfig
+
+        raw = self.kv_events_config
+        page_size = self.page_size
+        if not raw or page_size is None or page_size <= 0:
+            return None
+        try:
+            cfg = KVEventsConfig.from_cli(raw)
+        except Exception:
+            # Malformed JSON / schema mismatch. The publisher would
+            # have failed at server startup; ``/server_info`` must
+            # keep working, so just report "no publisher" to consumers.
+            return None
+        if cfg.publisher == "null" or not cfg.endpoint:
+            return None
+        if not cfg.endpoint.startswith("tcp://"):
+            return None
+        body = cfg.endpoint[len("tcp://") :]
+        last_colon = body.rfind(":")
+        if last_colon < 0:
+            return None
+        host = body[:last_colon]
+        try:
+            port = int(body[last_colon + 1 :])
+        except ValueError:
+            return None
+        if not host or not (0 < port < 65536):
+            return None
+        return {
+            "publisher": cfg.publisher,
+            "endpoint_host": host,
+            "endpoint_port_base": port,
+            "topic": cfg.topic,
+            "block_size": page_size,
+            "dp_size": self.dp_size,
+        }
 
 
 # NOTE: This is a global variable to hold the server args for scheduler.
