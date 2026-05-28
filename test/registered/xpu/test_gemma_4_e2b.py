@@ -305,5 +305,9 @@ class TestGemma4E2BXPU(CustomTestCase):
         )
 
 
+from sglang.test.ci.ci_register import register_xpu_ci
+
+register_xpu_ci(est_time=360, suite="stage-b-test-1-gpu-xpu")
+
 if __name__ == "__main__":
     unittest.main()
