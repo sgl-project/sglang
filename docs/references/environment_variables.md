@@ -88,16 +88,18 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_MORI_POST_BATCH_SIZE` | Number of RDMA work requests posted in a single batch to each QP | `-1` |
 | `SGLANG_MORI_NUM_WORKERS` | Number of worker threads in the RDMA executor thread pool | `1` |
 
-## NSA Backend Configuration (For DeepSeek V3.2)
+## DSA Backend Configuration (For DeepSeek V3.2)
 
 <!-- # Environment variable to control mtp precomputing of metadata for multi-step speculative decoding -->
 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
-| `SGLANG_NSA_FUSE_TOPK` | Fuse the operation of picking topk logits and picking topk indices from page table  | `true` |
-| `SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA` | Precompute metadata that can be shared among different draft steps when MTP is enabled | `true` |
+| `SGLANG_DSA_FUSE_TOPK` | Fuse the operation of picking topk logits and picking topk indices from page table (`SGLANG_NSA_FUSE_TOPK` is a deprecated alias) | `true` |
+| `SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC` | Use deterministic FlashInfer topk kernels when `--dsa-topk-backend=flashinfer` | `false` |
+| `SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK` | Tie-break mode for FlashInfer DSA topk when `--dsa-topk-backend=flashinfer`: unset disables explicit tie-breaking, `small` prefers the smaller candidate index for equal scores, and `large` prefers the larger candidate index for equal scores. Setting this variable makes FlashInfer use deterministic topk. | `unset` |
+| `SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA` | Precompute metadata that can be shared among different draft steps when MTP is enabled (`SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA` is a deprecated alias) | `true` |
 | `SGLANG_USE_FUSED_METADATA_COPY` | Control whether to use fused metadata copy kernel for cuda graph replay  | `true` |
-| `SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD` | When the maximum kv len in current prefill batch exceeds this value, the sparse mla kernel will be applied, else it falls back to dense MHA implementation. Default to the index topk of model (2048 for DeepSeek V3.2) | `2048` |
+| `SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD` | When the maximum kv len in current prefill batch exceeds this value, the sparse mla kernel will be applied, else it falls back to dense MHA implementation. Default to the index topk of model (2048 for DeepSeek V3.2) (`SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD` is a deprecated alias) | `2048` |
 
 
 ## Memory Management

@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sgl-router
+  namespace: sgl-router-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sgl-router
+  template:
+    metadata:
+      labels:
+        app: sgl-router
+    spec:
+      serviceAccountName: sgl-router
+      containers:
+        - name: router
+          image: sgl-router:e2e
+          imagePullPolicy: Never
+          args:
+            - "--config"
+            - "/etc/config/router.toml"
+          ports:
+            - containerPort: 8090
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8090
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8090
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /etc/config
+      volumes:
+        - name: config
+          configMap:
+            name: sgl-router-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sgl-router
+  namespace: sgl-router-test
+spec:
+  selector:
+    app: sgl-router
+  ports:
+    - name: http
+      port: 8090
+      targetPort: 8090

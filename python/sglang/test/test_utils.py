@@ -69,6 +69,8 @@ DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 # VL test models
 DEFAULT_MODEL_NAME_FOR_TEST_VL_PP = "Qwen/Qwen3-VL-2B-Thinking"
 DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP = "zai-org/GLM-4.1V-9B-Thinking"
+DEFAULT_MODEL_NAME_FOR_TEST_GEMMA4_PP = "google/gemma-4-26B-A4B-it"
+DEFAULT_MODEL_NAME_FOR_TEST_GEMMA4_PLE_PP = "google/gemma-4-E4B-it"
 
 # NVFP4 models
 DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST = "nvidia/DeepSeek-V3-0324-FP4"
@@ -570,6 +572,41 @@ def popen_with_error_check(command: list[str]):
     t = threading.Thread(target=_run_and_check, daemon=True)
     t.start()
     return process
+
+
+def start_subprocess_fail_fast_watcher(
+    named_procs: list[tuple[str, subprocess.Popen]],
+) -> threading.Event:
+    """Abort the test runner the moment any watched subprocess exits non-zero.
+
+    Caller must `.set()` the returned Event before intentional teardown."""
+    stop = threading.Event()
+
+    def watcher():
+        while not stop.is_set():
+            for name, proc in named_procs:
+                rc = proc.poll() if proc else None
+                if rc is None or rc == 0:
+                    continue
+                if stop.is_set():
+                    return
+                sys.stderr.write(
+                    f"[FIXTURE FAIL-FAST] {name} (pid={proc.pid}) exited "
+                    f"rc={rc}; aborting.\n"
+                )
+                sys.stderr.flush()
+                for _, sib in named_procs:
+                    if sib and sib is not proc:
+                        try:
+                            kill_process_tree(sib.pid, wait_timeout=10)
+                        except Exception:
+                            pass
+                # POSIX: signal N -> 128+N (os._exit masks negatives via & 0xff).
+                os._exit(rc if rc >= 0 else 128 + (-rc))
+            time.sleep(0.1)
+
+    threading.Thread(target=watcher, daemon=True, name="SubprocFailFastWatcher").start()
+    return stop
 
 
 def _try_enable_offline_mode_if_cache_complete(
