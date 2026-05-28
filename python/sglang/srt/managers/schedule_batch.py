@@ -740,10 +740,12 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
-        self.origin_input_ids_unpadded = array(
-            "q", origin_input_ids_unpadded or origin_input_ids
-        )  # Before image padding
         self.origin_input_ids = array("q", origin_input_ids)
+        self.origin_input_ids_unpadded = (
+            array("q", origin_input_ids_unpadded)
+            if origin_input_ids_unpadded
+            else self.origin_input_ids
+        )  # Before image padding
         # Each decode stage's output ids
         self.output_ids = array("q")
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
@@ -2439,7 +2441,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for idx in range(len(self.reqs)):
             self.release_req(idx, len(self.reqs) - idx, server_args)
 
-        self.filter_batch(keep_indices=[])
+        self.reqs = []
         return retracted_reqs
 
     def retract_decode(

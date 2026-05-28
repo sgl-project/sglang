@@ -4053,6 +4053,13 @@ def run_scheduler_process(
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
+        # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands
+        # of NCCL/TCPStore tracebacks before they finally die.
+        if envs.SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION.get():
+            try:
+                os.killpg(os.getpgrp(), signal.SIGKILL)
+            except Exception:
+                pass
     finally:
         if scheduler is not None:
             # FPM has a background ZMQ publisher thread that needs explicit
