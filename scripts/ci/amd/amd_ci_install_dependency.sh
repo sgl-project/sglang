@@ -270,10 +270,15 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     docker exec ci_sglang git clone https://github.com/ROCm/aiter.git /sgl-workspace/aiter
 
     # checkout correct version and install requirements
+    # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
+    # AITER's .gitattributes (*.csv text eol=lf, added in ROCm/aiter#3370) does
+    # not block switching to commits that predate that rule. The working tree
+    # was just produced by `rm -rf` + fresh `git clone` above, so there are no
+    # real user changes to preserve.
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
         git fetch --all && \
-        git checkout ${REPO_AITER_COMMIT} && \
+        git checkout -f ${REPO_AITER_COMMIT} && \
         git submodule update --init --recursive && \
         pip install -r requirements.txt
     "
