@@ -622,3 +622,69 @@ def plan_dcp_decode_metadata(
     kv_indices[:total_local_len] = local_kv_indices[:total_local_len]
     kv_lens.copy_(local_kv_lens)
     kv_indptr[: bs + 1] = local_kv_lens_cumsum[: bs + 1]
+
+
+# all gather kv cache and re-org to query orders
+def all_gather_kv_cache_for_dcp(
+    prefix_kv_a: torch.Tensor,
+    prefix_k_pe: torch.Tensor,
+    prefix_kv_lens_cpu: torch.Tensor,
+    prefix_starts_cpu: torch.Tensor = None,
+):
+    # 1. compute max kv_lens for each seq
+    dcp_world_size = get_dcp_world_size()
+    dcp_rank = get_dcp_rank()
+
+    if prefix_starts_cpu is None:
+        prefix_starts_cpu = torch.zeros_like(prefix_kv_lens_cpu)
+
+    left_pads = prefix_starts_cpu % dcp_world_size > dcp_rank
+    left_pads = left_pads.to(torch.int32)
+    right_pads = (
+        prefix_starts_cpu + prefix_kv_lens_cpu - 1
+    ) % dcp_world_size < dcp_rank
+    right_pads = right_pads.to(torch.int32)
+    padded_lens = (
+        prefix_kv_lens_cpu + dcp_world_size + (prefix_starts_cpu % dcp_world_size)
+    ) // dcp_world_size
+
+    local_kv_lens = padded_lens - left_pads - right_pads
+    local_kv_lens_cu = torch.zeros(
+        len(prefix_kv_lens_cpu) + 1,
+        dtype=torch.int32,
+    )
+    local_kv_lens_cu[1:] = torch.cumsum(local_kv_lens, dim=0)
+
+    padded_kv_cache_arr = []
+    prefix_kv_a = prefix_kv_a.squeeze(1)
+    prefix_kv_cache = torch.cat([prefix_kv_a, prefix_k_pe], dim=-1)
+    for req_idx in range(len(prefix_kv_lens_cpu)):
+        padded_tensor = prefix_kv_cache.new_empty(
+            (padded_lens[req_idx].item(),) + prefix_kv_cache.size()[1:]
+        )
+        padded_tensor[
+            left_pads[req_idx] : left_pads[req_idx] + local_kv_lens[req_idx]
+        ] = prefix_kv_cache[local_kv_lens_cu[req_idx] : local_kv_lens_cu[req_idx + 1]]
+        padded_kv_cache_arr.append(padded_tensor)
+
+    padded_kv_cache = torch.cat(padded_kv_cache_arr, dim=0)
+
+    gatherd_kv_cache = _all_gather_dcp_kv_cache(padded_kv_cache)
+
+    # 2. re-org kv cache to query orders
+    padded_lens_cu = torch.zeros(
+        len(prefix_kv_lens_cpu) + 1,
+        dtype=torch.int32,
+    )
+    padded_lens_cu[1:] = torch.cumsum(padded_lens, dim=0)
+    kv_cache_tuple = ()
+    for req_idx in range(len(prefix_kv_lens_cpu)):
+        kv_cache_tuple += (
+            gatherd_kv_cache[
+                padded_lens_cu[req_idx] * dcp_world_size
+                + (prefix_starts_cpu[req_idx] % dcp_world_size) :
+            ][: prefix_kv_lens_cpu[req_idx]],
+        )
+    gatherd_kv_cache = torch.cat(kv_cache_tuple, dim=0)
+
+    return gatherd_kv_cache.split([prefix_kv_a.size(-1), prefix_k_pe.size(-1)], dim=-1)
