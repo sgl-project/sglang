@@ -22,10 +22,13 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
 
-from sglang.srt.server_args import ServerArgs, get_global_server_args
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_int_env_var
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 opentelemetry_imported = False
