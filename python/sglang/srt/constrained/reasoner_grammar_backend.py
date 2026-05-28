@@ -199,6 +199,8 @@ class ReasonerGrammarObject(BaseGrammarObject):
             self._finished = finished
 
     def try_jump_forward(self, tokenizer):
+        if self._is_thinking():
+            return None
         if self.grammar is not None:
             return self.grammar.try_jump_forward(tokenizer)
         return None
