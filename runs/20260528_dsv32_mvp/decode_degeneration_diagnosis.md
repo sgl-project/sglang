@@ -78,3 +78,33 @@ On H200/CUDA the aiter/tilelang fused branches are off, so `forward_absorb_core`
 write still does not fire on decode. Next step: instrument `forward_decode` directly
 (log reached?/k is None?/save_kv_cache) for a decode step, then add the decode-token
 label write (the projected K-noPE is available as `k_nope` in forward_absorb_core).
+
+## Bug #2 — COMPLETE root cause (two layers); correct fix scoped for next round
+
+Bug #2 is itself two-layered, both confirmed on hardware via env-gated probes:
+
+(2a) `kv_b_proj` is lazily attached only to `attn_mha` (prefill), never to `attn_mqa`
+     (decode) — deepseek_v2.py ~1724. So decode's `_write_token_labels(layer=attn_mqa)`
+     hit the `kv_b_proj is None` guard and returned early (DS_DEBUG_WRITE_GUARD:
+     mode=DECODE kv_b_proj_none=True vs mode=EXTEND kv_b_proj_none=False).
+
+(2b) DEEPER: even with kv_b_proj attached, the decode path passes the WRONG tensor.
+     `forward_absorb_core` (forward_mla.py:513) calls
+     `attn_mqa(q_nope_out, k_nope, k_nope, ...)`, so `forward_decode` receives
+     `k = k_nope` — the ALREADY-PROJECTED K-noPE — not the 512-d latent key.
+     `_write_token_labels` assumes the latent and re-projects through kv_b_proj,
+     giving `RuntimeError: shape '[1, 16, 640]' is invalid for input of size 4096`
+     (decode k_nope is [T, H_local, *], last dim != kv_lora_rank=512).
+
+So merely attaching kv_b_proj to attn_mqa (attempted, then REVERTED) is wrong — it
+feeds an already-projected tensor into the projection. The correct fix writes decode
+token-labels from the already-projected `k_nope` directly (available in
+`forward_absorb_core` as a param, and as the selector's expected
+`[T, H_local, nope_dim]` input to `token_label_write`), bypassing the kv_b_proj
+re-projection. Candidate approaches for next round:
+  - Add a decode-path label write in `forward_absorb_core` using the in-hand `k_nope`
+    + the selector's `token_label_table`/`channel_mask` (skip kv_b_proj), OR
+  - Make `_write_token_labels` accept pre-projected k_nope (detect last-dim !=
+    kv_lora_rank) and skip the projection.
+Must validate: after the fix, `written_in_seq` grows with seq_len (not frozen at
+prompt_len), `0 < sparsity_rate < 1` on a >top_k prompt, and coherent decode.
