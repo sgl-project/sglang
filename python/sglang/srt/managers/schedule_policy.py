@@ -793,6 +793,15 @@ class PrefillAdder:
         # chunked-resume) and would skip _req_inc_lock_ref incorrectly.
         is_resume = req.has_pending_chunk and not req.is_dllm()
 
+        # req.host_hit_length is the last match_prefix output. For reuse
+        # admissions, the previous (fresh) admission already consumed it
+        # via init_load_back, so locally treat it as zero — both for
+        # budget accounting and to skip the redundant init_load_back call.
+        # We do NOT mutate req.host_hit_length: keeping the field as a
+        # pure match_prefix output preserves single-writer semantics and
+        # avoids cross-function reset contracts.
+        effective_host_hit_length = 0 if is_resume else req.host_hit_length
+
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                 local_prefillable=True,
@@ -829,7 +838,7 @@ class PrefillAdder:
         total_tokens = req.extend_input_len + max_new + self.page_size
 
         # adjusting the input_tokens based on host_hit_length and page_size
-        real_input_tokens = req.extend_input_len - req.host_hit_length
+        real_input_tokens = req.extend_input_len - effective_host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
@@ -861,15 +870,13 @@ class PrefillAdder:
                 if swa_needed >= self.rem_swa_tokens:
                     return AddReqResult.NO_TOKEN
 
-            # Fresh-only init_load_back. For reuse, host_hit_length was set
-            # on first admission and reset by prepare_for_extend after the
-            # cache-breakdown metric was computed, so the predicate naturally
-            # short-circuits here for reuse.
-            if req.host_hit_length > 0:
+            # Fresh-only init_load_back. effective_host_hit_length is 0 for
+            # reuse (see top of function), so the predicate skips reuse.
+            if effective_host_hit_length > 0:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
-                        host_hit_length=req.host_hit_length,
+                        host_hit_length=effective_host_hit_length,
                         req=req,
                     )
                 )

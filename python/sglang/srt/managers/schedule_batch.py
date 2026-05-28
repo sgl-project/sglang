@@ -2111,13 +2111,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len
-            # Reset host_hit_length after init_load_back consumed it so that
-            # subsequent chunks' admissions skip init_load_back (host KV
-            # already loaded). Runs unconditionally: post-retract reqs have
-            # retracted_stain=True (skipping the outer block) but still
-            # match_prefix + init_load_back on their re-admission, so the
-            # reset must apply to them too.
-            req.host_hit_length = 0
             req.is_retracted = False
 
             if get_global_server_args().enable_mamba_extra_buffer():
