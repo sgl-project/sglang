@@ -822,6 +822,16 @@ class SchedulerBatchResultProcessor:
                 f"Grammar accept_token failed for req {req.rid} with token {proposed}: {e}"
             )
             self.abort_request(AbortReq(rid=req.rid))
+
+        # _resolve_spec_overlap_tokens already added (len(proposed) - 1) to
+        # req.kv_committed_len based on the full spec-accepted count. If grammar
+        # terminated mid-list, the slots for the dropped tokens are committed but
+        # unused; roll them back so the KV pool free-list stays balanced when the
+        # request is released (otherwise SchedulerInvariantChecker._report_leak
+        # catches the imbalance — see PR comment / CI failure).
+        dropped = len(proposed) - len(accept_tokens)
+        if dropped > 0:
+            req.kv_committed_len -= dropped
         return accept_tokens
 
     def _apply_decode_grammar(
