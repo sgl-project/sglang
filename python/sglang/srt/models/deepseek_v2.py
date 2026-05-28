@@ -840,8 +840,11 @@ class DeepseekV2MoE(nn.Module):
                 **topk_kwargs,
             )
             final_hidden_states = self.experts(hidden_states, topk_output)
-            if not (_is_cuda or _is_musa) or isinstance(
-                self.experts.quant_method, KTEPWrapperMethod
+            if (
+                not _is_cuda
+                and not _is_musa
+                and not _use_aiter
+                or isinstance(self.experts.quant_method, KTEPWrapperMethod)
             ):
                 final_hidden_states *= self.routed_scaling_factor
 
@@ -2606,7 +2609,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
-                    extend_lens=forward_batch.extend_seq_lens_cpu,
+                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
         elif self.mla_enable_prefill_cp:
             if can_cp_split(len_input_ids, self.cp_size, forward_batch):
@@ -2615,7 +2618,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
-                    extend_lens=forward_batch.extend_seq_lens_cpu,
+                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
