@@ -508,6 +508,12 @@ class BailingMoELinearAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
         )
+        # Marker for HybridLinearAttnBackend._is_full_attn: Bailing wraps
+        # linear-attention layers in a plain RadixAttention, so the
+        # dispatcher can't tell from the type alone that this is a linear
+        # layer (would otherwise default to the full-attn backend, e.g. the
+        # same way MTP/NEXTN draft layers are routed).
+        self.attn._is_linear_attention = True
 
         self.group_norm_size = getattr(config, "group_norm_size", 1)
         self.rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-5))
