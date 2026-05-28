@@ -36,3 +36,30 @@ the offending kernel/index. Prime suspects in the sparse path:
   the selected-index count is exactly top_k over a longer sequence,
 - DS graph-state scratch buffers (scratch_scores etc.) sized for a max that the
   >top_k sequence exceeds.
+
+## DEEPER root cause (continued investigation) — DS prefill selection has bad batch semantics
+
+Localized with CUDA_LAUNCH_BLOCKING=1 (cheap, no compute-sanitizer) and a force-eager
+toggle:
+- The crash fires during the LONG-PROMPT PREFILL (forward_extend → forward_absorb_prepare
+  → `_select_topk_indices`), at layer 0 — NOT decode.
+- It is NOT graph-safe-Triton-specific: forcing the eager pure-torch selection
+  (`_compute_logical_token_scores`, confirmed no Triton) ALSO fails, but with a telling
+  error: `double_sparsity error cls=bad_adapter_input message=464 bad req_pool_indices
+  in batch at layer 0`. `logical_to_physical` found hundreds of out-of-range
+  `req_pool_indices` in the batch → bad physical slots → CUDA illegal access downstream
+  (the graph-safe path manifests the same as a Triton OOB).
+- Short prompts avoid this entirely via the MHA_ONE_SHOT bypass (`use_mha` →
+  `_select_topk_indices` returns None). Long prefills (> the MHA one-shot threshold,
+  ≈ top_k/2048 tokens here) use the MLA absorb prefill, which DOES run DS selection —
+  and the selection's per-extend-token batch / `req_pool_indices` handling is wrong.
+
+## Real fix (substantial, next round)
+DS sparse selection during PREFILL/extend mishandles the extend-token batch layout
+(req_pool_indices count/values don't match the extend-token rows). Options:
+1. Correctly expand/index `req_pool_indices` (and seq_lens) per extend token for the
+   prefill selection (match how DSA's indexer handles prefill queries), OR
+2. Determine the intended DS prefill-selection semantics vs DSA and align them.
+Note: simply skipping DS selection during prefill would diverge from DSA (which DOES
+select for prefill queries), so verify against DSA semantics before choosing.
+This is the blocker for AC-1.1 (genuine sparsity needs seq>top_k) and real-shape runs.
