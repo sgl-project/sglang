@@ -59,6 +59,9 @@ from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding.triton_kernels import (
+    triton_mimo_v2_rope_vscale_inplace,
+)
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -80,6 +83,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_bool_env_var,
     is_non_idle_and_non_empty,
     make_layers,
 )
@@ -87,6 +91,9 @@ from sglang.srt.utils import (
 MiMoV2Config = None
 
 logger = logging.getLogger(__name__)
+_enable_mimo_v2_fused_rope_vscale = get_bool_env_var(
+    "SGLANG_MIMO_V2_FUSED_ROPE_VSCALE", default="true"
+)
 
 
 def load_mimo_v2_qkv_proj_weight(
@@ -538,6 +545,31 @@ class MiMoV2Attention(nn.Module):
             else None
         )
 
+    def _try_fused_rope_vscale(
+        self,
+        positions: torch.Tensor,
+        qkv: torch.Tensor,
+    ) -> bool:
+        if not _enable_mimo_v2_fused_rope_vscale:
+            return False
+        if not getattr(self.rotary_emb, "is_neox_style", False):
+            return False
+
+        return triton_mimo_v2_rope_vscale_inplace(
+            qkv=qkv,
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            positions=positions,
+            q_size=self.q_size,
+            k_size=self.k_size,
+            v_size=self.v_size,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            v_head_dim=self.v_head_dim,
+            rotary_dim=self.rotary_emb.rotary_dim,
+            v_scale=self.v_scale,
+        )
+
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
             positions=state.positions,
@@ -559,11 +591,14 @@ class MiMoV2Attention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
 
-        q, k = self.rotary_emb(positions, q, k)
-        if self.v_scale is not None:
-            v = v * self.v_scale
+        if self._try_fused_rope_vscale(positions, qkv):
+            q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        else:
+            q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+            q, k = self.rotary_emb(positions, q, k)
+            if self.v_scale is not None:
+                v = v * self.v_scale
 
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
@@ -586,14 +621,16 @@ class MiMoV2Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
 
-        # [t, h, dr]
-        q, k = self.rotary_emb(positions, q, k)
-        # [t, h, d]
-
-        if self.v_scale is not None:
-            v = v * self.v_scale
+        if self._try_fused_rope_vscale(positions, qkv):
+            q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        else:
+            q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+            # [t, h, dr]
+            q, k = self.rotary_emb(positions, q, k)
+            # [t, h, d]
+            if self.v_scale is not None:
+                v = v * self.v_scale
         attn_output = self.attn(q, k, v, forward_batch, sinks=self.attention_sink_bias)
         output, _ = self.o_proj(attn_output)
         return output

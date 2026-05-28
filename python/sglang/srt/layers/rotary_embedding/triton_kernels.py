@@ -154,6 +154,133 @@ def triton_mrope_fused(
 
 
 @triton.jit
+def _triton_mimo_v2_rope_vscale_kernel(
+    qkv_ptr,
+    cos_sin_cache_ptr,
+    positions_ptr,
+    qkv_stride0: tl.constexpr,
+    q_size: tl.constexpr,
+    k_size: tl.constexpr,
+    v_size: tl.constexpr,
+    n_qh: tl.constexpr,
+    n_kh: tl.constexpr,
+    hd: tl.constexpr,
+    v_hd: tl.constexpr,
+    rd: tl.constexpr,
+    pad_n_qh: tl.constexpr,
+    pad_n_kh: tl.constexpr,
+    pad_half_rd: tl.constexpr,
+    pad_v_hd: tl.constexpr,
+    v_scale: tl.constexpr,
+    has_v_scale: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    token_qkv = qkv_ptr + pid * qkv_stride0
+    pos = tl.load(positions_ptr + pid).to(tl.int32)
+
+    half_rd = rd // 2
+    rope_offsets = tl.arange(0, pad_half_rd)
+    rope_mask = rope_offsets < half_rd
+    cos = tl.load(cos_sin_cache_ptr + pos * rd + rope_offsets, mask=rope_mask, other=0.0)
+    sin = tl.load(
+        cos_sin_cache_ptr + pos * rd + half_rd + rope_offsets,
+        mask=rope_mask,
+        other=0.0,
+    )
+
+    qh = tl.arange(0, pad_n_qh)[:, None]
+    d = rope_offsets[None, :]
+    q_mask = (qh < n_qh) & (d < half_rd)
+    q0_offset = qh * hd + d
+    q1_offset = q0_offset + half_rd
+    q0 = tl.load(token_qkv + q0_offset, mask=q_mask, other=0.0).to(cos.dtype)
+    q1 = tl.load(token_qkv + q1_offset, mask=q_mask, other=0.0).to(cos.dtype)
+    cos_b = cos[None, :]
+    sin_b = sin[None, :]
+    tl.store(token_qkv + q0_offset, q0 * cos_b - q1 * sin_b, mask=q_mask)
+    tl.store(token_qkv + q1_offset, q1 * cos_b + q0 * sin_b, mask=q_mask)
+
+    kh = tl.arange(0, pad_n_kh)[:, None]
+    k_mask = (kh < n_kh) & (d < half_rd)
+    k_base = token_qkv + q_size
+    k0_offset = kh * hd + d
+    k1_offset = k0_offset + half_rd
+    k0 = tl.load(k_base + k0_offset, mask=k_mask, other=0.0).to(cos.dtype)
+    k1 = tl.load(k_base + k1_offset, mask=k_mask, other=0.0).to(cos.dtype)
+    tl.store(k_base + k0_offset, k0 * cos_b - k1 * sin_b, mask=k_mask)
+    tl.store(k_base + k1_offset, k1 * cos_b + k0 * sin_b, mask=k_mask)
+
+    if has_v_scale:
+        v_offsets = tl.arange(0, pad_v_hd)
+        vh = tl.arange(0, pad_n_kh)[:, None]
+        vd = v_offsets[None, :]
+        v_mask = (vh < n_kh) & (vd < v_hd)
+        v_base = token_qkv + q_size + k_size
+        v_offset = vh * v_hd + vd
+        v = tl.load(v_base + v_offset, mask=v_mask, other=0.0)
+        tl.store(v_base + v_offset, v * v_scale, mask=v_mask)
+
+
+def triton_mimo_v2_rope_vscale_inplace(
+    qkv: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    q_size: int,
+    k_size: int,
+    v_size: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    v_head_dim: int,
+    rotary_dim: int,
+    v_scale: float | None,
+) -> bool:
+    if (
+        positions.ndim != 1
+        or qkv.ndim != 2
+        or not qkv.is_contiguous()
+        or rotary_dim % 2 != 0
+        or rotary_dim > head_dim
+        or q_size != num_heads * head_dim
+        or k_size != num_kv_heads * head_dim
+        or v_size != num_kv_heads * v_head_dim
+    ):
+        return False
+
+    num_tokens = qkv.shape[0]
+    if num_tokens == 0:
+        return True
+
+    pad_n_qh = triton.next_power_of_2(num_heads)
+    pad_n_kh = triton.next_power_of_2(num_kv_heads)
+    pad_half_rd = triton.next_power_of_2(rotary_dim // 2)
+    pad_v_hd = triton.next_power_of_2(v_head_dim)
+
+    _triton_mimo_v2_rope_vscale_kernel[(num_tokens,)](
+        qkv,
+        cos_sin_cache,
+        positions,
+        qkv.stride(0),
+        q_size,
+        k_size,
+        v_size,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        v_head_dim,
+        rotary_dim,
+        pad_n_qh,
+        pad_n_kh,
+        pad_half_rd,
+        pad_v_hd,
+        1.0 if v_scale is None else float(v_scale),
+        v_scale is not None,
+        num_warps=4,
+    )
+    return True
+
+
+@triton.jit
 def _triton_ernie45_rope_qk_fused(
     q_ptr,
     k_ptr,
