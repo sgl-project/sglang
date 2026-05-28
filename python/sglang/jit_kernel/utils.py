@@ -115,6 +115,12 @@ def is_hip_runtime() -> bool:
     return bool(torch.version.hip)
 
 
+# MThreads/MUSA note:
+@cache_once
+def is_musa_runtime() -> bool:
+    return hasattr(torch.version, "musa") and torch.version.musa is not None
+
+
 def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
     def _convert(arg: CPP_TEMPLATE_TYPE) -> str:
         if isinstance(arg, bool):
@@ -277,7 +283,18 @@ def _jit_compile_context():
 # NOTE: this might also be used in __main__.py for compile flags export
 def _get_default_target_flags() -> List[str]:
     if is_hip_runtime():
-        return ["-DUSE_ROCM", "-std=c++20", "-O3"]
+        flags = ["-DUSE_ROCM", "-std=c++20", "-O3"]
+        # Detect FP8 type based on GPU architecture
+        try:
+            device = torch.cuda.current_device()
+            gcn_arch = torch.cuda.get_device_properties(device).gcnArchName
+            if "gfx942" in gcn_arch:
+                flags.append("-DHIP_FP8_TYPE_FNUZ=1")
+            else:
+                flags.append("-DHIP_FP8_TYPE_E4M3=1")
+        except Exception:
+            flags.append("-DHIP_FP8_TYPE_E4M3=1")
+        return flags
     else:
         return [
             get_jit_cuda_arch().jit_flag,
@@ -307,7 +324,7 @@ def get_jit_cuda_arch() -> ArchInfo:
 
 @cache_once
 def is_arch_support_pdl() -> bool:
-    if is_hip_runtime():
+    if is_hip_runtime() or is_musa_runtime():
         return False
     return get_jit_cuda_arch().major >= 9
 

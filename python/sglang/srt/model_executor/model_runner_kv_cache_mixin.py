@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.configs.model_config import (
-    get_nsa_index_head_dim,
-    is_deepseek_nsa,
+    get_dsa_index_head_dim,
+    is_deepseek_dsa,
     is_deepseek_v4,
 )
 from sglang.srt.distributed.parallel_state import get_world_group
@@ -20,10 +20,11 @@ from sglang.srt.mem_cache.allocator import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
-    HiSparseNSATokenToKVPool,
+    HiSparseDSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
@@ -31,7 +32,6 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
     NoOpMHATokenToKVPool,
-    NSATokenToKVPool,
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
@@ -80,28 +80,30 @@ class ModelRunnerKVCacheMixin:
         server_args = self.server_args
         assert config is not None
 
-        # reserve the memory for the intermediate mamba states used for spec dec
-        if not self.spec_algorithm.is_none():
+        has_spec_dec = not self.spec_algorithm.is_none()
+        if has_spec_dec:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
-
-            max_running_requests = server_args.max_running_requests // (
-                self.dp_size if server_args.enable_dp_attention else 1
-            )
-            mamba_state_intermediate_size = (
-                config.mamba2_cache_params.mamba_cache_per_req
-                * max_running_requests
-                * server_args.speculative_num_draft_tokens
-            )
-            total_rest_memory = total_rest_memory - (
-                mamba_state_intermediate_size / (1 << 30)
-            )
 
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
             server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
                 server_args.dp_size if server_args.enable_dp_attention else 1
             )
+            # Reserve intermediate memory based on capped max_num_reqs
+            if has_spec_dec:
+                ratio = self._calculate_mamba_ratio()
+                capped_reqs = min(
+                    server_args.max_running_requests
+                    // (self.dp_size if server_args.enable_dp_attention else 1),
+                    server_args.max_mamba_cache_size // ratio,
+                )
+                intermediate_size = (
+                    config.mamba2_cache_params.mamba_cache_per_req
+                    * capped_reqs
+                    * server_args.speculative_num_draft_tokens
+                )
+                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
             server_args.disable_radix_cache
             and server_args.max_running_requests is not None
@@ -110,23 +112,64 @@ class ModelRunnerKVCacheMixin:
             server_args.max_mamba_cache_size = server_args.max_running_requests // (
                 server_args.dp_size if server_args.enable_dp_attention else 1
             )
+            # Reserve intermediate memory based on capped max_num_reqs
+            if has_spec_dec:
+                intermediate_size = (
+                    config.mamba2_cache_params.mamba_cache_per_req
+                    * server_args.max_mamba_cache_size
+                    * server_args.speculative_num_draft_tokens
+                )
+                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
             # Use ratio-based calculation to auto-fit available memory
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
+            per_req = config.mamba2_cache_params.mamba_cache_per_req
 
-            # allocate the memory based on the ratio between mamba state memory vs. full kv cache memory
-            # solve the equations:
-            # 1. mamba_state_memory + full_kv_cache_memory == total_rest_memory
-            # 2. mamba_state_memory / full_kv_cache_memory == server_args.mamba_full_memory_ratio
-            mamba_state_memory_raw = (
+            # Solve jointly for max_mamba_cache_size accounting for intermediate memory.
+            # The mamba budget (from the ratio split) must cover both:
+            #   1. main mamba state: max_mamba_cache_size * per_req
+            #   2. intermediate states: (max_mamba_cache_size / ratio) * D * per_req
+            # So: max_mamba_cache_size * per_req * (1 + D/ratio) = mamba_budget_bytes
+            mamba_budget = (
                 total_rest_memory
                 * server_args.mamba_full_memory_ratio
                 / (1 + server_args.mamba_full_memory_ratio)
             )
-            # calculate the max_mamba_cache_size based on the given total mamba memory
-            server_args.max_mamba_cache_size = int(
-                (mamba_state_memory_raw * (1 << 30))
-                // config.mamba2_cache_params.mamba_cache_per_req
+            mamba_budget_bytes = mamba_budget * (1 << 30)
+
+            if has_spec_dec:
+                ratio = self._calculate_mamba_ratio()
+                D = server_args.speculative_num_draft_tokens
+                # Joint solve: main_state + intermediate = mamba_budget
+                server_args.max_mamba_cache_size = int(
+                    mamba_budget_bytes // (per_req * (1 + D / ratio))
+                )
+                # Intermediate memory is included in mamba_budget, subtract it
+                # so the return value only has main_state subtracted from total
+                capped_reqs = min(
+                    server_args.max_running_requests
+                    // (self.dp_size if server_args.enable_dp_attention else 1),
+                    server_args.max_mamba_cache_size // ratio,
+                )
+                intermediate_size = per_req * capped_reqs * D
+                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+            else:
+                server_args.max_mamba_cache_size = int(mamba_budget_bytes // per_req)
+
+        # Validate: max_mamba_cache_size must be positive after memory allocation.
+        # A non-positive value means GPU memory is insufficient for the requested
+        # configuration. Fail fast with actionable advice instead of silently
+        # producing garbled output at runtime.
+        if server_args.max_mamba_cache_size <= 0:
+            raise RuntimeError(
+                f"Not enough GPU memory for hybrid (mamba/linear-attention) state cache. "
+                f"Computed max_mamba_cache_size={server_args.max_mamba_cache_size} "
+                f"(total_rest_memory={total_rest_memory:.2f} GB, "
+                f"mamba_cache_per_req={config.mamba2_cache_params.mamba_cache_per_req / (1 << 20):.2f} MB). "
+                f"Try: (1) reduce --max-running-requests, "
+                f"(2) increase --mem-fraction-static, "
+                f"(3) reduce --speculative-num-draft-tokens, or "
+                f"(4) use GPUs with more memory."
             )
 
         mamba_state_memory = (
@@ -137,36 +180,36 @@ class ModelRunnerKVCacheMixin:
         return total_rest_memory - mamba_state_memory
 
     def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
-        is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
+        is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
         kv_cache_dtype = self.kv_cache_dtype
         kv_lora_rank = self.model_config.kv_lora_rank
         qk_rope_head_dim = self.model_config.qk_rope_head_dim
         kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # default mla kv cache dim
 
-        # For non-NSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
-        if not is_nsa_model:
+        # For non-DSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
+        if not is_dsa_model:
             return kv_cache_dim
 
         # TRTLLM backend does not override kv_cache_dim for MLA kv cache
-        # Assuming nsa prefill and decode backends are the same when using trtllm MLA backend,
+        # Assuming dsa prefill and decode backends are the same when using trtllm MLA backend,
         # since it is not compatible for trtllm and other mla attn backend due to the different
         # kv cache layout.
         if (
-            self.server_args.nsa_prefill_backend == "trtllm"
-            or self.server_args.nsa_decode_backend == "trtllm"
+            self.server_args.dsa_prefill_backend == "trtllm"
+            or self.server_args.dsa_decode_backend == "trtllm"
         ):
             return kv_cache_dim
 
         # On HIP with TileLang backend, keep the default MLA KV cache dimension.
         # FP8 attention uses the nope(512 fp8) + rope(64 fp8) layout, without extra per-block scales.
         if _is_hip and (
-            self.server_args.nsa_prefill_backend == "tilelang"
-            or self.server_args.nsa_decode_backend == "tilelang"
+            self.server_args.dsa_prefill_backend == "tilelang"
+            or self.server_args.dsa_decode_backend == "tilelang"
         ):
             return kv_cache_dim
 
-        quant_block_size = NSATokenToKVPool.quant_block_size
-        rope_storage_dtype = NSATokenToKVPool.rope_storage_dtype
+        quant_block_size = DSATokenToKVPool.quant_block_size
+        rope_storage_dtype = DSATokenToKVPool.rope_storage_dtype
         # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout (excluding TRTLLM and HIP+TileLang).
         # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
         # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
@@ -199,7 +242,7 @@ class ModelRunnerKVCacheMixin:
 
     def _validate_prefill_only_disable_kv_cache_pool_family(
         self: ModelRunner,
-        is_nsa_model: bool,
+        is_dsa_model: bool,
         is_dsv4_model: bool,
         current_platform,
     ):
@@ -215,8 +258,8 @@ class ModelRunnerKVCacheMixin:
             self.server_args.attention_backend == "ascend" and not self.mambaish_config
         ):
             unsupported_pool_family = "NPU/Ascend KV pool"
-        elif self.use_mla_backend and is_nsa_model:
-            unsupported_pool_family = "NSA/MLA KV pool"
+        elif self.use_mla_backend and is_dsa_model:
+            unsupported_pool_family = "DSA/MLA KV pool"
         elif self.use_mla_backend and not self.mambaish_config:
             unsupported_pool_family = "MLA KV pool"
         elif self.is_hybrid_swa:
@@ -242,9 +285,10 @@ class ModelRunnerKVCacheMixin:
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
             # FIXME(lsyin): this is the temporary fix for the context length issue when using speculative decoding
+            max_spec_draft_tokens = self.server_args.max_speculative_num_draft_tokens
             extra_max_context_len = 4
-            if self.server_args.speculative_num_draft_tokens is not None:
-                extra_max_context_len += self.server_args.speculative_num_draft_tokens
+            if max_spec_draft_tokens is not None:
+                extra_max_context_len += max_spec_draft_tokens
 
             if self.server_args.disaggregation_mode == "decode":
                 from sglang.srt.disaggregation.decode import (
@@ -274,7 +318,7 @@ class ModelRunnerKVCacheMixin:
                                 if self.start_layer <= i < self.end_layer
                             ]
                         ),
-                        speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                        speculative_num_draft_tokens=max_spec_draft_tokens,
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
                         enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
@@ -308,7 +352,7 @@ class ModelRunnerKVCacheMixin:
                         ]
                     ),
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
-                    speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                    speculative_num_draft_tokens=max_spec_draft_tokens,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
                 )
@@ -325,14 +369,14 @@ class ModelRunnerKVCacheMixin:
             assert self.is_draft_worker
 
         # Initialize token_to_kv_pool
-        is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
+        is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
         is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
 
         # Out-of-tree platform plugin system — used by elif below
         from sglang.srt.platforms import current_platform
 
         self._validate_prefill_only_disable_kv_cache_pool_family(
-            is_nsa_model, is_dsv4_model, current_platform
+            is_dsa_model, is_dsv4_model, current_platform
         )
 
         if is_dsv4_model:
@@ -372,8 +416,8 @@ class ModelRunnerKVCacheMixin:
                 enable_hisparse=self.enable_hisparse,
             )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
-            if self.use_mla_backend and is_nsa_model:
-                PoolCls = current_platform.get_nsa_kv_pool_cls()
+            if self.use_mla_backend and is_dsa_model:
+                PoolCls = current_platform.get_dsa_kv_pool_cls()
                 self.token_to_kv_pool = PoolCls(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
@@ -386,7 +430,7 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
-                    index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                    index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
                 )
             elif self.use_mla_backend:
                 PoolCls = current_platform.get_mla_kv_pool_cls()
@@ -397,7 +441,7 @@ class ModelRunnerKVCacheMixin:
                     kv_lora_rank=self.model_config.kv_lora_rank,
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                     index_head_dim=(
-                        self.model_config.index_head_dim if is_nsa_model else None
+                        self.model_config.index_head_dim if is_dsa_model else None
                     ),
                     layer_num=self.num_effective_layers,
                     device=self.device,
@@ -469,7 +513,7 @@ class ModelRunnerKVCacheMixin:
                     kv_lora_rank=self.model_config.kv_lora_rank,
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                     index_head_dim=(
-                        self.model_config.index_head_dim if is_nsa_model else None
+                        self.model_config.index_head_dim if is_dsa_model else None
                     ),
                     layer_num=self.num_effective_layers,
                     device=self.device,
@@ -496,9 +540,9 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
-        elif self.use_mla_backend and is_nsa_model:
+        elif self.use_mla_backend and is_dsa_model:
             PoolCls = (
-                HiSparseNSATokenToKVPool if self.enable_hisparse else NSATokenToKVPool
+                HiSparseDSATokenToKVPool if self.enable_hisparse else DSATokenToKVPool
             )
             pool_kwargs = {}
             if self.enable_hisparse:
@@ -519,11 +563,11 @@ class ModelRunnerKVCacheMixin:
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
-                index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
                 **pool_kwargs,
             )
         elif self.use_mla_backend and not self.mambaish_config:
-            assert not is_nsa_model
+            assert not is_dsa_model
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 self.token_to_kv_pool = MLATokenToKVPoolFP4(
                     self.max_total_num_tokens,
@@ -833,6 +877,19 @@ class ModelRunnerKVCacheMixin:
                 max_num_reqs, self.server_args.max_mamba_cache_size // ratio
             )
 
+            if max_num_reqs <= 0:
+                raise RuntimeError(
+                    f"Hybrid (mamba/linear-attention) state cache is too small to serve "
+                    f"any requests. max_mamba_cache_size={self.server_args.max_mamba_cache_size}, "
+                    f"mamba_ratio={ratio}, resulting max_num_reqs={max_num_reqs}. "
+                    f"Try: (1) reduce --max-running-requests, "
+                    f"(2) increase --mem-fraction-static, or "
+                    f"(3) use GPUs with more memory."
+                )
+        logger.info(
+            f"Max concurrent requests (per dp worker) from the finalized token capacity: "
+            f"max_num_reqs={max_num_reqs}."
+        )
         return max_num_reqs
 
     def _apply_memory_pool_config(self: ModelRunner, config: MemoryPoolConfig):

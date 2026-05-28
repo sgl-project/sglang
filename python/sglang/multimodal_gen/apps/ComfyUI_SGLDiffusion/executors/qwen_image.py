@@ -120,7 +120,7 @@ class QwenImageEditExecutor(QwenImageExecutor):
         ref_latents=None,
         additional_t_cond=None,
         transformer_options={},
-        **kwargs
+        **kwargs,
     ):
         """Forward pass for QwenImageEdit model."""
         latents, orig_shape = self._pack_latents(x)
