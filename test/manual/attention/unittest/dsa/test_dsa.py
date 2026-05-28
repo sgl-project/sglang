@@ -9,7 +9,7 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from common.attention_methods.dsa_attention import (
+from sglang.test.kits.attention_unittest.attention_methods.dsa_attention import (
     DSA_DECODE_IMPL_VARIANTS,
     DSA_PAGE_SIZE,
     DSA_PREFILL_IMPL_VARIANTS,
@@ -27,13 +27,13 @@ from common.attention_methods.dsa_attention import (
     run_dsa_sparse_tilelang_decode_case,
     run_dsa_sparse_tilelang_prefill_case,
 )
-from common.runner_modes.cuda_graph_decode_runner import (
+from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_dsa_sparse_cuda_graph_decode_case,
 )
-from common.runner_modes.speculative_draft_extend_runner import (
+from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
     run_dsa_eagle_draft_extend_cuda_graph_runner_case,
 )
-from common.runner_modes.speculative_draft_runner import (
+from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (
     run_dsa_eagle_draft_cuda_graph_runner_case,
 )
 
@@ -411,7 +411,7 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
     # raw uint8 K buffer bytes, which round-trip correctly across
     # capture/replay regardless of bf16 vs FP8 packing.
     def test_sparse_fp8_cuda_graph_decode_case(self):
-        from common.runner_modes.cuda_graph_decode_runner import (
+        from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
             run_dsa_sparse_cuda_graph_decode_case,
         )
 

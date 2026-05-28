@@ -9,12 +9,12 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from common.attention_methods.gdn_attention import (
+from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
     GDNAttentionCase,
     make_gdn_cases,
     run_gdn_attention_case,
 )
-from common.runner_modes.split_op_runner import run_gdn_split_op_extend_case
+from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import run_gdn_split_op_extend_case
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")

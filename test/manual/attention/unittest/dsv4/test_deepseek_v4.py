@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 _FLASH_MLA_AVAILABLE = importlib.util.find_spec("flash_mla") is not None
 
-from common.attention_methods.dsv4_attention import (  # noqa: E402
+from sglang.test.kits.attention_unittest.attention_methods.dsv4_attention import (  # noqa: E402
     DSV4_PAGE_SIZE,
     DSV4AttentionCase,
     make_dsv4_cases,
@@ -35,20 +35,20 @@ from common.attention_methods.dsv4_attention import (  # noqa: E402
     run_dsv4_draft_extend_attention_case,
     run_dsv4_target_verify_attention_case,
 )
-from common.runner_modes.cuda_graph_decode_runner import (  # noqa: E402
+from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (  # noqa: E402
     run_dsv4_cuda_graph_decode_case,
 )
-from common.runner_modes.speculative_draft_runner import (
+from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (
     # noqa: E402
     run_dsv4_eagle_draft_cuda_graph_runner_case,
 )
-from common.runner_modes.speculative_draft_extend_runner import (
+from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
     run_dsv4_eagle_draft_extend_cuda_graph_runner_case,
 )
-from common.runner_modes.speculative_draft_extend_runner import (  # noqa: E402
+from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (  # noqa: E402
     run_dsv4_eagle_draft_extend_cuda_graph_case,
 )
-from common.runner_modes.speculative_target_verify_runner import (  # noqa: E402
+from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (  # noqa: E402
     run_dsv4_eagle_verify_cuda_graph_case,
 )
 

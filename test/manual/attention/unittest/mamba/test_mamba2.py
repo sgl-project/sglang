@@ -14,7 +14,7 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from common.attention_methods.mamba2_attention import (
+from sglang.test.kits.attention_unittest.attention_methods.mamba2_attention import (
     DEFAULT_CONV_KERNEL,
     DEFAULT_HEAD_DIM,
     DEFAULT_HIDDEN_SIZE,
@@ -27,13 +27,13 @@ from common.attention_methods.mamba2_attention import (
     make_mamba2_cases,
     run_mamba2_attention_case,
 )
-from common.runner_modes.cuda_graph_decode_runner import (
+from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_mamba2_cuda_graph_decode_case,
 )
-from common.runner_modes.speculative_draft_extend_runner import (
+from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
     run_mamba2_eagle_draft_extend_case,
 )
-from common.runner_modes.speculative_target_verify_runner import (
+from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
     run_mamba2_eagle_verify_case,
     run_mamba2_eagle_verify_cuda_graph_case,
 )

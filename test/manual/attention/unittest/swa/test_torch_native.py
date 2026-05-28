@@ -9,7 +9,7 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from common.attention_methods.dense_attention import (
+from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
     DenseAttentionCase,
     make_swa_no_prefix_input_config_cases,
     make_swa_prefix_input_config_cases,

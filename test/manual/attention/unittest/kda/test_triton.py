@@ -9,22 +9,22 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from common.attention_methods.kda_attention import (
+from sglang.test.kits.attention_unittest.attention_methods.kda_attention import (
     KDAAttentionCase,
     make_kda_cases,
     run_kda_attention_case,
 )
-from common.runner_modes.cuda_graph_decode_runner import (
+from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_kda_cuda_graph_decode_case,
 )
-from common.runner_modes.speculative_draft_extend_runner import (
+from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
     run_kda_eagle_draft_extend_case,
 )
-from common.runner_modes.speculative_target_verify_runner import (
+from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
     run_kda_eagle_verify_case,
     run_kda_eagle_verify_cuda_graph_case,
 )
-from common.runner_modes.split_op_runner import (
+from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
     run_kda_split_op_extend_case,
 )
 

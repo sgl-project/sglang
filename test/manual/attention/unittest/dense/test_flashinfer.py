@@ -10,28 +10,28 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from common.attention_methods.dense_attention import (
+from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
     DenseAttentionCase,
     make_dense_cases,
     run_dense_attention_case,
 )
-from common.runner_modes.cuda_graph_decode_runner import (
+from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_dense_cuda_graph_decode_case,
 )
-from common.runner_modes.speculative_draft_runner import (
+from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (
     run_dense_eagle_draft_cuda_graph_runner_case,
     run_dense_frozen_kv_mtp_cuda_graph_runner_case,
 )
-from common.runner_modes.speculative_draft_extend_runner import (
+from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
     run_dense_draft_extend_cuda_graph_case,
     run_dense_eagle_draft_extend_case,
     run_dense_eagle_draft_extend_cuda_graph_runner_case,
 )
-from common.runner_modes.speculative_target_verify_runner import (
+from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
     run_dense_spec_verify_case,
     run_dense_spec_verify_cuda_graph_case,
 )
-from common.runner_modes.split_op_runner import run_dense_split_op_extend_case
+from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import run_dense_split_op_extend_case
 
 
 @unittest.skipIf(

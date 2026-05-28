@@ -9,7 +9,7 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from common.attention_methods.dual_chunk_attention import (
+from sglang.test.kits.attention_unittest.attention_methods.dual_chunk_attention import (
     DualChunkAttentionCase,
     make_dual_chunk_cases,
     make_dual_chunk_sparse_cases,
@@ -19,7 +19,7 @@ from common.attention_methods.dual_chunk_attention import (
     run_dual_chunk_sparse_sub_window_case,
     run_dual_chunk_sparse_threshold_gated_case,
 )
-from common.runner_modes.cuda_graph_decode_runner import (
+from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_dual_chunk_cuda_graph_decode_case,
 )
 

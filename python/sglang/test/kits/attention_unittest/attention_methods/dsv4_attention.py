@@ -1406,7 +1406,7 @@ def run_dsv4_target_verify_attention_case(
         case.forward_mode.is_target_verify()
     ), f"run_dsv4_target_verify_attention_case requires TARGET_VERIFY case; got {case.forward_mode}"
     # Lazy import to avoid cycles (runner_modes imports attention_methods).
-    from common.runner_modes.speculative_target_verify_runner import (
+    from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
         _make_eagle_verify_input,
         _prepare_target_verify_batch,
     )
@@ -1476,7 +1476,7 @@ def run_dsv4_draft_extend_attention_case(
     assert case.forward_mode.is_draft_extend(
         include_v2=True
     ), f"run_dsv4_draft_extend_attention_case requires DRAFT_EXTEND; got {case.forward_mode}"
-    from common.runner_modes.speculative_draft_extend_runner import (
+    from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
         _make_eagle_draft_extend_input,
     )
 

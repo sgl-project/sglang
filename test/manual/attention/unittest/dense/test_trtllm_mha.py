@@ -11,11 +11,11 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from common.attention_methods.dense_attention import (
+from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
     DenseAttentionCase,
     run_dense_attention_case,
 )
-from common.runner_modes.cuda_graph_decode_runner import (
+from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_dense_cuda_graph_decode_case,
 )
 
