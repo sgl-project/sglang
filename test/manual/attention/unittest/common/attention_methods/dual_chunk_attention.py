@@ -14,6 +14,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import set_global_server_args_for_scheduler
+from ..mock_server_args import make_mock_server_args
 
 from .dense_attention import (
     DEFAULT_DEVICE,
@@ -306,7 +307,7 @@ class DualChunkMockModelRunner(ModelRunner):
         self.tp_size = 1
         self.dp_size = 1
         self.pp_size = 1
-        self.server_args = SimpleNamespace(
+        self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
             disable_cuda_graph=disable_cuda_graph,

@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
+from ..mock_server_args import make_mock_server_args
 
 _dp_attention.get_attention_tp_size = lambda: 1
 
@@ -211,7 +212,7 @@ class MockGDNModelRunner(ModelRunner):
             or case.forward_mode.is_draft_extend(include_v2=True)
             else 0
         )
-        self.server_args = SimpleNamespace(
+        self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
             disable_cuda_graph=disable_cuda_graph,

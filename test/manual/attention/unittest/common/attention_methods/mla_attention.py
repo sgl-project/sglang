@@ -19,6 +19,7 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import set_global_server_args_for_scheduler
+from ..mock_server_args import make_mock_server_args
 
 _dp_attention.get_attention_tp_size = lambda: 1
 
@@ -231,7 +232,7 @@ class MockMLAModelRunner(ModelRunner):
             or case.forward_mode.is_draft_extend(include_v2=True)
             else 0
         )
-        self.server_args = SimpleNamespace(
+        self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
             disable_cuda_graph=disable_cuda_graph,

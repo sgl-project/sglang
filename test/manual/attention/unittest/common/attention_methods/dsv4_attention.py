@@ -25,11 +25,13 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.server_args import set_global_server_args_for_scheduler
+from ..mock_server_args import make_mock_server_args
 
 # DSV4 backend pre-resolves attention TP at construction; pin to single-rank.
 _dp_attention.get_attention_tp_size = lambda: 1
@@ -323,7 +325,7 @@ class MockDSV4ModelRunner:
         self.tp_size = 1
         self.dp_size = 1
         self.pp_size = 1
-        self.server_args = SimpleNamespace(
+        self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
             disable_cuda_graph=disable_cuda_graph,
