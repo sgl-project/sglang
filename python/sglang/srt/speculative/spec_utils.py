@@ -464,7 +464,9 @@ def get_src_tgt_cache_loc(
     page_size: int,
 ):
     src_cache_loc = out_cache_loc[accept_index]
-    tgt_cache_loc = torch.empty_like(src_cache_loc)
+    # zeros_like, not empty_like: any uncovered tail stays at slot 0 (padding)
+    # instead of caching-allocator garbage.
+    tgt_cache_loc = torch.zeros_like(src_cache_loc)
     extended_len = seq_lens + draft_token_num
     keep_len = torch.minimum(
         (seq_lens + num_correct_drafts + 1 + page_size - 1) // page_size * page_size,
@@ -801,25 +803,6 @@ def draft_tp_context(tp_group: GroupCoordinator):
     # We disable mscclpp now because it doesn't support 2 comm groups.
     with patch_tensor_parallel_group(tp_group):
         yield
-
-
-def maybe_detect_nan(tensor: torch.Tensor, msg: str = ""):
-    """Async NaN check — no GPU-CPU sync, error surfaces at next sync point."""
-    if not envs.SGLANG_SPEC_NAN_DETECTION.get():
-        return
-    torch._assert_async(~torch.any(torch.isnan(tensor)), f"NaN detected! {msg}")
-
-
-def maybe_detect_oob(indices: torch.Tensor, low: int, high: int, msg: str):
-    """Async OOB check — no GPU-CPU sync, error surfaces at next sync point."""
-    if not envs.SGLANG_SPEC_OOB_DETECTION.get():
-        return
-    if indices.numel() == 0:
-        return
-    torch._assert_async(
-        (indices.min() >= low) & (indices.max() < high),
-        f"OOB indices not in [{low}, {high}): {msg}",
-    )
 
 
 # Disable torch.compile for this function because it will be

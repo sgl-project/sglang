@@ -763,9 +763,7 @@ class TboForwardBatchPreparer:
                 global_num_tokens_for_logprob_cpu=None,
                 sampling_info=None,
                 # For logits and logprobs post processing, thus we do not care
-                temp_scaled_logprobs=False,
                 temperature=None,
-                top_p_normalized_logprobs=False,
                 top_p=None,
                 mm_inputs=None,
                 top_logprobs_nums=None,
