@@ -180,6 +180,44 @@ def _build_pile_val_token_blocks(
     return blocks
 
 
+def _log_param_dtype_device_report(model) -> None:
+    """Log a parameter dtype + device-placement histogram for the loaded model.
+
+    Surfaces (a) whether the FP8 block-quantized checkpoint stayed FP8 or was
+    silently upcast to bf16/fp16, and (b) how Accelerate dispatched modules
+    across the visible GPUs. This is the evidence the one-block dry-run checks
+    before a full multi-block calibration is started.
+    """
+    from collections import Counter
+
+    dtype_counts: "Counter[str]" = Counter()
+    device_counts: "Counter[str]" = Counter()
+    total = 0
+    for _name, p in model.named_parameters():
+        dtype_counts[str(p.dtype)] += 1
+        device_counts[str(p.device)] += 1
+        total += 1
+
+    has_float8 = any("float8" in d for d in dtype_counts)
+    logger.info(
+        "Loaded model parameter report: %d tensors; dtype histogram=%s; "
+        "device histogram=%s; float8_present=%s.",
+        total,
+        dict(dtype_counts),
+        dict(device_counts),
+        has_float8,
+    )
+    hf_device_map = getattr(model, "hf_device_map", None)
+    if hf_device_map is not None:
+        placed_devices = sorted({str(v) for v in hf_device_map.values()})
+        logger.info(
+            "hf_device_map spans %d device(s): %s (%d module entries).",
+            len(placed_devices),
+            placed_devices,
+            len(hf_device_map),
+        )
+
+
 def _collect_channel_importance(
     *,
     model_path: str,
@@ -193,6 +231,7 @@ def _collect_channel_importance(
     block_size: Optional[int] = None,
     use_pile_val: bool = False,
     pile_val_seed: int = 42,
+    dry_run_blocks: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the calibration forward pass and return ``(importance, weights)``.
 
@@ -263,16 +302,25 @@ def _collect_channel_importance(
             tp,
         )
 
-    torch_dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float16
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    # Load the checkpoint in its native dtype (no bf16/fp16 upcast) and let
+    # HF/Accelerate shard the modules across all visible GPUs. DeepSeek-V3.2 is
+    # FP8 block-quantized on disk (~671GB); forcing a bf16 load would roughly
+    # double the footprint and pin the whole model to one device, neither of
+    # which fits one H200. ``device_map="auto"`` dispatches modules across the
+    # node's GPUs; ``torch_dtype="auto"`` preserves the on-disk dtype so FP8
+    # weights stay FP8. ``--dtype`` remains the recorded forward-stability hint
+    # and feeds nothing into the load anymore.
+    use_cuda = torch.cuda.is_available()
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=torch_dtype,
-        device_map={"": "cuda" if torch.cuda.is_available() else "cpu"},
+        torch_dtype="auto",
+        device_map="auto" if use_cuda else {"": "cpu"},
         trust_remote_code=True,
     )
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     model.eval()
+    _log_param_dtype_device_report(model)
 
     num_layers = int(getattr(config, "num_hidden_layers", num_layers_hint or 0))
     num_heads = int(getattr(config, "num_attention_heads", num_heads_hint or 0))
@@ -472,14 +520,50 @@ def _collect_channel_importance(
             tok_kwargs["truncation"] = True
         token_blocks = None
 
+    # With device_map="auto" the model is dispatched across GPUs and has no
+    # single ``model.device``; inputs must land on the device hosting the input
+    # embedding (the first module Accelerate executes). Resolve defensively so a
+    # dispatched real model, a plain single-device model, and unit fakes all work.
+    def _resolve_input_device() -> torch.device:
+        get_emb = getattr(model, "get_input_embeddings", None)
+        if callable(get_emb):
+            try:
+                emb = get_emb()
+                weight = getattr(emb, "weight", None)
+                if weight is not None:
+                    return weight.device
+            except Exception:
+                pass
+        dev = getattr(model, "device", None)
+        if isinstance(dev, torch.device):
+            return dev
+        try:
+            return next(model.parameters()).device
+        except Exception:
+            return torch.device("cpu")
+
+    input_device = _resolve_input_device()
+
+    if dry_run_blocks > 0:
+        logger.info(
+            "DRY RUN: limiting calibration to the first %d block(s); the mask "
+            "will NOT be written. Inputs route to %s.",
+            dry_run_blocks,
+            input_device,
+        )
+        if token_blocks is not None:
+            token_blocks = token_blocks[:dry_run_blocks]
+        else:
+            prompts = prompts[:dry_run_blocks]
+
     try:
         if token_blocks is not None:
             for block in token_blocks:
                 with torch.no_grad():
-                    model(input_ids=block.to(model.device))
+                    model(input_ids=block.to(input_device))
         else:
             for prompt in prompts:
-                inputs = tokenizer(prompt, **tok_kwargs).to(model.device)
+                inputs = tokenizer(prompt, **tok_kwargs).to(input_device)
                 with torch.no_grad():
                     model(**inputs)
     finally:
@@ -545,6 +629,7 @@ def calibrate(args: argparse.Namespace) -> str:
         dataset_source = "mit-han-lab/pile-val-backup"
         use_pile_val = True
 
+    dry_run_blocks = int(getattr(args, "dry_run_blocks", 0) or 0)
     importance, weights = _collect_channel_importance(
         model_path=args.model,
         dtype=args.dtype,
@@ -557,7 +642,22 @@ def calibrate(args: argparse.Namespace) -> str:
         block_size=block_size,
         use_pile_val=use_pile_val,
         pile_val_seed=seed,
+        dry_run_blocks=dry_run_blocks,
     )
+
+    if dry_run_blocks > 0:
+        L, H, head_dim = importance.shape
+        logger.info(
+            "DRY RUN complete: calibration hooks fired on all %d layers "
+            "(H=%d, head_dim=%d) over %d block(s); parameter dtypes/devices "
+            "logged above. Mask NOT written — rerun without --dry-run-blocks "
+            "for the full calibration.",
+            L,
+            H,
+            head_dim,
+            dry_run_blocks,
+        )
+        return ""
 
     L, H, head_dim = importance.shape
     if args.label_dim > head_dim:
@@ -687,6 +787,17 @@ def _make_parser() -> argparse.ArgumentParser:
             "serving. Without this flag a HuggingFace repo ID (e.g. "
             "deepseek-ai/DeepSeek-V3.2) is loaded via "
             "AutoModelForCausalLM.from_pretrained."
+        ),
+    )
+    p.add_argument(
+        "--dry-run-blocks",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, load the model, log parameter dtypes + device placement, "
+            "run only this many calibration blocks to confirm the Q/K hooks "
+            "fire on every layer, then exit WITHOUT writing a mask. Use to "
+            "validate the native-FP8 sharded load before the full run."
         ),
     )
     p.add_argument(
