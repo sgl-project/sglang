@@ -28,8 +28,9 @@
 //     moe         — backend.options[] + ep.values[]
 //     parsers     — items[] (each emits one toggle flag)
 //     speculative — options[] (single-select chip group)
-//     pdDisagg    — modes[] + ibDevices[] (engine handles role banner +
-//                   single-host bootstrap port internally)
+//     pdDisagg    — modes[] + transferBackends[] (each may carry env +
+//                   envWhen hw-gate) + ibDevices[] (engine handles role
+//                   banner + single-host bootstrap port internally)
 //     hicache     — backends[] + writePolicies[]
 //     megamoe     — requiresHw + excludesStrategy + stripEnv + options[]
 //                   (axis-level gating + env mutation)
@@ -759,10 +760,11 @@ export const Playground = ({ config }) => {
         const flags = (cell && cell.flags) || [];
         const baseSpec = flags.filter((f) => {
           const head = f.split(/[\s=]/)[0];
-          return head === "--speculative-algo"
+          return head === "--speculative-algorithm"
               || head === "--speculative-num-steps"
               || head === "--speculative-eagle-topk"
-              || head === "--speculative-num-draft-tokens";
+              || head === "--speculative-num-draft-tokens"
+              || head === "--speculative-ngram-max-bfs-breadth";
         });
         if (baseSpec.length === 0) return "off";
         for (const opt of (fc.options || [])) {
@@ -789,8 +791,9 @@ export const Playground = ({ config }) => {
         // would show base's lines as removed and identical lines as added.
         if (derived && value === derived) return { flags, env };
         flags = h.stripFlagsByFirstToken(flags, [
-          "--speculative-algo", "--speculative-num-steps",
+          "--speculative-algorithm", "--speculative-num-steps",
           "--speculative-eagle-topk", "--speculative-num-draft-tokens",
+          "--speculative-ngram-max-bfs-breadth",
         ]);
         const preset = (fc.options || []).find((p) => p.id === value);
         if (preset?.flags?.length) flags = h.insertBeforeTail(flags, preset.flags);
@@ -823,13 +826,16 @@ export const Playground = ({ config }) => {
     },
 
     // ---- Axis: PD Disaggregation --------------------------------------------
-    // Role select (off / prefill / decode) + optional IB device pick. Engine
-    // OWNS the `--disaggregation-*` flags (unconditional strip). When a role
-    // is picked, emits the role flag + transfer-backend + optional IB device
-    // + (single-host only) bootstrap port. `getRenderHints` reports the
-    // chosen role back to the renderer so it can prepend the role banner.
+    // Role select (off / prefill / decode) + transfer-backend select + optional
+    // IB device pick. Engine OWNS the `--disaggregation-*` flags (unconditional
+    // strip). When a role is picked, emits the role flag + the selected
+    // transfer backend + optional IB device + (single-host only) bootstrap
+    // port. A transfer backend may also carry per-backend env vars gated by
+    // the base cell's hw (config `transferBackends[].env` + `.envWhen`) — e.g.
+    // mooncake's MNNVL vars on GB200/GB300. `getRenderHints` reports the chosen
+    // role back to the renderer so it can prepend the role banner.
     pdDisagg: {
-      initState: () => ({ mode: "off", ibDevice: "auto" }),
+      initState: () => ({ mode: "off", transferBackend: "mooncake", ibDevice: "auto" }),
 
       revertHidden: (value, fc, base, h) => {
         let changed = false;
@@ -845,15 +851,27 @@ export const Playground = ({ config }) => {
         return changed ? next : value;
       },
 
-      apply: ({ flags, env, value, sel, h }) => {
+      apply: ({ flags, env, value, sel, fc, h }) => {
         flags = h.stripFlagsByFirstToken(flags, [
           "--disaggregation-mode", "--disaggregation-transfer-backend",
           "--disaggregation-ib-device", "--disaggregation-bootstrap-port",
         ]);
+        // This axis also owns whatever per-backend env its transfer backends
+        // declare (e.g. mooncake's MNNVL vars). Strip them all up front so
+        // apply stays idempotent; re-add below only when a role is active AND
+        // the chosen backend's hw gate matches the base cell.
+        const backends = fc.transferBackends || [];
+        const ownedEnvKeys = [];
+        for (const b of backends) {
+          for (const e of (b.env || [])) ownedEnvKeys.push(e.split("=")[0]);
+        }
+        if (ownedEnvKeys.length) env = h.stripEnvByPrefix(env, ownedEnvKeys);
+
         if (value.mode === "prefill" || value.mode === "decode") {
+          const backend = value.transferBackend || "mooncake";
           const adds = [
             `--disaggregation-mode ${value.mode}`,
-            "--disaggregation-transfer-backend mooncake",
+            `--disaggregation-transfer-backend ${backend}`,
           ];
           if (value.ibDevice && value.ibDevice !== "auto") {
             adds.push(`--disaggregation-ib-device ${value.ibDevice}`);
@@ -866,6 +884,16 @@ export const Playground = ({ config }) => {
             adds.push(`--dist-init-addr 127.0.0.1:${bootstrapPort}`);
           }
           flags = h.insertBeforeTail(flags, adds);
+
+          // Per-backend env, gated by the base cell's hw via config `envWhen`
+          // (constraint object — every key must match; no gate = always on).
+          const meta = backends.find((b) => b.id === backend);
+          if (meta && meta.env && meta.env.length) {
+            const gate = meta.envWhen;
+            const ok = !gate || Object.keys(gate).every(
+              (k) => (gate[k] || []).includes(sel[k]));
+            if (ok) env = [...env, ...meta.env];
+          }
         }
         return { flags, env };
       },
@@ -879,9 +907,10 @@ export const Playground = ({ config }) => {
 
       render: ({ axisId, value, setValue, fc, base, s, renderSelect }) => {
         const setSlot = (k, v) => setValue({ ...value, [k]: v });
-        const showModes = (fc.modes     || []).length > 0;
-        const showIb    = (fc.ibDevices || []).length > 0;
-        if (!showModes && !showIb) return null;
+        const showModes    = (fc.modes            || []).length > 0;
+        const showBackends = (fc.transferBackends || []).length > 0;
+        const showIb       = (fc.ibDevices        || []).length > 0;
+        if (!showModes && !showBackends && !showIb) return null;
         return (
           <div key={axisId} style={s.card}>
             <div style={s.compactRow}>
@@ -891,6 +920,13 @@ export const Playground = ({ config }) => {
                   <span style={s.fieldLabel}>Mode</span>
                   {renderSelect(value.mode, fc.modes,
                     (v) => setSlot("mode", v), base)}
+                </span>
+              )}
+              {showBackends && (
+                <span style={s.field}>
+                  <span style={s.fieldLabel}>Transfer Backend</span>
+                  {renderSelect(value.transferBackend, fc.transferBackends,
+                    (v) => setSlot("transferBackend", v), base)}
                 </span>
               )}
               {showIb && (
@@ -1707,6 +1743,31 @@ export const Playground = ({ config }) => {
     }
   }
 
+  // Cross-axis constraint facts. Some chip constraints must react to the
+  // LIVE state of a DIFFERENT axis, not just the base cell's 5 match dims —
+  // e.g. NGRAM speculative is incompatible with DP-Attention no matter which
+  // strategy the base cell uses, and the user can flip DP-Attention live in
+  // the Attention card. We derive those facts here and fold them into the
+  // `base` object handed to chip-constraint matching (`matchConstraint`
+  // reads them exactly like a real dim). They are NOT cell dimensions —
+  // only `hide`/`disable` constraint objects reference them, and only the
+  // RENDER path sees them (revertHidden keeps the clean 5-dim base, which
+  // is fine because cross-axis constraints use `disable`, never auto-
+  // reverted `hide`).
+  //
+  //   dpAttnOn — true when the effective DP-Attention resolves to "on":
+  //              the explicit Attention-card override if set, else the
+  //              value derived from the base cell. A positive DP degree
+  //              (or boolean true) is "on"; false / 0 / null is "off".
+  const attnDelta   = deltas.attention || {};
+  const attnDerived = derivedMap.attention || {};
+  const effDpAttn = (attnDelta.dpAttn !== null && attnDelta.dpAttn !== undefined)
+    ? attnDelta.dpAttn
+    : (attnDerived.dpAttn !== undefined ? attnDerived.dpAttn : null);
+  const dpAttnOn = (effDpAttn === true)
+    || (typeof effDpAttn === "number" && effDpAttn > 0);
+  const constraintBase = { ...base, dpAttnOn };
+
   let baseCommand = "";
   let playgroundCommand = "";
   let diffLines = [];
@@ -1903,7 +1964,11 @@ export const Playground = ({ config }) => {
         const setValue = (next) => setDeltas((d) => ({ ...d, [axisId]: next }));
         return handler.render({
           axisId, value: deltas[axisId], setValue,
-          fc, base, s, h: helpers, renderChip, renderSelect,
+          // constraintBase = the 5 cell dims + cross-axis derived facts
+          // (e.g. dpAttnOn) so chip `disable`/`hide` can react to other
+          // axes' live state. Real dims are preserved, so base.hw etc.
+          // direct reads inside render still work.
+          fc, base: constraintBase, s, h: helpers, renderChip, renderSelect,
           derived: derivedMap[axisId] || null,
         });
       })}
