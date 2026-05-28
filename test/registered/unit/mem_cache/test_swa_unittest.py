@@ -238,9 +238,7 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(
             [e for e in swa_update_events if isinstance(e, BlockRemoved)], []
         )
-        swa_update_stores = [
-            e for e in swa_update_events if isinstance(e, BlockStored)
-        ]
+        swa_update_stores = [e for e in swa_update_events if isinstance(e, BlockStored)]
         self.assertEqual({e.swa_valid_from for e in swa_update_stores}, {4})
 
         _insert(tree, allocator, [1, 2, 3, 4, 5, 6])

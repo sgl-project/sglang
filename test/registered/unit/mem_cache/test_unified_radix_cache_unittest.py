@@ -385,9 +385,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
             )
         )
         partial_restore_updates = self._stored_events(tree, StorageMedium.GPU)
-        self.assertEqual(
-            {e.swa_valid_from for e in partial_restore_updates}, {2, None}
-        )
+        self.assertEqual({e.swa_valid_from for e in partial_restore_updates}, {2, None})
 
         self._insert(tree, allocator, [1, 2, 3, 4, 5, 6])
         restore_updates = self._stored_events(tree, StorageMedium.GPU)
