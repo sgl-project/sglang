@@ -1148,16 +1148,20 @@ class AscendAttnBackend(AttentionBackend):
                     -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                 )
                 extend_seq_lens = self.forward_metadata.extend_seq_lens_cpu_int.npu()
-                cu_seqlens_q = torch.cat([
-                    torch.zeros(1, dtype=torch.int32).npu(),
-                    extend_seq_lens.cumsum(0)
-                ])
+                cu_seqlens_q = torch.cat(
+                    [
+                        torch.zeros(1, dtype=torch.int32).npu(),
+                        extend_seq_lens.cumsum(0).to(torch.int32),
+                    ]
+                )
                 max_seqlen_q = extend_seq_lens.max().item()
                 attn_output = flash_attn_with_kvcache(
                     q,
                     k,
                     v,
-                    cache_seqlens=torch.tensor(actual_seq_len_kv).npu(),
+                    cache_seqlens=torch.tensor(
+                        actual_seq_len_kv, dtype=torch.int32
+                    ).npu(),
                     page_table=self.forward_metadata.block_tables,
                     cu_seqlens_q=cu_seqlens_q,
                     max_seqlen_q=max_seqlen_q,
@@ -1168,7 +1172,7 @@ class AscendAttnBackend(AttentionBackend):
                     rotary_interleaved=False,
                     num_splits=0,
                     sm_margin=0,
-                    return_softmax_lse=False
+                    return_softmax_lse=False,
                 )
                 attn_output = attn_output.view(
                     -1, layer.tp_q_head_num * layer.v_head_dim
@@ -2095,10 +2099,7 @@ class AscendAttnBackend(AttentionBackend):
                     )
 
                 q = q.view(
-                    forward_batch.batch_size,
-                    -1,
-                    layer.tp_q_head_num,
-                    layer.qk_head_dim
+                    forward_batch.batch_size, -1, layer.tp_q_head_num, layer.qk_head_dim
                 )
                 k = k_cache.view(
                     -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
@@ -2106,12 +2107,14 @@ class AscendAttnBackend(AttentionBackend):
                 v = v_cache.view(
                     -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                 )
-                attn_output, softmax_lse, *rest = flash_attn_with_kvcache(
+                attn_output = flash_attn_with_kvcache(
                     q,
                     k,
                     v,
                     page_table=self.forward_metadata.block_tables,
-                    cache_seqlens=torch.tensor(actual_seq_len_kv).npu(),
+                    cache_seqlens=torch.tensor(
+                        actual_seq_len_kv, dtype=torch.int32
+                    ).npu(),
                     softmax_scale=layer.scaling,
                 )
             # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
