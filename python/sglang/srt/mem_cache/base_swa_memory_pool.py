@@ -14,6 +14,10 @@ class BaseSWAKVPool(KVCache):
     handle SWA state separately from the full KV state.
     """
 
+    # Whether PD prefill should cap prompt length by the SWA pool size.
+    # Generic SWA pools allocate full-prompt SWA KV; specialized pools may not.
+    pd_prefill_swa_pool_holds_full_prompt: bool = True
+
     swa_kv_pool: KVCache
 
     def invalidate_loc_cache(self) -> None:
