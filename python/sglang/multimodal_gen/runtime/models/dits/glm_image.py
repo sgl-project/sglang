@@ -65,8 +65,8 @@ class GlmImageLayerKVCache:
             self.k_cache = k
             self.v_cache = v
         else:
-            self.k_cache = torch.cat([self.k_cache, k], dim=2)
-            self.v_cache = torch.cat([self.v_cache, v], dim=2)
+            self.k_cache = torch.cat([self.k_cache, k], dim=1)
+            self.v_cache = torch.cat([self.v_cache, v], dim=1)
 
     def get(self):
         return self.k_cache, self.v_cache
