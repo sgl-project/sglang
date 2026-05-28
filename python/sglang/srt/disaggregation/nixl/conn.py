@@ -137,9 +137,7 @@ class KVArgsRegisterInfo:
             unpack_int_lists(msg[13], "I") if len(msg) > 13 and len(msg[13]) > 0 else []
         )
         dst_num_slots = (
-            int(msg[16].decode("ascii"))
-            if len(msg) > 16 and msg[16] != b""
-            else None
+            int(msg[16].decode("ascii")) if len(msg) > 16 and msg[16] != b"" else None
         )
 
         return cls(
@@ -297,9 +295,9 @@ class NixlKVManager(CommonKVManager):
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.kv_buffer_tensors = None
         self.prep_handles: Dict[str, Any] = {}
-        self.prep_handle_slice_src: Optional[
-            Tuple[Any, int, int, int]
-        ] = None  # (handle, num_groups, num_ptr_pairs, num_slots)
+        self.prep_handle_slice_src: Optional[Tuple[Any, int, int, int]] = (
+            None  # (handle, num_groups, num_ptr_pairs, num_slots)
+        )
         self.prep_handles_slice_dst: Dict[str, Tuple[Any, int]] = (
             {}
         )  # peer_name -> (handle, num_slots)
@@ -515,7 +513,11 @@ class NixlKVManager(CommonKVManager):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
 
     def _init_prep_handle(
-        self, peer_name: str, kv_ptrs: list[int], gpu_id: int, num_slots: Optional[int] = None
+        self,
+        peer_name: str,
+        kv_ptrs: list[int],
+        gpu_id: int,
+        num_slots: Optional[int] = None,
     ):
         """Pre-build NIXL dlist: all KV slots × all layers.
 
@@ -542,9 +544,9 @@ class NixlKVManager(CommonKVManager):
         self.prep_handles[peer_name] = self.agent.prep_xfer_dlist(
             peer_name, np.vstack(arrays), "VRAM"
         )
-        assert self.prep_handles[peer_name] is not None, (
-            f"prep_xfer_dlist returned None for peer '{peer_name}'"
-        )
+        assert (
+            self.prep_handles[peer_name] is not None
+        ), f"prep_xfer_dlist returned None for peer '{peer_name}'"
 
     def _init_prep_handle_slice(
         self, peer_name: str, decode_kv_args: KVArgsRegisterInfo
@@ -590,7 +592,9 @@ class NixlKVManager(CommonKVManager):
             dst_tp_rank_in_group = decode_tp_rank % decode_tp_size
             num_groups = decode_tp_size // prefill_tp_size
             num_heads_to_send = dst_heads_per_rank
-            src_head_start = (dst_tp_rank_in_group * dst_heads_per_rank) % src_heads_per_rank
+            src_head_start = (
+                dst_tp_rank_in_group * dst_heads_per_rank
+            ) % src_heads_per_rank
             head_group_idx = src_head_start // dst_heads_per_rank
             dst_head_offset = 0
 
@@ -629,13 +633,22 @@ class NixlKVManager(CommonKVManager):
                 ]
             )
             src_handle = self.agent.prep_xfer_dlist("", src_array, "VRAM")
-            assert src_handle is not None, (
-                f"prep_xfer_dlist returned None for slice src (decode_tp_size={decode_tp_size})"
+            assert (
+                src_handle is not None
+            ), f"prep_xfer_dlist returned None for slice src (decode_tp_size={decode_tp_size})"
+            self.prep_handle_slice_src = (
+                src_handle,
+                num_groups,
+                num_ptr_pairs,
+                num_slots,
             )
-            self.prep_handle_slice_src = (src_handle, num_groups, num_ptr_pairs, num_slots)
 
         # Dst dlist per-peer; use decode's slot count (may exceed prefill's).
-        num_slots_dst = decode_kv_args.dst_num_slots if decode_kv_args.dst_num_slots is not None else num_slots
+        num_slots_dst = (
+            decode_kv_args.dst_num_slots
+            if decode_kv_args.dst_num_slots is not None
+            else num_slots
+        )
         dst_slots = np.arange(num_slots_dst, dtype=np.int64)
         # (ptr, slot, token) → ravel.
         dst_ptrs_arr = np.array(dst_ptrs, dtype=np.int64)
@@ -653,9 +666,9 @@ class NixlKVManager(CommonKVManager):
             ]
         )
         dst_handle = self.agent.prep_xfer_dlist(peer_name, dst_array, "VRAM")
-        assert dst_handle is not None, (
-            f"prep_xfer_dlist returned None for slice dst for peer '{peer_name}'"
-        )
+        assert (
+            dst_handle is not None
+        ), f"prep_xfer_dlist returned None for slice dst for peer '{peer_name}'"
         self.prep_handles_slice_dst[peer_name] = (dst_handle, num_slots_dst)
         self.peer_head_group[peer_name] = head_group_idx
 
@@ -952,11 +965,19 @@ class NixlKVManager(CommonKVManager):
             src_prep = self.prep_handles[""]
             dst_prep = self.prep_handles[peer_name]
             info = self.decode_kv_args_table[peer_name]
-            num_slots_dst = info.dst_num_slots if info.dst_num_slots is not None else self._num_slots_src
+            num_slots_dst = (
+                info.dst_num_slots
+                if info.dst_num_slots is not None
+                else self._num_slots_src
+            )
             src_layer_lengths = [self._num_slots_src] * len(item_lens)
             dst_layer_lengths = [num_slots_dst] * len(item_lens)
-            src_indices = repeat_indices_over_layers(prefill_data_indices, src_layer_lengths)
-            dst_indices = repeat_indices_over_layers(dst_data_indices, dst_layer_lengths)
+            src_indices = repeat_indices_over_layers(
+                prefill_data_indices, src_layer_lengths
+            )
+            dst_indices = repeat_indices_over_layers(
+                dst_data_indices, dst_layer_lengths
+            )
             xfer_handle = self.agent.make_prepped_xfer(
                 "WRITE",
                 src_prep,
@@ -1117,21 +1138,33 @@ class NixlKVManager(CommonKVManager):
         # Prepped path: src dlist is shared per decode_tp_size; dst is per peer.
         assert self.prep_handle_slice_src is not None
         assert peer_name in self.prep_handles_slice_dst
-        src_handle, num_groups, num_ptr_pairs, num_slots_src = self.prep_handle_slice_src
+        src_handle, num_groups, num_ptr_pairs, num_slots_src = (
+            self.prep_handle_slice_src
+        )
         dst_handle, num_slots_dst = self.prep_handles_slice_dst[peer_name]
         head_group_idx = self.peer_head_group[peer_name]
         page_size = self.kv_args.page_size
         src_indices = expand_page_indices_for_slice(
             np.asarray(prefill_kv_indices, dtype=np.int32),
-            num_ptr_pairs, num_slots_src, page_size,
-            num_groups=num_groups, head_group_idx=head_group_idx,
+            num_ptr_pairs,
+            num_slots_src,
+            page_size,
+            num_groups=num_groups,
+            head_group_idx=head_group_idx,
         )
         dst_indices = expand_page_indices_for_slice(
             np.asarray(dst_kv_indices, dtype=np.int32),
-            num_ptr_pairs, num_slots_dst, page_size,
+            num_ptr_pairs,
+            num_slots_dst,
+            page_size,
         )
         xfer_handle = self.agent.make_prepped_xfer(
-            "WRITE", src_handle, src_indices, dst_handle, dst_indices, notif.encode("ascii")
+            "WRITE",
+            src_handle,
+            src_indices,
+            dst_handle,
+            dst_indices,
+            notif.encode("ascii"),
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create prepped slice transfer")
