@@ -3316,27 +3316,65 @@ class UnifiedRadixCacheSuite:
         )
         tree.sanity_check()
 
-    def test_partial_backup_reentry_returns_zero(self):
-        """Same-node reentry while a previous backup is in flight is rejected."""
+    def test_partial_backup_reentry_independent_op_ids(self):
+        """Same-node reentry while a previous backup is in flight registers a
+        second independent entry under a fresh op_id without losing the first
+        lock; both entries drain on writing_check."""
         if self._skip_unsupported_hicache_test():
             return
+        aux = self._select_partial_aux()
+        if aux is None:
+            self.skipTest("requires exactly one aux component")
         tree, allocator, req_to_token_pool = self._build_hicache_fixture()
         seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        seq = seq + self._make_seq(100, 2)
         self._insert(tree, allocator, req_to_token_pool, seq)
 
         m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
         node = m.last_device_node
+        # write_back=False requires parent already backuped: back up parent
+        # explicitly so the child write_backup can run with inc_lock_ref.
+        self.assertIsNot(node.parent, tree.root_node)
+        self._backup_node(tree, node.parent)
 
-        first = tree.write_backup(node, write_back=True)
+        def _inflight_for(n):
+            return [
+                op_id
+                for op_id, (entry_node, _) in tree.ongoing_write_through.items()
+                if entry_node is n
+            ]
+
+        # First call: full backup (FULL + aux). Use write_back=False so each
+        # call increments lock_ref — this is the path that previously leaked
+        # the first lock when reentry overwrote the dict entry.
+        full_lock_ref_before = node.component_data[ComponentType.FULL].lock_ref
+        first = tree.write_backup(node, write_back=False)
         self.assertGreater(first, 0)
-        self.assertIn(node.id, tree.ongoing_write_through)
+        first_ops = _inflight_for(node)
+        self.assertEqual(len(first_ops), 1)
+        first_lock_ref = node.component_data[ComponentType.FULL].lock_ref
+        self.assertGreater(first_lock_ref, full_lock_ref_before)
 
-        # Second call before writing_check completes the first must bail out.
-        second = tree.write_backup(node, write_back=True)
-        self.assertEqual(second, 0)
+        # Drop aux host backup to create a gap and re-issue. Reentry must
+        # register a second entry under a distinct op_id and take its own lock.
+        node.component_data[aux].host_value = None
+        second = tree.write_backup(node, write_back=False)
+        self.assertGreater(second, 0)
+        second_ops = _inflight_for(node)
+        self.assertEqual(len(second_ops), 2)
+        self.assertEqual(set(first_ops) & set(second_ops), set(first_ops))
+        self.assertNotEqual(set(first_ops), set(second_ops))
+        self.assertGreater(
+            node.component_data[ComponentType.FULL].lock_ref, first_lock_ref
+        )
 
         tree.writing_check(write_back=True)
-        self.assertNotIn(node.id, tree.ongoing_write_through)
+        self.assertEqual(len(_inflight_for(node)), 0)
+        # Both locks released — back to baseline.
+        self.assertEqual(
+            node.component_data[ComponentType.FULL].lock_ref, full_lock_ref_before
+        )
         tree.sanity_check()
 
     def test_partial_backup_inc_hit_count_triggers_after_restore(self):
