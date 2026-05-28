@@ -25,7 +25,7 @@ SGLang Diffusion supports AMD Instinct GPUs through ROCm. On AMD platforms, we u
 
 ### Moore Threads/MUSA Support
 
-SGLang Diffusion supports Moore Threads GPUs (MTGPU) through the MUSA software stack. On MUSA platforms, we use the Torch SDPA backend for attention. See the [installation guide](https://github.com/sgl-project/sglang/tree/main/docs/diffusion/installation.md) for setup instructions.
+SGLang Diffusion supports Moore Threads GPUs (MTGPU) through the MUSA software stack. On MUSA platforms, we use FlashAttention (FA3) when available; also supports Sage Attention when installed; otherwise falls back to the Torch SDPA backend. See the [installation guide](https://github.com/sgl-project/sglang/tree/main/docs/diffusion/installation.md) for setup instructions.
 
 ### Apple MPS Support
 

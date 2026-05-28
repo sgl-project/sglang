@@ -2,17 +2,20 @@ import math
 from functools import lru_cache
 from typing import Optional
 
-import tilelang
 import torch
 import triton
 import triton.language as tl
 
-tilelang.set_log_level("WARNING")
+try:
+    import tilelang
 
-pass_configs = {
-    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-}
+    tilelang.set_log_level("WARNING")
+    pass_configs = {
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+    }
+except ImportError:
+    pass
 
 FP8 = "float8_e4m3"
 BF16 = "bfloat16"
@@ -177,3 +180,257 @@ def apply_rotary_emb_triton(
         )
 
     return x
+
+
+@triton.jit
+def _fused_norm_rope_kernel(
+    x_ptr,
+    weight_ptr,
+    freqs_real_ptr,
+    positions_ptr,
+    eps,
+    stride_x_row,
+    stride_freq_row,
+    HEAD_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+    ROPE_PAIR_BLOCK: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+    USE_POS: tl.constexpr,
+):
+    # NOTE: avoids store-then-reload on the same kernel: rope-segment values
+    # are loaded a 2nd time as (real, imag) pairs straight from the input,
+    # rms_inv/weight applied in register, and all stores happen at the end.
+    pid = tl.program_id(0)
+    base = pid.to(tl.int64) * stride_x_row
+
+    offs = tl.arange(0, HEAD_BLOCK)
+    mask = offs < HEAD_DIM
+    x = tl.load(x_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+
+    sum_sq = tl.sum(x * x, axis=0)
+    rms_inv = tl.rsqrt(sum_sq / HEAD_DIM + eps)
+
+    if HAS_WEIGHT:
+        w = tl.load(weight_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        x_normed = x * rms_inv * w
+    else:
+        x_normed = x * rms_inv
+
+    rope_start = HEAD_DIM - ROPE_DIM
+
+    pair_offs = tl.arange(0, ROPE_PAIR_BLOCK)
+    pair_mask = pair_offs < (ROPE_DIM // 2)
+
+    x_real = tl.load(
+        x_ptr + base + rope_start + 2 * pair_offs,
+        mask=pair_mask,
+        other=0.0,
+    ).to(tl.float32)
+    x_imag = tl.load(
+        x_ptr + base + rope_start + 2 * pair_offs + 1,
+        mask=pair_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    if HAS_WEIGHT:
+        w_real = tl.load(
+            weight_ptr + rope_start + 2 * pair_offs,
+            mask=pair_mask,
+            other=1.0,
+        ).to(tl.float32)
+        w_imag = tl.load(
+            weight_ptr + rope_start + 2 * pair_offs + 1,
+            mask=pair_mask,
+            other=1.0,
+        ).to(tl.float32)
+        x_real = x_real * rms_inv * w_real
+        x_imag = x_imag * rms_inv * w_imag
+    else:
+        x_real = x_real * rms_inv
+        x_imag = x_imag * rms_inv
+
+    if USE_POS:
+        position = tl.load(positions_ptr + pid).to(tl.int64)
+    else:
+        position = pid.to(tl.int64)
+
+    freq_base = position * stride_freq_row
+    f_real = tl.load(
+        freqs_real_ptr + freq_base + 2 * pair_offs,
+        mask=pair_mask,
+        other=0.0,
+    ).to(tl.float32)
+    f_imag = tl.load(
+        freqs_real_ptr + freq_base + 2 * pair_offs + 1,
+        mask=pair_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    out_real = x_real * f_real - x_imag * f_imag
+    out_imag = x_real * f_imag + x_imag * f_real
+
+    is_non_rope = offs < rope_start
+    tl.store(
+        x_ptr + base + offs,
+        x_normed.to(x_ptr.dtype.element_ty),
+        mask=mask & is_non_rope,
+    )
+    tl.store(
+        x_ptr + base + rope_start + 2 * pair_offs,
+        out_real.to(x_ptr.dtype.element_ty),
+        mask=pair_mask,
+    )
+    tl.store(
+        x_ptr + base + rope_start + 2 * pair_offs + 1,
+        out_imag.to(x_ptr.dtype.element_ty),
+        mask=pair_mask,
+    )
+
+
+@triton.jit
+def _fused_softmax_pool_kernel(
+    kv_score_ptr,
+    out_ptr,
+    stride_bs: tl.constexpr,
+    stride_k: tl.constexpr,
+    K: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    base = pid * stride_bs
+
+    offs = tl.arange(0, HEAD_BLOCK)
+    mask = offs < HEAD_DIM
+
+    max_val = tl.full([HEAD_BLOCK], float("-inf"), dtype=tl.float32)
+    for k in range(K):
+        s = tl.load(
+            kv_score_ptr + base + k * stride_k + HEAD_DIM + offs,
+            mask=mask,
+            other=float("-inf"),
+        ).to(tl.float32)
+        max_val = tl.maximum(max_val, s)
+
+    sum_exp = tl.zeros([HEAD_BLOCK], dtype=tl.float32)
+    weighted = tl.zeros([HEAD_BLOCK], dtype=tl.float32)
+    for k in range(K):
+        s = tl.load(
+            kv_score_ptr + base + k * stride_k + HEAD_DIM + offs,
+            mask=mask,
+            other=float("-inf"),
+        ).to(tl.float32)
+        v = tl.load(
+            kv_score_ptr + base + k * stride_k + offs,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        w = tl.exp(s - max_val)
+        sum_exp += w
+        weighted += v * w
+
+    result = weighted / sum_exp
+    tl.store(
+        out_ptr + pid * HEAD_DIM + offs, result.to(out_ptr.dtype.element_ty), mask=mask
+    )
+
+
+def fused_softmax_pool_triton(
+    kv_score: torch.Tensor,
+    head_dim: int,
+) -> torch.Tensor:
+    """Fused softmax-weighted-sum: out = (kv * softmax(score, dim=1)).sum(dim=1).
+
+    Replaces the generic cunn_SpatialSoftMaxForward + elementwise multiply + sum
+    with a single Triton kernel.
+
+    Args:
+        kv_score: [bs, K, 2 * head_dim] where first head_dim is kv, second is score.
+        head_dim: dimension of each of kv and score.
+    Returns:
+        output: [bs, head_dim]
+    """
+    assert kv_score.dim() == 3
+    bs, K, last = kv_score.shape
+    assert last == 2 * head_dim
+    assert kv_score.is_contiguous()
+
+    out = torch.empty(bs, head_dim, dtype=kv_score.dtype, device=kv_score.device)
+    if bs == 0:
+        return out
+
+    HEAD_BLOCK = triton.next_power_of_2(head_dim)
+    grid = (bs,)
+    _fused_softmax_pool_kernel[grid](
+        kv_score,
+        out,
+        stride_bs=kv_score.stride(0),
+        stride_k=kv_score.stride(1),
+        K=K,
+        HEAD_DIM=head_dim,
+        HEAD_BLOCK=HEAD_BLOCK,
+    )
+    return out
+
+
+def fused_norm_rope_inplace_triton(
+    kv: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    eps: float,
+    freqs_cis: torch.Tensor,
+    positions: Optional[torch.Tensor] = None,
+) -> None:
+    """Fused RMSNorm (over head_dim) + RoPE (on last rope_dim of head_dim), in-place.
+
+    Equivalent to::
+
+        kv = rms_normalize(kv, eps, weight)
+        apply_rotary_emb_triton(kv[..., -rope_dim:], freqs_cis, positions=positions)
+
+    Args:
+        kv: [M, head_dim], any float dtype, contiguous along last dim. Modified in-place.
+        weight: [head_dim] or None.
+        eps: RMSNorm epsilon.
+        freqs_cis: complex tensor.
+            - If ``positions`` is None: shape [M, rope_dim // 2], one freq per token.
+            - Else: shape [max_seq, rope_dim // 2], full table; indexed by ``positions``.
+        positions: optional [M] int tensor, absolute positions to index into ``freqs_cis``.
+    """
+    assert kv.dim() == 2 and kv.stride(-1) == 1
+    M, head_dim = kv.shape
+
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    rope_dim = freqs_real.shape[-1]
+    assert head_dim >= rope_dim and rope_dim % 2 == 0
+    if weight is not None:
+        assert weight.shape == (head_dim,)
+    if positions is None:
+        assert (
+            freqs_real.shape[0] == M
+        ), f"freqs_cis row count {freqs_real.shape[0]} != M={M}"
+    else:
+        assert positions.shape == (M,) and positions.dim() == 1
+
+    if M == 0:
+        return
+
+    HEAD_BLOCK = triton.next_power_of_2(head_dim)
+    ROPE_PAIR_BLOCK = max(triton.next_power_of_2(rope_dim // 2), 1)
+
+    grid = (M,)
+    _fused_norm_rope_kernel[grid](
+        kv,
+        weight,
+        freqs_real,
+        positions,
+        eps,
+        kv.stride(0),
+        freqs_real.stride(0),
+        HEAD_DIM=head_dim,
+        ROPE_DIM=rope_dim,
+        HEAD_BLOCK=HEAD_BLOCK,
+        ROPE_PAIR_BLOCK=ROPE_PAIR_BLOCK,
+        HAS_WEIGHT=(weight is not None),
+        USE_POS=(positions is not None),
+    )
