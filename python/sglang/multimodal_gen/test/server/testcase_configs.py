@@ -472,12 +472,9 @@ def get_model_task_type_for_server_args(
     )
     if pipeline_class_name:
         config_classes = get_pipeline_config_classes(pipeline_class_name)
-        if config_classes is None:
-            raise ValueError(
-                f"Could not resolve pipeline config classes for {pipeline_class_name!r}"
-            )
-        pipeline_config_cls, _ = config_classes
-        return pipeline_config_cls.task_type
+        if config_classes is not None:
+            pipeline_config_cls, _ = config_classes
+            return pipeline_config_cls.task_type
 
     model_info = get_model_info(server_args.model_path)
     if model_info is None:
