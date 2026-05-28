@@ -942,15 +942,33 @@ class DeepseekV4AscendAttnBackend(
                 else:
                     state_loc_decode = state_loc_decode.to(torch.int32)
                 # c{ratio}_loc comes from the DSV4OutCacheLoc bundle the
-                # allocator stashed in alloc_decode. The kernel expects a
-                # [bs]-shaped tensor (0 padding for non-compressing reqs);
-                # the allocator only emits slots for reqs that closed a ratio
-                # chunk, so we scatter into a [bs]-padded buffer here.
+                # allocator stashed in alloc_decode. Densely-packed in the
+                # prefix [0, n_compress): bundle_loc[k] is the c-pool slot
+                # for the k-th boundary-hitting req (in batch order). The
+                # fused compressor op (torch.ops.custom.compressor) returns
+                # cmp_kv aligned the same way -- cmp_kv[k] is the compressed
+                # token for the k-th entry of positions_cmp_padding (also
+                # densely packed; see below). The epilog writes
+                # buf_flat[c{ratio}_loc[i]] = cmp_kv[i] for i in [0, bs);
+                # tail entries [n_compress, bs) stay 0 and land in the
+                # allocator-reserved skip slot 0 (NPUPagedTokenToKVPool
+                # free_pages starts at 1, so slot 0 is never read).
+                #
+                # NOTE: an earlier version scattered bundle_loc into
+                # ``compress_out_loc[idx]`` using ``idx = nonzero(should_compress)``
+                # (sparsely-padded by batch index). That broke multi-req
+                # batches whenever a boundary-hitting req was not at the
+                # front of the batch: cmp_kv[k] (densely packed) and
+                # c{ratio}_loc[idx[k]] (batch-indexed) misaligned, so
+                # compressed tokens were lost to slot 0 and real slots got
+                # padding junk -- the c4/c128 attention then read corrupt
+                # KV and produced garbled tokens (TP/multi-concurrency
+                # regression).
                 #
                 # out_cache_loc_dsv4 is None on IDLE DP-attention ranks
                 # (alloc_decode short-circuited because there's no real batch
                 # to allocate). For those ranks the kernel still needs a
-                # shape-correct compress_out_loc buffer, so emit all zeros —
+                # shape-correct compress_out_loc buffer, so emit all zeros --
                 # the captured graph will run with no actual compress work.
                 compress_out_loc = torch.zeros(
                     bs, dtype=torch.int32, device=device,
@@ -961,19 +979,11 @@ class DeepseekV4AscendAttnBackend(
                         if ratio == 4
                         else out_cache_loc_dsv4.out_c128_loc
                     )
-                    if bundle_loc.numel() > 0:
-                        valid = seq_lens > 0
-                        should_compress = ((seq_lens % ratio) == 0) & valid
-                        # from sglang.srt.layers.dp_attention import get_attention_dp_rank
-                        # print(f"[dsv4-compress] dp_rank={get_attention_dp_rank()} seq_lens={seq_lens.tolist()} should_compress={should_compress.tolist()}", flush=True)
-                        idx = torch.nonzero(
-                            should_compress, as_tuple=False
-                        ).flatten()
-                        n_compress = idx.numel()
-                        if n_compress > 0:
-                            compress_out_loc[idx] = (
-                                bundle_loc[:n_compress].to(torch.int32)
-                            )
+                    n_compress = bundle_loc.numel()
+                    if n_compress > 0:
+                        compress_out_loc[:n_compress] = bundle_loc.to(
+                            torch.int32
+                        )
 
             result[f"c{ratio}_state_page_table"] = state_page_2d
             if is_decode:
