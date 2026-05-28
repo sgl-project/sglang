@@ -108,11 +108,30 @@ class RuntimeHandle:
     def _safe_callback(self, chunk_callback, payload, **kwargs) -> None:
         try:
             chunk_callback(payload, **kwargs)
-        except Exception:
-            pass
+        except Exception as e:
+            # Most often: Rust receiver dropped (client disconnect, channel
+            # closed). Log at warning so it's visible without spamming on
+            # every normal cancellation.
+            logger.warning("gRPC chunk_callback failed: %s", e)
 
     def _submit_on_tm_loop(self, coro: Awaitable) -> None:
-        asyncio.run_coroutine_threadsafe(coro, self._tm_loop)
+        future = asyncio.run_coroutine_threadsafe(coro, self._tm_loop)
+        future.add_done_callback(self._log_unhandled_future_exception)
+
+    @staticmethod
+    def _log_unhandled_future_exception(future) -> None:
+        # All RuntimeHandle coroutines wrap their bodies in try/except and
+        # route errors through chunk_callback, so this is a defence in depth:
+        # if anything ever escapes (or a new caller forgets the wrap), we
+        # surface it instead of silently hanging the gRPC stream.
+        try:
+            future.result()
+        except Exception as e:
+            logger.error(
+                "gRPC scheduled coroutine raised unhandled exception: %s",
+                e,
+                exc_info=True,
+            )
 
     def _submit_json_unary(
         self,
@@ -204,11 +223,15 @@ class RuntimeHandle:
             obj = GenerateReqInput(**req_dict)
             stream = req_dict.get("stream", False)
             self._submit_on_tm_loop(self._run_generate(obj, chunk_callback, stream))
-        else:
+        elif req_type == "embed":
             from sglang.srt.managers.io_struct import EmbeddingReqInput
 
             obj = EmbeddingReqInput(**req_dict)
             self._submit_on_tm_loop(self._run_embed(obj, chunk_callback))
+        else:
+            raise ValueError(
+                f"Unknown req_type: {req_type!r} (expected 'generate' or 'embed')"
+            )
 
     async def _run_generate(self, obj, chunk_callback, stream: bool):
         try:
@@ -297,9 +320,10 @@ class RuntimeHandle:
 
         if self.tokenizer_manager.gracefully_exit:
             return False
-        if self.tokenizer_manager.server_status == ServerStatus.Starting:
-            return False
-        return True
+        return self.tokenizer_manager.server_status not in (
+            ServerStatus.Starting,
+            ServerStatus.UnHealthy,
+        )
 
     def tokenize(self, text: str, add_special_tokens: bool = True) -> str:
         """Tokenize text and return result as JSON string."""
@@ -625,16 +649,43 @@ class RuntimeHandle:
             result = await serving.handle_request(request_obj, mock_request)
 
             if hasattr(result, "body_iterator"):
+                # Parse SSE events per WHATWG spec (data:/event:/id: fields,
+                # `:` comments, blank-line event boundaries). OpenAIServing*
+                # currently emits one `data: <json>\n\n` per yield, but a
+                # naive `startswith("data: ")` filter silently drops anything
+                # else — multi-line data, comments, future event/id usage.
+                # See follow-up: replace SSE round-trip with a (dict,
+                # finished) hook on OpenAIServing*.
+                data_buf: List[str] = []
+
+                def _flush_event() -> None:
+                    if not data_buf:
+                        return
+                    body = "\n".join(data_buf)
+                    data_buf.clear()
+                    if body == "[DONE]" or not body:
+                        return
+                    chunk_callback(body.encode("utf-8"), finished=False)
+
                 async for raw_chunk in result.body_iterator:
                     if isinstance(raw_chunk, bytes):
                         raw_chunk = raw_chunk.decode("utf-8", errors="replace")
-                    if (
-                        raw_chunk.startswith("data: ")
-                        and raw_chunk.strip() != "data: [DONE]"
-                    ):
-                        json_chunk = raw_chunk[len("data: ") :].strip()
-                        if json_chunk:
-                            chunk_callback(json_chunk.encode("utf-8"), finished=False)
+                    for line in raw_chunk.split("\n"):
+                        line = line.rstrip("\r")
+                        if not line:
+                            _flush_event()
+                        elif line.startswith(":"):
+                            continue  # SSE comment / heartbeat
+                        elif line.startswith("data:"):
+                            value = line[5:]
+                            if value.startswith(" "):
+                                value = value[1:]
+                            data_buf.append(value)
+                        # event:, id:, retry:, unknown fields: ignored
+
+                # Defensive: emit a trailing event if the stream ended
+                # without a final blank line.
+                _flush_event()
                 chunk_callback(b"", finished=True)
             else:
                 if hasattr(result, "model_dump"):
@@ -645,7 +696,14 @@ class RuntimeHandle:
                     resp_bytes = json.dumps(result).encode("utf-8")
                 else:
                     resp_bytes = str(result).encode("utf-8")
-                status_code = int(getattr(result, "status_code", 200))
+                # ErrorResponse uses ``code``; Starlette/FastAPI Response
+                # uses ``status_code``. Honour whichever is present so error
+                # responses don't ship as HTTP 200 with an error body.
+                status_code = int(
+                    getattr(result, "status_code", None)
+                    or getattr(result, "code", None)
+                    or 200
+                )
                 chunk_callback(resp_bytes, finished=True, status_code=status_code)
 
         except Exception as e:
