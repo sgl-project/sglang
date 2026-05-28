@@ -59,7 +59,7 @@ from sglang.srt.utils import ceil_align
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
-    from flash_mla.flash_mla_interface import FlashMLASchedMeta
+    from sgl_kernel.flash_mla import FlashMLASchedMeta
 
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -87,7 +87,7 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 def _create_flashmla_metadata():
     if _is_sm120:
         return None
-    import flash_mla
+    import sgl_kernel.flash_mla as flash_mla
 
     return flash_mla.get_mla_metadata()[0]
 
@@ -1068,7 +1068,7 @@ class DeepseekV4AttnBackend(
                     extra_topk_length=extra_topk_lengths,
                 )[0]
             else:
-                import flash_mla
+                import sgl_kernel.flash_mla as flash_mla
 
                 o = flash_mla.flash_mla_with_kvcache(
                     q=q,

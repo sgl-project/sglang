@@ -42,6 +42,7 @@ class Mxfp4MarlinMoEMethod:
             FusedMoeWeightScaleSupported,
         )
 
+        layer._dsv4_mxfp4_backend = None  # set in process_weights_after_loading
         fp4_block_k = 32
 
         w13_weight = torch.nn.Parameter(
@@ -177,7 +178,7 @@ class Mxfp4MarlinMoEMethod:
             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
 
         # SM120: use Triton fused dequant+GEMM (Marlin kernel produces NaN on SM120)
-        if getattr(layer, "_dsv4_mxfp4_backend", None) == "sm120_triton":
+        if layer._dsv4_mxfp4_backend == "sm120_triton":
             from sglang.srt.layers.moe.fused_moe_triton.mxfp4_moe_sm120_triton import (
                 mxfp4_moe_forward_triton,
             )
