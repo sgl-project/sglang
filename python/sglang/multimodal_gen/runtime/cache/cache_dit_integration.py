@@ -12,6 +12,7 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_tp_world_size,
@@ -312,11 +313,18 @@ def enable_cache_on_transformer(
 
     _mark_transformer_parallelized(transformer, parallelism_config, sp_group, tp_group)
 
+    extra_kwargs = {}
+    attention_backend = envs.SGLANG_CACHE_DIT_ATTN_BACKEND
+    if attention_backend:
+        logger.info("cache-dit attention backend: %s", attention_backend)
+        extra_kwargs["attention_backend"] = attention_backend
+
     cache_dit.enable_cache(
         transformer,
         cache_config=cache_config,
         calibrator_config=calibrator_config,
         parallelism_config=None,
+        **extra_kwargs,
     )
 
     if parallelism_config is not None:
@@ -492,6 +500,11 @@ def enable_cache_on_dual_transformer(
         # Use Pattern_2 for Wan2.2 dual-transformer. We should check `model_name`
         # to ensure we only apply this for supported models. Different models
         # may require different ForwardPattern.
+        extra_kwargs = {}
+        attention_backend = envs.SGLANG_CACHE_DIT_ATTN_BACKEND
+        if attention_backend:
+            logger.info("cache-dit attention backend: %s", attention_backend)
+            extra_kwargs["attention_backend"] = attention_backend
         cache_dit.enable_cache(
             BlockAdapter(
                 transformer=[transformer, transformer_2],
@@ -501,6 +514,7 @@ def enable_cache_on_dual_transformer(
                 has_separate_cfg=True,
             ),
             parallelism_config=None,
+            **extra_kwargs,
         )
     else:
         raise ValueError(

@@ -571,6 +571,24 @@ SGLang Diffusion x Cache-DiT supports almost all models originally supported in 
 For models with < 8 inference steps (e.g., DMD distilled models), SCM will be automatically disabled. DBCache
 acceleration still works.
 
+## Ascend NPU Compile Backend
+
+On Ascend NPU, the default `torchair` compile backend cannot compile DiT models due to missing
+custom operator converters. You can use the `MindieSDBackend` from MindIE-SD instead:
+
+```bash
+export SGLANG_CACHE_DIT_MINDIESD_COMPILE="true"
+export SGLANG_ENABLE_TORCH_COMPILE="true"
+```
+
+MindieSDBackend enables operator fusion patterns (FastGelu, AdaLayerNorm) and provides
+approximately 4-5% speedup at 768+ resolutions compared to the default NPU compile path.
+
+<Note>
+Requires the `mindiesd` package (version 3.0.0 or later) installed on Ascend NPU.
+The default `torchair` compile backend is not supported for DiT inference.
+</Note>
+
 ## References
 
 - [Cache-DiT](https://github.com/vipshop/cache-dit)

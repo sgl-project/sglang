@@ -238,6 +238,16 @@ See [cache-dit documentation](./cache_dit) for detailed configuration.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>not set</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Custom SCM cache bins</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_CACHE_DIT_ATTN_BACKEND</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>not set</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Pass attention backend to cache-dit (e.g. <code>_mindiesd_laser</code> for Ascend NPU)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_CACHE_DIT_MINDIESD_COMPILE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>false</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Use <code>MindieSDBackend</code> for torch.compile on Ascend NPU. Requires <code>SGLANG_ENABLE_TORCH_COMPILE=true</code> and the <code>mindiesd</code> package.</td>
+    </tr>
   </tbody>
 </table>
 

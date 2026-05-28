@@ -299,10 +299,17 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         compile_kwargs: dict[str, Any] = {"fullgraph": False, "dynamic": None}
 
         if current_platform.is_npu():
-            backend = get_compiler_backend()
-            compile_kwargs["backend"] = backend
-            compile_kwargs["dynamic"] = False
-            logger.info("Compiling transformer with torchair backend on NPU")
+            if envs.SGLANG_CACHE_DIT_MINDIESD_COMPILE:
+                from mindiesd.compilation import MindieSDBackend
+
+                compile_kwargs["backend"] = MindieSDBackend()
+                compile_kwargs["dynamic"] = True
+                logger.info("Compiling transformer with MindieSDBackend on NPU")
+            else:
+                backend = get_compiler_backend()
+                compile_kwargs["backend"] = backend
+                compile_kwargs["dynamic"] = False
+                logger.info("Compiling transformer with torchair backend on NPU")
         else:
             try:
                 import torch._inductor.config as _inductor_cfg

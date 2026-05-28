@@ -46,6 +46,8 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_SCM_COMPUTE_BINS: str | None = None
     SGLANG_CACHE_DIT_SCM_CACHE_BINS: str | None = None
     SGLANG_CACHE_DIT_SCM_POLICY: str = "dynamic"
+    SGLANG_CACHE_DIT_ATTN_BACKEND: str | None = None
+    SGLANG_CACHE_DIT_MINDIESD_COMPILE: bool = False
     # cache-dit env vars (secondary transformer, e.g., Wan2.2 low-noise expert)
     SGLANG_CACHE_DIT_SECONDARY_FN: int = 1
     SGLANG_CACHE_DIT_SECONDARY_BN: int = 0
@@ -284,6 +286,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_CACHE_DIT_SCM_CACHE_BINS": _lazy_str("SGLANG_CACHE_DIT_SCM_CACHE_BINS"),
     # SCM policy: dynamic or static
     "SGLANG_CACHE_DIT_SCM_POLICY": _lazy_str("SGLANG_CACHE_DIT_SCM_POLICY", "dynamic"),
+    # cache-dit attention backend (e.g., "_mindiesd_laser")
+    "SGLANG_CACHE_DIT_ATTN_BACKEND": _lazy_str("SGLANG_CACHE_DIT_ATTN_BACKEND"),
+    # Enable MindieSDBackend compile (replaces torchair on NPU)
+    "SGLANG_CACHE_DIT_MINDIESD_COMPILE": _lazy_bool(
+        "SGLANG_CACHE_DIT_MINDIESD_COMPILE", "false"
+    ),
     # model loading
     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
