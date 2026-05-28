@@ -49,6 +49,21 @@ def is_capture_enabled() -> bool:
     return os.environ.get(_ENV_FLAG, "0") == "1"
 
 
+def _capturing_cuda_graph() -> bool:
+    """True while a CUDA graph is being captured on the current stream.
+
+    The capture records SHA fingerprints by copying tensors to CPU
+    (``_tensor_bytes_sha``), which is illegal during CUDA-graph capture
+    ("Cannot copy between CPU and CUDA tensors during CUDA graph capture").
+    The fixture reads the capture log from EAGER paired requests, so recording
+    during graph capture is both meaningless and unsafe — skip it. This matters
+    because the production label-write hook now fires on the decode path (which
+    is graph-captured); with capture enabled, an unguarded record would abort
+    capture at model-runner init.
+    """
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
 def _sha256_bytes(buf: bytes) -> str:
     return hashlib.sha256(buf).hexdigest()
 
@@ -89,7 +104,7 @@ def record_write(
         every shared-prefix slot is reachable after both cold and
         warm passes.
     """
-    if not is_capture_enabled():
+    if not is_capture_enabled() or _capturing_cuda_graph():
         return
     record: Dict[str, Any] = {
         "kind": "write",
@@ -126,7 +141,7 @@ def record_table_snapshot(
     the warm-vs-cold comparison can be by-slot, by-layer, with no
     sensitivity to ordering of intervening writes.
     """
-    if not is_capture_enabled():
+    if not is_capture_enabled() or _capturing_cuda_graph():
         return
     if signatures.dim() != 4 or written.dim() != 2:
         raise ValueError(

@@ -1583,7 +1583,13 @@ class DeepseekSparseAttnBackend(
         from sglang.srt.layers.attention.double_sparsity import (
             radix_fixture_capture as _ds_radix_capture,
         )
-        if _ds_radix_capture.is_capture_enabled():
+        # Skip the whole capture block while a CUDA graph is being captured:
+        # the fixture's SHA fingerprints copy tensors to CPU, which is illegal
+        # during capture. The label-write hook now fires on the (graph-captured)
+        # decode path, so without this an enabled capture aborts graph capture at
+        # model-runner init. The fixture reads its log from eager paired requests.
+        _ds_capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        if _ds_radix_capture.is_capture_enabled() and not _ds_capturing:
             _ds_radix_capture.record_write(
                 layer_id=layer_id,
                 cache_loc=cache_loc,
