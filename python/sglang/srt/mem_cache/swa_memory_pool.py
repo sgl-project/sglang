@@ -571,7 +571,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
 
         if _is_npu:
-            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
+            indices_2d = alloc_full_indices.to(torch.int64).unsqueeze(-1)
+            torch_npu.npu_scatter_nd_update_(
+                self.full_to_swa_index_mapping, 
+                indices_2d, 
                 alloc_swa_indices.to(torch.int64)
             )
         else:
