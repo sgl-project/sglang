@@ -646,6 +646,22 @@ class RuntimeHandle:
                 is_disconnected_fn=is_disconnected_fn,
             )
 
+            # Streaming endpoints can opt into the pre-SSE hook
+            # ``OpenAIServingBase.stream_chunks`` — the generator yields
+            # already-JSON-encoded bytes so we skip the SSE round-trip.
+            # Serving classes raise NotImplementedError from the default
+            # impl; we fall back to the SSE re-parser below.
+            if streaming:
+                try:
+                    async for chunk_bytes in serving.stream_chunks(
+                        request_obj, mock_request
+                    ):
+                        chunk_callback(chunk_bytes, finished=False)
+                    chunk_callback(b"", finished=True)
+                    return
+                except NotImplementedError:
+                    pass  # fall through to SSE re-parser
+
             result = await serving.handle_request(request_obj, mock_request)
 
             if hasattr(result, "body_iterator"):
@@ -654,8 +670,6 @@ class RuntimeHandle:
                 # currently emits one `data: <json>\n\n` per yield, but a
                 # naive `startswith("data: ")` filter silently drops anything
                 # else — multi-line data, comments, future event/id usage.
-                # See follow-up: replace SSE round-trip with a (dict,
-                # finished) hook on OpenAIServing*.
                 data_buf: List[str] = []
 
                 def _flush_event() -> None:

@@ -4,7 +4,7 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, AsyncIterator, List, Optional, Tuple, Union
 
 import orjson
 from fastapi import HTTPException, Request
@@ -201,6 +201,33 @@ class OpenAIServingBase(ABC):
             err_type="NotImplementedError",
             status_code=501,
         )
+
+    async def stream_chunks(
+        self,
+        request: OpenAIServingRequest,
+        raw_request: Request,
+    ) -> AsyncIterator[bytes]:
+        """Pre-SSE streaming hook.
+
+        Yield each chunk as already-JSON-encoded ``bytes``. The generator
+        ending signals end-of-stream — no ``[DONE]`` sentinel, no SSE
+        framing, no callers having to re-parse SSE on the receiving side.
+
+        Used by transports that want JSON chunks directly (e.g. the gRPC
+        bridge in :mod:`sglang.srt.entrypoints.grpc_bridge`). The HTTP
+        path keeps using :meth:`_handle_streaming_request` which wraps
+        chunks as SSE for the client.
+
+        Default raises NotImplementedError; override in serving classes
+        that support streaming.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement stream_chunks; "
+            "the gRPC bridge will fall back to SSE re-parsing until it does."
+        )
+        # The unreachable yield below makes this an async generator so
+        # `hasattr(serving, "stream_chunks")` checks work uniformly.
+        yield b""  # pragma: no cover
 
     def _validate_request(self, _: OpenAIServingRequest) -> Optional[str]:
         """Validate request"""
