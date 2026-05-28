@@ -179,9 +179,6 @@ class GPTQConfig(QuantizationConfig):
         )
 
     def get_linear_scheme(self, layer: torch.nn.Module):
-        from sglang.srt.layers.linear import LinearBase
-
-        assert isinstance(layer, LinearBase)
         return GPTQLinearScheme(self)
 
     def get_moe_scheme(self, layer: torch.nn.Module):
@@ -219,9 +216,6 @@ class GPTQAscendConfig(GPTQConfig):
         return None
 
     def get_linear_scheme(self, layer: torch.nn.Module):
-        from sglang.srt.layers.linear import LinearBase
-
-        assert isinstance(layer, LinearBase)
         return GPTQAscendLinearScheme(self)
 
     def get_moe_scheme(self, layer: torch.nn.Module):
