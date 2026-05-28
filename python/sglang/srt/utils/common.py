@@ -72,6 +72,7 @@ from typing import (
     Union,
 )
 from unittest import SkipTest
+from unittest.case import _ShouldStop
 from urllib.parse import unquote, urlparse
 
 import numpy as np
@@ -2770,6 +2771,13 @@ def retry(
             return fn()
         except SkipTest:
             # Do NOT retry skipped tests - used in CI and unittest
+            raise
+        except _ShouldStop:
+            # `unittest.case._ShouldStop` is raised by `subTest.__exit__`
+            # when a subtest fails/skips and `result.failfast` is True
+            # (CI invokes `python3 file.py -f`). It signals the outer
+            # `testPartExecutor` to stop the test method cleanly; do
+            # NOT retry, just propagate so unittest handles it.
             raise
         except Exception as e:
             traceback.print_exc()
