@@ -115,6 +115,12 @@ def is_hip_runtime() -> bool:
     return bool(torch.version.hip)
 
 
+# MThreads/MUSA note:
+@cache_once
+def is_musa_runtime() -> bool:
+    return hasattr(torch.version, "musa") and torch.version.musa is not None
+
+
 def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
     def _convert(arg: CPP_TEMPLATE_TYPE) -> str:
         if isinstance(arg, bool):
@@ -318,7 +324,7 @@ def get_jit_cuda_arch() -> ArchInfo:
 
 @cache_once
 def is_arch_support_pdl() -> bool:
-    if is_hip_runtime():
+    if is_hip_runtime() or is_musa_runtime():
         return False
     return get_jit_cuda_arch().major >= 9
 
