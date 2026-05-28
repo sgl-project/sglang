@@ -71,6 +71,57 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
         self.assertEqual(tuple(local_elem_count.shape), (sample.shape[0],))
         self.assertTrue(torch.all(local_elem_count == float(sample[0].numel())))
 
+    def test_ode_bit_exact_with_non_rollout_path(self):
+        """ODE rollout must produce the exact same prev_sample as the
+        non-rollout deterministic branch in
+        ``scheduling_flow_match_euler_discrete.step`` (``prev_sample =
+        sample + dt * model_output``). Uses bf16 model_output because the
+        wrapped-scalar promotion difference that a spurious
+        ``model_output.float()`` in the ODE branch would introduce is most
+        visible at bf16 precision."""
+        scheduler = _DummyScheduler()
+        batch = self._build_batch(debug_mode=False)
+        scheduler.prepare_rollout(batch)
+
+        sample = torch.randn(2, 4, 8, 8, dtype=torch.float32)
+        model_output = torch.randn_like(sample).to(torch.bfloat16)
+        current_sigma = torch.tensor(0.6, dtype=torch.float32)
+        next_sigma = torch.tensor(0.4, dtype=torch.float32)
+        dt = next_sigma - current_sigma
+
+        rollout_prev = scheduler.flow_sde_sampling(
+            batch,
+            model_output=model_output,
+            sample=sample,
+            current_sigma=current_sigma,
+            next_sigma=next_sigma,
+            generator=torch.Generator(device=sample.device).manual_seed(0),
+        )
+        # Exact expression used by the non-rollout branch at
+        # scheduling_flow_match_euler_discrete.py `prev_sample = sample +
+        # dt * model_output` (after the shared ``sample.to(fp32)`` cast).
+        non_rollout_prev = sample + dt * model_output
+
+        pre_cast_max_abs_diff = (rollout_prev - non_rollout_prev).abs().max().item()
+        post_cast_max_abs_diff = (
+            (
+                rollout_prev.to(model_output.dtype)
+                - non_rollout_prev.to(model_output.dtype)
+            )
+            .abs()
+            .max()
+            .item()
+        )
+        print(
+            f"\n[ODE rollout vs non-rollout, bf16 model_output] "
+            f"max |diff| pre-cast={pre_cast_max_abs_diff}, "
+            f"post-cast={post_cast_max_abs_diff}"
+        )
+
+        self.assertEqual(rollout_prev.dtype, non_rollout_prev.dtype)
+        self.assertEqual(pre_cast_max_abs_diff, 0.0)
+        self.assertEqual(post_cast_max_abs_diff, 0.0)
+
     def test_ode_debug_tensors_have_shape_safe_noise_std(self):
         scheduler = _DummyScheduler()
         batch = self._build_batch(debug_mode=True)
@@ -215,8 +266,19 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                 model_output = torch.randn(shape, generator=g, dtype=torch.float32)
                 sample = torch.randn(shape, generator=g, dtype=torch.float32)
                 variance_noise = torch.randn(shape, generator=g, dtype=torch.float32)
+
+                def _mock_rollout_variance_noise(_batch, *_args, **_kwargs):
+                    # flow_sde_sampling reads the full pre-shard noise from
+                    # rollout_session_data.noise_buffer to compute log_prob, so
+                    # the mock must populate it alongside returning the
+                    # (single-GPU trivially-sharded) noise.
+                    scheduler._get_rollout_session_data(  # type: ignore[attr-defined]
+                        _batch
+                    ).noise_buffer = variance_noise
+                    return variance_noise
+
                 scheduler._rollout_variance_noise = (  # type: ignore[method-assign]
-                    lambda _batch, *_args, **_kwargs: variance_noise
+                    _mock_rollout_variance_noise
                 )
 
                 prev_sgl = scheduler.flow_sde_sampling(
@@ -276,6 +338,244 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                         atol,
                         msg=f"{sde_type} seed={seed} {name} max_abs={err:.9f}",
                     )
+
+    def test_sde_cps_force_fp32_with_bf16_model_output(self):
+        """Regression for PyTorch's wrapped-scalar promotion trap: a 0-dim
+        fp32 ``noise_std_dev`` multiplied by an N-dim bf16 tensor silently
+        demotes to bf16, which would corrupt log-prob precision. SDE/CPS
+        branches therefore cast ``model_output.float()`` at entry. Passing
+        bf16 ``model_output`` must still yield an fp32 noise buffer and
+        an fp32 log-prob sum."""
+        scheduler = _DummyScheduler()
+        current_sigma = torch.tensor(0.5, dtype=torch.float32)
+        next_sigma = torch.tensor(0.3, dtype=torch.float32)
+        shape = (1, 16, 1, 32, 32)
+        pipeline_config = types.SimpleNamespace(
+            shard_latents_for_sp=lambda batch, latents: (latents, False)
+        )
+
+        for sde_type in ("sde", "cps"):
+            batch = self._build_batch(sde_type=sde_type, shape=shape)
+            scheduler.release_rollout_resources(batch)
+            scheduler.prepare_rollout(batch=batch, pipeline_config=pipeline_config)
+
+            g = torch.Generator(device="cpu").manual_seed(0)
+            model_output = torch.randn(shape, generator=g, dtype=torch.float32).to(
+                torch.bfloat16
+            )
+            sample = torch.randn(shape, generator=g, dtype=torch.float32)
+
+            # Use the real _rollout_variance_noise (no mock) so its dtype
+            # propagates from the (original) model_output.dtype into the
+            # noise buffer. If flow_sde_sampling fails to cast to fp32 at
+            # entry, the buffer is bf16 → log_prob becomes bf16.
+            scheduler.flow_sde_sampling(
+                batch,
+                model_output=model_output,
+                sample=sample,
+                current_sigma=current_sigma,
+                next_sigma=next_sigma,
+                generator=g,
+            )
+            log_prob_sum, _count = scheduler.consume_local_rollout_log_probs(batch)
+            self.assertEqual(
+                log_prob_sum.dtype,
+                torch.float32,
+                msg=f"{sde_type}: log_prob_sum must be fp32 with bf16 model_output",
+            )
+            noise_buffer = scheduler._get_rollout_session_data(batch).noise_buffer
+            self.assertEqual(
+                noise_buffer.dtype,
+                torch.float32,
+                msg=f"{sde_type}: noise_buffer must be fp32 with bf16 model_output",
+            )
+
+    def test_timestep_filters_gate_sde_and_trajectory(self):
+        """Per-step index filters: rollout_sde_step_indices gates variance-noise
+        injection (excluded steps = ODE transition + zero log-prob); independently,
+        rollout_return_step_indices gates the dit_trajectory append. Both features
+        are exercised here because they share the same step_index predicate."""
+        from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
+            RolloutDenoisingMixin,
+        )
+
+        # --- Part 1: rollout_sde_step_indices gates SDE noise injection ---
+        scheduler = _DummyScheduler()
+        shape = (1, 4, 8, 8)
+        pipeline_config = types.SimpleNamespace(
+            shard_latents_for_sp=lambda _batch, latents: (latents, False)
+        )
+        batch = types.SimpleNamespace(
+            rollout_log_prob_no_const=False,
+            rollout_noise_level=0.5,
+            rollout_sde_type="sde",
+            rollout_debug_mode=False,
+            rollout_sde_step_indices=[1],  # only step 1 is stochastic
+            latents=torch.empty(shape, dtype=torch.float32),
+            _rollout_session_data=None,
+        )
+        scheduler.prepare_rollout(batch=batch, pipeline_config=pipeline_config)
+
+        g = torch.Generator(device="cpu").manual_seed(0)
+        sample = torch.randn(shape, generator=g, dtype=torch.float32)
+        model_output = torch.randn(shape, generator=g, dtype=torch.float32)
+        current_sigma = torch.tensor(0.6, dtype=torch.float32)
+        next_sigma = torch.tensor(0.4, dtype=torch.float32)
+
+        variance_noise_ref = torch.randn(shape, generator=g, dtype=torch.float32)
+        variance_noise_call_count = {"n": 0}
+
+        def _mock_variance_noise(_batch, *_args, **_kwargs):
+            variance_noise_call_count["n"] += 1
+            scheduler._get_rollout_session_data(_batch).noise_buffer = (
+                variance_noise_ref
+            )
+            return variance_noise_ref
+
+        scheduler._rollout_variance_noise = (  # type: ignore[method-assign]
+            _mock_variance_noise
+        )
+
+        # Step 0: not in filter → deterministic ODE transition, no noise draw.
+        batch._rollout_loop_step_index = 0
+        prev_0 = scheduler.flow_sde_sampling(
+            batch,
+            model_output=model_output,
+            sample=sample,
+            current_sigma=current_sigma,
+            next_sigma=next_sigma,
+            generator=g,
+        )
+        self.assertEqual(variance_noise_call_count["n"], 0)
+        expected_ode = sample + (next_sigma - current_sigma) * model_output
+        self.assertTrue(torch.allclose(prev_0, expected_ode, atol=1e-6))
+
+        # Step 1: in filter → real SDE, noise drawn, prev differs from ODE form.
+        batch._rollout_loop_step_index = 1
+        prev_1 = scheduler.flow_sde_sampling(
+            batch,
+            model_output=model_output,
+            sample=sample,
+            current_sigma=current_sigma,
+            next_sigma=next_sigma,
+            generator=g,
+        )
+        self.assertEqual(variance_noise_call_count["n"], 1)
+        self.assertFalse(torch.allclose(prev_1, expected_ode, atol=1e-3))
+
+        log_prob_sum, elem_count = scheduler.consume_local_rollout_log_probs(batch)
+        self.assertEqual(tuple(log_prob_sum.shape), (shape[0], 2))
+        # Filtered step contributes zero log-prob; real SDE step does not.
+        self.assertTrue(
+            torch.allclose(log_prob_sum[:, 0], torch.zeros_like(log_prob_sum[:, 0]))
+        )
+        self.assertFalse(
+            torch.allclose(log_prob_sum[:, 1], torch.zeros_like(log_prob_sum[:, 1]))
+        )
+        # elem_count dimension must be preserved for both steps so downstream
+        # consume_local_rollout_log_probs stacking stays consistent.
+        self.assertTrue(torch.all(elem_count > 0))
+
+        # --- Part 2: rollout_return_step_indices gates dit trajectory append ---
+        class _DummyDit(RolloutDenoisingMixin):
+            pass
+
+        dit = _DummyDit()
+        lat = torch.zeros(1, 4, 8, 8)
+        ts = torch.tensor(0.5)
+
+        # Filter [0, 2] over steps 0,1,2 → steps 0 and 2 appended, step 1 skipped.
+        traj_filtered = types.SimpleNamespace(
+            rollout=True,
+            rollout_return_dit_trajectory=True,
+            rollout_return_step_indices=[0, 2],
+            _rollout_denoising_env_state={"step_latents": [], "step_timesteps": []},
+        )
+        for i in range(3):
+            dit._maybe_append_dit_trajectory_step(
+                batch=traj_filtered,
+                latents=lat,
+                timestep_value=ts,
+                step_index=i,
+            )
+        self.assertEqual(
+            len(traj_filtered._rollout_denoising_env_state["step_latents"]), 2
+        )
+        self.assertEqual(
+            len(traj_filtered._rollout_denoising_env_state["step_timesteps"]), 2
+        )
+
+        # None (default) → all steps appended (back-compat).
+        traj_all = types.SimpleNamespace(
+            rollout=True,
+            rollout_return_dit_trajectory=True,
+            rollout_return_step_indices=None,
+            _rollout_denoising_env_state={"step_latents": [], "step_timesteps": []},
+        )
+        for i in range(3):
+            dit._maybe_append_dit_trajectory_step(
+                batch=traj_all,
+                latents=lat,
+                timestep_value=ts,
+                step_index=i,
+            )
+        self.assertEqual(len(traj_all._rollout_denoising_env_state["step_latents"]), 3)
+
+        # Filter excludes step_index=T (the final/(T+1)-th latent appended by
+        # _postprocess_rollout_outputs). Simulate T=3 loop steps + final append.
+        traj_exclude_final = types.SimpleNamespace(
+            rollout=True,
+            rollout_return_dit_trajectory=True,
+            rollout_return_step_indices=[0, 1, 2],  # excludes T=3
+            _rollout_denoising_env_state={"step_latents": [], "step_timesteps": []},
+        )
+        for i in range(3):
+            dit._maybe_append_dit_trajectory_step(
+                batch=traj_exclude_final,
+                latents=lat,
+                timestep_value=ts,
+                step_index=i,
+            )
+        # Mimic the final append routed through the same filter.
+        dit._maybe_append_dit_trajectory_step(
+            batch=traj_exclude_final,
+            latents=lat,
+            timestep_value=torch.zeros(()),
+            step_index=3,
+        )
+        self.assertEqual(
+            len(traj_exclude_final._rollout_denoising_env_state["step_latents"]), 3
+        )
+        self.assertEqual(
+            len(traj_exclude_final._rollout_denoising_env_state["step_timesteps"]), 3
+        )
+
+        # Filter includes only step_index=T → only the final latent survives.
+        traj_only_final = types.SimpleNamespace(
+            rollout=True,
+            rollout_return_dit_trajectory=True,
+            rollout_return_step_indices=[3],
+            _rollout_denoising_env_state={"step_latents": [], "step_timesteps": []},
+        )
+        for i in range(3):
+            dit._maybe_append_dit_trajectory_step(
+                batch=traj_only_final,
+                latents=lat,
+                timestep_value=ts,
+                step_index=i,
+            )
+        dit._maybe_append_dit_trajectory_step(
+            batch=traj_only_final,
+            latents=lat,
+            timestep_value=torch.zeros(()),
+            step_index=3,
+        )
+        self.assertEqual(
+            len(traj_only_final._rollout_denoising_env_state["step_latents"]), 1
+        )
+        self.assertEqual(
+            len(traj_only_final._rollout_denoising_env_state["step_timesteps"]), 1
+        )
 
 
 if __name__ == "__main__":

@@ -19,7 +19,16 @@ from sglang.srt.layers.attention.fla.utils import (
     SUPPRESS_LEVEL,
     autocast_custom_fwd,
     input_guard,
+    is_intel,
 )
+
+if is_intel:
+    from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_delta_h import (
+        chunk_gated_delta_rule_fwd_h,
+    )
+    from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_fwd import (
+        chunk_gated_delta_rule_fwd_intra,
+    )
 
 CHUNK_SIZE = 64
 
@@ -36,7 +45,9 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: torch.LongTensor | None = None,
 ):
-    g = chunk_local_cumsum(g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens)
+    g = chunk_local_cumsum(
+        g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
+    )
 
     # fused kkt + solve_tril + recompute_w_u
     w, u, A = chunk_gated_delta_rule_fwd_intra(
@@ -56,6 +67,7 @@ def chunk_gated_delta_rule_fwd(
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
     )
     o = chunk_fwd_o(
         q=q,

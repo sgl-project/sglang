@@ -4,7 +4,7 @@ import os
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 import threading
 import unittest
@@ -56,6 +56,15 @@ class TestTraceFunctions(unittest.TestCase):
         self.assertEqual(mod.global_trace_level, 5)
         mod.global_trace_level = orig
 
+    def test_global_trace_level_env_var(self):
+        import importlib
+
+        with patch.dict(os.environ, {"SGLANG_TRACE_LEVEL": "2"}):
+            importlib.reload(mod)
+            self.assertEqual(mod.global_trace_level, 2)
+        importlib.reload(mod)  # restore default (SGLANG_TRACE_LEVEL unset → 3)
+        self.assertEqual(mod.global_trace_level, 3)
+
     def test_get_global_tracing_enabled(self):
         self.assertEqual(get_global_tracing_enabled(), mod.opentelemetry_initialized)
 
@@ -67,7 +76,7 @@ class TestTraceFunctions(unittest.TestCase):
 
 class TestDataclasses(unittest.TestCase):
     def test_trace_thread_info(self):
-        info = TraceThreadInfo("host", 123, "label", 0, 1)
+        info = TraceThreadInfo("host", 123, "label", 0, 1, 0)
         self.assertEqual(info.thread_label, "label")
 
     def test_trace_event(self):
@@ -79,7 +88,7 @@ class TestDataclasses(unittest.TestCase):
         self.assertEqual(s.slice_name, "slice")
 
     def test_trace_thread_context(self):
-        info = TraceThreadInfo("h", 1, "l", 0, 0)
+        info = TraceThreadInfo("h", 1, "l", 0, 0, 0)
         ctx = TraceThreadContext(thread_info=info, cur_slice_stack=[])
         self.assertEqual(len(ctx.cur_slice_stack), 0)
 
@@ -114,32 +123,38 @@ class TestTraceCustomIdGenerator(unittest.TestCase):
 # __get_host_id
 class TestGetHostId(unittest.TestCase):
     def test_from_machine_id_file(self):
-        with patch("os.path.exists", return_value=True), patch(
-            "builtins.open",
-            unittest.mock.mock_open(read_data="abc123\n"),
+        with (
+            patch("os.path.exists", return_value=True),
+            patch(
+                "builtins.open",
+                unittest.mock.mock_open(read_data="abc123\n"),
+            ),
         ):
             self.assertEqual(_get_host_id(), "abc123")
 
     def test_from_machine_id_file_error(self):
         """Falls back to MAC address when file read fails."""
-        with patch("os.path.exists", return_value=True), patch(
-            "builtins.open", side_effect=IOError("read error")
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("builtins.open", side_effect=IOError("read error")),
         ):
             result = _get_host_id()
             self.assertIsInstance(result, str)
             self.assertGreater(len(result), 0)
 
     def test_from_mac_address(self):
-        with patch("os.path.exists", return_value=False), patch(
-            "uuid.getnode", return_value=0x112233445566
+        with (
+            patch("os.path.exists", return_value=False),
+            patch("uuid.getnode", return_value=0x112233445566),
         ):
             result = _get_host_id()
             self.assertIsInstance(result, str)
             self.assertGreater(len(result), 0)
 
     def test_unknown_fallback(self):
-        with patch("os.path.exists", return_value=False), patch(
-            "uuid.getnode", return_value=0
+        with (
+            patch("os.path.exists", return_value=False),
+            patch("uuid.getnode", return_value=0),
         ):
             self.assertEqual(_get_host_id(), "unknown")
 
@@ -514,7 +529,7 @@ class TestTraceReqContextEnabled(unittest.TestCase):
 
         pid = threading.get_native_id()
         mod.threads_info[pid] = TraceThreadInfo(
-            "host", pid, "sched", tp_rank=0, dp_rank=0
+            "host", pid, "sched", tp_rank=0, dp_rank=0, pp_rank=0
         )
         ctx = TraceReqContext(rid="req-1")
         ctx.trace_req_start(ts=1000)

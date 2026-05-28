@@ -30,9 +30,13 @@ import torch.distributed
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.observability.metrics_collector import ExpertDispatchCollector
+from sglang.srt.observability.metrics_collector import (
+    STAT_LOGGER_ROLE_EXPERT_DISPATCH,
+    ExpertDispatchCollector,
+    resolve_collector_class,
+)
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import Withable, get_int_env_var
+from sglang.srt.utils import Withable, get_device, get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
@@ -475,6 +479,9 @@ def _list_sum(a: List, b: List) -> List:
 class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
     def __init__(self, *args, enable_global_physical_experts: bool, **kwargs):
         super().__init__(*args, **kwargs)
+
+        device = get_device()
+
         self._enable_global_physical_experts = enable_global_physical_experts
         self._data = torch.zeros(
             (
@@ -486,7 +493,7 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
                 ),
             ),
             dtype=torch.int,
-            device="cuda",
+            device=device,
         )
 
     def reset(self):
@@ -669,7 +676,12 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             self.window_sizes = [10, 100, 1000]
             self._history = _DequeCollection(maxlens=self.window_sizes)
             self._rank = torch.distributed.get_rank()
-            self._expert_dispatch_collector = ExpertDispatchCollector(
+            expert_dispatch_cls = resolve_collector_class(
+                self._server_args,
+                STAT_LOGGER_ROLE_EXPERT_DISPATCH,
+                ExpertDispatchCollector,
+            )
+            self._expert_dispatch_collector = expert_dispatch_cls(
                 self._expert_location_metadata.ep_size
             )
             self._metric_heatmap_collection_counter = 0

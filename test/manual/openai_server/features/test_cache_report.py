@@ -24,6 +24,7 @@ class TestCacheReport(CustomTestCase):
             timeout=300,
             other_args=[
                 "--chunked-prefill-size=40",
+                "--attention-backend=triton",
                 "--enable-cache-report",
             ],
         )
@@ -206,6 +207,14 @@ class TestCacheReport(CustomTestCase):
 
     #     asyncio.run(run_test())
 
+    @staticmethod
+    def _get_cached_tokens(response) -> int:
+        """Extract cached_tokens from response, returning 0 if prompt_tokens_details is None."""
+        details = response.usage.prompt_tokens_details
+        if details is None:
+            return 0
+        return int(details.cached_tokens)
+
     def test_cache_salt_effectiveness(self):
         print("=" * 100)
         print("Testing cache_salt effectiveness")
@@ -221,7 +230,7 @@ class TestCacheReport(CustomTestCase):
             max_tokens=10,
             extra_body={"cache_salt": "salt1"},
         )
-        cached_tokens_1_first = int(response1.usage.prompt_tokens_details.cached_tokens)
+        cached_tokens_1_first = self._get_cached_tokens(response1)
         prompt_tokens_1 = int(response1.usage.prompt_tokens)
         print(
             f"First request with salt1 - cached_tokens: {cached_tokens_1_first}, prompt_tokens: {prompt_tokens_1}"
@@ -235,9 +244,7 @@ class TestCacheReport(CustomTestCase):
             max_tokens=10,
             extra_body={"cache_salt": "salt1"},
         )
-        cached_tokens_1_second = int(
-            response2.usage.prompt_tokens_details.cached_tokens
-        )
+        cached_tokens_1_second = self._get_cached_tokens(response2)
         print(
             f"Second request with salt1 - cached_tokens: {cached_tokens_1_second}, prompt_tokens: {prompt_tokens_1}"
         )
@@ -258,7 +265,7 @@ class TestCacheReport(CustomTestCase):
             max_tokens=10,
             extra_body={"cache_salt": "salt2"},
         )
-        cached_tokens_2_first = int(response3.usage.prompt_tokens_details.cached_tokens)
+        cached_tokens_2_first = self._get_cached_tokens(response3)
         print(f"First request with salt2 - cached_tokens: {cached_tokens_2_first}")
 
         # Verify no cache hit for different salt (should be similar to first request with salt1)
@@ -274,14 +281,12 @@ class TestCacheReport(CustomTestCase):
             max_tokens=10,
             extra_body={"cache_salt": "salt2"},
         )
-        cached_tokens_2_second = int(
-            response4.usage.prompt_tokens_details.cached_tokens
-        )
+        cached_tokens_2_second = self._get_cached_tokens(response4)
         print(f"Second request with salt2 - cached_tokens: {cached_tokens_2_second}")
 
         # Verify cache hit for salt2
         assert (
-            cached_tokens_2_second == cached_tokens_2_first
+            cached_tokens_2_second > cached_tokens_2_first
         ), "Should have cache hit with same cache_salt for salt2"
 
 
