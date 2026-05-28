@@ -21,7 +21,7 @@ QWEN35_FP4_MODEL = "nvidia/Qwen3.5-397B-A17B-NVFP4"
 ACC_THRESHOLDS = {QWEN35_FP4_MODEL: {"gsm8k": 0.95}}
 
 
-class TestQwen35FP4MTPV2(ReasoningTokenUsageMixin, CustomTestCase):
+class TestQwen35FP4MTP(ReasoningTokenUsageMixin, CustomTestCase):
     reasoning_parser_name = "qwen3"
 
     @classmethod
