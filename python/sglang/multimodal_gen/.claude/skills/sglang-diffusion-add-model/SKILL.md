@@ -246,10 +246,14 @@ The `PipelineConfig` holds static model configuration and defines callback metho
 
 from dataclasses import dataclass, field
 
+import torch
+
+from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ImagePipelineConfig,      # for image generation
-    # SpatialImagePipelineConfig,  # alternative base
-    # VideoPipelineConfig,         # for video generation
+    ImagePipelineConfig,
+    ModelTaskType,
+    # PipelineConfig,              # common base for many video pipelines
+    # SpatialImagePipelineConfig,  # alternative base for spatial image models
 )
 from sglang.multimodal_gen.configs.models.dits.mymodel import MyModelDitConfig
 from sglang.multimodal_gen.configs.models.vaes.mymodel import MyModelVAEConfig
@@ -313,6 +317,11 @@ class MyModelPipelineConfig(ImagePipelineConfig):
         """Optional post-processing after VAE decoding."""
         return frames
 ```
+
+There is no separate `VideoPipelineConfig` base class. For video models, choose
+`ModelTaskType.T2V`, `ModelTaskType.I2V`, or `ModelTaskType.TI2V`, and follow
+existing video configs such as Wan, LTX, Hunyuan, Helios, or MOVA when deciding
+whether to subclass `PipelineConfig` directly or use a model-specific base.
 
 **Important**: The `prepare_pos_cond_kwargs` / `prepare_neg_cond_kwargs` methods define what the DiT receives at each denoising step. These must match the DiT's `forward()` signature.
 
@@ -502,14 +511,20 @@ In `python/sglang/multimodal_gen/registry.py`, register your configs:
 
 ```python
 register_configs(
-    model_family="my_model",
     sampling_param_cls=MyModelSamplingParams,
     pipeline_config_cls=MyModelPipelineConfig,
     hf_model_paths=[
         "org/my-model-name",  # HuggingFace model ID(s)
     ],
+    model_detectors=[
+        lambda path: "my-model" in path.lower(),
+    ],
 )
 ```
+
+`register_configs()` does not take a `model_family` argument. It registers the
+sampling and pipeline config classes, then resolves models by exact
+`hf_model_paths` or optional detector predicates.
 
 The `EntryClass` in your pipeline file is automatically discovered by the registry's `_discover_and_register_pipelines()` function -- no additional registration needed for the pipeline class itself.
 
@@ -590,4 +605,5 @@ After the model produces non-noise output, read
 [references/testing-and-accuracy.md](references/testing-and-accuracy.md) before
 adding GPU cases, component-accuracy skips/hooks, suite entries, or benchmark
 claims. That reference tracks the current `gpu_cases.py` / `testcase_configs.py`
-/ `run_suite.py` split and the component-accuracy decision rules.
+/ `accuracy_testcase_configs.py` / `run_suite.py` split and the component-accuracy
+decision rules.

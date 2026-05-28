@@ -86,7 +86,7 @@ import { KimiK26Deployment } from '/src/snippets/autoregressive/kimi-k26-deploym
 
 ### 3.2 Configuration Tips
 
-- **Memory**: Requires GPUs with ≥140GB each. Supported platforms: H200 (8×, TP=8), B300 (8×, TP=8), MI300X/MI325X (4×, TP=4), MI350X/MI355X (4×, TP=4). Use `--context-length 128000` to conserve memory.
+- **Memory**: Requires GPUs with ≥140GB each. Supported platforms: H200 (8×, TP=8), B200 (8×, TP=8), B300 (8×, TP=8), GB200 (4×, TP=4), GB300 (4×, TP=4), MI300X/MI325X (4×, TP=4), MI350X/MI355X (4×, TP=4). Use `--context-length 128000` to conserve memory.
 - **AMD GPU TP Constraint**: On AMD GPUs, TP must be ≤ 4 (not 8). Kimi-K2.6 has 64 attention heads; the AITER MLA kernel requires `heads_per_gpu % 16 == 0`. With TP=4, each GPU gets 16 heads (valid). With TP=8, each GPU gets 8 heads (invalid).
 - **AMD Docker Image**: Use `lmsysorg/sglang:v0.5.9-rocm700-mi35x` for MI350X/MI355X and `lmsysorg/sglang:v0.5.9-rocm700-mi30x` for MI300X/MI325X.
 - **DP Attention**: Enable with `--dp <N> --enable-dp-attention` for production throughput. A common choice is to set `--dp` equal to `--tp`, but this is not required.
@@ -693,9 +693,41 @@ python3 eval.py ocrbench \
 
 #### 5.1.5 MMMU Pro Vision
 
-```text Output
-Pending update...
+- Dataset: [MMMU Pro](https://huggingface.co/datasets/MMMU/MMMU_Pro) standard 10-option subset (1,730 questions with images)
+- Evaluation Tool: [Kimi-Vendor-Verifier](https://github.com/MoonshotAI/Kimi-Vendor-Verifier) (inspect-ai based)
+- Settings: max_tokens=32,768, thinking mode (default), max_connections=256
+
+> **Important**: Kimi-K2.6 is a reasoning model. Setting `max_tokens` too low (e.g., 4096) causes the thinking process to consume the entire token budget, leaving no tokens for the final answer. Use `max_tokens=32768` or higher.
+
+**Evaluation Command:**
+
+```shell Command
+cd Kimi-Vendor-Verifier
+
+OPENAI_BASE_URL=http://localhost:30000/v1 OPENAI_API_KEY=placeholder \
+python3 eval.py mmmu \
+  --model openai/moonshotai/Kimi-K2.6 \
+  --max-tokens 32768 \
+  --think-mode none \
+  --max-connections 256
 ```
+
+**Results (1,481/1,730 samples completed):**
+
+<table>
+  <thead>
+    <tr>
+      <th>Evaluation Mode</th>
+      <th>Accuracy</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>pass@1</td>
+      <td><strong>82.2%</strong></td>
+    </tr>
+  </tbody>
+</table>
 
 ### 5.2 Speed Benchmark
 

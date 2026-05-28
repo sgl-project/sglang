@@ -36,6 +36,11 @@ This section covers the main performance levers for SGLang Diffusion: attention 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Optimized attention implementations (FlashAttention, SageAttention, etc.)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Inference Batching</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Scheduler</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Request batching for native diffusion serving</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Profiling</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Diagnostics</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>PyTorch Profiler and Nsight Systems guidance</td>
@@ -46,6 +51,7 @@ This section covers the main performance levers for SGLang Diffusion: attention 
 ## Start Here
 
 - Use [Attention Backends](./attention_backends) to choose the best backend for your model and hardware.
+- Use [Inference Batching](./dynamic_batching) to improve throughput for compatible concurrent requests.
 - Use [Caching Acceleration](./caching-acceleration) to reduce denoising cost with Cache-DiT or TeaCache.
 - Use [Profiling](./profiling) when you need to diagnose a bottleneck rather than guess.
 

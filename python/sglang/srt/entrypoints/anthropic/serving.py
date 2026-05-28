@@ -146,6 +146,14 @@ class AnthropicServing:
                         )
                         if image_part is not None:
                             tool_content_parts.append(image_part)
+                    elif item_type == "tool_reference":
+                        # Anthropic uses `tool_name`; the SGLang chat template
+                        # matches on `name`. Translate at the boundary.
+                        ref_name = item.get("tool_name") or item.get("name")
+                        if ref_name:
+                            tool_content_parts.append(
+                                {"type": "tool_reference", "name": ref_name}
+                            )
 
                 tool_text = "\n".join(tool_text_parts)
                 if (
@@ -270,39 +278,41 @@ class AnthropicServing:
 
         chat_request = ChatCompletionRequest(**request_data)
 
-        # Convert tools
+        # Convert tools. Deferred tools stay in the list with defer_loading=True;
+        # the chat template hides them from the initial <tools> block and renders
+        # them on demand when a tool_reference block names them.
         if anthropic_request.tools:
-            tools = []
-            for tool in anthropic_request.tools:
-                tools.append(
-                    Tool(
-                        type="function",
-                        function={
-                            "name": tool.name,
-                            "description": tool.description or "",
-                            "parameters": tool.input_schema,
-                        },
-                    )
+            chat_request.tools = [
+                Tool(
+                    type="function",
+                    defer_loading=tool.defer_loading,
+                    function={
+                        "name": tool.name,
+                        "description": tool.description or "",
+                        "parameters": tool.input_schema,
+                    },
                 )
-            chat_request.tools = tools
+                for tool in anthropic_request.tools
+            ]
 
         # Convert tool choice
         if anthropic_request.tool_choice is not None:
-            if anthropic_request.tool_choice.type == "none":
+            tc_type = anthropic_request.tool_choice.type
+            if tc_type == "none":
                 chat_request.tool_choice = "none"
-            elif anthropic_request.tool_choice.type == "auto":
-                chat_request.tool_choice = "auto"
-            elif anthropic_request.tool_choice.type == "any":
-                chat_request.tool_choice = "required"
-            elif anthropic_request.tool_choice.type == "tool":
-                chat_request.tool_choice = ToolChoice(
-                    type="function",
-                    function=ToolChoiceFuncName(
-                        name=anthropic_request.tool_choice.name
-                    ),
-                )
-        elif anthropic_request.tools:
-            # Default to auto when tools are provided
+            elif chat_request.tools:
+                if tc_type == "auto":
+                    chat_request.tool_choice = "auto"
+                elif tc_type == "any":
+                    chat_request.tool_choice = "required"
+                elif tc_type == "tool":
+                    chat_request.tool_choice = ToolChoice(
+                        type="function",
+                        function=ToolChoiceFuncName(
+                            name=anthropic_request.tool_choice.name
+                        ),
+                    )
+        elif chat_request.tools:
             chat_request.tool_choice = "auto"
 
         return chat_request

@@ -2,10 +2,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from sglang.srt.speculative.adaptive_spec_params import (
-    AdaptiveSpeculativeParams,
-    load_adaptive_config,
-)
+from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -71,15 +68,14 @@ class AdaptiveController:
     The worker only needs to:
       1. Call ``register()`` for the initial state, then ``init_states()``
          once during startup.
-      2. Call ``on_verify_complete(accept_lengths)`` after each decode verify.
+      2. Call ``on_verify_complete(num_correct_drafts_per_req)`` after each decode verify.
     """
 
     def __init__(self, worker: AdaptiveSpecWorker, config_path: str | None = None):
         self.worker = worker
-        cfg = load_adaptive_config(config_path)
         self.params = AdaptiveSpeculativeParams(
             initial_steps=worker.speculative_num_steps,
-            config=cfg,
+            cfg_path=config_path,
         )
         self._states: dict[int, SpecRuntimeState] = {}
 
@@ -107,9 +103,9 @@ class AdaptiveController:
             self._states[steps] = state
         self._activate(self.params.current_steps)
 
-    def on_verify_complete(self, accept_lengths: list[int]) -> None:
+    def on_verify_complete(self, num_correct_drafts_per_req: list[int]) -> None:
         """Feed verify results; switch runtime state if EMA warrants it."""
-        if self.params.update(accept_lengths):
+        if self.params.update(num_correct_drafts_per_req):
             self._activate(self.params.current_steps)
 
     def _activate(self, speculative_num_steps: int) -> None:

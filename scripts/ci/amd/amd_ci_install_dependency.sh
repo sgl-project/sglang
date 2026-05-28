@@ -26,9 +26,9 @@ done
 OPTIONAL_DEPS="${1:-}"
 
 # Build python extras
-EXTRAS="dev_hip"
+EXTRAS="dev_hip,tracing"
 if [ -n "$OPTIONAL_DEPS" ]; then
-    EXTRAS="dev_hip,${OPTIONAL_DEPS}"
+    EXTRAS="dev_hip,tracing,${OPTIONAL_DEPS}"
 fi
 echo "Installing python extras: [${EXTRAS}]"
 
@@ -128,7 +128,12 @@ if [[ -n "${SKIP_TT_DEPS}" ]]; then
   echo "Didn't build lmms_eval, human-eval, and others"
 else
   # For lmms_evals evaluating MMMU
-  docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+  # Clone on host (with retry), then copy into the container. The checkout is
+  # owned by the runner (non-root); mark it safe so setuptools_scm /
+  # vcs_versioning can run `git` introspection during pip install.
+  git_clone_with_retry https://github.com/EvolvingLMMs-Lab/lmms-eval.git lmms-eval "--branch v0.4.1"
+  docker cp lmms-eval ci_sglang:/
+  docker exec ci_sglang git config --global --add safe.directory /lmms-eval
   install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
 
   git_clone_with_retry https://github.com/akao-amd/human-eval.git human-eval
@@ -169,7 +174,7 @@ EOF
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache pytest
 
   # Install cache-dit for qwen_image_t2i_cache_dit_enabled test (added in PR 16204)
-  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache cache-dit || echo "cache-dit installation failed"
+  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade 'cache-dit==1.3.0' || echo "cache-dit installation failed"
 
   # Install accelerate for distributed training and inference support
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache accelerate || echo "accelerate installation failed"
@@ -265,10 +270,15 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     docker exec ci_sglang git clone https://github.com/ROCm/aiter.git /sgl-workspace/aiter
 
     # checkout correct version and install requirements
+    # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
+    # AITER's .gitattributes (*.csv text eol=lf, added in ROCm/aiter#3370) does
+    # not block switching to commits that predate that rule. The working tree
+    # was just produced by `rm -rf` + fresh `git clone` above, so there are no
+    # real user changes to preserve.
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
         git fetch --all && \
-        git checkout ${REPO_AITER_COMMIT} && \
+        git checkout -f ${REPO_AITER_COMMIT} && \
         git submodule update --init --recursive && \
         pip install -r requirements.txt
     "
@@ -301,7 +311,7 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     # build AITER
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
-        GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
+        AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
     "
 
     echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="

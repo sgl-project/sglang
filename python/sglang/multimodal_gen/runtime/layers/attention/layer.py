@@ -1,10 +1,12 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+from contextlib import nullcontext
 from typing import Type
 
 import torch
 import torch.nn as nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
@@ -34,6 +36,13 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.utils import get_compute_dtype
+
+_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
+    SDPBackend.CUDNN_ATTENTION,
+    SDPBackend.FLASH_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.MATH,
+]
 
 
 class UlyssesAttention(nn.Module):
@@ -246,6 +255,7 @@ class LocalAttention(nn.Module):
             head_size, dtype, supported_attention_backends=supported_attention_backends
         )
         impl_cls = attn_backend.get_impl_cls()
+        self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
         self.attn_impl = impl_cls(
             num_heads=num_heads,
             head_size=head_size,
@@ -304,15 +314,21 @@ class LocalAttention(nn.Module):
                     mask = mask[:, None, :, :]
                 mask = (mask - 1.0) * torch.finfo(q_.dtype).max
 
-            return torch.nn.functional.scaled_dot_product_attention(
-                q_,
-                k_,
-                v_,
-                attn_mask=mask,
-                dropout_p=0.0,
-                is_causal=False,
-                scale=self.softmax_scale,
-            ).transpose(1, 2)
+            sdpa_context = (
+                sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+                if self.allow_cudnn_sdp and q_.device.type == "cuda"
+                else nullcontext()
+            )
+            with sdpa_context:
+                return torch.nn.functional.scaled_dot_product_attention(
+                    q_,
+                    k_,
+                    v_,
+                    attn_mask=mask,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=self.softmax_scale,
+                ).transpose(1, 2)
 
         output = self.attn_impl.forward(q, k, v, attn_metadata=ctx_attn_metadata)
         return output
@@ -373,6 +389,7 @@ class USPAttention(nn.Module):
                     f"Please ensure your platform supports these backends."
                 )
         impl_cls: Type["AttentionImpl"] = attn_backend.get_impl_cls()
+        self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
         self.attn_impl = impl_cls(
             num_heads=num_heads,
             head_size=head_size,
@@ -401,6 +418,7 @@ class USPAttention(nn.Module):
         attn_mask: torch.Tensor | None = None,
         num_replicated_prefix: int = 0,
         num_replicated_suffix: int = 0,
+        num_replicated_kv_prefix: int = 0,
         skip_sequence_parallel_override: bool = False,
     ) -> torch.Tensor:
         """
@@ -415,6 +433,12 @@ class USPAttention(nn.Module):
             num_replicated_suffix: number of trailing tokens in q/k/v that are
                 replicated across all SP ranks, e.g. caption tokens appended
                 after image tokens in Z-Image joint attention.
+            num_replicated_kv_prefix: number of leading tokens in k/v only
+                (not q) that are replicated across all SP ranks. Used for
+                cross-attention where the keys/values include a fully-replicated
+                conditioning prefix (e.g. cached text K/V) followed by a
+                sequence-sharded suffix (image tokens). Q has no replicated
+                portion and is fully sequence-sharded.
 
         Note: Replicated tensors are not supported in this implementation.
         When skip_sequence_parallel=True (set at construction time), all SP
@@ -453,15 +477,21 @@ class USPAttention(nn.Module):
                 k_ = k.transpose(1, 2)
                 v_ = v.transpose(1, 2)
                 mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
-                return torch.nn.functional.scaled_dot_product_attention(
-                    q_,
-                    k_,
-                    v_,
-                    attn_mask=mask,
-                    dropout_p=0.0,
-                    is_causal=False,
-                    scale=self.softmax_scale,
-                ).transpose(1, 2)
+                sdpa_context = (
+                    sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+                    if self.allow_cudnn_sdp and q_.device.type == "cuda"
+                    else nullcontext()
+                )
+                with sdpa_context:
+                    return torch.nn.functional.scaled_dot_product_attention(
+                        q_,
+                        k_,
+                        v_,
+                        attn_mask=mask,
+                        dropout_p=0.0,
+                        is_causal=False,
+                        scale=self.softmax_scale,
+                    ).transpose(1, 2)
 
             if get_ring_parallel_world_size() > 1:
                 raise NotImplementedError(
@@ -478,6 +508,10 @@ class USPAttention(nn.Module):
                 k = _usp_input_all_to_all(k, head_dim=2)
                 v = _usp_input_all_to_all(v, head_dim=2)
 
+            # If NCCL timeout/deadlock occurs here, check whether
+            # attn_mask is inconsistent across SP ranks (None on some, Tensor on
+            # others), which causes all_gather participant mismatch. Upstream
+            # mask builders must ensure all ranks produce the same mask type.
             gathered_mask = sequence_model_parallel_all_gather(
                 attn_mask.contiguous(), dim=1
             )
@@ -485,15 +519,21 @@ class USPAttention(nn.Module):
             k_ = k.transpose(1, 2)
             v_ = v.transpose(1, 2)
             mask = _prepare_sdpa_mask(gathered_mask, dtype=q_.dtype, device=q_.device)
-            out = torch.nn.functional.scaled_dot_product_attention(
-                q_,
-                k_,
-                v_,
-                attn_mask=mask,
-                dropout_p=0.0,
-                is_causal=False,
-                scale=self.softmax_scale,
-            ).transpose(1, 2)
+            sdpa_context = (
+                sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+                if self.allow_cudnn_sdp and q_.device.type == "cuda"
+                else nullcontext()
+            )
+            with sdpa_context:
+                out = torch.nn.functional.scaled_dot_product_attention(
+                    q_,
+                    k_,
+                    v_,
+                    attn_mask=mask,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=self.softmax_scale,
+                ).transpose(1, 2)
             if sp_size > 1:
                 out = _usp_output_all_to_all(out, head_dim=2)
             return out
@@ -504,9 +544,19 @@ class USPAttention(nn.Module):
             return out
 
         sp_size = get_ulysses_parallel_world_size()
-        if num_replicated_prefix > 0 and num_replicated_suffix > 0:
+        if (
+            sum(
+                bool(n)
+                for n in (
+                    num_replicated_prefix,
+                    num_replicated_suffix,
+                    num_replicated_kv_prefix,
+                )
+            )
+            > 1
+        ):
             raise ValueError(
-                "USPAttention does not support replicated prefix and suffix at the same time."
+                "USPAttention supports at most one replicated-token mode per call."
             )
         if sp_size > 1 and num_replicated_prefix > 0:
             return self._forward_with_replicated_prefix(
@@ -515,6 +565,10 @@ class USPAttention(nn.Module):
         if sp_size > 1 and num_replicated_suffix > 0:
             return self._forward_with_replicated_suffix(
                 q, k, v, ctx_attn_metadata, num_replicated_suffix
+            )
+        if sp_size > 1 and num_replicated_kv_prefix > 0:
+            return self._forward_with_replicated_kv_prefix(
+                q, k, v, ctx_attn_metadata, num_replicated_kv_prefix
             )
 
         # Ulysses-style All-to-All for sequence/head sharding
@@ -602,6 +656,48 @@ class USPAttention(nn.Module):
         out_rep = torch.cat(gathered, dim=2)
 
         return torch.cat([out_rep, out_shard], dim=1)
+
+    def _forward_with_replicated_kv_prefix(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        ctx_attn_metadata,
+        num_rep: int,
+    ) -> torch.Tensor:
+        """Ulysses cross-attention where only K/V have a replicated prefix.
+
+        Q is sequence-sharded across SP ranks with no replicated portion. K/V
+        carry a fully-replicated prefix (``[:num_rep]``, same on every rank,
+        e.g. cached text K/V) followed by a sequence-sharded suffix (e.g.
+        image tokens) that aligns with Q's sharding.
+
+        Strategy:
+        1. All-to-all Q and the sharded K/V suffix (seq → head shard).
+        2. Locally slice the replicated K/V prefix to the same head shard.
+        3. Concatenate prefix + suffix on the sequence dim and attend.
+        4. All-to-all the output back (head shard → seq shard).
+        """
+        sp_rank = get_sp_parallel_rank()
+
+        k_rep, k_shard = k[:, :num_rep], k[:, num_rep:]
+        v_rep, v_shard = v[:, :num_rep], v[:, num_rep:]
+
+        q = _usp_input_all_to_all(q, head_dim=2)
+        k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
+        v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
+
+        h_kv_local = k_shard.shape[2]
+        h_start = sp_rank * h_kv_local
+        h_end = h_start + h_kv_local
+        k_rep = k_rep[:, :, h_start:h_end, :].contiguous()
+        v_rep = v_rep[:, :, h_start:h_end, :].contiguous()
+
+        k = torch.cat([k_rep, k_shard], dim=1)
+        v = torch.cat([v_rep, v_shard], dim=1)
+
+        out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+        return _usp_output_all_to_all(out, head_dim=2)
 
     def _forward_with_replicated_suffix(
         self,
