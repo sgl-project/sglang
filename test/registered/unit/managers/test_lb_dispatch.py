@@ -1,4 +1,4 @@
-"""Unit tests for DataParallelController dispatch + DPBudget state machine.
+"""Unit tests for DataParallelController dispatch + DPBudget.dispatch.
 
 Covers the simpler LB algorithms:
   - round_robin (counter + active-worker skip)
@@ -9,6 +9,9 @@ The most complex algorithm, total_tokens, is exercised end-to-end in
 test/registered/disaggregation/test_disaggregation_dp_attention.py — its
 tie-breaking on total_requests transitively covers total_requests state
 as well.
+
+DPBudget.update_budget field mapping is tested separately in
+test_dp_budget.py (same directory); this file focuses on dispatch logic.
 
 Fragility note:
   The scheduler-method tests bypass ``DataParallelController.__init__``
@@ -63,31 +66,11 @@ def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None):
     )
 
 
-def _load(dp_rank, running=0, waiting=0, total_tokens=0):
-    """Minimal GetLoadsReqOutput stand-in for DPBudget.update_budget."""
-    return SimpleNamespace(
-        dp_rank=dp_rank,
-        num_running_reqs=running,
-        num_waiting_reqs=waiting,
-        num_total_tokens=total_tokens,
-    )
+class TestDPBudgetDispatch(CustomTestCase):
+    """DPBudget.dispatch picks rank from current state and increments counters.
 
-
-class TestDPBudget(CustomTestCase):
-    """DPBudget is a self-contained state machine — no mocks needed."""
-
-    def test_update_budget_sums_running_and_waiting(self):
-        budget = DPBudget(dp_size=4)
-        budget.update_budget(
-            SimpleNamespace(
-                loads=[
-                    _load(dp_rank=0, running=2, waiting=1, total_tokens=100),
-                    _load(dp_rank=1, running=1, waiting=0, total_tokens=50),
-                ]
-            )
-        )
-        self.assertEqual(budget.total_requests, [3, 1, 0, 0])
-        self.assertEqual(budget.total_tokens, [100, 50, 0, 0])
+    update_budget field mapping is covered separately by test_dp_budget.py.
+    """
 
     def test_total_requests_dispatch_picks_min_and_increments(self):
         budget = DPBudget(dp_size=3)
