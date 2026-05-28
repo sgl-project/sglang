@@ -63,3 +63,25 @@ DS sparse selection during PREFILL/extend mishandles the extend-token batch layo
 Note: simply skipping DS selection during prefill would diverge from DSA (which DOES
 select for prefill queries), so verify against DSA semantics before choosing.
 This is the blocker for AC-1.1 (genuine sparsity needs seq>top_k) and real-shape runs.
+
+## CONFIRMED mechanism (user-flagged call site forward_mla.py:268-290)
+`q = self.q_b_proj(q)[0].view(-1, num_local_heads, qk_head_dim)` makes `q_nope_for_ds`
+shape `[num_tokens, H, dim]` — ONE query row per token in the forward. Decode:
+num_tokens == num_reqs (works). Prefill/extend: num_tokens = all extend tokens (≫ num_reqs).
+The DS selection takes per-REQUEST `req_pool_indices` / `seq_lens` (len = num_reqs) but
+derives its batch from the query rows (`bs = queries.shape[0]` in
+`_compute_logical_token_scores`; same in the graph-safe grid). So it indexes
+`req_pool_indices[batch_id]` for batch_id up to num_tokens → reads past the
+num_reqs-length tensor → garbage pool indices ("N bad req_pool_indices in batch") →
+out-of-range physical slots → CUDA illegal access. The loop4 DS selection was written
+against the DECODE batch shape and never correctly handled the prefill per-token batch.
+
+## Fix direction
+The prefill DS selection must run per extend-token: for each query row, use its
+request's pool index and its absolute sequence position. Build per-token
+`req_pool_indices` (repeat each request's pool index by its extend length, e.g. via
+`forward_batch.extend_seq_lens` / `extend_start_loc`) and per-token effective
+`seq_lens` (the token's position+1, since each prefill token attends to its own prefix),
+then feed those to the selector — matching how DSA's lightning indexer selects per
+prefill query. Validate that selected logical positions stay within each token's prefix
+and that `0 < sparsity_rate < 1` for a >top_k prompt (AC-1.1) without OOB.
