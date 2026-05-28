@@ -817,15 +817,17 @@ class XPUAttentionBackend(AttentionBackend):
             value_cache = value_cache.view(
                 -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
             )
-            # XPU flash-attn does not support fp8 inputs; cast fp8 kv cache
-            # back to the compute dtype (bf16/fp16) before calling flash_attn.
+            # XPU flash-attn does not support fp8 inputs; use a lazy mirror
+            # buffer to avoid re-allocating and copying the full KV cache on
+            # every prefill step.  Only newly-written pages are copied.
             # This only fires when kv_cache_quant_algo=FP8 is set in the model
             # config (e.g. nvidia/Llama-3.3-70B-Instruct-FP8).  All other models
             # have key_cache.dtype == q.dtype already so the branch is skipped.
             _prefill_compute_dtype = q.dtype
             if key_cache.dtype != _prefill_compute_dtype:
-                key_cache = key_cache.to(_prefill_compute_dtype)
-                value_cache = value_cache.to(_prefill_compute_dtype)
+                key_cache, value_cache = self._get_kv_mirror(
+                    layer.layer_id, key_cache, value_cache, _prefill_compute_dtype
+                )
             if self.is_encoder_decoder and forward_batch.encoder_lens is not None:
                 page_table, cache_seqlens, causal = self._encoder_decoder_page_table(
                     layer, metadata
@@ -1377,13 +1379,16 @@ class XPUAttentionBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
             )
 
-            # XPU flash-attn does not support fp8 inputs; cast fp8 kv cache
-            # and q back to compute dtype before any flash_attn call.
-            # compute_dtype was saved before q was cast to kv_cache_dtype above.
+            # XPU flash-attn does not support fp8 inputs; use a lazy mirror
+            # buffer to avoid re-allocating and copying the full KV cache on
+            # every decode step.  Only newly-written pages are copied.
+            # q is cast directly (.to()) since it is a small per-step tensor.
             # Only fires for models with kv_cache_quant_algo=FP8 (e.g. Llama-3.3-FP8).
-            if key_cache.dtype != compute_dtype or q.dtype != compute_dtype:
-                key_cache = key_cache.to(compute_dtype)
-                value_cache = value_cache.to(compute_dtype)
+            if key_cache.dtype != compute_dtype:
+                key_cache, value_cache = self._get_kv_mirror(
+                    layer.layer_id, key_cache, value_cache, compute_dtype
+                )
+            if q.dtype != compute_dtype:
                 q = q.to(compute_dtype)
             if self.is_encoder_decoder and forward_batch.encoder_lens is not None:
                 page_table, cache_seqlens, causal = self._encoder_decoder_page_table(
