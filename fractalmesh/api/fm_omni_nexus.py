@@ -7,21 +7,24 @@ Endpoints: /api/health /api/stats /api/agents /api/affiliates
 Auto-refreshes every 30s in browser.
 Samuel James Hiotis | ABN 56 628 117 363 | Sole Trader
 """
-import os
 import json
+import os
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
 
 try:
-    from fastapi import FastAPI
-    from fastapi.responses import HTMLResponse, JSONResponse
     import uvicorn
+    from fastapi import FastAPI, Request
+    from fastapi.responses import HTMLResponse, JSONResponse
 except ImportError:
     raise SystemExit(
         "[fm-omni-nexus] fastapi/uvicorn not installed. "
         "Run: pip install fastapi uvicorn"
     )
+
+from flags import ggh
+from flags import router as flags_router
 
 ROOT = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))
 DB   = os.path.join(ROOT, "database", "sovereign.db")
@@ -33,6 +36,7 @@ ABN      = "56 628 117 363"
 SITE     = "https://fractalmesh.net"
 
 app = FastAPI(title="FractalMesh Omni Nexus", version="2.1.0")
+app.include_router(flags_router)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -70,13 +74,14 @@ def _pm2_list() -> list:
 # ── API endpoints ─────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
-def health():
+def health(request: Request):
     return {
         "status":    "ok",
         "operator":  OPERATOR,
         "abn":       ABN,
         "ts":        datetime.now(tz=timezone.utc).isoformat(),
         "db_exists": os.path.exists(DB),
+        "flags":     {"ggh": ggh(request)},
     }
 
 
