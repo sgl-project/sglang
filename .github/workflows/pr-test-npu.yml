@@ -23,10 +23,6 @@ concurrency:
   group: pr-test-npu-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
-env:
-  CANN_910b_image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-910b-ubuntu22.04-py3.11
-  CANN_a3_image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.11
-
 jobs:
   # ==================== Check Changes ==================== #
   check-changes:
@@ -81,6 +77,19 @@ jobs:
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
 
+  set-image-config:
+    runs-on: ubuntu-latest
+    outputs:
+      CANN_image_a3: ${{ steps.set-vars.outputs.CANN_image_a3 }}
+      CANN_image_910b: ${{ steps.set-vars.outputs.CANN_image_910b }}
+    steps:
+      # When triggered by PR, no inputs parameters are used. The latest community code is tested by default.
+      - name: Set image config
+        id: set-vars
+        run: |
+          echo "CANN_image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
+          echo "CANN_image_910b=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-910b-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
+
   stage-b-test-1-npu-a2:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
@@ -90,7 +99,7 @@ jobs:
       matrix:
         part: [ 0, 1 ]
     container:
-      image: ${{ env.CANN_910b_image }}
+      image: ${{ needs.set-image-config.outputs.CANN_image_910b }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -143,7 +152,7 @@ jobs:
       matrix:
         part: [0, 1]
     container:
-      image: ${{ env.CANN_910b_image }}
+      image: $${{ needs.set-image-config.outputs.CANN_image_910b }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -192,7 +201,7 @@ jobs:
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a3-4
     container:
-      image: ${{ env.CANN_a3_image }}
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -242,7 +251,7 @@ jobs:
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a3-16
     container:
-      image: ${{ env.CANN_a3_image }}
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -291,7 +300,7 @@ jobs:
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: linux-aarch64-a3-2
     container:
-      image: ${{ env.CANN_a3_image }}
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -348,7 +357,7 @@ jobs:
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: linux-aarch64-a3-16
     container:
-      image: ${{ env.CANN_a3_image }}
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -405,7 +414,7 @@ jobs:
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: linux-aarch64-a3-8
     container:
-      image: ${{ env.CANN_a3_image }}
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
