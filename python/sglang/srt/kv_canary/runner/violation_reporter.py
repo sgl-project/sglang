@@ -4,7 +4,7 @@ import logging
 
 from sglang.jit_kernel.kv_canary.consts import FailReason
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
-from sglang.srt.kv_canary.config import CanaryConfig
+from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.state import CanaryDeviceState
 
 logger = logging.getLogger(__name__)
@@ -59,7 +59,7 @@ class ViolationReporter:
         self._last_logged_write_index = valid_count
 
         # log mode: always surface every violation as WARNING.
-        if self._config.mode == "log":
+        if self._config.mode is CanaryMode.LOG:
             for message in messages:
                 logger.warning(message)
             return

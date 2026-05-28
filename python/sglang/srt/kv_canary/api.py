@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 import torch
 
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
-from sglang.srt.kv_canary.config import CanaryConfig
+from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.pool_patcher.api import attach_canary_buffers
 from sglang.srt.kv_canary.pool_patcher.utils import wrap_method
@@ -29,7 +29,7 @@ def install_canary(
     token_oracle_manager: Optional["TokenOracleManager"] = None,
 ) -> Optional[CanaryManager]:
     config = CanaryConfig.from_env(server_args)
-    if config.mode == "none":
+    if config.mode is CanaryMode.NONE:
         return None
 
     assert server_args.disable_piecewise_cuda_graph, (

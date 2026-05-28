@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 from sglang.jit_kernel.kv_canary.consts import (
     RealKvHashMode,
@@ -27,7 +27,7 @@ class CanaryConfig:
     install_canary(server_args, model_runner) once. Subsequent runtime never mutates it.
 
     Fields:
-        mode: "none" | "log" | "raise". none = no canary installed; log = canary runs, violations are logged
+        mode: CanaryMode value. none = no canary installed; log = canary runs, violations are logged
             but do NOT raise (used for production observability + canary self-test perturb); raise =
             violations propagate to host as RuntimeError after the next D2H pump.
         ring_capacity: Violation ring capacity (rows in ViolationLog.violation_ring). Sized generously;
@@ -50,7 +50,7 @@ class CanaryConfig:
             "canary protected N tokens, ran M sweep passes, K violations so far" every N forward steps.
     """
 
-    mode: Literal["none", "log", "raise"]
+    mode: CanaryMode
     ring_capacity: int
     sweep_interval: int
     real_kv_hash_mode: RealKvHashMode
@@ -69,7 +69,7 @@ class CanaryConfig:
         real_kv_raw = server_args.kv_canary_real_data.strip().upper()
 
         return cls(
-            mode=mode_raw,  # type: ignore[arg-type]
+            mode=CanaryMode(mode_raw),
             ring_capacity=envs.SGLANG_KV_CANARY_RING_CAPACITY.get(),
             sweep_interval=server_args.kv_canary_sweep_interval,
             real_kv_hash_mode=RealKvHashMode[real_kv_raw],
