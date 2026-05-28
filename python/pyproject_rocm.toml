@@ -88,54 +88,6 @@ tracing = [
   "opentelemetry-exporter-otlp-proto-grpc",
 ]
 
-# For Intel Gaudi(device : hpu) follow the installation guide
-# https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
-srt_hpu = ["sglang[runtime_common]"]
-
-# https://docs.sglang.io/platforms/mthreads_gpu.md
-srt_musa = [
-  "sglang[runtime_common]",
-  "torch",
-  "torch_musa",
-  "torchada>=0.1.57",
-  "mthreads-ml-py",
-  "mate>=0.2.0",
-  "deep-gemm>=0.1.3",
-  "flash_attn_3>=0.1.4",
-  "numpy<2.0",
-]
-
-diffusion_musa = [
-  "sglang[diffusion_common]",
-  "st_attn==0.0.7",
-  "vsa==0.0.4",
-  "runai_model_streamer>=0.15.5",
-  "cache-dit==1.1.8",
-]
-
-# https://docs.sglang.io/platforms/mps.md
-srt_mps = [
-    "sglang[runtime_common]",
-    "torch==2.11.0",
-    "torchao==0.9.0",
-    "torchaudio==2.11.0",
-    "torchvision",
-    "mlx",
-    "mlx-lm",
-]
-
-diffusion_mps = [
-  "sglang[diffusion_common]",
-  "cloudpickle==3.1.2",
-  "remote-pdb==2.1.0",
-  "cache-dit==1.2.3",
-  "addict==2.4.0",
-  "av==16.1.0",
-  "scikit-image==0.25.2",
-  "trimesh>=4.0.0",
-  "xatlas",
-]
-
 test = [
   "accelerate",
   "expecttest",
@@ -143,19 +95,59 @@ test = [
   "jsonlines",
   "matplotlib",
   "pandas",
-  "peft>=0.18.0,<0.19.0", # Pin to <0.19.0 due to torchao incompatibility
+  "peft>=0.18.0",
   "pytest",
   "sentence_transformers",
   "tabulate",
 ]
 
-all_hpu = ["sglang[srt_hpu]"]
-all_musa = ["sglang[srt_musa]", "sglang[diffusion_musa]"]
-all_mps = ["sglang[srt_mps]", "sglang[diffusion_mps]"]
+# ROCm 7.0.0 specific packages
+# Pin torch, triton, torchaudio, torchvision from ROCm repos
+# Pin sglang-kernel to matching ROCm wheel from GitHub releases
+rocm700 = [
+  "torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torch-2.9.1.dev20251204%2Brocm7.0.2.lw.git351ff442-cp310-cp310-linux_x86_64.whl",
+  "triton @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/triton-3.5.1%2Brocm7.0.2.gita272dfa8-cp310-cp310-linux_x86_64.whl",
+  "torchaudio @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torchaudio-2.9.0%2Brocm7.0.2.gite3c6ee2b-cp310-cp310-linux_x86_64.whl",
+  "torchvision @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torchvision-0.24.0%2Brocm7.0.2.gitb919bd0c-cp310-cp310-linux_x86_64.whl",
+  "mooncake-transfer-engine-non-cuda==0.3.8.post1",
+  "sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.4.1/sglang_kernel-0.4.1+rocm700-cp310-abi3-manylinux2014_x86_64.whl",
+  "amd-aiter",
+]
 
-dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
-dev_musa = ["sglang[all_musa]", "sglang[test]"]
-dev_mps = ["sglang[all_mps]", "sglang[test]"]
+# ROCm 7.2.0 specific packages
+rocm720 = [
+  "torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torch-2.9.1%2Brocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl",
+  "triton @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/triton-3.5.1%2Brocm7.2.0.gita272dfa8-cp310-cp310-linux_x86_64.whl",
+  "torchaudio @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torchaudio-2.9.0%2Brocm7.2.0.gite3c6ee2b-cp310-cp310-linux_x86_64.whl",
+  "torchvision @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torchvision-0.24.0%2Brocm7.2.0.gitb919bd0c-cp310-cp310-linux_x86_64.whl",
+  "mooncake-transfer-engine-non-cuda==0.3.8.post1",
+  "sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.4.1/sglang_kernel-0.4.1+rocm720-cp310-abi3-manylinux2014_x86_64.whl",
+  "amd-aiter",
+]
+
+# HIP (Heterogeneous-computing Interface for Portability) for AMD
+# Install with one of:
+#   pip install "sglang[srt_hip,rocm700]"
+#   pip install "sglang[srt_hip,rocm720]"
+srt_hip = [
+  "sglang[runtime_common]",
+  "torch",
+  "petit_kernel==0.0.2",
+  "wave-lang==3.8.2",
+]
+
+diffusion_hip = [
+  "sglang[diffusion_common]",
+  "peft>=0.18.0",
+  "st_attn==0.0.7",
+  "vsa==0.0.4",
+  "runai_model_streamer>=0.15.5",
+  "cache-dit==1.1.8",
+]
+
+all_hip = ["sglang[srt_hip]", "sglang[diffusion_hip]"]
+
+dev_hip = ["sglang[all_hip]", "sglang[test]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
@@ -198,3 +190,5 @@ version_file = "sglang/_version.py"
 git_describe_command = ["python3", "python/tools/get_version_tag.py"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
+# v3: No local version scheme (no +rocm suffix on sglang wheels)
+local_scheme = "no-local-version"
