@@ -22,10 +22,15 @@ limitations under the License.
 #include <torch/library.h>
 #include <torch/torch.h>
 
+#include <optional>
 #include <tuple>
 #include <vector>
 
 #include "scalar_type.hpp"
+
+#ifdef USE_MUSA
+#include "sgl_kernel_musa_ops.h"
+#endif
 
 #define _CONCAT(A, B) A##B
 #define CONCAT(A, B) _CONCAT(A, B)
@@ -168,7 +173,44 @@ void fast_topk_transform_ragged_interface(
 
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
+
+void deepseek_v4_topk_transform_512(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    const at::Tensor& page_table,
+    at::Tensor& page_indices,
+    int64_t page_size,
+    std::optional<at::Tensor> raw_indices_opt = std::nullopt);
 #endif
+
+/*
+ * From csrc/elementwise (DeepSeek-V4 norm + rope)
+ */
+void dsv4_fused_q_norm_rope(
+    const at::Tensor& q_input,
+    at::Tensor& q_output,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions,
+    double eps);
+
+void dsv4_fused_k_norm_rope_flashmla(
+    const at::Tensor& kv,
+    const at::Tensor& kv_weight,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions,
+    const at::Tensor& out_loc,
+    at::Tensor& kvcache,
+    double eps,
+    int64_t page_size);
+
+void dsv4_fused_q_indexer_rope_hadamard_quant(
+    const at::Tensor& q_input,
+    at::Tensor& q_fp8,
+    const at::Tensor& weight,
+    at::Tensor& weights_out,
+    double weight_scale,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions);
 
 /*
  * From csrc/gemm
@@ -326,6 +368,35 @@ void apply_shuffle_mul_sum(
     torch::Tensor& output,
     const torch::Tensor& permutation,
     const std::optional<torch::Tensor>& factors);
+
+/*
+ * From csrc/elementwise (DeepSeek-V4 norm + rope)
+ */
+void dsv4_fused_q_norm_rope(
+    const at::Tensor& q_input,
+    at::Tensor& q_output,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions,
+    double eps);
+
+void dsv4_fused_k_norm_rope_flashmla(
+    const at::Tensor& kv,
+    const at::Tensor& kv_weight,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions,
+    const at::Tensor& out_loc,
+    at::Tensor& kvcache,
+    double eps,
+    int64_t page_size);
+
+void dsv4_fused_q_indexer_rope_hadamard_quant(
+    const at::Tensor& q_input,
+    at::Tensor& q_fp8,
+    const at::Tensor& weight,
+    at::Tensor& weights_out,
+    double weight_scale,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions);
 
 void fused_qk_norm_rope(
     torch::Tensor& qkv,
@@ -807,8 +878,12 @@ std::vector<at::Tensor> fwd_kvcache_mla(
     const at::Tensor& tile_scheduler_metadata,  // num_sm_parts x TileSchedulerMetaDataSize
     const at::Tensor& num_splits,               // batch_size + 1
     const bool& is_fp8,
-    const std::optional<at::Tensor>& indices  // None, or batch_size x seqlen_q x topk
-);
+    const std::optional<at::Tensor>& indices,  // None, or batch_size x seqlen_q x topk
+    const std::optional<at::Tensor>& attn_sink,
+    const std::optional<at::Tensor>& extra_k_cache,
+    const std::optional<at::Tensor>& extra_indices_in_kvcache,
+    const std::optional<at::Tensor>& topk_length,
+    const std::optional<at::Tensor>& extra_topk_length);
 
 void FMHACutlassSM100FwdRun(
     at::Tensor workspace_buffer,
@@ -825,8 +900,14 @@ void FMHACutlassSM100FwdRun(
     int64_t max_seqlen_kv,
     bool is_varlen);
 
-std::vector<at::Tensor>
-sparse_prefill_fwd(const at::Tensor& q, const at::Tensor& kv, const at::Tensor& indices, double sm_scale, int64_t d_v);
+std::vector<at::Tensor> sparse_prefill_fwd(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    double sm_scale,
+    int64_t d_v,
+    const std::optional<at::Tensor>& attn_sink,
+    const std::optional<at::Tensor>& topk_length);
 
 std::vector<at::Tensor> fwd_kvcache_mla_fp8(
     at::Tensor& q,             // batch_size x seqlen_q x num_heads x head_size

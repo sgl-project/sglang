@@ -268,13 +268,13 @@ curl -sS -L "http://localhost:30010/v1/videos/<VIDEO_ID>/content" \
 The server supports dynamic loading, merging, and unmerging of LoRA adapters.
 
 **Important Notes:**
-- Mutual Exclusion: Only one LoRA can be *merged* (active) at a time
-- Switching: To switch LoRAs, you must first `unmerge` the current one, then `set` the new one
+- Mutual Exclusion: Only one LoRA configuration can be active per target at a time
+- Switching: To switch LoRAs, deactivate the current LoRA with `unmerge_lora_weights`, then `set` the new one
 - Caching: The server caches loaded LoRA weights in memory. Switching back to a previously loaded LoRA (same path) has little cost
 
 **Set LoRA Adapter**
 
-Loads one or more LoRA adapters and merges their weights into the model. Supports both single LoRA (backward compatible) and multiple LoRA adapters.
+Loads one or more LoRA adapters and applies them to the model. By default, regular weights are statically merged, while FSDP-sharded weights use dynamic LoRA to avoid full-gather memory peaks.
 
 **Endpoint:** `POST /v1/set_lora`
 
@@ -287,6 +287,7 @@ Loads one or more LoRA adapters and merges their weights into the model. Support
   - `"transformer_2"`: Apply only to transformer_2 (low noise for Wan2.2)
   - `"critic"`: Apply only to the critic model
 - `strength` (float or list of floats, optional): LoRA strength for merge, default 1.0. If a list, must match the length of `lora_nickname`. Values < 1.0 reduce the effect, values > 1.0 amplify the effect
+- `merge_mode` (string, optional): `"auto"` (default server policy), `"merge"` (force static merge), or `"dynamic"` (apply LoRA at forward time)
 
 **Single LoRA Example:**
 
@@ -331,7 +332,7 @@ curl -X POST http://localhost:30010/v1/set_lora \
 > When using multiple LoRAs:
 > - All list parameters (`lora_nickname`, `lora_path`, `target`, `strength`) must have the same length
 > - If `target` or `strength` is a single value, it will be applied to all LoRAs
-> - Multiple LoRAs applied to the same target will be merged in order
+> - Multiple LoRAs applied to the same target are applied in order
 
 
 **Merge LoRA Weights**
@@ -339,7 +340,7 @@ curl -X POST http://localhost:30010/v1/set_lora \
 Manually merges the currently set LoRA weights into the base model.
 
 > [!NOTE]
-> `set_lora` automatically performs a merge, so this is typically only needed if you have manually unmerged but want to re-apply the same LoRA without calling `set_lora` again.*
+> With FSDP-sharded weights, manual merge may require a full-gather and can OOM. Use `set_lora` with `merge_mode="auto"` or `"dynamic"` for the lower-peak path.
 
 **Endpoint:** `POST /v1/merge_lora_weights`
 
@@ -395,6 +396,7 @@ curl -sS -X GET "http://localhost:30010/v1/list_loras"
         "nickname": "lora2",
         "path": "tarn59/pixel_art_style_lora_z_image_turbo",
         "merged": true,
+        "mode": "merged",
         "strength": 1.0
       }
     ]

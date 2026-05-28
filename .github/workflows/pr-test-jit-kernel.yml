@@ -9,18 +9,13 @@ on:
       sgl_kernel:
         required: true
         type: string
-      b200_runner:
+      runner_config:
         required: true
         type: string
-      pr_head_sha:
-        required: false
+      runs_on_map:
+        required: true
         type: string
-        default: ''
       git_ref:
-        required: false
-        type: string
-        default: ''
-      target_stage:
         required: false
         type: string
         default: ''
@@ -28,7 +23,7 @@ on:
         required: false
         type: string
         default: 'false'
-      skip_stage_health_check:
+      skip_pr_test_health_check:
         required: false
         type: boolean
         default: false
@@ -40,22 +35,21 @@ env:
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
-  SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == true && 'true' || 'false' }}
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check == true && 'true' || 'false' }}
 
 jobs:
   jit-kernel-unit-test:
     if: |
       github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != 'true' &&
-      !inputs.target_stage
+      inputs.test_parallel_dispatch != 'true'
     runs-on: 1-gpu-h100
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
+      - uses: ./.github/actions/check-pr-test-health
 
       - uses: ./.github/actions/check-maintenance
 
@@ -82,19 +76,18 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-kernel-unit-1-gpu-large
+          python3 run_suite.py --hw cuda --suite base-b-kernel-unit-1-gpu-large
 
   jit-kernel-multigpu-unit-test:
     if: |
       github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != 'true' &&
-      !inputs.target_stage
+      inputs.test_parallel_dispatch != 'true'
     runs-on: 8-gpu-h200
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-maintenance
 
@@ -121,21 +114,20 @@ jobs:
         timeout-minutes: 45
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-kernel-unit-8-gpu-h200
+          python3 run_suite.py --hw cuda --suite base-b-kernel-unit-8-gpu-h200
 
   jit-kernel-benchmark-test:
     if: |
       github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != 'true' &&
-      !inputs.target_stage
+      inputs.test_parallel_dispatch != 'true'
     runs-on: 1-gpu-h100
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
+      - uses: ./.github/actions/check-pr-test-health
 
       - uses: ./.github/actions/check-maintenance
 
@@ -162,21 +154,20 @@ jobs:
         timeout-minutes: 45
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-kernel-benchmark-1-gpu-large
+          python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-1-gpu-large
 
   jit-kernel-b200-test:
     if: |
       github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != 'true' &&
-      !inputs.target_stage
-    runs-on: ${{ inputs.b200_runner }}
+      inputs.test_parallel_dispatch != 'true'
+    runs-on: ${{ fromJson(inputs.runs_on_map)[inputs.runner_config] }}
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
+      - uses: ./.github/actions/check-pr-test-health
 
       - uses: ./.github/actions/check-maintenance
 
@@ -203,4 +194,4 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-kernel-unit-1-gpu-b200
+          python3 run_suite.py --hw cuda --suite base-b-kernel-unit-1-gpu-b200
