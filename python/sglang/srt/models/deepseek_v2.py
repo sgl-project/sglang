@@ -1723,6 +1723,17 @@ class DeepseekV2AttentionMLA(
     ):
         if self.attn_mha.kv_b_proj is None:
             self.attn_mha.kv_b_proj = self.kv_b_proj
+        # The DS token-label write hook projects the latent K through the
+        # attention layer's kv_b_proj. Decode runs on attn_mqa (the absorbed
+        # MQA path), which — unlike attn_mha — was never given kv_b_proj, so
+        # _write_token_labels bailed at its `kv_b_proj is None` guard and decode
+        # tokens were never labelled. DS could then only ever select the prompt
+        # tokens, losing all generated context and degenerating into repetition.
+        # Attach it on attn_mqa too (DS-only; leaves non-DS behavior unchanged).
+        # The hook derives the per-head reshape width from the projection output,
+        # so attn_mqa's larger v_head_dim does not affect label extraction.
+        if self.use_double_sparsity and getattr(self.attn_mqa, "kv_b_proj", None) is None:
+            self.attn_mqa.kv_b_proj = self.kv_b_proj
 
         # when hidden_states is a tuple of tensors, the tuple will include quantized weight and scale tensor
         if isinstance(hidden_states, tuple):

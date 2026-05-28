@@ -1546,7 +1546,13 @@ class DeepseekSparseAttnBackend(
         nope_dim = self._ds_qk_nope_head_dim
         # kv_b_proj output is per-head [K_nope | V]; reshape first so that
         # slicing [:nope_dim] picks K-noPE columns, not V columns of earlier heads.
-        head_width = nope_dim + layer.v_head_dim
+        # Derive the per-head width from the projection output, NOT from
+        # ``layer.v_head_dim``: this hook fires from both the prefill attention
+        # layer (attn_mha, v_head_dim=128) and the decode layer (attn_mqa, whose
+        # v_head_dim is the absorbed kv_lora_rank=512). Using layer.v_head_dim
+        # produced a wrong reshape ([T,H,640] vs the real [T,H,256]) and crashed
+        # decode label writes; the projection's own output width is correct for both.
+        head_width = kv_proj_out.shape[-1] // H_local
         k_nope = kv_proj_out.view(T, H_local, head_width)[..., :nope_dim].contiguous()
 
         layer_id = layer.layer_id
