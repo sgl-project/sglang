@@ -4,26 +4,22 @@ export const Step37FlashDeployment = () => {
       name: 'hardware',
       title: 'Hardware Platform',
       items: [
-        { id: 'h200', label: 'H200', default: true },
+        { id: 'hopper', label: 'Hopper', default: true },
         { id: 'b200_b300', label: 'B200/B300', default: false },
         { id: 'gb200_gb300', label: 'GB200/GB300', default: false }
-      ]
-    },
-    modelsize: {
-      name: 'modelsize',
-      title: 'Model Size',
-      items: [
-        { id: '196b', label: '196B', subtitle: 'MOE', default: true },
       ]
     },
     quantization: {
       name: 'quantization',
       title: 'Quantization',
-      items: [
-        { id: 'bf16', label: 'BF16', default: true },
-        { id: 'fp8', label: 'FP8', default: false },
-        { id: 'nvfp4', label: 'NVFP4', default: false }
-      ]
+      getDynamicItems: (values) => {
+        const isHopper = values.hardware === 'hopper';
+        return [
+          { id: 'bf16', label: 'BF16', default: true },
+          { id: 'fp8', label: 'FP8', default: false },
+          ...(isHopper ? [] : [{ id: 'nvfp4', label: 'NVFP4', default: false }])
+        ];
+      }
     },
     reasoningParser: {
       name: 'reasoningParser',
@@ -46,10 +42,13 @@ export const Step37FlashDeployment = () => {
     speculative: {
       name: 'speculative',
       title: 'Speculative Decoding',
-      items: [
-        { id: 'disabled', label: 'Disabled', default: true },
-        { id: 'enabled', label: 'Enabled', default: false }
-      ],
+      getDynamicItems: (values) => {
+        const isNVFP4 = values.quantization === 'nvfp4';
+        return [
+          { id: 'disabled', label: 'Disabled', default: true },
+          { id: 'enabled', label: 'Enabled', default: false, disabled: isNVFP4, disabledReason: 'Not supported with NVFP4' }
+        ];
+      },
       commandRule: (value) => {
         if (value !== 'enabled') return null;
 
@@ -60,26 +59,12 @@ export const Step37FlashDeployment = () => {
     }
   };
 
-  const modelConfigs = {
-    '196b': {
-      baseName: '196b',
-      isMOE: true,
-      h200: { tp: 4, bf16: true },
-      b200_b300: { tp: 4, bf16: true },
-      gb200_gb300: { tp: 4, bf16: true },
-    },
-  };
-
   const generateCommand = (values) => {
-    const { hardware, modelsize: modelSize, quantization, reasoningParser } = values;
+    const { hardware, quantization } = values;
     const isNVFP4 = quantization === 'nvfp4';
-
-    const modelSizeConfig = modelConfigs[modelSize];
-    const hwConfig = modelSizeConfig[hardware];
     const quantSuffix = quantization === 'fp8' ? '-FP8' : quantization === 'nvfp4' ? '-NVFP4' : '';
     const modelName = `stepfun-ai/Step-3.7-Flash${quantSuffix}`;
-
-    let tpValue = hwConfig.tp;
+    const tpValue = hardware === 'gb200_gb300' ? 4 : 8;
 
     let cmd = '';
 
@@ -94,11 +79,12 @@ export const Step37FlashDeployment = () => {
       cmd += ` \\\n  --ep ${tpValue}`;
     }
 
-    // NVFP4 requires additional flags
+    // NVFP4 requires additional flags (Blackwell only)
     if (isNVFP4) {
-      cmd += ' \\\n  --quantization modelopt_fp4';
-      cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
       cmd += ' \\\n  --moe-runner-backend flashinfer_trtllm';
+      cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
+      cmd += ' \\\n  --quantization modelopt_fp4';
+      cmd += ' \\\n  --attention-backend trtllm_mha';
     }
 
     // Trust remote code for custom architecture
@@ -175,7 +161,18 @@ export const Step37FlashDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+    setValues((prev) => {
+      const next = { ...prev, [optionName]: value };
+      // Reset nvfp4 to bf16 when switching to Hopper
+      if (optionName === 'hardware' && value === 'hopper' && prev.quantization === 'nvfp4') {
+        next.quantization = 'bf16';
+      }
+      // Reset speculative to disabled when switching to nvfp4
+      if (optionName === 'quantization' && value === 'nvfp4' && prev.speculative === 'enabled') {
+        next.speculative = 'disabled';
+      }
+      return next;
+    });
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {

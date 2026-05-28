@@ -8,13 +8,20 @@ import { Step37FlashDeployment } from '/src/snippets/autoregressive/step-37-flas
 
 ## 1. Model Introduction
 
-[Step-3.7-Flash](https://huggingface.co/stepfun-ai/Step-3.7-Flash) is StepFun's latest production-grade multimodal reasoning engine, combining elite intelligence with low-latency, cost-effective inference. Built on a Sparse Mixture-of-Experts architecture with integrated vision understanding, Step-3.7-Flash is purpose-built for autonomous agents in real-world workflows. The model is available in multiple quantization formats (BF16, FP8, NVFP4) optimized for different hardware platforms.
+[Step-3.7-Flash](https://huggingface.co/stepfun-ai/Step-3.7-Flash) is a 198B-parameter Mixture-of-Experts (MoE) vision-language model that combines a 196B-parameter language backbone with a 1.8B-parameter vision encoder for native image understanding. Engineered for high-frequency production workloads, it activates approximately 11B parameters per token and supports a 256k context window with three selectable reasoning levels (low, medium, and high). The model is available in multiple quantization formats (BF16, FP8, NVFP4).
 
-Key highlights:
-- **Multimodal Understanding**: Native vision encoder for image understanding, supporting single and multi-image inputs alongside text.
-- **Hybrid Attention Architecture**: Interleaves Sliding Window Attention (SWA) and Global Attention (GA) with a 3:1 ratio and an aggressive 128-token window, ensuring consistent performance across massive datasets while significantly reducing computational overhead.
-- **Sparse Mixture-of-Experts**: Only 11B active parameters out of 196B total parameters.
-- **Multi-Layer Multi-Token Prediction (MTP)**: Equipped with 3-way Multi-Token Prediction (MTP-3) for complex, multi-step reasoning chains with immediate responsiveness.
+Step-3.7-Flash is built for developers who need to scale agentic workflows that combine perception, search, and reasoning — from parsing massive financial reports in one pass, to running multi-step search loops with cross-source verification, to operating concurrent coding agents in high-throughput pipelines.
+
+### Capabilities & Performance
+
+<Note>The specific benchmark values are based on the [Step-3.7-Flash model card](https://huggingface.co/stepfun-ai/Step-3.7-Flash).</Note>
+
+**Multimodal Perception and Verification** — The model delivers top-tier visual intelligence, securing first place on SimpleVQA (Search) with 79.2 and achieving frontier parity on V\* (Python) at 95.3. It accurately processes dense visual interfaces such as UI wireframes, application GUIs, and data charts, mapping them into structured code. When it encounters an incomplete visual asset, it can independently identify missing data and execute lookups to verify context.
+
+**Workflow Integrity and Tool Orchestration** — Step-3.7-Flash leads the ClawEval-1.1 benchmark with 67.1, significantly outperforming the next closest competitor at 59.8. Backed by scores of 49.5 on Toolathlon and 48.1 on HLE w. Tool, it reliably interacts with external APIs and executes long-horizon workflows without drifting from instructions or violating system constraints.
+
+**Code Engineering** — Secured second place on SWE-Bench PRO with 56.3. It can independently trace multi-file repositories, isolate bugs from raw issue reports, and generate functional patches that pass automated unit tests.
+
 
 ## 2. SGLang Installation
 
