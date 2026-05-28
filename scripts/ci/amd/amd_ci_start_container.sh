@@ -303,18 +303,31 @@ for candidate in \
     /home/runner/sglang-data \
     /home/runner/cache \
     /home/runner/.cache \
+    /home/runner/_work/_tool \
+    /home/runner/_work/_actions \
     /sgl-data \
     /sglang-data \
     /mnt/sgl-data \
     /mnt/sglang-data \
     /mnt/cache \
+    /data \
     /data/sgl-data \
     /data/sglang-data \
+    /data2 \
+    /data2/sgl-data \
+    /data2/sglang-data \
+    /data2/models \
+    /data2/models/huggingface \
+    /data2/models/huggingface/hub \
     /run/sgl-data \
     /run/sglang-data \
     /run/cache \
     /run/runner/sgl-data \
-    /run/runner/sglang-data; do
+    /run/runner/sglang-data \
+    /scratch \
+    /cache \
+    /opt/cache \
+    /var/cache/sglang; do
     if [[ -e "$candidate" ]]; then
         if [[ -d "$candidate" ]]; then
             size=$(du -sh "$candidate" 2>/dev/null | cut -f1)
@@ -338,8 +351,17 @@ echo ""
 echo "Host /run contents (often the persistent NVMe on MI runners):"
 ls -la /run 2>/dev/null || echo "  (cannot list /run)"
 echo ""
+echo "Host /run subdirectory sizes (top-level only):"
+du -sh /run/* 2>/dev/null | sort -hr | head -20 || true
+echo ""
+echo "Host /run/* one level deeper (max-depth 2):"
+find /run -maxdepth 2 -type d 2>/dev/null | head -40 || true
+echo ""
 echo "Host /data contents:"
 ls -la /data 2>/dev/null || echo "  (cannot list /data or does not exist)"
+echo ""
+echo "Host /data2 contents:"
+ls -la /data2 2>/dev/null || echo "  (cannot list /data2 or does not exist)"
 echo ""
 echo "Host filesystem usage:"
 df -h 2>/dev/null | head -25 || true
