@@ -8,6 +8,7 @@ import triton.testing
 
 from sglang.jit_kernel.benchmark.utils import run_benchmark_no_cudagraph
 from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import sparse_mla_q8kv8_prefill_fwd
+from sglang.srt.utils import is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
 
@@ -54,7 +55,7 @@ if HAS_Q16_FLASHMLA:
 
 
 def _sm90_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
+    return is_sm90_supported()
 
 
 def _make_indices(s_q: int, s_kv: int, topk: int, d_qk: int) -> torch.Tensor:

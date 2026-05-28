@@ -26,28 +26,11 @@ limitations under the License.
 
 namespace {
 
-static int _q8kv8_num_sm_cache[16] = {0};
-
-static inline int _get_num_sm_cached(int device_id) {
-  if (device_id < 0 || device_id >= 16) {
-    int num_sm;
-    cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device_id);
-    return num_sm;
-  }
-  int cached = _q8kv8_num_sm_cache[device_id];
-  if (cached == 0) {
-    cudaDeviceGetAttribute(&cached, cudaDevAttrMultiProcessorCount, device_id);
-    _q8kv8_num_sm_cache[device_id] = cached;
-  }
-  return cached;
-}
-
 static inline void
-_set_device_stream_and_sm(SparseMlaQ8Kv8PrefillParams& params, tvm::ffi::TensorView q, int64_t cuda_stream) {
+_set_device_and_stream(SparseMlaQ8Kv8PrefillParams& params, tvm::ffi::TensorView q, int64_t cuda_stream) {
   DLDevice dev = q.device();
   cudaSetDevice(dev.device_id);
   params.stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  params.num_sm = _get_num_sm_cached(dev.device_id);
 }
 
 template <int D_QK>
@@ -130,7 +113,7 @@ static inline SparseMlaQ8Kv8PrefillParams _make_common_params(
   params.max_logits = static_cast<float*>(max_logits.data_ptr());
   params.lse = static_cast<float*>(lse.data_ptr());
 
-  _set_device_stream_and_sm(params, q, cuda_stream);
+  _set_device_and_stream(params, q, cuda_stream);
   return params;
 }
 
