@@ -184,6 +184,7 @@ class TestStatusAndFormatting(unittest.TestCase):
             }
         ]
         report = rur.format_report(results, 24, 0.0, longest_waits=waits)
+        self.assertIn(rur.TZ_LABEL, report)  # generated-time stamped with tz
         self.assertIn("| Status |", report)  # new main-table column
         self.assertIn("Longest Queue Waits", report)
         self.assertIn(f"]({url})", report)  # clickable job link

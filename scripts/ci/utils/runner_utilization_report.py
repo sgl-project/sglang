@@ -16,6 +16,17 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
+# Display all clock times in California time (auto PST/PDT). Internals stay in
+# UTC — this only affects how timestamps are rendered in the report.
+try:
+    from zoneinfo import ZoneInfo
+
+    DISPLAY_TZ = ZoneInfo("America/Los_Angeles")
+    TZ_LABEL = "PT"
+except Exception:  # zoneinfo/tzdata unavailable — fall back to UTC
+    DISPLAY_TZ = timezone.utc
+    TZ_LABEL = "UTC"
+
 # Labels to skip when grouping runners (GitHub default labels)
 DEFAULT_LABELS_TO_IGNORE = {"self-hosted", "Linux", "X64", "ARM64"}
 GITHUB_HOSTED_LABELS = {"ubuntu-latest", "ubuntu-22.04", "ubuntu-24.04"}
@@ -632,11 +643,13 @@ def build_queue_timeline(label_jobs, window_start, window_end, max_series=8):
     if total <= 0 or not label_jobs:
         return [], []
     hours = total / 3600
-    n = max(12, min(48, round(hours * 2)))  # ~30-min resolution
+    # Keep the number of x-axis labels low (one per point in mermaid) so they
+    # stay readable — ~2h resolution for a 24h window (~13 labels).
+    n = max(8, min(12, round(hours)))
     step = total / n
     samples = [window_start + timedelta(seconds=step * i) for i in range(n + 1)]
     fmt = _bucket_label_fmt(hours)
-    sample_labels = [t.strftime(fmt) for t in samples]
+    sample_labels = [t.astimezone(DISPLAY_TZ).strftime(fmt) for t in samples]
 
     series = []
     for label, jobs in label_jobs.items():
@@ -681,7 +694,7 @@ def build_load_buckets(label_jobs, window_start, window_end, max_pools=6):
     step = total / n
     edges = [window_start + timedelta(seconds=step * i) for i in range(n + 1)]
     fmt = _bucket_label_fmt(hours)
-    bucket_labels = [edges[i].strftime(fmt) for i in range(n)]
+    bucket_labels = [edges[i].astimezone(DISPLAY_TZ).strftime(fmt) for i in range(n)]
 
     out = []
     for label, jobs in label_jobs.items():
@@ -726,7 +739,8 @@ def format_report(
         "# Runner Utilization Report",
         "",
         f"**Time window:** Last {hours} hours · "
-        f"**Generated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        f"**Generated:** "
+        f"{datetime.now(DISPLAY_TZ).strftime('%Y-%m-%d %H:%M')} {TZ_LABEL}",
         "",
     ]
     if fetch_failure_pct > 1.0:
@@ -770,20 +784,21 @@ def format_report(
                 "",
                 "## Queue Wait Over Time",
                 "",
-                "Longest in-queue wait per runner pool across the window "
-                "(minutes). Queue time is per-pool — a queued job isn't on a "
-                "host yet, so it can't be attributed to a physical runner.",
+                f"Longest in-queue wait per runner pool across the window "
+                f"(minutes; times in {TZ_LABEL}). Queue time is per-pool — a "
+                f"queued job isn't on a host yet, so it can't be attributed to "
+                f"a physical runner.",
                 "",
                 f"**Pools:** {legend}",
                 "",
                 "```mermaid",
-                '%%{init: {"xyChart": {"width": 1400, "height": 520}, '
+                '%%{init: {"xyChart": {"width": 1500, "height": 520}, '
                 '"themeVariables": {"xyChart": {"plotColorPalette": "'
                 + palette
                 + '"}}}}%%',
                 "xychart-beta",
                 '    title "Queue Wait Over Time (min, per runner pool)"',
-                f'    x-axis "Time (UTC)" [{x_cats}]',
+                f'    x-axis "Time ({TZ_LABEL})" [{x_cats}]',
                 f'    y-axis "Wait (min)" 0 --> {ymax}',
             ]
         )
@@ -800,9 +815,10 @@ def format_report(
                 "",
                 "## Running vs Queued Per Hour",
                 "",
-                "Per runner pool: jobs **running** (🔵 line) and **queued** "
-                "(🟠 bars) during each bucket. Bars rising above the line mean "
-                "demand outran capacity and a backlog built up.",
+                f"Per runner pool: jobs **running** (🔵 line) and **queued** "
+                f"(🟠 bars) during each hourly bucket (times in {TZ_LABEL}). "
+                f"Bars rising above the line mean demand outran capacity and a "
+                f"backlog built up.",
             ]
         )
         for lbl, running, queued in pools:
