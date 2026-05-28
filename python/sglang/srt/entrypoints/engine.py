@@ -561,6 +561,78 @@ class Engine(EngineScoreMixin, EngineBase):
         return ret
 
     @classmethod
+    def _launch_weight_cache_daemons(cls, server_args: ServerArgs):
+        """Launch weight cache daemon processes for each GPU/TP rank.
+
+        Each daemon loads model weights into GPU memory and serves them
+        via CUDA IPC handles. Engine processes then load from daemons
+        instead of disk, enabling fast restart.
+        """
+        import multiprocessing as mp
+
+        from sglang.srt.weight_cache.daemon import run_weight_cache_daemon
+        from sglang.srt.weight_cache.protocol import get_ready_path
+
+        tp_size = server_args.tp_size
+        gpu_ids = list(range(tp_size))
+
+        daemon_procs = []
+        logger.info(
+            f"Launching {tp_size} weight cache daemon(s) for model={server_args.model_path}"
+        )
+
+        for gpu_id in gpu_ids:
+            proc = mp.Process(
+                target=run_weight_cache_daemon,
+                kwargs=dict(
+                    model_path=server_args.model_path,
+                    gpu_id=gpu_id,
+                    tp_size=tp_size,
+                    tp_rank=gpu_id,
+                    dp_size=1,
+                    load_format=server_args.load_format,
+                    dtype=server_args.dtype,
+                    quantization=server_args.quantization,
+                    model_loader_extra_config=server_args.model_loader_extra_config,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                ),
+                daemon=True,
+                name=f"weight_cache_daemon_gpu{gpu_id}",
+            )
+            proc.start()
+            daemon_procs.append(proc)
+
+        # Wait for all daemons to be ready (ready file exists)
+        import time
+
+        timeout = 1800  # 30 min timeout for large model loading
+        check_interval = 2
+        elapsed = 0
+        for gpu_id in gpu_ids:
+            ready_path = get_ready_path(gpu_id)
+            while not os.path.exists(ready_path):
+                time.sleep(check_interval)
+                elapsed += check_interval
+                if elapsed > timeout:
+                    raise TimeoutError(
+                        f"Weight cache daemon for gpu={gpu_id} did not become ready "
+                        f"within {timeout}s"
+                    )
+                # Check if daemon process is still alive
+                for p in daemon_procs:
+                    if not p.is_alive():
+                        raise RuntimeError(
+                            f"Weight cache daemon for gpu={gpu_id} exited prematurely "
+                            f"with code {p.exitcode}"
+                        )
+            logger.info(f"Weight cache daemon for gpu={gpu_id} is ready")
+
+        # Store daemon procs for cleanup
+        cls._weight_cache_daemon_procs = daemon_procs
+        logger.info("All weight cache daemons are ready")
+
+    @classmethod
     def _launch_scheduler_processes(
         cls,
         server_args: ServerArgs,
@@ -789,6 +861,10 @@ class Engine(EngineScoreMixin, EngineBase):
             or server_args.tool_call_parser == "auto"
         ):
             resolve_auto_parsers(server_args)
+
+        # Launch weight cache daemons if in daemon mode
+        if server_args.weight_cache_mode == "daemon":
+            cls._launch_weight_cache_daemons(server_args)
 
         # Launch scheduler processes
         scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(

@@ -1268,7 +1268,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             modelopt_config=modelopt_config,
             rl_quant_profile=self.server_args.rl_quant_profile,
             draft_model_idx=self.draft_model_idx,
+            weight_cache_mode=self.server_args.weight_cache_mode,
+            weight_cache_socket=self.server_args.weight_cache_socket,
         )
+
+        # If weight cache is enabled, override load format to IPC_CACHE
+        if self.server_args.weight_cache_mode != "off":
+            self.load_config.load_format = LoadFormat.IPC_CACHE
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
                 self.model_config, self.load_config, self.tp_size

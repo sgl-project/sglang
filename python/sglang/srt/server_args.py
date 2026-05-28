@@ -114,6 +114,7 @@ LOAD_FORMAT_CHOICES = [
     "fastsafetensors",
     "private",
     "runai_streamer",
+    "ipc_cache",
 ]
 
 QUANTIZATION_CHOICES = [
@@ -748,6 +749,8 @@ class ServerArgs:
     enable_memory_saver: bool = False
     enable_weights_cpu_backup: bool = False
     enable_draft_weights_cpu_backup: bool = False
+    weight_cache_mode: str = "off"
+    weight_cache_socket: Optional[str] = None
     allow_auto_truncate: bool = False
     enable_custom_logit_processor: bool = False
     flashinfer_mla_disable_ragged: bool = False
@@ -6384,6 +6387,23 @@ class ServerArgs:
             "--enable-draft-weights-cpu-backup",
             action="store_true",
             help="Save draft model weights to CPU memory during release_weights_occupation and resume_weights_occupation",
+        )
+        parser.add_argument(
+            "--weight-cache-mode",
+            type=str,
+            default="off",
+            choices=["off", "daemon", "client", "copy"],
+            help="Weight cache mode. 'off': normal disk loading. "
+            "'daemon': launch weight cache daemon (holds weights in GPU memory). "
+            "'client': connect to existing daemon and load via IPC. "
+            "'copy': connect to daemon, copy weights to own allocation, then release IPC handle.",
+        )
+        parser.add_argument(
+            "--weight-cache-socket",
+            type=str,
+            default=None,
+            help="Unix socket path for weight cache daemon (client/copy mode). "
+            "If not set, uses /tmp/sglang_weight_cache_gpu{tp_rank}.sock",
         )
         parser.add_argument(
             "--allow-auto-truncate",
