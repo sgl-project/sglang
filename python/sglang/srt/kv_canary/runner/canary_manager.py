@@ -168,10 +168,6 @@ class CanaryManager:
             for _ in range(num_sfms)
         )
 
-    @property
-    def active_tag_count(self) -> int:
-        return len(self._active_tags)
-
     @contextlib.contextmanager
     def with_active_single_forward_manager(self, index: int) -> Iterator[None]:
         assert (

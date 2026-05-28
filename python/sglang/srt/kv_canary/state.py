@@ -53,11 +53,6 @@ class ViolationLog:
             violation_write_index=torch.zeros(1, dtype=torch.int32, device=device),
         )
 
-    def clear(self) -> None:
-        """Reset to all-zero (forgets all past violations)."""
-        self.violation_ring.zero_()
-        self.violation_write_index.zero_()
-
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CanaryDeviceState:
