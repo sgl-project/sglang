@@ -701,8 +701,13 @@ class GemmaRMSNorm(MultiPlatformOp):
         x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
         return x
 
-    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(x)
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return self._forward_impl(x, residual, post_residual_addition)
 
     def forward_with_allreduce_fusion(
         self,
@@ -814,6 +819,21 @@ class Gemma4RMSNorm(MultiPlatformOp):
             # scale_shift=0.0 → standard RMSNorm without +1 shift
             out = rmsnorm(x, self.weight.data, self.eps)
 
+        if needs_reshape:
+            out = out.reshape(original_shape)
+        return out
+
+    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
+        if x.numel() == 0:
+            return x
+        needs_reshape = x.dim() != 2
+        if needs_reshape:
+            original_shape = x.shape
+            x = x.contiguous().reshape(-1, original_shape[-1])
+        if self.with_scale and self.scale_shift == 1.0:
+            out = gemma_rmsnorm(x, self.weight.data, self.eps)
+        else:
+            out = rmsnorm(x, self.weight.data, self.eps)
         if needs_reshape:
             out = out.reshape(original_shape)
         return out
