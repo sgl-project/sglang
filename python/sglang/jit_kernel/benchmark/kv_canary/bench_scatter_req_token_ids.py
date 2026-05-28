@@ -16,7 +16,6 @@ from sglang.jit_kernel.kv_canary.scatter_req_token_ids import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, suite="base-b-kernel-benchmark-1-gpu-large")
 register_cuda_ci(est_time=180, suite="nightly-kernel-1-gpu", nightly=True)
 
 
