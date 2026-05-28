@@ -2379,13 +2379,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         from flashinfer.autotuner import autotune
 
         cache_path = self._flashinfer_autotune_cache_path()
-        logger.info("Running FlashInfer autotune with cache: %s", cache_path)
+        if envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
+            autotune_cache = cache_path
+            logger.info("Running FlashInfer autotune with cache: %s", autotune_cache)
+        else:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            runs_dir = cache_path.parent / "runs"
+            runs_dir.mkdir(parents=True, exist_ok=True)
+            autotune_cache = (
+                runs_dir / f"{cache_path.stem}.{timestamp}{cache_path.suffix}"
+            )
+            logger.info(
+                "Running FlashInfer autotune (cache reuse DISABLED via "
+                "SGLANG_FLASHINFER_AUTOTUNE_CACHE=0); writing fresh result to: %s",
+                autotune_cache,
+            )
 
         # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
         # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
         self.forward_stream.wait_stream(torch.cuda.current_stream())
         with torch.get_device_module(self.device).stream(self.forward_stream):
-            with torch.inference_mode(), autotune(True, cache=str(cache_path)):
+            with torch.inference_mode(), autotune(True, cache=str(autotune_cache)):
                 self._dummy_run(batch_size=self.req_to_token_pool.size)
         torch.cuda.current_stream().wait_stream(self.forward_stream)
         logger.info("FlashInfer autotune completed.")
