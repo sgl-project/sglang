@@ -1050,6 +1050,7 @@ class ModelConfig:
         Used for hybrid checkpoints where `config.json:quantization_config`
         declares FP8 linear + NVFP4 MoE but only the sibling
         `hf_quant_config.json` carries the NVFP4 details.
+        This is for nvidia/DeepSeek-V4-Pro-NVFP4 only, other modelopt checkpoints use the standard config.json.
 
         Returns {"group_size": int, "exclude_modules": list[str]} on success,
         or None when the file is missing or has no NVFP4 entries.
