@@ -23,6 +23,10 @@ concurrency:
   group: pr-test-npu-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
+env:
+  CANN_910b_image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-910b-ubuntu22.04-py3.11
+  CANN_a3_image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.11
+
 jobs:
   # ==================== Check Changes ==================== #
   check-changes:
@@ -86,7 +90,7 @@ jobs:
       matrix:
         part: [ 0, 1 ]
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-910b-ubuntu22.04-py3.11
+      image: ${CANN_910b_image}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -139,7 +143,7 @@ jobs:
       matrix:
         part: [0, 1]
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-910b-ubuntu22.04-py3.11
+      image: ${CANN_910b_image}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -188,7 +192,7 @@ jobs:
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a3-4
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.11
+      image: ${CANN_a3_image}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -238,7 +242,7 @@ jobs:
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a3-16
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.11
+      image: ${CANN_a3_image}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -287,7 +291,7 @@ jobs:
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: linux-aarch64-a3-2
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.11
+      image: ${CANN_a3_image}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -310,7 +314,7 @@ jobs:
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
           pip config set global.trusted-host "${CACHING_URL}"
 
-          bash scripts/ci/npu/npu_ci_install_dependency.sh a3 diffusion
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy gsm8k dataset
@@ -344,7 +348,7 @@ jobs:
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: linux-aarch64-a3-16
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.11
+      image: ${CANN_a3_image}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -367,7 +371,7 @@ jobs:
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
           pip config set global.trusted-host "${CACHING_URL}"
 
-          bash scripts/ci/npu/npu_ci_install_dependency.sh a3 diffusion
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy gsm8k dataset
@@ -401,7 +405,7 @@ jobs:
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: linux-aarch64-a3-8
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.11
+      image: ${CANN_a3_image}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -424,7 +428,7 @@ jobs:
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
           pip config set global.trusted-host "${CACHING_URL}"
 
-          bash scripts/ci/npu/npu_ci_install_dependency.sh a3 diffusion
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy gsm8k dataset
