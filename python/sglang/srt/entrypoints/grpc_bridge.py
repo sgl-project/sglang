@@ -146,9 +146,10 @@ class RuntimeHandle:
         ``payload_coro_factory`` is a zero-arg callable returning a coroutine
         that awaits the operation and returns the success payload (dict/list).
         ``error_payload_fn`` maps a caught exception to the payload sent on
-        the error path; defaults to ``{"message": str(e)}``.
+        the error path; defaults to ``{"error": {"message": str(e)}}``,
+        matching the OpenAI passthrough error shape.
         """
-        error_fn = error_payload_fn or (lambda e: {"message": str(e)})
+        error_fn = error_payload_fn or (lambda e: {"error": {"message": str(e)}})
 
         async def _run() -> None:
             try:
@@ -205,7 +206,14 @@ class RuntimeHandle:
         }
         return self._openai_serving_classes
 
-    def submit_request(self, *, req_type: str, req_dict: dict, chunk_callback):
+    def submit_request(
+        self,
+        *,
+        req_type: str,
+        req_dict: dict,
+        chunk_callback,
+        is_disconnected_fn: Optional[Callable[[], bool]] = None,
+    ):
         """Submit a generate or embed request from a pre-built dict.
 
         The Rust gRPC server builds ``req_dict`` directly from proto fields,
@@ -216,53 +224,82 @@ class RuntimeHandle:
             req_type: "generate" or "embed" (classify uses "embed").
             req_dict: Dict matching the dataclass constructor kwargs.
             chunk_callback: Rust-side PyO3 callback object.
+            is_disconnected_fn: Optional sync callable wrapping the Rust
+                cancellation token; lets TokenizerManager abort the request
+                when the gRPC client drops.
         """
+        mock_request = (
+            MockRequest(is_disconnected_fn=is_disconnected_fn)
+            if is_disconnected_fn is not None
+            else None
+        )
         if req_type == "generate":
             from sglang.srt.managers.io_struct import GenerateReqInput
 
             obj = GenerateReqInput(**req_dict)
             stream = req_dict.get("stream", False)
-            self._submit_on_tm_loop(self._run_generate(obj, chunk_callback, stream))
+            self._submit_on_tm_loop(
+                self._run_generate(obj, chunk_callback, stream, mock_request)
+            )
         elif req_type == "embed":
             from sglang.srt.managers.io_struct import EmbeddingReqInput
 
             obj = EmbeddingReqInput(**req_dict)
-            self._submit_on_tm_loop(self._run_embed(obj, chunk_callback))
+            self._submit_on_tm_loop(self._run_embed(obj, chunk_callback, mock_request))
         else:
             raise ValueError(
                 f"Unknown req_type: {req_type!r} (expected 'generate' or 'embed')"
             )
 
-    async def _run_generate(self, obj, chunk_callback, stream: bool):
+    async def _run_generate(self, obj, chunk_callback, stream: bool, request):
         try:
-            gen = self.tokenizer_manager.generate_request(obj, request=None)
+            gen = self.tokenizer_manager.generate_request(obj, request=request)
             if stream:
                 async for chunk in gen:
                     finished = (
                         chunk.get("meta_info", {}).get("finish_reason") is not None
                     )
-                    chunk_callback(chunk, finished=finished)
+                    self._safe_callback(chunk_callback, chunk, finished=finished)
                     if finished:
                         return
+                # Defensive: generator exited without a finish_reason chunk.
+                # Send a terminal callback so the Rust side closes the stream.
+                self._safe_callback(chunk_callback, {}, finished=True)
             else:
                 result = await gen.__anext__()
-                chunk_callback(result, finished=True)
+                self._safe_callback(chunk_callback, result, finished=True)
         except StopAsyncIteration:
             self._safe_callback(chunk_callback, {}, finished=True)
         except Exception as e:
             logger.error("gRPC generate error for rid=%s: %s", obj.rid, e)
-            self._safe_callback(chunk_callback, {}, finished=True, error=str(e))
+            self._safe_callback(
+                chunk_callback,
+                json.dumps({"error": {"message": str(e)}}).encode("utf-8"),
+                finished=True,
+                error=str(e),
+            )
 
-    async def _run_embed(self, obj, chunk_callback):
+    async def _run_embed(self, obj, chunk_callback, request):
         try:
-            gen = self.tokenizer_manager.generate_request(obj, request=None)
+            gen = self.tokenizer_manager.generate_request(obj, request=request)
             result = await gen.__anext__()
-            chunk_callback(result, finished=True)
+            self._safe_callback(chunk_callback, result, finished=True)
         except StopAsyncIteration:
             self._safe_callback(chunk_callback, {}, finished=True)
         except Exception as e:
             logger.error("gRPC embed error for rid=%s: %s", obj.rid, e)
-            self._safe_callback(chunk_callback, {}, finished=True, error=str(e))
+            self._safe_callback(
+                chunk_callback,
+                json.dumps({"error": {"message": str(e)}}).encode("utf-8"),
+                finished=True,
+                error=str(e),
+            )
+
+    # Bounded so a stuck TM loop can't deadlock the gRPC handler thread that
+    # called abort. abort_request only enqueues a message on the ZMQ socket,
+    # so a few seconds is generous; if we time out, log and drop — the client
+    # will retry or give up.
+    _ABORT_TIMEOUT_S = 5.0
 
     def abort(self, rid: str = "", abort_all: bool = False):
         """Abort a request by request ID or abort all active requests."""
@@ -281,7 +318,17 @@ class RuntimeHandle:
             self._abort_async(rid, abort_all),
             loop,
         )
-        future.result()
+        try:
+            future.result(timeout=self._ABORT_TIMEOUT_S)
+        except TimeoutError:
+            future.cancel()
+            logger.error(
+                "gRPC abort timed out after %ss (rid=%r, abort_all=%s); "
+                "tokenizer_manager loop appears stuck",
+                self._ABORT_TIMEOUT_S,
+                rid,
+                abort_all,
+            )
 
     async def _abort_async(self, rid: str, abort_all: bool) -> None:
         self.tokenizer_manager.abort_request(rid=rid, abort_all=abort_all)
@@ -301,16 +348,10 @@ class RuntimeHandle:
 
     def get_server_info(self) -> str:
         """Return server info as a JSON string."""
-        result: Dict[str, Any] = {}
-        try:
-            sa = self.server_args
-            if hasattr(sa, "model_config"):
-                sa = dataclasses.replace(sa)
-                if hasattr(sa, "model_config"):
-                    delattr(sa, "model_config")
-            result.update(dataclasses.asdict(sa))
-        except Exception:
-            pass
+        # dataclasses.asdict only walks declared fields, so dynamic attrs like
+        # ServerArgs.model_config (set lazily by get_model_config) are
+        # excluded automatically.
+        result: Dict[str, Any] = dict(dataclasses.asdict(self.server_args))
         result.update(self.scheduler_info)
         return json.dumps(result, default=str)
 
@@ -374,12 +415,7 @@ class RuntimeHandle:
             result = await self.tokenizer_manager.get_loads(dp_rank=dp_rank)
             return [dataclasses.asdict(r) for r in result]
 
-        self._submit_json_unary(
-            "get_load",
-            _payload,
-            chunk_callback,
-            error_payload_fn=lambda e: {"error": str(e)},
-        )
+        self._submit_json_unary("get_load", _payload, chunk_callback)
 
     def flush_cache(self, chunk_callback) -> None:
         """Flush the radix cache. Sends result through chunk_callback."""
