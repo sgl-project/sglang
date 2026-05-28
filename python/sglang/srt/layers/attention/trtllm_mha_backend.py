@@ -124,15 +124,29 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             model_runner.server_args.speculative_num_draft_tokens
         )
 
-        # Sliding Window Attention(SWA) hybrid model support.
+        # Sliding Window Attention (SWA) hybrid model support.
         # For hybrid SWA models, the KV cache is split into two pools (full and SWA)
         # with separate index spaces. We maintain a translated page_table for SWA
         # layers so the trtllm kernel reads from the correct pool.
-        kv_pool = model_runner.token_to_kv_pool
-        self.use_sliding_window_kv_pool = isinstance(kv_pool, SWAKVPool)
-        self._swa_kv_pool: Optional[SWAKVPool] = (
-            kv_pool if self.use_sliding_window_kv_pool else None
-        )
+        #
+        # We deliberately do NOT cache ``isinstance(token_to_kv_pool, SWAKVPool)``
+        # at init time. The FROZEN_KV_MTP draft worker constructs this backend
+        # against the non-SWA draft pool and then swaps ``token_to_kv_pool`` to
+        # the target's SWA pool at forward time; a cached flag would go stale
+        # and the SWA-typed layers would hand full-pool page indices to the
+        # trtllm ``fmhaSm100fKernel_*SlidingOrChunkedCausal*`` kernel, which
+        # would trap with ``CUDA error: an illegal memory access`` once the SWA
+        # pool fills. Mirroring flashinfer's pattern, the SWA pool is resolved
+        # per call via the ``_swa_pool`` property below.
+        #
+        # ``model_has_sliding_window`` is still resolved at init time because
+        # CUDA-graph SWA-page-table buffers must be allocated up front (capture
+        # happens before any forward-time pool swap). ``model_runner.sliding_window_size``
+        # is set from ``model.get_attention_sliding_window_size()`` or
+        # ``config.sliding_window_size`` and reflects the *model*, not the pool,
+        # so it is correct for both target and FROZEN_KV_MTP draft backends.
+        _model_sw = getattr(model_runner, "sliding_window_size", None)
+        self.model_has_sliding_window: bool = _model_sw is not None and _model_sw > 0
 
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
@@ -147,22 +161,43 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
 
+    @property
+    def _swa_pool(self) -> Optional[SWAKVPool]:
+        """Return the current SWA pool, or None if the current pool is non-SWA.
+
+        Resolved per call from ``self.token_to_kv_pool`` (mirroring
+        ``flashinfer_backend.py``'s pattern of recomputing the SWA flag
+        per ``call_begin_forward``). This is what makes the backend safe
+        under FROZEN_KV_MTP, which swaps ``token_to_kv_pool`` to the
+        target's SWA pool at forward time.
+        """
+        pool = self.token_to_kv_pool
+        return pool if isinstance(pool, SWAKVPool) else None
+
     def _maybe_translate_swa(
         self, token_indices: torch.Tensor
     ) -> Optional[torch.Tensor]:
         """Translate full-pool token indices to SWA-pool indices, or return None."""
-        if not self.use_sliding_window_kv_pool:
+        swa_pool = self._swa_pool
+        if swa_pool is None:
             return None
         shape = token_indices.shape
-        return self._swa_kv_pool.translate_loc_from_full_to_swa(
+        return swa_pool.translate_loc_from_full_to_swa(
             token_indices.reshape(-1)
         ).reshape(shape)
 
     def _alloc_swa_page_table(
         self, max_bs: int, max_num_pages: int
     ) -> Optional[torch.Tensor]:
-        """Allocate a SWA page_table buffer, or return None for non-SWA models."""
-        if not self.use_sliding_window_kv_pool:
+        """Allocate a SWA page_table buffer, or return None for non-SWA models.
+
+        Keyed off ``self.model_has_sliding_window`` rather than the current
+        pool: CUDA graphs are captured before any FROZEN_KV_MTP pool swap,
+        and the draft worker's pool is initially non-SWA. The buffer must
+        be present at capture time so SWA-typed layers have somewhere to
+        bind their page table when the swap happens at forward time.
+        """
+        if not self.model_has_sliding_window:
             return None
         return torch.zeros(max_bs, max_num_pages, dtype=torch.int32, device=self.device)
 
@@ -184,10 +219,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Return cache locations in the correct index space for the given layer."""
-        if self.use_sliding_window_kv_pool:
-            _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
+        swa_pool = self._swa_pool
+        if swa_pool is not None:
+            _, is_swa = swa_pool.layers_mapping[layer.layer_id]
             if is_swa:
-                return self._swa_kv_pool.translate_loc_from_full_to_swa(
+                return swa_pool.translate_loc_from_full_to_swa(
                     forward_batch.out_cache_loc
                 )
         return forward_batch.out_cache_loc
@@ -203,10 +239,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     def _get_layer_page_table(
         self, layer: RadixAttention, forward_batch: ForwardBatch
     ) -> torch.Tensor:
-        """Return the correct page_table for the given layer (SWA or full)."""
+        """Return the correct page_table for the given layer (SWA or full).
+
+        ``swa_page_table`` is pre-allocated at backend init when the model
+        has any sliding-window layer (see ``_alloc_swa_page_table``), so its
+        presence alone is not enough to decide SWA routing — we additionally
+        need a current SWA pool to read the per-layer ``layers_mapping``
+        from. At forward time both are true iff this layer should read SWA.
+        """
         swa_pt = self.forward_metadata.swa_page_table
-        if swa_pt is not None:
-            _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
+        swa_pool = self._swa_pool
+        if swa_pt is not None and swa_pool is not None:
+            _, is_swa = swa_pool.layers_mapping[layer.layer_id]
             if is_swa:
                 return swa_pt
         return self.forward_metadata.page_table
