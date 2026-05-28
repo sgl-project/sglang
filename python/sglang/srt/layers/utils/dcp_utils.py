@@ -453,12 +453,18 @@ def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
 def all_gather_kv_cache_for_mha_chunk_extend(
     kv_a: torch.Tensor,
     k_pe: torch.Tensor,
+    prefix_kv_lens_cpu: torch.Tensor,
+    prefix_starts_cpu: torch.Tensor = None,
 ):
     if dcp_enabled():
-        return (
-            _all_gather_dcp_kv_cache(kv_a).contiguous(),
-            _all_gather_dcp_kv_cache(k_pe).contiguous(),
+        gathered_kv = all_gather_kv_cache_for_dcp(
+            kv_a,
+            k_pe,
+            prefix_kv_lens_cpu,
+            prefix_starts_cpu,
         )
+        kv_a, k_pe = gathered_kv.split([kv_a.shape[-1], k_pe.shape[-1]], dim=-1)
+        kv_a = kv_a.unsqueeze(1)
     return kv_a, k_pe
 
 

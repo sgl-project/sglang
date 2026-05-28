@@ -9,10 +9,6 @@ import triton.language as tl
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.layers.utils.dcp_utils import (
-    dcp_enabled,
-    get_attention_dcp_world_size,
-)
 from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
     get_token_to_kv_pool,
@@ -144,12 +140,6 @@ class ForwardBatchDeepSeekMHAMixin:
         # chunk_capacity is the maximum number of tokens in each chunk
         chunk_capacity = self.get_max_chunk_capacity()
         self.prefix_chunk_len = chunk_capacity // self.batch_size
-        if dcp_enabled():
-            self.prefix_chunk_len = (
-                self.prefix_chunk_len
-                // get_attention_dcp_world_size()
-                * get_attention_dcp_world_size()
-            )
 
         self.num_prefix_chunks = (
             max(self.extend_prefix_lens_cpu) + self.prefix_chunk_len - 1

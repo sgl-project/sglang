@@ -436,7 +436,10 @@ class DeepseekMHAForwardMixin:
                 kv_indices, kv_a_dtype, forward_batch
             )
             kv_a_normed, k_pe = all_gather_kv_cache_for_mha_chunk_extend(
-                kv_a_normed, k_pe
+                kv_a_normed,
+                k_pe,
+                forward_batch.prefix_chunk_seq_lens_cpu[i],
+                forward_batch.prefix_chunk_starts_cpu[i],
             )
             kv = self.kv_b_proj(kv_a_normed)[0]
             kv = kv.view(
