@@ -6,6 +6,7 @@ import sys
 import pytest
 import torch
 
+from sglang.srt.utils import is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, suite="stage-b-kernel-unit-1-gpu-large")
@@ -25,7 +26,7 @@ S_KV = 256
 
 
 def _sm90_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
+    return is_sm90_supported()
 
 
 def _make_fp8_tensor(shape: tuple[int, ...], seed: int) -> torch.Tensor:

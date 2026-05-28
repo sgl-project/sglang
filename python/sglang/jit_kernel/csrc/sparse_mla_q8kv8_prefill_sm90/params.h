@@ -43,6 +43,5 @@ struct SparseMlaQ8Kv8PrefillParams {
   float* __restrict__ max_logits;
   float* __restrict__ lse;
 
-  int num_sm;
   cudaStream_t stream;
 };

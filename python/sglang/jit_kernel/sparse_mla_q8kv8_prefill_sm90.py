@@ -233,6 +233,11 @@ def sparse_mla_q8kv8_prefill_fwd(
     h_kv = kv.shape[1]
     topk = indices.shape[2]
 
+    if d_v != 512:
+        raise ValueError(
+            f"sparse_mla_q8kv8_prefill_fwd only supports d_v=512, got {d_v}"
+        )
+
     if (attn_sink is None) != (topk_length is None):
         raise ValueError("attn_sink and topk_length must be provided together")
 
