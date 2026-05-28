@@ -62,6 +62,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
     next_power_of_2,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
@@ -78,6 +79,7 @@ GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -102,7 +104,11 @@ def _set_kv_buffer_impl(
     same_kv_dim: bool = True,
 ) -> None:
     row_bytes = row_dim * store_dtype.itemsize
-    if (_is_cuda or _is_hip) and same_kv_dim and can_use_store_cache(row_bytes):
+    if (
+        (_is_cuda or _is_hip or _is_xpu)
+        and same_kv_dim
+        and can_use_store_cache(row_bytes)
+    ):
         return store_cache(
             k.view(-1, row_dim),
             v.view(-1, row_dim),
