@@ -360,10 +360,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self._insert(tree, allocator, [1, 2, 3, 4])
         first_insert = self._stored_events(tree, StorageMedium.GPU)
         self.assertGreater(len(first_insert), 0)
-        self.assertTrue(
-            all(e.kv_cache_spec_kind == "full_attention" for e in first_insert)
-        )
-        self.assertTrue(all(e.kv_cache_spec_sliding_window == 4 for e in first_insert))
+        self.assertTrue(all(e.swa_sliding_window_size == 4 for e in first_insert))
         self.assertTrue(all(e.swa_valid_from is None for e in first_insert))
 
         self._insert(tree, allocator, [1, 2, 3, 4, 5, 6])

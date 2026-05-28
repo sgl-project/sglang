@@ -146,8 +146,7 @@ class TestSWA(unittest.TestCase):
             block_size=1,
             lora_id=None,
             medium="GPU",
-            kv_cache_spec_kind="full_attention",
-            kv_cache_spec_sliding_window=4,
+            swa_sliding_window_size=4,
             swa_valid_from=2,
         )
         self.assertEqual(
@@ -160,7 +159,6 @@ class TestSWA(unittest.TestCase):
                 1,
                 None,
                 "GPU",
-                "full_attention",
                 4,
                 2,
             ],
@@ -173,8 +171,7 @@ class TestSWA(unittest.TestCase):
             block_size=1,
             lora_id=None,
             medium="GPU",
-            kv_cache_spec_kind="full_attention",
-            kv_cache_spec_sliding_window=4,
+            swa_sliding_window_size=4,
         )
         self.assertEqual(
             msgspec.msgpack.decode(msgspec.msgpack.encode(event)),
@@ -186,7 +183,6 @@ class TestSWA(unittest.TestCase):
                 1,
                 None,
                 "GPU",
-                "full_attention",
                 4,
             ],
         )
@@ -204,10 +200,7 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(len(first_insert_events), 4)
         self.assertEqual([e.token_ids[0] for e in first_insert_events], [1, 2, 3, 4])
         self.assertTrue(
-            all(e.kv_cache_spec_kind == "full_attention" for e in first_insert_events)
-        )
-        self.assertTrue(
-            all(e.kv_cache_spec_sliding_window == 4 for e in first_insert_events)
+            all(e.swa_sliding_window_size == 4 for e in first_insert_events)
         )
         self.assertTrue(all(e.swa_valid_from is None for e in first_insert_events))
 

@@ -2249,8 +2249,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return {}
 
         metadata: dict[str, object] = {
-            "kv_cache_spec_kind": "full_attention",
-            "kv_cache_spec_sliding_window": int(sliding_window_size),
+            "swa_sliding_window_size": int(sliding_window_size),
         }
         swa_valid_from = self._swa_valid_from_for_event(node, medium)
         if swa_valid_from is not None:
