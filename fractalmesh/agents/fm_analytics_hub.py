@@ -6,6 +6,7 @@ All credentials sourced from ~/.secrets/fractal.env at runtime.
 Samuel James Hiotis | ABN 56 628 117 363
 """
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -644,7 +645,7 @@ class AnalyticsHandler(BaseHTTPRequestHandler):
         auth = self.headers.get("X-Admin-Secret", "") or self.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
             auth = auth[7:]
-        if not ADMIN_SECRET or auth != ADMIN_SECRET:
+        if not ADMIN_SECRET or not hmac.compare_digest(auth, ADMIN_SECRET):
             self._forbidden()
             return False
         return True

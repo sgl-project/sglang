@@ -15,6 +15,7 @@ Samuel James Hiotis | ABN 56628117363
 import base64
 import email
 import email.header
+import hmac
 import imaplib
 import json
 import logging
@@ -559,7 +560,7 @@ def _seed_rules(conn: sqlite3.Connection) -> int:
 
 def _require_admin(handler) -> bool:
     secret = handler.headers.get("X-Admin-Secret", "")
-    if not ADMIN_SECRET or secret != ADMIN_SECRET:
+    if not ADMIN_SECRET or not hmac.compare_digest(secret, ADMIN_SECRET):
         handler._send_json({"error": "Unauthorized"}, 401)
         return False
     return True

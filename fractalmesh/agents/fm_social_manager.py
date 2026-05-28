@@ -583,11 +583,11 @@ def _check_admin(handler: BaseHTTPRequestHandler) -> bool:
     if not ADMIN_SECRET:
         return True
     auth = handler.headers.get("X-Admin-Secret", "")
-    if auth == ADMIN_SECRET:
+    if hmac.compare_digest(auth, ADMIN_SECRET):
         return True
     # Also accept Bearer token
     bearer = handler.headers.get("Authorization", "")
-    if bearer.startswith("Bearer ") and bearer[7:] == ADMIN_SECRET:
+    if bearer.startswith("Bearer ") and hmac.compare_digest(bearer[7:], ADMIN_SECRET):
         return True
     return False
 

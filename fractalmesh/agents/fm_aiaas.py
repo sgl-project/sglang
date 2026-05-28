@@ -5,6 +5,7 @@ FractalMesh OMEGA Titan | Multi-provider AI inference gateway.
 All credentials sourced from ~/.secrets/fractal.env at runtime.
 Samuel James Hiotis | ABN 56 628 117 363
 """
+import hmac
 import json
 import logging
 import os
@@ -547,7 +548,7 @@ class AIaaSHandler(BaseHTTPRequestHandler):
 
     def _handle_admin_keys_create(self):
         admin_secret = self.headers.get("X-Admin-Secret", "").strip()
-        if not ADMIN_SECRET or admin_secret != ADMIN_SECRET:
+        if not ADMIN_SECRET or not hmac.compare_digest(admin_secret, ADMIN_SECRET):
             self._send_error(403, "Invalid or missing X-Admin-Secret")
             return
         body = self._read_body()
@@ -590,7 +591,7 @@ class AIaaSHandler(BaseHTTPRequestHandler):
 
     def _handle_admin_usage(self):
         admin_secret = self.headers.get("X-Admin-Secret", "").strip()
-        if not ADMIN_SECRET or admin_secret != ADMIN_SECRET:
+        if not ADMIN_SECRET or not hmac.compare_digest(admin_secret, ADMIN_SECRET):
             self._send_error(403, "Invalid or missing X-Admin-Secret")
             return
         try:

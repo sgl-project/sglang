@@ -189,7 +189,7 @@ def _require_admin(handler) -> bool:
     auth = handler.headers.get("Authorization", "")
     token = auth.removeprefix("Bearer ").strip()
     expected = hmac.new(ADMIN_SECRET.encode(), b"admin", hashlib.sha256).hexdigest()
-    ok = hmac.compare_digest(token, expected) or token == ADMIN_SECRET
+    ok = hmac.compare_digest(token, expected) or hmac.compare_digest(token, ADMIN_SECRET)
     if not ok:
         _json_resp(handler, 403, {"error": "admin authorisation required"})
     return ok

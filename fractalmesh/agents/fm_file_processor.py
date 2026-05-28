@@ -8,6 +8,7 @@ import base64
 import csv
 import gzip
 import hashlib
+import hmac
 import html
 import io
 import json
@@ -759,7 +760,7 @@ def _require_admin(handler) -> bool:
         return True
     auth = handler.headers.get("Authorization", "")
     token = auth.replace("Bearer ", "").strip()
-    if token != ADMIN_SECRET:
+    if not hmac.compare_digest(token, ADMIN_SECRET):
         _json_response(handler, 401, {"error": "Unauthorized"})
         return False
     return True

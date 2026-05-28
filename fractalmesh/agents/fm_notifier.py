@@ -6,6 +6,7 @@ Channels: telegram, email, slack, log_only
 DB: ~/fmsaas/database/sovereign.db (WAL mode)
 """
 
+import hmac
 import json
 import logging
 import os
@@ -327,7 +328,7 @@ class NotifierHandler(BaseHTTPRequestHandler):
 
     def _require_admin(self) -> bool:
         secret = self.headers.get("X-Admin-Secret", "")
-        if not ADMIN_SECRET or secret != ADMIN_SECRET:
+        if not ADMIN_SECRET or not hmac.compare_digest(secret, ADMIN_SECRET):
             self._send_json({"error": "unauthorized"}, 403)
             return False
         return True

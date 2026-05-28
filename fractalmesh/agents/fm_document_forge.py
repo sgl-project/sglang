@@ -6,6 +6,7 @@ Port: 7857  |  Samuel James Hiotis | ABN 56 628 117 363
 import base64
 import gzip
 import hashlib
+import hmac
 import html
 import io
 import json
@@ -925,7 +926,7 @@ def _error(handler, msg, status=400):
 
 def _require_admin(handler) -> bool:
     auth = handler.headers.get("X-Admin-Secret", "")
-    if not ADMIN_SECRET or auth != ADMIN_SECRET:
+    if not ADMIN_SECRET or not hmac.compare_digest(auth, ADMIN_SECRET):
         _error(handler, "Unauthorized — X-Admin-Secret required", 401)
         return False
     return True

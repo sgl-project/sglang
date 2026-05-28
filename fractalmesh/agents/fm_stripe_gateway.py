@@ -480,7 +480,7 @@ class StripeGatewayHandler(BaseHTTPRequestHandler):
     def _require_admin(self) -> bool:
         """Return True if admin auth passes; otherwise send 403 and return False."""
         secret = self.headers.get("X-Admin-Secret", "")
-        if not ADMIN_SECRET or secret != ADMIN_SECRET:
+        if not ADMIN_SECRET or not hmac.compare_digest(secret, ADMIN_SECRET):
             self._send(403, {"error": "forbidden: X-Admin-Secret required"})
             return False
         return True

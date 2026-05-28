@@ -7,6 +7,7 @@ All credentials sourced from ~/.secrets/fractal.env at runtime.
 Samuel James Hiotis | ABN 56 628 117 363
 """
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -346,7 +347,7 @@ def _check_auth(handler) -> bool:
     secret = handler.headers.get("X-Admin-Secret", "")
     if not ADMIN_SECRET:
         return True  # no secret configured → open
-    return secret == ADMIN_SECRET
+    return hmac.compare_digest(secret, ADMIN_SECRET)
 
 
 # ── background sync thread ─────────────────────────────────────────────────────

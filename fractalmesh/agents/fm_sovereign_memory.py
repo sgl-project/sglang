@@ -7,6 +7,7 @@ Port: 7853
 """
 import gzip
 import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -287,7 +288,7 @@ def _require_admin(handler) -> bool:
     if not ADMIN_SECRET:
         return True
     secret = handler.headers.get("X-Admin-Secret", "")
-    if secret != ADMIN_SECRET:
+    if not hmac.compare_digest(secret, ADMIN_SECRET):
         _json_response(handler, 403, {"error": "forbidden"})
         return False
     return True

@@ -15,6 +15,7 @@ import base64
 import csv
 import gzip
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -710,7 +711,7 @@ def start_scheduler() -> None:
 
 def _check_admin(handler: "PipelineHandler") -> bool:
     secret = handler.headers.get("X-Admin-Secret", "")
-    if not ADMIN_SECRET or secret == ADMIN_SECRET:
+    if not ADMIN_SECRET or hmac.compare_digest(secret, ADMIN_SECRET):
         return True
     return False
 

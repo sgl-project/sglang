@@ -203,7 +203,7 @@ def require_admin(handler: "CampaignHandler") -> bool:
     if not ADMIN_SECRET:
         return True
     auth = handler.headers.get("X-Admin-Secret", "")
-    if auth != ADMIN_SECRET:
+    if not hmac.compare_digest(auth, ADMIN_SECRET):
         error_resp(handler, 403, "Forbidden: invalid admin secret")
         return False
     return True

@@ -4,6 +4,7 @@ Real-time log scanning, system health monitoring, credential leak detection,
 and port health checks for the FractalMesh OMEGA Titan platform.
 Samuel James Hiotis | ABN 56 628 117 363 | Sole Trader
 """
+import hmac
 import json
 import os
 import pathlib
@@ -247,9 +248,9 @@ def _check_port(port: int, timeout: float = 0.5) -> tuple:
 def _check_auth(handler: "SecurityHandler") -> bool:
     """Validate X-Admin-Secret header against ADMIN_SECRET."""
     if not ADMIN_SECRET:
-        return False
+        return True
     provided = handler.headers.get("X-Admin-Secret", "")
-    return provided == ADMIN_SECRET
+    return hmac.compare_digest(provided, ADMIN_SECRET)
 
 
 # ---------------------------------------------------------------------------

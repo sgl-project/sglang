@@ -557,9 +557,9 @@ class PodcastHandler(BaseHTTPRequestHandler):
             return True
         auth = self.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
-            return auth[7:] == ADMIN_SECRET
+            return hmac.compare_digest(auth[7:], ADMIN_SECRET)
         body_secret = self.headers.get("X-Admin-Secret", "")
-        return body_secret == ADMIN_SECRET
+        return hmac.compare_digest(body_secret, ADMIN_SECRET)
 
     def _send(self, status: int, data, content_type: str = "application/json"):
         body = json.dumps(data, default=str).encode() if not isinstance(data, bytes) else data

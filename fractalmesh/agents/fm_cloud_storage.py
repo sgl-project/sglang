@@ -124,7 +124,7 @@ def _read_body(handler: "BaseHTTPRequestHandler") -> bytes:
 
 def _require_admin(handler: "BaseHTTPRequestHandler") -> bool:
     secret = handler.headers.get("X-Admin-Secret", "")
-    if not ADMIN_SECRET or secret != ADMIN_SECRET:
+    if not ADMIN_SECRET or not hmac.compare_digest(secret, ADMIN_SECRET):
         _json_response(handler, 403, {"error": "forbidden"})
         return False
     return True

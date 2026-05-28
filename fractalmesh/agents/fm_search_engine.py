@@ -8,6 +8,7 @@ Samuel James Hiotis | ABN 56 628 117 363
 """
 import collections
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -662,9 +663,9 @@ def _is_admin(handler) -> bool:
         return True  # no secret configured → open
     auth = handler.headers.get("Authorization", "")
     secret_header = handler.headers.get("X-Admin-Secret", "")
-    if secret_header == ADMIN_SECRET:
+    if hmac.compare_digest(secret_header, ADMIN_SECRET):
         return True
-    if auth.startswith("Bearer ") and auth[7:] == ADMIN_SECRET:
+    if auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], ADMIN_SECRET):
         return True
     return False
 
