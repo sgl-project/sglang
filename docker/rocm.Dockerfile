@@ -206,9 +206,14 @@ ENV SETUPTOOLS_SCM_PRETEND_VERSION=
 # AITER_USE_SYSTEM_TRITON=0 when intentionally testing aiter-managed Triton.
 ENV AITER_USE_SYSTEM_TRITON=1
 RUN pip uninstall -y aiter
+# Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
+# AITER's .gitattributes (*.csv text eol=lf, added in ROCm/aiter#3370) does not
+# block switching to commits that predate that rule (e.g. the current default
+# AITER_COMMIT_DEFAULT). The working tree was just produced by a fresh
+# `git clone` above, so there are no real user changes to preserve.
 RUN git clone ${AITER_REPO} \
  && cd aiter \
- && git checkout ${AITER_COMMIT} \
+ && git checkout -f ${AITER_COMMIT} \
  && git cherry-pick --no-commit b639cb63bcac4672dce33a731fad042a65cb3649 \
  && git submodule update --init --recursive \
  && pip install -r requirements.txt

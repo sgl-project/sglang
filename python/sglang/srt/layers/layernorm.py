@@ -178,6 +178,7 @@ def _forward_with_allreduce_fusion(
                     residual=residual,
                     weight=weight,
                     eps=norm_module.variance_epsilon,
+                    max_token_num=max(x.shape[0], 2048),
                     use_attn_tp_group=use_attn_tp_group,
                 )
                 if fused_result[0] is not None:
