@@ -1509,19 +1509,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     split_forward_count: int = 1
     split_forward_batch: ForwardBatch = None
 
-    # For logits and logprob post processing (ForwardBatch keeps its own copies)
-    temp_scaled_logprobs: bool = False
-    top_p_normalized_logprobs: bool = False
-
     # CPU mirror of req_pool_indices; schedule-path only (used in overlap_utils,
     # not read by ForwardBatch), stale in spec draft window
     req_pool_indices_cpu: torch.Tensor = None  # shape: [b], int64
 
     # Forward-pass metrics
     fpm_start_time: float = 0.0
-
-    # Stream
-    has_stream: bool = False
 
     # Whether to return captured experts
     return_routed_experts: bool = False
@@ -1673,7 +1666,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             model_config=model_config,
             enable_overlap=enable_overlap,
             return_logprob=return_logprob,
-            has_stream=any(req.stream for req in reqs),
             has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
@@ -2585,7 +2577,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = None
             self.token_ids_logprobs = None
 
-        self.has_stream = any(req.stream for req in self.reqs)
         self.has_grammar = any(req.grammar for req in self.reqs)
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
@@ -2641,7 +2632,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.multimodal_inputs.extend(other.multimodal_inputs)
 
         self.return_logprob |= other.return_logprob
-        self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
