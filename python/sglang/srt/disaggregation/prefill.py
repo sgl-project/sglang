@@ -997,6 +997,7 @@ class SchedulerDisaggregationPrefillMixin:
         """Release KV cache and requeue an optimistic prefill request.
         Uses reset_for_retract() as the base reset, then clears disagg-specific fields.
         """
+        max_retries = self.server_args.optimistic_prefill_retries
         maybe_cache_unfinished_req(req, self.tree_cache)
         release_kv_cache(req, self.tree_cache)
         req.reset_for_retract()
@@ -1006,8 +1007,22 @@ class SchedulerDisaggregationPrefillMixin:
         req.tmp_end_idx = -1
         req.hidden_states_tensor = None
         req.optimistic_stop = False
-        req.optimistic_prefill_remaining -= 1
-        if req.optimistic_prefill_remaining <= 0:
+        req.time_stats.reset_prefill_retry_time()
+        if req.time_stats.prefill_retry_count >= max_retries:
+            logger.info(
+                f"Req {req.rid} exhausted optimistic prefill retries "
+                "falling back to bootstrap queue"
+            )
+            # reset it so the next real bootstrap done can be recorded
+            req.time_stats.bootstrap_done_time = 0.0
             self.disagg_prefill_bootstrap_queue.queue.append(req)
         else:
+            req.time_stats.prefill_retry_count += 1
+            logger.info(
+                f"Req {req.rid} optimistic prefill retry "
+                f"{req.time_stats.prefill_retry_count}/{max_retries}"
+            )
+            if self.metrics_reporter.enable_metrics:
+                self.metrics_collector.increment_prefill_retries(1)
+            req.time_stats.set_wait_queue_entry_time()
             self.waiting_queue.insert(0, req)

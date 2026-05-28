@@ -277,6 +277,3 @@ sgl-kernel/csrc/**/*_musa/
 *.npz
 artifacts/
 .claude/scheduled_tasks.lock
-
-# Humanize working files
-.humanize/

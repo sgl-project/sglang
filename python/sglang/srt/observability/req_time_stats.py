@@ -668,6 +668,17 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         if self.trace_ctx.tracing_enable:
             self.trace_ctx.trace_event("retract", 1, convert_time_to_realtime_ns(ts))
 
+    def reset_prefill_retry_time(self):
+        self.wait_queue_entry_time = 0.0
+        self.forward_entry_time = 0.0
+        self.prefill_finished_time = 0.0
+        self.completion_time = 0.0
+        self.prefill_transfer_queue_entry_time = 0.0
+        self.prefill_kv_transfer_finish_time = 0.0
+        self.last_forward_entry_time = 0.0
+        self.last_prefill_finished_time = 0.0
+        self.last_chunked_prefill_finish_time = 0.0
+
     def set_wait_queue_entry_time(self, ts=None):
         ts = ts or time.perf_counter()
         if self.wait_queue_entry_time == 0.0:
@@ -1013,20 +1024,35 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 self.bootstrap_done_time > 0
                 and self.prefill_bootstrap_queue_entry_time > 0
             ):
-                bootstrap_duration = self.duration_between(
+                bootstrap_wait_duration = self.duration_between(
                     self.prefill_bootstrap_queue_entry_time, self.bootstrap_done_time
                 )
-                alloc_wait_duration = self.duration_between(
-                    self.bootstrap_done_time, self.wait_queue_entry_time
-                )
+                ready_to_queue_duration = 0.0
+                bootstrap_wait_after_queue_duration = 0.0
+                if self.wait_queue_entry_time > 0:
+                    if self.wait_queue_entry_time >= self.bootstrap_done_time:
+                        ready_to_queue_duration = self.duration_between(
+                            self.bootstrap_done_time, self.wait_queue_entry_time
+                        )
+                    else:
+                        bootstrap_wait_after_queue_duration = self.duration_between(
+                            self.wait_queue_entry_time, self.bootstrap_done_time
+                        )
                 if SGLANG_TEST_REQUEST_TIME_STATS:
                     assert (
-                        bootstrap_duration >= 0 and alloc_wait_duration >= 0
-                    ), f"bootstrap_duration={bootstrap_duration} < 0 or alloc_wait_duration={alloc_wait_duration} < 0"
+                        bootstrap_wait_duration >= 0
+                        and ready_to_queue_duration >= 0
+                        and bootstrap_wait_after_queue_duration >= 0
+                    ), f"bootstrap_wait_duration={bootstrap_wait_duration} < 0 or ready_to_queue_duration={ready_to_queue_duration} < 0 or bootstrap_wait_after_queue_duration={bootstrap_wait_after_queue_duration} < 0"
                 bootstrap_fields = (
-                    f"bootstrap_duration={self.format_duration(bootstrap_duration)}, "
-                    f"alloc_wait_duration={self.format_duration(alloc_wait_duration)}, "
+                    f"bootstrap_wait_duration={self.format_duration(bootstrap_wait_duration)}, "
+                    f"ready_to_queue_duration={self.format_duration(ready_to_queue_duration)}, "
                 )
+                if bootstrap_wait_after_queue_duration > 0:
+                    bootstrap_fields += (
+                        f"bootstrap_wait_after_queue_duration="
+                        f"{self.format_duration(bootstrap_wait_after_queue_duration)}, "
+                    )
             elif self.bootstrap_done_time > 0:
                 bootstrap_fields = f"bootstrap_done_time={self.format_wallclock(self.bootstrap_done_time)}, "
             else:

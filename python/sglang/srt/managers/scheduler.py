@@ -2118,13 +2118,14 @@ class Scheduler(
                 and not is_retracted
                 and not req.optimistic_prefill
             ):
+                bootstrap_entry_time = time.perf_counter()
                 if self.disagg_prefill_bootstrap_queue.create_sender(
                     req, self.model_config.num_key_value_heads
                 ):
-                    req.optimistic_prefill = True
-                    req.optimistic_prefill_remaining = (
-                        self.server_args.optimistic_prefill_retries
+                    req.time_stats.set_prefill_bootstrap_queue_entry_time(
+                        bootstrap_entry_time
                     )
+                    req.optimistic_prefill = True
                     self.waiting_queue.append(req)
                     req.time_stats.set_wait_queue_entry_time()
             else:
