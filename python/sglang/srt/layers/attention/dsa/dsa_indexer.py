@@ -163,12 +163,7 @@ if _is_cuda:
         softmax_scale: float,
         q_scale: torch.Tensor,
     ) -> torch.Tensor:
-        from sglang.srt.layers.deep_gemm_wrapper import entrypoint as deep_gemm_wrapper
-
-        out = torch.empty(
-            (x.shape[0], weight.shape[0]), dtype=torch.float32, device=x.device
-        )
-        deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, weight, out)
+        out = torch.mm(x, weight.t(), out_dtype=torch.float32)
         weights = out * n_heads_inv_sqrt
         weights = weights.unsqueeze(-1) * q_scale * softmax_scale
         return weights
