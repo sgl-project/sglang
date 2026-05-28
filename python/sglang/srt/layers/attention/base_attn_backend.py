@@ -18,6 +18,13 @@ if TYPE_CHECKING:
 class AttentionBackend(ABC):
     """The base class of attention backends"""
 
+    # Most attention backends can rebuild and replace forward metadata before
+    # every forward. BCG capture is different: some backends expose metadata
+    # tensors to kernels across graph breaks, so the captured graph depends on
+    # those tensor addresses. Such backends opt in here, create the metadata
+    # object during capture, and refresh its dynamic fields before each replay.
+    use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
+
     @abstractmethod
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -52,6 +59,29 @@ class AttentionBackend(ABC):
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         """Init the metadata for a forward pass for replaying a cuda graph."""
+        raise NotImplementedError()
+
+    def init_forward_metadata_for_breakable_cuda_graph_capture(
+        self,
+        forward_batch: ForwardBatch,
+    ):
+        """Create forward metadata whose tensor addresses will be graph-captured."""
+        raise NotImplementedError()
+
+    def prepare_forward_metadata_for_breakable_cuda_graph_replay(
+        self,
+        capture_metadata,
+        forward_batch: ForwardBatch,
+        *,
+        static_forward_batch: Optional[ForwardBatch] = None,
+    ) -> None:
+        """Refresh captured metadata for the current batch before BCG replay.
+
+        Implementations should update ``capture_metadata`` in place where graph
+        address stability is required, assign any safe per-replay objects, and
+        make the backend's active ``forward_metadata`` point to the captured
+        metadata object.
+        """
         raise NotImplementedError()
 
     def get_cuda_graph_seq_len_fill_value(self):
