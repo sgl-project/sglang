@@ -482,7 +482,10 @@ class DeepseekMHAForwardMixin:
             _ds_backend = _resolve_attn_backend(forward_batch)
             if hasattr(_ds_backend, "_write_token_labels"):
                 _ds_backend._write_token_labels(
-                    self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1)
+                    self.attn_mha,
+                    forward_batch.out_cache_loc,
+                    kv_a.unsqueeze(1),
+                    forward_batch=forward_batch,
                 )
 
     def _get_mla_kv_buffer(

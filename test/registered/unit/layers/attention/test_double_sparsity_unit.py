@@ -18,6 +18,7 @@ import sys
 import unittest
 from types import SimpleNamespace
 from typing import Dict, Tuple
+from unittest import mock
 from unittest.mock import MagicMock
 
 import torch
@@ -6544,10 +6545,12 @@ class TestAC1CallSites(unittest.TestCase):
 
         captured_k = []
 
-        def spy_write(layer_arg, cache_loc_arg, k_arg):
+        def spy_write(layer_arg, cache_loc_arg, k_arg, forward_batch=None):
             captured_k.append(k_arg.clone())
             # Still call the real method to populate the table
-            NativeSparseAttnBackend._write_token_labels(backend, layer_arg, cache_loc_arg, k_arg)
+            NativeSparseAttnBackend._write_token_labels(
+                backend, layer_arg, cache_loc_arg, k_arg, forward_batch=forward_batch
+            )
 
         with (
             mock_patch(
@@ -6649,6 +6652,167 @@ class TestAC1CallSites(unittest.TestCase):
         # With save_kv_cache=False, the KV-write block is skipped; table must remain zero
         self.assertFalse(table.written[0, 5].item(), "slot 5 written despite save_kv_cache=False")
         self.assertFalse(table.written[0, 10].item(), "slot 10 written despite save_kv_cache=False")
+
+
+class TestRadixCaptureExtendSnapshotProducer(unittest.TestCase):
+    """Producer-side regression for the radix-capture extend snapshot.
+
+    ``_write_token_labels`` now accepts ``forward_batch`` and publishes the
+    per-request radix-capture snapshot only when capture is enabled, a
+    ``forward_batch`` is present, AND the forward mode is extend. Before this
+    fix the method referenced ``forward_batch`` without accepting it, so the
+    name lookup raised inside a swallowing ``try/except`` and the extend
+    snapshot was never published. These tests fail if that regression returns:
+    they pin publish-on-extend, no-publish-when-disabled, no-publish-on-decode,
+    no-crash/no-publish when ``forward_batch`` is None (labels still written),
+    and that a decode forward does not overwrite an existing extend snapshot.
+    """
+
+    def _build(
+        self,
+        *,
+        T=3,
+        num_heads=2,
+        nope_dim=4,
+        v_head_dim=4,
+        kv_lora_rank=8,
+        label_dim=2,
+        max_tokens=64,
+    ):
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+        from sglang.srt.layers.attention.dsa_backend import NativeSparseAttnBackend
+
+        table = allocate_token_label_table(
+            num_layers_local=1,
+            max_tokens=max_tokens,
+            num_heads_local=num_heads,
+            label_dim=label_dim,
+            page_size=64,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        channel_sel = torch.arange(label_dim, dtype=torch.int32)
+        channel_sel_all = (
+            channel_sel.view(1, 1, label_dim).expand(1, num_heads, -1).contiguous()
+        )
+        W = torch.randn(kv_lora_rank, num_heads * (nope_dim + v_head_dim))
+
+        class _FakeProj:
+            def __call__(self, x):
+                return (x @ W,)
+
+        backend = object.__new__(NativeSparseAttnBackend)
+        backend.enable_double_sparsity = True
+        backend._ds_token_label_table = table
+        backend._ds_channel_selection = channel_sel_all
+        backend._ds_qk_nope_head_dim = nope_dim
+        backend.hisparse_coordinator = None
+
+        layer = SimpleNamespace(layer_id=0, kv_b_proj=_FakeProj(), v_head_dim=v_head_dim)
+        cache_loc = torch.tensor([5, 10, 20, 31, 42], dtype=torch.int64)[:T]
+        k = torch.randn(T, 1, kv_lora_rank)
+
+        def make_fb(is_extend: bool):
+            req_to_token = torch.zeros((2, max_tokens), dtype=torch.int64)
+            req_to_token[0, :T] = cache_loc
+            return SimpleNamespace(
+                req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+                req_pool_indices=torch.tensor([0], dtype=torch.int64),
+                seq_lens=torch.tensor([T], dtype=torch.int64),
+                forward_mode=SimpleNamespace(is_extend=lambda: is_extend),
+            )
+
+        return backend, layer, cache_loc, k, table, make_fb
+
+    def test_extend_publishes_capture_snapshot(self):
+        from sglang.srt.layers.attention.double_sparsity import radix_fixture_capture
+
+        backend, layer, cache_loc, k, table, make_fb = self._build(T=3)
+        fb = make_fb(is_extend=True)
+        with mock.patch.dict(
+            os.environ, {"SGLANG_DS_RADIX_FIXTURE_CAPTURE": "1"}
+        ):
+            radix_fixture_capture.clear_log()
+            backend._write_token_labels(layer, cache_loc, k, forward_batch=fb)
+
+        # Labels written first, regardless of capture.
+        self.assertTrue(table.written[0, cache_loc].all().item())
+        # Snapshot published into the auto-created per-request summary.
+        summary = fb.ds_per_request_summary
+        self.assertIn("double_sparsity_radix_capture", summary)
+        self.assertNotIn("double_sparsity_radix_capture_error", summary)
+        records = summary["double_sparsity_radix_capture"]
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec["prompt_len"], 3)
+        self.assertEqual(len(rec["per_token_slot_sha"]), 3)
+        self.assertTrue(all(rec["per_layer_written_all_true"]))
+
+    def test_capture_disabled_publishes_no_key(self):
+        backend, layer, cache_loc, k, table, make_fb = self._build(T=3)
+        fb = make_fb(is_extend=True)
+        with mock.patch.dict(
+            os.environ, {"SGLANG_DS_RADIX_FIXTURE_CAPTURE": "0"}
+        ):
+            backend._write_token_labels(layer, cache_loc, k, forward_batch=fb)
+
+        self.assertTrue(table.written[0, cache_loc].all().item())
+        summary = getattr(fb, "ds_per_request_summary", None)
+        self.assertTrue(
+            summary is None or "double_sparsity_radix_capture" not in summary
+        )
+
+    def test_decode_forward_does_not_publish(self):
+        from sglang.srt.layers.attention.double_sparsity import radix_fixture_capture
+
+        backend, layer, cache_loc, k, table, make_fb = self._build(T=3)
+        fb = make_fb(is_extend=False)
+        with mock.patch.dict(
+            os.environ, {"SGLANG_DS_RADIX_FIXTURE_CAPTURE": "1"}
+        ):
+            radix_fixture_capture.clear_log()
+            backend._write_token_labels(layer, cache_loc, k, forward_batch=fb)
+
+        self.assertTrue(table.written[0, cache_loc].all().item())
+        summary = getattr(fb, "ds_per_request_summary", None)
+        self.assertTrue(
+            summary is None or "double_sparsity_radix_capture" not in summary
+        )
+
+    def test_forward_batch_none_writes_labels_without_publish(self):
+        from sglang.srt.layers.attention.double_sparsity import radix_fixture_capture
+
+        backend, layer, cache_loc, k, table, _ = self._build(T=3)
+        with mock.patch.dict(
+            os.environ, {"SGLANG_DS_RADIX_FIXTURE_CAPTURE": "1"}
+        ):
+            radix_fixture_capture.clear_log()
+            # No forward_batch in scope must not crash and must still write labels.
+            backend._write_token_labels(layer, cache_loc, k, forward_batch=None)
+
+        self.assertTrue(table.written[0, cache_loc].all().item())
+
+    def test_decode_does_not_overwrite_extend_snapshot(self):
+        from sglang.srt.layers.attention.double_sparsity import radix_fixture_capture
+
+        backend, layer, cache_loc, k, table, make_fb = self._build(T=3)
+        fb = make_fb(is_extend=True)
+        with mock.patch.dict(
+            os.environ, {"SGLANG_DS_RADIX_FIXTURE_CAPTURE": "1"}
+        ):
+            radix_fixture_capture.clear_log()
+            backend._write_token_labels(layer, cache_loc, k, forward_batch=fb)
+            extend_snapshot = fb.ds_per_request_summary["double_sparsity_radix_capture"]
+            # Same batch flips to decode; the extend snapshot must survive.
+            fb.forward_mode = SimpleNamespace(is_extend=lambda: False)
+            backend._write_token_labels(layer, cache_loc, k, forward_batch=fb)
+
+        self.assertIs(
+            fb.ds_per_request_summary["double_sparsity_radix_capture"],
+            extend_snapshot,
+        )
 
 
 class TestAC2Lifetime(unittest.TestCase):
@@ -7400,7 +7564,7 @@ class TestAC7MHABypass(unittest.TestCase):
 
         write_calls: list = []
 
-        def spy_write(layer, cache_loc, k):
+        def spy_write(layer, cache_loc, k, forward_batch=None):
             write_calls.append(k.shape)
 
         mock_pool = MagicMock()

@@ -1503,6 +1503,7 @@ class DeepseekSparseAttnBackend(
         layer,
         cache_loc: torch.Tensor,
         k: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> None:
         """Write per-slot token labels after a KV-cache write.
 
@@ -1512,6 +1513,13 @@ class DeepseekSparseAttnBackend(
 
         No-ops if DS is not enabled or the bind context is unavailable.
         ``k`` shape: ``[T, 1, kv_lora_rank]``.
+
+        ``forward_batch`` is the live batch for this forward; it carries the
+        per-request slot map and the per-request summary transport used to
+        publish the radix-capture extend snapshot. It is optional so unit
+        fixtures and the rare label-write site without a batch in scope still
+        write labels; the extend snapshot only publishes when it is present
+        and the mode is extend.
         """
         if (
             not self.enable_double_sparsity
@@ -1578,14 +1586,12 @@ class DeepseekSparseAttnBackend(
                     layer_id, cache_loc.long()
                 ],
             )
-            try:
-                forward_mode = getattr(forward_batch, "forward_mode", None)
-                is_extend = bool(
-                    forward_mode is not None
-                    and getattr(forward_mode, "is_extend", lambda: False)()
-                )
-            except Exception:
-                is_extend = False
+            forward_mode = getattr(forward_batch, "forward_mode", None)
+            is_extend = bool(
+                forward_batch is not None
+                and forward_mode is not None
+                and getattr(forward_mode, "is_extend", lambda: False)()
+            )
             if is_extend:
                 _ds_radix_publish_extend_snapshot(
                     backend=self,
@@ -1661,7 +1667,7 @@ class DeepseekSparseAttnBackend(
                     k,
                     k_rope,
                 )
-                self._write_token_labels(layer, cache_loc, k)
+                self._write_token_labels(layer, cache_loc, k, forward_batch=forward_batch)
 
         # Use MHA kernel if in MHA_ONE_SHOT mode
         if self.use_mha:
@@ -1860,7 +1866,7 @@ class DeepseekSparseAttnBackend(
                     k,
                     k_rope,
                 )
-                self._write_token_labels(layer, cache_loc, k)
+                self._write_token_labels(layer, cache_loc, k, forward_batch=forward_batch)
 
         # Do absorbed multi-latent attention
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -2384,7 +2390,9 @@ class DeepseekSparseAttnBackend(
                 else forward_batch.encoder_out_cache_loc
             )
             self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
-            self._write_token_labels(layer, cache_loc, k_for_labels)
+            self._write_token_labels(
+                layer, cache_loc, k_for_labels, forward_batch=forward_batch
+            )
 
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)
