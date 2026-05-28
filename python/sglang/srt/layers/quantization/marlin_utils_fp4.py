@@ -52,14 +52,30 @@ def _normalize_scale_tensor(
     raise TypeError(f"Unsupported MXFP4 scale dtype for Marlin: {scales.dtype}")
 
 
+def _get_optional_param(layer: torch.nn.Module, *names: str) -> torch.Tensor | None:
+    for name in names:
+        value = getattr(layer, name, None)
+        if value is not None:
+            return value
+    return None
+
+
 def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     group_size = 32
     w13 = layer.w13_weight.data
     w2 = layer.w2_weight.data
-    w13_scale = layer.w13_weight_scale_inv.data
-    w2_scale = layer.w2_weight_scale_inv.data
-    w13_bias = getattr(layer, "w13_bias", None)
-    w2_bias = getattr(layer, "w2_bias", None)
+    w13_scale = _get_optional_param(layer, "w13_weight_scale", "w13_weight_scale_inv")
+    w2_scale = _get_optional_param(layer, "w2_weight_scale", "w2_weight_scale_inv")
+    w13_bias = _get_optional_param(layer, "w13_weight_bias", "w13_bias")
+    w2_bias = _get_optional_param(layer, "w2_weight_bias", "w2_bias")
+
+    if w13_scale is None or w2_scale is None:
+        raise ValueError("MXFP4 Marlin requires w13/w2 weight scales.")
+
+    w13_scale_data = w13_scale.data if hasattr(w13_scale, "data") else w13_scale
+    w2_scale_data = w2_scale.data if hasattr(w2_scale, "data") else w2_scale
+    w13_bias_data = w13_bias.data if hasattr(w13_bias, "data") else w13_bias
+    w2_bias_data = w2_bias.data if hasattr(w2_bias, "data") else w2_bias
 
     num_experts = w13.shape[0]
     intermediate_size = w13.shape[1] // 2
@@ -67,7 +83,7 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     param_dtype = getattr(
         layer,
         "orig_dtype",
-        w13_bias.dtype if w13_bias is not None else torch.bfloat16,
+        w13_bias_data.dtype if w13_bias_data is not None else torch.bfloat16,
     )
 
     device = w13.device
@@ -129,19 +145,19 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
 
     w13_marlin = _repack_weight(w13, True)
     w2_marlin = _repack_weight(w2, False)
-    w13_scale_marlin = _permute_scales(w13_scale, True)
-    w2_scale_marlin = _permute_scales(w2_scale, False)
+    w13_scale_marlin = _permute_scales(w13_scale_data, True)
+    w2_scale_marlin = _permute_scales(w2_scale_data, False)
 
     layer.w13_weight = torch.nn.Parameter(w13_marlin, requires_grad=False)
     layer.w2_weight = torch.nn.Parameter(w2_marlin, requires_grad=False)
-    layer.w13_weight_scale_inv = torch.nn.Parameter(
-        w13_scale_marlin, requires_grad=False
-    )
-    layer.w2_weight_scale_inv = torch.nn.Parameter(w2_scale_marlin, requires_grad=False)
+    layer.w13_weight_scale = torch.nn.Parameter(w13_scale_marlin, requires_grad=False)
+    layer.w2_weight_scale = torch.nn.Parameter(w2_scale_marlin, requires_grad=False)
 
-    if w13_bias is not None:
-        layer.w13_bias = torch.nn.Parameter(
-            _permute_bias(w13_bias), requires_grad=False
+    if w13_bias_data is not None:
+        layer.w13_weight_bias = torch.nn.Parameter(
+            _permute_bias(w13_bias_data), requires_grad=False
         )
-    if w2_bias is not None:
-        layer.w2_bias = torch.nn.Parameter(_permute_bias(w2_bias), requires_grad=False)
+    if w2_bias_data is not None:
+        layer.w2_weight_bias = torch.nn.Parameter(
+            _permute_bias(w2_bias_data), requires_grad=False
+        )

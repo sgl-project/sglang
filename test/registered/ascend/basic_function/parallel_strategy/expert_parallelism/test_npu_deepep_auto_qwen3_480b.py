@@ -63,11 +63,12 @@ class TestDeepEpQwen(GSM8KAscendMixin, TestMMLU, CustomTestCase):
         24,
     ]
     env = {
-        "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
-        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
-        "HCCL_BUFFSIZE": "2100",
-        "HCCL_OP_EXPANSION_MODE": "AIV",
-        **os.environ,
+      "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+      "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
+      "HCCL_BUFFSIZE": "2100",
+      "HCCL_OP_EXPANSION_MODE": "AIV",
+      "TRANSFORMERS_VERBOSITY": "error",
+      **os.environ,
     }
 
     # MMLU Configs
