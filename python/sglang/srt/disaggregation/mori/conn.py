@@ -1267,15 +1267,6 @@ class MoriKVSender(CommonKVSender):
         self.status_notified = False
         self.init_time = time.time()
 
-    def pop_decode_prefix_len(self) -> int:
-        return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
-
-    def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
-        # Allow the final chunk to flow through even when the delta is exactly
-        # zero pages (full prefix hit on decode): we still need to deliver aux
-        # / state and mark the transfer Success.
-        return num_pages > 0 or last_chunk
-
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
