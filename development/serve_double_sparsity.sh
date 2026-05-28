@@ -26,7 +26,7 @@
 
 set -euo pipefail
 
-MODEL_PATH="${MODEL_PATH:-deepseek-ai/DeepSeek-V3.2}"
+MODEL_PATH="${MODEL_PATH:-/cluster-storage/models/deepseek-ai/DeepSeek-V3.2}"
 PORT="${PORT:-30000}"
 TP_SIZE="${TP_SIZE:-8}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"

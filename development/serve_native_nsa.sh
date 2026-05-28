@@ -18,19 +18,35 @@
 #   --disable-overlap-schedule
 #   --disable-piecewise-cuda-graph
 #   --page-size 64
-# NOTE: this script does NOT pass --disable-radix-cache. Per plan §13 the
-# DSA baseline runs with radix cache ON so any DS TPS gap vs DSA reflects
-# the DS configuration alone, not the radix gate that DS still has to
-# clear (AC-10).
+# NOTE: by default this script does NOT pass --disable-radix-cache. Per
+# plan §13 the loop4-compatible AC-11 sweep runs the DSA baseline with radix
+# cache ON so any DS TPS gap vs DSA reflects the DS configuration alone, not
+# the radix gate that DS still has to clear (AC-10).
+#
+# The TIER-1 smoke is different: DS still launches with --disable-radix-cache
+# (the AC-10 gate has not been flipped yet) and the two-column comparator
+# (development/benchmark_compare.py) refuses a radix-cache mismatch between
+# the columns. Set DISABLE_RADIX_CACHE=1 to launch this baseline radix-off so
+# the smoke compares apples-to-apples. Leave it unset (default ON) for the
+# radix-on AC-11 sweep once DS has cleared the AC-10 flip.
 
 set -euo pipefail
 
-MODEL_PATH="${MODEL_PATH:-deepseek-ai/DeepSeek-V3.2}"
+MODEL_PATH="${MODEL_PATH:-/cluster-storage/models/deepseek-ai/DeepSeek-V3.2}"
 PORT="${PORT:-30000}"
 TP_SIZE="${TP_SIZE:-8}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
 PAGE_SIZE="${PAGE_SIZE:-64}"
 LOG_DIR="${LOG_DIR:-$(pwd)/development/logs}"
+
+# Radix-off parity knob for the TIER-1 smoke (see header NOTE). Default 0
+# keeps radix cache ON for the AC-11 sweep; set DISABLE_RADIX_CACHE=1 to add
+# --disable-radix-cache so the smoke matches the DS launcher.
+DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
+RADIX_CACHE_ARG=""
+if [[ "${DISABLE_RADIX_CACHE}" == "1" ]]; then
+  RADIX_CACHE_ARG="--disable-radix-cache"
+fi
 
 mkdir -p "${LOG_DIR}"
 
@@ -41,6 +57,7 @@ echo "    port         = ${PORT}"
 echo "    tp_size      = ${TP_SIZE}"
 echo "    kv_cache     = ${KV_CACHE_DTYPE}"
 echo "    page_size    = ${PAGE_SIZE}"
+echo "    radix_cache  = $([[ -n "${RADIX_CACHE_ARG}" ]] && echo "disabled (smoke parity)" || echo "enabled (AC-11 default)")"
 echo "    log          = ${LOG_FILE}"
 
 exec python3 -m sglang.launch_server \
@@ -53,5 +70,6 @@ exec python3 -m sglang.launch_server \
   --dsa-decode-backend flashmla_kv \
   --disable-overlap-schedule \
   --disable-piecewise-cuda-graph \
+  ${RADIX_CACHE_ARG} \
   --trust-remote-code \
   2>&1 | tee "${LOG_FILE}"
