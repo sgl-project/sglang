@@ -1108,45 +1108,6 @@ class Scheduler(
         """
         return (r for r in self.active_reqs.values() if r.has_pending_chunk)
 
-    def _release_chunked_orphan(self, req: Req, *, reset_for_retract: bool) -> None:
-        """Release resources held by a stashed chunked-resume req.
-
-        Shared by `abort_request` (active段 stashed-chunked branch) and
-        `pause_generation(retract)` chunked release loop. Skipped in DECODE
-        mode (DECODE chunked-resume doesn't enter active_reqs).
-
-        Args:
-            req: The stashed chunked-resume req to release.
-            reset_for_retract: If True (pause(retract) path), req re-enters
-                waiting for re-prefill; uses `reset_for_retract()` for full
-                state reset (including zeroing `scheduled_extend_len`) and
-                KEEPS its metadata_buffer slot. If False (abort path), req
-                is going away; releases the metadata_buffer slot for
-                PREFILL mode but leaves `scheduled_extend_len` untouched
-                (the value is meaningless once `_deactivate` removes the
-                req from `active_reqs`; the derived `has_pending_chunk`
-                view is harmless because no iterator will see this req).
-        """
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
-            return
-        # Disagg PREFILL: signal peer decode node that send is aborted/
-        # retracted so it doesn't wait forever.
-        if (
-            self.disaggregation_mode == DisaggregationMode.PREFILL
-            and req.disagg_kv_sender is not None
-        ):
-            if hasattr(req.disagg_kv_sender, "abort"):
-                req.disagg_kv_sender.abort()
-            req.disagg_kv_sender = None
-        release_kv_cache(req, self.tree_cache, is_insert=False)
-        if reset_for_retract:
-            req.reset_for_retract()
-        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            release_req_to_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
-            )
-        self._deactivate(req)
-
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
         uses_transformers_backend = (
@@ -3737,35 +3698,33 @@ class Scheduler(
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
-        # Iterate active_reqs instead of batch_reqs so that stashed
-        # chunked-resume reqs (in active_reqs but NOT in any current batch)
-        # get their resources released immediately. batch_rids was built
-        # above and includes cur_batch + running_batch + PP mbs[*];
-        # "in-batch" reqs go through to_finish, "stashed-chunked" reqs need
-        # explicit release because no batch result path will pick them up.
+        # Active段: iterate active_reqs (includes both in-batch reqs and
+        # stashed chunked-resume between iters). Uniformly set to_finish;
+        # release happens in batch_result_processor on the next forward,
+        # matching main-upstream's delayed-release pattern.
+        #
+        # Stashed chunked-resume (in active_reqs but not in any current
+        # batch.reqs) will be picked up by next iter's Stage A stash + inline
+        # admission cycle: it gets re-admitted, runs one more chunk forward,
+        # then batch_result_processor sees finished() and releases. Wastes
+        # one chunk forward's compute but keeps the code aligned with
+        # main-upstream.
+        #
+        # KNOWN PRE-EXISTING BUG (from main-upstream): in disagg PREFILL
+        # mode, mid-prefill chunked-resume reqs aborted here will NOT
+        # trigger disagg_kv_sender.abort() (the disagg PREFILL batch result
+        # processor at disagg/prefill.py only calls release_kv_cache, no
+        # sender.abort; the abort-side disagg_prefill_inflight_queue scan
+        # only sees reqs that completed their last chunk, not mid-prefill
+        # ones). The decode peer may wait indefinitely. Fix in a separate PR.
         for rid in list(self.active_reqs.keys()):
             req = self.active_reqs[rid]
             if req.finished():
                 continue
             if not (recv_req.abort_all or rid.startswith(recv_req.rid)):
                 continue
-
-            if rid in batch_rids:
-                # In some batch: standard to_finish path; release_kv_cache +
-                # _deactivate happen in process_batch_result_*.
-                logger.debug(f"Abort running request. {req.rid=}")
-                req.to_finish = FINISH_ABORT()
-            else:
-                # Active but not in any batch — the only legitimate case is
-                # a stashed chunked-resume mid-prefill. Release immediately,
-                # else row+KV+lock_ref leak.
-                assert req.has_pending_chunk and req.req_pool_idx is not None, (
-                    f"unexpected active-but-not-in-batch req: {rid} "
-                    f"has_pending_chunk={req.has_pending_chunk} "
-                    f"req_pool_idx={req.req_pool_idx}"
-                )
-                self._release_chunked_orphan(req, reset_for_retract=False)
-                logger.debug(f"Abort stashed chunked-resume request. {req.rid=}")
+            logger.debug(f"Abort running request. {req.rid=}")
+            req.to_finish = FINISH_ABORT()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
@@ -3831,9 +3790,23 @@ class Scheduler(
             # state so continue_generation re-prefills them from
             # origin_input_ids. list(...) because we mutate active_reqs via
             # _deactivate inside the loop.
+            #
+            # Inline chunked-resume retract release: chunked-resume reqs in
+            # active_reqs (but not in running_batch) need explicit cleanup
+            # because retract_all only covers running_batch. Mirrors
+            # release_req + reset_for_retract semantics.
             for req in list(self.chunked_reqs()):
                 if req.req_pool_idx is not None:
-                    self._release_chunked_orphan(req, reset_for_retract=True)
+                    if (
+                        self.disaggregation_mode == DisaggregationMode.PREFILL
+                        and req.disagg_kv_sender is not None
+                    ):
+                        if hasattr(req.disagg_kv_sender, "abort"):
+                            req.disagg_kv_sender.abort()
+                        req.disagg_kv_sender = None
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    req.reset_for_retract()
+                    self._deactivate(req)
                     # TODO: after release, this req is NOT re-enqueued to
                     # waiting_queue. Either the design relies on the original
                     # reference staying in waiting_queue (but retention was
