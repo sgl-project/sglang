@@ -1982,11 +1982,25 @@ if __name__ == "__main__":
             "image",
             "mooncake",
             "longbench_v2",
+            "speed-bench",
         ],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
         "--dataset-path", type=str, default="", help="Path to the dataset."
+    )
+    parser.add_argument(
+        "--speed-bench-category",
+        type=str,
+        default=None,
+        choices=["low_entropy", "mixed", "high_entropy"],
+        help="Category filter for the speed-bench dataset.",
+    )
+    parser.add_argument(
+        "--speed-bench-output-len",
+        type=int,
+        default=512,
+        help="Fixed output length for speed-bench requests (default: 512).",
     )
     parser.add_argument(
         "--model",
