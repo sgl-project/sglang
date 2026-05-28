@@ -16,6 +16,7 @@ from pydantic import (
     NonNegativeInt,
     Tag,
     field_validator,
+    model_validator,
 )
 
 
@@ -254,36 +255,75 @@ class AnthropicToolChoice(BaseModel):
 class AnthropicThinkingParam(BaseModel):
     """Anthropic extended-thinking control on the request.
 
-    ``type`` accepts ``enabled`` / ``disabled`` plus ``adaptive`` (Claude
-    4.7's auto-reasoning mode that the Anthropic SDK and Claude Code 2.x
-    send by default). ``adaptive`` is treated identically to ``enabled``
-    on the serving side because the local OpenAI-compatible backend does
-    not expose an auto-throttle knob.
+    Mirrors the Anthropic SDK's ``ThinkingConfigParam`` discriminated
+    union of three variants — see ``anthropic-sdk-python``'s
+    ``thinking_config_{enabled,disabled,adaptive}_param.py``:
 
-    ``budget_tokens`` is accepted for SDK compatibility but the OpenAI
-    backend has no equivalent hard budget knob; the serving layer rejects
-    requests that set it so callers do not silently get an unbounded
-    thinking budget.
+    * ``enabled`` requires ``budget_tokens`` (≥1024) and accepts
+      ``display``.
+    * ``disabled`` accepts no other fields.
+    * ``adaptive`` (Claude 4.7) accepts ``display`` but not
+      ``budget_tokens``.
 
-    ``display`` (Claude 4.7) is accepted for SDK compatibility. ``omitted``
-    is logged but currently no-op — the backend still streams reasoning
-    deltas because there is no upstream knob to suppress them mid-stream.
+    The serving layer treats ``adaptive`` identically to ``enabled``
+    because the local OpenAI-compatible backend has no auto-throttle
+    equivalent. ``budget_tokens`` is accepted on ``enabled`` for SDK
+    compatibility but the backend has no hard-cap knob to honor it; the
+    serving layer logs a WARNING so operators see that the requested
+    budget is not enforced. ``display="omitted"`` is accepted but
+    similarly cannot suppress reasoning mid-stream and is logged.
     """
 
     type: Literal["enabled", "disabled", "adaptive"]
     budget_tokens: Optional[int] = None
     display: Optional[Literal["summarized", "omitted"]] = None
 
+    @model_validator(mode="after")
+    def _validate_thinking_shape(self):
+        # Cross-field rules mirror the SDK's three discriminated variants.
+        if self.type == "enabled":
+            if self.budget_tokens is None:
+                raise ValueError(
+                    "thinking.budget_tokens is required when "
+                    "thinking.type is 'enabled'"
+                )
+            if self.budget_tokens < 1024:
+                raise ValueError(
+                    "thinking.budget_tokens must be >= 1024 "
+                    "(got {})".format(self.budget_tokens)
+                )
+        elif self.type == "disabled":
+            if self.budget_tokens is not None:
+                raise ValueError(
+                    "thinking.budget_tokens is not allowed when "
+                    "thinking.type is 'disabled'"
+                )
+            if self.display is not None:
+                raise ValueError(
+                    "thinking.display is not allowed when "
+                    "thinking.type is 'disabled'"
+                )
+        elif self.type == "adaptive":
+            if self.budget_tokens is not None:
+                raise ValueError(
+                    "thinking.budget_tokens is not allowed when "
+                    "thinking.type is 'adaptive'"
+                )
+        return self
+
 
 class AnthropicTaskBudget(BaseModel):
     """Claude 4.7 ``output_config.task_budget`` — soft hint, not a hard cap.
 
-    The hard cap is still ``max_tokens``; ``task_budget`` is forwarded to
-    the model as context for long agent loops.
+    Mirrors ``BetaTokenTaskBudgetParam`` in the Anthropic SDK: ``total``
+    and ``type`` are required; ``remaining`` is the client-tracked
+    countdown used for compaction. The hard cap on generation is still
+    ``max_tokens``; we never enforce ``task_budget`` ourselves.
     """
 
     type: Literal["tokens"]
     total: int = Field(gt=0)
+    remaining: Optional[int] = Field(default=None, ge=0)
 
 
 class AnthropicOutputConfig(BaseModel):

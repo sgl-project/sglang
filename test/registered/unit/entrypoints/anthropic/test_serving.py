@@ -652,9 +652,15 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(anthropic_response.content[1].text, "the answer is 4")
 
     def test_request_thinking_enabled_invokes_apply_reasoning_enabled(self):
-        """``thinking={"type": "enabled"}`` must flip the reasoning toggle on."""
+        """``thinking={"type":"enabled", "budget_tokens":N}`` flips reasoning on.
+
+        ``budget_tokens`` is required by the SDK shape on ``enabled``; the
+        local backend does not enforce it but accepts the value.
+        """
         serving = self._serving()
-        request = self._anthropic_request(thinking={"type": "enabled"}, stream=False)
+        request = self._anthropic_request(
+            thinking={"type": "enabled", "budget_tokens": 1024}, stream=False
+        )
         serving._convert_to_chat_completion_request(request)
         self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
 
@@ -665,14 +671,73 @@ class TestAnthropicServing(unittest.TestCase):
         serving._convert_to_chat_completion_request(request)
         self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [False])
 
-    def test_request_thinking_budget_tokens_is_rejected(self):
-        """``budget_tokens`` is not yet supported and must fail loudly."""
+    def test_request_thinking_enabled_with_budget_tokens_logs_warning(self):
+        """SDK shape: ``enabled`` requires ``budget_tokens``. We accept it
+        (the SDK would), but log a WARNING because the local backend has
+        no equivalent hard-cap knob — the budget is not enforced."""
+        import logging
+
         serving = self._serving()
         request = self._anthropic_request(
-            thinking={"type": "enabled", "budget_tokens": 1024}, stream=False
+            thinking={"type": "enabled", "budget_tokens": 2048}, stream=False
         )
-        with self.assertRaises(ValueError):
+        with self.assertLogs(
+            "sglang.srt.entrypoints.anthropic.serving", level=logging.WARNING
+        ) as log:
             serving._convert_to_chat_completion_request(request)
+        self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
+        self.assertTrue(
+            any("budget_tokens=2048" in r and "not enforced" in r for r in log.output),
+            f"expected unenforced-budget warning: {log.output}",
+        )
+
+    def test_request_thinking_enabled_requires_budget_tokens(self):
+        """SDK requires ``budget_tokens`` for ``type=enabled`` — Pydantic 400."""
+        from pydantic import ValidationError
+
+        with self.assertRaises(ValidationError) as ctx:
+            self._anthropic_request(thinking={"type": "enabled"}, stream=False)
+        self.assertIn("budget_tokens", str(ctx.exception))
+
+    def test_request_thinking_enabled_budget_below_min_is_rejected(self):
+        """SDK doc: ``budget_tokens`` must be >= 1024."""
+        from pydantic import ValidationError
+
+        with self.assertRaises(ValidationError) as ctx:
+            self._anthropic_request(
+                thinking={"type": "enabled", "budget_tokens": 512}, stream=False
+            )
+        self.assertIn("1024", str(ctx.exception))
+
+    def test_request_thinking_disabled_with_display_is_rejected(self):
+        """SDK ``ThinkingConfigDisabledParam`` has no ``display`` field."""
+        from pydantic import ValidationError
+
+        with self.assertRaises(ValidationError) as ctx:
+            self._anthropic_request(
+                thinking={"type": "disabled", "display": "omitted"}, stream=False
+            )
+        self.assertIn("display", str(ctx.exception))
+
+    def test_request_thinking_disabled_with_budget_is_rejected(self):
+        """SDK ``ThinkingConfigDisabledParam`` has no ``budget_tokens`` field."""
+        from pydantic import ValidationError
+
+        with self.assertRaises(ValidationError) as ctx:
+            self._anthropic_request(
+                thinking={"type": "disabled", "budget_tokens": 2048}, stream=False
+            )
+        self.assertIn("budget_tokens", str(ctx.exception))
+
+    def test_request_thinking_adaptive_with_budget_is_rejected(self):
+        """SDK ``ThinkingConfigAdaptiveParam`` has no ``budget_tokens`` field."""
+        from pydantic import ValidationError
+
+        with self.assertRaises(ValidationError) as ctx:
+            self._anthropic_request(
+                thinking={"type": "adaptive", "budget_tokens": 2048}, stream=False
+            )
+        self.assertIn("budget_tokens", str(ctx.exception))
 
     def test_request_thinking_adaptive_is_treated_as_enabled(self):
         """Claude 4.7 ``thinking.type='adaptive'`` (the SDK default for
@@ -685,12 +750,18 @@ class TestAnthropicServing(unittest.TestCase):
 
     def test_request_thinking_display_omitted_logs_warning_but_still_enables(self):
         """``thinking.display='omitted'`` is accepted; reasoning stays on
-        because we cannot suppress reasoning text from the OpenAI stream."""
+        because we cannot suppress reasoning text from the OpenAI stream.
+        ``enabled`` requires ``budget_tokens`` per SDK shape."""
         import logging
 
         serving = self._serving()
         request = self._anthropic_request(
-            thinking={"type": "enabled", "display": "omitted"}, stream=False
+            thinking={
+                "type": "enabled",
+                "budget_tokens": 1024,
+                "display": "omitted",
+            },
+            stream=False,
         )
         with self.assertLogs(
             "sglang.srt.entrypoints.anthropic.serving", level=logging.WARNING
@@ -732,6 +803,20 @@ class TestAnthropicServing(unittest.TestCase):
         # max_tokens is untouched
         self.assertEqual(chat_request.max_tokens, 16)
         self.assertTrue(any("task_budget" in r and "32768" in r for r in log.output))
+
+    def test_request_task_budget_with_remaining_is_accepted(self):
+        """SDK's ``BetaTokenTaskBudgetParam`` has a ``remaining`` field
+        used for client-side compaction. Must round-trip cleanly."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            output_config={
+                "task_budget": {"type": "tokens", "total": 32768, "remaining": 12000}
+            },
+            stream=False,
+        )
+        # Must not raise; pre-existing logging still works.
+        serving._convert_to_chat_completion_request(request)
+        self.assertEqual(request.output_config.task_budget.remaining, 12000)
 
     def test_request_betas_is_accepted_and_logged(self):
         """The Anthropic SDK attaches ``betas`` to many requests; must not 400."""

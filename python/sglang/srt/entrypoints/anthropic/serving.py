@@ -519,13 +519,21 @@ class AnthropicServing:
         chat_request = ChatCompletionRequest(**request_data)
 
         if anthropic_request.thinking is not None:
-            # ``budget_tokens`` is a hard cap that the OpenAI backend has no
-            # equivalent for. Rejecting is safer than silently ignoring —
-            # otherwise users requesting bounded thinking would get
-            # unbounded reasoning and inflated bills.
+            # The protocol layer already enforces SDK shape:
+            #   enabled  -> budget_tokens required (>=1024), display optional
+            #   disabled -> neither budget_tokens nor display allowed
+            #   adaptive -> budget_tokens forbidden, display optional
+            # So by the time we get here ``budget_tokens`` can only be
+            # set on ``enabled``. The local backend has no equivalent
+            # hard-cap knob, so we log a WARNING instead of rejecting —
+            # the Anthropic SDK would have accepted the request and we
+            # mirror that. Operators see the unenforced budget in logs.
             if anthropic_request.thinking.budget_tokens is not None:
-                raise ValueError(
-                    "Anthropic thinking.budget_tokens is not supported yet"
+                logger.warning(
+                    "Anthropic thinking.budget_tokens=%d is accepted for "
+                    "SDK compatibility but the local backend has no "
+                    "equivalent hard-cap knob — the budget is not enforced",
+                    anthropic_request.thinking.budget_tokens,
                 )
             # Claude 4.7's ``adaptive`` is treated identically to ``enabled``
             # because the local backend has no auto-throttle equivalent.
