@@ -285,7 +285,15 @@ class FullComponent(TreeComponent):
 
         if phase == CacheTransferPhase.BACKUP_HOST:
             if transfers and transfers[0].host_indices is not None:
-                node.component_data[ct].host_value = transfers[0].host_indices.clone()
+                cd = node.component_data[ct]
+                # Caller (write_backup) must gate this on cd.host_value is None
+                # via full_needs_backup. Overwriting here would orphan the
+                # previous host slot and leak it.
+                assert cd.host_value is None, (
+                    "FullComponent BACKUP_HOST commit on a node that already "
+                    "has host_value would leak the previous host slot."
+                )
+                cd.host_value = transfers[0].host_indices.clone()
 
         elif phase == CacheTransferPhase.LOAD_BACK:
             if not transfers or transfers[0].device_indices is None:
