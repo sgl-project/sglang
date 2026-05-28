@@ -29,8 +29,8 @@ on:
         value: ${{ jobs.run.outputs.partitions }}
       partition_model_sha:
         value: ${{ jobs.run.outputs.partition_model_sha }}
-      b200_runner:
-        value: ${{ jobs.run.outputs.b200_runner }}
+      runs_on_map:
+        value: ${{ jobs.run.outputs.runs_on_map }}
       enable_retry:
         value: ${{ jobs.run.outputs.enable_retry }}
       continue_on_error:
@@ -47,7 +47,7 @@ jobs:
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
       partitions: ${{ steps.partitions.outputs.partitions }}
       partition_model_sha: ${{ steps.partition-model-sha.outputs.sha }}
-      b200_runner: ${{ steps.set-runner.outputs.b200_runner }}
+      runs_on_map: ${{ steps.runner-map.outputs.runs_on_map }}
       enable_retry: ${{ steps.set-retry.outputs.enable_retry }}
       continue_on_error: ${{ steps.set-continue-on-error.outputs.continue_on_error }}
     steps:
@@ -173,6 +173,13 @@ jobs:
           else
             echo "b200_runner=4-gpu-b200" >> $GITHUB_OUTPUT
           fi
+
+      - name: Build runs_on_map (resolves $b200_runner sentinel)
+        id: runner-map
+        run: |
+          python3 scripts/ci/runner_configs.py --map \
+            '${{ steps.set-runner.outputs.b200_runner }}' \
+            >> "$GITHUB_OUTPUT"
 
       - name: Enable retry for CI
         id: set-retry

@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 )
 
 # Constrained decoding with EAGLE3 speculative reasoning (tp=2)
-register_cuda_ci(est_time=137, stage="stage-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=137, stage="base-b", runner_config="2-gpu-large")
 
 
 class ServerWithGrammar(CustomTestCase):
@@ -51,10 +51,7 @@ class ServerWithGrammar(CustomTestCase):
             "--speculative-num-draft-tokens=8",
         ]
 
-        with (
-            envs.SGLANG_SPEC_NAN_DETECTION.override(True),
-            envs.SGLANG_SPEC_OOB_DETECTION.override(True),
-        ):
+        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

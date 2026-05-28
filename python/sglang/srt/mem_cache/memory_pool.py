@@ -40,12 +40,12 @@ from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa import index_buf_accessor
-from sglang.srt.layers.attention.nsa.quant_k_cache import (
+from sglang.srt.layers.attention.dsa import index_buf_accessor
+from sglang.srt.layers.attention.dsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
-from sglang.srt.layers.attention.nsa.utils import aiter_can_use_preshuffle_paged_mqa
+from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
@@ -64,6 +64,7 @@ from sglang.srt.utils import (
     is_npu,
     next_power_of_2,
 )
+from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -109,6 +110,16 @@ def _set_kv_buffer_impl(
             v_cache.view(-1, row_dim),
             indices,
             row_bytes=row_bytes,
+        )
+
+    if _is_cpu and _cpu_has_amx_support:
+        return torch.ops.sgl_kernel.store_cache_cpu(
+            k,
+            v,
+            k_cache,
+            v_cache,
+            indices,
+            row_dim,
         )
 
     from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
@@ -165,10 +176,11 @@ class ReqToTokenPool:
         # https://github.com/sgl-project/sglang/pull/20476
         # if not any(r.is_dllm() for r in reqs):
         #     assert (
-        #         sum(1 for i in reusing if reqs[i].is_chunked > 0) <= 1
+        #         sum(1 for i in reusing if reqs[i].inflight_middle_chunks > 0) <= 1
         #     ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
-            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in reusing
+            reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
+            for i in reusing
         ), "reusing request must be chunked or have committed KV"
 
         need_size = len(reqs) - len(reusing)
@@ -288,6 +300,13 @@ class MambaPool:
                 device=device,
             )
             if speculative_num_draft_tokens is not None:
+                if _is_npu:
+                    temporal_state = temporal_state.transpose(-1, -2)
+                    temporal_state_shape = (
+                        *temporal_state_shape[:-2],
+                        temporal_state_shape[-1],
+                        temporal_state_shape[-2],
+                    )
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
                 intermediate_ssm_state_cache = torch.zeros(
@@ -363,20 +382,22 @@ class MambaPool:
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-        # clear at alloc time — expand a scalar GPU zero to the right shape, no CPU-GPU sync
+        return select_index
+
+    def clear_slots(self, indices: torch.Tensor):
+        """Zero out mamba state at the given pool indices. Must run on forward stream."""
+        need_size = len(indices)
         for i in range(len(self.mamba_cache.conv)):
             t = self.mamba_cache.conv[i]
             z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
                 t.shape[0], need_size, *t.shape[2:]
             )
-            t[:, select_index] = z
+            t[:, indices] = z
         t = self.mamba_cache.temporal
         z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
             t.shape[0], need_size, *t.shape[2:]
         )
-        t[:, select_index] = z
-
-        return select_index
+        t[:, indices] = z
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -388,25 +409,17 @@ class MambaPool:
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
 
-    def copy_from(self, src_index: torch.Tensor, dst_index: torch.Tensor):
+    def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         for i in range(len(self.mamba_cache.conv)):
-            self.mamba_cache.conv[i][:, dst_index] = self.mamba_cache.conv[i][
-                :, src_index
+            self.mamba_cache.conv[i][:, dst_indices] = self.mamba_cache.conv[i][
+                :, src_indices
             ]
-        self.mamba_cache.temporal[:, dst_index] = self.mamba_cache.temporal[
-            :, src_index
+        self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
+            :, src_indices
         ]
-        return
-
-    def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
-        dst_index = self.alloc(1)
-        if dst_index is None:
-            return None
-        self.copy_from(src_index, dst_index)
-        return dst_index
 
     def get_cpu_copy(self, indices):
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         conv_cpu = [
             conv[:, indices].to("cpu", non_blocking=True)
             for conv in self.mamba_cache.conv
@@ -414,18 +427,18 @@ class MambaPool:
         temporal_cpu = self.mamba_cache.temporal[:, indices].to(
             "cpu", non_blocking=True
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         return conv_cpu, temporal_cpu
 
     def load_cpu_copy(self, mamba_cache_cpu, indices):
         conv_cpu, temporal_cpu = mamba_cache_cpu
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         for i, conv in enumerate(self.mamba_cache.conv):
             conv[:, indices] = conv_cpu[i].to(conv.device, non_blocking=True)
         self.mamba_cache.temporal[:, indices] = temporal_cpu.to(
             self.mamba_cache.temporal.device, non_blocking=True
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
     def get_contiguous_buf_infos(self):
         """
@@ -547,8 +560,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
         self.device = device
-        # Indexed by req_pool_idx, so size from the req pool buffer
-        # (self.req_to_token.shape[0]), not from the mamba state pool size.
         req_pool_size = self.req_to_token.shape[0]
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
             req_pool_size, dtype=torch.int32, device=self.device
@@ -557,7 +568,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
                 torch.zeros(
                     (req_pool_size, self.mamba_ping_pong_track_buffer_size),
-                    dtype=torch.int32,
+                    dtype=torch.int64,
                     device=self.device,
                 )
             )
@@ -577,17 +588,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_indices: list[torch.Tensor] = []
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
         for req in reqs:
-            mid = None
-            if req.mamba_pool_idx is not None:  # for radix cache
-                mid = req.mamba_pool_idx
+            if req.mamba_pool_idx is not None:  # for radix cache / continuing chunked
+                pass
             else:
                 mid = self.mamba_pool.alloc(1)
                 assert (
                     mid is not None
                 ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_pool.available_size()=}, {len(reqs)=}"
-                mid = mid[0]
-                req.mamba_pool_idx = mid
-            mamba_indices.append(mid)
+                req.mamba_pool_idx = mid[0]
+                req.mamba_needs_clear = True
+            mamba_indices.append(req.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.mamba_ping_pong_track_buffer is None:
                     req.mamba_ping_pong_track_buffer = self.mamba_pool.alloc(
@@ -608,9 +618,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
         self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
-            ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers).to(
-                dtype=torch.int32
-            )
+            ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
             self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
                 ping_pong_tensor
             )
@@ -741,13 +749,13 @@ class KVCache(abc.ABC):
             k_size_GB = k_size / GB
             v_size_GB = v_size / GB
             logger.info(
-                f"KV Cache is allocated. #tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB"
+                f"KV Cache is allocated. dtype: {self.dtype}, #tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB"
             )
             self.mem_usage = k_size_GB + v_size_GB
         else:
             kv_size_GB = kv_size_bytes / GB
             logger.info(
-                f"KV Cache is allocated. #tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB"
+                f"KV Cache is allocated. dtype: {self.dtype}, #tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB"
             )
             self.mem_usage = kv_size_GB
 
@@ -982,7 +990,7 @@ class MHATokenToKVPool(KVCache):
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def get_cpu_copy(self, indices, mamba_indices=None):
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -996,11 +1004,11 @@ class MHATokenToKVPool(KVCache):
                     "cpu", non_blocking=True
                 )
                 kv_cache_cpu[-1].append([k_cpu, v_cpu])
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             for i in range(0, len(indices), chunk_size):
@@ -1014,7 +1022,7 @@ class MHATokenToKVPool(KVCache):
                 v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=True)
                 self.k_buffer[layer_id][chunk_indices] = k_chunk
                 self.v_buffer[layer_id][chunk_indices] = v_chunk
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
@@ -1084,6 +1092,11 @@ class MHATokenToKVPool(KVCache):
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # Catch stale indices here instead of as illegal-addr or silent KV corruption.
+        size_limit = self.size + self.page_size
+        maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
+        maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
+
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
             return
@@ -1628,7 +1641,7 @@ class MLATokenToKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
-        use_nsa: bool = False,
+        use_dsa: bool = False,
         override_kv_cache_dim: Optional[int] = None,
     ):
         super().__init__(
@@ -1644,17 +1657,17 @@ class MLATokenToKVPool(KVCache):
 
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
-        self.use_nsa = use_nsa
-        self.nsa_kv_cache_store_fp8 = (
-            use_nsa
+        self.use_dsa = use_dsa
+        self.dsa_kv_cache_store_fp8 = (
+            use_dsa
             and dtype == torch.float8_e4m3fn
             and override_kv_cache_dim is not None
         )
-        # When override_kv_cache_dim is provided with nsa model, we assume the
+        # When override_kv_cache_dim is provided with dsa model, we assume the
         # override kv cache dim is correct and use it directly.
         self.kv_cache_dim = (
             override_kv_cache_dim
-            if self.nsa_kv_cache_store_fp8
+            if self.dsa_kv_cache_store_fp8
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
@@ -1665,8 +1678,8 @@ class MLATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
-        if not use_nsa:
-            # NSA will allocate indexer KV cache later and then log the total size
+        if not use_dsa:
+            # DSA will allocate indexer KV cache later and then log the total size
             self._finalize_allocation_log(size)
 
     def _create_buffers(self):
@@ -1736,7 +1749,7 @@ class MLATokenToKVPool(KVCache):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        assert not self.nsa_kv_cache_store_fp8
+        assert not self.dsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
@@ -1756,7 +1769,7 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
 
-        if _is_hip and self.use_nsa and self.dtype == fp8_dtype:
+        if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
             set_mla_kv_buffer_triton_fp8_quant(
@@ -1766,7 +1779,7 @@ class MLATokenToKVPool(KVCache):
                 cache_k_rope,
                 fp8_dtype,
             )
-        elif self.nsa_kv_cache_store_fp8:
+        elif self.dsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
             # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
@@ -1822,7 +1835,7 @@ class MLATokenToKVPool(KVCache):
         return cache_k_nope, cache_k_rope
 
     def get_cpu_copy(self, indices, mamba_indices=None):
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -1833,11 +1846,11 @@ class MLATokenToKVPool(KVCache):
                     "cpu", non_blocking=True
                 )
                 kv_cache_cpu[-1].append(kv_cpu)
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             for i in range(0, len(indices), chunk_size):
@@ -1846,7 +1859,7 @@ class MLATokenToKVPool(KVCache):
                 assert kv_cpu.shape[0] == len(chunk_indices)
                 kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
                 self.kv_buffer[layer_id][chunk_indices] = kv_chunk
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
 
 class MLATokenToKVPoolFP4(MLATokenToKVPool):
@@ -1915,7 +1928,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        assert not self.nsa_kv_cache_store_fp8
+        assert not self.dsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
             from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
 
@@ -1940,7 +1953,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
     ):
         layer_id = layer.layer_id
 
-        if self.nsa_kv_cache_store_fp8:
+        if self.dsa_kv_cache_store_fp8:
             # original cache_k: (num_tokens, num_heads 1, hidden 576); we unsqueeze the page_size=1 dim here
             # TODO no need to cat
             cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
@@ -1978,7 +1991,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             )
 
 
-class NSATokenToKVPool(MLATokenToKVPool):
+class DSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
@@ -2015,7 +2028,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             enable_memory_saver,
             start_layer,
             end_layer,
-            use_nsa=True,
+            use_dsa=True,
             override_kv_cache_dim=override_dim,
         )
         # self.index_k_dtype = torch.float8_e4m3fn
@@ -2023,7 +2036,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         self.index_head_dim = index_head_dim
         if index_buf_size is None:
             index_buf_size = size
-        # num head == 1 and head dim == 128 for index_k in NSA
+        # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
 
         if _is_hip:
@@ -2034,7 +2047,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             else:
                 assert (
                     self.page_size == 1
-                ), f"HIP legacy NSA path requires page_size == 1, got {self.page_size}"
+                ), f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
         else:
             assert self.page_size == 64
         with (
@@ -2143,11 +2156,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
         )
 
     def get_cpu_copy(self, indices):
-        # NSA keeps a page-indexed index_k_with_scale_buffer alongside kv_buffer.
+        # DSA keeps a page-indexed index_k_with_scale_buffer alongside kv_buffer.
         # Retract frees the slots/pages and they get reused by other reqs'
         # set_index_k_scale_buffer, so we must offload it here too -- otherwise
         # resume restores kv_buffer but leaves foreign index/scale in place and
-        # NSA attention reads garbage at those token positions.
+        # DSA attention reads garbage at those token positions.
         kv_cache_cpu = super().get_cpu_copy(indices)
 
         page_indices = indices[:: self.page_size] // self.page_size

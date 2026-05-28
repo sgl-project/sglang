@@ -21,12 +21,14 @@ from __future__ import annotations
 import copy
 import uuid
 from abc import ABC
+from array import array
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Annotated, Any, Dict, List, Literal, Optional, Union
 
 import torch
+from pydantic import PlainValidator
 
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -39,6 +41,7 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
+from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -135,8 +138,13 @@ MultimodalDataInputFormat = Union[
 class GenerateReqInput(BaseReq):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
-    # The token ids for text; one can specify either text or input_ids
-    input_ids: Optional[Union[List[List[int]], List[int]]] = None
+    # The token ids for text.
+    #
+    # Use C-loop validator to replace Pydantic per-element type check for efficiency.
+    input_ids: Annotated[
+        Optional[Union[List[List[int]], List[int]]],
+        PlainValidator(validate_optional_list_i64_1d_2d),
+    ] = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -712,7 +720,7 @@ class TokenizedGenerateReqInput(BaseReq):
     # The input text
     input_text: str
     # The input token ids
-    input_ids: List[int]
+    input_ids: Optional[array[int]]
     # The multimodal inputs
     mm_inputs: object
     # The sampling parameters
@@ -1027,7 +1035,7 @@ class TokenizedEmbeddingReqInput(BaseReq):
     # The input text
     input_text: str
     # The input token ids
-    input_ids: List[int]
+    input_ids: array[int]
     # The image inputs
     image_inputs: dict
     # The token type ids
@@ -1075,10 +1083,10 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     finished_reasons: List[BaseFinishReason]
     # For incremental decoding
     decoded_texts: List[str]
-    decode_ids: List[int]
+    decode_ids: List[array[int]]
     read_offsets: List[int]
     # Only used when `--skip-tokenizer-init` is on
-    output_ids: Optional[List[int]]
+    output_ids: Optional[List[array[int]]]
     # Detokenization configs
     skip_special_tokens: List[bool]
     spaces_between_special_tokens: List[bool]
