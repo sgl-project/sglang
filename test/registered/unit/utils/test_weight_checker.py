@@ -543,10 +543,10 @@ class TestHashTensor(CustomTestCase):
         b = torch.ones(64, dtype=torch.float32).cuda()
         self.assertNotEqual(_hash_tensor(a), _hash_tensor(b))
 
-    def test_returns_16_char_hex(self):
+    def test_returns_32_char_hex(self):
         t = torch.zeros(64, dtype=torch.float32).cuda()
         h = _hash_tensor(t)
-        self.assertEqual(len(h), 16)
+        self.assertEqual(len(h), 32)
         int(h, 16)  # raises if not hex
 
     def test_does_not_mutate_input(self):
