@@ -151,8 +151,8 @@ class RadixAttention(nn.Module):
 @register_split_op()
 def unified_attention_with_output(
     query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
+    key: Optional[torch.Tensor],
+    value: Optional[torch.Tensor],
     output: torch.Tensor,
     save_kv_cache: bool,
     layer_id: int,
@@ -174,8 +174,10 @@ def unified_attention_with_output(
     real_num_tokens = forward_batch.num_token_non_padded_cpu
 
     query = query[:real_num_tokens]
-    key = key[:real_num_tokens]
-    value = value[:real_num_tokens]
+    if key is not None:
+        key = key[:real_num_tokens]
+    if value is not None:
+        value = value[:real_num_tokens]
 
     kwargs = {}
     if q_rope is not None:
