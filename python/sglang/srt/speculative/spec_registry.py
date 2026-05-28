@@ -6,8 +6,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Callable, Dict, Optional, Type
 
+import torch
+
 if TYPE_CHECKING:
+    from sglang.srt.managers.overlap_utils import FutureMap
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.spec_info import SpecInput
 
 WorkerFactory = Callable[["ServerArgs"], Type]
 ServerArgsValidator = Callable[["ServerArgs"], None]
@@ -64,6 +69,9 @@ class CustomSpecAlgo:
     def is_ngram(self) -> bool:
         return False
 
+    def supports_target_verify_for_draft(self) -> bool:
+        return False
+
     def supports_spec_v2(self) -> bool:
         return self.supports_overlap
 
@@ -73,6 +81,25 @@ class CustomSpecAlgo:
                 f"Speculative algorithm {self.name} does not support overlap scheduling."
             )
         return self.factory(server_args)
+
+    def get_num_tokens_per_bs_for_target_verify(
+        self, num_draft_tokens: int, is_draft_worker: bool
+    ) -> int:
+        # FIXME: Remove this after the forward mode refactor. Target verify is
+        # essentially a fixed sequence length prefill/extend with full cuda
+        # graph support. We can use it for target verify, or we can use it for
+        # other cases which is not target verify but fixed length prefill.
+        # Here, we expose this interface to allow the other use cases.
+        return num_draft_tokens
+
+    def build_disagg_draft_input(
+        self,
+        batch: ScheduleBatch,
+        server_args: ServerArgs,
+        last_tokens_tensor: torch.Tensor,
+        future_map: FutureMap,
+    ) -> Optional[SpecInput]:
+        return None
 
 
 _REGISTRY: Dict[str, CustomSpecAlgo] = {}

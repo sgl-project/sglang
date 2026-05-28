@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=302, stage="stage-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=302, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
@@ -55,8 +55,7 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
         try:
             with (
                 envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
-                envs.SGLANG_SPEC_NAN_DETECTION.override(True),
-                envs.SGLANG_SPEC_OOB_DETECTION.override(True),
+                envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True),
             ):
                 cls.process = popen_launch_server(
                     cls.model,

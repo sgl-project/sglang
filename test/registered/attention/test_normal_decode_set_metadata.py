@@ -20,8 +20,8 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-# Register this test for CUDA CI in stage-b (fast attention/kernel tests)
-register_cuda_ci(est_time=11, stage="stage-b", runner_config="1-gpu-large")
+# Register this test for CUDA CI in base-b (fast attention/kernel tests)
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
 
 
 def reference_normal_decode_set_metadata(
