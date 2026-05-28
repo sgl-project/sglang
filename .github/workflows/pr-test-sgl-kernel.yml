@@ -6,18 +6,17 @@ on:
       sgl_kernel:
         required: true
         type: string
-      b200_runner:
+      runner_config:
         required: true
         type: string
-      pr_head_sha:
-        required: false
+      runs_on_map:
+        required: true
         type: string
-        default: ''
       git_ref:
         required: false
         type: string
         default: ''
-      skip_stage_health_check:
+      skip_pr_test_health_check:
         required: false
         type: boolean
         default: false
@@ -28,7 +27,7 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
-  SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == true && 'true' || 'false' }}
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check == true && 'true' || 'false' }}
 
 jobs:
   sgl-kernel-unit-test:
@@ -37,9 +36,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
+      - uses: ./.github/actions/check-pr-test-health
 
       - uses: ./.github/actions/check-maintenance
 
@@ -66,50 +65,15 @@ jobs:
           cd sgl-kernel
           pytest tests/
 
-  sgl-kernel-mla-test:
-    runs-on: 1-gpu-h100
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-stage-health
-
-      - uses: ./.github/actions/check-maintenance
-
-      - name: Cleanup
-        run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda*
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        run: |
-          cd test/registered/mla
-          python3 test_mla_deepseek_v3.py
-
   sgl-kernel-benchmark-test:
     runs-on: 1-gpu-h100
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
+      - uses: ./.github/actions/check-pr-test-health
 
       - uses: ./.github/actions/check-maintenance
 
@@ -149,14 +113,14 @@ jobs:
           echo "All benchmark tests completed!"
 
   sgl-kernel-b200-test:
-    runs-on: ${{ inputs.b200_runner }}
+    runs-on: ${{ fromJson(inputs.runs_on_map)[inputs.runner_config] }}
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
+      - uses: ./.github/actions/check-pr-test-health
 
       - uses: ./.github/actions/check-maintenance
 

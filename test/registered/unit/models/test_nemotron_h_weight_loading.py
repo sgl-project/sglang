@@ -7,7 +7,7 @@ parameters absent from the current runtime model.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=4, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
@@ -35,7 +35,7 @@ class _FakeParam:
 class TestNemotronHWeightLoading(unittest.TestCase):
     def _make_minimal_model(self, named_parameters=()):
         model = object.__new__(NemotronHForCausalLM)
-        model.config = SimpleNamespace(n_routed_experts=2)
+        model.config = SimpleNamespace(n_routed_experts=2, max_n_routed_experts=2)
         model.model = SimpleNamespace()
         model.pp_group = _FakePPGroup()
         model.remap_prefix = {}

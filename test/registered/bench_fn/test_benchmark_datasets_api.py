@@ -26,7 +26,8 @@ from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.datasets.sharegpt import sample_sharegpt_requests
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-b-test-cpu")
 
 
 class _DummyTokenTensor:
@@ -405,12 +406,15 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         fake_mmmu_dataset = _FakeMMMUDataset(
             [{"image_1": Image.new("RGB", (4, 4), color="white"), "question": "q"}]
         )
-        with patch(
-            "sglang.benchmark.datasets.mmmu.get_processor",
-            return_value=self.processor,
-        ), patch(
-            "sglang.benchmark.datasets.mmmu.load_dataset",
-            return_value=fake_mmmu_dataset,
+        with (
+            patch(
+                "sglang.benchmark.datasets.mmmu.get_processor",
+                return_value=self.processor,
+            ),
+            patch(
+                "sglang.benchmark.datasets.mmmu.load_dataset",
+                return_value=fake_mmmu_dataset,
+            ),
         ):
             mmmu_args = make_args(dataset_name="mmmu", num_prompts=1)
             mmmu_rows = get_dataset(mmmu_args, self.tokenizer, model_id="dummy-model")

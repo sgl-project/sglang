@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -79,6 +81,7 @@ from sglang.srt.model_executor.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -393,10 +396,11 @@ class NemotronHMoEDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        layer_config = config.get_nemotron_h_config_for_layer(layer_idx)
 
         self.layer_idx = layer_idx
         self.mixer = NemotronHMoE(
-            config,
+            layer_config,
             layer_idx=layer_idx,
             quant_config=quant_config,
             prefix=f"{prefix}.mixer",
@@ -479,7 +483,7 @@ class NemotronHMambaDecoderLayer(nn.Module):
             if real_num_tokens < original_num_tokens:
                 hidden_states = hidden_states[:real_num_tokens]
         output = torch.empty_like(hidden_states)
-        attn_backend = forward_batch.attn_backend
+        attn_backend = get_attn_backend()
         assert isinstance(attn_backend, HybridLinearAttnBackend)
         assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
         attn_backend.linear_attn_backend.forward(
@@ -487,6 +491,7 @@ class NemotronHMambaDecoderLayer(nn.Module):
             layer_id=self.layer_id,
             hidden_states=hidden_states,
             output=output,
+            forward_batch=forward_batch,
             use_triton_causal_conv=True,
         )
         return _pad_to_original_num_tokens(output, original_num_tokens)
@@ -605,6 +610,7 @@ class NemotronHAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_idx,
+            sliding_window_size=config.sliding_window,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
@@ -662,9 +668,10 @@ class NemotronHAttentionDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        layer_config = config.get_nemotron_h_config_for_layer(layer_idx)
 
         self.mixer = NemotronHAttention(
-            config,
+            layer_config,
             layer_idx,
             quant_config,
             prefix=f"{prefix}.mixer",
@@ -1055,7 +1062,7 @@ class NemotronHForCausalLM(nn.Module):
             ckpt_gate_proj_name="up_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="",
-            num_experts=self.config.n_routed_experts,
+            num_experts=self.config.max_n_routed_experts,
         )
 
         params_dict = dict(self.named_parameters())
@@ -1155,7 +1162,11 @@ class NemotronHForCausalLM(nn.Module):
                         logger.warning(f"Parameter {name} not found in params_dict")
 
 
-EntryClass = [NemotronHForCausalLM]
+class NemotronHPuzzleForCausalLM(NemotronHForCausalLM):
+    pass
+
+
+EntryClass = [NemotronHForCausalLM, NemotronHPuzzleForCausalLM]
 
 
 @register_custom_op(mutates_args=["output"])
@@ -1173,7 +1184,7 @@ def nemotron_mamba2_with_output(
 
     # In piecewise CUDA graph mode, hidden_states may be padded to the
     # captured graph size. Slice to actual token count for Mamba forward.
-    attn_backend = forward_batch.attn_backend
+    attn_backend = get_attn_backend()
     metadata = attn_backend.linear_attn_backend.forward_metadata
     num_actual_tokens = metadata.num_prefill_tokens + (
         metadata.num_decodes * metadata.draft_token_num

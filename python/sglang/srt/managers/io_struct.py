@@ -21,12 +21,14 @@ from __future__ import annotations
 import copy
 import uuid
 from abc import ABC
+from array import array
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Annotated, Any, Dict, List, Literal, Optional, Union
 
 import torch
+from pydantic import PlainValidator
 
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -39,6 +41,7 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
+from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -95,13 +98,13 @@ class SpeculativeDecodingMetricsMixin:
 
     # Accepted drafts: Number of accepted draft tokens during speculative decoding
     # (strict drafts-only count, excludes the bonus token).
-    spec_accepted_drafts: List[int]
+    spec_num_correct_drafts: List[int]
 
     # Acceptance histogram: List of lists, where each inner list represents histogram counts.
     # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
     # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
     # Empty list [] when speculative decoding is disabled.
-    spec_acceptance_histogram: List[List[int]]
+    spec_correct_drafts_histogram: List[List[int]]
 
 
 # Parameters for a session
@@ -135,8 +138,13 @@ MultimodalDataInputFormat = Union[
 class GenerateReqInput(BaseReq):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
-    # The token ids for text; one can specify either text or input_ids
-    input_ids: Optional[Union[List[List[int]], List[int]]] = None
+    # The token ids for text.
+    #
+    # Use C-loop validator to replace Pydantic per-element type check for efficiency.
+    input_ids: Annotated[
+        Optional[Union[List[List[int]], List[int]]],
+        PlainValidator(validate_optional_list_i64_1d_2d),
+    ] = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -174,7 +182,9 @@ class GenerateReqInput(BaseReq):
     # Whether to return captured routed experts
     return_routed_experts: bool = False
     return_indexer_topk: bool = False
-    # The start location in the prompt for returning routed experts.
+    # Absolute start position for returned routings; response covers
+    # `[routed_experts_start_len, seqlen - 1)`. Must be in [0, prompt_tokens].
+    # 0 = full sequence.
     routed_experts_start_len: int = 0
 
     # The modalities of the image data [image, multi-images, video]
@@ -654,6 +664,7 @@ class GenerateReqInput(BaseReq):
                 else self.return_hidden_states
             ),
             return_routed_experts=self.return_routed_experts,
+            routed_experts_start_len=self.routed_experts_start_len,
             return_indexer_topk=self.return_indexer_topk,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
@@ -709,7 +720,7 @@ class TokenizedGenerateReqInput(BaseReq):
     # The input text
     input_text: str
     # The input token ids
-    input_ids: List[int]
+    input_ids: Optional[array[int]]
     # The multimodal inputs
     mm_inputs: object
     # The sampling parameters
@@ -730,7 +741,7 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
-    # The start location in the prompt for returning routed experts.
+    # See GenerateReqInput.routed_experts_start_len.
     routed_experts_start_len: int = 0
 
     return_indexer_topk: bool = False
@@ -1024,7 +1035,7 @@ class TokenizedEmbeddingReqInput(BaseReq):
     # The input text
     input_text: str
     # The input token ids
-    input_ids: List[int]
+    input_ids: array[int]
     # The image inputs
     image_inputs: dict
     # The token type ids
@@ -1072,10 +1083,10 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     finished_reasons: List[BaseFinishReason]
     # For incremental decoding
     decoded_texts: List[str]
-    decode_ids: List[int]
+    decode_ids: List[array[int]]
     read_offsets: List[int]
     # Only used when `--skip-tokenizer-init` is on
-    output_ids: Optional[List[int]]
+    output_ids: Optional[List[array[int]]]
     # Detokenization configs
     skip_special_tokens: List[bool]
     spaces_between_special_tokens: List[bool]
@@ -1378,7 +1389,12 @@ class PauseGenerationReqInput(BaseReq):
 
 @dataclass
 class ContinueGenerationReqInput(BaseReq):
-    pass
+    # Call torch.cuda.empty_cache() before un-pausing. Returns blocks
+    # cached by the PyTorch allocator (left over from transient allocs
+    # during post-weight-update processing) back to the driver before
+    # inference resumes, with no race against active streams. Set to
+    # False to skip the empty_cache call.
+    torch_empty_cache: bool = True
 
 
 @dataclass
@@ -1407,7 +1423,7 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     weight_version: Optional[str] = None
     # Whether to update weights asynchronously
     is_async: bool = False
-    # Whether to empty torch cache
+    # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
     # Whether to keep the scheduler paused after weight update
     keep_pause: bool = False
@@ -1758,6 +1774,7 @@ class ConfigureLoggingReq(BaseReq):
     dump_requests_folder: Optional[str] = None
     dump_requests_threshold: Optional[int] = None
     crash_dump_folder: Optional[str] = None
+    dump_requests_exclude_meta_keys: Optional[List[str]] = None
 
 
 @dataclass
