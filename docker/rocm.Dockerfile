@@ -210,9 +210,7 @@ ENV SETUPTOOLS_SCM_PRETEND_VERSION=
 RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO} \
  && cd aiter \
- && git checkout ${AITER_COMMIT} \
- && git cherry-pick --no-commit d7caa3d20b28fff4ea95623ee5a147d0e1a50c4e \
- && git cherry-pick --no-commit 4901f7e76fc1b926e3047717131394026c6c817e \
+ && git checkout -f ${AITER_COMMIT} \
  && git submodule update --init --recursive \
  && pip install -r requirements.txt
 
