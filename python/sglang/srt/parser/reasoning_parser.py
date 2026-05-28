@@ -627,6 +627,11 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
 
     TEXT_START_TOKEN = "<|START_TEXT|>"
     TEXT_END_TOKEN = "<|END_TEXT|>"
+    # When the model decides to call tools instead of producing a final text
+    # block, it emits an action block instead of a text block. The reasoning
+    # parser must leave that block intact so the downstream tool-call parser
+    # can pick it up.
+    ACTION_START_TOKEN = "<|START_ACTION|>"
 
     def __init__(
         self,
@@ -648,26 +653,36 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
             continue_final_message=continue_final_message,
             previous_content=previous_content,
         )
-        # Streaming state for the final-text block: once we've stepped past
-        # <|END_THINKING|> we still need to strip the surrounding
-        # <|START_TEXT|>...<|END_TEXT|> markers from the normal-text stream.
+        # Streaming state machine. The model emits, in order:
+        #   1. reasoning  (between START_THINKING [in prefix] and END_THINKING)
+        #   2. either ``<|START_TEXT|>...<|END_TEXT|>`` (final answer) or
+        #      ``<|START_ACTION|>...<|END_ACTION|>`` (tool calls) -- never both.
+        # When ``reasoning=False`` the chat template emits both START/END
+        # thinking in the prefix and step 1 is empty; the generated stream
+        # then starts directly with the text or action block.
+        self._reasoning_done = False
         self._saw_text_start = False
         self._saw_text_end = False
-        self._normal_buffer = ""
+        self._in_action_mode = False
 
     @classmethod
     def _strip_text_markers(cls, raw: str) -> str:
         """Extract the substring between ``<|START_TEXT|>`` and
-        ``<|END_TEXT|>``. If ``<|START_TEXT|>`` is absent (model never
-        produced a final text block, e.g. ran out of tokens still thinking)
-        return ``""``. If ``<|END_TEXT|>`` is absent (stop token or
-        max_new_tokens cut the stream off inside the text block) return
+        ``<|END_TEXT|>``. If ``<|START_TEXT|>`` is absent but a
+        ``<|START_ACTION|>`` block is present, the model produced a tool
+        call instead of a text answer -- return the raw text untouched so
+        the downstream tool-call parser can pick up the action block. If
+        neither marker is present (ran out of tokens still inside
+        thinking) return ``""``. If ``<|END_TEXT|>`` is absent (stop token
+        or max_new_tokens cut the stream off inside the text block) return
         everything after ``<|START_TEXT|>``.
         """
         if not raw:
             return ""
         s = raw.find(cls.TEXT_START_TOKEN)
         if s == -1:
+            if cls.ACTION_START_TOKEN in raw:
+                return raw
             return ""
         s += len(cls.TEXT_START_TOKEN)
         tail = raw[s:]
@@ -690,12 +705,21 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
         # "no answer" rather than falling back to ``reasoning_content``.
         end_think_idx = text.find(self.think_end_token)
         text_start_idx = text.find(self.TEXT_START_TOKEN)
+        action_start_idx = text.find(self.ACTION_START_TOKEN)
         if end_think_idx != -1:
             reasoning = text[:end_think_idx]
             rest = text[end_think_idx + len(self.think_end_token) :]
         elif text_start_idx != -1:
             reasoning = text[:text_start_idx]
             rest = text[text_start_idx:]
+        elif action_start_idx != -1:
+            # reasoning=False + tool call: chat template emitted both
+            # START/END thinking in the prefix, the model only generated
+            # an action block. Treat the prefix before the action block as
+            # (probably empty) reasoning so the action block reaches the
+            # tool-call parser intact.
+            reasoning = text[:action_start_idx]
+            rest = text[action_start_idx:]
         else:
             reasoning = text
             rest = ""
@@ -712,54 +736,108 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
         )
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
-        # Let the base detector route bytes into reasoning vs normal first.
-        result = super().parse_streaming_increment(new_text)
-        # While we're still inside the reasoning block (or the base detector
-        # decided this chunk is purely reasoning) nothing to strip.
-        if result.reasoning_text and not result.normal_text:
-            return result
+        """Streaming parse. Custom state machine -- we don't reuse the base
+        class because Cohere's "reasoning=False" path (the model emits no
+        ``<|END_THINKING|>``, just goes straight to a text or action block)
+        is fundamentally incompatible with the base detector's
+        ``force_reasoning`` semantics."""
+        self._buffer += new_text
+        buf = self._buffer
 
-        normal_inc = result.normal_text or ""
-        if not normal_inc:
-            return result
+        if not self._reasoning_done:
+            # Look for any marker that ends reasoning: an explicit
+            # END_THINKING, or an implicit transition via the start of the
+            # final-text or action block (reasoning=False case).
+            markers = (
+                (self.think_end_token, "think_end"),
+                (self.TEXT_START_TOKEN, "text"),
+                (self.ACTION_START_TOKEN, "action"),
+            )
+            first_pos = None
+            first_marker = None
+            first_kind = None
+            for marker_text, kind in markers:
+                p = buf.find(marker_text)
+                if p != -1 and (first_pos is None or p < first_pos):
+                    first_pos, first_marker, first_kind = p, marker_text, kind
+            if first_pos is None:
+                # No marker seen yet. Stream the reasoning prefix, but keep
+                # enough tail in the buffer to recognise a marker split
+                # across chunk boundaries.
+                if not self.stream_reasoning:
+                    return StreamingParseResult()
+                max_keep = max(len(m) for m, _ in markers) - 1
+                if len(buf) > max_keep:
+                    head = buf[:-max_keep]
+                    self._buffer = buf[-max_keep:]
+                    return StreamingParseResult(reasoning_text=head)
+                return StreamingParseResult()
 
-        out_normal = ""
-        # Append the new normal-stream slice to our buffer and walk through
-        # the START_TEXT / END_TEXT markers.
-        self._normal_buffer += normal_inc
+            reasoning_chunk = buf[:first_pos]
+            if first_kind == "think_end":
+                self._buffer = buf[first_pos + len(first_marker) :]
+            else:
+                # Implicit reasoning-end: leave the start-of-block marker in
+                # the buffer for the post-thinking branch below to consume.
+                self._buffer = buf[first_pos:]
+            self._reasoning_done = True
+            if reasoning_chunk:
+                return StreamingParseResult(reasoning_text=reasoning_chunk)
+            buf = self._buffer
+
+        # Reasoning is closed. Decide between text-stripping and
+        # action-passthrough on first sight of a marker.
+        if self._in_action_mode:
+            if not buf:
+                return StreamingParseResult()
+            self._buffer = ""
+            return StreamingParseResult(normal_text=buf)
 
         if not self._saw_text_start:
-            s = self._normal_buffer.find(self.TEXT_START_TOKEN)
-            if s == -1:
-                # The buffer may contain a partial START_TEXT marker at the
-                # tail; keep the last (len-1) chars in case the next chunk
-                # completes the marker.
-                keep = len(self.TEXT_START_TOKEN) - 1
-                if len(self._normal_buffer) > keep:
-                    self._normal_buffer = self._normal_buffer[-keep:]
-                result.normal_text = ""
-                return result
-            # Drop everything up to and including the START_TEXT marker.
-            self._normal_buffer = self._normal_buffer[s + len(self.TEXT_START_TOKEN) :]
+            s_text = buf.find(self.TEXT_START_TOKEN)
+            s_action = buf.find(self.ACTION_START_TOKEN)
+            picks = [
+                (p, k)
+                for p, k in ((s_text, "text"), (s_action, "action"))
+                if p != -1
+            ]
+            if not picks:
+                max_keep = (
+                    max(len(self.TEXT_START_TOKEN), len(self.ACTION_START_TOKEN))
+                    - 1
+                )
+                if len(buf) > max_keep:
+                    self._buffer = buf[-max_keep:]
+                return StreamingParseResult()
+            picks.sort()
+            first_pos, first_kind = picks[0]
+            if first_kind == "action":
+                self._in_action_mode = True
+                out_normal = buf[first_pos:]
+                self._buffer = ""
+                return StreamingParseResult(normal_text=out_normal)
+            # Found <|START_TEXT|>. Drop everything up to and including the
+            # marker -- text content streams next.
+            self._buffer = buf[first_pos + len(self.TEXT_START_TOKEN) :]
             self._saw_text_start = True
+            buf = self._buffer
 
         if self._saw_text_start and not self._saw_text_end:
-            e = self._normal_buffer.find(self.TEXT_END_TOKEN)
+            e = buf.find(self.TEXT_END_TOKEN)
             if e == -1:
-                # Emit everything except possible partial END_TEXT tail.
+                # Emit everything except a possible partial END_TEXT tail.
                 keep = len(self.TEXT_END_TOKEN) - 1
-                if len(self._normal_buffer) > keep:
-                    out_normal = self._normal_buffer[:-keep]
-                    self._normal_buffer = self._normal_buffer[-keep:]
-                else:
-                    out_normal = ""
-            else:
-                out_normal = self._normal_buffer[:e]
-                self._normal_buffer = self._normal_buffer[e + len(self.TEXT_END_TOKEN) :]
-                self._saw_text_end = True
+                if len(buf) > keep:
+                    out_normal = buf[:-keep]
+                    self._buffer = buf[-keep:]
+                    return StreamingParseResult(normal_text=out_normal)
+                return StreamingParseResult()
+            out_normal = buf[:e]
+            self._buffer = buf[e + len(self.TEXT_END_TOKEN) :]
+            self._saw_text_end = True
+            return StreamingParseResult(normal_text=out_normal)
 
-        result.normal_text = out_normal
-        return result
+        return StreamingParseResult()
 
 
 class ReasoningParser:
