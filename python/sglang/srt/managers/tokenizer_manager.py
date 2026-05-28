@@ -856,9 +856,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         len(mm_inputs.mm_items),
                     )
                 else:
-                    for item, hex_hash in zip(
-                        mm_inputs.mm_items, caller_mm_hashes
-                    ):
+                    for item, hex_hash in zip(mm_inputs.mm_items, caller_mm_hashes):
                         if not isinstance(item, MultimodalDataItem):
                             continue
                         try:

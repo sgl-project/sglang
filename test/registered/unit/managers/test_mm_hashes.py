@@ -51,7 +51,9 @@ class TestMmHashesContract(CustomTestCase):
         # raise so any accidental recompute is loud.
         with patch(
             "sglang.srt.managers.mm_utils.hash_feature",
-            side_effect=AssertionError("hash_feature must NOT be called when hash is preset"),
+            side_effect=AssertionError(
+                "hash_feature must NOT be called when hash is preset"
+            ),
         ):
             item.set_pad_value()
         self.assertEqual(item.hash, 0xDEADBEEF)
