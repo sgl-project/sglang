@@ -1208,6 +1208,9 @@ def _prune_splitk_configs(configs, named_args, **kwargs):
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 128, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 128, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        # BLOCK_H=32: critical for cc=32 with h_q=128 (gives 256 blocks with split_k=2)
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_N": 128}, num_warps=4, num_stages=1),
     ],
     key=["total_tokens_bucket", "h_q", "topk_per_split"],
     prune_configs_by={"early_config_prune": _prune_splitk_configs},
@@ -1590,6 +1593,7 @@ def fused_gather_attn_decode_dsv4_dual_scope(
     topk_length_extra: Optional[torch.Tensor] = None,
     attn_sink: Optional[torch.Tensor] = None,
     s_q: int = 1,
+    force_no_splitk: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Fused gather+dequant+attention for DSV4 with dual scope (main + extra).
@@ -1608,6 +1612,9 @@ def fused_gather_attn_decode_dsv4_dual_scope(
         topk_length_extra: Optional per-batch topk length for extra [b]
         attn_sink: Optional attention sink values [h_q]
         s_q: Sequence length per batch
+        force_no_splitk: If True, skip split-K and use the non-splitk kernel
+            directly. Used by the dispatch layer for large batch prefill where
+            the non-splitk fused kernel avoids intermediate buffer allocation.
 
     Returns:
         output: Attention output [total_tokens, h_q, d_v]
@@ -1647,6 +1654,10 @@ def fused_gather_attn_decode_dsv4_dual_scope(
         or kv_cache_size_extra > BUFFER_OPS_DISABLE_THRESHOLD
     )
 
+    # When force_no_splitk is set, skip the split-K decision and fall
+    # through to the non-splitk kernel path below.
+    use_splitk = not force_no_splitk
+
     # Use Split-K for dual scope in these cases:
     # 1. Small batch sizes with h_q=128 or large topk to increase GPU parallelism
     # 2. Large topk (>= 2048) with medium/large batch sizes
@@ -1665,7 +1676,7 @@ def fused_gather_attn_decode_dsv4_dual_scope(
     # For h_q > 64 (e.g. h_q=128), the non-splitk grid has very few blocks
     # in the H dimension, leading to low GPU utilization at medium batch sizes.
     use_splitk_for_large_hq = h_q > 64 and total_tokens > 8 and total_topk >= 256
-    if (
+    if use_splitk and (
         use_splitk_for_small_bs
         or use_splitk_for_h64_large_topk
         or use_splitk_for_large_topk

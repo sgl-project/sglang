@@ -2360,7 +2360,7 @@ class ServerArgs:
                 support_mamba_cache=True,
                 support_mamba_cache_extra_buffer=True,
             )
-        elif model_arch in ["NemotronHForCausalLM"]:
+        elif model_arch in ["NemotronHForCausalLM", "NemotronHPuzzleForCausalLM"]:
             from sglang.srt.arg_groups.nemotron_h_hook import (
                 apply_nemotron_h_defaults,
             )
@@ -3097,6 +3097,22 @@ class ServerArgs:
                 "--linear-attn-decode-backend flashinfer on SM100+ requires "
                 "--mamba-ssm-dtype bfloat16, "
                 f"got {self.mamba_ssm_dtype!r}"
+            )
+
+        # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel)
+        # for correctness and best performance.
+        prefill = self.linear_attn_prefill_backend or self.linear_attn_backend
+        cuda_version = torch.version.cuda
+        cuda_major = int(cuda_version.split(".")[0]) if cuda_version is not None else 0
+        if (
+            prefill == "flashinfer"
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] >= 10
+            and cuda_major < 13
+        ):
+            raise ValueError(
+                "--linear-attn-prefill-backend flashinfer on SM100+ requires CUDA 13+, "
+                f"got CUDA {cuda_version or 'unknown'}"
             )
 
     def _handle_context_parallelism(self):
