@@ -47,7 +47,7 @@ SERVER_LAUNCH_TIMEOUT = 3600
 #   test/registered/amd/accuracy/mi30x/test_deepseek_r1_eval_amd.py
 GSM8K_ACCURACY_THRESHOLD = 0.93
 GSM8K_NUM_EXAMPLES = None
-GSM8K_NUM_THREADS = 512
+GSM8K_NUM_THREADS = 64
 
 
 class TestDeepSeekR1HiCacheMI35x(CustomTestCase):
@@ -154,7 +154,7 @@ class TestDeepSeekR1HiCacheMI35x(CustomTestCase):
                 "### DeepSeek-R1-0528 FP8 HiCache GSM8K (MI35x)\n\n"
                 "| Model | Examples | Max Parallel | Score | Threshold | Latency |\n"
                 "| ----- | --------- | ------------ | ----- | --------- | ------- |\n"
-                f"| {self.model} | full | default ({GSM8K_NUM_THREADS}) | "
+                f"| {self.model} | full | {GSM8K_NUM_THREADS} | "
                 f"{score:.3f} | {GSM8K_ACCURACY_THRESHOLD:.2f} | "
                 f"{metrics.get('latency', 0):.1f}s |\n"
             )
