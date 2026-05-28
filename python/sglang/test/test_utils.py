@@ -184,17 +184,6 @@ def is_in_amd_ci():
     return get_bool_env_var("SGLANG_IS_IN_CI_AMD")
 
 
-def ci_use_ascending_capture_order(server_args) -> bool:
-    """Whether to flip cuda-graph capture to ascending bs order (FA3 varlen IMA workaround, #26532)."""
-    if not is_in_ci():
-        return False
-    return "fa3" in (
-        server_args.attention_backend,
-        server_args.decode_attention_backend,
-        server_args.speculative_draft_attention_backend,
-    )
-
-
 def is_blackwell_system():
     """Same CUDA capability + toolkit semantics as ``sglang.srt.utils.is_blackwell``."""
     return is_blackwell()

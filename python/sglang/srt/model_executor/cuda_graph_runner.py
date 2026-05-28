@@ -530,6 +530,18 @@ def set_global_graph_memory_pool(val):
     global_graph_memory_pool = val
 
 
+def _ci_use_ascending_capture_order(server_args) -> bool:
+    """Whether CI + FA3 forces ascending cuda-graph capture (FA3 varlen IMA workaround, #26532)."""
+    if not envs.SGLANG_IS_IN_CI.get():
+        return False
+    prefill_backend, decode_backend = server_args.get_attention_backends()
+    return "fa3" in (
+        prefill_backend,
+        decode_backend,
+        server_args.speculative_draft_attention_backend,
+    )
+
+
 class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
@@ -815,8 +827,6 @@ class CudaGraphRunner:
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
 
-        from sglang.test.test_utils import ci_use_ascending_capture_order
-
         def _capture_one_stream(stream_idx: Optional[int] = None):
             avail_mem = get_available_gpu_memory(
                 self.model_runner.device,
@@ -827,7 +837,7 @@ class CudaGraphRunner:
             # FA3 varlen workspace-slot IMA (#26532).
             bs_seq = (
                 list(self.capture_bs)
-                if ci_use_ascending_capture_order(self.model_runner.server_args)
+                if _ci_use_ascending_capture_order(self.model_runner.server_args)
                 else list(reversed(self.capture_bs))
             )
             capture_range = (
