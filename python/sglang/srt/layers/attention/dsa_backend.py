@@ -2514,12 +2514,26 @@ class DeepseekSparseAttnBackend(
             device_sm = get_device_sm()
 
             # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
+            #
+            # Double Sparsity is dense-prefill / sparse-decode by design (classic DS
+            # only sparsifies the decode KV read; prefill attends densely). DSA's
+            # sparse MLA prefill path runs the per-decode-query selection, which is
+            # ill-defined for the per-extend-token prefill batch (it indexes the
+            # per-request req_pool_indices/seq_lens with a per-token batch -> bad
+            # indices -> CUDA illegal access for seq_len > the dense threshold). So
+            # for DS we keep the dense MHA prefill regardless of the length threshold
+            # (subject to the remaining feasibility checks); _select_topk_indices'
+            # use_mha branch then skips DS selection during prefill, and labels are
+            # still written via the MHA_ONE_SHOT _set_mla_kv_buffer hook.
             self.use_mha = (
                 (
                     device_sm == 90 or (device_sm >= 100 and device_sm < 110)
                 )  # SM90/SM100 only
-                and max_kv_len
-                <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
+                and (
+                    self.enable_double_sparsity
+                    or max_kv_len
+                    <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()
+                )  # DS: dense prefill always; DSA: short enough for MHA
                 and self.token_to_kv_pool.dtype in [torch.bfloat16, torch.float8_e4m3fn]
                 and sum_seq_lens
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
