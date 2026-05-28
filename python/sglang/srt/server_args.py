@@ -25,6 +25,7 @@ import logging
 import os
 import random
 import tempfile
+from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.srt.arg_groups.argparse_actions import (
@@ -590,8 +591,6 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
-    speculative_adaptive: bool = False
-    speculative_adaptive_config: Optional[str] = None
     speculative_skip_dp_mlp_sync: bool = False
 
     # Speculative decoding (ngram)
@@ -604,6 +603,10 @@ class ServerArgs:
     speculative_ngram_external_sam_budget: int = 0
     speculative_ngram_external_corpus_max_tokens: int = 10000000
     enable_multi_layer_eagle: bool = False
+
+    # Adaptive speculative decoding
+    speculative_adaptive: bool = False
+    speculative_adaptive_config: Optional[str] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -7050,8 +7053,9 @@ class ServerArgs:
     def enable_mamba_extra_buffer(self) -> bool:
         return self.mamba_scheduler_strategy == "extra_buffer"
 
-    def effective_max_speculative_num_draft_tokens(self) -> Optional[int]:
-        """Return the maximum draft-token count runtime speculative decoding may use."""
+    @cached_property
+    def max_speculative_num_draft_tokens(self) -> Optional[int]:
+        """Return the maximum draft-token count speculative decoding may use."""
         if self.speculative_num_draft_tokens is None:
             return None
         if not self.speculative_adaptive:
