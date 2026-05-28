@@ -681,7 +681,7 @@ class MMEncoder:
 
     def _calculate_hashes_from_features(
         self, mm_feature, grid_thw: List, modality: Modality
-    ) -> List[str]:
+    ) -> List[int]:
         """CPU Task: Compute hashes based on processed feature patches."""
         hashes = []
         if modality == Modality.AUDIO and isinstance(mm_feature, list):
@@ -795,7 +795,9 @@ class MMEncoder:
                 )
             else:
                 mm_hashes = hashes
-            exist_mask = await self.mm_global_cache.batch_is_exist(mm_hashes)
+            # Convert hashes to strings (L2 cache expects string keys for Mooncake)
+            str_mm_hashes = [str(h) for h in mm_hashes]
+            exist_mask = await self.mm_global_cache.batch_is_exist(str_mm_hashes)
             mask_tensor = torch.tensor(
                 [1 if e else 0 for e in exist_mask], dtype=torch.int32
             )
@@ -826,7 +828,7 @@ class MMEncoder:
 
         if self.rank == 0:
             if hit_indices:
-                hit_hashes = [mm_hashes[i] for i in hit_indices]
+                hit_hashes = [str_mm_hashes[i] for i in hit_indices]
                 hit_tokens = [
                     self.get_num_tokens(grid_thw[i], modality) for i in hit_indices
                 ]
@@ -876,7 +878,7 @@ class MMEncoder:
             # Fill in cache-hit embeddings (from prefetch or fallback)
             if prefetch_status.item() == 1 and hit_indices:
                 cached_slices = self.mm_global_cache.get_embeddings(
-                    [mm_hashes[i] for i in hit_indices]
+                    [str_mm_hashes[i] for i in hit_indices]
                 )
                 for i, idx in enumerate(hit_indices):
                     final_slices[idx] = cached_slices[i]
@@ -888,10 +890,10 @@ class MMEncoder:
 
             # Background insert: store newly computed embeddings into global cache.
             # Includes both original misses and fallback-recomputed hits.
-            all_new_hashes = [mm_hashes[i] for i in missing_indices]
+            all_new_hashes = [str_mm_hashes[i] for i in missing_indices]
             all_new_slices = list(new_slices)
             if fallback_slices is not None:
-                all_new_hashes += [mm_hashes[i] for i in hit_indices]
+                all_new_hashes += [str_mm_hashes[i] for i in hit_indices]
                 all_new_slices += list(fallback_slices)
 
             if all_new_hashes:
