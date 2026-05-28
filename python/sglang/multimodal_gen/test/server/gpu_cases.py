@@ -36,6 +36,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST,
+    DEFAULT_FLUX_2_KLEIN_BASE_4B_MODEL_NAME_FOR_TEST,
     DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
     DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST,
@@ -122,6 +123,15 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             model_path=DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST,
         ),
         T2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "flux_2_klein_base_image_t2i",
+        DiffusionServerArgs(
+            model_path=DEFAULT_FLUX_2_KLEIN_BASE_4B_MODEL_NAME_FOR_TEST,
+        ),
+        T2I_sampling_params,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
     ),
     # TODO: replace with a faster model to test the --dit-layerwise-offload
     # TODO: currently, we don't support sending more than one request in test, and setting `num_outputs_per_prompt` to 2 doesn't guarantee the denoising be executed twice,
@@ -536,6 +546,8 @@ TWO_GPU_CASES = [
             extras=[
                 "--lora-weight-name",
                 "985347-wan22_14B-low-Nfj1nx-e65.safetensors",
+                "--lora-merge-mode",
+                "dynamic",
             ],
         ),
         DiffusionSamplingParams(

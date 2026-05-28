@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import logging
+from array import array
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List
 
 import torch
 
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 logger = logging.getLogger(__name__)
@@ -71,11 +72,12 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         # Set fields
         self.input_ids = torch.tensor(
-            sum(input_ids, []), dtype=torch.int32, device=self.device
+            sum(input_ids, array("q")), dtype=torch.int32, device=self.device
         )
         self.req_pool_indices = torch.tensor(
             req_pool_indices, dtype=torch.int64, device=self.device
         )
+        self.req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
         self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         self.orig_seq_lens = torch.tensor(
@@ -134,55 +136,16 @@ class ScheduleBatchDisaggregationDecodeMixin:
             last_tokens, dtype=torch.int64, device=self.device
         )
 
-        # Simulate the eagle run.
-        if self.spec_algorithm.is_eagle():
-            num_states = server_args.speculative_eagle_topk
-            if server_args.enable_multi_layer_eagle:
-                num_states *= server_args.speculative_num_steps
-            topk_p = torch.stack(
-                [
-                    torch.as_tensor(
-                        req.output_topk_p[:num_states],
-                        device=self.device,
-                        dtype=torch.float32,
-                    )
-                    for req in self.reqs
-                ],
-                dim=0,
-            )
-            topk_index = torch.stack(
-                [
-                    torch.as_tensor(
-                        req.output_topk_index[:num_states],
-                        device=self.device,
-                        dtype=torch.int64,
-                    )
-                    for req in self.reqs
-                ],
-                dim=0,
-            )
-
-            hidden_states_list = [req.hidden_states_tensor for req in self.reqs]
-            hidden_states = torch.stack(hidden_states_list, dim=0).to(self.device)
-
-            # local import to avoid circular import
-            from sglang.srt.speculative.eagle_info import EagleDraftInput
-
-            spec_info = EagleDraftInput(
-                topk_p=topk_p,
-                topk_index=topk_index,
-                hidden_states=hidden_states,
-                bonus_tokens=last_tokens_tensor,
-                new_seq_lens=self.seq_lens,
-            )
-            spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-            if self.enable_overlap:
-                from sglang.srt.managers.overlap_utils import FutureIndices
-
-                spec_info.future_indices = FutureIndices(indices=self.req_pool_indices)
-                future_map.publish(spec_info.future_indices, spec_info.new_seq_lens)
-                future_map.stash(spec_info.future_indices, spec_info)
+        spec_info = self.spec_algorithm.build_disagg_draft_input(
+            self,
+            server_args,
+            last_tokens_tensor,
+            future_map,
+        )
+        if spec_info is not None:
             self.spec_info = spec_info
         else:
-            # Non-spec: input_ids feeds the next decode forward directly.
+            # Non-spec: positive last token feeds decode directly. No FutureMap
+            # bootstrap needed (SB self-maintains seq_lens; resolve_future is
+            # a no-op on positive input_ids).
             self.input_ids = last_tokens_tensor
