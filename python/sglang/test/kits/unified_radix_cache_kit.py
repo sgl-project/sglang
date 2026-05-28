@@ -1,24 +1,11 @@
 import random
-import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kl_multiturn_utils import (
-    get_input_ids,
-    make_mamba_decode_assert,
-    make_mamba_prefill_assert,
     test_input_output_logprobs_match_decode_cache_hit_helper,
     test_input_output_logprobs_match_helper,
     test_input_output_logprobs_match_prefill_cache_hit_helper,
-)
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    is_in_ci,
-    popen_launch_server,
 )
 
 
@@ -28,18 +15,8 @@ def _random_suffixes(n, length, seed):
     return [[rng.randint(1, 30000) for _ in range(length)] for _ in range(n)]
 
 
-MAMBA_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
-MAMBA_CHUNK_SIZE = 64
-MAMBA_TRACK_INTERVAL = 128
-
-SWA_MODEL = "openai/gpt-oss-20b"
-FULL_MODEL = "Qwen/Qwen3-32B"
-
-register_cuda_ci(est_time=760, stage="base-c", runner_config="4-gpu-h100")
-
-
 class UnifiedRadixTreeTestMixin:
-    """Mixin: gsm8k、mmlu and multi-turn KL tests with multi-branch interleaving."""
+    """Mixin: gsm8k, mmlu and multi-turn KL tests with multi-branch interleaving."""
 
     kl_threshold: float = 0.003
     max_new_tokens: int = 512
@@ -168,112 +145,3 @@ class UnifiedRadixTreeTestMixin:
             request_batch_size=self.decode_hit_request_batch_size,
             inter_batch_delay_s=self.decode_hit_inter_batch_delay_s,
         )
-
-
-class TestUnifiedFullRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
-    """Full attention."""
-
-    kl_threshold = 0.0025
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = FULL_MODEL
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--tp-size",
-                "4",
-                "--mem-fraction-static",
-                "0.80",
-                "--page-size",
-                "64",
-            ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
-        )
-        cls.input_ids = get_input_ids(cls.model, num_samples=18)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-
-class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
-    """Mamba hybrid + UnifiedRadixCache."""
-
-    kl_threshold = 0.003
-    prefill_cache_assert = staticmethod(
-        make_mamba_prefill_assert(chunk_size=MAMBA_CHUNK_SIZE)
-    )
-    decode_cache_assert = staticmethod(
-        make_mamba_decode_assert(track_interval=MAMBA_TRACK_INTERVAL)
-    )
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = MAMBA_MODEL
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--tp-size",
-                "4",
-                "--chunked-prefill-size",
-                "2048",
-                "--mem-fraction-static",
-                "0.85",
-                "--mamba-scheduler-strategy",
-                "extra_buffer",
-                "--mamba-track-interval",
-                str(MAMBA_TRACK_INTERVAL),
-            ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
-        )
-        cls.input_ids = get_input_ids(cls.model, num_samples=18)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-
-class TestUnifiedSWARadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
-    """SWA hybrid + UnifiedRadixCache."""
-
-    kl_threshold = 0.03
-    gsm8k_threshold = 0.7
-    mmlu_threshold = 0.7
-
-    @unittest.skipIf(is_in_ci(), "SWA model mmlu eval not stable enough")
-    def test_mmlu(self):
-        super().test_mmlu()
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = SWA_MODEL
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--tp-size",
-                "4",
-                "--mem-fraction-static",
-                "0.7",
-                "--cuda-graph-backend-prefill=disabled",
-            ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
-        )
-        cls.input_ids = get_input_ids(cls.model, num_samples=18)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-
-if __name__ == "__main__":
-    unittest.main()

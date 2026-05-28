@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=370, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=200, stage="extra-b", runner_config="8-gpu-h200")
 
 NEMOTRON_3_SUPER_BF16_MODEL = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
 
@@ -44,46 +44,6 @@ MTP_ARGS = [
 ]
 
 
-def _run_gsm8k(test_case):
-    args = SimpleNamespace(
-        model=test_case.model,
-        eval_name="gsm8k",
-        num_shots=5,
-        num_examples=200,
-        max_tokens=16000,
-        num_threads=200,
-        repeat=1,
-        temperature=1.0,
-        top_p=0.95,
-        base_url=test_case.base_url,
-        host="http://127.0.0.1",
-        port=int(test_case.base_url.split(":")[-1]),
-    )
-    metrics = run_eval(args)
-    print(f"{metrics=}")
-    test_case.assertGreaterEqual(metrics["score"], 0.96)
-
-
-class TestNvidiaNemotron3SuperBF16(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = NEMOTRON_3_SUPER_BF16_MODEL
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=NEMOTRON_3_SUPER_BF16_ARGS,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        _run_gsm8k(self)
-
-
 class TestNvidiaNemotron3SuperBF16MTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -101,7 +61,23 @@ class TestNvidiaNemotron3SuperBF16MTP(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
-        _run_gsm8k(self)
+        args = SimpleNamespace(
+            model=self.model,
+            eval_name="gsm8k",
+            num_shots=5,
+            num_examples=200,
+            max_tokens=16000,
+            num_threads=200,
+            repeat=1,
+            temperature=1.0,
+            top_p=0.95,
+            base_url=self.base_url,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+        self.assertGreaterEqual(metrics["score"], 0.96)
 
 
 if __name__ == "__main__":
