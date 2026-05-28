@@ -2303,15 +2303,54 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return attn_backend_wrapper(self, full_attention_backend)
 
     def kernel_warmup(self):
-        """
-        Warmup and tune kernels before cuda graph capture.
-        Currently only doing FlashInfer autotune.
-        """
+        """Warmup and tune kernels before cuda graph capture."""
         if self.device != "cuda":
             return
 
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
+
+        self._pp_parallel_deep_gemm_warmup()
+
+    def _pp_parallel_deep_gemm_warmup(self):
+        """Per-PP-rank local dummy forward so DeepGEMM JIT compiles in
+        parallel across PP stages instead of serially via the warmup
+        ``/generate`` request flowing through the pipeline.
+        """
+        if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            return
+        if self.pp_size <= 1:
+            return
+        # Speculative target-verify has its own metadata; rely on serving warmup.
+        if self.spec_algorithm.is_speculative():
+            return
+
+        logger.info(
+            "PP-parallel DeepGEMM warmup start (pp_rank=%d, tp_rank=%d).",
+            self.pp_rank,
+            self.tp_rank,
+        )
+        t0 = time.perf_counter()
+        try:
+            with torch.inference_mode():
+                if self.is_generation:
+                    self._dummy_run(
+                        batch_size=1,
+                        forward_mode_override=ForwardMode.DECODE,
+                    )
+                self._dummy_run(
+                    batch_size=1,
+                    forward_mode_override=ForwardMode.EXTEND,
+                )
+        except Exception as e:
+            logger.warning("PP-parallel DeepGEMM warmup skipped: %r", e)
+            return
+
+        logger.info(
+            "PP-parallel DeepGEMM warmup done in %.2fs (pp_rank=%d).",
+            time.perf_counter() - t0,
+            self.pp_rank,
+        )
 
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Pre-initialize flashinfer allreduce fusion workspaces.
@@ -2440,9 +2479,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             / f"rank_tp{self.tp_rank}_pp{self.pp_rank}_dp{self.dp_rank or 0}.json"
         )
 
-    def _dummy_run(self, batch_size: int, run_ctx=None):
-        """Run a dummy forward pass for warmup/profiling."""
-        if self.is_generation:
+    def _dummy_run(
+        self,
+        batch_size: int,
+        run_ctx=None,
+        forward_mode_override: Optional[ForwardMode] = None,
+    ):
+        """Run a dummy forward pass for warmup/profiling.
+
+        ``forward_mode_override`` forces EXTEND/DECODE regardless of
+        ``is_generation`` (used by the PP-parallel DeepGEMM warmup).
+        """
+        if forward_mode_override is not None:
+            capture_forward_mode = forward_mode_override
+        elif self.is_generation:
             capture_forward_mode = ForwardMode.DECODE
         else:
             capture_forward_mode = ForwardMode.EXTEND
@@ -2517,7 +2567,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         buffers.num_token_non_padded[...] = num_tokens
 
         # For extend mode
-        if not self.is_generation:
+        if capture_forward_mode == ForwardMode.EXTEND:
             extend_prefix_lens_cpu = [0] * batch_size
             extend_seq_lens_cpu = [seq_len_fill_value] * batch_size
             extend_num_tokens = num_tokens
