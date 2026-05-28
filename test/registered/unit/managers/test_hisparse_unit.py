@@ -52,7 +52,7 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         finished_reason=None,
         hisparse_staging=False,
         staging=False,
-        pending_middle_outputs=0,
+        scheduled_extend_len=len(origin_input_ids),
     )
     req.finished = lambda: req.finished_reason is not None
     req.set_extend_input_len = lambda extend_input_len: setattr(

@@ -79,7 +79,12 @@ class TestPrefillAdder(CustomTestCase):
         req.finished.return_value = False
         # v2 add_one_req reads these on the reuse-branch gate; MagicMock(spec=Req)
         # doesn't surface attributes set only in Req.__init__, so seed them.
+        # has_pending_chunk is a derived @property on Req now but MagicMock
+        # turns property accesses into a fresh Mock by default; override to a
+        # concrete bool so add_one_req's is_resume gate sees False for the
+        # mock reqs in this unit test.
         req.has_pending_chunk = False
+        req.scheduled_extend_len = 0
         req.is_dllm.return_value = False
         req.host_hit_length = 0
         return req

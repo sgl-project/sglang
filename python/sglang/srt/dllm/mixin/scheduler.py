@@ -201,7 +201,6 @@ class SchedulerDllmMixin:
 
         if can_run_list:
             self.dllm_manager.add_staging_reqs(can_run_list)
-            self.dllm_manager.increment_pending_middle_outputs()
 
         self.adder = adder
         self.can_run_list = can_run_list
@@ -337,11 +336,6 @@ class DllmManager:
         if self.dllm_config is None:
             return True
         return len(self.waiting_queue) == 0
-
-    def increment_pending_middle_outputs(self) -> None:
-        """Increment chunked count for all staging requests."""
-        for req in self.staging_queue:
-            req.pending_middle_outputs += 1
 
     def filter_finished_reqs(self) -> None:
         """Remove finished requests from both queues."""

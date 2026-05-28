@@ -18,6 +18,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import (
+    OutputProcessMode,
     Req,
     ScheduleBatch,
 )
@@ -214,68 +215,20 @@ class SchedulerBatchResultProcessor:
             # Check finish conditions
             logprob_pt = 0
 
-            for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            for i, (req, next_token_id, mode) in enumerate(
+                zip(batch.reqs, next_token_ids, batch.output_process_mode, strict=True)
+            ):
                 if req.finished() or req.is_retracted:
                     # decode req in mixed batch or retracted req
                     continue
 
-                if req.pending_middle_outputs <= 0:
-                    req.time_stats.set_prefill_finished_time()
-
-                    # req output_ids are set here
-                    req.output_ids.append(next_token_id)
-
-                    self._maybe_update_reasoning_tokens(req, next_token_id)
-
-                    req.update_finish_state()
-                    if req.finished():
-                        self._maybe_collect_routed_experts(req)
-                        self._maybe_collect_indexer_topk(req)
-                        release_kv_cache(req, self.tree_cache)
-                        self.deactivate_req(req)
-                        req.time_stats.set_completion_time()
-                    elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        maybe_cache_unfinished_req(req, self.tree_cache)
-                        if self.server_args.enable_hisparse:
-                            self.hisparse_coordinator.admit_request_into_staging(req)
-
-                    self._maybe_collect_customized_info(i, req, logits_output)
-
-                    if batch.return_logprob:
-                        logprob_pt = self._apply_prefill_logprobs(
-                            req=req,
-                            i=i,
-                            logits_output=logits_output,
-                            extend_input_len_per_req=extend_input_len_per_req,
-                            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
-                            next_token_ids=next_token_ids,
-                            logprob_pt=logprob_pt,
-                        )
-
-                    if (
-                        req.return_hidden_states
-                        and logits_output.hidden_states is not None
-                    ):
-                        hidden_state_offset = self._append_prefill_hidden_states(
-                            req=req,
-                            logits_output=logits_output,
-                            hidden_state_offset=hidden_state_offset,
-                        )
-
-                    if req.grammar is not None:
-                        self._apply_prefill_grammar(
-                            req=req, next_token_id=next_token_id
-                        )
-
-                else:
-                    # being chunked reqs' prefill is not finished
-                    req.pending_middle_outputs -= 1
-                    # There is only at most one request being currently chunked.
-                    # Because this request does not finish prefill,
-                    # we don't want to stream the request currently being chunked.
+                if mode is OutputProcessMode.EXTEND_MIDDLE_CHUNK:
+                    # Non-final prefill chunk: the sample is garbage; only
+                    # input logprobs accumulate. There is at most one
+                    # mid-chunk req per iteration, so its stream is held
+                    # back until the final chunk completes.
                     skip_stream_req = req
 
-                    # Incrementally update input logprobs.
                     if batch.return_logprob:
                         logprob_pt = self._apply_chunked_prefill_logprobs(
                             req=req,
@@ -287,6 +240,57 @@ class SchedulerBatchResultProcessor:
                         )
 
                     req.time_stats.set_last_chunked_prefill_finish_time()
+                    continue
+
+                assert mode in (
+                    OutputProcessMode.EXTEND_LAST_CHUNK,
+                    OutputProcessMode.DECODE,
+                ), (
+                    f"unexpected output_process_mode {mode} in "
+                    "process_batch_result_prefill (generation)"
+                )
+
+                req.time_stats.set_prefill_finished_time()
+
+                # req output_ids are set here
+                req.output_ids.append(next_token_id)
+
+                self._maybe_update_reasoning_tokens(req, next_token_id)
+
+                req.update_finish_state()
+                if req.finished():
+                    self._maybe_collect_routed_experts(req)
+                    self._maybe_collect_indexer_topk(req)
+                    release_kv_cache(req, self.tree_cache)
+                    self.deactivate_req(req)
+                    req.time_stats.set_completion_time()
+                elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                    maybe_cache_unfinished_req(req, self.tree_cache)
+                    if self.server_args.enable_hisparse:
+                        self.hisparse_coordinator.admit_request_into_staging(req)
+
+                self._maybe_collect_customized_info(i, req, logits_output)
+
+                if batch.return_logprob:
+                    logprob_pt = self._apply_prefill_logprobs(
+                        req=req,
+                        i=i,
+                        logits_output=logits_output,
+                        extend_input_len_per_req=extend_input_len_per_req,
+                        extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+                        next_token_ids=next_token_ids,
+                        logprob_pt=logprob_pt,
+                    )
+
+                if req.return_hidden_states and logits_output.hidden_states is not None:
+                    hidden_state_offset = self._append_prefill_hidden_states(
+                        req=req,
+                        logits_output=logits_output,
+                        hidden_state_offset=hidden_state_offset,
+                    )
+
+                if req.grammar is not None:
+                    self._apply_prefill_grammar(req=req, next_token_id=next_token_id)
 
         else:  # embedding or reward model
             if result.copy_done is not None:
@@ -302,29 +306,41 @@ class SchedulerBatchResultProcessor:
                     phs = phs.cpu().detach()
 
             # Check finish conditions
-            for i, req in enumerate(batch.reqs):
+            for i, (req, mode) in enumerate(
+                zip(batch.reqs, batch.output_process_mode, strict=True)
+            ):
                 if req.is_retracted:
                     continue
 
                 req.embedding = embeddings[i]
                 if req.return_pooled_hidden_states and phs is not None:
                     req.pooled_hidden_state = phs[i]
-                if req.pending_middle_outputs <= 0:
-                    req.time_stats.set_prefill_finished_time()
-                    # Dummy output token for embedding models
-                    req.output_ids.append(0)
-                    req.update_finish_state()
 
-                    if req.finished():
-                        release_kv_cache(req, self.tree_cache)
-                        self.deactivate_req(req)
-                        req.time_stats.set_completion_time()
-                    else:
-                        maybe_cache_unfinished_req(req, self.tree_cache)
-                else:
-                    # being chunked reqs' prefill is not finished
-                    req.pending_middle_outputs -= 1
+                if mode is OutputProcessMode.EXTEND_MIDDLE_CHUNK:
+                    # Mid-chunk: prefill not finished yet, no embedding output
+                    # to commit. Logprobs/KV bookkeeping happens elsewhere.
                     req.time_stats.set_last_chunked_prefill_finish_time()
+                    continue
+
+                assert mode in (
+                    OutputProcessMode.EXTEND_LAST_CHUNK,
+                    OutputProcessMode.DECODE,
+                ), (
+                    f"unexpected output_process_mode {mode} in "
+                    "process_batch_result_prefill (embedding)"
+                )
+
+                req.time_stats.set_prefill_finished_time()
+                # Dummy output token for embedding models
+                req.output_ids.append(0)
+                req.update_finish_state()
+
+                if req.finished():
+                    release_kv_cache(req, self.tree_cache)
+                    self.deactivate_req(req)
+                    req.time_stats.set_completion_time()
+                else:
+                    maybe_cache_unfinished_req(req, self.tree_cache)
 
         self.output_streamer.stream_output(
             batch.reqs, batch.return_logprob, skip_stream_req

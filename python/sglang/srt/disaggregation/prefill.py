@@ -46,6 +46,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
+    OutputProcessMode,
     Req,
     ScheduleBatch,
 )
@@ -511,67 +512,22 @@ class SchedulerDisaggregationPrefillMixin:
                     logits_output.input_token_logprobs.tolist()
                 )
 
-        for i, (req, next_token_id) in enumerate(
-            zip(batch.reqs, next_token_ids, strict=True)
+        for i, (req, next_token_id, mode) in enumerate(
+            zip(
+                batch.reqs,
+                next_token_ids,
+                batch.output_process_mode,
+                strict=True,
+            )
         ):
-            if req.pending_middle_outputs <= 0:
-                req.time_stats.set_prefill_finished_time()
-
-                # There is no output_ids for prefill
-                req.output_ids.append(next_token_id)
-                maybe_cache_unfinished_req(req, self.tree_cache)
-                self.disagg_prefill_inflight_queue.append(req)
-                if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
-                    req.output_topk_p = batch.spec_info.topk_p[i]
-                    req.output_topk_index = batch.spec_info.topk_index[i]
-                    req.hidden_states_tensor = (
-                        batch.spec_info.hidden_states[i].cpu().clone()
-                    )
-                else:
-                    req.hidden_states_tensor = None
-                if req.return_logprob:
-                    assert extend_logprob_start_len_per_req is not None
-                    assert extend_input_len_per_req is not None
-                    extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                    extend_input_len = extend_input_len_per_req[i]
-                    num_input_logprobs = extend_input_len - extend_logprob_start_len
-                    self.batch_result_processor.logprob_result_processor.add_logprob_return_values(
-                        i,
-                        req,
-                        logprob_pt,
-                        next_token_ids,
-                        num_input_logprobs,
-                        logits_output,
-                    )
-                    logprob_pt += num_input_logprobs
-                self.send_kv_chunk(req, last_chunk=True)
-                req.time_stats.set_prefill_transfer_queue_entry_time()
-
-                if req.grammar is not None:
-                    # FIXME: this try-except block is for handling unexpected xgrammar issue.
-                    try:
-                        req.grammar.accept_token(next_token_id)
-                    except ValueError as e:
-                        # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                        # This can happen if the grammar is not set correctly or the token is invalid.
-                        error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                        release_kv_cache(req, self.tree_cache)
-                        self._deactivate(req)
-                        prepare_abort(
-                            req,
-                            error_message,
-                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                        )
-                    req.grammar.finished = req.finished()
-            else:
-                # being chunked reqs' prefill is not finished
-                req.pending_middle_outputs -= 1
-
+            if mode is OutputProcessMode.EXTEND_MIDDLE_CHUNK:
+                # Non-final disagg-prefill chunk: sample is garbage; only
+                # input logprobs accumulate. Overlap mode also delays the
+                # KV transfer to this point.
                 if req.return_logprob:
                     extend_logprob_start_len = extend_logprob_start_len_per_req[i]
                     extend_input_len = extend_input_len_per_req[i]
                     if extend_logprob_start_len < extend_input_len:
-                        # Update input logprobs.
                         num_input_logprobs = extend_input_len - extend_logprob_start_len
                         self.batch_result_processor.logprob_result_processor.add_input_logprob_return_values(
                             i,
@@ -586,6 +542,64 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_overlap:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
+                continue
+
+            assert mode in (
+                OutputProcessMode.EXTEND_LAST_CHUNK,
+                OutputProcessMode.DECODE,
+            ), (
+                f"unexpected output_process_mode {mode} in "
+                "process_batch_result_disagg_prefill"
+            )
+
+            req.time_stats.set_prefill_finished_time()
+
+            # There is no output_ids for prefill
+            req.output_ids.append(next_token_id)
+            maybe_cache_unfinished_req(req, self.tree_cache)
+            self.disagg_prefill_inflight_queue.append(req)
+            if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
+                req.output_topk_p = batch.spec_info.topk_p[i]
+                req.output_topk_index = batch.spec_info.topk_index[i]
+                req.hidden_states_tensor = (
+                    batch.spec_info.hidden_states[i].cpu().clone()
+                )
+            else:
+                req.hidden_states_tensor = None
+            if req.return_logprob:
+                assert extend_logprob_start_len_per_req is not None
+                assert extend_input_len_per_req is not None
+                extend_logprob_start_len = extend_logprob_start_len_per_req[i]
+                extend_input_len = extend_input_len_per_req[i]
+                num_input_logprobs = extend_input_len - extend_logprob_start_len
+                self.batch_result_processor.logprob_result_processor.add_logprob_return_values(
+                    i,
+                    req,
+                    logprob_pt,
+                    next_token_ids,
+                    num_input_logprobs,
+                    logits_output,
+                )
+                logprob_pt += num_input_logprobs
+            self.send_kv_chunk(req, last_chunk=True)
+            req.time_stats.set_prefill_transfer_queue_entry_time()
+
+            if req.grammar is not None:
+                # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                try:
+                    req.grammar.accept_token(next_token_id)
+                except ValueError as e:
+                    # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                    # This can happen if the grammar is not set correctly or the token is invalid.
+                    error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                    release_kv_cache(req, self.tree_cache)
+                    self._deactivate(req)
+                    prepare_abort(
+                        req,
+                        error_message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                req.grammar.finished = req.finished()
 
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
@@ -746,12 +760,12 @@ class SchedulerDisaggregationPrefillMixin:
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             last_bs = self.last_batch.batch_size()
-            # Drop chunked-resume reqs from last_batch — running_batch runs
-            # decode forward and admitting a mid-prefill req there breaks
-            # shape + KV accounting. The dropped reqs stay in
-            # self.active_reqs and re-enter via the next iter's Stage A
+            # Drop mid-prefill / DLLM-intermediate reqs from last_batch —
+            # running_batch runs decode forward and admitting a mid-prefill
+            # req there breaks shape + KV accounting. The dropped reqs stay
+            # in self.active_reqs and re-enter via the next iter's Stage A
             # stash + admission cycle.
-            self.last_batch.filter_batch(exclude_chunked_req=True)
+            self.last_batch.filter_batch(only_decode_ready=True)
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 

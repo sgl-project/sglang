@@ -593,6 +593,10 @@ class SchedulerPPMixin:
                 req.fill_ids = req.origin_input_ids
                 req.logprob_start_len = -1
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+                # Profiling forward simulates one full prefill — mark the whole
+                # prompt as scheduled so output_process_mode resolves to
+                # EXTEND_LAST_CHUNK in init_new.
+                req.scheduled_extend_len = len(req.origin_input_ids)
 
                 # Prepare batch
                 batch = ScheduleBatch.init_new(
