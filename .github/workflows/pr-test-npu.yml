@@ -23,6 +23,9 @@ concurrency:
   group: pr-test-npu-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
+env:
+  CANN_image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-910b-ubuntu22.04-py3.11
+
 jobs:
   # ==================== Check Changes ==================== #
   check-changes:
@@ -86,7 +89,7 @@ jobs:
       matrix:
         part: [ 0, 1 ]
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-910b-ubuntu22.04-py3.11
+      image: ${{ env.CANN_image }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
