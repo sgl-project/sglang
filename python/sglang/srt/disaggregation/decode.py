@@ -297,6 +297,20 @@ class DecodeRequest:
         return self.req.priority
 
 
+class HiCacheRestoreGatedKVReceiver:
+    def __init__(self, decode_req: DecodeRequest):
+        self.decode_req = decode_req
+
+    def poll(self) -> KVPoll:
+        poll = self.decode_req.kv_receiver.poll()
+        if (
+            poll == KVPoll.Success
+            and self.decode_req.hicache_restore_status == HiCacheRestoreResult.PENDING
+        ):
+            return KVPoll.Transferring
+        return poll
+
+
 class DecodePreallocQueue:
     """
     Store the requests that are preallocating.
@@ -527,7 +541,7 @@ class DecodePreallocQueue:
 
         l3_storage_hit_length = 0
         last_host_node = None
-        if self.scheduler.server_args.enable_hierarchical_cache:
+        if self.scheduler.enable_decode_hicache:
             matched_len = l1_prefix_len + l2_host_hit_length
             suffix_tokens = req.origin_input_ids[matched_len:]
             last_host_node = result.last_host_node
@@ -579,6 +593,8 @@ class DecodePreallocQueue:
 
     def _hicache_pending_restore_tokens(self) -> int:
         """Total device tokens reserved for pending HiCache L2/L3 load_back."""
+        if not self.scheduler.enable_decode_hicache:
+            return 0
         return sum(
             dr.prefix_match.restore_token_count
             for dr in self.transfer_queue.queue
@@ -1008,7 +1024,8 @@ class DecodePreallocQueue:
                 total_prefix_len,
             )
             decode_req.prefix_match = prefix_match
-            self._start_hicache_prefetch(decode_req.req, prefix_match)
+            if self.scheduler.enable_decode_hicache:
+                self._start_hicache_prefetch(decode_req.req, prefix_match)
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
@@ -1745,8 +1762,13 @@ class DecodeTransferQueue:
         return
 
     def _poll_with_metadata_gate(self) -> List[int]:
+        pollers = (
+            [HiCacheRestoreGatedKVReceiver(dr) for dr in self.queue]
+            if self.scheduler.enable_decode_hicache
+            else [dr.kv_receiver for dr in self.queue]
+        )
         return poll_and_all_reduce(
-            [dr.kv_receiver for dr in self.queue],
+            pollers,
             self.gloo_group,
             decode_reqs=self.queue,
             metadata_buffers=self.metadata_buffers,
@@ -1777,6 +1799,15 @@ class DecodeTransferQueue:
         if not self.queue:
             return []
 
+        if self.scheduler.enable_decode_hicache:
+            self._process_hicache_local_restores(
+                [
+                    decode_req
+                    for decode_req in self.queue
+                    if rids_to_check is None or decode_req.req.rid in rids_to_check
+                ]
+            )
+
         if self.enable_staging:
             polls = self._poll_with_staging()
         else:
@@ -1784,14 +1815,6 @@ class DecodeTransferQueue:
 
         transferred_reqs = []
         indices_to_remove = set()
-        restore_decode_reqs = [
-            decode_req
-            for decode_req, poll in zip(self.queue, polls)
-            if (rids_to_check is None or decode_req.req.rid in rids_to_check)
-            and poll != KVPoll.Failed
-        ]
-        self._process_hicache_local_restores(restore_decode_reqs)
-
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -1827,29 +1850,31 @@ class DecodeTransferQueue:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             if poll == KVPoll.Success:
-                if hicache_restore_status == HiCacheRestoreResult.PENDING:
+                if (
+                    self.scheduler.enable_decode_hicache
+                    and hicache_restore_status == HiCacheRestoreResult.PENDING
+                ):
                     continue
-                should_remove = self._commit_transfer_to_req(decode_req)
-                if should_remove:
-                    indices_to_remove.add(i)
-                    # Check if request was aborted due to corruption
-                    if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-                        self.scheduler.output_streamer.stream_output(
-                            [decode_req.req],
-                            decode_req.req.return_logprob,
+                self._commit_transfer_to_req(decode_req)
+                indices_to_remove.add(i)
+                # Check if request was aborted due to corruption
+                if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                    self.scheduler.output_streamer.stream_output(
+                        [decode_req.req],
+                        decode_req.req.return_logprob,
+                    )
+                    if self.scheduler.enable_hisparse:
+                        self.scheduler.hisparse_coordinator.request_finished(
+                            decode_req.req
                         )
-                        if self.scheduler.enable_hisparse:
-                            self.scheduler.hisparse_coordinator.request_finished(
-                                decode_req.req
-                            )
-                        self._clean_hicache_prefetch_resources(decode_req)
-                        release_kv_cache(
-                            decode_req.req, self.tree_cache, is_insert=False
-                        )
-                        if self.scheduler.metrics_reporter.enable_metrics:
-                            self.scheduler.metrics_collector.increment_transfer_failed_reqs()
-                    else:
-                        transferred_reqs.append(decode_req.req)
+                    self._clean_hicache_prefetch_resources(decode_req)
+                    release_kv_cache(
+                        decode_req.req, self.tree_cache, is_insert=False
+                    )
+                    if self.scheduler.metrics_reporter.enable_metrics:
+                        self.scheduler.metrics_collector.increment_transfer_failed_reqs()
+                else:
+                    transferred_reqs.append(decode_req.req)
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
@@ -2061,7 +2086,7 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def process_decode_queue(self: Scheduler):
-        if self.enable_hierarchical_cache:
+        if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 
         if self.server_args.disaggregation_decode_enable_offload_kvcache:

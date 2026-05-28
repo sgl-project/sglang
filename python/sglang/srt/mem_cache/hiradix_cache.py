@@ -813,20 +813,14 @@ class HiRadixCache(RadixCache):
         del self.cache_controller.ack_load_queue[:finish_count]
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
-        """Return True only after all CPxTP ranks finish a load-back event."""
+        """Return True after the local load-back event is complete."""
         if consumer_index < 0:
             return True
 
         finish_event = self.cache_controller.layer_done_counter.events[
             consumer_index
         ].finish_event
-        is_done = torch.tensor(
-            int(finish_event.query()),
-            dtype=torch.int,
-            device="cpu",
-        )
-        self._all_reduce_attn_groups(is_done, torch.distributed.ReduceOp.MIN)
-        if not bool(is_done.item()):
+        if not finish_event.query():
             return False
 
         self.loading_check()
