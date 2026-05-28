@@ -3742,59 +3742,26 @@ class Scheduler(
         self.last_batch = None
         self.cur_batch = None
 
-        if recv_req.mode == "retract":
-            if not self.running_batch.is_empty():
-                self.running_batch.filter_batch(v1_spec_info_filtered=True)
-                if len(self.running_batch.reqs) != 0:
-                    retracted_reqs = self.running_batch.reqs
-                    for idx in range(len(self.running_batch.reqs)):
-                        release_req(
-                            req=self.running_batch.reqs[idx],
-                            remaing_req_count=len(self.running_batch.reqs) - idx,
-                            server_args=self.server_args,
-                            req_to_token_pool=self.running_batch.req_to_token_pool,
-                            token_to_kv_pool_allocator=self.running_batch.token_to_kv_pool_allocator,
-                            tree_cache=self.running_batch.tree_cache,
-                            hisparse_coordinator=self.running_batch.hisparse_coordinator,
-                        )
-                    self.running_batch.reqs = []
-                    # release_req released resources for every running req;
-                    # drop from active_reqs before re-enqueueing as waiting.
-                    for req in retracted_reqs:
-                        self._deactivate(req)
-                        self._add_request_to_queue(req)
+        if recv_req.mode == "retract" and not self.running_batch.is_empty():
+            self.running_batch.filter_batch(v1_spec_info_filtered=True)
 
-                self.running_batch.batch_is_full = False
+            retract_reqs = [*self.running_batch.reqs, *self.chunked_reqs()]
 
-            # Chunked-resume reqs still hold their row + KV + radix lock_ref
-            # from prior admissions. Without explicit release, pause(retract)'s
-            # 'flush_cache can succeed' contract (see PauseGenerationReqInput
-            # docstring) is violated. Release in-place and reset their chunked
-            # state so continue_generation re-prefills them from
-            # origin_input_ids. list(...) because we mutate active_reqs via
-            # _deactivate inside the loop.
-            #
-            # Inline chunked-resume retract release: chunked-resume reqs in
-            # active_reqs (but not in running_batch) need explicit cleanup
-            # because retract_all only covers running_batch. Mirrors
-            # release_req + reset_for_retract semantics.
-            for req in list(self.chunked_reqs()):
-                if req.req_pool_idx is not None:
-                    if (
-                        self.disaggregation_mode == DisaggregationMode.PREFILL
-                        and req.disagg_kv_sender is not None
-                    ):
-                        if hasattr(req.disagg_kv_sender, "abort"):
-                            req.disagg_kv_sender.abort()
-                        req.disagg_kv_sender = None
-                    release_kv_cache(req, self.tree_cache, is_insert=False)
-                    req.reset_for_retract()
-                    self._deactivate(req)
-                    # TODO: after release, this req is NOT re-enqueued to
-                    # waiting_queue. Either the design relies on the original
-                    # reference staying in waiting_queue (but retention was
-                    # removed) or this is a pre-existing latent bug.
-                    # Investigate separately.
+            for idx, req in enumerate(retract_reqs):
+                release_req(
+                    req=req,
+                    remaing_req_count=len(retract_reqs) - idx,
+                    server_args=self.server_args,
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    tree_cache=self.tree_cache,
+                    hisparse_coordinator=self.hisparse_coordinator,
+                )
+                self._deactivate(req)
+                self._add_request_to_queue(req)
+
+            self.running_batch.reqs = []
+            self.running_batch.batch_is_full = False
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         if recv_req.torch_empty_cache:
