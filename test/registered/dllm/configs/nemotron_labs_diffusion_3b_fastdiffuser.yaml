@@ -1,0 +1,2 @@
+algorithm: FastDiffuser
+causal_context: true
