@@ -44,7 +44,6 @@ from sglang.srt.distributed.parallel_state import (
     set_pdmux_status,
 )
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -120,18 +119,6 @@ def _make_graph_key(bs, stream_idx=None, variant_label=None):
     if variant_label is not None:
         key = f"{variant_label}_{key}"
     return key
-
-
-def _ci_use_ascending_capture_order(server_args) -> bool:
-    """Whether CI + FA3 forces ascending cuda-graph capture (FA3 varlen IMA workaround, #26532)."""
-    if not envs.SGLANG_IS_IN_CI.get():
-        return False
-    prefill_backend, decode_backend = server_args.get_attention_backends()
-    return "fa3" in (
-        prefill_backend,
-        decode_backend,
-        server_args.speculative_draft_attention_backend,
-    )
 
 
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
@@ -440,17 +427,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner.gpu_id,
                 empty_cache=False,
             )
-            # Reverse for memory sharing; CI+FA3 uses ascending to dodge the
-            # FA3 varlen workspace-slot IMA (#26532).
-            bs_seq = (
-                list(self.capture_bs)
-                if _ci_use_ascending_capture_order(self.model_runner.server_args)
-                else list(reversed(self.capture_bs))
-            )
+            # Reverse the order to enable better memory sharing across cuda graphs.
             capture_range = (
-                tqdm.tqdm(bs_seq)
+                tqdm.tqdm(list(reversed(self.capture_bs)))
                 if get_tensor_model_parallel_rank() == 0
-                else iter(bs_seq)
+                else reversed(self.capture_bs)
             )
             lora_variants = (
                 [("lora", True), ("nolora", False)]
