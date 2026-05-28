@@ -71,6 +71,11 @@ class MoriEPNormalDispatchOutput(NamedTuple):
     origin_topk_ids: torch.Tensor
     origin_topk_weights: torch.Tensor
     out_dtype: torch.dtype
+    # Host-side scheduling hint, see MoriEPLLDispatchOutput.expected_m. For
+    # normal dispatch the output is compact (no padding), so expected_m simply
+    # equals topk_ids.shape[0]; carrying the field on both flavors gives the
+    # downstream runner a single uniform attribute to read.
+    expected_m: int
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -88,6 +93,14 @@ class MoriEPLLDispatchOutput(NamedTuple):
     origin_topk_ids: torch.Tensor
     origin_topk_weights: torch.Tensor
     out_dtype: torch.dtype
+    # Host-side scheduling hint: average #tokens per local expert under
+    # uniform routing. In LL dispatch topk_ids.shape[0] is the padded buffer
+    # size (num_local_experts * num_max_dispatch_tokens_per_rank) and tells
+    # nothing about the real workload, which pegs aiter's get_padded_M tier
+    # lookup at the worst tier. expected_m gives the runner the realistic M
+    # to feed into the tier lookup; the device-side masked_m mechanism still
+    # governs correctness, so a slightly-off hint only affects perf.
+    expected_m: int
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -621,6 +634,8 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
             origin_topk_ids=topk_ids,
             origin_topk_weights=topk_weights,
             out_dtype=output_dtype,
+            # Normal dispatch is compact: recv_topk_ids carries the real M.
+            expected_m=recv_topk_ids.shape[0],
         )
 
     def _dispatch_core(
@@ -872,6 +887,17 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
 
         self.mori_op.dispatch_recv()
 
+        # Host-side avg #tokens per local expert under uniform routing.
+        # `topk_ids` here is the pre-dispatch (origin) one, so its first dim is
+        # the real per-rank #tokens; the ceil-div +num_experts term gives the
+        # tier lookup a small (~1) margin in the exactly-divisible case.
+        num_tokens = topk_ids.shape[0]
+        topk = topk_ids.shape[1]
+        world_size = self.num_experts // self.num_local_experts
+        expected_m = (
+            num_tokens * world_size * topk + self.num_experts
+        ) // self.num_experts
+
         return MoriEPLLDispatchOutput(
             hidden_states=hidden_states,
             hidden_states_scale=recv_scales,
@@ -881,6 +907,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
             origin_topk_ids=topk_ids,
             origin_topk_weights=topk_weights,
             out_dtype=output_dtype,
+            expected_m=expected_m,
         )
 
     def _dispatch_core(

@@ -16,7 +16,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.utils import get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
@@ -73,6 +72,11 @@ class AiterRunnerInput(RunnerInput):
     # Mori-only fused_moe kwargs.
     num_local_tokens: Optional[torch.Tensor] = None
     output_dtype: Optional[torch.dtype] = None
+    # Host-side avg #tokens per local expert under uniform routing. Forwarded
+    # to aiter.fused_moe so its get_padded_M tier lookup picks a kernel sized
+    # for the realistic workload instead of the (potentially padded) M from
+    # topk_ids.shape[0]. None for non-mori callers preserves prior behavior.
+    expected_m: Optional[int] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -133,6 +137,8 @@ class AiterRunnerCore(MoeRunnerCore):
         if quant_info.swiglu_limit > 0:
             extra["gate_mode"] = GateMode.INTERLEAVE.value
             extra["swiglu_limit"] = quant_info.swiglu_limit
+        if runner_input.expected_m is not None:
+            extra["expected_m"] = runner_input.expected_m
 
         output = fused_moe(
             hidden_states=runner_input.hidden_states,
@@ -248,6 +254,11 @@ def _pre_permute_deepep_to_aiter(
     a1_scale: Optional[torch.Tensor] = None
     num_local_tokens: Optional[torch.Tensor] = None
     output_dtype: Optional[torch.dtype] = None
+    # Carried from mori dispatch outputs into AiterRunnerInput so the AITER
+    # fused_moe call can use it for kernel-config tier lookup. Replaces the
+    # SGLANG_MORI_MOE_MAX_INPUT_TOKENS truncation workaround (PR #22952) --
+    # see aiter commit "[fused_moe] add expected_m host-side scheduling hint".
+    expected_m: Optional[int] = None
     quant_type = quant_info.quant_type
 
     if is_mori:
@@ -256,17 +267,7 @@ def _pre_permute_deepep_to_aiter(
         a1_scale = dispatch_output.hidden_states_scale
         num_local_tokens = dispatch_output.num_recv_tokens_per_expert
         output_dtype = dispatch_output.out_dtype
-
-        # Truncate dispatch tensors to the configured cap; mori combine only
-        # reads [0, totalRecvTokenNum), so the truncated result needs no
-        # padding back.
-        mori_max = get_int_env_var("SGLANG_MORI_MOE_MAX_INPUT_TOKENS", 0)
-        if mori_max > 0:
-            hidden_states = hidden_states[:mori_max]
-            if a1_scale is not None:
-                a1_scale = a1_scale[:mori_max]
-            topk_ids = topk_ids[:mori_max]
-            topk_weights = topk_weights[:mori_max]
+        expected_m = dispatch_output.expected_m
 
         # Upscale dispatched activations when there is no AITER kernel for the
         # weight/activation dtype pair.
@@ -324,6 +325,7 @@ def _pre_permute_deepep_to_aiter(
         a1_scale=a1_scale,
         num_local_tokens=num_local_tokens,
         output_dtype=output_dtype,
+        expected_m=expected_m,
     )
 
 
