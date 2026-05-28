@@ -69,11 +69,11 @@ def _should_use_fused_dual_scope(total_tokens: int, h_q: int, total_topk: int) -
     if h_q <= 64 and total_topk >= 1024:
         return total_tokens <= 128
     # h_q > 64 (e.g. h_q=128 when q is padded to full n_heads).
+    # The splitk kernel handles total_tokens up to 128 well via
+    # use_splitk_for_large_hq in fused_gather_attn_decode_dsv4_dual_scope_low_overhead.
+    # Beyond 128, _should_use_fused_nosplitk takes over at total_tokens >= 256.
     if h_q > 64:
-        if total_topk >= 400:
-            return total_tokens <= 32
-        else:
-            return total_tokens <= 128
+        return total_tokens <= 128
     return True
 
 
