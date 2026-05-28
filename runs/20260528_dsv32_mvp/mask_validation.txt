@@ -1,0 +1,12 @@
+-rw-r--r-- 1 root root 999992 May 28 17:27 /models/dsv32-fp8-channel-mask.safetensors
+
+load_channel_mask: SUCCESS
+dtype        = fp8_e4m3
+page_size    = 64
+label_dim    = 16
+head_dim     = 128
+channel_selection.shape = (61, 128, 16)
+channel_selection.dtype = torch.int32
+content_sha256          = 7b3207cae888c141173703384bfd7c8974b7adb64b1fddbdacac3ab26c7d6ac6
+content_sha256[:12]     = 7b3207cae888
+channel idx min/max     = 0 127 (must be in [0, head_dim))

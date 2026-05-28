@@ -283,3 +283,6 @@ artifacts/
 
 # RLCR active plan file (kept on disk, not tracked during the loop)
 development/loop5/refined_plan_v1.md
+
+# Large local calibration corpus (rebuildable; provenance recorded in calibration_provenance.md)
+runs/20260528_dsv32_mvp/calib_corpus_pileval.txt
