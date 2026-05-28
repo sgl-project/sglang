@@ -8,19 +8,19 @@ handles retries with exponential backoff, logs delivery history.
 Credentials sourced from ~/.secrets/fractal.env at runtime — never hardcoded.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
-import json
-import time
-import hmac
-import hashlib
-import secrets
 import base64
+import hashlib
+import hmac
+import json
+import os
+import secrets
 import sqlite3
 import threading
-import urllib.request
+import time
 import urllib.error
-from pathlib import Path
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 # ── vault loading (MUST be before any os.getenv calls) ─────────────────────────
 _ENV_FILE = Path.home() / ".secrets" / "fractal.env"

@@ -4,28 +4,28 @@ Port: 7876  (FILE_PROCESSOR_PORT env var)
 stdlib only: no third-party dependencies
 """
 
-import os
-import json
-import sqlite3
-import time
-import hashlib
-import threading
 import base64
-import gzip
-import io
-import re
 import csv
+import gzip
+import hashlib
 import html
-import textwrap
-import mimetypes
-import struct
-import zipfile
-import tarfile
-import uuid
+import io
+import json
 import math
-from pathlib import Path
+import mimetypes
+import os
+import re
+import sqlite3
+import struct
+import tarfile
+import textwrap
+import threading
+import time
+import uuid
+import zipfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 # ---------------------------------------------------------------------------
 # Vault / env loading

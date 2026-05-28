@@ -3,12 +3,12 @@ FractalMesh Workspace Sync Agent
 Syncs working files between FRACTALMESH_HOME and git repo; logs drift to sovereign.db
 Samuel James Hiotis | ABN 56 628 117 363
 """
+import hashlib
 import os
-import time
 import signal
 import sqlite3
-import hashlib
 import subprocess
+import time
 from datetime import datetime
 
 ROOT      = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

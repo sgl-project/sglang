@@ -6,17 +6,17 @@ exposes them in Prometheus text format + JSON endpoints.
 Credentials sourced from ~/.secrets/fractal.env at runtime — never hardcoded.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
 import json
-import time
+import logging
+import os
 import socket
 import sqlite3
-import logging
 import threading
-import urllib.request
+import time
 import urllib.error
-from pathlib import Path
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 # ── vault ─────────────────────────────────────────────────────────────────────

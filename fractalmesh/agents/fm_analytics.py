@@ -4,9 +4,12 @@ FractalMesh Analytics Engine — Port 5060
 MRR/ARR/LTV/Cohort/Funnel revenue analytics
 Samuel James Hiotis | ABN 56628117363
 """
-import os, sqlite3, json
-from pathlib import Path
+import json
+import os
+import sqlite3
 from datetime import datetime, timedelta
+from pathlib import Path
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 

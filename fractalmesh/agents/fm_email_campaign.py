@@ -7,19 +7,19 @@ send bulk emails via SendGrid, track opens/clicks via pixel tracking,
 and analyse deliverability.
 """
 
-import os
-import json
-import sqlite3
-import time
+import base64
 import hashlib
 import hmac
-import re
 import html
-import base64
+import json
+import os
+import re
+import sqlite3
 import threading
-import urllib.request
+import time
 import urllib.error
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -968,6 +968,7 @@ class CampaignHandler(BaseHTTPRequestHandler):
         # Parse ISO 8601 to epoch float
         try:
             import time as _t
+
             # Handle both 'Z' suffix and offset-naive strings
             s = str(scheduled_at_raw).replace("Z", "+00:00")
             # Use strptime for stdlib-only parsing

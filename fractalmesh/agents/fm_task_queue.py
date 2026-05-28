@@ -7,20 +7,20 @@ and a dead-letter queue. Workers process tasks concurrently per queue.
 Credentials sourced from ~/.secrets/fractal.env at runtime — never hardcoded.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
-import json
-import time
-import hmac
 import hashlib
-import sqlite3
-import threading
-import subprocess
-import urllib.request
-import urllib.error
+import hmac
+import json
 import logging
+import os
 import queue
-from pathlib import Path
+import sqlite3
+import subprocess
+import threading
+import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 # ── vault ──────────────────────────────────────────────────────────────────────
 _ENV_FILE = Path.home() / ".secrets" / "fractal.env"

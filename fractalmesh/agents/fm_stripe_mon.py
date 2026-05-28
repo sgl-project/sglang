@@ -7,13 +7,16 @@ then emails the AI Node Blueprint PDF to the customer.
 Samuel James Hiotis | ABN 56628117363
 Vault keys: GMAIL_USER, GMAIL_APP_PASS, STRIPE_WEBHOOK_SECRET
 """
-import os, time, logging, smtplib
-from pathlib import Path
+import logging
+import os
+import smtplib
+import time
+from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.mime.application import MIMEApplication
+from pathlib import Path
 
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 
 # ── Load vault ───────────────────────────────────────────────────────────────
 _vault = Path(os.path.expanduser("~/.secrets/fractal.env"))
@@ -93,7 +96,8 @@ def stripe_webhook():
     if webhook_secret:
         sig_header = request.headers.get("Stripe-Signature", "")
         try:
-            import hmac, hashlib
+            import hashlib
+            import hmac
             ts_part  = [p for p in sig_header.split(",") if p.startswith("t=")]
             sig_part = [p for p in sig_header.split(",") if p.startswith("v1=")]
             if ts_part and sig_part:

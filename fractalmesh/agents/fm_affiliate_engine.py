@@ -4,19 +4,19 @@ Port: 7842
 Samuel James Hiotis | ABN 56 628 117 363
 """
 
-import os
-import json
-import sqlite3
-import logging
-import signal
-import time
 import hashlib
-import urllib.request
+import json
+import logging
+import os
+import signal
+import sqlite3
+import time
 import urllib.error
 import urllib.parse
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.request
+from datetime import date, datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from datetime import datetime, date
 
 # ---------------------------------------------------------------------------
 # Vault loading

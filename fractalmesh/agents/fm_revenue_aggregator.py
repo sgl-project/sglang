@@ -5,17 +5,17 @@ Polls Stripe, affiliate dashboards, and internal agents to produce a unified
 revenue snapshot. All credentials sourced from ~/.secrets/fractal.env at runtime.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
-import json
-import time
-import hmac
 import hashlib
+import hmac
+import json
+import logging
+import os
 import signal
 import sqlite3
-import logging
+import time
 import urllib.request
-from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any
 
 # ── vault ─────────────────────────────────────────────────────────────────────

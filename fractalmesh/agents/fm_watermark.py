@@ -4,12 +4,12 @@ Applies visible + metadata watermarks to generated documents and images.
 Supports Markdown (metadata injection) and plain text (footer stamp).
 Samuel James Hiotis | ABN 56 628 117 363 | Sole Trader
 """
+import hashlib
 import os
 import re
-import time
 import signal
 import sqlite3
-import hashlib
+import time
 from datetime import datetime
 
 ROOT       = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

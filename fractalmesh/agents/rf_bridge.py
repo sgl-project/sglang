@@ -4,7 +4,11 @@ rf_bridge.py — Syncs RF/GBWiGLE telemetry sales into FractalMesh sovereign.db
 Runs every 5 minutes, reads ~/ai-mesh/sales/rf_sales.json → writes to SQLite
 Samuel James Hiotis | ABN 56628117363 | Albury NSW
 """
-import os, json, sqlite3, time, logging
+import json
+import logging
+import os
+import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
 

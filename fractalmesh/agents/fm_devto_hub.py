@@ -6,17 +6,17 @@ follower growth, series management, and OpenRouter-powered content generation.
 All credentials sourced from ~/.secrets/fractal.env at runtime.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
 import json
-import time
+import logging
+import os
 import signal
 import sqlite3
-import logging
-import urllib.request
+import time
 import urllib.error
 import urllib.parse
-from pathlib import Path
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any
 
 # ── vault ─────────────────────────────────────────────────────────────────────

@@ -4,14 +4,14 @@ Tracks Google AdMob ad revenue, RPM, fill rate, and impressions.
 Correlates ad performance with product/campaign data.
 Samuel James Hiotis | ABN 56 628 117 363 | Sole Trader
 """
-import os
+import base64
 import json
-import time
+import os
 import signal
 import sqlite3
-import base64
-import urllib.request
+import time
 import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta
 
 ROOT       = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

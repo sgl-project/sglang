@@ -5,17 +5,17 @@ Unified intent multiplexer for cross-app integration.
 Credentials sourced from ~/.secrets/fractal.env at runtime — never hardcoded.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
-import json
-import time
-import hmac
 import hashlib
+import hmac
+import json
+import logging
+import os
 import signal
 import sqlite3
-import logging
 import subprocess
-from pathlib import Path
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any
 
 # ── vault ─────────────────────────────────────────────────────────────────────

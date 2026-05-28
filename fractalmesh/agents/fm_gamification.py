@@ -8,20 +8,20 @@ Tracks player progress, awards XP and badges automatically when conditions
 are met. Supports events (login, purchase, review, referral, etc.).
 """
 
-import os
-import json
-import sqlite3
-import time
 import hashlib
 import hmac
-import secrets
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from pathlib import Path
-from urllib.parse import urlparse, parse_qs
-import urllib.request
-import urllib.error
+import json
 import math
+import os
+import secrets
+import sqlite3
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 # ---------------------------------------------------------------------------
 # Vault loading — MUST be before any os.getenv calls

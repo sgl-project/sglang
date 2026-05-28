@@ -4,9 +4,18 @@ fm_admin_api.py — FractalMesh Unified Administration API (Port 7804)
 Mesh management, agent control, config, audit, port scanning, DB stats.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os, json, time, signal, sqlite3, logging, subprocess, socket, urllib.request, hmac
-from pathlib import Path
+import hmac
+import json
+import logging
+import os
+import signal
+import socket
+import sqlite3
+import subprocess
+import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 _vault = Path(os.path.expanduser("~/.secrets/fractal.env"))
 if _vault.exists():

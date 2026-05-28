@@ -4,10 +4,19 @@ fm_auth_manager.py — FractalMesh Authentication & Authorization Manager (Port 
 Central auth system: registration, login, JWT-like tokens, roles, permissions, OAuth2.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os, json, time, sqlite3, hashlib, hmac, secrets, base64, threading
-from pathlib import Path
+import base64
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import sqlite3
+import threading
+import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
-import urllib.request, urllib.error
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Vault loading — MUST appear before any os.getenv calls

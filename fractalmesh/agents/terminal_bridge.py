@@ -5,11 +5,11 @@ WebSocket server on :5062 — /terminal (exec) + /telemetry (log broadcast)
 """
 
 import asyncio
+import glob
 import json
 import os
 import re
 import sys
-import glob
 from pathlib import Path
 
 try:

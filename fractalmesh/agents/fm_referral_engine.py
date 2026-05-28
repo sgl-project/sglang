@@ -7,20 +7,20 @@ Full referral and affiliate marketing system: unique referral links, click
 tracking, conversion recording, commission calculation, and Stripe payouts.
 """
 
-import os
-import json
-import sqlite3
-import time
+import base64
 import hashlib
 import hmac
+import json
+import os
 import secrets
+import sqlite3
 import threading
-import base64
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from pathlib import Path
-from urllib.parse import urlparse, parse_qs
-import urllib.request
+import time
 import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 # ---------------------------------------------------------------------------
 # Vault loading

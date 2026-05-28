@@ -247,7 +247,9 @@ def _send_welcome_email(name: str, email: str, api_key: str, plan: str) -> None:
 def _stripe_post(path: str, params: dict) -> dict:
     if not STRIPE_SECRET_KEY:
         return {}
-    import urllib.parse, urllib.request, urllib.error
+    import urllib.error
+    import urllib.parse
+    import urllib.request
     data = urllib.parse.urlencode(params).encode()
     req = urllib.request.Request(
         f"https://api.stripe.com/v1{path}",

@@ -4,10 +4,20 @@ fm_rag_pipeline.py — RAG Pipeline Agent (Port 7806)
 Ingest, chunk, index, retrieve, and generate. Pure Python TF-IDF similarity.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os, json, time, signal, sqlite3, logging, math, re, urllib.request, urllib.error, urllib.parse
-from pathlib import Path
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+import logging
+import math
+import os
+import re
+import signal
+import sqlite3
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import Counter
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 _vault = Path(os.path.expanduser("~/.secrets/fractal.env"))
 if _vault.exists():

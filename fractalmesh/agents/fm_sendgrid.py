@@ -3,18 +3,18 @@ FractalMesh OMEGA Titan — SendGrid Mail API v3 Agent
 Port: 7817
 """
 
-import os
 import json
-import sqlite3
 import logging
+import os
 import signal
+import sqlite3
 import time
-import urllib.request
 import urllib.error
 import urllib.parse
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from pathlib import Path
+import urllib.request
 from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Vault loading

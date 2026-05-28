@@ -12,25 +12,25 @@ Vault keys: GMAIL_USER, GMAIL_APP_PASS, IMAP_HOST, IMAP_PORT,
 Samuel James Hiotis | ABN 56628117363
 """
 
-import os
-import json
-import re
-import sqlite3
-import time
+import base64
 import email
 import email.header
 import imaplib
-import smtplib
-import threading
+import json
 import logging
-import urllib.request
-import urllib.parse
-from pathlib import Path
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import os
 import quopri
-import base64
+import re
+import smtplib
+import sqlite3
+import threading
+import time
+import urllib.parse
+import urllib.request
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Vault loader

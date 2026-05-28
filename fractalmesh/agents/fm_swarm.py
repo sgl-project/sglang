@@ -5,18 +5,18 @@ FractalMesh OMEGA Titan — multi-strategy task batch dispatcher.
 Credentials sourced from ~/.secrets/fractal.env at runtime — never hardcoded.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
-import json
-import time
-import hmac
-import hashlib
-import sqlite3
-import logging
-import urllib.request
-import urllib.error
 import concurrent.futures
-from pathlib import Path
+import hashlib
+import hmac
+import json
+import logging
+import os
+import sqlite3
+import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any, Optional
 
 # ── vault ─────────────────────────────────────────────────────────────────────

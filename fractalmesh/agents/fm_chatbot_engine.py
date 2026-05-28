@@ -11,17 +11,17 @@ context prepending, and full conversation threading.
 Samuel James Hiotis | ABN 56 628 117 363
 """
 
-import os
-import json
-import sqlite3
-import time
 import hashlib
 import hmac
+import json
+import os
 import secrets
+import sqlite3
 import threading
-import urllib.request
+import time
 import urllib.error
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -852,7 +852,7 @@ class ChatbotHandler(BaseHTTPRequestHandler):
     # /conversations  (GET)  — query param: user_id
     # ------------------------------------------------------------------
     def _handle_list_conversations(self):
-        from urllib.parse import urlparse, parse_qs
+        from urllib.parse import parse_qs, urlparse
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
         user_id = params.get("user_id", [None])[0]

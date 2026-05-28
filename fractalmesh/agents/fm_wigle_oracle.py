@@ -3,14 +3,14 @@ FractalMesh WiGLE Oracle Agent
 Queries WiGLE API for local WiFi network telemetry; logs to sovereign.db
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
+import base64
 import json
-import time
+import os
 import signal
 import sqlite3
-import base64
-import urllib.request
+import time
 import urllib.parse
+import urllib.request
 from datetime import datetime
 
 ROOT      = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

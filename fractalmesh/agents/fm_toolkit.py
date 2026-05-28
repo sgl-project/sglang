@@ -4,12 +4,12 @@ Shared utility runner: env validation, vault check, disk health, port scan
 Samuel James Hiotis | ABN 56 628 117 363
 """
 import os
-import sys
-import time
+import shutil
 import signal
 import socket
-import shutil
 import sqlite3
+import sys
+import time
 from datetime import datetime
 
 ROOT     = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

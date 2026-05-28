@@ -6,19 +6,19 @@ stdlib only: os, json, sqlite3, time, http.server, threading, math,
              urllib, pathlib, socket, hashlib, base64
 """
 
-import os
-import json
-import sqlite3
-import time
-import threading
-import math
-import hashlib
 import base64
+import hashlib
+import json
+import math
+import os
 import socket
-import urllib.request
+import sqlite3
+import threading
+import time
 import urllib.parse
-from pathlib import Path
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Config / vault

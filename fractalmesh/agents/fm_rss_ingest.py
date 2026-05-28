@@ -6,18 +6,18 @@ by GUID/URL hash, and exposes a REST API for consumers.
 Credentials from ~/.secrets/fractal.env — never hardcoded.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
-import json
-import time
-import hmac
 import hashlib
+import hmac
+import json
+import os
 import sqlite3
 import threading
-from pathlib import Path
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
-from urllib.request import urlopen, Request
+from pathlib import Path
 from urllib.error import URLError
+from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
 from xml.etree import ElementTree as ET
 
 # ── vault ─────────────────────────────────────────────────────────────────────

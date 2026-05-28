@@ -3,12 +3,12 @@ FractalMesh Pulse Bus
 Secure internal event bus — HMAC-signed payloads, SQLite ledger
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import sys
-import json
-import sqlite3
-import hmac
 import hashlib
+import hmac
+import json
 import os
+import sqlite3
+import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))

@@ -6,9 +6,16 @@ Syncs sovereign.db content to Firebase Notes app,
 registers IP/research documents, maintains knowledge base.
 Port: 5061 (health only)
 """
-import os, json, time, sqlite3, logging, urllib.request, urllib.parse
-from pathlib import Path
+import json
+import logging
+import os
+import sqlite3
+import time
+import urllib.parse
+import urllib.request
 from datetime import datetime
+from pathlib import Path
+
 from flask import Flask, jsonify
 from flask_cors import CORS
 
@@ -167,6 +174,7 @@ def rag():
     return jsonify([dict(r) for r in rows])
 
 import threading
+
 
 def _background_loop():
     while True:

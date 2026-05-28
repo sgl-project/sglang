@@ -4,14 +4,14 @@ fm_lba_bridge.py — LBA/TFN shield + ATO identity heartbeat
 TFN is NEVER logged, transmitted, or stored — presence checked only.
 Samuel James Hiotis | ABN 56628117363
 """
-import os
 import json
-import time
+import logging
+import os
 import signal
 import sqlite3
-import logging
-from pathlib import Path
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 _vault = Path(os.path.expanduser("~/.secrets/fractal.env"))
 if _vault.exists():

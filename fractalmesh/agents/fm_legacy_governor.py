@@ -6,15 +6,15 @@ pre-OMEGA Titan integrations.
 Credentials from ~/.secrets/fractal.env — never hardcoded.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
-import json
-import time
 import hmac
+import json
+import os
 import sqlite3
 import threading
-from pathlib import Path
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 # ── vault ─────────────────────────────────────────────────────────────────────
 _VAULT = Path.home() / ".secrets" / "fractal.env"

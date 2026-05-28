@@ -4,11 +4,19 @@ fm_support_desk.py — FractalMesh OMEGA Titan Customer Support Desk (Port 7868)
 AI-powered ticketing system with auto-classification, SLA enforcement, and KB.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os, json, sqlite3, time, hashlib, hmac, threading, re, html
-from pathlib import Path
+import hashlib
+import hmac
+import html
+import json
+import os
+import re
+import sqlite3
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
 
 # ---------------------------------------------------------------------------
 # Vault loading
@@ -45,6 +53,7 @@ _START_TIME = time.time()
 # Minimal logger
 # ---------------------------------------------------------------------------
 import logging
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [SUPPORT] %(message)s",

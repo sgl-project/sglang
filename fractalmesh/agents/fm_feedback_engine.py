@@ -9,18 +9,18 @@ scores, analyse sentiment, and track customer satisfaction over time.
 Samuel James Hiotis | ABN 56 628 117 363
 """
 
-import os
-import json
-import sqlite3
-import time
 import hashlib
 import hmac
-import threading
+import json
+import os
 import secrets
+import sqlite3
 import statistics
-import urllib.request
+import threading
+import time
 import urllib.error
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 # ---------------------------------------------------------------------------

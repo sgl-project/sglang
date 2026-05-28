@@ -3,15 +3,15 @@ FractalMesh OSINT Spider Agent
 Google Dorking + analytics-grade lead discovery; dry-run safe; logs to sovereign.db
 Samuel James Hiotis | ABN 56 628 117 363
 """
+import hashlib
+import json
 import os
 import re
-import json
-import time
 import signal
 import sqlite3
-import hashlib
-import urllib.request
+import time
 import urllib.parse
+import urllib.request
 from datetime import datetime
 
 ROOT     = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

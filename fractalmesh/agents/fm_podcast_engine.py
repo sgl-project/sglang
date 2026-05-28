@@ -10,18 +10,18 @@ send notifications via SendGrid, store audio on Cloudflare R2.
 Samuel James Hiotis | ABN 56 628 117 363
 """
 
-import os
-import json
-import sqlite3
-import time
-import hashlib
 import base64
 import gzip
+import hashlib
+import json
+import os
+import sqlite3
 import threading
-import xml.etree.ElementTree as ET
-import urllib.request
+import time
 import urllib.error
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.request
+import xml.etree.ElementTree as ET
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -61,6 +61,7 @@ for _d in (DB_PATH.parent, LOG_PATH.parent):
     _d.mkdir(parents=True, exist_ok=True)
 
 import logging
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [PODCAST] %(levelname)s %(message)s",
@@ -239,8 +240,8 @@ def _r2_upload(key: str, data: bytes, content_type: str = "audio/mpeg") -> str:
     """Upload bytes to R2 and return the public URL."""
     if not all([R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME]):
         raise RuntimeError("R2 credentials not fully configured")
-    import hmac as _hmac
     import hashlib as _hs
+    import hmac as _hmac
 
     t = time.gmtime()
     datestamp = time.strftime("%Y%m%d", t)

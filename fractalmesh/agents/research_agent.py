@@ -4,14 +4,14 @@ NOAA geomagnetic Kp index, CoinGecko crypto prices,
 business analytics aggregation. Feeds sovereign.db.
 Samuel James Hiotis | ABN 56 628 117 363 | Sole Trader
 """
-import os
+import hashlib
 import json
-import time
+import os
 import signal
 import sqlite3
-import hashlib
-import urllib.request
+import time
 import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 
 ROOT     = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

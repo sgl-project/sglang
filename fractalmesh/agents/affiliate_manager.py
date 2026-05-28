@@ -4,11 +4,11 @@ Tracks affiliate program performance, click attribution,
 conversion revenue. Seeds 10 partner programs on first run.
 Samuel James Hiotis | ABN 56 628 117 363 | Sole Trader
 """
-import os
 import json
-import time
+import os
 import signal
 import sqlite3
+import time
 from datetime import datetime, timezone
 
 ROOT     = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

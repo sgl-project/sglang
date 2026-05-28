@@ -4,9 +4,17 @@ fm_lighthouse.py — Lighthouse / PageSpeed Insights Auditing Agent (Port 7799)
 Audits FractalMesh pages for performance, accessibility, SEO, best practices.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os, json, time, signal, sqlite3, logging, urllib.request, urllib.parse, subprocess
-from pathlib import Path
+import json
+import logging
+import os
+import signal
+import sqlite3
+import subprocess
+import time
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 _vault = Path(os.path.expanduser("~/.secrets/fractal.env"))
 if _vault.exists():

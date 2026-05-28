@@ -4,9 +4,17 @@ fm_notion.py — Notion API Integration Agent (Port 7802)
 Pages, databases, content calendar, revenue sync, strategy sync.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os, json, time, signal, sqlite3, logging, urllib.request, urllib.error, urllib.parse
-from pathlib import Path
+import json
+import logging
+import os
+import signal
+import sqlite3
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 _vault = Path(os.path.expanduser("~/.secrets/fractal.env"))
 if _vault.exists():

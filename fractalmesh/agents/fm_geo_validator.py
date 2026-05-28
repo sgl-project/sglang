@@ -4,16 +4,16 @@ Validates prospect coordinates, tags leads with lat/lon metadata,
 cross-references Albury-Wodonga corridor for outreach prioritisation.
 Samuel James Hiotis | ABN 56 628 117 363 | Sole Trader
 """
-import os
-import re
+import hashlib
 import json
 import math
-import time
+import os
+import re
 import signal
 import sqlite3
-import hashlib
-import urllib.request
+import time
 import urllib.parse
+import urllib.request
 from datetime import datetime
 
 ROOT     = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

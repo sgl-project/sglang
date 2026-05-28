@@ -5,21 +5,21 @@ FractalMesh OMEGA Titan | Person/Domain/WiFi/Social intelligence gathering.
 All credentials sourced from ~/.secrets/fractal.env at runtime.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
-import json
-import time
-import signal
-import sqlite3
-import logging
-import re
 import base64
-import urllib.request
-import urllib.error
-import urllib.parse
 import csv
 import io
-from pathlib import Path
+import json
+import logging
+import os
+import re
+import signal
+import sqlite3
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 # ── vault ─────────────────────────────────────────────────────────────────────
 _vault = Path(os.path.expanduser("~/.secrets/fractal.env"))

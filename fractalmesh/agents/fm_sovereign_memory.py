@@ -5,17 +5,17 @@ Central memory/knowledge store: facts, decisions, agent outputs, learned pattern
 Provides RAG-like retrieval via keyword search. Backs up to GitHub Gist periodically.
 Port: 7853
 """
-import os
-import json
 import gzip
-import time
-import sqlite3
 import hashlib
+import json
+import os
+import sqlite3
 import threading
-import urllib.request
+import time
 import urllib.error
-from pathlib import Path
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Vault / env bootstrap

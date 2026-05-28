@@ -3,12 +3,12 @@ FractalMesh RL Quad Agent
 4-quadrant reinforcement learning: revenue, compliance, infra, reputation axes
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
 import math
-import time
+import os
 import random
 import signal
 import sqlite3
+import time
 from datetime import datetime
 
 ROOT     = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

@@ -5,12 +5,22 @@ Structured knowledge base with full-text search, versioning, collections, and AI
 Samuel James Hiotis | ABN 56 628 117 363
 """
 
-import os, json, sqlite3, time, hashlib, hmac, re, html, gzip, base64, threading
-from pathlib import Path
+import base64
+import gzip
+import hashlib
+import hmac
+import html
+import json
+import os
+import re
+import sqlite3
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs, quote
-from urllib.request import urlopen, Request
+from pathlib import Path
 from urllib.error import URLError
+from urllib.parse import parse_qs, quote, urlparse
+from urllib.request import Request, urlopen
 
 # ---------------------------------------------------------------------------
 # Vault / env loading

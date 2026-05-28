@@ -4,19 +4,19 @@ fm_cdn_proxy.py — CDN Cache Proxy & Edge Accelerator (Port 7901)
 FractalMesh OMEGA Titan | Samuel James Hiotis | ABN 56 628 117 363
 Credentials sourced from ~/.secrets/fractal.env — never hardcoded.
 """
-import os
-import json
-import sqlite3
-import time
 import hashlib
 import hmac
+import json
+import os
 import secrets
+import sqlite3
 import threading
-from pathlib import Path
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs, urlencode
-import urllib.request
+import time
 import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlparse
 
 # ── vault ─────────────────────────────────────────────────────────────────────
 _ENV_FILE = Path.home() / ".secrets" / "fractal.env"

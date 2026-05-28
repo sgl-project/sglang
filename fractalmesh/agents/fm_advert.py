@@ -6,11 +6,16 @@ Automated lead nurture sequences via Gmail SMTP.
 Runs every 6 hours. Zero-capital: emails hot leads → closes pipeline.
 Sequences: Welcome → Demo invite → Signal preview → Close
 """
-import os, json, time, sqlite3, smtplib, logging
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from pathlib import Path
+import json
+import logging
+import os
+import smtplib
+import sqlite3
+import time
 from datetime import datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [ADVERT] %(message)s")
 log = logging.getLogger("advert")

@@ -4,7 +4,12 @@ FractalMesh NFT Minter v4.1
 Watches .latest_track → Pinata IPFS → Sugar Solana mint → Dev.to post
 Vault: PINATA_KEY or PINATA_JWT, DEVTO_KEY, SOLANA_KEYPAIR_PATH
 """
-import os, sys, json, time, subprocess, logging
+import json
+import logging
+import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 logging.basicConfig(

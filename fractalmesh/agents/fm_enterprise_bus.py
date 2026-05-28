@@ -3,17 +3,17 @@ FractalMesh Enterprise Bus v2.0.0
 Thread-safe message bus with circuit breakers, HMAC signing, monetization tracking.
 Samuel James Hiotis | ABN 56 628 117 363 | Sole Trader
 """
-import os
-import json
-import time
+import hashlib
 import hmac
+import json
+import os
+import queue
 import signal
 import sqlite3
-import hashlib
 import threading
-import queue
-from datetime import datetime
+import time
 from collections import defaultdict, deque
+from datetime import datetime
 
 ROOT     = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))
 DB       = os.path.join(ROOT, "database", "sovereign.db")

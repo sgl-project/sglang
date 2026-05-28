@@ -3,22 +3,22 @@ FractalMesh OMEGA Titan — Document Forge Agent
 Auto-generates professional documents: invoices, proposals, reports, NDAs, SOWs.
 Port: 7857  |  Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
-import json
-import sqlite3
-import time
+import base64
+import gzip
 import hashlib
-import threading
-import string
+import html
+import io
+import json
+import os
 import random
 import re
-import io
-import gzip
-import html
+import sqlite3
+import string
 import textwrap
-import base64
-from pathlib import Path
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Vault / env loading

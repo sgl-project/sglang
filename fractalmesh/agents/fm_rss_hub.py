@@ -4,10 +4,17 @@ fm_rss_hub.py — Multi-RSS Feed Aggregator & Publisher (Port 7805)
 Fetches 20 feeds, stores items, generates digest, exports RSS.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os, json, time, signal, sqlite3, logging, urllib.request, urllib.error
+import json
+import logging
+import os
+import signal
+import sqlite3
+import time
+import urllib.error
+import urllib.request
 import xml.etree.ElementTree as ET
-from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 _vault = Path(os.path.expanduser("~/.secrets/fractal.env"))
 if _vault.exists():

@@ -4,9 +4,9 @@ Tracks open tasks with φ-weighted priority scoring; logs to sovereign.db
 Samuel James Hiotis | ABN 56 628 117 363
 """
 import os
-import time
 import signal
 import sqlite3
+import time
 from datetime import datetime
 
 ROOT     = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

@@ -5,7 +5,12 @@ OpenRouter LLM → structured JSON → midiutil MIDI → fluidsynth WAV → mpv
 Loops every DJ_INTERVAL seconds. Writes .latest_track for nft_minter.py.
 Vault: OPENROUTER_KEY or OPENROUTER_API_KEY (FractalMesh default)
 """
-import os, sys, json, time, subprocess, logging
+import json
+import logging
+import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 logging.basicConfig(

@@ -4,13 +4,13 @@ GPT-4o-mini article generation with affiliate link embedding.
 Posts to dev.to; stores content in sovereign.db content_pieces table.
 Samuel James Hiotis | ABN 56 628 117 363 | Sole Trader
 """
-import os
 import json
-import time
+import os
 import signal
 import sqlite3
-import urllib.request
+import time
 import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 
 ROOT     = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

@@ -6,20 +6,20 @@ Deduplicates, ranks, and caches results in SQLite (WAL mode).
 All credentials sourced from ~/.secrets/fractal.env at runtime.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
-import json
-import time
-import sqlite3
-import hashlib
-import threading
-import re
-import math
 import collections
-import urllib.request
+import hashlib
+import json
+import math
+import os
+import re
+import sqlite3
+import threading
+import time
 import urllib.error
 import urllib.parse
-from pathlib import Path
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 # ── vault ─────────────────────────────────────────────────────────────────────
 _ENV_FILE = Path.home() / ".secrets" / "fractal.env"
@@ -52,6 +52,7 @@ START_TIME       = time.time()
 
 # ── simple logger ─────────────────────────────────────────────────────────────
 import logging
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [SEARCH] %(message)s",

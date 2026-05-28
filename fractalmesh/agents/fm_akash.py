@@ -5,15 +5,15 @@ Manages Akash decentralised cloud deployments via SDL templates and CLI.
 All credentials sourced from ~/.secrets/fractal.env at runtime.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
 import json
-import time
+import logging
+import os
 import signal
 import sqlite3
-import logging
 import subprocess
-from pathlib import Path
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 try:
     import yaml

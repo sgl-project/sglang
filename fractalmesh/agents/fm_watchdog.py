@@ -6,18 +6,18 @@ records uptime analytics and incident history in sovereign.db.
 Samuel James Hiotis | ABN 56 628 117 363
 """
 
-import os
+import hmac
 import json
+import logging
+import os
+import signal
+import socket
 import sqlite3
 import subprocess
-import socket
-import time
 import threading
-import signal
-import logging
-import hmac
-from pathlib import Path
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Vault / env bootstrap

@@ -5,9 +5,15 @@ Pipelines: map-reduce summarise, RAG, research, code review, strategy.
 Calls OpenRouter agent (7791) for LLM — no LangChain install required.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os, json, time, signal, sqlite3, logging, urllib.request
-from pathlib import Path
+import json
+import logging
+import os
+import signal
+import sqlite3
+import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 _vault = Path(os.path.expanduser("~/.secrets/fractal.env"))
 if _vault.exists():

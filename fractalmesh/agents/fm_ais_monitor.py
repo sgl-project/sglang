@@ -5,15 +5,15 @@ suspicious gap patterns. Sources: AISHub (free share tier), VesselFinder.
 Outputs structured alerts to ais_alerts table for insurance/intel reports.
 Samuel James Hiotis | ABN 56 628 117 363 | Sole Trader
 """
-import os
+import hashlib
 import json
 import math
-import time
+import os
 import signal
 import sqlite3
-import hashlib
-import urllib.request
+import time
 import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta
 
 ROOT     = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

@@ -3,11 +3,11 @@ FractalMesh Live Tokenomics Agent
 Tracks royalty pools, φ-harmonic balances, and tokenomics state in sovereign.db
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
 import math
-import time
+import os
 import signal
 import sqlite3
+import time
 from datetime import datetime
 
 ROOT     = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

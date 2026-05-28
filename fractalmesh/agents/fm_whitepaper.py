@@ -5,9 +5,12 @@ Markdown → PDF + Zenodo DOI + Dev.to
 Runs every 10 min via PM2 cron_restart
 Samuel James Hiotis | ABN 56628117363 | Albury NSW
 """
-import os, json, requests
-from pathlib import Path
+import json
+import os
 from datetime import datetime
+from pathlib import Path
+
+import requests
 
 ROOT           = os.environ.get("FRACTALMESH_HOME", str(Path.home() / "fmsaas"))
 WHITEPAPER_DIR = os.path.join(ROOT, "whitepapers")

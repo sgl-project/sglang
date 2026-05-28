@@ -7,19 +7,19 @@ are normalised and routed to the right FractalMesh intent via MCP.
 Credentials sourced from ~/.secrets/fractal.env at runtime — never hardcoded.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
-import json
-import time
-import hmac
+import fnmatch
 import hashlib
+import hmac
+import json
+import logging
+import os
 import signal
 import sqlite3
-import logging
-import fnmatch
-import urllib.request
+import time
 import urllib.error
-from pathlib import Path
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 # ── vault ──────────────────────────────────────────────────────────────────────
 _vault = Path(os.path.expanduser("~/.secrets/fractal.env"))

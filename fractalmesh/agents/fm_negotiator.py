@@ -5,15 +5,15 @@ Includes satellite intelligence report tiers (methane, AIS, crop yield).
 Logs pipeline stages to sovereign.db; dry-run safe.
 Samuel James Hiotis | ABN 56 628 117 363 | Sole Trader
 """
-import os
 import json
-import time
+import os
 import signal
-import sqlite3
 import smtplib
+import sqlite3
+import time
+from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime
 
 ROOT       = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))
 DB         = os.path.join(ROOT, "database", "sovereign.db")

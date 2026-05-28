@@ -4,15 +4,15 @@ FractalMesh Drip Agent v2.1.0
 Enrolls leads from leads table; 3-day step spacing; Gmail SMTP_SSL.
 Samuel James Hiotis | ABN 56 628 117 363 | Sole Trader
 """
-import os
 import json
-import time
+import os
 import signal
-import sqlite3
 import smtplib
+import sqlite3
+import time
+from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime, timedelta, timezone
 
 ROOT       = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))
 DB         = os.path.join(ROOT, "database", "sovereign.db")

@@ -4,12 +4,12 @@ Estimates node fleet energy consumption, calculates CO2 footprint,
 reports offset opportunities, and tracks carbon credit metrics.
 Samuel James Hiotis | ABN 56 628 117 363 | Sole Trader
 """
-import os
 import json
-import time
+import math
+import os
 import signal
 import sqlite3
-import math
+import time
 from datetime import datetime
 
 ROOT     = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

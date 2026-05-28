@@ -6,16 +6,16 @@ financial dashboards, goal tracking, and multi-source revenue aggregation.
 All credentials sourced from ~/.secrets/fractal.env at runtime.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
+import hashlib
 import json
 import math
-import time
+import os
 import sqlite3
 import threading
-import hashlib
-from pathlib import Path
+import time
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 # ── vault ──────────────────────────────────────────────────────────────────────
 _vault = Path(os.path.expanduser("~/.secrets/fractal.env"))

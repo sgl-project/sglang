@@ -8,6 +8,7 @@ Port 7813 | sovereign.db WAL
 
 # ── Vault load ────────────────────────────────────────────────────────────────
 import os
+
 _VAULT = os.path.join(os.path.expanduser("~"), ".secrets", "fractal.env")
 try:
     with open(_VAULT) as _vf:
@@ -19,18 +20,19 @@ try:
 except FileNotFoundError:
     pass
 
-# ── stdlib imports ─────────────────────────────────────────────────────────────
-import urllib.request
-import urllib.error
-import urllib.parse
+import hashlib
+import hmac
 import json
-import sqlite3
 import logging
 import signal
+import sqlite3
 import time
-import hmac
-import hashlib
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.error
+import urllib.parse
+
+# ── stdlib imports ─────────────────────────────────────────────────────────────
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────

@@ -6,14 +6,14 @@ Also queries NASA EMIT methane plume data (public API, no key required).
 Feeds: osint-harvester pipeline → methane_readings + crop_signals tables.
 Samuel James Hiotis | ABN 56 628 117 363 | Sole Trader
 """
-import os
+import hashlib
 import json
-import time
+import os
 import signal
 import sqlite3
-import hashlib
-import urllib.request
+import time
 import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta
 
 ROOT     = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

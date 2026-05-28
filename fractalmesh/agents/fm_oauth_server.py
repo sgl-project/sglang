@@ -4,18 +4,18 @@ fm_oauth_server.py — OAuth 2.0 Authorization Server (Port 7905)
 FractalMesh OMEGA Titan | Samuel James Hiotis | ABN 56 628 117 363
 Credentials sourced from ~/.secrets/fractal.env — never hardcoded.
 """
-import os
-import json
-import sqlite3
-import time
+import base64
 import hashlib
 import hmac
+import json
+import os
 import secrets
-import base64
+import sqlite3
 import threading
-from pathlib import Path
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs, urlencode
+from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlparse
 
 # ── vault ─────────────────────────────────────────────────────────────────────
 _ENV_FILE = Path.home() / ".secrets" / "fractal.env"

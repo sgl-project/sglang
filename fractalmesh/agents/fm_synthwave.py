@@ -3,11 +3,11 @@ FractalMesh Synthwave Agent
 Generates φ-harmonic content metadata and schedules media asset production
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
 import math
-import time
+import os
 import signal
 import sqlite3
+import time
 from datetime import datetime
 
 ROOT     = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

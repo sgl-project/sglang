@@ -3,14 +3,14 @@ FractalMesh Dork Engine Agent
 OSINT lead-discovery via structured search dorks; logs to sovereign.db leads table
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
+import hashlib
 import json
-import time
+import os
 import signal
 import sqlite3
-import hashlib
-import urllib.request
+import time
 import urllib.parse
+import urllib.request
 from datetime import datetime
 
 ROOT     = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

@@ -6,9 +6,15 @@ Integrates: Figma REST API, exports UI components to www/,
             syncs TerraMesh design tokens, publishes previews.
 Runs every 30 min. Zero-capital: design assets → product demos → sales.
 """
-import os, json, time, logging, urllib.request, urllib.parse, hashlib
-from pathlib import Path
+import hashlib
+import json
+import logging
+import os
+import time
+import urllib.parse
+import urllib.request
 from datetime import datetime
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [FIGMA] %(message)s")

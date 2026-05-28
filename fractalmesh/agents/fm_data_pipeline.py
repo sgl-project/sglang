@@ -11,21 +11,21 @@ Supports CSV imports, JSON API ingestion, cross-table aggregations, and data exp
 Samuel James Hiotis | ABN 56 628 117 363
 """
 
-import os
-import json
-import sqlite3
-import time
-import hashlib
-import threading
-import re
-import csv
-import io
-import gzip
 import base64
-import urllib.request
+import csv
+import gzip
+import hashlib
+import io
+import json
+import os
+import re
+import sqlite3
+import threading
+import time
 import urllib.error
 import urllib.parse
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 # ---------------------------------------------------------------------------

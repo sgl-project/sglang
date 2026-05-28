@@ -4,12 +4,12 @@ Rotates sovereign ad copy to configured channels on a cooldown schedule
 Samuel James Hiotis | ABN 56 628 117 363
 """
 import os
-import time
 import signal
-import sqlite3
 import smtplib
-from email.mime.text import MIMEText
+import sqlite3
+import time
 from datetime import datetime
+from email.mime.text import MIMEText
 
 ROOT       = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))
 DB         = os.path.join(ROOT, "database", "sovereign.db")

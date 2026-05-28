@@ -3,12 +3,12 @@ FractalMesh Immortality Agent
 Hardware immortality protocol: backs up sovereign.db, verifies checksums, rotates snapshots
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
-import time
-import signal
-import shutil
 import hashlib
+import os
+import shutil
+import signal
 import sqlite3
+import time
 from datetime import datetime
 
 ROOT     = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

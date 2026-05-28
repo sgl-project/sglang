@@ -10,19 +10,19 @@ AI-powered content recommendations via Anthropic claude-haiku-4-5.
 Samuel James Hiotis | ABN 56 628 117 363
 """
 
-import os
-import json
-import sqlite3
-import time
 import hashlib
 import hmac
-import secrets
-import re
 import html
+import json
+import os
+import re
+import secrets
+import sqlite3
 import threading
-import urllib.request
+import time
 import urllib.error
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -1228,6 +1228,7 @@ class SEOHandler(BaseHTTPRequestHandler):
 # Compatibility shim for urllib.parse import in handler
 # ---------------------------------------------------------------------------
 import urllib.parse as _urllib_parse
+
 
 def _url_unquote(s: str) -> str:
     return _urllib_parse.unquote(s)

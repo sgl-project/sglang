@@ -5,17 +5,17 @@ FractalMesh OMEGA Titan | Log rotation, compression, file-watcher, tail, purge.
 All credentials sourced from ~/.secrets/fractal.env at runtime.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
-import json
 import gzip
+import json
+import os
+import pathlib
 import shutil
+import signal
 import sqlite3
 import threading
 import time
-import signal
-import pathlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
 # ── vault ─────────────────────────────────────────────────────────────────────
 _vault = pathlib.Path(os.path.expanduser("~/.secrets/fractal.env"))

@@ -4,10 +4,10 @@ Monitors Android + Raspberry Pi nodes via ADB/SSH; logs health to sovereign.db
 Samuel James Hiotis | ABN 56 628 117 363
 """
 import os
-import time
 import signal
 import sqlite3
 import subprocess
+import time
 from datetime import datetime
 
 ROOT     = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

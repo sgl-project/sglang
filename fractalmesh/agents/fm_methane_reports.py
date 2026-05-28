@@ -6,16 +6,16 @@ Integrates with fm_negotiator for Stripe billing.
 Report buyers: oil & gas operators, carbon traders, compliance teams.
 Samuel James Hiotis | ABN 56 628 117 363 | Sole Trader
 """
-import os
-import json
-import time
-import signal
-import sqlite3
 import hashlib
+import json
+import os
+import signal
 import smtplib
+import sqlite3
+import time
+from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime, timedelta
 
 ROOT       = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))
 REPO       = os.getenv("REPO_ROOT",        os.path.expanduser("~/sglang"))

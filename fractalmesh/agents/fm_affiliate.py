@@ -4,9 +4,9 @@ Tracks affiliate link health, logs conversions to sovereign.db
 Samuel James Hiotis | ABN 56 628 117 363
 """
 import os
-import time
 import signal
 import sqlite3
+import time
 import urllib.request
 from datetime import datetime
 

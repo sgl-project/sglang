@@ -6,17 +6,17 @@ dispatches intents to the MCP bus, and exposes a payment event query API.
 Credentials from ~/.secrets/fractal.env — never hardcoded.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
-import json
-import time
-import hmac
 import hashlib
+import hmac
+import json
+import os
 import sqlite3
 import threading
-from pathlib import Path
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
-from urllib.request import urlopen, Request
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
 
 # ── vault ─────────────────────────────────────────────────────────────────────
 _VAULT = Path.home() / ".secrets" / "fractal.env"

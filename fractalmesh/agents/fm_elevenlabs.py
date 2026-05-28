@@ -3,18 +3,18 @@ FractalMesh OMEGA Titan — ElevenLabs TTS Agent
 Port: 7815
 """
 
-import os
+import base64
 import json
-import sqlite3
 import logging
+import os
 import signal
+import sqlite3
 import time
-import urllib.request
 import urllib.error
 import urllib.parse
-import base64
+import urllib.request
 import uuid
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 # ---------------------------------------------------------------------------

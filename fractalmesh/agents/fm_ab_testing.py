@@ -5,20 +5,20 @@ FractalMesh OMEGA Titan | Deterministic assignment, z-test significance, statist
 All credentials sourced from ~/.secrets/fractal.env at runtime.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
-import json
-import time
-import math
-import hmac
 import hashlib
+import hmac
+import json
+import math
+import os
 import secrets
 import sqlite3
 import statistics
 import threading
-import urllib.request
+import time
 import urllib.error
-from pathlib import Path
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 # ── vault loading (must be before any os.getenv calls) ────────────────────────
 _ENV_FILE = Path.home() / ".secrets" / "fractal.env"

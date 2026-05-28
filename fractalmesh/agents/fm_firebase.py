@@ -4,9 +4,17 @@ fm_firebase.py — Firebase / Firestore REST Agent (Port 7795)
 Read/write Firestore, sync mesh state, auth via service account or API key.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os, json, time, signal, sqlite3, logging, urllib.request, urllib.error, urllib.parse
-from pathlib import Path
+import json
+import logging
+import os
+import signal
+import sqlite3
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any
 
 _vault = Path(os.path.expanduser("~/.secrets/fractal.env"))
@@ -53,7 +61,9 @@ def _auth_token() -> str:
         if time.time() < _token_cache["expires"]:
             return _token_cache["token"]
         try:
-            import base64, hmac, hashlib
+            import base64
+            import hashlib
+            import hmac
             sa = json.loads(Path(FB_SA_JSON).read_text())
             # JWT for service account
             header  = base64.urlsafe_b64encode(json.dumps({"alg":"RS256","typ":"JWT"}).encode()).rstrip(b"=")

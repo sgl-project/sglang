@@ -5,11 +5,16 @@ Watches delivery_queue → sends HTML branded email → marks delivered
 Samuel James Hiotis | ABN 56628117363 | Albury NSW
 v402: HTML emails with branding, per-product onboarding links, access keys.
 """
-import os, time, json, smtplib, sqlite3, logging
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from pathlib import Path
+import json
+import logging
+import os
+import smtplib
+import sqlite3
+import time
 from datetime import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from pathlib import Path
 
 for vault in [Path(os.path.expanduser("~/.secrets/fractal.env")),
               Path(os.path.expanduser("~/fmsaas/.env"))]:

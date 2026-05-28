@@ -6,9 +6,17 @@ Models: MiniMax-M2.7, MiniMax-M2.7-highspeed, MiniMax-M2.5, MiniMax-M2.1, MiniMa
 TTS: speech-2.8-hd with voice selection, speed, pitch, sound effects.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os, json, time, signal, sqlite3, logging, binascii, urllib.request, urllib.error
-from pathlib import Path
+import binascii
+import json
+import logging
+import os
+import signal
+import sqlite3
+import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 _vault = Path(os.path.expanduser("~/.secrets/fractal.env"))
 if _vault.exists():

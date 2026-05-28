@@ -4,9 +4,17 @@ fm_coolify.py — Coolify Self-Hosted PaaS Agent (Port 7796)
 Deploy, restart, stop, update env vars via Coolify v4 API.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os, json, time, signal, sqlite3, logging, subprocess, urllib.request, urllib.error
-from pathlib import Path
+import json
+import logging
+import os
+import signal
+import sqlite3
+import subprocess
+import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 _vault = Path(os.path.expanduser("~/.secrets/fractal.env"))
 if _vault.exists():

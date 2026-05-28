@@ -3,12 +3,13 @@ FractalMesh Mesh Integrator
 External webhook bridge — validates token, routes directives to internal bus
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
-import sys
-import sqlite3
 import json
+import os
+import sqlite3
+import sys
+
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 

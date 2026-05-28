@@ -5,18 +5,18 @@ FractalMesh OMEGA Titan — pipeline orchestration, git operations, GitHub webho
 All credentials sourced from ~/.secrets/fractal.env at runtime.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
-import json
-import time
-import hmac
 import hashlib
+import hmac
+import json
+import logging
+import os
 import signal
 import sqlite3
 import subprocess
 import threading
-import logging
-from pathlib import Path
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 # ── vault ─────────────────────────────────────────────────────────────────────
 _vault = Path(os.path.expanduser("~/.secrets/fractal.env"))

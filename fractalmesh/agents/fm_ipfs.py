@@ -3,14 +3,14 @@ FractalMesh IPFS Agent
 Pins sovereign documents to IPFS; logs CIDs to sovereign.db
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
 import json
-import time
+import os
 import signal
 import sqlite3
 import subprocess
-import urllib.request
+import time
 import urllib.parse
+import urllib.request
 from datetime import datetime
 
 ROOT     = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

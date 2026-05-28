@@ -7,18 +7,18 @@ or MCP intents. Tracks full execution history and failures.
 Credentials sourced from ~/.secrets/fractal.env at runtime — never hardcoded.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
-import json
-import time
-import hmac
 import hashlib
-import sqlite3
+import hmac
+import json
 import math
+import os
 import re
-import threading
+import sqlite3
 import subprocess
-import urllib.request
+import threading
+import time
 import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -50,6 +50,7 @@ START_TIME = time.time()
 
 # ── logging ────────────────────────────────────────────────────────────────────
 import logging
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [SCHEDULER_PRO] %(message)s",
@@ -207,6 +208,7 @@ def _next_cron_run(expr: str) -> float:
     dows     = _parse_field(dows_f,    0,  6)  # 0=Sunday
 
     import time as _time
+
     # Walk minute by minute from now+60s, up to 366 days
     now_epoch = _time.time()
     candidate = now_epoch + 60  # start one minute from now
@@ -245,6 +247,7 @@ def _compute_next_run(schedule: str) -> float:
     elif schedule.startswith("at:"):
         iso = schedule[3:]
         import time as _time
+
         # Parse ISO timestamp (YYYY-MM-DDTHH:MM:SS or with Z/offset)
         iso_clean = iso.replace("Z", "+00:00")
         try:

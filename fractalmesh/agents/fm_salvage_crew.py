@@ -4,10 +4,10 @@ Recovers corrupted or missing sovereign.db tables; re-seeds from backup snapshot
 Samuel James Hiotis | ABN 56 628 117 363
 """
 import os
-import time
-import signal
 import shutil
+import signal
 import sqlite3
+import time
 from datetime import datetime
 
 ROOT     = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))

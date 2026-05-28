@@ -3,13 +3,13 @@ FractalMesh Oversight Agent
 Immutable audit trail: HMAC-signs and logs every agent heartbeat; AFSL compliance layer
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
-import sys
 import json
-import time
+import os
 import signal
 import sqlite3
 import subprocess
+import sys
+import time
 from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -57,7 +57,9 @@ def _sign(payload: dict) -> str:
         sig, _ = generate_fingerprint(payload)
         return sig
     except Exception:
-        import hmac as _hmac, hashlib as _hl, json as _json
+        import hashlib as _hl
+        import hmac as _hmac
+        import json as _json
         secret  = os.getenv("BUS_SECRET", "fallback").encode()
         body    = _json.dumps(payload, sort_keys=True).encode()
         return _hmac.new(secret, body, _hl.sha256).hexdigest()

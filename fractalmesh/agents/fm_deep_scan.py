@@ -5,19 +5,19 @@ Comprehensive domain/IP/email/keyword intelligence scanning.
 All credentials sourced from ~/.secrets/fractal.env at runtime.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
 import json
-import time
+import logging
+import os
 import re
 import socket
 import sqlite3
-import logging
-import urllib.request
-import urllib.parse
+import time
 import urllib.error
-from pathlib import Path
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import urllib.parse
+import urllib.request
 from html.parser import HTMLParser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 # ── vault ──────────────────────────────────────────────────────────────────────
 _vault = Path(os.path.expanduser("~/.secrets/fractal.env"))

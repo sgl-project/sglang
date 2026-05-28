@@ -5,17 +5,17 @@ Logs operator identity and authorisation state; HMAC-signs each pulse.
 TFN is NEVER read or logged by this agent.
 Samuel James Hiotis | ABN 56628117363
 """
-import os
-import sys
-import json
-import time
+import hashlib
 import hmac
+import json
+import logging
+import os
 import signal
 import sqlite3
-import hashlib
-import logging
-from pathlib import Path
+import sys
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 _vault = Path(os.path.expanduser("~/.secrets/fractal.env"))
 if _vault.exists():

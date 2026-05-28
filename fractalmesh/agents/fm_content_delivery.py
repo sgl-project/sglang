@@ -8,21 +8,21 @@ AWS Signature Version 4 for all R2 operations — stdlib only, no credentials
 hardcoded.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
-import json
-import time
-import hmac
 import base64
 import hashlib
+import hmac
+import json
+import mimetypes
+import os
 import secrets
 import sqlite3
-import mimetypes
 import threading
-import urllib.request
+import time
 import urllib.error
 import urllib.parse
-from pathlib import Path
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 # ── vault ──────────────────────────────────────────────────────────────────────
 _ENV_FILE = Path.home() / ".secrets" / "fractal.env"

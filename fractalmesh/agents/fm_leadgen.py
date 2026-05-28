@@ -6,17 +6,17 @@ Samuel James Hiotis | ABN 56 628 117 363 | Sole Trader
 All credentials sourced from ~/.secrets/fractal.env at runtime. Never hardcoded.
 """
 
-import os
 import json
-import re
-import sqlite3
 import logging
+import os
+import re
 import signal
+import sqlite3
 import time
-import urllib.request
 import urllib.error
 import urllib.parse
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 # ---------------------------------------------------------------------------

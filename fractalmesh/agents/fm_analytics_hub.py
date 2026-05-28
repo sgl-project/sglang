@@ -5,19 +5,19 @@ FractalMesh OMEGA Titan | Central BI: KPIs, reports, funnels, cohorts, alerts, a
 All credentials sourced from ~/.secrets/fractal.env at runtime.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os
-import json
-import time
-import math
 import hashlib
+import json
+import math
+import os
 import sqlite3
-import threading
 import statistics
-import urllib.request
+import threading
+import time
 import urllib.error
-from pathlib import Path
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import urllib.request
 from collections import defaultdict
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 # ── vault ──────────────────────────────────────────────────────────────────────
 _ENV_FILE = Path.home() / ".secrets" / "fractal.env"

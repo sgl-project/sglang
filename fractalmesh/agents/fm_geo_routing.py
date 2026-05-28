@@ -5,11 +5,19 @@ IP geolocation, currency conversion, content routing, and localisation.
 Lookup visitor location, route to correct regional config, handle currency/timezone/language preferences.
 Samuel James Hiotis | ABN 56 628 117 363
 """
-import os, json, time, sqlite3, threading, hashlib, hmac, secrets
-from pathlib import Path
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import sqlite3
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.request import urlopen, Request as URLRequest
-from urllib.error import URLError, HTTPError
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request as URLRequest
+from urllib.request import urlopen
 
 # ---------------------------------------------------------------------------
 # Vault / env bootstrap — MUST be before any os.getenv calls

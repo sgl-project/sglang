@@ -4,13 +4,13 @@ Port: 7846
 Samuel James Hiotis | ABN 56 628 117 363 | Sole Trader
 """
 
-import os
+import hashlib
+import hmac
 import json
+import os
+import secrets
 import sqlite3
 import time
-import hmac
-import hashlib
-import secrets
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlparse

@@ -4,13 +4,13 @@ Checks DNS, HTTP reachability, and SSL expiry for sovereign domains
 Samuel James Hiotis | ABN 56 628 117 363
 """
 import os
-import ssl
-import time
 import signal
 import socket
 import sqlite3
-import urllib.request
+import ssl
+import time
 import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 
 ROOT     = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))
