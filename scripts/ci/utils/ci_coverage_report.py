@@ -38,6 +38,52 @@ assert set(BACKEND_DISPLAY_ORDER) == {
     b.name for b in HWBackend
 }, "BACKEND_DISPLAY_ORDER is out of sync with HWBackend"
 
+# --------------------------------------------------------------------------- #
+# multimodal_gen test coverage
+#
+# multimodal_gen tests live under python/sglang/multimodal_gen/test/ and use
+# their own run_suite.py / partitioning framework, NOT the register_*_ci()
+# registry used under test/registered/. To surface them in the daily
+# overview we synthesize CIRegistry records from file paths + filename
+# tokens, using the rules below. These are heuristics derived from how the
+# multimodal_gen workflows (pr-test-{musa,npu,amd}.yml, pr-test-multimodal-
+# gen.yml) currently invoke each file -- they MAY drift if a workflow
+# stops/starts running a directory.
+# --------------------------------------------------------------------------- #
+MULTIMODAL_GEN_TEST_DIR = "python/sglang/multimodal_gen/test"
+
+# Subdirectory (relative to MULTIMODAL_GEN_TEST_DIR) -> backends those files
+# run on by default. Empty string is the top-level. Files whose tokenized
+# filename contains an explicit backend marker (see below) override this.
+_MM_GEN_SUBDIR_BACKENDS = {
+    # Top-level helper-style tests (e.g. test_consistency_metrics.py).
+    "": ("CUDA",),
+    # server/ top-level: pr-test-multimodal-gen.yml drives CUDA, pr-test-amd
+    # mirrors the same suite on AMD runners.
+    "server": ("CUDA", "AMD"),
+    "server/musa": ("MUSA",),
+    "server/ascend": ("NPU",),
+    "layers": ("CUDA",),
+    "unit": ("CUDA",),
+    "cli": ("CUDA",),
+    "manual": ("CUDA",),
+}
+
+# Filenames that match `test_*.py` by convention but contain no real tests
+# (utility / fixture modules). Skipped before classification.
+_MM_GEN_HELPER_FILENAMES = frozenset({"test_utils.py"})
+
+# Filename token -> backend override. Tokenization is `stem.split("_")`, so a
+# file like `test_server_1_gpu_musa.py` yields tokens
+# {test, server, 1, gpu, musa} and matches `musa`. This correctly catches
+# both `test_musa_*.py` (musa-named kernels) and `test_*_musa*.py` (musa
+# variants of generic server tests). `nightly` is detected the same way and
+# flips the nightly flag without changing the backend.
+_MM_GEN_FILENAME_BACKEND_TOKENS = {
+    "musa": ("MUSA",),
+    "npu": ("NPU",),
+}
+
 
 def collect_all_tests(registered_dir: str) -> list[CIRegistry]:
     """Collect all CI registrations from registered directory."""
@@ -54,10 +100,92 @@ def collect_all_tests(registered_dir: str) -> list[CIRegistry]:
     return all_tests
 
 
+def collect_multimodal_gen_tests(
+    mm_gen_dir: str = MULTIMODAL_GEN_TEST_DIR,
+) -> list[CIRegistry]:
+    """Synthesize CIRegistry records for multimodal_gen tests.
+
+    multimodal_gen doesn't use register_*_ci(); see the module-level comment
+    above MULTIMODAL_GEN_TEST_DIR for the rules. Returns one record per
+    (file, backend) pair, matching the convention used for registered tests
+    that target multiple backends.
+    """
+    mm_gen_path = Path(mm_gen_dir)
+    if not mm_gen_path.is_dir():
+        return []
+
+    # Discover test files: anything matching test_*.py anywhere under the
+    # tree. The csrc/ and apps/ subtrees aren't part of the test/ directory
+    # so we don't need to exclude them.
+    test_files = sorted(mm_gen_path.glob("**/test_*.py"))
+    records: list[CIRegistry] = []
+
+    for file in test_files:
+        rel = file.relative_to(mm_gen_path)
+        subdir = "/".join(rel.parts[:-1])  # "" for top-level
+        filename_only = rel.parts[-1]
+
+        if filename_only in _MM_GEN_HELPER_FILENAMES:
+            continue  # test_utils.py and similar -- helper modules, not tests
+
+        # Tokenize stem to look for explicit backend / nightly markers.
+        stem_tokens = set(filename_only[:-3].split("_"))
+        nightly = "nightly" in stem_tokens
+
+        backends: tuple[str, ...] = ()
+        for token, override in _MM_GEN_FILENAME_BACKEND_TOKENS.items():
+            if token in stem_tokens:
+                backends = override
+                break
+        if not backends:
+            backends = _MM_GEN_SUBDIR_BACKENDS.get(subdir, ())
+
+        if not backends:
+            print(
+                f"Warning: multimodal_gen file {file} matches no backend "
+                f"rule (subdir={subdir!r}, tokens={sorted(stem_tokens)}); "
+                f"add a rule to _MM_GEN_SUBDIR_BACKENDS.",
+                file=sys.stderr,
+            )
+            continue
+
+        for backend_name in backends:
+            records.append(
+                CIRegistry(
+                    backend=HWBackend[backend_name],
+                    filename=str(file),
+                    # mm_gen does its own per-case partitioning -- file-level
+                    # estimates aren't available. Surfaced as 0 in the
+                    # by-suite section, which is correct (we don't know).
+                    est_time=0.0,
+                    suite=f"mm-gen-{backend_name.lower()}",
+                    nightly=nightly,
+                    disabled=None,
+                )
+            )
+
+    return records
+
+
 def get_folder_name(filename: str) -> str:
-    """Extract folder name from test filename."""
-    # e.g., "registered/models/test_foo.py" -> "models"
+    """Extract folder name from test filename.
+
+    Registered tests use test/registered/<folder>/test_*.py and map to
+    <folder>. multimodal_gen tests live outside that tree and get a virtual
+    `mm_gen/<subdir>` folder so they show up as their own rows in the
+    Folder Summary table.
+    """
     parts = Path(filename).parts
+    if "multimodal_gen" in parts:
+        try:
+            mg_idx = parts.index("multimodal_gen")
+            test_idx = parts.index("test", mg_idx)
+            sub_parts = parts[test_idx + 1 : -1]  # strip 'test' anchor + file
+            if sub_parts:
+                return "mm_gen/" + "/".join(sub_parts)
+            return "mm_gen"
+        except ValueError:
+            pass  # fall through to default
     if "registered" in parts:
         idx = parts.index("registered")
         if idx + 1 < len(parts) - 1:  # Has subfolder
@@ -469,6 +597,14 @@ def main():
         default="test/registered",
         help="Path to registered test directory",
     )
+    parser.add_argument(
+        "--multimodal-gen-dir",
+        default=MULTIMODAL_GEN_TEST_DIR,
+        help=(
+            "Path to multimodal_gen test directory. Pass empty string to "
+            "skip multimodal_gen tests entirely."
+        ),
+    )
     args = parser.parse_args()
 
     # Change to repo root if needed
@@ -477,6 +613,8 @@ def main():
     os.chdir(repo_root)
 
     tests = collect_all_tests(args.registered_dir)
+    if args.multimodal_gen_dir:
+        tests.extend(collect_multimodal_gen_tests(args.multimodal_gen_dir))
 
     if args.output_format == "markdown":
         report = generate_markdown_report(tests, section=args.section)
