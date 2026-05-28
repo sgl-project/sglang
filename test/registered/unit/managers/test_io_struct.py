@@ -518,6 +518,7 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             lora_path=["path1", "path2"],
             custom_logit_processor=["processor1", "processor2"],
             return_hidden_states=True,
+            require_reasoning=True,
         )
         req.normalize_batch_and_arguments()
 
@@ -538,6 +539,7 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(item0.lora_path, "path1")
         self.assertEqual(item0.custom_logit_processor, "processor1")
         self.assertEqual(item0.return_hidden_states, True)
+        self.assertEqual(item0.require_reasoning, True)
 
     def test_regenerate_rid(self):
         """Test the regenerate_rid method."""
