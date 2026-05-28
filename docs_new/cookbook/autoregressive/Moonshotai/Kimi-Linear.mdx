@@ -1,0 +1,297 @@
+---
+title: Kimi-Linear
+metatags:
+    description: "Deploy Kimi-Linear with SGLang - community contribution guide for Moonshot AI's Kimi-Linear model deployment."
+---
+
+import { KimiLinearDeployment } from '/src/snippets/autoregressive/kimi-linear-deployment.jsx';
+
+## AMD GPU Support
+
+## 1. Model Introduction
+Kimi Linear is a hybrid linear attention architecture that outperforms traditional full attention methods across various contexts, including short, long, and reinforcement learning (RL) scaling regimes. At its core is Kimi Delta Attention (KDA)—a refined version of Gated DeltaNet that introduces a more efficient gating mechanism to optimize the use of finite-state RNN memory.
+
+This generation delivers comprehensive upgrades across the board:
+
+Kimi Delta Attention (KDA): A linear attention mechanism that refines the gated delta rule with finegrained gating.
+Hybrid Architecture: A 3:1 KDA-to-global MLA ratio reduces memory usage while maintaining or surpassing the quality of full attention.
+Superior Performance: Outperforms full attention in a variety of tasks, including long-context and RL-style benchmarks on 1.4T token training runs with fair comparisons.
+High Throughput: Achieves up to 6× faster decoding and significantly reduces time per output token (TPOT).
+
+For more details, please refer to the [official Kimi Linear GitHub Repository]: https://github.com/MoonshotAI/Kimi-Linear
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
+
+## 3. Model Deployment
+
+This section provides a progressive guide from quick deployment to performance optimization, suitable for users at different levels.
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model variant, deployment strategy, and thinking capabilities.
+
+<KimiLinearDeployment />
+
+## 4. Model Invocation
+
+### 4.1 Basic Usage
+
+For basic API usage and request examples, please refer to:
+
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
+- [SGLang OpenAI Vision API Guide](../../../docs/basic_usage/openai_api_vision)
+
+### 4.2 Advanced Usage
+
+#### 4.2.1 Launch the docker
+```shell Command
+docker pull lmsysorg/sglang:v0.5.7-rocm700-mi30x
+```
+
+```shell Command
+docker run -d -it --ipc=host --network=host --privileged \
+  --cap-add=CAP_SYS_ADMIN \
+  --device=/dev/kfd --device=/dev/dri --device=/dev/mem \
+  --group-add video --cap-add=SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  -v /:/work \
+  -e SHELL=/bin/bash \
+  --name Kimi-linear \
+  lmsysorg/sglang:v0.5.7-rocm700-mi30x \
+  /bin/bash
+```
+
+#### 4.2.2 pre-installation steps inside the docker
+
+```shell Command
+pip install sentencepiece tiktoken
+```
+
+#### 4.2.3 Launch the server
+```shell Command
+export SGLANG_ROCM_FUSED_DECODE_MLA=0
+
+SGLANG_ROCM_FUSED_DECODE_MLA=0 python3 -m sglang.launch_server \
+  --model-path moonshotai/Kimi-Linear-48B-A3B-Instruct \
+  --tokenizer-path  moonshotai/Kimi-Linear-48B-A3B-Instruct \
+  --tp 4 \
+  --trust-remote-code
+```
+
+## 5. Benchmark
+### 5.1 Speed Benchmark
+Test Environment:
+
+Hardware: AMD MI300X GPU
+
+Model: Kimi-Linear-48B-A3B-Instruct
+
+Tensor Parallelism: 4
+
+sglang version: 0.5.7
+
+- **Model Deployment**
+
+```bash Command
+SGLANG_ROCM_FUSED_DECODE_MLA=0 python3 -m sglang.launch_server \
+  --model-path moonshotai/Kimi-Linear-48B-A3B-Instruct \
+  --tokenizer-path  moonshotai/Kimi-Linear-48B-A3B-Instruct \
+  --tp 4 \
+  --trust-remote-code
+```
+
+### 5.1.1 Low Concurrency (Latency-Optimized)
+
+- Benchmark Command:
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --model moonshotai/Kimi-Linear-48B-A3B-Instruct \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+- Test Results:
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  23.86
+Total input tokens:                      6101
+Total input text tokens:                 6101
+Total input vision tokens:               0
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    4001
+Request throughput (req/s):              0.42
+Input token throughput (tok/s):          255.70
+Output token throughput (tok/s):         176.86
+Peak output token throughput (tok/s):    190.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          432.56
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   2383.93
+Median E2E Latency (ms):                 1911.63
+---------------Time to First Token----------------
+Mean TTFT (ms):                          141.33
+Median TTFT (ms):                        126.27
+P99 TTFT (ms):                           294.76
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          5.32
+Median TPOT (ms):                        5.33
+P99 TPOT (ms):                           5.36
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           5.33
+Median ITL (ms):                         5.32
+P95 ITL (ms):                            5.44
+P99 ITL (ms):                            5.58
+Max ITL (ms):                            11.46
+==================================================
+```
+
+### 5.1.2 Medium Concurrency (Balanced)
+- Benchmark Command:
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --model moonshotai/Kimi-Linear-48B-A3B-Instruct \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 80 \
+  --max-concurrency 16 \
+  --request-rate inf
+```
+
+- Test Results:
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  31.38
+Total input tokens:                      39668
+Total input text tokens:                 39668
+Total input vision tokens:               0
+Total generated tokens:                  40805
+Total generated tokens (retokenized):    39667
+Request throughput (req/s):              2.55
+Input token throughput (tok/s):          1264.13
+Output token throughput (tok/s):         1300.37
+Peak output token throughput (tok/s):    1801.00
+Peak concurrent requests:                21
+Total token throughput (tok/s):          2564.50
+Concurrency:                             14.13
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   5543.18
+Median E2E Latency (ms):                 5755.31
+---------------Time to First Token----------------
+Mean TTFT (ms):                          175.25
+Median TTFT (ms):                        137.87
+P99 TTFT (ms):                           292.92
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          10.75
+Median TPOT (ms):                        10.87
+P99 TPOT (ms):                           16.74
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           10.54
+Median ITL (ms):                         7.95
+P95 ITL (ms):                            13.68
+P99 ITL (ms):                            116.80
+Max ITL (ms):                            299.89
+==================================================
+
+```
+
+### 5.1.3 High Concurrency (Throughput-Optimized)
+- Benchmark Command:
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --model moonshotai/Kimi-Linear-48B-A3B-Instruct \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 500 \
+  --max-concurrency 100 \
+  --request-rate inf
+```
+
+- Test Results:
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     500
+Benchmark duration (s):                  79.71
+Total input tokens:                      249831
+Total input text tokens:                 249831
+Total input vision tokens:               0
+Total generated tokens:                  252662
+Total generated tokens (retokenized):    228448
+Request throughput (req/s):              6.27
+Input token throughput (tok/s):          3134.20
+Output token throughput (tok/s):         3169.72
+Peak output token throughput (tok/s):    6109.00
+Peak concurrent requests:                110
+Total token throughput (tok/s):          6303.92
+Concurrency:                             94.80
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   15113.92
+Median E2E Latency (ms):                 13851.52
+---------------Time to First Token----------------
+Mean TTFT (ms):                          564.46
+Median TTFT (ms):                        226.04
+P99 TTFT (ms):                           2683.14
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          29.63
+Median TPOT (ms):                        31.28
+P99 TPOT (ms):                           38.84
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           28.85
+Median ITL (ms):                         16.29
+P95 ITL (ms):                            123.42
+P99 ITL (ms):                            157.80
+Max ITL (ms):                            2481.11
+==================================================
+```
+### 5.2 Accuracy Benchmark
+
+#### 5.2.1 GSM8K Benchmark
+
+- Server Command
+
+```shell Command
+SGLANG_ROCM_FUSED_DECODE_MLA=0 python3 -m sglang.launch_server \
+  --model-path moonshotai/Kimi-Linear-48B-A3B-Instruct \
+  --tokenizer-path  moonshotai/Kimi-Linear-48B-A3B-Instruct \
+  --tp 4 \
+  --trust-remote-code
+```
+
+- Benchmark Command
+
+```shell Command
+python3 -m sglang.test.few_shot_gsm8k --num-questions 200
+```
+
+- **Result**:
+
+```text Output
+Accuracy: 0.705
+Invalid: 0.000
+Latency: 11.855 s
+Output throughput: 3224.982 token/s
+```

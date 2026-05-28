@@ -1,21 +1,56 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+import os
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ModelWorkerBatch
-    from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_npu = is_npu()
+
+# Token-buf consume tracking: init to -1, assert non-negative on gather,
+# write -1 back. Catches "gather without intermediate stash" bugs. CI enables
+# via the existing SGLANG_IS_IN_CI; off in production.
+_DEBUG_ASSERT = os.getenv("SGLANG_IS_IN_CI", "").lower() == "true"
+
+
+@torch.compile(dynamic=True, disable=_is_npu)
+def _assert_nonneg_and_invalidate(
+    values: torch.Tensor, buf: torch.Tensor, indices: torch.Tensor
+) -> None:
+    """Fused: assert all `values >= 0` and scatter -1 into `buf[indices]`.
+    Compiled so the reduction + assert + scatter run as one kernel launch."""
+    torch._assert_async((values >= 0).all())
+    buf[indices] = -1
+
+
+@torch.compile(dynamic=True, disable=_is_npu)
+def _gather_spec_extras(
+    indices: torch.Tensor,
+    topk_p_buf: torch.Tensor,
+    topk_index_buf: torch.Tensor,
+    output_tokens_buf: torch.Tensor,
+    hidden_states_buf: Optional[torch.Tensor],
+):
+    """Compiled gather of spec extras. `hidden_states_buf` is None when the
+    build does not capture hidden states."""
+    topk_p = topk_p_buf[indices]
+    topk_index = topk_index_buf[indices]
+    bonus_tokens = output_tokens_buf[indices]
+    hidden_states = (
+        hidden_states_buf[indices] if hidden_states_buf is not None else None
+    )
+    return topk_p, topk_index, bonus_tokens, hidden_states
 
 
 def _resolve_future_token_ids_native(input_ids, future_token_ids_map):
@@ -36,152 +71,193 @@ else:
     _resolve_future_token_ids = _resolve_future_token_ids_native
 
 
-@dataclass
-class FutureIndices:
-    indices: torch.Tensor
-    interval: Optional[slice] = None
-
-
 class FutureMap:
+    """Cross-iter relay buffer for values the next iter's schedule cannot
+    compute locally (e.g. spec_v2 seq_lens after accept_lens, sampled tokens).
+
+    Forward stream publishes into a buf; next iter's schedule pulls lazily.
+    Schedule-deterministic values (e.g. non-spec seq_lens via +1) stay
+    maintained by SB directly and do not need the relay.
+
+    SB.seq_lens GPU is always a faithful seq_lens_cpu mirror; forward path
+    treats it as read-only, spec mutations land on forward_batch.seq_lens.
+    """
+
     def __init__(
         self,
-        max_running_requests: int,
-        chunked_prefill_size: int,
-        context_len: int,
         device: torch.device,
-        spec_algo: Optional[SpeculativeAlgorithm] = None,
+        spec_algo: SpeculativeAlgorithm,
+        req_to_token_pool: ReqToTokenPool,
     ):
-        # FIXME: the calculation of future_limit and future_buffer_len maybe too conservative
-        self.future_ct = 0
-
-        # Circular buffer layout (wraps in this order):
-        # Running decode batch -> Prefill chunk 1 -> ... -> Prefill chunk N
-        # A running decode batch's result will be resolved after all prefill chunks are done.
-        # reserve `max_num_chunks` extra future slots on top of `max_running_requests * 3`.
-        max_num_chunks = (
-            (context_len + chunked_prefill_size - 1) // chunked_prefill_size
-            if chunked_prefill_size
-            else 0
-        )
-        self.future_limit = max_running_requests * (3 + max_num_chunks)
-        # Adding 2 * max_running_requests to future_limit ensures the buffer is sufficiently large.
-        self.future_buffer_len = self.future_limit + 2 * max_running_requests
+        # Bufs indexed by req_pool_idx; slot 0 mirrors KV padding row so
+        # CUDA-graph padded batches (req_pool_idx == 0) are harmless.
         self.device = device
         self.spec_algo = spec_algo
+        self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
 
-        if self.spec_algo.is_none():
-            # For non-speculative decoding, we only need to store the token ids.
-            self.buf_initialized = True
-            self.token_ids_buf = torch.empty(
-                (self.future_buffer_len,), dtype=torch.int64, device=self.device
+        self.output_tokens_buf = (
+            torch.full((self.req_pool_size,), -1, dtype=torch.int64, device=self.device)
+            if _DEBUG_ASSERT
+            else torch.empty(
+                (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
+        )
+        self.new_seq_lens_buf = torch.empty(
+            (self.req_pool_size,), dtype=torch.int64, device=self.device
+        )
+        # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
+        # D2H pulls (gated only on publish, off the schedule stream).
+        if _is_cuda or _is_hip:
+            self.new_seq_lens_cpu_pinned = torch.empty(
+                (self.req_pool_size,), dtype=torch.int64, pin_memory=True
+            )
+            self.fwd_prepare_d2h_stream = torch.get_device_module(self.device).Stream()
         else:
-            # For speculative decoding, we lazily initialize the buffers
-            # This is to make the shape derivation easier.
-            self.buf_initialized = False
+            self.new_seq_lens_cpu_pinned = None
+            self.fwd_prepare_d2h_stream = None
+        if self.spec_algo.is_some():
+            self._forward_buf_initialized = False
 
-    def _lazy_init_buf(self, draft_input: EagleDraftInput):
-        self.buf_initialized = True
+        self.publish_ready = None  # lazy device.Event(); only spec_v2 needs it
 
-        # Get a reference for each tensor
+    def _lazy_init_forward_buf(self, draft_input: EagleDraftInput):
+        self._forward_buf_initialized = True
+
         topk_p0 = draft_input.topk_p[0]
         topk_index0 = draft_input.topk_index[0]
-        verified_id0 = draft_input.verified_id[0]
-        new_seq_lens0 = draft_input.new_seq_lens[0]
-
         self.topk_p_buf = torch.empty(
-            (self.future_buffer_len, *topk_p0.shape),
+            (self.req_pool_size, *topk_p0.shape),
             dtype=topk_p0.dtype,
             device=self.device,
         )
         self.topk_index_buf = torch.empty(
-            (self.future_buffer_len, *topk_index0.shape),
+            (self.req_pool_size, *topk_index0.shape),
             dtype=topk_index0.dtype,
             device=self.device,
         )
-        self.verified_id_buf = torch.empty(
-            (self.future_buffer_len, *verified_id0.shape),
-            dtype=verified_id0.dtype,
-            device=self.device,
-        )
-        self.new_seq_lens_buf = torch.empty(
-            (self.future_buffer_len, *new_seq_lens0.shape),
-            dtype=new_seq_lens0.dtype,
-            device=self.device,
-        )
-
         if spec_need_hidden_states():
             hidden_states0 = draft_input.hidden_states[0]
             self.hidden_states_buf = torch.empty(
-                (self.future_buffer_len, *hidden_states0.shape),
+                (self.req_pool_size, *hidden_states0.shape),
                 dtype=hidden_states0.dtype,
                 device=self.device,
             )
 
-    def alloc_future_indices(self, bs: int) -> FutureIndices:
-        """Update the circular buffer pointer and allocate future indices."""
-        cur_future_ct = self.future_ct
-        self.future_ct = (cur_future_ct + bs) % self.future_limit
-        start = cur_future_ct + 1
-        end = cur_future_ct + 1 + bs
-        indices = torch.arange(start, end, dtype=torch.int64, device=self.device)
-        return FutureIndices(indices=indices, interval=slice(start, end))
-
-    def resolve_future(self, model_worker_batch: ModelWorkerBatch):
+    def resolve_future(self, batch: ScheduleBatch):
+        # seq_lens is already real on entry (SB +1 for non-spec;
+        # resolve_seq_lens_cpu pulled from buf for spec_v2). Only resolve
+        # input_ids tokens / spec extras here.
         if self.spec_algo.is_none():
-            _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
+            _resolve_future_token_ids(batch.input_ids, self.output_tokens_buf)
+            if _DEBUG_ASSERT:
+                _assert_nonneg_and_invalidate(
+                    batch.input_ids, self.output_tokens_buf, batch.req_pool_indices
+                )
         else:
-            # TODO(lsyin): write future indices into spec_info.future_indices
-            draft_input: EagleDraftInput = model_worker_batch.spec_info
-            if draft_input is None:
-                # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
-                return
-            indices = draft_input.future_indices.indices
-            # The indices tensor was allocated on the default stream but is
-            # used here on the forward stream. Meanwhile, the old spec_info
-            # holding this tensor will lose all Python references (replaced at
-            # model_worker_batch.spec_info and batch.spec_info), so the
-            # caching allocator (torch GC) could reclaim the memory before
-            # the GPU finishes reading it.
-            indices.record_stream(torch.get_device_module(self.device).current_stream())
-            draft_input.topk_p = self.topk_p_buf[indices]
-            draft_input.topk_index = self.topk_index_buf[indices]
-            draft_input.verified_id = self.verified_id_buf[indices]
-            draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
-            if spec_need_hidden_states():
-                draft_input.hidden_states = self.hidden_states_buf[indices]
+            self._resolve_spec_extras(batch)
 
-    def is_empty_slice(self, s: slice) -> bool:
-        start, stop, step = s.indices(self.future_buffer_len)
-        if step > 0:
-            return start >= stop
-        else:
-            return start <= stop
+    def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
+        draft_input: EagleDraftInput = batch.spec_info
+        if draft_input is None:
+            # FIXME(lsyin): only prefill; not compatible with mixed mode
+            return
+        indices = draft_input.future_indices
+        # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
+        # record_batch_in_overlap; record_stream here is redundant.
+        indices.record_stream(torch.get_device_module(self.device).current_stream())
+        hidden_states_buf = (
+            self.hidden_states_buf if spec_need_hidden_states() else None
+        )
+        (
+            draft_input.topk_p,
+            draft_input.topk_index,
+            draft_input.bonus_tokens,
+            hidden_states,
+        ) = _gather_spec_extras(
+            indices,
+            self.topk_p_buf,
+            self.topk_index_buf,
+            self.output_tokens_buf,
+            hidden_states_buf,
+        )
+        if hidden_states is not None:
+            draft_input.hidden_states = hidden_states
+        if _DEBUG_ASSERT:
+            _assert_nonneg_and_invalidate(
+                draft_input.bonus_tokens, self.output_tokens_buf, indices
+            )
 
-    def store_to_map(
-        self, future_indices: FutureIndices, batch_result: GenerationBatchResult
-    ):
-        if self.spec_algo.is_none():
-            intv = future_indices.interval
-            self.token_ids_buf[intv] = batch_result.next_token_ids
-        else:
-            draft_input: EagleDraftInput = batch_result.next_draft_input
-            self.store_to_map_for_new_batch(future_indices, draft_input)
+    def set_input_ids_sentinel(
+        self, batch: ScheduleBatch, future_indices: torch.Tensor
+    ) -> None:
+        # Sentinel for the decode portion so mixed batches can cat extend
+        # (positive real tokens) + decode (negative sentinels) into one
+        # input_ids; resolve_future translates negatives via output_tokens_buf.
+        batch.input_ids = -future_indices
 
-    def store_to_map_for_new_batch(
-        self, future_indices: FutureIndices, draft_input: EagleDraftInput
-    ):
-        intv = future_indices.interval
-        if self.is_empty_slice(intv):
-            # idle indices in dp attention do not need store info
+    def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
+        # seq_lens_cpu may be needed on the host for kernel-launch prep (some backends).
+        # Run this D2H on a standalone stream to avoid chain-blocking forward_n ->
+        # prepare_{n+1}: a sync on the schedule stream would inherit its WAR barrier and
+        # stall the host until forward_n ends.
+        fi = batch.spec_info.future_indices if batch.spec_info is not None else None
+        if fi is None:
+            return
+        if self.publish_ready is not None:
+            self.publish_ready.wait()
+        batch.seq_lens = self.new_seq_lens_buf[fi]
+
+        if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
+            batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
             return
 
-        if not self.buf_initialized:
-            self._lazy_init_buf(draft_input)
+        # Mechanism: don't sync the schedule stream; gate a private stream on the
+        # publish event and copy into the static pinned buffer.
+        self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
+        with torch.get_device_module(self.device).stream(self.fwd_prepare_d2h_stream):
+            self.new_seq_lens_cpu_pinned.copy_(self.new_seq_lens_buf, non_blocking=True)
+        self.fwd_prepare_d2h_stream.synchronize()
 
-        self.topk_p_buf[intv] = draft_input.topk_p
-        self.topk_index_buf[intv] = draft_input.topk_index
-        self.verified_id_buf[intv] = draft_input.verified_id
-        self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
+        # FIXME: fi == batch.req_pool_indices; unify future_indices and req_pool_indices.
+        batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]
+        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+
+    def publish(self, future_indices: torch.Tensor, new_seq_lens: torch.Tensor) -> None:
+        indices = future_indices
+        if indices.shape[0] == 0:
+            return  # DP idle
+        self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
+        # Only spec_v2 needs the event; it gates the seq_lens D2H on the private stream.
+        if self.spec_algo.is_some():
+            if self.publish_ready is None:
+                self.publish_ready = torch.get_device_module(self.device).Event()
+            self.publish_ready.record()
+
+    def stash(
+        self,
+        future_indices: torch.Tensor,
+        payload: Union[torch.Tensor, EagleDraftInput],
+    ) -> None:
+        indices = future_indices
+        if indices.shape[0] == 0:
+            # DP idle: payload is empty stub; lazy-init shape peek would IndexError.
+            return
+        if self.spec_algo.is_none():
+            self.output_tokens_buf[indices] = payload.to(torch.int64)
+            return
+
+        draft_input: EagleDraftInput = payload
+        if not self._forward_buf_initialized:
+            self._lazy_init_forward_buf(draft_input)
+        self.output_tokens_buf[indices] = draft_input.bonus_tokens.to(
+            self.output_tokens_buf.dtype
+        )
+        self.topk_p_buf[indices] = draft_input.topk_p.to(self.topk_p_buf.dtype)
+        self.topk_index_buf[indices] = draft_input.topk_index.to(
+            self.topk_index_buf.dtype
+        )
         if spec_need_hidden_states():
-            self.hidden_states_buf[intv] = draft_input.hidden_states
+            self.hidden_states_buf[indices] = draft_input.hidden_states.to(
+                self.hidden_states_buf.dtype
+            )

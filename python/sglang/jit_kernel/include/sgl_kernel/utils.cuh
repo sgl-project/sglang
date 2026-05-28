@@ -44,6 +44,9 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #define cudaGetErrorString hipGetErrorString
 #define cudaGetLastError hipGetLastError
 #define cudaLaunchKernel hipLaunchKernel
+#define cudaMemcpyAsync hipMemcpyAsync
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
 #endif
 
 #ifndef USE_ROCM
@@ -83,6 +86,13 @@ using fp32x4_t = float4;
 #define SGLANG_LDG(arg) *(arg)
 #endif
 
+// DLPack device type for the current platform
+#ifndef USE_ROCM
+inline constexpr auto kDLGPU = kDLCUDA;
+#else
+inline constexpr auto kDLGPU = kDLROCM;
+#endif
+
 namespace device {
 
 /// \brief Macro: forced-inline device function qualifier.
@@ -114,7 +124,11 @@ inline constexpr std::size_t kMaxVecBytes = SGL_ARCH_BLACKWELL_OR_GREATER ? 32 :
 /// \brief Number of threads per warp (always 32 on NVIDIA/AMD GPUs).
 inline constexpr auto kWarpThreads = 32u;
 /// \brief Full warp active mask (all 32 lanes).
+#ifndef USE_ROCM
 inline constexpr auto kFullMask = 0xffffffffu;
+#else
+inline constexpr auto kFullMask = 0xffffffffffffffffULL;
+#endif
 
 /**
  * \brief PDL (Programmatic Dependent Launch): wait for the primary kernel.
@@ -259,13 +273,23 @@ struct LaunchKernel {
     m_config.numAttrs = 0;
 #else
     if (enabled) {
-      m_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      m_attrs[0].val.programmaticStreamSerializationAllowed = true;
-      m_config.numAttrs = 1;
+      auto& attr = m_attrs[m_config.numAttrs++];
+      attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attr.val.programmaticStreamSerializationAllowed = true;
       m_config.attrs = m_attrs;
-    } else {
-      m_config.numAttrs = 0;
     }
+#endif
+    return *this;
+  }
+
+  auto enable_cluster(dim3 cluster_dim) -> LaunchKernel& {
+#ifdef USE_ROCM
+    (void)cluster_dim;
+#else
+    auto& attr = m_attrs[m_config.numAttrs++];
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim = {cluster_dim.x, cluster_dim.y, cluster_dim.z};
+    m_config.attrs = m_attrs;
 #endif
     return *this;
   }
@@ -303,7 +327,7 @@ struct LaunchKernel {
 
   cudaLaunchConfig_t m_config;
   const DebugInfo m_location;
-  cudaLaunchAttribute m_attrs[1];
+  cudaLaunchAttribute m_attrs[2];
 };
 
 }  // namespace host
