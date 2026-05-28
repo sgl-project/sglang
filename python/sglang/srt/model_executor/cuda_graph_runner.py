@@ -286,6 +286,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
+            # Pair with seq_lens fill: padded rows must point at reserved
+            # req_pool slot 0 (req_to_token[0, :] is all zeros from init),
+            # so dummy attention reads land on slot 0 instead of a stale
+            # req_to_token row left by an earlier replay.
+            self.req_pool_indices.zero_()
             if self.mamba_track_indices is not None:
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
@@ -523,6 +528,18 @@ def get_global_graph_memory_pool():
 def set_global_graph_memory_pool(val):
     global global_graph_memory_pool
     global_graph_memory_pool = val
+
+
+def _ci_use_ascending_capture_order(server_args) -> bool:
+    """Whether CI + FA3 forces ascending cuda-graph capture (FA3 varlen IMA workaround, #26532)."""
+    if not envs.SGLANG_IS_IN_CI.get():
+        return False
+    prefill_backend, decode_backend = server_args.get_attention_backends()
+    return "fa3" in (
+        prefill_backend,
+        decode_backend,
+        server_args.speculative_draft_attention_backend,
+    )
 
 
 class CudaGraphRunner:
@@ -816,11 +833,17 @@ class CudaGraphRunner:
                 self.model_runner.gpu_id,
                 empty_cache=False,
             )
-            # Reverse the order to enable better memory sharing across cuda graphs.
+            # Reverse for memory sharing; CI+FA3 uses ascending to dodge the
+            # FA3 varlen workspace-slot IMA (#26532).
+            bs_seq = (
+                list(self.capture_bs)
+                if _ci_use_ascending_capture_order(self.model_runner.server_args)
+                else list(reversed(self.capture_bs))
+            )
             capture_range = (
-                tqdm.tqdm(list(reversed(self.capture_bs)))
+                tqdm.tqdm(bs_seq)
                 if get_tensor_model_parallel_rank() == 0
-                else reversed(self.capture_bs)
+                else iter(bs_seq)
             )
             for i, bs in enumerate(capture_range):
                 if get_tensor_model_parallel_rank() == 0:

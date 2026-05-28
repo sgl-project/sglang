@@ -503,10 +503,33 @@ class FlashAttentionBackend(AttentionBackend):
         elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
             include_draft_extend_v2=True
         ):
-            metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+            # DRAFT_EXTEND_V2: seq_lens = prefix_lens; effective KV extent is prefix + extend.
+            if forward_batch.forward_mode.is_draft_extend_v2():
+                effective_cache_seqlens = (
+                    seqlens_in_batch + forward_batch.extend_seq_lens
+                )
+                seq_lens_cpu = forward_batch.seq_lens_cpu
+                extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+                if extend_seq_lens_cpu is not None:
+                    extend_cpu_tensor = torch.as_tensor(
+                        extend_seq_lens_cpu, dtype=seq_lens_cpu.dtype
+                    )
+                    effective_max_seq_len_k = int(
+                        (seq_lens_cpu + extend_cpu_tensor)
+                        .max()
+                        .item()  # per-request sum, not max+max
+                    )
+                else:
+                    effective_max_seq_len_k = int(effective_cache_seqlens.max().item())
+            else:
+                effective_cache_seqlens = seqlens_in_batch
+                effective_max_seq_len_k = int(forward_batch.seq_lens_cpu.max().item())
+
+            metadata.cache_seqlens_int32 = effective_cache_seqlens.to(torch.int32)
+            metadata.max_seq_len_k = effective_max_seq_len_k
             metadata.cu_seqlens_k = torch.nn.functional.pad(
-                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+                torch.cumsum(effective_cache_seqlens, dim=0, dtype=torch.int32),
+                (1, 0),
             )
 
             # MLA/MHA CP: prepare_mlp_sync_batch pads extend tokens up to
@@ -547,28 +570,37 @@ class FlashAttentionBackend(AttentionBackend):
             if forward_batch.forward_mode == ForwardMode.EXTEND:
                 self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
 
-        # Encoder metadata for cross attention
+        # Encoder metadata for cross attention. Supports per-request varlen
+        # encoder lengths (e.g. MossVL with different image sizes per request).
         if forward_batch.encoder_lens is not None:
-            assert (
-                forward_batch.encoder_lens.numel() == 1
-            ), "Only encoder size 1 is supported for now"
-
             metadata.encoder_lens_int32 = forward_batch.encoder_lens.to(torch.int32)
             metadata.encoder_cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(metadata.encoder_lens_int32, dim=0, dtype=torch.int32),
                 (1, 0),
             )
             metadata.encoder_max_seq_len_k = metadata.encoder_lens_int32.max().item()
+
+            # Cross-attn page_table: per-request rows. cache_seqlens
+            # (encoder_lens_int32) caps per-request reads so any garbage past
+            # encoder_lens[i] is never consumed.
             metadata.encoder_page_table = self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.encoder_max_seq_len_k
             ]
 
-            # Currently only support forward_batch.encoder_lens.numel() == 1
+            # Self-attn (text) page_table: text starts at per-request offset
+            # encoder_lens[i], NOT at a single max. Use a fancy-index gather.
+            text_max = metadata.max_seq_len_k
+            arange_text = torch.arange(
+                text_max, device=forward_batch.req_pool_indices.device
+            )
+            text_col = forward_batch.encoder_lens.long().unsqueeze(
+                1
+            ) + arange_text.unsqueeze(
+                0
+            )  # (bs, max_seq_len_k)
+            text_row = forward_batch.req_pool_indices.unsqueeze(1).expand(-1, text_max)
             metadata.page_table = self.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices,
-                metadata.encoder_max_seq_len_k : (
-                    metadata.encoder_max_seq_len_k + metadata.max_seq_len_k
-                ),
+                text_row, text_col
             ]
 
         if self.use_sliding_window_kv_pool:
@@ -2258,13 +2290,8 @@ class FlashAttentionBackend(AttentionBackend):
 
         elif forward_mode.is_draft_extend_v2():
             metadata = self.draft_extend_metadata[bs]
-            metadata.cache_seqlens_int32.copy_(seq_lens)
 
-            metadata.max_seq_len_k = seq_lens_cpu.max().item()
-            metadata.cu_seqlens_k[1:].copy_(
-                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
-            )
-
+            # DRAFT_EXTEND_V2: seq_lens = prefix_lens; effective KV extent is prefix + extend.
             extend_seq_lens_tensor = getattr(spec_info, "extend_seq_lens_tensor", None)
             extend_seq_lens_cpu = getattr(spec_info, "extend_seq_lens_cpu", None)
             if extend_seq_lens_tensor is not None:
@@ -2283,6 +2310,25 @@ class FlashAttentionBackend(AttentionBackend):
                     (bs,), default_extend, dtype=torch.int32, device=device
                 )
                 extend_seq_lens_cpu = [default_extend] * bs
+
+            effective_cache_seqlens = seq_lens.to(torch.int32) + extend_seq_lens
+            metadata.cache_seqlens_int32.copy_(effective_cache_seqlens)
+
+            if extend_seq_lens_cpu is not None:
+                extend_cpu_tensor = torch.as_tensor(
+                    extend_seq_lens_cpu, dtype=seq_lens_cpu.dtype
+                )
+                metadata.max_seq_len_k = int(
+                    (seq_lens_cpu + extend_cpu_tensor)
+                    .max()
+                    .item()  # per-request sum, not max+max
+                )
+            else:
+                metadata.max_seq_len_k = int(effective_cache_seqlens.max().item())
+
+            metadata.cu_seqlens_k[1:].copy_(
+                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+            )
 
             if extend_seq_lens_cpu:
                 metadata.max_seq_len_q = int(max(extend_seq_lens_cpu))
@@ -2312,25 +2358,25 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
 
         if encoder_lens is not None:
-            # Only support encoder size 1 for now
-            metadata.encoder_max_seq_len_k = encoder_lens[0]
-            metadata.encoder_lens_int32.copy_(encoder_lens[:1])
-            metadata.encoder_cu_seqlens_k[1:].copy_(
-                torch.cumsum(metadata.encoder_lens_int32, dim=0, dtype=torch.int32)
+            # Per-request varlen encoder support (e.g. MossVL different images).
+            metadata.encoder_max_seq_len_k = int(encoder_lens.max().item())
+            metadata.encoder_lens_int32[:bs].copy_(encoder_lens[:bs].to(torch.int32))
+            metadata.encoder_cu_seqlens_k[1 : bs + 1].copy_(
+                torch.cumsum(metadata.encoder_lens_int32[:bs], dim=0, dtype=torch.int32)
             )
 
-            metadata.encoder_page_table[:, : metadata.encoder_max_seq_len_k].copy_(
+            metadata.encoder_page_table[:bs, : metadata.encoder_max_seq_len_k].copy_(
                 self.req_to_token[req_pool_indices, : metadata.encoder_max_seq_len_k]
             )
 
-            # Update the regular page table
-            page_table = self.req_to_token[
-                req_pool_indices,
-                metadata.encoder_max_seq_len_k : (
-                    metadata.encoder_max_seq_len_k + metadata.max_seq_len_k
-                ),
-            ]
-            metadata.page_table[:, : metadata.max_seq_len_k].copy_(page_table)
+            # Self-attn (text) page_table: per-request offset = encoder_lens[i].
+            text_max = metadata.max_seq_len_k
+            arange_text = torch.arange(text_max, device=req_pool_indices.device)
+            text_col = encoder_lens[:bs].long().unsqueeze(1) + arange_text.unsqueeze(0)
+            text_row = req_pool_indices.unsqueeze(1).expand(-1, text_max)
+            metadata.page_table[:bs, :text_max].copy_(
+                self.req_to_token[text_row, text_col]
+            )
 
         self.forward_metadata = metadata
         self.forward_metadata_spec_decode_expand = metadata_expand
