@@ -1364,6 +1364,13 @@
         "cooldown_interval_minutes": 0,
         "reason": "top contributor"
     },
+    "zcnrex": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
     "zhaochenyang20": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -1393,6 +1400,13 @@
         "reason": "custom override"
     },
     "zhyncs": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "top contributor"
+    },
+    "zianglih": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "can_rerun_stage": true,
