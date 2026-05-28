@@ -120,16 +120,12 @@ def _apply_norm_with_fp32_residual(
 ) -> torch.Tensor:
     """Normalize ``residual`` (typically fp32) and cast back to ``target_dtype``.
 
-    SGLang's fused RMSNorm kernel assumes the input dtype matches the weight
-    dtype, so when the residual is kept in fp32 we route through the eager
-    ``forward_native`` path before casting back to the model dtype.
+    The fp32 residual stream is preserved by the caller (the residual tensor
+    is kept around for the next accumulation), so the norm itself can run at
+    ``target_dtype`` -- this lets us hit the fused sgl_kernel rmsnorm path
+    instead of the eager ``forward_native`` fallback (5+ kernel launches per
+    call, ×120 norms per step).
     """
-    if isinstance(norm, RMSNorm):
-        if residual.dtype != norm.weight.dtype:
-            hidden_states = norm.forward_native(residual)
-        else:
-            hidden_states = norm(residual)
-        return hidden_states.to(target_dtype)
     return norm(residual.to(target_dtype))
 
 
@@ -269,12 +265,12 @@ class CCA(nn.Module):
         eps = 1e-12
         sqrt_head_dim = float(self.sqrt_head_dim)
         query_fp32 = query.to(torch.float32)
-        q_norm = torch.linalg.vector_norm(query_fp32, ord=2, dim=-1, keepdim=True)
-        query_fp32 = query_fp32 * torch.rsqrt(q_norm * q_norm + eps) * sqrt_head_dim
+        inv_q = torch.rsqrt(query_fp32.pow(2).sum(-1, keepdim=True) + eps) * sqrt_head_dim
+        query_fp32 = query_fp32 * inv_q
 
         key_fp32 = key.to(torch.float32)
-        k_norm = torch.linalg.vector_norm(key_fp32, ord=2, dim=-1, keepdim=True)
-        key_fp32 = key_fp32 * torch.rsqrt(k_norm * k_norm + eps) * sqrt_head_dim
+        inv_k = torch.rsqrt(key_fp32.pow(2).sum(-1, keepdim=True) + eps) * sqrt_head_dim
+        key_fp32 = key_fp32 * inv_k
         temp = self.temp.to(torch.float32).view(1, self.num_k_heads, 1)
         if self.clamp_temp:
             temp = torch.exp(torch.clamp(temp, 1e-7, 2.0))
@@ -302,18 +298,16 @@ class CCA(nn.Module):
         query_pre_grouped = query_pre.view(
             query_pre.shape[0], num_k_heads, self.gqa_groups, query_pre.shape[-1]
         )
-        query_out_grouped = query_conv.view_as(query_pre_grouped).float()
+        query_pre_grouped_fp32 = query_pre_grouped.to(torch.float32)
         query_out_grouped = (
-            query_out_grouped
-            + 0.5 * query_pre_grouped.float()
+            query_conv.view_as(query_pre_grouped).to(torch.float32)
+            + 0.5 * query_pre_grouped_fp32
             + 0.5 * key_base_fp32.unsqueeze(-2)
         )
         query_out = query_out_grouped.reshape(query_pre.shape[0], -1, query_pre.shape[-1])
 
-        query_pre_mean = torch.mean(
-            query_pre_grouped.float(), dim=-2, dtype=torch.float32
-        )
-        key_out = key_conv.float() + 0.5 * query_pre_mean + 0.5 * key_base_fp32
+        query_pre_mean = query_pre_grouped_fp32.mean(dim=-2, dtype=torch.float32)
+        key_out = key_conv.to(torch.float32) + 0.5 * query_pre_mean + 0.5 * key_base_fp32
         return query_out, key_out
 
     def _conv_qk_run(self, padded: torch.Tensor) -> torch.Tensor:
@@ -363,7 +357,7 @@ class CCA(nn.Module):
         v2, _ = self.val_proj2(hs_shifted)
         value = torch.cat([v1, v2], dim=-1).squeeze(1).view(
             S, self.num_k_heads, self.head_dim
-        ).to(torch.float32)
+        )
         return query, key, value
 
     def _forward_extend(
@@ -392,42 +386,96 @@ class CCA(nn.Module):
         v2_input = torch.empty_like(hidden_states)
 
         conv_state, prev_hs_state, mamba_indices = self._get_pool_state(forward_batch)
+        # Materialize mamba_indices on CPU once instead of once per loop iter
+        # (each ``.item()`` is a GPU->CPU sync; B*60 syncs/step otherwise).
+        mamba_idx_cpu = mamba_indices.tolist()
 
-        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu or []
-        extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu or []
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
 
-        start = 0
-        for i, seq_len in enumerate(extend_seq_lens_cpu):
-            end = start + int(seq_len)
-            mamba_idx = int(mamba_indices[i].item())
-            has_prefix = int(extend_prefix_lens_cpu[i]) > 0
+        # Fresh-prefill fast path: when no request has a cached prefix the
+        # per-request convs (one launch each, ×60 attention layers ×B requests)
+        # can be coalesced into a single packed convolution. The conv chain is
+        # two ``kernel_size=2`` convs (effective receptive field = 3), so each
+        # request's S valid outputs are produced from the packed positions
+        # ``[a_i, a_i + S_i - 1]`` where the input segment for request i is
+        # ``[pad, pad, x_0, ..., x_{S-1}]`` of length ``S_i + total_padding``.
+        all_fresh = bool(extend_seq_lens_cpu) and not any(
+            int(p) > 0 for p in extend_prefix_lens_cpu
+        )
 
-            qk_cur = qk[start:end].transpose(0, 1).unsqueeze(0)  # [1, C, S_cur]
-            if has_prefix:
-                left_pad = conv_state[mamba_idx].unsqueeze(0).to(dtype)
-            else:
-                left_pad = qk_cur.new_zeros((1, self.in_out_ch, self.total_padding))
-            padded = torch.cat([left_pad, qk_cur], dim=-1)
+        if all_fresh:
+            seq_lens = [int(s) for s in extend_seq_lens_cpu]
+            pad = self.total_padding
+            # Build packed buffer: per request -> [pad zeros, S_i tokens].
+            offsets_in = [0]
+            for s in seq_lens:
+                offsets_in.append(offsets_in[-1] + s + pad)
+            packed = qk.new_zeros((1, self.in_out_ch, offsets_in[-1]))
+            start = 0
+            for i, s in enumerate(seq_lens):
+                end = start + s
+                packed[0, :, offsets_in[i] + pad : offsets_in[i + 1]] = qk[
+                    start:end
+                ].transpose(0, 1)
+                start = end
 
-            out = self._conv_qk_run(padded)  # [1, C, S_cur]
-            qk_out[start:end] = out.squeeze(0).transpose(0, 1)
+            packed_out = self._conv_qk_run(packed)  # [1, C, offsets_in[-1] - pad]
 
-            new_state = padded[..., -self.total_padding :]
-            conv_state[mamba_idx] = new_state.squeeze(0).to(conv_state.dtype)
+            start = 0
+            for i, s in enumerate(seq_lens):
+                end = start + s
+                a_i = offsets_in[i]
+                qk_out[start:end] = (
+                    packed_out[0, :, a_i : a_i + s].transpose(0, 1)
+                )
+                new_state = packed[0, :, a_i + s : a_i + s + pad]
+                conv_state[mamba_idx_cpu[i]] = new_state.to(conv_state.dtype)
 
-            hs_cur = hidden_states[start:end]
-            if has_prefix:
-                first = prev_hs_state[mamba_idx].squeeze(-1).to(dtype).unsqueeze(0)
-            else:
+                hs_cur = hidden_states[start:end]
                 first = hidden_states.new_zeros((1, self.hidden_size))
-            shifted = torch.cat([first, hs_cur[:-1]], dim=0)
-            v2_input[start:end] = shifted
+                v2_input[start:end] = torch.cat([first, hs_cur[:-1]], dim=0)
+                prev_hs_state[mamba_idx_cpu[i]] = hs_cur[-1].unsqueeze(-1).to(
+                    prev_hs_state.dtype
+                )
+                start = end
+        else:
+            start = 0
+            for i, seq_len in enumerate(extend_seq_lens_cpu):
+                end = start + int(seq_len)
+                mamba_idx = mamba_idx_cpu[i]
+                has_prefix = int(extend_prefix_lens_cpu[i]) > 0
 
-            prev_hs_state[mamba_idx] = hs_cur[-1].unsqueeze(-1).to(
-                prev_hs_state.dtype
-            )
+                qk_cur = qk[start:end].transpose(0, 1).unsqueeze(0)  # [1, C, S_cur]
+                if has_prefix:
+                    left_pad = conv_state[mamba_idx].unsqueeze(0).to(dtype)
+                else:
+                    left_pad = qk_cur.new_zeros(
+                        (1, self.in_out_ch, self.total_padding)
+                    )
+                padded = torch.cat([left_pad, qk_cur], dim=-1)
 
-            start = end
+                out = self._conv_qk_run(padded)  # [1, C, S_cur]
+                qk_out[start:end] = out.squeeze(0).transpose(0, 1)
+
+                new_state = padded[..., -self.total_padding :]
+                conv_state[mamba_idx] = new_state.squeeze(0).to(conv_state.dtype)
+
+                hs_cur = hidden_states[start:end]
+                if has_prefix:
+                    first = (
+                        prev_hs_state[mamba_idx].squeeze(-1).to(dtype).unsqueeze(0)
+                    )
+                else:
+                    first = hidden_states.new_zeros((1, self.hidden_size))
+                shifted = torch.cat([first, hs_cur[:-1]], dim=0)
+                v2_input[start:end] = shifted
+
+                prev_hs_state[mamba_idx] = hs_cur[-1].unsqueeze(-1).to(
+                    prev_hs_state.dtype
+                )
+
+                start = end
 
         query_conv = qk_out[:, : self.latent_q_dim].view(
             T, self.num_q_heads, self.head_dim
@@ -443,11 +491,7 @@ class CCA(nn.Module):
 
         v1, _ = self.val_proj1(hidden_states)
         v2, _ = self.val_proj2(v2_input)
-        value = (
-            torch.cat([v1, v2], dim=-1)
-            .view(T, self.num_k_heads, self.head_dim)
-            .to(torch.float32)
-        )
+        value = torch.cat([v1, v2], dim=-1).view(T, self.num_k_heads, self.head_dim)
         return query, key, value
 
     def _forward_decode(
@@ -500,11 +544,7 @@ class CCA(nn.Module):
         prev_hs = prev_hs_state.index_select(0, mamba_indices).squeeze(-1).to(dtype)
         v1, _ = self.val_proj1(hidden_states)
         v2, _ = self.val_proj2(prev_hs)
-        value = (
-            torch.cat([v1, v2], dim=-1)
-            .view(T, self.num_k_heads, self.head_dim)
-            .to(torch.float32)
-        )
+        value = torch.cat([v1, v2], dim=-1).view(T, self.num_k_heads, self.head_dim)
         prev_hs_state.index_copy_(
             0, mamba_indices, hidden_states.unsqueeze(-1).to(prev_hs_state.dtype)
         )
@@ -517,7 +557,12 @@ class CCA(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project ``hidden_states`` into ``(q, k, v)`` honoring per-request state.
 
-        Returns float32 tensors with shapes::
+        ``q`` / ``k`` are returned in fp32 (the normalize step keeps fp32 for
+        stability); ``v`` is returned in the input dtype since the caller
+        casts everything back to ``hidden_states.dtype`` before rotary +
+        attention anyway.
+
+        Shapes::
 
             q : [T, num_q_heads, head_dim]
             k : [T, num_k_heads, head_dim]
@@ -528,7 +573,7 @@ class CCA(nn.Module):
             return (
                 zero.view(0, self.num_q_heads, self.head_dim).to(torch.float32),
                 zero.view(0, self.num_k_heads, self.head_dim).to(torch.float32),
-                zero.view(0, self.num_k_heads, self.head_dim).to(torch.float32),
+                zero.view(0, self.num_k_heads, self.head_dim),
             )
 
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -612,8 +657,9 @@ class ZayaAttention(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # CCA returns fp32 ``[T, heads, head_dim]`` tensors; flatten the head
-        # dim and cast to the model dtype before rotary + RadixAttention.
+        # CCA returns fp32 q/k and input-dtype v as ``[T, heads, head_dim]``
+        # tensors; flatten the head dim and cast all to the model dtype before
+        # rotary + RadixAttention.
         q, k, v = self.qkv(hidden_states, forward_batch)
         target_dtype = hidden_states.dtype
         q = q.reshape(q.shape[0], -1).to(target_dtype)
@@ -739,7 +785,10 @@ class ZayaRouter(nn.Module):
         ):
             hs = hs + prev_router_hidden_states * self.router_states_scale
 
-        router_hidden_states_next = hs.clone()
+        # ``hs`` is a freshly-allocated tensor (output of ``down_proj`` or the
+        # EDA add above) and ``rmsnorm_eda`` is non-residual / out-of-place,
+        # so we can hand the same buffer to the next layer without cloning.
+        router_hidden_states_next = hs
 
         hs_norm = self.rmsnorm_eda(hs)
 
@@ -857,14 +906,19 @@ class ZayaBlock(nn.Module):
             topk_out = topk_out._replace(topk_ids=clamped_ids)
 
             experts_out = self.experts(hidden_states, topk_out)
-            mod_out = hidden_states * probs
-
-            if self.tp_size > 1:
-                mod_out = tensor_model_parallel_all_reduce(mod_out)
-                experts_out = tensor_model_parallel_all_reduce(experts_out)
-
+            # ``mod_out`` is computed identically on every TP rank (both
+            # ``hidden_states`` and ``probs`` are replicated). Fold the skip
+            # mask into the per-rank partial experts output *before*
+            # all-reduce so the single reduction yields:
+            #   sum_r(mask · partial_r) + (1 - mask) · mod_out
+            # = mask · experts_out_full + (1 - mask) · mod_out
+            # without double-counting ``mod_out`` by tp_size.
             mod_mask = (indices != self.num_moe_experts).to(experts_out.dtype)
-            hidden_out = mod_mask * experts_out + (1.0 - mod_mask) * mod_out
+            mod_out = hidden_states * probs
+            masked_experts = mod_mask * experts_out
+            if self.tp_size > 1:
+                masked_experts = tensor_model_parallel_all_reduce(masked_experts)
+            hidden_out = masked_experts + (1.0 - mod_mask) * mod_out
         else:
             hidden_out = self.experts(hidden_states, topk_out)
             if self.tp_size > 1:
