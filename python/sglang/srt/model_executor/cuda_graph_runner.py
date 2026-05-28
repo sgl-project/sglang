@@ -815,17 +815,25 @@ class CudaGraphRunner:
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
 
+        from sglang.test.test_utils import ci_use_ascending_capture_order
+
         def _capture_one_stream(stream_idx: Optional[int] = None):
             avail_mem = get_available_gpu_memory(
                 self.model_runner.device,
                 self.model_runner.gpu_id,
                 empty_cache=False,
             )
-            # Reverse the order to enable better memory sharing across cuda graphs.
+            # Reverse for memory sharing; CI+FA3 uses ascending to dodge the
+            # FA3 varlen workspace-slot IMA (#26532).
+            bs_seq = (
+                list(self.capture_bs)
+                if ci_use_ascending_capture_order(self.model_runner.server_args)
+                else list(reversed(self.capture_bs))
+            )
             capture_range = (
-                tqdm.tqdm(list(reversed(self.capture_bs)))
+                tqdm.tqdm(bs_seq)
                 if get_tensor_model_parallel_rank() == 0
-                else reversed(self.capture_bs)
+                else iter(bs_seq)
             )
             for i, bs in enumerate(capture_range):
                 if get_tensor_model_parallel_rank() == 0:
