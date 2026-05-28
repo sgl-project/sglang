@@ -687,7 +687,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
             shape_key = self._make_graph_key(bs, stream_idx, variant_label)
-            self.backend.capture_one(shape_key, run_once, dummies=None)
+            self.backend.capture_one(
+                shape_key,
+                run_once,
+                dummies=None,
+                post_warmup_hook=getattr(
+                    self.model_runner.attn_backend,
+                    "on_after_cuda_graph_warmup",
+                    None,
+                ),
+            )
 
     # -----------------------------------------------------------------
     # recapture

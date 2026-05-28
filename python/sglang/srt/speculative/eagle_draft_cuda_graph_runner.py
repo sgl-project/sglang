@@ -398,7 +398,14 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             )
             self.deepep_adapter.capture(is_extend_in_batch=False)
             shape_key = self._make_graph_key(num_seqs)
-            self.backend.capture_one(shape_key, run_once, dummies=None)
+            self.backend.capture_one(
+                shape_key,
+                run_once,
+                dummies=None,
+                post_warmup_hook=getattr(
+                    self.draft_attn_backend, "on_after_cuda_graph_warmup", None
+                ),
+            )
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
         parent_list, top_scores_index, draft_tokens = (t[:raw_bs] for t in out)

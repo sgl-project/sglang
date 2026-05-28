@@ -78,14 +78,20 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         shape_key: Any,
         forward_fn: Callable[[], Any],
         dummies: Optional[Any] = None,
+        post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         # Two jit warmups so kernels stay loaded and any one-time setup
         # cost is paid before the actual capture; then capture under
-        # the cuda-graph context.
+        # the cuda-graph context. The post-warmup hook (when provided)
+        # lets the attention backend reset state that warmup mutated
+        # (e.g. FlashMLA metadata, PREP_IN_CUDA_GRAPH raw->full upgrade)
+        # so capture starts from a clean baseline.
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
             forward_fn()
+            if post_warmup_hook is not None:
+                post_warmup_hook()
 
         graph = torch.cuda.CUDAGraph()
 

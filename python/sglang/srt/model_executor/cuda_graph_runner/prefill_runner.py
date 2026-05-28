@@ -346,7 +346,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         def run_once():
             return self._run_forward(forward_batch, num_tokens)
 
-        self.backend.capture_one(num_tokens, run_once, dummies=None)
+        self.backend.capture_one(
+            num_tokens,
+            run_once,
+            dummies=None,
+            post_warmup_hook=getattr(
+                self.model_runner.attn_backend,
+                "on_after_cuda_graph_warmup",
+                None,
+            ),
+        )
 
     # -----------------------------------------------------------------
     # replay_prepare

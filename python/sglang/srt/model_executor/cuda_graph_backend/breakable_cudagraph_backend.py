@@ -180,12 +180,17 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         shape_key: Any,
         forward_fn: Callable[[], Any],
         dummies: Optional[Any] = None,
+        post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         # Two jit warmups, then capture under BreakableCUDAGraphCapture.
+        # post_warmup_hook lets the attention backend reset state that
+        # warmup mutated (see FullCudaGraphBackend.capture_one for detail).
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
             forward_fn()
+            if post_warmup_hook is not None:
+                post_warmup_hook()
 
         graph = BreakableCUDAGraph()
         captured_fn = (

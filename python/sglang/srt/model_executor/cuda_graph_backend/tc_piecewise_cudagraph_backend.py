@@ -260,14 +260,19 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         shape_key: Any,
         forward_fn: Callable[[], Any],
         dummies: Optional[Any] = None,
+        post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         """Per-shape: call 1 warms FX state, call 2 captures the cuda
         graph (inside ``capture_session``). See ``cuda_piecewise_backend.py``.
+        ``post_warmup_hook`` resets attention-backend state between the
+        warmup pass and the captured pass (see FullCudaGraphBackend).
         """
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
             forward_fn()
+            if post_warmup_hook is not None:
+                post_warmup_hook()
 
     def replay(
         self,

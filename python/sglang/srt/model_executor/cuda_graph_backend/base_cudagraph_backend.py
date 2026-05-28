@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Iterator, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
 import torch
 
@@ -74,6 +74,7 @@ class BaseCudaGraphBackend(ABC):
         shape_key: Any,
         forward_fn,
         dummies: Optional[Any] = None,
+        post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None: ...
 
     @abstractmethod

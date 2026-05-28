@@ -507,7 +507,14 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             )
             self.deepep_adapter.capture(is_extend_in_batch=True)
             shape_key = self._make_graph_key(bs)
-            self.backend.capture_one(shape_key, run_once, dummies=None)
+            self.backend.capture_one(
+                shape_key,
+                run_once,
+                dummies=None,
+                post_warmup_hook=getattr(
+                    self.attn_backend, "on_after_cuda_graph_warmup", None
+                ),
+            )
 
     def init_replay_state(
         self, forward_batch: ForwardBatch, bs: int, raw_bs: int, num_tokens: int
