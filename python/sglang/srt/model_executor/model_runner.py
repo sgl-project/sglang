@@ -2082,12 +2082,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         na = NetworkAddress(master_address, group_port)
         message = ""
         try:
+            handles = []
             for _, weights in self.model.named_parameters():
-                torch.distributed.broadcast(
-                    weights,
-                    src=0,
-                    group=send_group,
+                handles.append(
+                    torch.distributed.broadcast(
+                        weights,
+                        src=0,
+                        group=send_group,
+                        async_op=True,
+                    )
                 )
+            for handle in handles:
+                handle.wait()
             success = True
             message = f"Succeeded to send weights through {na.to_host_port_str()} {group_name}."
         except Exception as e:
