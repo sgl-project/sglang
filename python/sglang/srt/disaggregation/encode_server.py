@@ -2679,14 +2679,18 @@ class DPDispatcher:
                 pending = self.pending_futures[rank]
                 for key, future in list(pending.items()):
                     if not future.done():
-                        future.set_result({
-                            "req_id": key.removesuffix("_send"),
-                            "_dp_type": "send" if key.endswith("_send") else "encode",
-                            "content": None,
-                            "_error": reason,
-                            "_error_type": "WorkerDied",
-                            "_error_code": int(HTTPStatus.SERVICE_UNAVAILABLE),
-                        })
+                        future.set_result(
+                            {
+                                "req_id": key.removesuffix("_send"),
+                                "_dp_type": (
+                                    "send" if key.endswith("_send") else "encode"
+                                ),
+                                "content": None,
+                                "_error": reason,
+                                "_error_type": "WorkerDied",
+                                "_error_code": int(HTTPStatus.SERVICE_UNAVAILABLE),
+                            }
+                        )
                     pending.pop(key, None)
                 self.req_id_to_rank = {
                     r: rk for r, rk in self.req_id_to_rank.items() if rk != rank
@@ -3013,7 +3017,6 @@ def launch_server(server_args: ServerArgs):
     uvicorn.run(app, host=server_args.host, port=server_args.port)
 
 
-
 def _launch_server_dp(server_args: ServerArgs):
     global dp_dispatcher
 
@@ -3044,6 +3047,7 @@ def _launch_server_dp(server_args: ServerArgs):
     import atexit
 
     worker_processes: List[mp.Process] = []
+
     def _kill_workers():
         for p in worker_processes:
             if p.is_alive():
@@ -3082,7 +3086,6 @@ def _launch_server_dp(server_args: ServerArgs):
     )
 
     uvicorn.run(app, host=server_args.host, port=server_args.port)
-
 
 
 def _summarise_dp_broadcast(results: List[dict]) -> Response:
