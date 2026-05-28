@@ -1,0 +1,15 @@
+name: "FractalMesh CodeQL Config"
+
+disable-default-queries: false
+
+queries:
+  - uses: security-and-quality
+
+paths-ignore:
+  - "fractalmesh/agents/"
+  - "benchmark/"
+  - "docs/"
+  - "examples/"
+  - "test/"
+  - "**/*.md"
+  - "**/*.txt"

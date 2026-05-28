@@ -1,0 +1,67 @@
+name: "CodeQL Analysis"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 3 * * 1"  # weekly Monday 03:00 UTC
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: python
+            build-mode: none
+          - language: rust
+            build-mode: manual
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          config-file: ./.github/codeql/codeql-config.yml
+          build-mode: ${{ matrix.build-mode }}
+
+      # Rust: full build so CodeQL gets complete coverage
+      - if: matrix.language == 'rust'
+        name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - if: matrix.language == 'rust'
+        name: Cache Rust build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sgl-model-gateway/target
+          key: ${{ runner.os }}-cargo-codeql-${{ hashFiles('sgl-model-gateway/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-codeql-
+
+      - if: matrix.language == 'rust'
+        name: Build Rust workspace
+        working-directory: sgl-model-gateway
+        run: cargo build --release 2>&1 | tail -20
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
