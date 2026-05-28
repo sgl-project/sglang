@@ -19,6 +19,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import (
     get_bool_env_var,
     is_cuda,
+    is_hip,
     is_musa,
     is_npu,
 )
@@ -41,6 +42,9 @@ if is_musa():
         top_p_renorm_prob,
     )
 
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+if _use_aiter:
+    from aiter import greedy_sample as _aiter_greedy_sample
 
 if is_npu():
     import torch_npu
@@ -106,8 +110,13 @@ class Sampler(nn.Module):
         logits = self._preprocess_logits(logits, sampling_info)
 
         if sampling_info.is_all_greedy:
-            # Use torch.argmax if all requests use greedy sampling
-            batch_next_token_ids = torch.argmax(logits, -1)
+            if _use_aiter:
+                batch_next_token_ids = torch.empty(
+                    logits.shape[0], device=logits.device, dtype=torch.int32
+                )
+                _aiter_greedy_sample(batch_next_token_ids, logits)
+            else:
+                batch_next_token_ids = torch.argmax(logits, -1)
             if return_logprob:
                 original_logprobs = logprobs = torch.nn.functional.log_softmax(
                     logits, dim=-1
