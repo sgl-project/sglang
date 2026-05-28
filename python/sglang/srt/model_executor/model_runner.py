@@ -2331,6 +2331,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 2 * block_m,
                 max(n_sms // 8, 2) * block_m,
                 max(n_sms // 4, 4) * block_m,
+                n_sms * block_m,
             }
         )
 
