@@ -101,6 +101,30 @@ configure_environment() {
         [ "${VIRTUAL_ENV:-}" = "$UV_VENV" ] || { echo "FATAL: venv activation did not set VIRTUAL_ENV correctly"; exit 1; }
         [ "$(command -v python3)" = "$UV_VENV/bin/python3" ] || { echo "FATAL: python3 still resolves outside venv (got $(command -v python3))"; exit 1; }
 
+        # cute-dsl IR emission (flashinfer SM100 fp4 GEMM autotune) spends
+        # ~30% of wall-clock in inspect.findsource via getframeinfo(context=1).
+        # The cutlass-dsl wrapper only uses frameInfo.code_context for an MLIR
+        # location *name* — falls back to frameInfo.function when code_context
+        # is None. Forcing context=0 skips findsource entirely; codegen and
+        # autotune results are unaffected. Verified 3.2-3.35x speedup on b200
+        # cold autotune (313s -> 96s); see Desktop/b200_fp4_findsource_fix.md.
+        # Delivered as a .pth file because Ubuntu ships its own
+        # /usr/lib/python3.10/sitecustomize.py that wins the lookup order and
+        # shadows any sitecustomize.py we'd drop into the venv.
+        SP="$UV_VENV/lib/python${SYS_PYTHON_VER}/site-packages"
+        cat > "$SP/_sglang_ci_dsl_loc_fix.py" <<'PY'
+"""Force cutlass-dsl per-op getframeinfo(context=1) -> context=0, skipping
+inspect.findsource. ~3x faster cute-dsl IR emission (b200 SM100 fp4 GEMM
+autotune). Location names degrade from source-line text to function name;
+codegen and autotune results are unaffected."""
+import inspect as _i
+_orig = _i.getframeinfo
+def _fast_getframeinfo(frame, context=1):
+    return _orig(frame, context=0)
+_i.getframeinfo = _fast_getframeinfo
+PY
+        echo "import _sglang_ci_dsl_loc_fix" > "$SP/_sglang_ci_dsl_loc_fix.pth"
+
         if [ -n "${GITHUB_ENV:-}" ]; then
             # Self-heal: see install_rustup.sh for context on missing _runner_file_commands/.
             mkdir -p "$(dirname "$GITHUB_ENV")" 2>/dev/null || true
