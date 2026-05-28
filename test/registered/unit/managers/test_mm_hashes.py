@@ -18,8 +18,8 @@ from unittest.mock import patch
 
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.schedule_batch import (
-    MultimodalDataItem,
     Modality,
+    MultimodalDataItem,
     _compute_pad_value,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
