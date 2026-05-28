@@ -107,8 +107,13 @@ def _build_multimodal_content(prompt: str, image_paths: List[str]) -> list:
         parts.append({"type": "text", "text": tail})
     # No `<image N>` placeholders in the prompt: anchor the image at the front.
     if used == 0 and image_paths:
-        parts.insert(0, {"type": "image_url",
-                         "image_url": {"url": _path_to_image_url(image_paths[0])}})
+        parts.insert(
+            0,
+            {
+                "type": "image_url",
+                "image_url": {"url": _path_to_image_url(image_paths[0])},
+            },
+        )
     return parts
 
 

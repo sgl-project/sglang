@@ -113,13 +113,14 @@ def eval_mmmu(args):
         if "InternVL" in args.model_path:
             images = [PIL.Image.open(p).convert("RGB") for p in image_paths]
             pv = [
-                image_to_pixel_values(im, input_size=448, max_num=12, use_thumbnail=True)
+                image_to_pixel_values(
+                    im, input_size=448, max_num=12, use_thumbnail=True
+                )
                 for im in images
             ]
             pixel_values = torch.cat(pv, dim=0).to(device="cuda", dtype=torch.bfloat16)
             contents = "".join(
-                "<image>\n" if kind == "image" else val
-                for kind, val in parts
+                "<image>\n" if kind == "image" else val for kind, val in parts
             )
             response = model.chat(
                 tokenizer, pixel_values, contents, generation_config_internvl
@@ -129,7 +130,11 @@ def eval_mmmu(args):
             continue
 
         contents = [
-            {"type": "image", "image": val} if kind == "image" else {"type": "text", "text": val}
+            (
+                {"type": "image", "image": val}
+                if kind == "image"
+                else {"type": "text", "text": val}
+            )
             for kind, val in parts
         ]
         messages = [{"role": "user", "content": contents}]
@@ -149,8 +154,7 @@ def eval_mmmu(args):
             response = processor.decode(generation, skip_special_tokens=True)
         except:
             contents = [
-                PIL.Image.open(val) if kind == "image" else val
-                for kind, val in parts
+                PIL.Image.open(val) if kind == "image" else val for kind, val in parts
             ]
             messages = [{"role": "user", "content": contents}]
             response = model.chat(

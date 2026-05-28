@@ -115,7 +115,9 @@ def process_single_sample(data):
             o_imgs_paths.append(img_path)
 
     # MMMU rows carry up to 7 images as image_1..image_7.
-    images = [data[f"image_{i}"] for i in range(1, 8) if data.get(f"image_{i}") is not None]
+    images = [
+        data[f"image_{i}"] for i in range(1, 8) if data.get(f"image_{i}") is not None
+    ]
 
     common = {
         "id": data["id"],
