@@ -280,5 +280,143 @@ def test_sparse_mla_q8kv8_prefill_precision(d_qk: int, s_q: int, topk: int, s_kv
     assert lse_diff < 2e-3, f"lse_diff {lse_diff:.2e} exceeds 2e-3"
 
 
+@pytest.mark.skipif(
+    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+)
+def test_sparse_mla_q8kv8_prefill_no_alias_between_calls():
+    """Two default-allocation calls with the same shape must return independent
+    storage. This guards against regressing to a module-scope output cache."""
+    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+        sparse_mla_q8kv8_prefill_fwd,
+    )
+
+    q, kv, indices, sm_scale, q_scale, kv_scale, attn_sink, topk_length = _make_case(
+        d_qk=576, with_sink=False
+    )
+
+    out1, ml1, lse1 = sparse_mla_q8kv8_prefill_fwd(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+        d_v=D_V,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+    )
+    snapshot = out1.clone()
+
+    out2, ml2, lse2 = sparse_mla_q8kv8_prefill_fwd(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+        d_v=D_V,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+    )
+    torch.cuda.synchronize()
+
+    assert out1.data_ptr() != out2.data_ptr()
+    assert ml1.data_ptr() != ml2.data_ptr()
+    assert lse1.data_ptr() != lse2.data_ptr()
+    # The first call's output must not be overwritten by the second call.
+    torch.testing.assert_close(out1, snapshot)
+
+
+@pytest.mark.skipif(
+    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+)
+def test_sparse_mla_q8kv8_prefill_caller_owned_buffers():
+    """Caller-provided ``out`` / ``max_logits`` / ``lse`` tensors must be
+    written into in-place and returned as-is."""
+    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+        sparse_mla_q8kv8_prefill_fwd,
+    )
+
+    q, kv, indices, sm_scale, q_scale, kv_scale, attn_sink, topk_length = _make_case(
+        d_qk=576, with_sink=False
+    )
+    s_q = q.shape[0]
+    out_buf = torch.empty((s_q, H_Q, D_V), dtype=torch.bfloat16, device="cuda")
+    ml_buf = torch.empty((s_q, H_Q), dtype=torch.float32, device="cuda")
+    lse_buf = torch.empty((s_q, H_Q), dtype=torch.float32, device="cuda")
+
+    out, ml, lse = sparse_mla_q8kv8_prefill_fwd(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+        d_v=D_V,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+        out=out_buf,
+        max_logits=ml_buf,
+        lse=lse_buf,
+    )
+    torch.cuda.synchronize()
+
+    assert out.data_ptr() == out_buf.data_ptr()
+    assert ml.data_ptr() == ml_buf.data_ptr()
+    assert lse.data_ptr() == lse_buf.data_ptr()
+    assert torch.isfinite(out.float()).all()
+    assert torch.isfinite(ml.float()).all()
+    assert torch.isfinite(lse.float()).all()
+
+
+@pytest.mark.skipif(
+    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+)
+def test_sparse_mla_q8kv8_prefill_rejects_bad_buffers():
+    """Validation: wrong shape/dtype and aliasing must raise ValueError."""
+    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+        sparse_mla_q8kv8_prefill_fwd,
+    )
+
+    q, kv, indices, sm_scale, q_scale, kv_scale, attn_sink, topk_length = _make_case(
+        d_qk=576, with_sink=False
+    )
+    s_q = q.shape[0]
+
+    def _call(**overrides):
+        kwargs = dict(
+            q=q,
+            kv=kv,
+            indices=indices,
+            sm_scale=sm_scale,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+            d_v=D_V,
+            attn_sink=attn_sink,
+            topk_length=topk_length,
+        )
+        kwargs.update(overrides)
+        return sparse_mla_q8kv8_prefill_fwd(**kwargs)
+
+    # Wrong dtype.
+    bad_out = torch.empty((s_q, H_Q, D_V), dtype=torch.float16, device="cuda")
+    with pytest.raises(ValueError):
+        _call(out=bad_out)
+
+    # Wrong shape.
+    bad_ml = torch.empty((s_q + 1, H_Q), dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError):
+        _call(max_logits=bad_ml)
+
+    # Aliased max_logits / lse.
+    shared = torch.empty((s_q, H_Q), dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError):
+        _call(max_logits=shared, lse=shared)
+
+    # d_v != 512.
+    with pytest.raises(ValueError):
+        _call(d_v=256)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
