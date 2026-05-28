@@ -28,8 +28,23 @@ NEMOTRON_3_SUPER_BF16_ARGS = [
     '{"enable_multithread_load": true, "num_threads": 50}',
 ]
 
+MTP_ARGS = [
+    "--speculative-algorithm",
+    "EAGLE",
+    "--speculative-num-steps",
+    "3",
+    "--speculative-eagle-topk",
+    "1",
+    "--speculative-num-draft-tokens",
+    "4",
+    "--max-running-requests",
+    "200",
+    "--mem-fraction-static",
+    "0.75",
+]
 
-class TestNvidiaNemotron3SuperBF16(CustomTestCase):
+
+class TestNvidiaNemotron3SuperBF16MTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = NEMOTRON_3_SUPER_BF16_MODEL
@@ -38,7 +53,7 @@ class TestNvidiaNemotron3SuperBF16(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=NEMOTRON_3_SUPER_BF16_ARGS,
+            other_args=NEMOTRON_3_SUPER_BF16_ARGS + MTP_ARGS,
         )
 
     @classmethod
