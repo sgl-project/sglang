@@ -108,34 +108,41 @@ class KimiK25Processor:
         return_tensors="pt",
         **kwargs,
     ):
-        if text is not None:
-            raise ValueError("KimiK25Processor only supports messages input")
-        if messages is None:
-            raise ValueError("KimiK25Processor requires messages input")
-
-        image_tokens = 0
-        for message in messages:
-            content = message.get("content", [])
-            if isinstance(content, str):
-                continue
-            for item in content:
-                if item.get("type") == "text":
+        if messages is not None:
+            image_tokens = 0
+            for message in messages:
+                content = message.get("content", [])
+                if isinstance(content, str):
                     continue
-                if item.get("type") != "image_url" or not isinstance(
-                    item.get("image_url"), str
-                ):
-                    raise ValueError(
-                        "KimiK25Processor expects string image_url content items"
-                    )
-                image_tokens += 4
+                for item in content:
+                    if item.get("type") == "text":
+                        continue
+                    if item.get("type") != "image_url" or not isinstance(
+                        item.get("image_url"), str
+                    ):
+                        raise ValueError(
+                            "KimiK25Processor expects string image_url content items"
+                        )
+                    image_tokens += 4
 
-        prompt = self.tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=kwargs.get("add_generation_prompt", False),
-            tokenize=False,
-            return_dict=False,
-        )
-        text_len = len(self.tokenizer.encode(prompt))
+            prompt = self.tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=kwargs.get("add_generation_prompt", False),
+                tokenize=False,
+                return_dict=False,
+            )
+            text_len = len(self.tokenizer.encode(prompt))
+            return {"input_ids": _DummyTokenTensor(text_len + image_tokens)}
+
+        if isinstance(text, list):
+            raise ValueError(
+                "KimiK25Processor only supports string text input; list text should fall back"
+            )
+        if text is None:
+            raise ValueError("KimiK25Processor requires text or messages input")
+
+        image_tokens = 4 * len(medias) if medias else 0
+        text_len = len(self.tokenizer.encode(text))
         return {"input_ids": _DummyTokenTensor(text_len + image_tokens)}
 
 
@@ -408,7 +415,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             rows = sample_mmmu_requests(
                 num_requests=1,
                 processor=KimiK25Processor(self.tokenizer),
-                backend="custom-backend",
+                backend="sglang",
                 fixed_output_len=6,
                 random_sample=False,
             )
@@ -420,23 +427,28 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertGreater(rows[0].vision_prompt_len, 0)
 
     def test_image_sampler_with_kimi_k25_processor(self):
-        rows = sample_image_requests(
-            num_requests=1,
-            image_count=1,
-            input_len=8,
-            output_len=4,
-            range_ratio=0.0,
-            processor=KimiK25Processor(self.tokenizer),
-            image_content="blank",
-            image_format="png",
-            image_resolution="8x8",
-            backend="sglang",
-            random_image_count=False,
-        )
+        fixed_text_prompt = "tok_1 tok_2 tok_3 tok_4 tok_5 tok_6 tok_7 tok_8"
+        with patch(
+            "sglang.benchmark.datasets.image.gen_mm_prompt",
+            return_value=fixed_text_prompt,
+        ):
+            rows = sample_image_requests(
+                num_requests=1,
+                image_count=1,
+                input_len=8,
+                output_len=4,
+                range_ratio=0.0,
+                processor=KimiK25Processor(self.tokenizer),
+                image_content="blank",
+                image_format="png",
+                image_resolution="8x8",
+                backend="sglang",
+                random_image_count=False,
+            )
         row = rows[0]
         self.assertEqual(len(rows), 1)
         text_only_templated = self.tokenizer.apply_chat_template(
-            [{"role": "user", "content": row.prompt}],
+            [{"role": "user", "content": fixed_text_prompt}],
             add_generation_prompt=True,
             tokenize=False,
             return_dict=False,
