@@ -5,8 +5,8 @@ from typing import Optional
 import torch
 
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
-from sglang.srt.kv_canary.pool_patch.buf_info_splice import patch_buf_info_method
-from sglang.srt.kv_canary.pool_patch.buffer_alloc import (
+from sglang.srt.kv_canary.pool_patcher.buf_info_splice import patch_buf_info_method
+from sglang.srt.kv_canary.pool_patcher.buffer_alloc import (
     alloc_canary_buf,
     make_row_source,
 )

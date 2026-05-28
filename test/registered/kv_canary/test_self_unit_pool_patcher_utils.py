@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.kv_canary.pool_patch.utils import wrap_method
+from sglang.srt.kv_canary.pool_patcher.utils import wrap_method
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -14,7 +14,7 @@ class _FakeObj:
         return f"hello {name}"
 
 
-class TestPoolPatchUtils(CustomTestCase):
+class TestPoolPatcherUtils(CustomTestCase):
     def test_wrap_method_delegates_to_wrapper(self) -> None:
         """Verify wrapped methods delegate through the wrapper."""
         obj = _FakeObj()

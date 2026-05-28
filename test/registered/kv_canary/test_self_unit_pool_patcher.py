@@ -14,7 +14,7 @@ from sglang.jit_kernel.kv_canary.verify import (
     launch_canary_verify_kernel,
 )
 from sglang.srt.kv_canary.buffer_group import PoolKind
-from sglang.srt.kv_canary.pool_patch.api import attach_canary_buffers
+from sglang.srt.kv_canary.pool_patcher.api import attach_canary_buffers
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
@@ -27,13 +27,13 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-small")
 
 
-class PoolPatchHelper:
+class PoolPatcherHelper:
     def setUp(self):
         self.device = DEFAULT_DEVICE
         self.config = make_base_config()
 
 
-class TestAttachCanaryBuffers(PoolPatchHelper, CustomTestCase):
+class TestAttachCanaryBuffers(PoolPatcherHelper, CustomTestCase):
     def test_canary_buffer_group_allocate_full_only(self):
         """Verify MHA pools allocate only full canary buffers."""
         pool = make_mha_pool(self.device, num_slots=16, dim=8, layer_num=2)
@@ -69,7 +69,7 @@ class TestAttachCanaryBuffers(PoolPatchHelper, CustomTestCase):
         self.assertIsNone(groups[PoolKind.FULL].swa_index_lut)
 
 
-class TestRealKvSources(PoolPatchHelper, CustomTestCase):
+class TestRealKvSources(PoolPatcherHelper, CustomTestCase):
     def test_real_kv_sources_above_4_raises(self):
         """Verify too many real KV sources are rejected."""
         tensor = torch.zeros(4, 16, dtype=torch.uint8, device=self.device)
@@ -110,7 +110,7 @@ class TestRealKvSources(PoolPatchHelper, CustomTestCase):
             )
 
 
-class TestPoolPatchBufferInfos(PoolPatchHelper, CustomTestCase):
+class TestPoolPatcherBufferInfos(PoolPatcherHelper, CustomTestCase):
     def test_get_contiguous_buf_infos_inserts_canary_entries(self):
         """Verify contiguous buffer metadata includes canary entries after patching."""
         for patched in (False, True):
@@ -177,7 +177,7 @@ class TestPoolPatchBufferInfos(PoolPatchHelper, CustomTestCase):
         self.assertEqual(ptrs_after[-1], canary_v_ptrs[1])
 
 
-class TestCanaryBufferBudget(PoolPatchHelper, CustomTestCase):
+class TestCanaryBufferBudget(PoolPatcherHelper, CustomTestCase):
     def test_canary_buf_per_token_bytes_within_budget(self):
         """Verify canary per-token storage stays below the real KV budget."""
         pool = make_mha_pool(self.device, num_slots=16, dim=64, layer_num=2)

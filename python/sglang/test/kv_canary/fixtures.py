@@ -10,9 +10,9 @@ from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES, RealKvSource
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
-from sglang.srt.kv_canary.pool_patch.adapters.mha import attach_mha
-from sglang.srt.kv_canary.pool_patch.adapters.swa import attach_swa
-from sglang.srt.kv_canary.pool_patch.api import register_pool_attacher
+from sglang.srt.kv_canary.pool_patcher.adapters.mha import attach_mha
+from sglang.srt.kv_canary.pool_patcher.adapters.swa import attach_swa
+from sglang.srt.kv_canary.pool_patcher.api import register_pool_attacher
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 

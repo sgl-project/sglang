@@ -7,7 +7,7 @@ import torch
 
 from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
-from sglang.srt.kv_canary.pool_patch.buffer_alloc import (
+from sglang.srt.kv_canary.pool_patcher.buffer_alloc import (
     make_packed_source,
     make_row_source,
     resolve_real_kv_read_bytes,
