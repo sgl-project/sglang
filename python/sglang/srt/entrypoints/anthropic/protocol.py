@@ -254,14 +254,48 @@ class AnthropicToolChoice(BaseModel):
 class AnthropicThinkingParam(BaseModel):
     """Anthropic extended-thinking control on the request.
 
+    ``type`` accepts ``enabled`` / ``disabled`` plus ``adaptive`` (Claude
+    4.7's auto-reasoning mode that the Anthropic SDK and Claude Code 2.x
+    send by default). ``adaptive`` is treated identically to ``enabled``
+    on the serving side because the local OpenAI-compatible backend does
+    not expose an auto-throttle knob.
+
     ``budget_tokens`` is accepted for SDK compatibility but the OpenAI
     backend has no equivalent hard budget knob; the serving layer rejects
     requests that set it so callers do not silently get an unbounded
     thinking budget.
+
+    ``display`` (Claude 4.7) is accepted for SDK compatibility. ``omitted``
+    is logged but currently no-op — the backend still streams reasoning
+    deltas because there is no upstream knob to suppress them mid-stream.
     """
 
-    type: Literal["enabled", "disabled"]
+    type: Literal["enabled", "disabled", "adaptive"]
     budget_tokens: Optional[int] = None
+    display: Optional[Literal["summarized", "omitted"]] = None
+
+
+class AnthropicTaskBudget(BaseModel):
+    """Claude 4.7 ``output_config.task_budget`` — soft hint, not a hard cap.
+
+    The hard cap is still ``max_tokens``; ``task_budget`` is forwarded to
+    the model as context for long agent loops.
+    """
+
+    type: Literal["tokens"]
+    total: int = Field(gt=0)
+
+
+class AnthropicOutputConfig(BaseModel):
+    """Claude 4.7 ``output_config`` block.
+
+    ``effort`` maps to the OpenAI ``reasoning_effort`` knob (``xhigh`` →
+    ``max`` because the OpenAI Literal does not include ``xhigh``).
+    ``task_budget`` is propagated as a custom-param hint.
+    """
+
+    effort: Optional[Literal["low", "medium", "high", "xhigh", "max"]] = None
+    task_budget: Optional[AnthropicTaskBudget] = None
 
 
 class AnthropicCountTokensRequest(BaseModel):
@@ -273,6 +307,9 @@ class AnthropicCountTokensRequest(BaseModel):
     thinking: Optional[AnthropicThinkingParam] = None
     tool_choice: Optional[AnthropicToolChoice] = None
     tools: Optional[list[AnthropicTool]] = None
+    # Claude 4.7 / SDK-compatibility fields. Accepted but no-op on count.
+    output_config: Optional[AnthropicOutputConfig] = None
+    betas: Optional[list[str]] = None
 
 
 class AnthropicCountTokensResponse(BaseModel):
@@ -297,6 +334,10 @@ class AnthropicMessagesRequest(BaseModel):
     tools: Optional[list[AnthropicTool]] = None
     top_k: Optional[int] = None
     top_p: Optional[float] = None
+    # Claude 4.7 fields. The Anthropic SDK / Claude Code attach these even
+    # when targeting non-Anthropic backends, so the schema must accept them.
+    output_config: Optional[AnthropicOutputConfig] = None
+    betas: Optional[list[str]] = None
 
     @field_validator("model")
     @classmethod

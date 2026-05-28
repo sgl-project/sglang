@@ -674,6 +674,80 @@ class TestAnthropicServing(unittest.TestCase):
         with self.assertRaises(ValueError):
             serving._convert_to_chat_completion_request(request)
 
+    def test_request_thinking_adaptive_is_treated_as_enabled(self):
+        """Claude 4.7 ``thinking.type='adaptive'`` (the SDK default for
+        unknown models) must be accepted and routed to ``apply_reasoning_enabled(True)``.
+        """
+        serving = self._serving()
+        request = self._anthropic_request(thinking={"type": "adaptive"}, stream=False)
+        serving._convert_to_chat_completion_request(request)
+        self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
+
+    def test_request_thinking_display_omitted_logs_warning_but_still_enables(self):
+        """``thinking.display='omitted'`` is accepted; reasoning stays on
+        because we cannot suppress reasoning text from the OpenAI stream."""
+        import logging
+
+        serving = self._serving()
+        request = self._anthropic_request(
+            thinking={"type": "enabled", "display": "omitted"}, stream=False
+        )
+        with self.assertLogs(
+            "sglang.srt.entrypoints.anthropic.serving", level=logging.WARNING
+        ) as log:
+            serving._convert_to_chat_completion_request(request)
+        self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
+        self.assertTrue(any("omitted" in r for r in log.output))
+
+    def test_request_output_config_effort_maps_to_reasoning_effort(self):
+        """``output_config.effort`` rows map onto ``reasoning_effort``."""
+        for anthropic_effort, openai_effort in [
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("xhigh", "max"),  # OpenAI Literal has no xhigh
+            ("max", "max"),
+        ]:
+            with self.subTest(anthropic_effort=anthropic_effort):
+                serving = self._serving()
+                request = self._anthropic_request(
+                    output_config={"effort": anthropic_effort}, stream=False
+                )
+                chat_request = serving._convert_to_chat_completion_request(request)
+                self.assertEqual(chat_request.reasoning_effort, openai_effort)
+
+    def test_request_output_config_task_budget_is_logged_not_enforced(self):
+        """``task_budget`` is a soft hint; ``max_tokens`` is the hard cap."""
+        import logging
+
+        serving = self._serving()
+        request = self._anthropic_request(
+            output_config={"task_budget": {"type": "tokens", "total": 32768}},
+            stream=False,
+        )
+        with self.assertLogs(
+            "sglang.srt.entrypoints.anthropic.serving", level=logging.INFO
+        ) as log:
+            chat_request = serving._convert_to_chat_completion_request(request)
+        # max_tokens is untouched
+        self.assertEqual(chat_request.max_tokens, 16)
+        self.assertTrue(any("task_budget" in r and "32768" in r for r in log.output))
+
+    def test_request_betas_is_accepted_and_logged(self):
+        """The Anthropic SDK attaches ``betas`` to many requests; must not 400."""
+        import logging
+
+        serving = self._serving()
+        request = self._anthropic_request(
+            betas=["thinking-2025-08-04", "computer-use-2025-01-24"],
+            stream=False,
+        )
+        with self.assertLogs(
+            "sglang.srt.entrypoints.anthropic.serving", level=logging.INFO
+        ) as log:
+            serving._convert_to_chat_completion_request(request)
+        self.assertTrue(any("betas" in r for r in log.output))
+
     def test_assistant_thinking_history_is_rewrapped_for_chat_template(self):
         """Past-turn thinking blocks get re-emitted via wrap_reasoning_history."""
         serving = self._serving()

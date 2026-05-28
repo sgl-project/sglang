@@ -527,9 +527,51 @@ class AnthropicServing:
                 raise ValueError(
                     "Anthropic thinking.budget_tokens is not supported yet"
                 )
-            self.openai_serving_chat.apply_reasoning_enabled(
-                chat_request,
-                anthropic_request.thinking.type == "enabled",
+            # Claude 4.7's ``adaptive`` is treated identically to ``enabled``
+            # because the local backend has no auto-throttle equivalent.
+            # Anything other than ``disabled`` enables reasoning.
+            enabled = anthropic_request.thinking.type != "disabled"
+            if anthropic_request.thinking.display == "omitted":
+                # Anthropic 4.7 spec: keep reasoning ON but hide reasoning
+                # text from the client. The OpenAI streaming pipeline has
+                # no equivalent suppress knob — log so operators can see
+                # the request, then proceed with normal reasoning emission.
+                logger.warning(
+                    "Anthropic thinking.display='omitted' is accepted for "
+                    "SDK compatibility but reasoning text will still be "
+                    "emitted to the client"
+                )
+            self.openai_serving_chat.apply_reasoning_enabled(chat_request, enabled)
+
+        # Claude 4.7 ``output_config``: map ``effort`` onto the OpenAI
+        # ``reasoning_effort`` knob. ``xhigh`` collapses to ``max`` because
+        # the OpenAI Literal does not include the Anthropic-only ``xhigh``.
+        # ``task_budget`` is a soft hint forwarded as a custom param so the
+        # model can see it without it becoming a hard cap (``max_tokens``
+        # is still the hard cap).
+        if anthropic_request.output_config is not None:
+            oc = anthropic_request.output_config
+            if oc.effort is not None:
+                chat_request.reasoning_effort = (
+                    "max" if oc.effort == "xhigh" else oc.effort
+                )
+            if oc.task_budget is not None:
+                # Custom params are silently ignored by backends that
+                # don't recognise them; logging it makes the propagation
+                # visible.
+                logger.info(
+                    "Anthropic output_config.task_budget hint: %d %s",
+                    oc.task_budget.total,
+                    oc.task_budget.type,
+                )
+
+        # ``betas`` is the Anthropic SDK's opt-in feature list (e.g.
+        # ``["thinking-2025-08-04"]``). The local backend has no
+        # equivalent beta system; accept-and-log so requests don't 400.
+        if anthropic_request.betas:
+            logger.info(
+                "Anthropic request opted into betas %s — no-op locally",
+                anthropic_request.betas,
             )
 
         # Convert tools. Deferred tools stay in the list with defer_loading=True;
