@@ -29,7 +29,13 @@ mkdir -p "${RESULTS_DIR}"
 SYS_LEN=2253
 Q_LEN=1843
 OUT_LEN=512
-NUM_PROMPTS=$(( 5 * 64 ))
+# Per-epoch prompt count. bench_serving runs FULL epochs of NUM_PROMPTS before
+# re-checking the measurement window, so one epoch at this 4096-ISL shape can
+# take ~15 min at conc 16. The plan-locked AC-8/AC-9/AC-11 default is 5*64=320;
+# a TIER-1 smoke can override NUM_PROMPTS (e.g. 64) so each epoch is short and
+# the shortened-window smoke actually finishes quickly. Keep it >= the largest
+# concurrency so a smoke epoch still saturates the requested concurrency.
+NUM_PROMPTS="${NUM_PROMPTS:-$(( 5 * 64 ))}"
 NUM_GROUPS=1
 
 # Per-concurrency seeds, mirroring the reference sweep pattern.
