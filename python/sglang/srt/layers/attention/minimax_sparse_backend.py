@@ -207,6 +207,15 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             prefix_lens = torch.zeros_like(seq_lens)
 
+        # In DP attention mode, q may be padded beyond the actual token count
+        # for collective communication alignment. Trim to actual tokens so
+        # the sparse attention kernel sees consistent shapes.
+        actual_num_tokens = int(cu_seqlens[-1].item())
+        original_num_tokens = q.shape[0]
+        if actual_num_tokens < original_num_tokens:
+            q = q[:actual_num_tokens]
+            idx_q = idx_q[:actual_num_tokens]
+
         idx_o, o = minimax_sparse_prefill(
             q,
             k_cache,
@@ -231,9 +240,21 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             score_type=self.score_type,
             disable_index_value=disable_value,
         )
+
+        # Pad output back to original size for DP communication
+        if actual_num_tokens < original_num_tokens:
+            pad_len = original_num_tokens - actual_num_tokens
+            o = torch.cat(
+                [o, o.new_zeros(pad_len, *o.shape[1:])], dim=0
+            )
+            if idx_o is not None:
+                idx_o = torch.cat(
+                    [idx_o, idx_o.new_zeros(pad_len, *idx_o.shape[1:])], dim=0
+                )
+
         return (
-            None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),
-            o.reshape(q.shape[0], -1).contiguous(),
+            None if idx_o is None else idx_o.reshape(original_num_tokens, -1).contiguous(),
+            o.reshape(original_num_tokens, -1).contiguous(),
         )
 
     def forward_decode(
