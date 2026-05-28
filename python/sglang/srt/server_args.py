@@ -3260,6 +3260,17 @@ class ServerArgs:
                 )
                 self.moe_runner_backend = "flashinfer_trtllm"
 
+        if (
+            self.moe_runner_backend == "auto"
+            and self.quantization == "modelopt_fp4"
+            and is_sm120_supported()
+        ):
+            self.moe_runner_backend = "flashinfer_cutlass"
+            logger.info(
+                "Use flashinfer_cutlass as MoE runner backend on SM120 for "
+                "modelopt_fp4 (trtllm-gen MoE kernels are SM100-only)"
+            )
+
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [
                 "modelopt_fp4",
