@@ -191,5 +191,55 @@ class TestStatusAndFormatting(unittest.TestCase):
         self.assertIn("⏳", report)
 
 
+class TestChartBuilders(unittest.TestCase):
+    @staticmethod
+    def _info(created, queue_end, start=None, end=None):
+        return {
+            "created_at": created,
+            "queue_end": queue_end,
+            "start": start,
+            "end": end,
+        }
+
+    def test_queue_timeline_tracks_ongoing_wait(self):
+        # One job queued the whole 4h window (still waiting at the end).
+        lj = {"8-gpu-h200": [self._info(CREATED, NOW)]}
+        labels, series = rur.build_queue_timeline(lj, CREATED, NOW)
+        self.assertEqual(len(series), 1)
+        pool, vals = series[0]
+        self.assertEqual(pool, "8-gpu-h200")
+        self.assertEqual(len(vals), len(labels))  # x/y aligned for mermaid
+        self.assertAlmostEqual(vals[0], 0, delta=2)  # ~0 at window start
+        self.assertAlmostEqual(vals[-1], 240, delta=2)  # full 4h wait at end
+
+    def test_queue_timeline_caps_and_sorts_by_peak(self):
+        lj = {
+            f"pool{i}": [self._info(CREATED, CREATED + timedelta(minutes=10 * i + 1))]
+            for i in range(12)
+        }
+        _, series = rur.build_queue_timeline(lj, CREATED, NOW, max_series=8)
+        self.assertEqual(len(series), 8)  # capped at palette size
+        peaks = [max(v) for _, v in series]
+        self.assertEqual(peaks, sorted(peaks, reverse=True))  # busiest first
+
+    def test_load_buckets_counts_running_and_queued(self):
+        ws = NOW - timedelta(hours=8)  # 8 hourly buckets
+        start = ws + timedelta(hours=1)
+        end = ws + timedelta(hours=3)
+        lj = {"p": [self._info(ws, start, start=start, end=end)]}
+        labels, pools = rur.build_load_buckets(lj, ws, NOW)
+        self.assertEqual(len(labels), 8)
+        lbl, running, queued = pools[0]
+        self.assertEqual(lbl, "p")
+        self.assertEqual(len(running), 8)
+        self.assertEqual((queued[0], running[0]), (1, 0))  # hour 0: waiting
+        self.assertEqual((queued[1], running[1]), (0, 1))  # hour 1: running
+        self.assertEqual(running[3], 0)  # ended by hour 3
+
+    def test_empty_inputs_safe(self):
+        self.assertEqual(rur.build_queue_timeline({}, CREATED, NOW), ([], []))
+        self.assertEqual(rur.build_load_buckets({}, CREATED, NOW), ([], []))
+
+
 if __name__ == "__main__":
     unittest.main()

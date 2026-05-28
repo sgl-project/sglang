@@ -586,7 +586,121 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
     # Per-job detail (deduped across labels), longest waits first, for the
     # links + status section of the report.
     longest_waits = sorted(all_job_infos, key=lambda j: j["queue_time"], reverse=True)
-    return results, fetch_failure_pct, longest_waits
+    queue_timeline = build_queue_timeline(label_jobs, window_start, window_end)
+    load_buckets = build_load_buckets(label_jobs, window_start, window_end)
+    return (
+        results,
+        fetch_failure_pct,
+        longest_waits,
+        queue_timeline,
+        load_buckets,
+    )
+
+
+# Distinct line colors paired with a matching legend emoji, in the same order,
+# so the emoji swatch identifies each line — xychart-beta has no built-in
+# legend. Series get palette colors in declaration order.
+QUEUE_CHART_COLORS = [
+    ("🔴", "#e6194B"),
+    ("🟢", "#3cb44b"),
+    ("🔵", "#4363d8"),
+    ("🟠", "#f58231"),
+    ("🟣", "#911eb4"),
+    ("🟤", "#9A6324"),
+    ("⚫", "#000000"),
+    ("🟡", "#ffe119"),
+]
+
+
+def _bucket_label_fmt(window_hours: float) -> str:
+    return "%m-%d %H:%M" if window_hours > 24 else "%H:%M"
+
+
+def build_queue_timeline(label_jobs, window_start, window_end, max_series=8):
+    """Sample each runner pool's longest in-queue wait across the window.
+
+    At each sample time t, a pool's value is the max (t - created_at) over
+    jobs dispatched under that pool that were still waiting at t
+    (created_at <= t < queue_end), in minutes — i.e. how long the worst waiter
+    had been queued at that instant. Queue time is inherently per-pool: a
+    queued job has no host yet, so it can't be tied to a physical runner.
+
+    Returns (sample_labels, [(pool, [values...]), ...]) for the pools with the
+    highest peak wait, capped at max_series (the palette size).
+    """
+    total = (window_end - window_start).total_seconds()
+    if total <= 0 or not label_jobs:
+        return [], []
+    hours = total / 3600
+    n = max(12, min(48, round(hours * 2)))  # ~30-min resolution
+    step = total / n
+    samples = [window_start + timedelta(seconds=step * i) for i in range(n + 1)]
+    fmt = _bucket_label_fmt(hours)
+    sample_labels = [t.strftime(fmt) for t in samples]
+
+    series = []
+    for label, jobs in label_jobs.items():
+        waits = [
+            (j["created_at"], j["queue_end"])
+            for j in jobs
+            if j.get("created_at")
+            and j.get("queue_end")
+            and j["queue_end"] > j["created_at"]
+        ]
+        if not waits:
+            continue
+        values = []
+        for t in samples:
+            best = 0.0
+            for c, qe in waits:
+                # Inclusive at qe so the peak (at pickup, or `now` for a job
+                # still queued at the window end) lands on a sample.
+                if c <= t <= qe:
+                    best = max(best, (t - c).total_seconds() / 60.0)
+            values.append(round(best, 1))
+        peak = max(values)
+        if peak > 0:
+            series.append((label, values, peak))
+    series.sort(key=lambda s: s[2], reverse=True)
+    return sample_labels, [(lbl, vals) for lbl, vals, _ in series[:max_series]]
+
+
+def build_load_buckets(label_jobs, window_start, window_end, max_pools=6):
+    """Per runner pool, count jobs running and queued during each hourly bucket.
+
+    A job is *running* in a bucket if its [start, end] interval overlaps it, and
+    *queued* if its waiting interval [created_at, queue_end] overlaps it.
+    Returns (bucket_labels, [(pool, running[], queued[]), ...]) for the busiest
+    pools (by peak running+queued), capped at max_pools.
+    """
+    total = (window_end - window_start).total_seconds()
+    if total <= 0 or not label_jobs:
+        return [], []
+    hours = total / 3600
+    n = max(6, min(48, round(hours)))  # ~hourly buckets
+    step = total / n
+    edges = [window_start + timedelta(seconds=step * i) for i in range(n + 1)]
+    fmt = _bucket_label_fmt(hours)
+    bucket_labels = [edges[i].strftime(fmt) for i in range(n)]
+
+    out = []
+    for label, jobs in label_jobs.items():
+        running = [0] * n
+        queued = [0] * n
+        for j in jobs:
+            s, e = j.get("start"), j.get("end")
+            c, qe = j.get("created_at"), j.get("queue_end")
+            for i in range(n):
+                b0, b1 = edges[i], edges[i + 1]
+                if s is not None and e is not None and s < b1 and e > b0:
+                    running[i] += 1
+                if c is not None and qe is not None and c < b1 and qe > b0:
+                    queued[i] += 1
+        peak = max((r + q for r, q in zip(running, queued)), default=0)
+        if peak > 0:
+            out.append((label, running, queued, peak))
+    out.sort(key=lambda x: x[3], reverse=True)
+    return bucket_labels, [(lbl, r, q) for lbl, r, q, _ in out[:max_pools]]
 
 
 def format_report(
@@ -595,6 +709,8 @@ def format_report(
     fetch_failure_pct: float = 0.0,
     longest_waits: list = None,
     top_n: int = 20,
+    queue_timeline: tuple = None,
+    load_buckets: tuple = None,
 ) -> str:
     """One compact summary table — original schema, fixed columns.
 
@@ -638,6 +754,77 @@ def format_report(
             f"{r['avg_queue_min']:.1f}m | {r['max_queue_min']:.1f}m | "
             f"{format_status_counts(r.get('status_counts', {}))} |"
         )
+
+    # Queue wait over time — one big multi-line chart, one line per runner pool.
+    if queue_timeline and queue_timeline[1]:
+        sample_labels, series = queue_timeline
+        palette = ",".join(c for _, c in QUEUE_CHART_COLORS[: len(series)])
+        ymax = int(max(max(vals) for _, vals in series) * 1.1) + 5
+        x_cats = ", ".join(f'"{s}"' for s in sample_labels)
+        legend = "  ".join(
+            f"{emoji} `{lbl}`"
+            for (emoji, _), (lbl, _) in zip(QUEUE_CHART_COLORS, series)
+        )
+        lines.extend(
+            [
+                "",
+                "## Queue Wait Over Time",
+                "",
+                "Longest in-queue wait per runner pool across the window "
+                "(minutes). Queue time is per-pool — a queued job isn't on a "
+                "host yet, so it can't be attributed to a physical runner.",
+                "",
+                f"**Pools:** {legend}",
+                "",
+                "```mermaid",
+                '%%{init: {"xyChart": {"width": 1400, "height": 520}, '
+                '"themeVariables": {"xyChart": {"plotColorPalette": "'
+                + palette
+                + '"}}}}%%',
+                "xychart-beta",
+                '    title "Queue Wait Over Time (min, per runner pool)"',
+                f'    x-axis "Time (UTC)" [{x_cats}]',
+                f'    y-axis "Wait (min)" 0 --> {ymax}',
+            ]
+        )
+        for _, vals in series:
+            lines.append("    line [" + ", ".join(str(v) for v in vals) + "]")
+        lines.append("```")
+
+    # Running vs queued per hour — one bar+line chart per busy runner pool.
+    if load_buckets and load_buckets[1]:
+        bucket_labels, pools = load_buckets
+        x_cats = ", ".join(f'"{s}"' for s in bucket_labels)
+        lines.extend(
+            [
+                "",
+                "## Running vs Queued Per Hour",
+                "",
+                "Per runner pool: jobs **running** (🔵 line) and **queued** "
+                "(🟠 bars) during each bucket. Bars rising above the line mean "
+                "demand outran capacity and a backlog built up.",
+            ]
+        )
+        for lbl, running, queued in pools:
+            ymax = int(max(max(running), max(queued), 1) * 1.1) + 1
+            lines.extend(
+                [
+                    "",
+                    f"### {lbl}",
+                    "",
+                    "```mermaid",
+                    '%%{init: {"xyChart": {"width": 1200, "height": 340}, '
+                    '"themeVariables": {"xyChart": {"plotColorPalette": '
+                    '"#f58231,#4363d8"}}}}%%',
+                    "xychart-beta",
+                    f'    title "{lbl} — running (line) & queued (bars) per hour"',
+                    f"    x-axis [{x_cats}]",
+                    f'    y-axis "Jobs" 0 --> {ymax}',
+                    "    bar [" + ", ".join(str(v) for v in queued) + "]",
+                    "    line [" + ", ".join(str(v) for v in running) + "]",
+                    "```",
+                ]
+            )
 
     # Longest queue waits — links to the actual jobs, with live status, so the
     # worst waits (including jobs still queued/running right now) are one click
@@ -738,11 +925,16 @@ def main():
     parser.add_argument("--output", type=str, help="Output file (default: stdout)")
     args = parser.parse_args()
 
-    results, fetch_failure_pct, longest_waits = calculate_utilization(
-        args.repo, args.hours, args.filter
+    results, fetch_failure_pct, longest_waits, queue_timeline, load_buckets = (
+        calculate_utilization(args.repo, args.hours, args.filter)
     )
     report = format_report(
-        results, args.hours, fetch_failure_pct, longest_waits=longest_waits
+        results,
+        args.hours,
+        fetch_failure_pct,
+        longest_waits=longest_waits,
+        queue_timeline=queue_timeline,
+        load_buckets=load_buckets,
     )
 
     if args.output:
