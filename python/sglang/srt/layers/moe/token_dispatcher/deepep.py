@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -532,9 +531,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             # Use the default dispatch config for this group size
             # (Buffer is the deep_ep / zbal buffer already imported)
             dispatch_config = Buffer.get_dispatch_config(self.group.size())
-            
+
         # Now set the quant type if the config supports it (safe for CUDA)
-        if dispatch_config is not None and hasattr(dispatch_config, 'normal_quant_type'):
+        if dispatch_config is not None and hasattr(
+            dispatch_config, "normal_quant_type"
+        ):
             dispatch_config.normal_quant_type = self.get_normal_quant_type()
 
         _deepep_precompile_tp_barrier()
