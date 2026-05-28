@@ -277,7 +277,9 @@ class DataParallelController:
         for dp_rank in range(server_args.dp_size):
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
-            tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
+            tmp_port_args.detokenizer_ipc_name = port_args.scheduler_detokenizer_ipc(
+                dp_rank
+            )
             tmp_port_args.instance_id = port_args.instance_id
 
             # This port is checked free in PortArgs.init_new.
@@ -530,6 +532,9 @@ class DataParallelController:
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port
                     rank_port_args.instance_id = port_args.instance_id
+                    rank_port_args.detokenizer_ipc_name = (
+                        port_args.scheduler_detokenizer_ipc(dp_rank)
+                    )
 
                 reader, writer = mp.Pipe(duplex=False)
                 gpu_id = (
