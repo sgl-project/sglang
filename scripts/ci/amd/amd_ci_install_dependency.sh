@@ -317,6 +317,14 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
 fi
 
+# Apply gluon hotpatch for pre-installed AITER in CI images (idempotent; no-op on fixed aiter).
+if docker exec ci_sglang test -d /sgl-workspace/aiter 2>/dev/null; then
+    echo "[CI-AITER-CHECK] Applying gluon pa_mqa_logits instr_shape hotpatch (idempotent)..."
+    docker exec ci_sglang python3 \
+        /sglang-checkout/scripts/ci/amd/patch_aiter_gluon_pa_mqa_logits.py \
+        /sgl-workspace/aiter || true
+fi
+
 echo "[CI-AITER-CHECK] === AITER VERSION CHECK END ==="
 
 

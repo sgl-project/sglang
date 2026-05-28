@@ -120,6 +120,9 @@ sglang serve \
 The following ROCm command is an additional option for AMD GPUs and does not replace the NVIDIA instructions above.
 
 ```shell Command
+SGLANG_ROCM_FUSED_DECODE_MLA=0 \
+ROCM_QUICK_REDUCE_QUANTIZATION=INT4 \
+SAFETENSORS_FAST_GPU=1 \
 sglang serve \
   --model-path zai-org/GLM-5 \
   --tp 8 \
@@ -132,6 +135,8 @@ sglang serve \
   --host 0.0.0.0 \
   --port 30000
 ```
+
+GLM-5 uses DSA (not MLA): set `SGLANG_ROCM_FUSED_DECODE_MLA=0` on ROCm. `ROCM_QUICK_REDUCE_QUANTIZATION=INT4` and `SAFETENSORS_FAST_GPU=1` speed weight load on large checkpoints.
 
 ### 4.2 Basic Usage
 

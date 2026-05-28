@@ -151,7 +151,11 @@ export const GLM5Deployment = () => {
     const tpValue = hwConfig.tp;
     const memFraction = hwConfig.mem;
 
-    let cmd = 'sglang serve \\\n';
+    let cmd = '';
+    if (isAMD) {
+      cmd += 'SGLANG_ROCM_FUSED_DECODE_MLA=0 ROCM_QUICK_REDUCE_QUANTIZATION=INT4 SAFETENSORS_FAST_GPU=1 ';
+    }
+    cmd += 'sglang serve \\\n';
     cmd += `  --model-path ${modelName}`;
     cmd += ` \\\n  --tp ${tpValue}`;
 

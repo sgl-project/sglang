@@ -210,11 +210,14 @@ RUN pip uninstall -y aiter
 # block switching to commits that predate that rule (e.g. the current default
 # AITER_COMMIT_DEFAULT). The working tree was just produced by a fresh
 # `git clone` above, so there are no real user changes to preserve.
+COPY scripts/ci/amd/patch_aiter_gluon_pa_mqa_logits.py /tmp/patch_aiter_gluon_pa_mqa_logits.py
+
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
  && git submodule update --init --recursive \
- && pip install -r requirements.txt
+ && pip install -r requirements.txt \
+ && python3 /tmp/patch_aiter_gluon_pa_mqa_logits.py /sgl-workspace/aiter
 
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
