@@ -1659,11 +1659,11 @@ class SchedulerDisaggregationDecodeMixin:
                 new_prebuilt_batch
             )
             # Defensive: chunked prefill is a prefill-side concept; decode-side
-            # prebuilt batches shouldn't carry has_pending_chunk reqs. The
-            # waiting_queue invariant is checked by _assert_invariants in sync
-            # mode; the filter protects against any future code that would
-            # route a chunked req through the disagg decode path.
-            new_prebuilt_batch.filter_batch(only_decode_ready=True)
+            # prebuilt batches shouldn't carry intermediate-mode reqs.
+            modes = new_prebuilt_batch.output_process_mode or []
+            assert not any(
+                m.is_intermediate() for m in modes
+            ), "prebuilt batch carries intermediate-mode reqs"
             if not new_prebuilt_batch.is_empty():
                 if self.running_batch.is_empty():
                     self.running_batch = new_prebuilt_batch

@@ -2467,14 +2467,13 @@ class Scheduler(
         # Runs outside the last_batch block so stale requests are cleaned
         # even when no new batches arrive (e.g. traffic stops).
         if self.running_batch.is_prefill_only:
-            # Defensive only_decode_ready filter: the merge step above already
-            # drops mid-prefill / DLLM-intermediate reqs from last_batch, so
-            # running_batch shouldn't normally hold one. Keeping the filter
-            # ensures any leak in that invariant doesn't survive here; the
-            # dropped req remains in active_reqs and is re-admitted next iter
-            # via the inline chunked admission block in
-            # _get_new_batch_prefill_raw.
-            self.running_batch.filter_batch(only_decode_ready=True)
+            # Defensive: the last_batch filter+merge step above already drops
+            # mid-prefill / DLLM-intermediate reqs, so running_batch shouldn't
+            # hold any here.
+            modes = self.running_batch.output_process_mode or []
+            assert not any(
+                m.is_intermediate() for m in modes
+            ), "running_batch contains intermediate-mode reqs in is_prefill_only branch"
             if self.running_batch.is_empty():
                 self.running_batch.batch_is_full = False
 
@@ -2816,14 +2815,15 @@ class Scheduler(
             and new_batch.input_embeds is None
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
-            # only_decode_ready here is defensive — by design running_batch
-            # holds decode reqs only (the last_batch filter+merge step above
-            # already drops mid-prefill / DLLM-intermediate), and any dropped
-            # chunked-resume would still ride active_reqs to next iter's
-            # Stage A.
-            self.running_batch.filter_batch(
-                v1_spec_info_filtered=True, only_decode_ready=True
-            )
+            # v1_spec_info_filtered is functional spec-decoding state cleanup;
+            # the only_decode_ready filter was defensive (last_batch filter+merge
+            # above already drops mid-prefill / DLLM-intermediate) — replaced
+            # with assert below.
+            self.running_batch.filter_batch(v1_spec_info_filtered=True)
+            modes = self.running_batch.output_process_mode or []
+            assert not any(
+                m.is_intermediate() for m in modes
+            ), "running_batch contains intermediate-mode reqs before mix_with_running"
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
                 new_batch.mix_with_running(self.running_batch)
