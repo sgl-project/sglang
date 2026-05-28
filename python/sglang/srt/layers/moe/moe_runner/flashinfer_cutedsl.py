@@ -21,6 +21,10 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferCombineInput,
+        FlashinferDispatchOutput,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -217,8 +221,16 @@ def resolve_cutedsl_standard_scales(
     return w1_alpha, fc2_input_scale, w2_alpha, used_input_scale
 
 
-def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
+def ensure_cutedsl_wrapper(layer: torch.nn.Module, num_tokens: int = 0) -> None:
     """Lazily create CuteDslMoEWrapper and resolve scales on first forward.
+
+    Args:
+        layer: The FusedMoE layer module.
+        num_tokens: Current token count entering the MoE layer.  Used as
+            the buffer size for the non-a2a (allgather) path, where the
+            autotune dummy run passes req_to_token_pool.size * dp_size —
+            the worst-case post-allgather batch.  For the a2a path this
+            is ignored in favour of the dispatcher's workspace limit.
 
     The wrapper is created lazily (not in __init__ / create_weights) because
     it depends on final weight shapes and EP configuration.  The wrapper's
@@ -248,10 +260,19 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
 
     server_args = get_global_server_args()
     use_cuda_graph = server_args is not None and not server_args.disable_cuda_graph
-    max_num_tokens = max(
-        getattr(server_args, "cuda_graph_max_bs", None) or 512,
-        getattr(server_args, "chunked_prefill_size", None) or 8192,
-    )
+
+    # Buffer size must cover the worst-case token count the MoE layer can see.
+    # - A2A path: dispatch returns tensors flattened from
+    #   [ep_size, max_tokens_per_rank, ...].
+    # - Standard allgather path: dp_size * max local tokens per rank.
+    dispatcher = getattr(layer, "dispatcher", None)
+    if hasattr(dispatcher, "max_num_tokens"):
+        max_num_tokens = dispatcher.max_num_tokens * getattr(dispatcher, "ep_size", 1)
+    else:
+        # Standard allgather path: num_tokens from the first forward is
+        # req_to_token_pool.size * dp_size (the autotune dummy run's batch),
+        # which is the worst-case post-allgather token count.
+        max_num_tokens = max(num_tokens, 1)
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
     # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
     # buffers are normal tensors.  This call typically happens inside
@@ -375,6 +396,72 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     )
 
     return StandardCombineInput(hidden_states=output)
+
+
+@register_fused_func("flashinfer", "flashinfer_cutedsl")
+def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
+    dispatch_output: FlashinferDispatchOutput,
+    quant_info: CuteDslFp4MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> FlashinferCombineInput:
+    """CuteDSL fused func for flashinfer alltoall dispatcher.
+
+    Two cases depending on whether the dispatcher did FP4 quantization:
+    - bf16 input (SGLANG_MOE_NVFP4_DISPATCH=0): quantize with cutedsl's scale
+    - FP4 input (SGLANG_MOE_NVFP4_DISPATCH=1): pass through (same fp4_quantize params)
+    """
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferCombineInput,
+    )
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+
+    assert runner_config.activation == "silu", "Only silu is supported for CuteDSL MoE."
+    assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
+
+    hidden_states = dispatch_output.hidden_states
+    x_sf = dispatch_output.hidden_states_scale
+    topk_output = dispatch_output.topk_output
+    assert TopKOutputChecker.format_is_standard(topk_output)
+
+    topk_ids = topk_output.topk_ids
+    topk_weights = topk_output.topk_weights
+    if topk_ids.dtype != torch.int32:
+        topk_ids = topk_ids.to(torch.int32)
+
+    if x_sf is not None:
+        # NVFP4 dispatch, inputs are already quantized.
+        x_fp4 = hidden_states
+    else:
+        x_fp4, x_sf = fp4_quantize(
+            hidden_states,
+            quant_info.a1_scale,
+            sf_vec_size=_FP4_SF_VEC_SIZE,
+            is_sf_swizzled_layout=False,
+        )
+
+    output = quant_info.wrapper.run(
+        x=x_fp4,
+        x_sf=x_sf,
+        token_selected_experts=topk_ids,
+        token_final_scales=topk_weights,
+        w1_weight=quant_info.w13_weight,
+        w1_weight_sf=quant_info.w13_weight_sf,
+        w1_alpha=quant_info.w1_alpha,
+        fc2_input_scale=quant_info.a2_scale,
+        w2_weight=quant_info.w2_weight,
+        w2_weight_sf=quant_info.w2_weight_sf,
+        w2_alpha=quant_info.w2_alpha,
+    )
+
+    # Note: output contains routed expert results; shared_expert is handled separately
+
+    # Write into pre-allocated workspace buffer if available
+    if dispatch_output.moe_output is not None:
+        dispatch_output.moe_output.copy_(output)
+        output = dispatch_output.moe_output
+
+    return FlashinferCombineInput(hidden_states=output)
 
 
 @register_fused_func("deepep", "flashinfer_cutedsl")
