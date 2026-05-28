@@ -120,12 +120,10 @@ class BreakableCudaGraphRunner:
         self.attention_layers = model_runner.attention_layers
         self.moe_layers = model_runner.moe_layers
         self.moe_fusions = model_runner.moe_fusions
-        self.use_static_attn_metadata_replay = (
-            model_runner.attn_backend.use_static_metadata_replay_breakable_cuda_graph
+        self.use_captured_attn_metadata = (
+            model_runner.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
         )
-        self.attn_metadata_buffers = (
-            {} if self.use_static_attn_metadata_replay else None
-        )
+        self.attn_metadata_buffers = {} if self.use_captured_attn_metadata else None
 
         # Resolve the inner transformer-stack module (the same boundary PCG draws
         # via patch_model). At replay we monkey-patch this module's forward with
@@ -359,10 +357,10 @@ class BreakableCudaGraphRunner:
 
     def _init_forward_metadata_for_capture(self, forward_batch, num_tokens):
         attn_backend = self.model_runner.attn_backend
-        if not self.use_static_attn_metadata_replay:
+        if not self.use_captured_attn_metadata:
             attn_backend.init_forward_metadata(forward_batch)
             return
-        metadata = attn_backend.init_forward_metadata_capture_breakable_cuda_graph(
+        metadata = attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
             forward_batch
         )
         assert self.attn_metadata_buffers is not None
@@ -372,12 +370,12 @@ class BreakableCudaGraphRunner:
         self, forward_batch, static_forward_batch, num_tokens
     ):
         attn_backend = self.model_runner.attn_backend
-        if not self.use_static_attn_metadata_replay:
+        if not self.use_captured_attn_metadata:
             attn_backend.init_forward_metadata(forward_batch)
             return
         assert self.attn_metadata_buffers is not None
         metadata = self.attn_metadata_buffers[num_tokens]
-        attn_backend.copy_forward_metadata_replay_breakable_cuda_graph(
+        attn_backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
             metadata,
             forward_batch,
             static_forward_batch=static_forward_batch,

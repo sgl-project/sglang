@@ -165,7 +165,7 @@ class DSV4AttnMetadata:
             ],
         )
 
-    def copy_for_breakable_cuda_graph_replay_(self, other: DSV4AttnMetadata) -> None:
+    def refresh_for_breakable_cuda_graph_replay_(self, other: DSV4AttnMetadata) -> None:
         assert self.c4_sparse_topk == other.c4_sparse_topk
         assert self.page_size == other.page_size
         assert self.cuda_int32_kwargs == other.cuda_int32_kwargs
@@ -190,6 +190,8 @@ class DSV4AttnMetadata:
             "c4_flashmla_metadata",
             "c128_flashmla_metadata",
         ]
+        # Keep graph-captured tensor objects alive for fields that captured
+        # kernels read by address; overwrite only their contents.
         for field_name in tensor_copy_fields:
             src_val = getattr(other, field_name)
             dst_val = getattr(self, field_name)
@@ -198,9 +200,9 @@ class DSV4AttnMetadata:
             assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
             dst_val.copy_(src_val)
 
-        # c4_sparse_page_indices is produced by the captured indexer graph
-        # before the attention graph break reads it, so replay should not copy
-        # the freshly built value over that capture-owned buffer.
+        # These fields are safe to replace because captured kernels only need
+        # the current per-replay objects, or the field is produced inside the
+        # captured graph before the attention graph break consumes it.
         for field_name in reference_assign_fields:
             setattr(self, field_name, getattr(other, field_name))
 
@@ -323,8 +325,8 @@ class DSV4Metadata:
             self.c128_compress_metadata, src=other.c128_compress_metadata
         )
 
-    def copy_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
-        self.core_attn_metadata.copy_for_breakable_cuda_graph_replay_(
+    def refresh_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
+        self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
             static_metadata.core_attn_metadata
         )
         maybe_copy_inplace(self.indexer_metadata, src=static_metadata.indexer_metadata)
@@ -389,7 +391,7 @@ class _GraphBucket(enum.Enum):
 class DeepseekV4AttnBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
-    use_static_metadata_replay_breakable_cuda_graph: bool = True
+    use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
 
     def __init__(
         self,
@@ -832,7 +834,7 @@ class DeepseekV4AttnBackend(
 
         return metadata
 
-    def init_forward_metadata_capture_breakable_cuda_graph(
+    def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
     ):
         self.forward_metadata = self._build_forward_metadata(
@@ -842,7 +844,7 @@ class DeepseekV4AttnBackend(
         )
         return self.forward_metadata
 
-    def copy_forward_metadata_replay_breakable_cuda_graph(
+    def prepare_forward_metadata_for_breakable_cuda_graph_replay(
         self,
         capture_metadata,
         forward_batch: ForwardBatch,
@@ -858,7 +860,7 @@ class DeepseekV4AttnBackend(
             use_prefill_cuda_graph=True,
         )
         assert isinstance(capture_metadata, DSV4Metadata)
-        capture_metadata.copy_for_breakable_cuda_graph_replay_(static_metadata)
+        capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
         self.forward_metadata = capture_metadata
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
@@ -1408,7 +1410,7 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
-    def init_forward_metadata_capture_breakable_cuda_graph(
+    def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
     ):
         ret = []
@@ -1416,11 +1418,11 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
             ret.append(
                 self.attn_backends[
                     i
-                ].init_forward_metadata_capture_breakable_cuda_graph(forward_batch)
+                ].init_forward_metadata_for_breakable_cuda_graph_capture(forward_batch)
             )
         return ret
 
-    def copy_forward_metadata_replay_breakable_cuda_graph(
+    def prepare_forward_metadata_for_breakable_cuda_graph_replay(
         self,
         capture_metadata,
         forward_batch: ForwardBatch,
@@ -1429,7 +1431,9 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
     ) -> None:
         assert len(capture_metadata) == self.speculative_num_steps - 1
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].copy_forward_metadata_replay_breakable_cuda_graph(
+            self.attn_backends[
+                i
+            ].prepare_forward_metadata_for_breakable_cuda_graph_replay(
                 capture_metadata[i],
                 forward_batch,
                 static_forward_batch=static_forward_batch,
