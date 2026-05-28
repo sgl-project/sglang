@@ -61,9 +61,7 @@ _DEVICE = torch.device("cuda")
 
 
 # ---------------------------------------------------------------------------
-# Shared per-test scaffolding helpers. Each repeats >20 times across the file
-# and the call sites only ever vary a handful of fields, so keeping the
-# defaults here keeps individual tests focused on "input → expected violation".
+# Shared per-test scaffolding helpers.
 # ---------------------------------------------------------------------------
 
 
@@ -227,9 +225,7 @@ def _stamp_clean_kv_chain(
 
 
 # ---------------------------------------------------------------------------
-# Kernel-contract invariants (counter accounting, OFF-mode short-circuit,
-# chain-anchor, ring-reset). Each test asserts an absolute property of the
-# verify kernel that a CUDA-vs-ref diff cannot catch on its own.
+# Kernel-contract invariants.
 # ---------------------------------------------------------------------------
 
 
