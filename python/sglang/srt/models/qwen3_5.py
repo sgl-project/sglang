@@ -39,6 +39,12 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
 # Layers - Attention
+from sglang.srt.layers.attention.aiter_fused_qk_norm_rope import (
+    fused_qk_norm_rope_cache as aiter_fused_qk_norm_rope_cache,
+)
+from sglang.srt.layers.attention.aiter_fused_qk_norm_rope import (
+    is_available as aiter_fused_qk_norm_rope_available,
+)
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
@@ -885,6 +891,42 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         )
         return q, k, v, gate
 
+    def forward_prepare_aiter_fused(self, positions, hidden_states, forward_batch):
+        """ROCm/aiter fused path: qkv_proj -> [split + QK-RMSNorm + RoPE + KV-cache-write]
+        in a single Triton kernel.
+
+        Returns ``(q, k, v, gate)`` post-norm/post-RoPE. K and V are ALREADY written to
+        the KV cache; the caller must pass ``save_kv_cache=False`` to ``self.attn``.
+        """
+        qkv, _ = self.qkv_proj(hidden_states)
+
+        pool = forward_batch.token_to_kv_pool
+        k_buffer = pool.get_key_buffer(self.attn.layer_id)
+        v_buffer = pool.get_value_buffer(self.attn.layer_id)
+
+        q, gate, k, v = aiter_fused_qk_norm_rope_cache(
+            qkv,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            positions=positions,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+            slot_mapping=forward_batch.out_cache_loc,
+            num_q_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            page_size=pool.page_size,
+            eps=self.q_norm.variance_epsilon,
+            is_neox=getattr(self.rotary_emb, "is_neox_style", True),
+            attn_output_gate=self.attn_output_gate,
+            gated_qkv_layout="interleaved",
+            # TODO: thread FP8 KV scales when fp8_kv cache is enabled.
+            k_scale=getattr(self.attn, "k_scale", None),
+            v_scale=getattr(self.attn, "v_scale", None),
+        )
+        return q, k, v, gate
+
     def self_attention(
         self,
         positions: torch.Tensor,
@@ -892,23 +934,39 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        if (
-            not _is_npu
-            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-            or not self.attn_output_gate
-        ):
-            q, k, v, gate = self.forward_prepare_native(
-                positions=positions,
-                hidden_states=hidden_states,
-            )
-        else:
-            q, k, v, gate = self.forward_prepare_npu(
+        # ROCm fused path: split + QK-norm + RoPE + KV-cache-write in one kernel.
+        # Skip the subsequent in-attention cache write because the kernel did it.
+        use_aiter_fused = (
+            _is_hip
+            and aiter_fused_qk_norm_rope_available()
+            and self.partial_rotary_factor == 1.0
+        )
+
+        if use_aiter_fused:
+            q, k, v, gate = self.forward_prepare_aiter_fused(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+            attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=False)
+        else:
+            if (
+                not _is_npu
+                or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+                or not self.attn_output_gate
+            ):
+                q, k, v, gate = self.forward_prepare_native(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                )
+            else:
+                q, k, v, gate = self.forward_prepare_npu(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
 
-        attn_output = self.attn(q, k, v, forward_batch)
+            attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
