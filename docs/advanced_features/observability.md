@@ -15,6 +15,12 @@ By default, SGLang does not log any request contents. You can log them by using 
 You can control the verbosity by using `--log-request-level`.
 See [Logging](server_arguments.md#logging) for more details.
 
+You can change verbosity at runtime:
+
+```
+python3 -m sglang.srt.managers.configure_logging --url http://localhost:30000 --log-level=debug
+```
+
 ## Request Dump and Replay
 
 You can dump all requests and replay them later for benchmarking or other purposes.

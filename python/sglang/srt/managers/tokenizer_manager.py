@@ -1594,6 +1594,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         if obj.crash_dump_folder is not None:
             self.crash_dump_folder = obj.crash_dump_folder
+        if obj.log_level is not None:
+            logging.getLogger().setLevel(obj.log_level.upper())
+        self.send_to_scheduler.send_pyobj(obj)
         logging.info(f"Config logging: {obj=}")
 
     async def freeze_gc(self):
