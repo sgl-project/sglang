@@ -280,3 +280,6 @@ artifacts/
 
 # Humanize local loop state (never committed)
 .humanize*
+
+# RLCR active plan file (kept on disk, not tracked during the loop)
+development/loop5/refined_plan_v1.md
