@@ -32,6 +32,9 @@ from sglang.srt.mem_cache.utils import (
 
 
 class KVCacheEventMixin:
+    def _kv_event_store_metadata(self, node: Any, medium=None) -> dict[str, Any]:
+        return {}
+
     def _record_store_event(self, node: Any, medium=None):
         # One BlockStored per ``page_size`` chunk.
         # ``medium`` defaults to StorageMedium.GPU but callers may override
@@ -57,6 +60,7 @@ class KVCacheEventMixin:
             logical_len = len(node.key)
             is_bigram = node.key.is_bigram
             raw = node.key.token_ids
+            metadata = self._kv_event_store_metadata(node, medium)
             for start in range(0, logical_len, self.page_size):
                 end = min(start + self.page_size, logical_len)
                 if end <= start:
@@ -77,6 +81,7 @@ class KVCacheEventMixin:
                         block_size=len(page_tokens),
                         lora_id=None,
                         medium=medium,
+                        **metadata,
                     )
                 )
 

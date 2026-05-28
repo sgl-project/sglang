@@ -874,7 +874,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
-        self._record_store_event(new_node)
         return new_node
 
     def _unevict_node_on_insert(
@@ -891,7 +890,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(node)
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
-        self._record_store_event(node, medium=StorageMedium.GPU)
 
     def _insert_helper(
         self,
@@ -914,6 +912,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 node = self._split_node(node.key, node, prefix_len)
 
             if node.evicted:
+                old_parent = node.parent
                 self._unevict_node_on_insert(node, value[:prefix_len])
                 # FULL was restored from the request's fresh KV. Aux
                 # components (e.g. SWA) may still hold tombstones and need
@@ -927,9 +926,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         total_prefix_len=total_prefix_length,
                         params=params,
                     )
+                if node.parent is not None and node.parent is not old_parent:
+                    self._record_store_event(node.parent, medium=StorageMedium.GPU)
+                self._record_store_event(node, medium=StorageMedium.GPU)
             else:
                 value_slice = value[:prefix_len]
                 consumed_from = prefix_len
+                old_parent = node.parent
+                old_swa_valid_from = (
+                    self._swa_valid_from_for_event(node)
+                    if self.supports_swa()
+                    else None
+                )
                 # Let each component claim ownership of overlapping KV slots
                 for component in self._components_tuple:
                     comp_consumed_from = component.update_component_on_insert_overlap(
@@ -940,6 +948,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         params=params,
                     )
                     consumed_from = min(consumed_from, comp_consumed_from)
+                if self.supports_swa():
+                    new_swa_valid_from = self._swa_valid_from_for_event(node)
+                    if (
+                        new_swa_valid_from != old_swa_valid_from
+                        or node.parent is not old_parent
+                    ):
+                        if node.parent is not None and node.parent is not old_parent:
+                            self._record_store_event(
+                                node.parent, medium=StorageMedium.GPU
+                            )
+                        self._record_store_event(node, medium=StorageMedium.GPU)
 
                 dup_start = max(0, params.prev_prefix_len - total_prefix_length)
                 if dup_start < consumed_from:
@@ -970,10 +989,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # cleanup_after_caching_req can free them properly.
                 self.token_to_kv_pool_allocator.free(value)
                 return InsertResult(prefix_len=total_prefix_length)
+            insert_parent = node
             target_node = self._add_new_node(node, key, value)
             is_new_leaf = True
         else:
             target_node = node
+            insert_parent = node
 
         # Finalize: let each component attach its data to the target node.
         # e.g. Mamba attaches mamba_value to the leaf node
@@ -986,6 +1007,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 result=result,
             )
         if is_new_leaf:
+            if (
+                target_node.parent is not None
+                and target_node.parent is not insert_parent
+            ):
+                self._record_store_event(target_node.parent, medium=StorageMedium.GPU)
+            self._record_store_event(target_node, medium=StorageMedium.GPU)
             self._inc_hit_count(target_node, params.chunked)
         return result
 
@@ -1069,7 +1096,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     if EvictLayer.HOST in target:
                         assert cd.host_lock_ref == 0
                     self._evict_component_and_detach_lru(
-                        node, comp, target=target, tracker=tracker
+                        node,
+                        comp,
+                        target=target,
+                        tracker=tracker,
+                        emit_swa_kv_event_update=(
+                            trigger.component_type != BASE_COMPONENT_TYPE
+                        ),
                     )
 
         # Now that all components (including SWA which depends on Full.value)
@@ -1094,6 +1127,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         comp: TreeComponent,
         target: EvictLayer = EvictLayer.DEVICE,
         tracker: dict[ComponentType, int] = None,
+        emit_swa_kv_event_update: bool = True,
     ) -> tuple[int, int]:
         device_freed, host_freed = comp.evict_component(node, target=target)
         if tracker is not None:
@@ -1112,6 +1146,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 lru = lru_lists[ct]
                 if lru.in_list(node):
                     lru.remove_node(node)
+        if emit_swa_kv_event_update and ct == ComponentType.SWA:
+            full_cd = node.component_data[BASE_COMPONENT_TYPE]
+            if device_freed > 0 and full_cd.value is not None:
+                self._record_store_event(node, medium=StorageMedium.GPU)
+            if host_freed > 0 and full_cd.host_value is not None:
+                self._record_store_event(node, medium=StorageMedium.CPU)
         return device_freed, host_freed
 
     def _iteratively_delete_tombstone_leaf(
@@ -1282,7 +1322,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._record_remove_event(node, medium=StorageMedium.GPU)
                 for comp in self._components_tuple:
                     self._evict_component_and_detach_lru(
-                        node, comp, target=EvictLayer.ALL, tracker=tracker
+                        node,
+                        comp,
+                        target=EvictLayer.ALL,
+                        tracker=tracker,
+                        emit_swa_kv_event_update=False,
                     )
                 self.evictable_device_leaves.discard(node)
                 parent = node.parent
@@ -1303,7 +1347,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._record_remove_event(node, medium=StorageMedium.CPU)
         for comp in self._components_tuple:
             _, hf = self._evict_component_and_detach_lru(
-                node, comp, target=EvictLayer.ALL, tracker=None
+                node,
+                comp,
+                target=EvictLayer.ALL,
+                tracker=None,
+                emit_swa_kv_event_update=False,
             )
             tracker[comp.component_type] += hf
         self.evictable_host_leaves.discard(node)
@@ -1447,14 +1495,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             CacheTransferPhase.LOAD_BACK,
             [kv_xfer],
         )
-        for node in kv_xfer.nodes_to_load or ():
-            self._record_store_event(node, medium=StorageMedium.GPU)
         for ct, xfers in comp_xfers.items():
             self.components[ct].commit_hicache_transfer(
                 best_match_node,
                 CacheTransferPhase.LOAD_BACK,
                 xfers,
             )
+        loaded_nodes = []
+        loaded_node_ids = set()
+        for node in kv_xfer.nodes_to_load or ():
+            loaded_nodes.append(node)
+            loaded_node_ids.add(node.id)
+        for ct, xfers in comp_xfers.items():
+            if ct != ComponentType.SWA:
+                continue
+            for xfer in xfers:
+                for node in xfer.nodes_to_load or ():
+                    if node.id not in loaded_node_ids:
+                        loaded_nodes.append(node)
+                        loaded_node_ids.add(node.id)
+        for node in loaded_nodes:
+            self._record_store_event(node, medium=StorageMedium.GPU)
 
         self._update_evictable_leaf_sets(best_match_node)
         self.ongoing_load_back[best_match_node.id] = (
@@ -2176,6 +2237,47 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def supports_swa(self) -> bool:
         return ComponentType.SWA in self.components
+
+    def _kv_event_store_metadata(
+        self, node: UnifiedTreeNode, medium=None
+    ) -> dict[str, object]:
+        if not self.supports_swa():
+            return {}
+
+        sliding_window_size = self.sliding_window_size
+        if sliding_window_size is None:
+            return {}
+
+        metadata: dict[str, object] = {
+            "group_idx": 0,
+            "kv_cache_spec_kind": "full_attention",
+            "kv_cache_spec_sliding_window": int(sliding_window_size),
+        }
+        swa_valid_from = self._swa_valid_from_for_event(node, medium)
+        if swa_valid_from is not None:
+            metadata["swa_valid_from"] = int(swa_valid_from)
+        return metadata
+
+    def _node_has_swa_for_event(self, node: UnifiedTreeNode, medium=None) -> bool:
+        cd = node.component_data[ComponentType.SWA]
+        if medium in (StorageMedium.CPU, StorageMedium.CPU.value):
+            return cd.host_value is not None
+        return cd.value is not None
+
+    def _node_end_position(self, node: UnifiedTreeNode) -> int:
+        position = 0
+        cur = node
+        while cur is not None and cur != self.root_node:
+            position += len(cur.key)
+            cur = cur.parent
+        return position
+
+    def _swa_valid_from_for_event(
+        self, node: UnifiedTreeNode, medium=None
+    ) -> Optional[int]:
+        if not self._node_has_swa_for_event(node, medium):
+            return self._node_end_position(node)
+        return None
 
     def supports_mamba(self) -> bool:
         return ComponentType.MAMBA in self.components

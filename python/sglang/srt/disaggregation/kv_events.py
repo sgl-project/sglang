@@ -90,6 +90,17 @@ class BlockStored(KVCacheEvent):
     block_size: int
     lora_id: Optional[int]
     medium: Optional[str] = None
+    # Keep these fields after medium for array-like wire compatibility with
+    # consumers that already understand lora_name / extra_keys.
+    lora_name: Optional[str] = None
+    extra_keys: Optional[Any] = None
+    group_idx: Optional[int] = None
+    kv_cache_spec_kind: Optional[str] = None
+    kv_cache_spec_sliding_window: Optional[int] = None
+    # Scoped to this block's node. Consumers matching a longer prefix should
+    # aggregate this metadata along the matched block path and use the deepest
+    # non-None value.
+    swa_valid_from: Optional[int] = None
 
 
 class BlockRemoved(KVCacheEvent):
