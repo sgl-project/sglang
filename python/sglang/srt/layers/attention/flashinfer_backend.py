@@ -140,6 +140,7 @@ global_workspace_buffer = None
 # This is used to remove some host-to-device copy overhead.
 global_override_indptr_cpu = None
 
+
 def _get_kv_cache_quant_method(kv_pool):
     """Return the concrete KV quant method, unwrapping composite KV pools."""
     fallback = None
@@ -157,6 +158,7 @@ def _get_kv_cache_quant_method(kv_pool):
             return quant_method
         fallback = quant_method
     return fallback
+
 
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
