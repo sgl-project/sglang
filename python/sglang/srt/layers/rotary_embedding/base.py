@@ -423,7 +423,7 @@ class RotaryEmbedding(MultiPlatformOp):
         positions = torch.add(positions, offsets) if offsets is not None else positions
 
         # Fused_qk_rope only supports aligned head_size
-        if self.head_size in [64, 128, 256, 512]:
+        if self.head_size in [128, 256, 512]:
             num_tokens = positions.size(0)
             q_rope = query.view(num_tokens, -1, self.head_size)
             k_rope = key.view(num_tokens, -1, self.head_size)
