@@ -229,6 +229,11 @@ def _quantize_fp8_qkv(q, k, v, layer):
 
 
 global_zero_init_workspace_buffer = None
+# cute-dsl needs its own workspace: it overwrites the buffer with split-KV
+# partials, which corrupts the trtllm-gen multiCtasKv counters that rely on the
+# zero-init buffer (they share it under attention-backend=cutedsl_mla, where
+# draft-extend falls back to trtllm-gen) and deadlocks the reduction.
+global_cute_dsl_workspace_buffer = None
 
 
 @dataclass
@@ -263,6 +268,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
+        backend: str = "trtllm-gen",
     ):
         super().__init__(
             model_runner,
@@ -286,6 +292,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
 
         # Runtime parameters
+        self.backend = backend
         self.scaling = config.scaling
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
@@ -294,14 +301,26 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Workspace allocation
         self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
-        global global_zero_init_workspace_buffer
-        if global_zero_init_workspace_buffer is None:
-            global_zero_init_workspace_buffer = torch.zeros(
-                self.workspace_size,
-                dtype=torch.uint8,
-                device=model_runner.device,
-            )
-        self.workspace_buffer = global_zero_init_workspace_buffer
+        if self.backend == "cute-dsl":
+            # Separate buffer from trtllm-gen (see note above); safe to share
+            # among cute-dsl instances.
+            global global_cute_dsl_workspace_buffer
+            if global_cute_dsl_workspace_buffer is None:
+                global_cute_dsl_workspace_buffer = torch.zeros(
+                    self.workspace_size,
+                    dtype=torch.int8,
+                    device=model_runner.device,
+                )
+            self.workspace_buffer = global_cute_dsl_workspace_buffer
+        else:
+            global global_zero_init_workspace_buffer
+            if global_zero_init_workspace_buffer is None:
+                global_zero_init_workspace_buffer = torch.zeros(
+                    self.workspace_size,
+                    dtype=torch.int8,
+                    device=model_runner.device,
+                )
+            self.workspace_buffer = global_zero_init_workspace_buffer
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
@@ -577,6 +596,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
+    def init_mha_chunk_metadata(self, forward_batch: "ForwardBatch") -> None:
+        has_prefix = any(forward_batch.extend_prefix_lens_cpu)
+        fallback_to_flashinfer_impl = (
+            self.disable_chunked_prefix_cache and has_prefix
+        ) or is_in_piecewise_cuda_graph()
+        if fallback_to_flashinfer_impl:
+            super().init_mha_chunk_metadata(forward_batch)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
         # Delegate to parent for non-decode modes.
@@ -799,6 +826,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens_i32 = (
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
+        extra_kwargs = {"backend": self.backend} if self.backend != "trtllm-gen" else {}
         return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache,
@@ -811,6 +839,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             max_seq_len=max_seq_len,
             bmm1_scale=bmm1_scale,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+            **extra_kwargs,
         )
 
     def _run_prefill_kernel(
@@ -898,7 +927,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert (
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
-            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+            self.token_to_kv_pool.set_mla_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
 
@@ -924,7 +953,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             query = query.unsqueeze(1)
 
         # Prepare KV cache inline
-        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
 
         # Get metadata
@@ -1005,7 +1034,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert (
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
-            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+            self.token_to_kv_pool.set_mla_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
 
@@ -1046,7 +1075,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # Ensure query has shape [bs, num_draft_tokens, num_q_heads, head_dim]
             bs = forward_batch.batch_size
 
-            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
 
             q = q.to(self.data_type)
@@ -1144,7 +1173,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert k_rope is None
             chunk_idx = forward_batch.prefix_chunk_idx
 
-            out = torch.zeros(
+            out = torch.empty(
                 q.shape[0],
                 layer.tp_q_head_num,
                 layer.v_head_dim,
@@ -1187,7 +1216,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             return result
         else:
-            out = torch.zeros(
+            out = torch.empty(
                 q.shape[0],
                 q.shape[1],
                 v.shape[2],
@@ -1216,7 +1245,11 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
     """Multi-step draft backend for TRT-LLM MLA used by EAGLE."""
 
     def __init__(
-        self, model_runner: "ModelRunner", topk: int, speculative_num_steps: int
+        self,
+        model_runner: "ModelRunner",
+        topk: int,
+        speculative_num_steps: int,
+        backend: str = "trtllm-gen",
     ):
         super().__init__(model_runner, topk, speculative_num_steps)
 
@@ -1226,4 +1259,24 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
                 skip_prefill=True,
                 kv_indptr_buf=self.kv_indptr[i],
                 q_indptr_decode_buf=self.q_indptr_decode,
+                backend=backend,
+            )
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_metadata(forward_batch)
+
+    def init_forward_metadata_replay_cuda_graph(
+        self, forward_batch: ForwardBatch, bs: int
+    ):
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
+                bs,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                seq_lens_sum=None,
+                encoder_lens=None,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=forward_batch.spec_info,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
             )

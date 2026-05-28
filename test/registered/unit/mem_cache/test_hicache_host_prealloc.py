@@ -8,9 +8,9 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
-    NSATokenToKVPool,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -306,12 +306,12 @@ class TestHiCacheHostPrealloc(unittest.TestCase):
         self.assertTrue(host_pool.stop_observed)
         self.assertTrue(host_pool._buffer_ready)
 
-    def test_prealloc_factory_rejects_nsa_for_first_pr(self):
+    def test_prealloc_factory_rejects_dsa_for_first_pr(self):
         _, _, _, _, _, make_prealloc_host_kv_pool = _memory_pool_host_modules()
-        nsa_pool = object.__new__(NSATokenToKVPool)
-        with self.assertRaisesRegex(ValueError, "NSA host pools"):
+        dsa_pool = object.__new__(DSATokenToKVPool)
+        with self.assertRaisesRegex(ValueError, "DSA host pools"):
             make_prealloc_host_kv_pool(
-                nsa_pool,
+                dsa_pool,
                 host_to_device_ratio=2.0,
                 host_size=0,
                 page_size=1,
@@ -320,7 +320,7 @@ class TestHiCacheHostPrealloc(unittest.TestCase):
 
     def test_prealloc_factory_rejects_unknown_pool_type(self):
         # Cover the generic fallthrough in make_prealloc_host_kv_pool that
-        # rejects anything not MHA/MLA/NSA (Mamba, V4 paged, sidecars, etc.).
+        # rejects anything not MHA/MLA/DSA (Mamba, V4 paged, sidecars, etc.).
         _, _, _, _, _, make_prealloc_host_kv_pool = _memory_pool_host_modules()
         unknown_pool = SimpleNamespace(size=1, page_size=1)
         with self.assertRaisesRegex(ValueError, "does not support host pool type"):

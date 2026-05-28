@@ -674,15 +674,32 @@ class KimiK25ForConditionalGeneration(nn.Module):
             self.vision_tower = self.vision_tower.to(dtype=target_dtype)
             self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
+    @property
+    def model(self):
+        # Alias .model to .language_model so this class satisfies the piecewise
+        # CUDA graph gate, which checks `hasattr(model, "model")`.
+        return self.language_model
+
+    def __setattr__(self, name, value):
+        # Skip redundant self.model.model assignment in runner to avoid duplicate
+        # nn.Module registration.
+        if name == "model":
+            return
+        super().__setattr__(name, value)
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = self.vision_tower.device
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
         pixel_values = torch.cat([item.feature for item in items], dim=0).to(
             device=device, dtype=target_dtype
         )
-        grid_thws = torch.concat([item.image_grid_thw for item in items], dim=0).to(
-            device
-        )
+        image_grid_thws = []
+        for item in items:
+            grid_thw = item.model_specific_data.get("image_grid_thw")
+            if grid_thw is None:
+                grid_thw = item.model_specific_data["grid_thws"]
+            image_grid_thws.append(grid_thw)
+        grid_thws = torch.concat(image_grid_thws, dim=0).to(device)
 
         if self.use_data_parallel:
             image_embeds = run_dp_sharded_mrope_vision_model(
