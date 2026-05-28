@@ -53,6 +53,7 @@ class DraftBackendFactory:
             "flashmla": self._create_flashmla_decode_backend,
             "trtllm_mha": self._create_trtllm_mha_decode_backend,
             "trtllm_mla": self._create_trtllm_mla_decode_backend,
+            "cutedsl_mla": self._create_cutedsl_mla_decode_backend,
             "tokenspeed_mla": self._create_tokenspeed_mla_decode_backend,
             "dsa": self._create_dsa_decode_backend,
             "nsa": self._create_dsa_decode_backend,  # Deprecated alias for "dsa"
@@ -81,6 +82,8 @@ class DraftBackendFactory:
             "flashmla": self._create_flashmla_prefill_backend,
             "trtllm_mha": self._create_trtllm_mha_prefill_backend,
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
+            # cute-dsl MLA only supports decode; draft-extend falls back to trtllm-gen.
+            "cutedsl_mla": self._create_trtllm_mla_prefill_backend,
             "tokenspeed_mla": self._create_tokenspeed_mla_prefill_backend,
             "dsa": self._create_dsa_prefill_backend,
             "nsa": self._create_dsa_prefill_backend,  # Deprecated alias for "dsa"
@@ -188,7 +191,7 @@ class DraftBackendFactory:
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
 
-    def _create_trtllm_mla_decode_backend(self):
+    def _create_trtllm_mla_decode_backend(self, backend: str = "trtllm-gen"):
         if not get_global_server_args().use_mla_backend:
             raise ValueError(
                 "trtllm_mla backend requires MLA model (use_mla_backend=True)."
@@ -199,8 +202,14 @@ class DraftBackendFactory:
         )
 
         return TRTLLMMLAMultiStepDraftBackend(
-            self.draft_model_runner, self.topk, self.speculative_num_steps
+            self.draft_model_runner,
+            self.topk,
+            self.speculative_num_steps,
+            backend=backend,
         )
+
+    def _create_cutedsl_mla_decode_backend(self):
+        return self._create_trtllm_mla_decode_backend(backend="cute-dsl")
 
     def _create_tokenspeed_mla_decode_backend(self):
         if not get_global_server_args().use_mla_backend:
