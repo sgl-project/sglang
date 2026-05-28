@@ -627,7 +627,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.remote_instance_init_transfer_engine()
 
         if not self.is_draft_worker:
-            logger.info("Computing initial expert location metadata...")
             set_global_expert_location_metadata(
                 compute_initial_expert_location_metadata(
                     server_args=server_args,
@@ -635,7 +634,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     moe_ep_rank=self.moe_ep_rank,
                 )
             )
-            logger.info("Expert location metadata computed.")
             if self.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
                 logger.info(
                     f"Initial expert_location_metadata: {get_global_expert_location_metadata()}"
@@ -667,11 +665,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             vocab_size=self.model_config.vocab_size,
         )
         # Load the model
-        logger.info("Creating sampler and loading model...")
         self.sampler = create_sampler()
         self.load_model()
         self._prepare_moe_topk()
-        logger.info("Model loaded successfully.")
 
         # Load the expert backup client
         self.expert_backup_client = (
