@@ -509,7 +509,7 @@ class DeepSeekV4SingleKVPoolHost(HiSparseHostPoolMixin):
             assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
             data_ptrs.append(buf.data_ptr())
             data_lens.append(buf.nbytes)
-            item_lens.append(buf[0].nbytes)
+            item_lens.append(self.page_size * buf[0].nbytes)
 
         return data_ptrs, data_lens, item_lens
 

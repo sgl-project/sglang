@@ -62,12 +62,14 @@ class TestDeepSeekV4SingleKVPoolHostGetContiguousBufInfos(unittest.TestCase):
         for i in range(layer_num):
             self.assertEqual(data_lens[i], host_pool.kv_buffer[i].nbytes)
 
-    def test_item_lens_match_row_sizes(self):
-        """Item lengths should match the byte size of one row in each layer."""
-        host_pool = self._make_host_pool(layer_num=2, dim=128)
+    def test_item_lens_match_page_sizes(self):
+        """Item lengths should match the byte size of one page in each layer."""
+        host_pool = self._make_host_pool(layer_num=2, dim=128, page_size=16)
         data_ptrs, data_lens, item_lens = host_pool.get_contiguous_buf_infos()
         for i in range(2):
-            self.assertEqual(item_lens[i], host_pool.kv_buffer[i][0].nbytes)
+            self.assertEqual(
+                item_lens[i], host_pool.page_size * host_pool.kv_buffer[i][0].nbytes
+            )
 
 
 if __name__ == "__main__":
