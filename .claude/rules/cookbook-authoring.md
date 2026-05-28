@@ -172,12 +172,13 @@ for this model. Recognised axis keys and their schemas (full reference in
 
 | Axis key | Widget | Use when |
 |---|---|---|
-| `attention` | TP / DP / CP / DP-Attention sub-knobs | Model exposes parallelism knobs in §3.1 cells and you want users to override them. |
+| `attention` | TP / CP / DP-Attention sub-knobs (DP-Attention is a combined knob: its value is the DP degree AND toggles `--enable-dp-attention`) | Model exposes parallelism knobs in §3.1 cells and you want users to override them. |
 | `moe` | Backend select + EP knob | Model is MoE and supports multiple `--moe-*-backend` choices. |
 | `parsers` | Multi-toggle | Model has reasoning / tool-call parsers. |
 | `speculative` | Single-select | Model has spec-decoding presets you want to expose. |
-| `pdDisagg` | Mode + IB device | Model supports prefill/decode disaggregation. |
+| `pdDisagg` | Mode + transfer backend (+ optional per-backend env via `envWhen` hw-gate) + IB device | Model supports prefill/decode disaggregation. |
 | `hicache` | Enable + storage + write policy | Model is large enough that hierarchical KV cache matters. |
+| `hisparse` | Enable + host-ratio select; whole card gated on the live PD-Disagg mode being `decode` | DSA-style model (DeepSeek-V3.2 / V4, GLM-5) that supports decode-side hierarchical sparse attention. |
 | `megamoe` | Single-select with hw/strategy gating | Blackwell-only kernel fusion variant. |
 
 **Per-chip constraints**: any chip entry in any axis can be wrapped with

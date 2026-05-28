@@ -37,7 +37,7 @@ The Playground is where you experiment with **SGLang features beyond the verifie
 
 The knobs come in two flavors:
 
-- **Built-in SGLang features** — parallelism overrides (TP / CP / DP-Attention — DP-Attention's value is the DP degree, with `off` to disable), MoE backend + EP, reasoning / tool-call parsers, speculative-decoding presets, prefill/decode disaggregation, HiCache tiers.
+- **Built-in SGLang features** — parallelism overrides (TP / CP / DP-Attention — DP-Attention's value is the DP degree, with `off` to disable), MoE backend + EP, reasoning / tool-call parsers, speculative-decoding presets, prefill/decode disaggregation, HiCache tiers, and HiSparse hierarchical sparse attention (decode-role only — the card appears once PD-Disagg mode is set to decode).
 - **DeepSeek-V4 specific features** — MegaMoE W4A8 / W4A4 fused kernel (Blackwell only).
 
 Lines highlighted **green** are added by your overrides; lines with **red strikethrough** were in the verified base but stripped by an override. When no override differs from the base cell, the playground inherits the base's **Verified** badge; any actual change flips it to **Not Verified** until the new configuration is run end-to-end and submitted back.

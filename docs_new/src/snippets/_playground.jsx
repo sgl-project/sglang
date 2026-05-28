@@ -32,6 +32,9 @@
 //                   envWhen hw-gate) + ibDevices[] (engine handles role
 //                   banner + single-host bootstrap port internally)
 //     hicache     — backends[] + writePolicies[]
+//     hisparse    — requiredFlags[] + config{} + hostRatios[] +
+//                   defaultHostRatio (decode-only: card gated on the live
+//                   PD-Disagg mode == "decode" via cross-axis fact pdMode)
 //     megamoe     — requiresHw + excludesStrategy + stripEnv + options[]
 //                   (axis-level gating + env mutation)
 //
@@ -942,6 +945,89 @@ export const Playground = ({ config }) => {
       },
     },
 
+    // ---- Axis: HiSparse (hierarchical sparse attention) ---------------------
+    // Enable toggle + host_to_device_ratio select. Engine OWNS the
+    // `--enable-hisparse` / `--hisparse-config` flags PLUS the required
+    // decode-side companions declared in `fc.requiredFlags`
+    // (`--kv-cache-dtype bfloat16`, `--nsa-decode-backend flashmla_sparse`).
+    // All are stripped unconditionally and re-added only when enabled.
+    //
+    // HiSparse is a DECODE-INSTANCE-ONLY optimization that requires PD
+    // disaggregation (per docs/advanced_features/hisparse_guide.mdx), so it
+    // is gated TWO ways:
+    //   - render hides the whole card unless the live PD-Disagg mode is
+    //     `decode` (cross-axis fact `base.pdMode`); and
+    //   - apply only emits when `--disaggregation-mode decode` is already in
+    //     the flag list. pdDisagg's apply runs BEFORE this axis (declaration
+    //     order), so that flag is present by the time we check — this keeps
+    //     emission correct even if the enable toggle is left on while the
+    //     user flips PD-Disagg away from decode.
+    // top_k / device_buffer_size come from `fc.config`; only the memory-
+    // dependent host_to_device_ratio is exposed as a knob.
+    hisparse: {
+      initState: (fc) => ({ enable: false, hostRatio: (fc && fc.defaultHostRatio) || null }),
+
+      revertHidden: (value, fc, base, h) => {
+        // hostRatio chips carry no hide constraints today; nothing to revert.
+        // Card visibility (PD decode) is enforced in render + the apply decode
+        // gate, NOT here — revertHidden only sees the clean 5-dim base.
+        if (value.hostRatio !== null && fc.hostRatios
+            && h.isHidden(fc.hostRatios, value.hostRatio, base)) {
+          return { ...value, hostRatio: (fc && fc.defaultHostRatio) || null };
+        }
+        return value;
+      },
+
+      apply: ({ flags, env, value, fc, h }) => {
+        const ownedHeads = [
+          "--enable-hisparse", "--hisparse-config",
+          ...((fc.requiredFlags || []).map((f) => f.split(/\s/)[0])),
+        ];
+        flags = h.stripFlagsByFirstToken(flags, ownedHeads);
+        // Decode-instance gate: pdDisagg (which runs first) inserts
+        // `--disaggregation-mode decode` when that role is picked.
+        const isDecode = flags.includes("--disaggregation-mode decode");
+        if (value.enable && isDecode) {
+          const ratio = (value.hostRatio !== null && value.hostRatio !== undefined)
+            ? value.hostRatio
+            : (fc.defaultHostRatio || 10);
+          const cfg = { ...(fc.config || {}), host_to_device_ratio: ratio };
+          const adds = [
+            ...(fc.requiredFlags || []),
+            "--enable-hisparse",
+            `--hisparse-config '${JSON.stringify(cfg)}'`,
+          ];
+          flags = h.insertBeforeTail(flags, adds);
+        }
+        return { flags, env };
+      },
+
+      render: ({ axisId, value, setValue, fc, base, s, renderChip, renderSelect }) => {
+        // Decode-only: hide the card unless PD-Disagg mode is decode.
+        if (base.pdMode !== "decode") return null;
+        const setSlot = (k, v) => setValue({ ...value, [k]: v });
+        const hasRatios = (fc.hostRatios || []).length > 0;
+        return (
+          <div key={axisId} style={s.card}>
+            <div style={s.compactRow}>
+              <span style={s.axisTitle}>HiSparse</span>
+              <span style={s.field}>
+                {renderChip("Enable", value.enable, true,
+                  () => setSlot("enable", !value.enable))}
+              </span>
+              {hasRatios && (
+                <span style={s.field}>
+                  <span style={s.fieldLabel}>Host ratio</span>
+                  {renderSelect(value.hostRatio, fc.hostRatios,
+                    (v) => setSlot("hostRatio", v), base)}
+                </span>
+              )}
+            </div>
+          </div>
+        );
+      },
+    },
+
     // ---- Axis: Hierarchical KV Cache ----------------------------------------
     // Enable toggle + optional backend + optional write policy. Engine OWNS
     // the `--hicache-*` family of flags (unconditional strip). Emission
@@ -1759,6 +1845,10 @@ export const Playground = ({ config }) => {
   //              the explicit Attention-card override if set, else the
   //              value derived from the base cell. A positive DP degree
   //              (or boolean true) is "on"; false / 0 / null is "off".
+  //   pdMode   — the live PD-Disaggregation role ("off" / "prefill" /
+  //              "decode"). PD is a playground-only axis (no base derive),
+  //              so this reads straight from the delta. Used to gate the
+  //              decode-only HiSparse card.
   const attnDelta   = deltas.attention || {};
   const attnDerived = derivedMap.attention || {};
   const effDpAttn = (attnDelta.dpAttn !== null && attnDelta.dpAttn !== undefined)
@@ -1766,7 +1856,8 @@ export const Playground = ({ config }) => {
     : (attnDerived.dpAttn !== undefined ? attnDerived.dpAttn : null);
   const dpAttnOn = (effDpAttn === true)
     || (typeof effDpAttn === "number" && effDpAttn > 0);
-  const constraintBase = { ...base, dpAttnOn };
+  const pdMode = (deltas.pdDisagg && deltas.pdDisagg.mode) || "off";
+  const constraintBase = { ...base, dpAttnOn, pdMode };
 
   let baseCommand = "";
   let playgroundCommand = "";

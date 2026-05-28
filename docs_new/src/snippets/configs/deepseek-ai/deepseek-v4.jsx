@@ -287,7 +287,34 @@ export const config = {
       writePolicies: ["auto", "write_through", "write_back", "write_through_selective"],
     },
 
-    // ----- Card 7: "MegaMoE" — single-select chip group, Blackwell-only -----
+    // ----- Card 7: "HiSparse" — decode-only hierarchical sparse attention -----
+    // HiSparse keeps only a small hot KV buffer on GPU and the full KV in CPU
+    // pinned memory, swapping in the top-k entries on demand. It is a
+    // DECODE-INSTANCE optimization that requires PD disaggregation, so the
+    // engine only shows this card when §3.3's PD-Disagg mode is `decode`, and
+    // only emits its flags on a decode-role command.
+    //
+    //   requiredFlags    — decode-side companions emitted alongside
+    //                      --enable-hisparse (engine strips + re-adds them).
+    //   config           — base hisparse-config JSON; the engine adds the
+    //                      selected host_to_device_ratio before serializing.
+    //   hostRatios       — host_to_device_ratio options. Tune by host RAM
+    //                      (~1TB → 5, ~2TB → 10) per the HiSparse guide.
+    // See docs/advanced_features/hisparse_guide.mdx.
+    hisparse: {
+      requiredFlags: [
+        "--kv-cache-dtype bfloat16",
+        "--nsa-decode-backend flashmla_sparse",
+      ],
+      config: { top_k: 2048, device_buffer_size: 6144 },
+      hostRatios: [
+        { id: 5,  label: "5 (~1TB host)" },
+        { id: 10, label: "10 (~2TB host)" },
+      ],
+      defaultHostRatio: 10,
+    },
+
+    // ----- Card 8: "MegaMoE" — single-select chip group, Blackwell-only -----
     // MegaMoE fuses MoE dispatch + GEMM into a single kernel for higher MoE
     // throughput. Only runnable on Blackwell GPUs — `requiresHw` tells the
     // engine to hide this card when the base cell's hw is outside the list.
