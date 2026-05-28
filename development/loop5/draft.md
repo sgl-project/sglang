@@ -3,12 +3,24 @@
 ## Objective
 
 Get a **demonstrable Double Sparsity (DS) MVP** running end-to-end on
-the 2-node H200 cluster as fast as possible. The MVP is: DS-on
-DeepSeek-V3.2 (FP8) serves real requests on H200 with comparable
-quality to the DSA baseline, and we have a single benchmark JSON +
-quality smoke artifact pair to show for it. It does **not** need to
-hit the directional TPS gate, prove FP8 scale stability, or close
-the radix-cache flip. Those are post-MVP follow-ups.
+the 2-node H200 cluster as fast as possible, without confusing a
+hardware smoke milestone with the loop4-complete MVP.
+
+There are two deliverables:
+
+1. **Smoke MVP:** DS-on DeepSeek-V3.2 (FP8) serves real requests on
+   H200, produces non-trivial DS selection, has one DS benchmark JSON
+   + one DSA benchmark JSON, and passes the paired quality smoke.
+2. **Loop4-compatible MVP:** the smoke milestone plus the loop4
+   requirements needed to claim comparable default-cookbook behavior:
+   TP=8, FP8 KV, page size 64, CUDA graphs represented, chunked
+   prefill probed, radix cache enabled for the final run, DSA baseline
+   captured with matching knobs, AC-11 comparator run, and AC-12 full
+   quality gate run.
+
+If AC-10 radix, AC-11 comparator, or AC-12 full quality are missing,
+the result is a useful smoke milestone, not the minimal viable working
+version requested by loop4.
 
 ## Why a new loop
 
@@ -37,6 +49,20 @@ That single missing file is the actual root blocker.
 
 ## MVP scope — IN
 
+0. **Close the Round 38 AC-10 producer bug before claiming radix-on.**
+   The current capture producer path is unreachable: `_write_token_labels`
+   does not accept `forward_batch`, but the capture branch references it
+   and then hides the failure. Fix this first:
+   - update `_write_token_labels(..., forward_batch: Optional[ForwardBatch] = None)`;
+   - pass the live `forward_batch` at the extend, decode, and TRT-LLM
+     call sites;
+   - keep token-label writes first and publish radix capture only when
+     `forward_batch` is present and the mode is extend;
+   - add the producer-side regression required by Round 38;
+   - verify `/generate` exposes non-empty
+     `meta_info["double_sparsity_radix_capture"]` when
+     `SGLANG_DS_RADIX_FIXTURE_CAPTURE=1`.
+
 1. **Generate the channel mask** (`task-ac4-hwrun`). Single GPU,
    `--tp 1`, ~15–30 min wall-clock. Unblocks every DS-on AC.
    Output: `/models/dsv32-fp8-channel-mask.safetensors`. Validate
@@ -60,8 +86,13 @@ That single missing file is the actual root blocker.
    - DS run: boot `serve_double_sparsity.sh`, run
      `development/benchmark.sh` with the same operating point.
      ~30 min total.
-   - Both with `--disable-radix-cache` (radix-on is post-MVP).
-   - Both at single trial each (3-trial AC-11 sweep is post-MVP).
+   - A radix-off DS run is allowed only as a smoke/debug run. The
+     final loop4-compatible MVP run must close AC-10 and run DS and
+     DSA with radix cache enabled.
+   - A single trial is allowed only for the smoke milestone. The final
+     comparable-performance run uses the AC-11 shape: conc 16 / 32 /
+     64, 3 trials, 120s warmup, 600s measurement window, median
+     comparison.
 
 4. **Quality smoke** (`task-ac8-quality`). Boot both servers
    simultaneously on different ports; run
@@ -69,38 +100,52 @@ That single missing file is the actual root blocker.
    DSA outputs on 20 deterministic prompts. Gates: prefix-match
    ≥ 0.80, ROUGE-L ≥ 0.85, NIAH-mini 4/5. ~5 min.
 
-That is the MVP. Demonstrable: one DS benchmark JSON, one DSA
+That is the smoke MVP. Demonstrable: one DS benchmark JSON, one DSA
 benchmark JSON, one quality smoke artifact, side-by-side. Enough
 to say "DS works on V3.2 FP8 with comparable quality at the
 locked Option B operating point."
 
-## MVP scope — EXPLICITLY OUT (post-MVP)
+The loop4-compatible MVP additionally requires radix-on final serving,
+AC-11 comparator evidence, and AC-12 full quality evidence.
 
-These are real plan items but are NOT on the MVP critical path:
+## Smoke-only items that are NOT enough for loop4 MVP
 
-- **AC-10 radix-cache flip.** `--disable-radix-cache` stays in the
-  DS launcher. The two M3-B fixtures (label capture + FP8 store-
-  path scale stability) and the `record_radix_fixture_passed`
-  helper exist (Round 35–38 work) but we don't need a radix-on
-  config to demo DS. Post-MVP: run the fixtures, flip the guard.
-- **AC-11 directional comparator.** The 3-trial DSA + DS sweep
-  at conc=64 with 120s warmup + 600s window + median + comparator
-  is overbuilt for an MVP. We use single-trial bench_serving runs
-  to size the gap; full AC-11 is a follow-up after MVP.
-- **AC-6 CUDA-graph capture validation.** Eager-mode DS is the
-  default and already exercises the kernel. Capture validation
-  comes after MVP if perf demands it.
-- **AC-1b chunked-prefill probe.** Cheap to run later; not
-  MVP-gating.
-- **AC-12 full NIAH 4K/16K/64K + MMLU 5-shot.** The 5-minute
-  quality smoke (AC-8.b) is enough for MVP. The full gate is
-  post-MVP.
+These are allowed to defer only for the smoke milestone. They are not
+allowed to remain deferred when claiming the loop4-compatible MVP:
+
+- **AC-10 radix-cache flip.** Radix-off is acceptable for first boot
+  and bench smoke only. To claim default-cookbook comparable behavior,
+  run the M3-B fixtures, prove producer capture works, flip the guard,
+  remove `--disable-radix-cache` from the final DS launch, and run the
+  final comparator with radix cache on.
+- **AC-11 directional comparator.** Single-trial bench_serving runs
+  size the gap but do not prove comparable speed/performance. The final
+  result needs the 3-trial DSA + DS sweep at conc 16 / 32 / 64 with
+  120s warmup, 600s measurement, medians, DS TPS within 5% of DSA, and
+  DS P99 TTFT no worse than 1.10x DSA.
+- **AC-6 CUDA-graph capture validation.** Eager-mode DS is useful for
+  diagnosis, but the client asks for performant knobs. The final bundle
+  must record whether CUDA graphs are enabled and must include a clear
+  exception if capture cannot be used.
+- **AC-1b chunked-prefill probe.** Run and record the probe. If it
+  passes, keep the default chunked-prefill setting. If it fails, disable
+  it on both DS and DSA for apples-to-apples evidence and file the
+  follow-up.
+- **AC-12 full NIAH 4K/16K/64K + MMLU 5-shot.** The 5-minute quality
+  smoke gates whether to continue, but the full gate is required before
+  declaring loop4 MVP complete.
 
 ## Critical path (concrete commands)
 
 ```bash
 # 0. Sanity
 nvidia-smi --query-gpu=index,name,memory.free --format=csv
+
+# 0a. Before radix-on claims
+# Patch the Round 38 AC-10 producer bug and verify:
+#   SGLANG_DS_RADIX_FIXTURE_CAPTURE=1 /generate returns
+#   meta_info["double_sparsity_radix_capture"] with non-empty
+#   per-token and per-layer evidence.
 
 # 1. Channel mask (~15-30 min, single GPU)
 mkdir -p /models
@@ -154,6 +199,21 @@ python development/benchmark_compare.py \
 DS_BASE_URL=http://127.0.0.1:30000 \
 DSA_BASE_URL=http://127.0.0.1:30001 \
   pytest test/manual/test_dsv32_quality_smoke.py -v
+
+# 8. Final loop4-compatible comparator, after AC-10 radix flip
+# Ensure the DS launcher no longer passes --disable-radix-cache.
+TRIALS=3 WARMUP_SECONDS=120 MEASUREMENT_WINDOW_S=600 \
+MODE=native_nsa CONCURRENCIES="16 32 64" \
+  bash development/benchmark_baseline.sh
+
+TRIALS=3 WARMUP_SECONDS=120 MEASUREMENT_WINDOW_S=600 \
+MODE=double_sparsity CONCURRENCIES="16 32 64" \
+  bash development/benchmark.sh
+
+# 9. Full quality gate
+DS_BASE_URL=http://127.0.0.1:30000 \
+DSA_BASE_URL=http://127.0.0.1:30001 \
+  pytest test/manual/test_double_sparsity_v32.py -v
 ```
 
 ## Acceptance evidence — what "MVP done" looks like
@@ -165,6 +225,12 @@ containing:
   output.
 - `serve_*.log` for both DS and DSA boots (showing no crashes,
   validator accepted, all 8 GPUs visible).
+- Branch and commit SHA.
+- Full server args from `/get_server_info`.
+- Knob evidence: TP value, `kv_cache_dtype=fp8_e4m3`, `page_size=64`,
+  CUDA graph status, radix cache status, chunked-prefill setting,
+  DS config path, mask content hash, and whether overlap scheduling /
+  piecewise CUDA graph remain disabled under Option B.
 - Six bench JSONLs: `native_nsa_*c{16,32,64}_t1.jsonl` and
   `double_sparsity_*c{16,32,64}_t1.jsonl` plus matching `.meta.json`
   sidecars.
@@ -172,11 +238,21 @@ containing:
   AC-7/AC-8 report — TPS, TTFT, no-op detector).
 - `dsv32_quality_smoke_*.json` with prefix-match / ROUGE-L /
   NIAH-mini numbers for the paired DS/DSA run.
+- Final loop4-compatible evidence, when claiming MVP complete:
+  - radix-on DS and DSA launch evidence;
+  - AC-11 3-trial comparator artifacts and pass/fail summary;
+  - AC-12 NIAH 4K/16K/64K + MMLU 5-shot artifacts and pass/fail
+    summary.
 
-The MVP narrative: "DS-on V3.2 FP8 serves at the locked Option B
+The smoke narrative: "DS-on V3.2 FP8 serves at the locked Option B
 operating point. Side-by-side with DSA at conc 16/32/64. Quality
 smoke passes on 20 paired prompts. Here's the bench JSON and the
 comparator report."
+
+The loop4 MVP narrative adds: "The final run used matching production
+knobs, including radix cache enabled; CUDA graph and chunked-prefill
+status are recorded; AC-11 comparator and AC-12 quality gates are
+complete."
 
 ## Risks + likely failure modes
 
@@ -195,8 +271,9 @@ comparator report."
    (a) DS labels are bad → re-check calibrate output, or
    (b) prompts are too short / sensitive. Investigate by running
    ROUGE-L only on long-output prompts first.
-5. **TPS gap > 5%.** Acceptable for MVP. Note it; size it; ship.
-   Tuning is post-MVP.
+5. **TPS gap > 5%.** Acceptable for the smoke milestone. Not
+   acceptable for the loop4-compatible MVP unless the artifact is
+   explicitly reported as an AC-11 failure requiring follow-up tuning.
 
 ## Loop-runner notes
 
@@ -207,4 +284,6 @@ comparator report."
   just code changes. If a round did not produce an artifact, it
   stalled.
 - The existing loop-4 code stays as-is unless a specific bench
-  failure mode requires patching it.
+  failure mode requires patching it. The Round 38 AC-10 producer
+  bug is the one known exception that must be patched before a
+  radix-on or default-cookbook parity claim.

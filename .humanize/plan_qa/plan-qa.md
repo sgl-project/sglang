@@ -2,459 +2,231 @@
 
 ## Summary
 
-Processed 26 comment blocks (CRITICAL, MAJOR, SEQ, TEST, LT, RISK, SMELL, CODEX-AGREE tags) from `development/loop4/plan.md`. Two rounds of external Codex review were incorporated alongside pensieve architectural review. Primary changes: (1) corrected the CRITICAL-1 k-dimension error (kv_b_proj projection required at write time); (2) updated calibration to paper-faithful Method 1 Q·K (confirmed from original DoubleSparse paper source); (3) added missing `task-ac0-deepseek-v2`; (4) fixed score tensor shape [bs, max_tokens]; (5) corrected task sequencing for AC-1b, AC-6 dependency on M2; (6) added reproducibility mechanics to AC-11 gate; (7) added stale-slot negative test to AC-2. All comments fully resolved; plan converges.
-
----
+This refinement processed **19 comment blocks** added to `development/loop5/plan.md` during a two-stage annotated review (a pensieve/Linus-style pass and a Codex adjudication pass, plus one user note). Classification: **0 questions, 18 change requests, 1 research request**. All 19 were resolved — the research request was answered by reading the actual code, every change request was applied to the refined plan, and the user's note resolved the one outstanding decision (DEC-5). The most consequential edits were: collapsing the analyze-only "design the AC-10 flip" task into direct implementation (removing the Loop-4-style drift trap), correcting the calibration framing (the load IS a bare HF `from_pretrained`, so `device_map="auto"` is the right hook; the real risk is FP8 block-quant shard-loading), moving the CUDA-graph evidence to the first boot, relabeling the smoke-comparator task as a consumer of AC-8/AC-9, and pinning down `MODEL_PATH` override. No pending decisions remain; convergence status is `converged`.
 
 ## Comment Ledger
 
 | CMT-ID | Classification | Location | Original Text (excerpt) | Disposition |
 |--------|----------------|----------|-------------------------|-------------|
-| CMT-1 | research_request | Goal Description | "CRITICAL-1: The `k` argument at `set_mla_kv_buffer` is the MLA latent key (512-d)..." | researched + applied |
-| CMT-2 | change_request | AC-0 | "CRITICAL-3: `validator.py` reads `nsa_prefill_backend`... dead attribute names..." | applied |
-| CMT-3 | change_request | AC-0 | "CRITICAL-4: `device_buffer_size=4096`... covers only ~5% of a typical H200 KV pool..." | applied |
-| CMT-4 | change_request | AC-0 | "SEQ-2: `deepseek_v2.py` changes are missing from the task table entirely..." | applied |
-| CMT-5 | change_request | AC-0 | "TEST-2: AC-13 'green after every code change'... impossible during AC-0 development..." | applied |
-| CMT-6 | change_request | AC-0 | "CODEX-AGREE: TEST-2/3/4: confirmed..." | applied (folded into CMT-5/CMT-12/CMT-14) |
-| CMT-7 | change_request | AC-2 | "LT-2: 'Freed/evicted KV slots do not produce persistent label pollution'... not proved..." | applied |
-| CMT-8 | change_request | AC-2 | "CODEX-AGREE: LT-2/TEST-5: save_kv_cache=False fused path... AC-7 needs to pin..." | applied (folded into CMT-7/CMT-15) |
-| CMT-9 | research_request | AC-4 | "MAJOR-6: `calibrate.py` computes L2-squared K importance... not Q·K..." | researched + applied |
-| CMT-10 | change_request | AC-4 | "MAJOR-5: `--model-arch deepseek_v3` flag doesn't exist in calibrate.py..." | applied |
-| CMT-11 | research_request | AC-4 | "RISK-1: Pre-loop prerequisite: read `get_dsa_index_topk(V3.2_config)`..." | researched + applied |
-| CMT-12 | change_request | AC-5 | "TEST-3: all_reduce(SUM) fires over `[max_tokens]`-shaped score tensor... wrong shape..." | applied |
-| CMT-13 | question | AC-5 | "LT-3: TP=2 on a single node uses shared-memory NCCL... Different failure modes..." | answered + note added |
-| CMT-14 | change_request | AC-6 | "TEST-4: `assert_no_alloc_in_region`... real CUDA graph capture barrier is PyTorch's graph mode itself..." | applied |
-| CMT-15 | change_request | AC-6 | "SEQ-5: `capture_decode_step` calls `retrieve_topk` with ownership mask... task-ac0-cuda-graph doesn't depend on task-m2-rangemask..." | applied |
-| CMT-16 | change_request | AC-7 | "TEST-5: label-write hook at `dsa_backend.py:L1439` is inside `if save_kv_cache:`..." | applied |
-| CMT-17 | change_request | AC-8 | "RISK-3: quality smoke baseline has no specification for when/how it was generated..." | applied |
-| CMT-18 | change_request | AC-8 | "SMELL-2: `error_containment` counter check requires `row_errors` dict to survive rewrite..." | applied |
-| CMT-19 | change_request | AC-10 | "RISK-4: 'Cold-prefix vs warm-prefix labels are bit-stable' assumes FP8 scale factors are identical..." | applied |
-| CMT-20 | change_request | AC-11 | "LT-4: 'DS-on TPS within 5% of DSA-on TPS' is not falsifiable as written..." | applied |
-| CMT-21 | change_request | AC-11 | "CODEX-AGREE: RISK-3/LT-4: both quality smoke and performance gates need reproducibility mechanics..." | applied (folded into CMT-17/CMT-20) |
-| CMT-22 | research_request | Feasibility Hints | "CRITICAL-1 repeated in code path: This `k` is NOT 128-d projected nope K..." | researched + applied |
-| CMT-23 | research_request | Feasibility Hints | "RISK-2: FlashMLA at `dsa_backend.py:L1864-L1874` expects indices into `kv_cache.view(-1, 64, ...)`..." | researched + applied |
-| CMT-24 | change_request | Feasibility Hints | "MAJOR-6 in code path: 'No changes to the importance metric' is incorrect..." | applied (same as CMT-9) |
-| CMT-25 | change_request | Task Breakdown (HTML) | "SEQ-2 + SMELL-1: Missing task: update `deepseek_v2.py` for AC-0 rotation..." | applied |
-| CMT-26 | change_request | Task Breakdown (HTML) | "SEQ-4: AC-1b is scheduled after task-ac8-server, but its outcome retroactively changes AC-8's config..." | applied |
-| CMT-27 | change_request | Claude-Codex Deliberation | "CRITICAL-1 in deliberation: resolution rests on a false factual premise..." | applied |
-| CMT-28 | change_request | RLCR Config | "LT-5: 14-round budget... CRITICAL-1 and missing deepseek_v2.py tasks are unresolved..." | applied |
-
----
+| CMT-1 | change_request | Goal Description | "The plan correctly names the channel mask as the root blocker, then immediately introduces a second prerequisite..." | applied |
+| CMT-2 | change_request | Goal Description | "Codex — Agree. Code confirms the AC-0 producer bug is capture-specific..." | applied |
+| CMT-3 | change_request | Goal Description | "Codex — Additional critique: AC-4 says native FP8 sharded load, but the current calibration forward loop still calls model(input_ids=block.to(model.device))..." | applied |
+| CMT-4 | change_request | Acceptance Criteria | "Codex — Additional critique: this is not just a run step yet, because serve_double_sparsity.sh still defaults MODEL_PATH..." | applied |
+| CMT-5 | change_request | Acceptance Criteria | "Codex — Additional critique: AC-6 should distinguish regular CUDA graph from piecewise CUDA graph..." | applied |
+| CMT-6 | change_request | Acceptance Criteria | "The Feasibility Hint (step 5) says 'design and implement the AC-10 radix-flip mechanism.' That phrasing — design, then implement — is the exact pattern that caused Loop 4 to stall..." | applied |
+| CMT-7 | change_request | Acceptance Criteria | "Codex — Partially agree. I agree the analyze wording invites drift, but the 'few lines' premise is too glib..." | applied |
+| CMT-8 | change_request | Task Breakdown | "task2 is tagged coding but it's a hardware run that produces an artifact, not a code change..." | applied |
+| CMT-9 | change_request | Task Breakdown | "Codex — Partially agree. The graph really does allow task3/task4 before task2... I would not make calibration depend on AC-0..." | applied |
+| CMT-10 | research_request | Task Breakdown | "The device_map=\"auto\" approach mentioned in the Feasibility Hints is speculative — calibrate.py likely uses its own model-loading routine..." | researched |
+| CMT-11 | change_request | Task Breakdown | "Codex — Disagree with the factual premise. The actual load is a bare AutoModelForCausalLM.from_pretrained(...device_map={\"\": \"cuda\"...})..." | applied |
+| CMT-12 | change_request | Task Breakdown | "task8 is labeled AC-8 but it's the comparator output, which is distinct from the DS benchmark artifact that AC-8 actually requires..." | applied |
+| CMT-13 | change_request | Task Breakdown | "Codex — Agree. benchmark.sh and benchmark_baseline.sh produce the benchmark JSONL plus .meta.json sidecars, while benchmark_compare.py consumes..." | applied |
+| CMT-14 | change_request | Task Breakdown | "This is the exact drift the draft warned about. Loop 4 stalled on 'analyze' work that never produced hardware artifacts. task10 is a pure design task..." | applied |
+| CMT-15 | change_request | Task Breakdown | "Codex — Partially agree. Collapse the analyze-only task or require a written decision artifact, yes. But current code is not just a flag flip..." | applied |
+| CMT-16 | change_request | Task Breakdown | "task14 depends on task11 (radix flip), but CUDA-graph status is independent of whether radix cache is on or off..." | applied |
+| CMT-17 | change_request | Task Breakdown | "Codex — Agree. ModelRunner.init_device_graphs() captures regular CUDA graphs during model-runner initialization whenever disable_cuda_graph is false..." | applied |
+| CMT-18 | change_request | Pending User Decisions | "claude and codex seem to agree so go with claude's positions of not using environemtn override." | resolved |
+| CMT-19 | change_request | Pending User Decisions | "Codex — Additional critique: agree final evidence should not use SGLANG_DS_RADIX_OVERRIDE; the pending choice should be narrowed..." | applied |
 
 ## Answers
 
-### CMT-13: LT-3 — TP=2 single-node NCCL vs production TP=8 NVLink/IB
-
-**Original Comment:**
-```
-CRITIQUE [LT-3] TP=2 on a single node uses shared-memory NCCL collectives, not the actual NCCL over NVLink/IB path used in production TP=8. Different failure modes: no dropped packets, no timeout behavior, same NUMA domain. A rank-divergence bug caused by a wrong process group config would only appear at AC-6/AC-8. If TP correctness is the goal, consider at least testing with `NCCL_P2P_DISABLE=1` to force a more production-representative collective path.
-```
-
-**Answer:**
-The observation is correct. Single-node TP=2 with shared-memory NCCL differs from production TP=8 over NVLink/IB. However, the AC-5 harness serves a specific and bounded purpose: it verifies the logical correctness of the `all_reduce(SUM)` domain (logical position space vs physical slot space) and that the reduce operation itself is not a no-op. This is a unit-level correctness gate, not a production-fidelity gate. The production TP path is exercised at AC-6 (CUDA graph capture on real H200) and AC-8 (bench_serving on 8×H200 TP=8). NCCL_P2P_DISABLE=1 can be used as a fallback if AC-6 reveals rank-divergence that AC-5 missed.
-
-**Plan Changes:**
-Added to Implementation Notes (TP Collective Notes): "If AC-5 passes but AC-6 shows rank divergence, set `NCCL_P2P_DISABLE=1` in the TP test to force a more production-representative path."
-
----
+No `question`-type comments were present. All comments were directive (change requests) or investigative (one research request). See **Research Findings** and **Plan Changes Applied**.
 
 ## Research Findings
 
-### CMT-1 / CMT-22: CRITICAL-1 — What is the `k` argument at `set_mla_kv_buffer`?
+### CMT-10: Verify the actual calibration model-load site before prescribing `device_map`
 
 **Original Comment:**
 ```
-CRITIQUE [CRITICAL-1] The `k` argument at `set_mla_kv_buffer` is the MLA latent key (512-d, `kv_lora_rank=512`), not the 128-d projected nope K. The per-head projection `Q·K_nope^T` only materializes inside the attention kernel when `kv_b_proj` is applied — it is never written to the hook site. `memory_pool.py` confirms: `cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512)|scales(16)]`. Writing 128-d labels at this hook site requires applying `kv_b_proj` at write time...
+The `device_map="auto"` approach mentioned in the Feasibility Hints is speculative — `calibrate.py` likely uses its own model-loading routine tied to SGLang's engine, not a bare HuggingFace `from_pretrained` call. If the calibration entrypoint doesn't go through the standard `AutoModel` path, `device_map="auto"` does nothing and you're back to OOM on load. task3 needs to verify the actual load call site in `calibrate.py` before proposing a fix, or you'll code-change the wrong thing and not discover it until task4 blows up on hardware. Maxim: prefer-pragmatic-solutions — read the code before prescribing the patch.
 ```
 
 **Research Scope:**
-- `memory_pool.py:L1757-1792` — `set_mla_kv_buffer` signature, third param is `cache_k_nope: torch.Tensor`
-- `memory_pool.py:L1785` comment — `cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512)|scales(16)]` — confirms 512-d latent
-- `forward_mla.py:L159` — `k_nope = latent_cache[..., :self.kv_lora_rank]` — kv_lora_rank=512
-- `deepseek_v2.py:L1719-1720` — `if self.attn_mha.kv_b_proj is None: self.attn_mha.kv_b_proj = self.kv_b_proj` — confirms kv_b_proj accessible at hook site
-- `/cluster-storage/models/deepseek-ai/DeepSeek-V3.2/config.json` — `kv_lora_rank: 512`, `qk_nope_head_dim: 128`
+Read the model-load site in `python/sglang/srt/layers/attention/double_sparsity/calibrate.py` (the `AutoConfig`/`AutoModelForCausalLM` block and the calibration forward loop). Cross-checked against the Codex finding in CMT-11.
 
 **Findings:**
-- `k` at `set_mla_kv_buffer` is definitively 512-d MLA latent key, not 128-d projected nope K.
-- The 128-d projection `K_nope = latent @ kv_b_proj_k_side` only materializes inside the FlashMLA CUDA kernel.
-- However, `layer.kv_b_proj` IS accessible at all three hook sites via `deepseek_v2.py:L1720`.
-- The write kernel can apply the K-side projection matmul at hook time: `[T, 512] @ [512, H_local*(128+v_dim)]` → slice K_nope prefix `[T, H_local*128]` → reshape `[T, H_local, 128]`.
+The premise is incorrect. The load is a **bare** `AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch_dtype, device_map={"": "cuda" if torch.cuda.is_available() else "cpu"}, trust_remote_code=True)` following an `AutoConfig.from_pretrained(...)` — it does NOT go through an SGLang engine loader. Therefore `device_map="auto"` IS the correct hook (it routes through HF/Accelerate dispatch). The real risks are different: (a) whether HF can shard-load the DeepSeek FP8 block-quantized checkpoint without upcasting to bf16, and (b) the calibration forward loop's single-device assumption (`model(input_ids=block.to(model.device))`), which must be fixed once modules are dispatched across multiple GPUs.
 
 **Impact on Plan:**
-- Goal Description updated: removed claim that 128-d is read directly; added explicit mention of kv_b_proj projection step at write time.
-- Feasibility Hints code example updated: replaced direct-read snippet with projection-then-write snippet.
-- Claude-Codex Deliberation DEC-1 re-resolved: "kv_b_proj K-side projection applied at hook time; `layer.kv_b_proj` accessible."
-- `task-m1-hook` updated: explicitly includes the kv_b_proj projection step.
-
----
-
-### CMT-9 / CMT-24: MAJOR-6 — What calibration method does the original DoubleSparse use?
-
-**Original Comment:**
-```
-CRITIQUE [MAJOR-6] The plan says `calibrate.py` implements "Method 1 (`mean(abs(Q·K))` per channel)" and "is already correct." It isn't. The actual implementation computes L2-squared K importance: `sum_over_tokens(K_channel^2)` — no Q involvement at all (`calibrate.py:L244-246`). Method 1 requires hooking both Q and K projections and computing joint attention scores.
-```
-
-**Research Scope:**
-- `calibrate.py:L244-246` — confirmed: `squared = tensor.pow(2); squared = squared.reshape(-1, num_heads, k_head_dim).sum(dim=0)` — L2-squared K, no Q involvement
-- `development/past_implementations/DoubleSparse/config/offline_calibration.py:L91-93` — original paper calibration:
-  ```python
-  # Method 1: every token only attend to itself
-  out = q * k  # element-wise per channel
-  out = out.reshape(-1, m.num_heads, m.head_dim).abs().mean(dim=0)
-  ```
-- `development/past_implementations/sglang-last-with-double-sparsity/python/sglang/srt/server_args.py:L599` — `ds_heavy_channel_type: str = "qk"` — original sglang used pre-generated JSON from the paper's calibration (Method 1 implicitly)
-
-**Findings:**
-- The original DoubleSparse paper uses **Method 1** exclusively: `mean(abs(q_channel * k_channel))` per channel, element-wise Q·K, then sort channels descending.
-- `sglang-last-with-double-sparsity` loaded pre-generated JSON from this calibration (flag name `"qk"` confirms Q·K-based origin).
-- Current `calibrate.py` uses L2(K²) — different from both the paper and sglang-last.
-- Implementing Method 1 requires co-registering both Q_nope and K_nope hooks in the same forward pass and computing the joint per-channel score.
-
-**Impact on Plan:**
-- AC-4 updated: calibration explicitly requires Method 1 (Q·K joint), with both Q_nope and kv_b_proj hooks.
-- `task-ac4-calibrate` updated: scope includes Q hook addition alongside K hook.
-- Feasibility Hints calibration section updated: shows Method 1 signature with Q+K.
-- Reference added: `DoubleSparse/config/offline_calibration.py`.
-
----
-
-### CMT-11: RISK-1 — Verify `get_dsa_index_topk(V3.2_config)` before writing validator
-
-**Original Comment:**
-```
-CRITIQUE [RISK-1] Pre-loop prerequisite: read `get_dsa_index_topk(V3.2_config)` on the actual H200 cluster before writing any validator code. The plan assumes this returns 2048, but it's never verified.
-```
-
-**Research Scope:**
-- `/cluster-storage/models/deepseek-ai/DeepSeek-V3.2/config.json` — read directly
-
-**Findings:**
-- `config.json` contains `"index_topk": 2048` — confirmed.
-- Other confirmed values: `"kv_lora_rank": 512`, `"qk_nope_head_dim": 128`, `"num_attention_heads": 128`.
-
-**Impact on Plan:**
-- Added to Implementation Notes (Pre-Loop Verifications): "topk confirmed: get_dsa_index_topk returns 2048 — verified from config.json."
-- No change to validator logic needed; the assumption was correct.
-
----
-
-### CMT-23: RISK-2 — FlashMLA index format (slot IDs vs block indices)
-
-**Original Comment:**
-```
-CRITIQUE [RISK-2] The plan describes physical_slots as "flattened physical token indices" but FlashMLA at `dsa_backend.py:L1864-L1874` expects indices into `kv_cache.view(-1, 64, ...)` — each index selects a 64-token block, not a single token slot.
-```
-
-**Research Scope:**
-- `dsa_backend.py:L1864` — `kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)` + `indices = page_table_1.unsqueeze(1)`
-- `dsa_backend.py:L1872-1874` — shape assertion on indices
-- `dsa/dsa_indexer.py:L550` — `assert page_size == 64`
-- `dsa/dsa_indexer.py:L553-555` — `metadata.get_page_table_1()` or `metadata.get_page_table_64()` for block_tables
-- `dsa_backend.py:L438-446` — `_transform_table_1_to_real`: `return page_table[:, strided_indices] // page_size` — divides by page_size to get block indices
-
-**Findings:**
-- `page_table_1` in FlashMLA path stores VALUES from `req_to_token` directly (physical token slot indices), NOT pre-divided block indices.
-- The `kv_cache.view(-1, 64, ...)` reshaping means FlashMLA uses the token indices to index into the paged view, where each "page" holds 64 tokens. The indices into this view ARE the physical token slot IDs from `req_to_token` — they are naturally aligned because `req_to_token` stores token-level slot IDs and FlashMLA's paged view interprets them as such.
-- The `_transform_table_1_to_real` path that divides by page_size is for a different path (the DSA-non-FlashMLA path). The `flashmla_kv` sparse path in Option B does NOT divide — it uses req_to_token values directly.
-- Therefore: the adapter's output of `req_to_token` values IS the correct format. No additional conversion needed.
-
-**Impact on Plan:**
-- Feasibility Hints adapter section clarified: "req_to_token values are exactly the physical token indices FlashMLA expects (page_table_1 in dsa_indexer.py is populated directly from req_to_token); no additional conversion needed."
-
----
+The calibration framing in `AC-4`, `task3`, and Feasibility Hint step 2 was rewritten to state the load path explicitly, add a one-block dry-run that logs parameter dtypes and device placement (proving no upcast) before the full run, and flag the `model.device` forward-loop fix. The original speculative wording was removed.
 
 ## Plan Changes Applied
 
-### CMT-2: CRITICAL-3 — Fix dead validator attribute names
+### CHANGE-A (CMT-1, CMT-2): AC-0 scope clarification + artifact-per-round
 
-**Original Comment:**
+**Original Comments:**
 ```
-CRITIQUE [CRITICAL-3] `validator.py` reads `server_args.nsa_prefill_backend` and `server_args.nsa_decode_backend` for the backend-KV-dtype check. Those attributes don't exist — live names are `dsa_prefill_backend` and `dsa_decode_backend`. The validator's backend pairing check silently passes (reads `None, None`) regardless of actual config.
+CMT-1: The plan correctly names the channel mask as the root blocker, then immediately introduces a second prerequisite (the AC-0 producer fix) that is gated on radix-on claims only. But task1 (AC-0) and task3 (calibration load change) are shown as independent, meaning a round could open with the AC-0 fix and spend the entire round on code changes before any hardware is touched. The draft's explicit instruction is "the existing loop-4 code stays as-is unless a specific bench failure mode requires patching it" and "the Round 38 AC-10 producer bug is the one known exception." The plan should make explicit that AC-0 is a prerequisite for radix-on claims only, not for the mask generation or the boot smoke. If a round starts by working on the producer fix, it must also produce a hardware artifact that round — the fix alone is not a complete round. The current framing doesn't enforce this; "coding" tag is not the same as "artifact produced."
 ```
-
-**Changes Made:**
-- AC-0 Positive Tests: added "validator.py reads `dsa_prefill_backend`/`dsa_decode_backend` (corrected from dead `nsa_*` attributes); backend-KV-dtype check fires correctly on a bad config."
-- `task-ac0-validator`: added "fix dead attribute names `nsa_prefill_backend`/`nsa_decode_backend` → `dsa_prefill_backend`/`dsa_decode_backend`."
-
-**Affected Sections:** AC-0, Task Breakdown
-
----
-
-### CMT-3: CRITICAL-4 — Derive max_tokens from req_to_token_pool.size
-
-**Original Comment:**
 ```
-CRITIQUE [CRITICAL-4] `device_buffer_size=4096` is passed as `max_pages` / `max_tokens`... After token rotation, `max_tokens=4096` covers only ~5% of a typical H200 KV pool. Any slot with index ≥ 4096 triggers an out-of-bounds write or silently drops labels.
+CMT-2: Codex — Agree. Code confirms the AC-0 producer bug is capture-specific: `dsa_backend._write_token_labels` writes the token-label table first, then references undefined `forward_batch` only inside the `SGLANG_DS_RADIX_FIXTURE_CAPTURE` branch. Mask generation and a radix-off boot do not consume that capture path, so AC-0 should gate radix evidence/default parity, not calibration; any AC-0 round still needs a hardware artifact to avoid repeating Loop 4 drift.
 ```
 
 **Changes Made:**
-- AC-0 Positive Tests: "Token label table allocates with `max_tokens = req_to_token_pool.size` (derived at bind time, not from `device_buffer_size`)."
-- `task-ac0-deepseek-v2` (new task): includes "(1) derive `max_tokens = req_to_token_pool.size` at bind time."
-- `task-ac0-config`: `device_buffer_size` explicitly documented as score-scratch buffer cap (not pool size).
+Added a scope sentence to AC-0 stating it gates radix-on evidence and default-cookbook parity claims ONLY — mask generation (AC-4) and the radix-off boot smoke (AC-1) do not consume the capture path and may proceed in parallel — plus the rule that an AC-0 round must still produce a hardware artifact (the `coding` tag alone does not satisfy artifact-per-round).
 
-**Affected Sections:** AC-0, Task Breakdown
+**Affected Sections:**
+- Acceptance Criteria: AC-0 scope note added.
+- Dependencies and Sequence: dependency note now states calibration runs in parallel and does not depend on AC-0.
 
----
+**Cross-Reference Updates:** none (no ID changes).
 
-### CMT-4 / CMT-25: SEQ-2 — Add missing task-ac0-deepseek-v2
+### CHANGE-B (CMT-3, CMT-10, CMT-11): Calibration load framing, dry-run, and FP8 shard-load risk
+
+**Original Comments:**
+```
+CMT-3: Codex — Additional critique: AC-4 says native FP8 sharded load, but the current calibration forward loop still calls `model(input_ids=block.to(model.device))`, which is a single-device assumption that can break once HF dispatch shards modules. Task3 should produce a tiny one-block calibration log that records parameter dtypes and device placement before spending a full 256-block run.
+```
+```
+CMT-11: Codex — Disagree with the factual premise. The actual load is a bare `AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch_dtype, device_map={"": "cuda" if torch.cuda.is_available() else "cpu"}, trust_remote_code=True)` after `AutoConfig`, so `device_map="auto"` would hit HF/Accelerate rather than an SGLang engine loader. The real risk is different: task3 must prove HF can shard-load the DeepSeek FP8 block-quantized checkpoint without upcasting, and must fix the later `model.device` forward-loop assumption if modules are dispatched across GPUs.
+```
+(CMT-10 verbatim text is in **Research Findings** above.)
+
+**Changes Made:**
+Rewrote AC-4 to name the actual load call, the `device_map="auto"` HF/Accelerate path, the two real risks (FP8 block-quant shard-load without upcast; `model.device` forward-loop assumption), and added a positive test requiring a one-block dry-run that logs dtypes/device placement before the full run. Updated Feasibility Hint step 2 and the task3 description to match.
+
+**Affected Sections:**
+- Acceptance Criteria: AC-4 description + new positive test.
+- Feasibility Hints and Suggestions: step 2 rewritten.
+- Task Breakdown: task3 description updated.
+
+**Cross-Reference Updates:** none.
+
+### CHANGE-C (CMT-4): MODEL_PATH override before first boot
 
 **Original Comment:**
 ```
-CRITIQUE [SEQ-2] `deepseek_v2.py` changes are missing from the task table entirely. Required changes: (1) `_bind_double_sparsity_runtime_data`: rename, max_tokens sizing; (2) `_select_topk_indices`: adapter ABI change; (3) `ds_topk_indices_out` pre-allocation; (4) `row_errors` dict wiring.
+Codex — Additional critique: this is not just a run step yet, because `development/serve_double_sparsity.sh` still defaults `MODEL_PATH` to `deepseek-ai/DeepSeek-V3.2`, while DEC-6 requires `/cluster-storage/models/deepseek-ai/DeepSeek-V3.2`. Task5 must edit or override that before first boot, otherwise `/get_server_info` can describe a different revision/download path than the artifact bundle claims.
 ```
 
 **Changes Made:**
-- New task added to Task Breakdown: `task-ac0-deepseek-v2 | Update deepseek_v2.py: ... | AC-0 | coding | task-ac0-adapter`
-- Dependencies graph updated in Milestones section.
+AC-1 now states the serve script defaults `MODEL_PATH` to the HF id and MUST be overridden to the cluster path before first boot (per DEC-6), with a positive test that `/get_server_info` reports the cluster path (not the HF-id default). task5 description updated to "Override the serve script's MODEL_PATH default...".
 
-**Affected Sections:** Task Breakdown, Dependencies and Sequence
+**Affected Sections:**
+- Acceptance Criteria: AC-1 description + positive test.
+- Task Breakdown: task5 description.
 
----
+**Cross-Reference Updates:** none.
 
-### CMT-5: TEST-2 — Scope AC-13 as post-AC-0 gate only
+### CHANGE-D (CMT-5, CMT-16, CMT-17): AC-6 regular-vs-piecewise CUDA graph + capture at first boot
 
-**Original Comment:**
+**Original Comments:**
 ```
-CRITIQUE [TEST-2] AC-13 says "regression suite green after every code change throughout the loop." The 150 existing unit tests use page-level shapes — they will all fail during AC-0 development before migration completes.
+CMT-5: Codex — Additional critique: AC-6 should distinguish regular CUDA graph from piecewise CUDA graph. Option B passes `--disable-piecewise-cuda-graph`, but regular `disable_cuda_graph` remains false by default and `ModelRunner.init_device_graphs()` is the boot-time capture path; evidence that only says piecewise is disabled does not prove regular capture/replay status.
 ```
-
-**Changes Made:**
-- AC-13 rewritten: "Scope: this gate applies after AC-0 shape migration is complete... gate is not 'green after every change' — it is green after `task-ac0-tests` merges."
-- Milestones section: "AC-13: regression suite green after `task-ac0-tests` merges (and remains green for all subsequent changes)."
-
-**Affected Sections:** AC-13, Dependencies and Sequence
-
----
-
-### CMT-7 / CMT-8: LT-2 — Add stale-slot negative test to AC-2
-
-**Original Comment:**
 ```
-CRITIQUE [LT-2] "Freed/evicted KV slots do not produce persistent label pollution" is asserted, not proved. The AC-2 positive test should include a synthetic freed→reallocated→read fixture that fails without valid_mask protection.
+CMT-16: task14 depends on task11 (radix flip), but CUDA-graph status is independent of whether radix cache is on or off. You can record this status immediately after the first DS boot in task5 — that's when the server either captures graphs or logs why it can't. Deferring it to M3 means you have no CUDA-graph evidence until after the AC-10 flip, which adds an unnecessary wait and a round of work that could have been a one-liner artifact in task5. This is scope-creep-by-dependency-ordering. Move task14 to depend on task5.
+```
+```
+CMT-17: Codex — Agree. `ModelRunner.init_device_graphs()` captures regular CUDA graphs during model-runner initialization whenever `disable_cuda_graph` is false, before any request and independent of radix cache; the DS launcher disables piecewise CUDA graph, not regular CUDA graph. Replay/use is then visible through scheduler logs and metrics via `can_run_cuda_graph`, so the first task5 boot plus smoke request can already record capture and replay status.
 ```
 
 **Changes Made:**
-- AC-2 Negative Tests: added "Stale-slot fixture: allocate a slot, write labels, free, reallocate to new request, invoke selector BEFORE new write fires — confirm stale labels from prior request are not returned. Verifies the overwrite-before-read invariant holds on all paths including `save_kv_cache=False` fused tilelang prefill."
-- `task-ac2-lifetime`: "add stale-slot negative test (freed→reallocated→read before write)."
+AC-6 rewritten to require the REGULAR CUDA-graph capture/replay status (distinct from disabled piecewise), observable at first boot via `init_device_graphs()` and `can_run_cuda_graph` metrics. The CUDA-graph evidence task now depends on the first boot (task5), not the radix flip, and was moved into M2. Milestones updated.
 
-**Affected Sections:** AC-2, Task Breakdown
+**Affected Sections:**
+- Acceptance Criteria: AC-6 rewritten (positive/negative tests).
+- Dependencies and Sequence: AC-6 evidence moved to M2 Phase A; removed from M3 Phase C.
+- Task Breakdown: CUDA-graph task now `task10`, depends on `task5`.
 
----
+**Cross-Reference Updates:** the CUDA-graph task moved from old `task14` to new `task10`; the evidence-bundle task (now `task15`) updated to depend on `task10` for the AC-6 artifact.
 
-### CMT-10: MAJOR-5 — Remove --model-arch flag (auto-detect works)
+### CHANGE-E (CMT-12, CMT-13): Relabel the smoke-comparator task as an AC-8/AC-9 consumer
 
-**Original Comment:**
+**Original Comments:**
 ```
-CRITIQUE [MAJOR-5] The `--model-arch deepseek_v3` flag doesn't exist in `calibrate.py`. Additionally, `calibrate.py` already auto-detects architecture via `getattr(config, "qk_nope_head_dim", 0)`.
+CMT-12: task8 is labeled AC-8 but it's the comparator output, which is distinct from the DS benchmark artifact that AC-8 actually requires. This is a wrong AC assignment — the comparator is the AC-8/AC-9 *consumer*, not its target. Minor, but in a plan where artifact labeling is the whole point of the smoke-vs-loop4 distinction, mislabeling here will cause confusion during the evidence-bundle assembly in task16.
 ```
-
-**Changes Made:**
-- AC-4 Positive Tests: removed `--model-arch deepseek_v3` from the sample command; added "(Auto-detects V3.2 MLA via `qk_nope_head_dim=128` from model config; no `--model-arch` flag required)."
-- `task-ac4-calibrate`: removed "add `--model-arch deepseek_v3`" from scope; kept `kv_b_proj` traversal.
-
-**Affected Sections:** AC-4, Task Breakdown
-
----
-
-### CMT-12: TEST-3 — Fix score tensor shape to [bs, max_tokens]
-
-**Original Comment:**
 ```
-CRITIQUE [TEST-3] AC-5 says `all_reduce(SUM)` fires over `[max_tokens]`-shaped score tensor. The actual `all_reduce_page_scores` reduces a `[bs, max_pages]` tensor (batch-keyed, not flat). After token rotation this becomes `[bs, max_tokens]` — NOT a 1-D `[max_tokens]` tensor.
+CMT-13: Codex — Agree. `development/benchmark.sh` and `development/benchmark_baseline.sh` produce the benchmark JSONL plus `.meta.json` sidecars, while `development/benchmark_compare.py` consumes `--baseline` and `--ds` JSONLs and emits a report. task8 should target comparator/report evidence, not AC-8 alone; AC-8/AC-9 are task7's producer artifacts.
 ```
 
 **Changes Made:**
-- AC-5 Positive Tests: "all_reduce(SUM) fires over `[bs, max_tokens]`-shaped score tensor (batch-keyed, not flat)."
-- `task-ac0-kernel`: "all_reduce over [bs, max_tokens] score tensor (batch-keyed)."
-- `task-ac5-tp`: "all_reduce(SUM) on [bs, max_tokens] score tensor in logical-position space."
+task8 retargeted from `AC-8` to `AC-8, AC-9` and its description rewritten to "Smoke comparator report (`mvp_compare.md`) CONSUMING task7's DS+DSA JSONLs" — clarifying it is the consumer, while task7 remains the AC-8/AC-9 producer.
 
-**Affected Sections:** AC-5, Task Breakdown
+**Affected Sections:**
+- Task Breakdown: task8 description and Target AC.
 
----
+**Cross-Reference Updates:** none (task7 remains the producer).
 
-### CMT-14: TEST-4 — Clarify CUDA graph capture mechanism
+### CHANGE-F (CMT-6, CMT-7, CMT-14, CMT-15): Collapse the AC-10 "design" task into direct implementation
 
-**Original Comment:**
+**Original Comments:**
 ```
-CRITIQUE [TEST-4] `assert_no_alloc_in_region` counts PyTorch caching-allocator allocations. The real CUDA graph capture barrier is PyTorch's graph mode itself, which errors on any `cudaMalloc`. The AC-6 negative test is valid but the mechanism it claims to test is muddled.
+CMT-6: The Feasibility Hint (step 5) says "design and implement the AC-10 radix-flip mechanism." That phrasing — design, then implement — is the exact pattern that caused Loop 4 to stall. The AC text itself is correctly outcome-focused ("boots radix-on WITHOUT relying on an environment override"), but combining it with a dedicated analyze task (task10) creates a scaffolding trap. The validator guard flip is a few lines in `validator.py` and a launcher flag. There is no mechanism here worth a separate design round — the design is: pass a CLI flag, the validator reads it, done. Maxim: eliminate-special-cases — the "design" step is a special case that should not exist; just implement it directly in task11.
 ```
-
-**Changes Made:**
-- AC-6 Negative Tests rewritten: "With a non-preallocated scoring buffer, PyTorch's graph capture mode fails outright — the `assert_no_alloc_in_region` detector fires as a secondary belt-and-suspenders check. The negative test confirms that preallocating output buffers before `torch.cuda.graph.capture_begin()` is the load-bearing fix."
-- `task-ac6-cuda-graph`: "confirm preallocation prevents PyTorch graph capture failure (not just alloc detector)."
-
-**Affected Sections:** AC-6, Task Breakdown
-
----
-
-### CMT-15: SEQ-5 — task-ac0-cuda-graph depends on task-m2-rangemask
-
-**Original Comment:**
 ```
-CRITIQUE [SEQ-5] `capture_decode_step` calls `retrieve_topk` with a `per_request_valid` ownership mask. `task-ac0-cuda-graph` doesn't mention this parameter. If it closes before `task-m2-rangemask`, the captured graph omits the ownership mask.
+CMT-7: Codex — Partially agree. I agree the analyze wording invites drift, but the "few lines" premise is too glib: `validate_double_sparsity()` reads a transient `server_args._double_sparsity_radix_fixture_passed` before boot, `record_radix_fixture_passed()` only sets that in-process attribute and logs an optional artifact SHA, and `serve_double_sparsity.sh` has no CLI/state hook today. That is real ServerArgs/launcher plumbing, not just deleting `--disable-radix-cache`.
+```
+```
+CMT-14: This is the exact drift the draft warned about. Loop 4 stalled on "analyze" work that never produced hardware artifacts. task10 is a pure design task with no artifact output — it doesn't even produce a `runs/` entry. The draft says "single mainline objective per round = the next concrete command." The AC-10 radix-flip mechanism is not architecturally ambiguous: the validator reads a flag or a state file, the launcher sets it, done. You don't need a design round for this; you need a commit and a boot. Collapse task10 into task11 or, at minimum, require task10 to produce a concrete proposal artifact (a written decision, not just "we thought about it") so it doesn't become a multi-round analysis spiral. Maxim: prefer-pragmatic-solutions — don't design what you can just implement.
+```
+```
+CMT-15: Codex — Partially agree. Collapse the analyze-only task or require a written decision artifact, yes. But current code is not just a flag flip: `ServerArgs` has no fixture-passed CLI field, `validate_double_sparsity()` runs during `check_server_args()`, and the helper's state is not persisted across processes. A clean no-env path needs a specific ServerArgs/launcher/artifact contract.
 ```
 
 **Changes Made:**
-- `task-ac0-cuda-graph` Depends On: added `task-m2-rangemask`.
-- AC-6 text: "Note: `task-ac0-cuda-graph` must depend on `task-m2-rangemask`, since `capture_decode_step` calls `selector.retrieve_topk` with the ownership mask parameter introduced in M2."
+Removed the analyze-only "design the AC-10 flip" task entirely and folded its scope into a single direct implementation task. The implementation task now specifies the concrete contract Codex identified: add a ServerArgs/launcher field (or state-file/artifact-path) that sets `_double_sparsity_radix_fixture_passed` before `validate_double_sparsity` runs in `check_server_args()`; pass both fixtures; remove `--disable-radix-cache`. Feasibility Hint step 5 changed from "design and implement" to "implement ... directly (no separate design round)". After collapsing, the entire Task Breakdown was renumbered to stay contiguous (task1–task15). The plan now has no `analyze` tasks, which is intentional (the only analyze task was the drift trap being removed).
 
-**Affected Sections:** AC-6, Task Breakdown
+**Affected Sections:**
+- Feasibility Hints and Suggestions: step 5.
+- Dependencies and Sequence: M3 Phase A wording.
+- Task Breakdown: old `task10` removed; old `task11`→`task11` (implementation, now depends on `task2`); all subsequent tasks renumbered.
+- Pending User Decisions: DEC-5 implementation note (see CHANGE-H).
 
----
+**Cross-Reference Updates:** task IDs renumbered after the collapse — old task11→task11 (impl, dep task2), old task12→task12, old task13→task13, old task14→task10 (CUDA graph), old task15→task14, old task16→task15. All `Depends On` references and milestone text were updated to the new IDs.
 
-### CMT-16: TEST-5 — AC-7 must verify save_kv_cache=True on FP8 V3.2 prefill
+### CHANGE-G (CMT-8, CMT-9): task2 as the explicit M2 artifact gate; calibration stays parallel
 
-**Original Comment:**
+**Original Comments:**
 ```
-CRITIQUE [TEST-5] The label-write hook at `dsa_backend.py:L1439` is inside `if save_kv_cache:`. For FP8 prefill on V3.2, this may be the default fast path using save_kv_cache=False. If so, the token-label write hook silently never fires.
+CMT-8: task2 is tagged `coding` but it's a hardware run that produces an artifact, not a code change. If the probe fails here, task3 is unblocked and task4 depends on task3, so you'd start calibration before you've confirmed the producer fix holds. The dependency graph should show task4 (and therefore task5) depending on a passing task2, not just task1. Right now the plan lets a broken AC-0 silently coexist with a running calibration.
 ```
-
-**Changes Made:**
-- AC-7 Positive Tests: added "Explicit path verification: confirm that the FP8 V3.2 prefill path sets `save_kv_cache=True` at hook sites, so the `token_label_write` hook fires. If any path uses `save_kv_cache=False`, identify and instrument the alternative hook site. Verification must be logged in the task-ac7-bypass commit."
-- `task-m1-hook`: "verify that the FP8 prefill path sets `save_kv_cache=True` at each hook site; document findings in commit message."
-- `task-ac7-bypass`: "explicitly confirm save_kv_cache=True on FP8 V3.2 prefill path or identify alternative hook site."
-
-**Affected Sections:** AC-7, Task Breakdown
-
----
-
-### CMT-17 / CMT-21: RISK-3 — Specify DSA reference generation for AC-8 quality smoke
-
-**Original Comment:**
 ```
-CRITIQUE [RISK-3] The quality smoke baseline ("reference outputs cached from DSA-on") has no specification for when and how it was generated or verified. `temperature=0` does not guarantee bit-identical outputs across server restarts with FP8 KV quantization.
+CMT-9: Codex — Partially agree. The graph really does allow task3/task4 before task2 because task3 has no dependency and task4 depends only on task3, and task2 is an artifact-producing hardware run mislabeled as coding. I would not make calibration depend on AC-0, though: `calibrate.py` and `load_channel_mask()` do not consume the radix capture path, and task5 already gates first DS boot on both task2 and task4. The cleaner fix is to let mask generation proceed in parallel while making task2 an explicit artifact gate for M2.
 ```
 
-**Changes Made:**
-- AC-8 Positive Tests quality smoke: "generate the DSA reference on the **same server binary** used for the DS run, in the **same server restart session** immediately before the DS smoke test; record the DSA server commit SHA alongside the reference file."
-- `task-ac8-quality`: "generate DSA reference on same server binary + same restart session, record commit SHA."
+**Resolution / Changes Made:**
+Codex's resolution was adopted over the stricter CMT-8 proposal: calibration (task3/task4) is NOT made dependent on AC-0, because the calibration and `load_channel_mask` paths do not consume the radix capture. Instead, task2's description now marks it as "the explicit artifact gate into M2," and first DS boot (task5) already gates on both task2 (passing capture probe) and task4 (validated mask). The Dependencies note states this explicitly. The routing tag stays `coding` because the schema permits only `coding`/`analyze`; the "hardware-run produces an artifact" nuance is captured in the description and the artifact-per-round rule rather than a new tag.
 
-**Affected Sections:** AC-8, Task Breakdown
+**Affected Sections:**
+- Task Breakdown: task2 description.
+- Dependencies and Sequence: dependency note.
 
----
+**Cross-Reference Updates:** none.
 
-### CMT-18: SMELL-2 — Document row_errors decision in task-ac0-adapter
+### CHANGE-H (CMT-18, CMT-19): Resolve DEC-5 — no environment override
 
-**Original Comment:**
+**Original Comments:**
 ```
-CRITIQUE [SMELL-2] The `error_containment` counter check requires the adapter's `row_errors` side-channel dict to survive the < 150 LOC rewrite. Explicitly decide: keep the dict, replace with structured exceptions, or remove per-row tracking.
+CMT-18: claude and codex seem to agree so go with claude's positions of not using environemtn override.
+```
+```
+CMT-19: Codex — Additional critique: agree final evidence should not use `SGLANG_DS_RADIX_OVERRIDE`; the pending choice should be narrowed to a CLI/artifact-path or state-file contract that sets `_double_sparsity_radix_fixture_passed` before validation. Leaving the env override as an option conflicts with AC-10's negative test and this DEC-5 user note.
 ```
 
 **Changes Made:**
-- `task-ac0-adapter`: "Error tracking: keep `row_errors` dict pattern (compatible with existing AC-8 counter check); a simple scalar error count replaces per-row mutable dict."
-- Implementation Notes (Error Containment Design): "keep `row_errors` pattern; adapter returns scalar `error_count` alongside `physical_slots`; structured exceptions avoided on hot decode path."
+DEC-5 flipped from PENDING to RESOLVED (user decision): no environment override; the flip is wired via a ServerArgs/launcher field or a state-file/artifact-path contract that sets `_double_sparsity_radix_fixture_passed` before `validate_double_sparsity` runs in `check_server_args()`. Recorded the implementation-plumbing note and that the work happens directly in the implementation task (no separate design round).
 
-**Affected Sections:** Task Breakdown, Implementation Notes
+**Affected Sections:**
+- Pending User Decisions: DEC-5 status and body.
+- Claude-Codex Deliberation: Convergence Status updated to note DEC-5 resolution; a refinement bullet added to Resolved Disagreements.
 
----
-
-### CMT-19: RISK-4 — Add FP8 scale factor verification to AC-10
-
-**Original Comment:**
-```
-CRITIQUE [RISK-4] "Cold-prefix vs warm-prefix labels are bit-stable" assumes FP8 quantization scale factors are identical for a token written in isolation vs. within a fully packed KV page. This is not guaranteed.
-```
-
-**Changes Made:**
-- AC-10: "Explicit verification: confirm that FP8 block quantization assigns identical per-block scale factors for the same token regardless of block-fill level (cold singleton vs. fully-packed block). If scale factors can differ, document the failure mode and defer radix cache to Loop 5."
-
-**Affected Sections:** AC-10
-
----
-
-### CMT-20 / CMT-21: LT-4 — Add reproducibility mechanics to AC-11 gate
-
-**Original Comment:**
-```
-CRITIQUE [LT-4] "DS-on TPS within 5% of DSA-on TPS" is not falsifiable as written. A single bench_serving run at conc=64 with ISL=4096 has P99 TTFT variance that can swing 5%+ from measurement noise alone.
-```
-
-**Changes Made:**
-- AC-11: added "Reproducibility requirements: use fixed random seed for request arrival; run for minimum 600s measurement window after 120s warmup; run at least 3 independent trials and report median; record commit SHA + full server args + chunked-prefill setting alongside each result JSON."
-- `task-ac11-compare`: "with fixed seed, 600s window, 120s warmup, 3 trials, median aggregation."
-
-**Affected Sections:** AC-11, Task Breakdown
-
----
-
-### CMT-26: SEQ-4 — Move task-ac1b-probe before task-ac8-server
-
-**Original Comment:**
-```
-CRITIQUE [SEQ-4] AC-1b is scheduled after task-ac8-server, but its outcome retroactively changes AC-8's operating point. If probe fails, AC-8's bench_serving must be re-run with the wrong config.
-```
-
-**Changes Made:**
-- `task-ac1b-probe` Depends On: changed from `task-ac8-server` to `task-ac6-hwrun`.
-- `task-ac8-server` Depends On: added `task-ac1b-probe` (so chunked-prefill config is known before full bench_serving run).
-- Dependencies paragraph updated.
-
-**Affected Sections:** Task Breakdown, Dependencies and Sequence
-
----
-
-### CMT-27: CRITICAL-1 in Deliberation — Re-resolve DEC-1 with correct implementation path
-
-**Original Comment:**
-```
-CRITIQUE [CRITICAL-1 in deliberation] This resolution rests on a false factual premise: "The write kernel is updated to read `k` (k_nope, bf16) directly from the `set_mla_kv_buffer` call site." The `k` argument at that call site is 512-d MLA latent K, not 128-d projected nope K.
-```
-
-**Changes Made:**
-- Claude-Codex Deliberation DEC-1 resolution text rewritten: "128-d nope K is correct (paper-faithful, theoretically superior). However, the `k` argument at `set_mla_kv_buffer` is the 512-d MLA latent key — reading 128-d per-head K_nope requires applying `kv_b_proj` at write time. `layer.kv_b_proj` is accessible at all three hook sites (`deepseek_v2.py:L1720`). The write kernel is NOT reading 128-d directly — it applies the projection."
-
-**Affected Sections:** Claude-Codex Deliberation
-
----
-
-### CMT-28: LT-5 — Pre-loop kv_b_proj investigation note
-
-**Original Comment:**
-```
-CRITIQUE [LT-5] The 14-round budget... Resolve the CRITICAL-1 question (128-d requires adding `kv_b_proj` projection vs. accepting 512-d latent) before the loop starts — if 128-d is confirmed but requires adding a projection matmul on the write path, that is a substantial new workload.
-```
-
-**Changes Made:**
-- RLCR Loop Configuration: "The kv_b_proj projection step in `task-m1-hook` and the Method 1 Q+K hook refactor in `task-ac4-calibrate` both add scope vs the original estimate; these are explicitly tracked as separate tasks."
-- Implementation Notes (Pre-Loop Verifications): "kv_b_proj projection cost: Before writing `task-m1-hook`, measure the projection matmul cost on H200 at realistic batch sizes."
-
-**Affected Sections:** Implementation Notes, RLCR Loop Configuration
-
----
+**Cross-Reference Updates:** none.
 
 ## Remaining Decisions
 
-None. All comments fully resolved.
-
----
+None. All decisions DEC-1 through DEC-7 are RESOLVED (DEC-5 resolved by the user during this refinement). No items require further user input.
 
 ## Refinement Metadata
 
-- **Input Plan:** `development/loop4/plan.md`
-- **Output Plan:** `development/loop4/refined_plan_v1.md`
-- **QA Document:** `.humanize/plan_qa/plan-qa.md`
-- **Total Comments Processed:** 28 (including CODEX-AGREE blocks counted separately)
-  - Questions: 1 (CMT-13)
-  - Change Requests: 19 (CMT-2, CMT-3, CMT-4, CMT-5, CMT-6, CMT-7, CMT-8, CMT-10, CMT-12, CMT-13, CMT-14, CMT-15, CMT-16, CMT-17, CMT-18, CMT-19, CMT-20, CMT-21, CMT-25, CMT-26, CMT-27, CMT-28)
-  - Research Requests: 5 (CMT-1, CMT-9, CMT-11, CMT-22, CMT-23)
-- **Research Sources:**
-  - `memory_pool.py:L1757-1792` — confirms 512-d latent at set_mla_kv_buffer
-  - `deepseek_v2.py:L1719-1720` — confirms kv_b_proj accessible at hook site
-  - `dsa_backend.py:L1864-1874` — FlashMLA index format
-  - `dsa/dsa_indexer.py:L550-555` — page_size=64 and req_to_token format
-  - `/cluster-storage/models/deepseek-ai/DeepSeek-V3.2/config.json` — confirmed index_topk=2048
-  - `development/past_implementations/DoubleSparse/config/offline_calibration.py` — confirmed Method 1 Q·K
-  - `development/past_implementations/sglang-last-with-double-sparsity/python/sglang/srt/server_args.py:L599` — confirmed ds_heavy_channel_type="qk"
-  - `calibrate.py:L244-246` — confirmed L2(K²) divergence from Method 1
-- **Plan Sections Modified:**
-  - Goal Description
-  - AC-0, AC-2, AC-4, AC-5, AC-6, AC-7, AC-8, AC-10, AC-11, AC-13
-  - Feasibility Hints and Suggestions
-  - Dependencies and Sequence
-  - Task Breakdown (7 tasks modified, 1 added)
-  - Claude-Codex Deliberation
-  - Implementation Notes
-  - RLCR Loop Configuration
-- **Convergence Status:** `converged`
-- **Refinement Date:** 2026-05-27
+- **Input Plan:** development/loop5/plan.md
+- **Output Plan:** development/loop5/refined_plan_v1.md
+- **QA Document:** .humanize/plan_qa/plan-qa.md
+- **Total Comments Processed:** 19
+  - Questions: 0
+  - Change Requests: 18
+  - Research Requests: 1
+- **Plan Sections Modified:** Goal Description, Acceptance Criteria, Feasibility Hints and Suggestions, Dependencies and Sequence, Task Breakdown, Claude-Codex Deliberation, Pending User Decisions
+- **Convergence Status:** converged
+- **Refinement Date:** 2026-05-28
