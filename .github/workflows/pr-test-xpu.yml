@@ -117,7 +117,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cid="${{ steps.start_container.outputs.container_id }}"
-          docker exec "$cid" bash -c "source /home/sdp/miniforge3/bin/activate && conda activate py3.12 && cd /home/sdp/sglang/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu"
+          docker exec "$cid" bash -c "source /opt/venv/bin/activate && cd /sgl-workspace/sglang/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu"
 
       - name: Cleanup container
         if: always()
@@ -181,7 +181,7 @@ jobs:
         timeout-minutes: 60
         run: |
           cid="${{ steps.start_container.outputs.container_id }}"
-          docker exec "$cid" bash -c "source /opt/venv/bin/activate && cd /sgl-workspace/sglang/test/srt && python3 run_suite.py --hw xpu --suite stage-b-test-1-gpu-xpu"
+          docker exec "$cid" bash -c "source /opt/venv/bin/activate && cd /sgl-workspace/sglang/test && python3 run_suite.py --hw xpu --suite stage-b-test-1-gpu-xpu"
 
       - name: Cleanup container
         if: always()
