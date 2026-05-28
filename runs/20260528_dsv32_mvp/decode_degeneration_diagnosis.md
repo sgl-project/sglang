@@ -49,3 +49,6 @@ decode attention reads garbage → repetition.
 ## Artifacts
 - ds_generate_probe.json (graph DS), ds_eager_generate_probe.json (eager DS),
   dsa_baseline_generate_probe.json (baseline control), decode_degeneration_control.md.
+
+## Round-2 code-read refinement
+`_compute_logical_token_scores` (the eager logical scorer) DOES mask positions >= seq_len to -inf (selection_kernel.py:495-496), so the over-count is NOT a missing seq_len bound in that scorer. The bug must be in its INPUTS (the `seq_lens` actually passed during decode) or in `select_topk_sequence_order`'s valid count. Round-3 MUST instrument the live values (seq_lens, max_seq_len, finite-score count, valid_lengths) rather than blind-patch the scorer, which reads correct.
