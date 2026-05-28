@@ -69,6 +69,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
@@ -1661,9 +1662,9 @@ class SchedulerDisaggregationDecodeMixin:
             # Defensive: chunked prefill is a prefill-side concept; decode-side
             # prebuilt batches shouldn't carry has_pending_chunk reqs. The
             # waiting_queue invariant is checked by _assert_invariants in sync
-            # mode; this flag protects against any future code that would route
-            # a chunked req through the disagg decode path.
-            new_prebuilt_batch.filter_batch(exclude_chunked_req=True)
+            # mode; the filter protects against any future code that would
+            # route a chunked req through the disagg decode path.
+            new_prebuilt_batch.filter_batch(only_decode_ready=True)
             if not new_prebuilt_batch.is_empty():
                 if self.running_batch.is_empty():
                     self.running_batch = new_prebuilt_batch
@@ -1744,7 +1745,9 @@ class SchedulerDisaggregationDecodeMixin:
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
-        # construct a schedule batch with those requests and mark as decode
+        # construct a schedule batch with those requests and mark as decode.
+        # Pass forward_mode=PREBUILT so output_process_mode is set to DECODE
+        # (the prefill was performed remotely; locally we only schedule decode).
         new_batch = ScheduleBatch.init_new(
             can_run_list,
             self.req_to_token_pool,
@@ -1753,6 +1756,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
+            forward_mode=ForwardMode.PREBUILT,
         )
 
         # construct fake completed prefill

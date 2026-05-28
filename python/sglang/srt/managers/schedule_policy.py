@@ -648,6 +648,12 @@ class PrefillAdder:
         truncated = req.extend_input_len > _rem_tokens
         req.extend_input_len = min(req.extend_input_len, _rem_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
+        # DLLM uses scheduled_extend_len bookkeeping for symmetry with
+        # chunked-prefill; DLLM's has_pending_chunk is always False (the
+        # property short-circuits is_dllm()), so this only affects audit
+        # views. Snapshot the post-admit position the same way as
+        # add_one_req.
+        req.scheduled_extend_len = len(req.prefix_indices) + req.extend_input_len
         self.can_run_list.append(req)
 
         # Update budget: reserve max_new_tokens only if not truncated
@@ -751,7 +757,6 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             self._add_dllm_req(req, 0)
-            truncated = False
         elif (
             self.rem_chunk_tokens is None  # chunked prefill is disabled
             or req.extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
@@ -763,7 +768,6 @@ class PrefillAdder:
                 req.extend_input_len,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
             )
-            truncated = False
         else:
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
@@ -775,10 +779,11 @@ class PrefillAdder:
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
             self._update_prefill_budget(0, trunc_len, 0)
-            truncated = True
 
-        if not req.is_dllm():
-            req.has_pending_chunk = truncated
+        # Plan-time advance: snapshot how far fill_ids has been scheduled.
+        # See add_one_req for the rationale (prefix_indices + admitted
+        # tokens yields the right last-vs-middle comparison).
+        req.scheduled_extend_len = len(req.prefix_indices) + req.extend_input_len
 
         return self.budget_state()
 
@@ -902,7 +907,6 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-                truncated = False
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill (or last chunk of a chunked-resume req).
                 self.can_run_list.append(req)
@@ -917,7 +921,6 @@ class PrefillAdder:
                         CLIP_MAX_NEW_TOKENS,
                     ),
                 )
-                truncated = False
             else:
                 # Chunked prefill: this admission doesn't complete the prefill.
                 # Make sure at least one page is available
@@ -952,12 +955,15 @@ class PrefillAdder:
                 if not is_resume:
                     self._req_inc_lock_ref(req)
                 self._update_prefill_budget(budget_prefix, trunc_len, 0)
-                truncated = True
 
-        # has_pending_chunk: persistent flag carrying chunked-resume state
-        # across iters. DLLM uses its own staging_queue + pending_middle_outputs counter.
-        if not req.is_dllm():
-            req.has_pending_chunk = truncated
+        # Plan-time advance: snapshot how far this req's fill_ids has been
+        # scheduled. After this admit, fill_ids covers `prefix_indices`
+        # plus the `extend_input_len` tokens newly admitted; setting
+        # `scheduled_extend_len` to that sum keeps it monotone with the
+        # original "truncated" flag semantics (last chunk admit yields
+        # scheduled_extend_len == len(origin_input_ids), middle chunk
+        # yields strictly less).
+        req.scheduled_extend_len = len(req.prefix_indices) + req.extend_input_len
 
         return self.budget_state()
 
