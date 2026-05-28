@@ -11,9 +11,14 @@ repos:
       - id: end-of-file-fixer
       - id: check-yaml
         args: [--allow-multiple-documents]
+        # Helm chart templates embed Go template syntax ({{- ... -}})
+        # that is not valid YAML on its own; the rendered output is
+        # validated by `helm template` / `helm lint`.
+        exclude: ^experimental/sgl-router/helm/.*/templates/.*\.(yaml|tpl)$
       - id: check-toml
       - id: check-ast
       - id: check-added-large-files
+        args: ['--maxkb=1500']
       - id: check-merge-conflict
       - id: check-shebang-scripts-are-executable
       - id: detect-private-key
@@ -106,6 +111,12 @@ repos:
         entry: bash -c 'rustup component add --toolchain nightly rustfmt >/dev/null && cd sgl-model-gateway && cargo +nightly fmt -- --check'
         language: system
         files: ^sgl-model-gateway/.*\.rs$
+        pass_filenames: false
+      - id: rustfmt-sgl-router
+        name: rustfmt experimental/sgl-router
+        entry: bash -c 'cd experimental/sgl-router && cargo fmt -- --check'
+        language: system
+        files: ^experimental/sgl-router/.*\.rs$
         pass_filenames: false
   - repo: https://github.com/lycheeverse/lychee.git
     rev: lychee-v0.22.0
