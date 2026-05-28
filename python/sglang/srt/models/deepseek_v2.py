@@ -2145,6 +2145,18 @@ class DeepseekV2AttentionMLA(
                 if req_to_token_pool is not None
                 else None
             )
+            # Production ForwardBatch does not carry req_to_token_pool on the
+            # decode path, so resolve it from the ForwardContext-published
+            # attention backend (which caches model_runner.req_to_token_pool's
+            # map at init — see dsa_backend). Without this the selector falls
+            # into physical-domain mode and logical_to_physical is skipped
+            # (ds_out filled with -1), so DS decode attends to no tokens and
+            # the output degenerates while only the prompt slots ever score.
+            if req_to_token is None and _has_forward_context():
+                _rtt_backend = _get_attn_backend()
+                if isinstance(_rtt_backend, _TboAttnBackend):
+                    _rtt_backend = _rtt_backend.primary
+                req_to_token = getattr(_rtt_backend, "req_to_token", None)
 
             def _run() -> torch.Tensor:
                 assert_real_selector_or_placeholder_allowed(
