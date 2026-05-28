@@ -19,6 +19,9 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
+from sglang.srt.multimodal.processors.kimi_token_ids import (
+    process_kimi_token_ids_mm_data,
+)
 
 # ---------------------------------------------------------------------------
 # GPU image preprocessing utilities (resize, pad, normalize, patchify on CUDA)
@@ -373,6 +376,11 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
+        if isinstance(input_text, list):
+            return await process_kimi_token_ids_mm_data(
+                self, input_text, image_data, **kwargs
+            )
+
         base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
