@@ -65,6 +65,7 @@ Select with `--dataset-name`:
 - `image`: generates images and wraps them in chat messages; supports custom resolutions, multiple formats, and different content types
 - `generated-shared-prefix`: synthetic dataset with shared long system prompts and short questions
 - `mmmu`: samples from MMMU (Math split) and includes images
+- `speed-bench`: [SPEED-Bench](https://huggingface.co/datasets/nvidia/SPEED-Bench) (**SPEculative Evaluation Dataset**) — a unified benchmark for evaluating [Speculative Decoding (SD)](https://arxiv.org/abs/2604.09557) algorithms. Uses the Throughput split, which provides fixed-length input sequences (1K–32K tokens) grouped into three output-entropy categories (`low_entropy`, `mixed`, `high_entropy`). Requires a pre-downloaded JSONL file passed via `--dataset-path`.
 
 Common dataset flags:
 
@@ -89,6 +90,12 @@ Image dataset flags (for `image`):
 - `--image-resolution`: Image resolution; supports presets (4k, 1080p, 720p, 360p) or custom 'heightxwidth' format (e.g., 1080x1920, 512x768)
 - `--image-format`: Image format (jpeg or png)
 - `--image-content`: Image content type (random or blank)
+
+SPEED-Bench flags (for `speed-bench`):
+
+- `--dataset-path PATH`: path to the pre-downloaded SPEED-Bench Throughput JSONL (e.g., `throughput_1k.jsonl`). Use the [SPEED-Bench measurement framework](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/specdec_bench) to generate it.
+- `--speed-bench-category`: filter to one entropy category: `low_entropy`, `mixed`, or `high_entropy` (default: all)
+- `--speed-bench-output-len`: fixed number of output tokens per request (default: 512)
 
 ### Examples
 
@@ -123,6 +130,23 @@ python3 -m sglang.bench_serving \
     --random-input 1024 \
     --random-output 1024 \
     --random-range-ratio 0.5
+```
+
+3. To benchmark speculative decoding throughput using SPEED-Bench (mixed-entropy category, 1K ISL), you can run:
+
+```bash Command
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --speculative-algorithm EAGLE --speculative-draft-model-path <draft-model-path>
+```
+
+```bash Command
+python3 -m sglang.bench_serving \
+    --backend sglang \
+    --dataset-name speed-bench \
+    --dataset-path /path/to/throughput_1k.jsonl \
+    --speed-bench-category mixed \
+    --speed-bench-output-len 512 \
+    --num-prompts 512
 ```
 
 ### Choosing model and tokenizer
