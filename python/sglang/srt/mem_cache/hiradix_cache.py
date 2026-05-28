@@ -111,6 +111,9 @@ class HiRadixCache(RadixCache):
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.extra_metric_labels = server_args.extra_metric_labels
 
+        # Stash for _parse_storage_backend_extra_config (Patch D): used as the
+        # fallback default when extra_config does not pin prefetch_threshold.
+        self._server_args_prefetch_threshold = server_args.hicache_prefetch_threshold
         (
             extra_config,
             prefetch_threshold,
@@ -154,6 +157,9 @@ class HiRadixCache(RadixCache):
                 pp_rank=self.pp_rank,
                 pp_size=self.pp_size,
                 enable_storage_metrics=self.enable_storage_metrics,
+                hicache_prefetch_capacity_tokens=getattr(
+                    server_args, "hicache_prefetch_capacity_tokens", 0
+                ),
             )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
@@ -584,7 +590,11 @@ class HiRadixCache(RadixCache):
                 raise e
 
         defaults = PrefetchTimeoutConfig()
-        prefetch_threshold = extra_config.pop("prefetch_threshold", 256)  # tokens
+        prefetch_threshold = extra_config.pop(
+            "prefetch_threshold",
+            getattr(self, "_server_args_prefetch_threshold", 256),
+        )  # tokens
+        prefetch_threshold = max(prefetch_threshold, self.page_size)
         prefetch_timeout_base = extra_config.pop(
             "prefetch_timeout_base", defaults.base
         )  # seconds

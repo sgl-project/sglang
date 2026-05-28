@@ -667,6 +667,20 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
+    # Token-count threshold below which prefetch_from_storage skips the L3
+    # lookup. Lower-bounded internally to page_size. Override via
+    # --hicache-prefetch-threshold or via hicache_storage_backend_extra_config
+    # JSON key `prefetch_threshold` (the JSON key wins if both are set, per
+    # _parse_storage_backend_extra_config semantics).
+    hicache_prefetch_threshold: int = 256
+
+    # Override for the L3 prefetch in-flight capacity (tokens). 0 = auto:
+    # uses 0.8*(host-device) if host > device, else 0.5*device_size.
+    # When the auto formula clamps to 0 (e.g. hicache-ratio=1.0 where
+    # host == device), L3 reads are effectively disabled because
+    # prefetch_rate_limited() returns True immediately. Set to a positive
+    # integer (e.g. 65536) to unblock cross-session reuse on ratio=1.0.
+    hicache_prefetch_capacity_tokens: int = 0
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -5983,6 +5997,29 @@ class ServerArgs:
             type=int,
             default=ServerArgs.mamba_track_interval,
             help="The interval to track the mamba state during decode.",
+        )
+        parser.add_argument(
+            "--hicache-prefetch-threshold",
+            type=int,
+            default=ServerArgs.hicache_prefetch_threshold,
+            help=(
+                "Minimum page-aligned new-input token count required for "
+                "prefetch_from_storage to dispatch an L3 lookup. Lower-bounded "
+                "internally to page_size. Default 256 matches the historical "
+                "in-config-blob default. Lower (e.g. 16) lets smoke-test prompts "
+                "exercise the L3 read path; raise to suppress lookup spam on "
+                "trivially-short prompts."
+            ),
+        )
+        parser.add_argument(
+            "--hicache-prefetch-capacity-tokens",
+            type=int,
+            default=ServerArgs.hicache_prefetch_capacity_tokens,
+            help=(
+                "Override the L3 prefetch in-flight capacity (tokens). "
+                "0 = auto: uses 0.8*(host-device) if host>device, else "
+                "0.5*device_size."
+            ),
         )
         parser.add_argument(
             "--mamba-backend",
