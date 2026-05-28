@@ -79,9 +79,9 @@ class HiRadixCache(RadixCache):
                 self.token_to_kv_pool_host = prealloc_host_kv_pool
             else:
                 if prealloc_host_kv_pool is not None:
-                    logger.warning(
-                        "Ignoring mismatched HiCache prealloc host pool %s for MHA KV pool.",
-                        type(prealloc_host_kv_pool).__name__,
+                    raise ValueError(
+                        f"Mismatched HiCache prealloc host pool "
+                        f"{type(prealloc_host_kv_pool).__name__} for MHA KV pool."
                     )
                 self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                     self.kv_cache,
@@ -105,9 +105,9 @@ class HiRadixCache(RadixCache):
                 self.token_to_kv_pool_host = prealloc_host_kv_pool
             else:
                 if prealloc_host_kv_pool is not None:
-                    logger.warning(
-                        "Ignoring mismatched HiCache prealloc host pool %s for MLA KV pool.",
-                        type(prealloc_host_kv_pool).__name__,
+                    raise ValueError(
+                        f"Mismatched HiCache prealloc host pool "
+                        f"{type(prealloc_host_kv_pool).__name__} for MLA KV pool."
                     )
                 self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                     self.kv_cache,

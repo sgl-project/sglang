@@ -121,9 +121,9 @@ def build_kv_only_stack(
         kv_host_pool.wait_kv_buffer_ready()
     else:
         if prealloc_host_kv_pool is not None:
-            logger.warning(
-                "Ignoring mismatched HiCache prealloc host pool %s for unified KV-only path.",
-                type(prealloc_host_kv_pool).__name__,
+            raise ValueError(
+                f"Mismatched HiCache prealloc host pool "
+                f"{type(prealloc_host_kv_pool).__name__} for unified KV-only path."
             )
         kv_host_pool = build_kv_host_pool(
             kv_pool=kv_pool,

@@ -69,6 +69,16 @@ def _memory_pool_host_modules():
     )
 
 
+def _host_pool_host_classes():
+    _install_kvcacheio_stub()
+    from sglang.srt.mem_cache.memory_pool_host import (  # noqa: PLC0415
+        MHATokenToKVPoolHost,
+        MLATokenToKVPoolHost,
+    )
+
+    return MHATokenToKVPoolHost, MLATokenToKVPoolHost
+
+
 def _fake_mha_pool():
     pool = object.__new__(MHATokenToKVPool)
     pool.store_dtype = torch.float32
@@ -320,6 +330,71 @@ class TestHiCacheHostPrealloc(unittest.TestCase):
                 host_size=0,
                 page_size=1,
                 layout="layer_first",
+            )
+
+    def test_hiradix_rejects_mismatched_mha_prealloc_pool(self):
+        _install_kvcacheio_stub()
+        _, MLATokenToKVPoolHost = _host_pool_host_classes()
+        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache  # noqa: PLC0415
+
+        params = SimpleNamespace(
+            enable_metrics=False,
+            page_size=1,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                get_kvcache=lambda: _fake_mha_pool()
+            ),
+            prealloc_host_kv_pool=object.__new__(MLATokenToKVPoolHost),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "Mismatched HiCache prealloc host pool .* for MHA KV pool"
+        ):
+            HiRadixCache(params, SimpleNamespace())
+
+    def test_hiradix_rejects_mismatched_mla_prealloc_pool(self):
+        _install_kvcacheio_stub()
+        MHATokenToKVPoolHost, _ = _host_pool_host_classes()
+        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache  # noqa: PLC0415
+
+        params = SimpleNamespace(
+            enable_metrics=False,
+            page_size=1,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                get_kvcache=lambda: _fake_mla_pool()
+            ),
+            prealloc_host_kv_pool=object.__new__(MHATokenToKVPoolHost),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "Mismatched HiCache prealloc host pool .* for MLA KV pool"
+        ):
+            HiRadixCache(params, SimpleNamespace())
+
+    def test_unified_kv_only_rejects_mismatched_prealloc_pool(self):
+        _install_kvcacheio_stub()
+        _, MLATokenToKVPoolHost = _host_pool_host_classes()
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (  # noqa: PLC0415
+            build_kv_only_stack,
+        )
+
+        params = SimpleNamespace(
+            prealloc_host_kv_pool=object.__new__(MLATokenToKVPoolHost),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "Mismatched HiCache prealloc host pool .* for unified KV-only path",
+        ):
+            build_kv_only_stack(
+                params=params,
+                server_args=SimpleNamespace(),
+                kv_pool=_fake_mha_pool(),
+                full_layer_mapping={0: 0},
+                page_size=1,
+                tp_group=None,
+                load_cache_event=None,
+                storage_backend=None,
+                use_mla=False,
             )
 
     def test_bounded_pretouch_skips_when_stop_event_missing(self):

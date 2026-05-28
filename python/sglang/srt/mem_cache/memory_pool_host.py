@@ -113,7 +113,7 @@ def bounded_pretouch_host_tensor(buffer: torch.Tensor, tag: str = "") -> None:
     total_bytes = buffer.numel() * buffer.element_size()
     page_step = max(1, 4096 // buffer.element_size())
     chunk_elems = max(page_step, PRETOUCH_CHUNK_BYTES // buffer.element_size())
-    flat = buffer.reshape(-1)
+    flat = buffer.view(-1)
     touched_bytes = 0
     t0 = time.perf_counter()
 
@@ -343,6 +343,7 @@ class HostKVCache(abc.ABC):
         except BaseException as e:  # noqa: BLE001
             self._alloc_error = e
 
+    @synchronized
     def wait_kv_buffer_ready(self) -> None:
         """Wait until host buffers exist and post-allocation setup is done."""
 
@@ -393,11 +394,15 @@ class HostKVCache(abc.ABC):
         if not self._cuda_host_register_deferred:
             return
         captured_device = getattr(self, "_alloc_cuda_device", None)
-        if captured_device is not None:
-            torch.cuda.set_device(captured_device)
         t0 = time.perf_counter()
-        for tag, buffer in self._iter_cuda_host_register_buffers():
-            cuda_host_register_tensor(buffer, tag=tag)
+        ctx = (
+            torch.cuda.device(captured_device)
+            if captured_device is not None
+            else nullcontext()
+        )
+        with ctx:
+            for tag, buffer in self._iter_cuda_host_register_buffers():
+                cuda_host_register_tensor(buffer, tag=tag)
         logger.info(
             f"[hicache-register] deferred CUDA host registration finished in "
             f"{time.perf_counter() - t0:.2f}s ({type(self).__name__})"
