@@ -25,6 +25,7 @@ import logging
 import os
 import random
 import tempfile
+from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.srt.arg_groups.argparse_actions import (
@@ -597,7 +598,6 @@ class ServerArgs:
     # Adaptive speculative decoding
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
-    speculative_adaptive_max_draft_tokens: Optional[int] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -7029,6 +7029,7 @@ class ServerArgs:
     def enable_mamba_extra_buffer(self) -> bool:
         return self.mamba_scheduler_strategy == "extra_buffer"
 
+    @cached_property
     def effective_max_speculative_num_draft_tokens(self) -> Optional[int]:
         """Return the maximum draft-token count runtime speculative decoding may use."""
         if self.speculative_num_draft_tokens is None:
@@ -7036,20 +7037,17 @@ class ServerArgs:
         if not self.speculative_adaptive:
             return self.speculative_num_draft_tokens
 
-        if self.speculative_adaptive_max_draft_tokens is None:
-            from sglang.srt.speculative.adaptive_spec_params import (
-                resolve_candidate_steps_from_config,
-            )
+        from sglang.srt.speculative.adaptive_spec_params import (
+            resolve_candidate_steps_from_config,
+        )
 
-            candidate_steps = resolve_candidate_steps_from_config(
-                initial_steps=self.speculative_num_steps,
-                cfg_path=self.speculative_adaptive_config,
-            )
-            # TODO: adaptive spec currently requires topk=1, so each runtime state
-            # needs steps + 1 draft-token slots. Revisit this if topk>1 is supported.
-            self.speculative_adaptive_max_draft_tokens = max(candidate_steps) + 1
-
-        return self.speculative_adaptive_max_draft_tokens
+        candidate_steps = resolve_candidate_steps_from_config(
+            initial_steps=self.speculative_num_steps,
+            cfg_path=self.speculative_adaptive_config,
+        )
+        # TODO: adaptive spec currently requires topk=1, so each runtime state
+        # needs steps + 1 draft-token slots. Revisit this if topk>1 is supported.
+        return max(candidate_steps) + 1
 
     @property
     def mamba_cache_chunk_size(self) -> int:
