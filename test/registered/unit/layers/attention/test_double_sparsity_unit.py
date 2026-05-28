@@ -8380,6 +8380,158 @@ class TestBuildRequestCapture(unittest.TestCase):
         for v in records[0]["per_layer_written_all_true"]:
             self.assertFalse(v)
 
+    def test_per_token_slot_sha_lengths_match_prompt_len(self):
+        """``per_token_slot_sha`` and per-layer per-token label SHAs
+        are aligned with the prompt range — every position has exactly
+        one slot SHA and one label SHA per layer. The capture-aware
+        fixture relies on this alignment to compare positions."""
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as cap,
+        )
+        table = self._build_table()
+        slots = torch.tensor([10, 11, 12, 13, 14, 15], dtype=torch.int64)
+        self._populate(table, slots, k_nope_seed=13)
+        req_to_token = torch.zeros(2, 16, dtype=torch.int64)
+        req_to_token[0, :6] = slots
+        records = cap.build_request_capture(
+            signatures=table.signatures, written=table.written,
+            req_to_token=req_to_token,
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([6], dtype=torch.int64),
+        )
+        rec = records[0]
+        self.assertEqual(rec["prompt_len"], 6)
+        self.assertEqual(len(rec["per_token_slot_sha"]), 6)
+        self.assertEqual(
+            len(rec["per_layer_per_token_label_sha"]),
+            table.num_layers_local,
+        )
+        for layer_row in rec["per_layer_per_token_label_sha"]:
+            self.assertEqual(len(layer_row), 6)
+
+    def test_compare_cached_prefix_first_position_diff(self):
+        """``compare_cached_prefix`` names the FIRST diverging
+        position. Slot SHA differs at position 2 → result kind='slot',
+        position=2."""
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as cap,
+        )
+        cold = {
+            "per_token_slot_sha": ["s0", "s1", "s2", "s3", "s4"],
+            "per_layer_per_token_label_sha": [
+                ["L0_0", "L0_1", "L0_2", "L0_3", "L0_4"],
+            ],
+        }
+        warm = {
+            "per_token_slot_sha": ["s0", "s1", "DIVERGED", "s3", "s4"],
+            "per_layer_per_token_label_sha": [
+                ["L0_0", "L0_1", "L0_2", "L0_3", "L0_4"],
+            ],
+        }
+        result = cap.compare_cached_prefix(
+            cold=cold, warm=warm, cached_tokens=5,
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["divergence_kind"], "slot")
+        self.assertEqual(result["first_diverging_position"], 2)
+
+    def test_compare_cached_prefix_zero_cached_tokens_no_overlap(self):
+        """``cached_tokens=0`` means the warm pass did not reuse any
+        prefix — the helper returns kind='no_cached_prefix' so the
+        verdict helper can refuse with a clear message."""
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as cap,
+        )
+        rec = {
+            "per_token_slot_sha": ["s0", "s1"],
+            "per_layer_per_token_label_sha": [["L0_0", "L0_1"]],
+        }
+        result = cap.compare_cached_prefix(
+            cold=rec, warm=rec, cached_tokens=0,
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["divergence_kind"], "no_cached_prefix")
+
+    def test_per_token_slot_sha_deterministic_across_calls(self):
+        """Two identical calls produce bit-equal per-token slot SHAs.
+        Foundation of the cold/warm comparison: same slots → same
+        SHAs."""
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as cap,
+        )
+        table = self._build_table()
+        slots = torch.tensor([3, 4, 5], dtype=torch.int64)
+        self._populate(table, slots, k_nope_seed=99)
+        req_to_token = torch.zeros(2, 8, dtype=torch.int64)
+        req_to_token[0, :3] = slots
+
+        def _call():
+            return cap.build_request_capture(
+                signatures=table.signatures, written=table.written,
+                req_to_token=req_to_token,
+                req_pool_indices=torch.tensor([0], dtype=torch.int64),
+                seq_lens=torch.tensor([3], dtype=torch.int64),
+            )
+
+        a = _call()[0]
+        b = _call()[0]
+        self.assertEqual(a["per_token_slot_sha"], b["per_token_slot_sha"])
+        self.assertEqual(
+            a["per_layer_per_token_label_sha"],
+            b["per_layer_per_token_label_sha"],
+        )
+
+    def test_compare_cached_prefix_label_divergence_named_layer(self):
+        """Slot SHAs match across all positions but layer 1's per-
+        token label SHA diverges at position 1 → kind='label',
+        first_diverging_position=1, layer=1 in the reason."""
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as cap,
+        )
+        common_slots = ["s0", "s1", "s2"]
+        cold = {
+            "per_token_slot_sha": list(common_slots),
+            "per_layer_per_token_label_sha": [
+                ["L0_0", "L0_1", "L0_2"],
+                ["L1_0", "L1_1", "L1_2"],
+            ],
+        }
+        warm = {
+            "per_token_slot_sha": list(common_slots),
+            "per_layer_per_token_label_sha": [
+                ["L0_0", "L0_1", "L0_2"],
+                ["L1_0", "L1_DIVERGED", "L1_2"],
+            ],
+        }
+        result = cap.compare_cached_prefix(
+            cold=cold, warm=warm, cached_tokens=3,
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["divergence_kind"], "label")
+        self.assertEqual(result["first_diverging_position"], 1)
+        self.assertIn("layer=1", result["reason"])
+
+    def test_compare_cached_prefix_clamps_to_shorter_capture(self):
+        """``cached_tokens`` larger than either capture's length is
+        clamped to the actual overlap. If the overlapping positions
+        agree, the result is ``ok=True`` — extra positions absent
+        from either side are not treated as a divergence."""
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as cap,
+        )
+        cold = {
+            "per_token_slot_sha": ["s0", "s1"],
+            "per_layer_per_token_label_sha": [["L0_0", "L0_1"]],
+        }
+        warm = {
+            "per_token_slot_sha": ["s0", "s1", "s2"],
+            "per_layer_per_token_label_sha": [["L0_0", "L0_1", "L0_2"]],
+        }
+        result = cap.compare_cached_prefix(
+            cold=cold, warm=warm, cached_tokens=10,
+        )
+        self.assertTrue(result["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

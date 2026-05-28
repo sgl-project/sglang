@@ -244,14 +244,17 @@ def build_request_capture(
             records.append({
                 "prompt_len": prompt_len,
                 "slots_sha": _tensor_bytes_sha(slots_long),
+                "per_token_slot_sha": [],
                 "per_layer_label_sha": ["<empty>"] * L,
                 "per_layer_written_sha": ["<empty>"] * L,
                 "per_layer_written_all_true": [True] * L,
+                "per_layer_per_token_label_sha": [[] for _ in range(L)],
             })
             continue
         per_layer_label_sha: List[str] = []
         per_layer_written_sha: List[str] = []
         per_layer_written_all_true: List[bool] = []
+        per_layer_per_token_label_sha: List[List[str]] = []
         for layer_id in range(L):
             per_layer_label_sha.append(
                 _tensor_bytes_sha(signatures[layer_id, slots_long])
@@ -261,11 +264,118 @@ def build_request_capture(
             per_layer_written_all_true.append(
                 bool(written_slice.all().item())
             )
+            # Per-token label SHA so the fixture can compare just the
+            # first `cached_tokens` positions (the radix-cache-reused
+            # prefix) without false-mismatching on later decode-allocated
+            # slots that one side has and the other does not.
+            layer_slice = signatures[layer_id, slots_long]
+            per_layer_per_token_label_sha.append([
+                _tensor_bytes_sha(layer_slice[t])
+                for t in range(layer_slice.shape[0])
+            ])
+        per_token_slot_sha = [
+            _tensor_bytes_sha(slots_long[t : t + 1])
+            for t in range(slots_long.shape[0])
+        ]
         records.append({
             "prompt_len": prompt_len,
             "slots_sha": _tensor_bytes_sha(slots_long),
+            "per_token_slot_sha": per_token_slot_sha,
             "per_layer_label_sha": per_layer_label_sha,
             "per_layer_written_sha": per_layer_written_sha,
             "per_layer_written_all_true": per_layer_written_all_true,
+            "per_layer_per_token_label_sha": per_layer_per_token_label_sha,
         })
     return records
+
+
+def compare_cached_prefix(
+    *,
+    cold: Dict[str, Any],
+    warm: Dict[str, Any],
+    cached_tokens: int,
+) -> Dict[str, Any]:
+    """Compare just the first ``cached_tokens`` positions of two
+    per-request capture records.
+
+    The radix cache reuses the leading prefix slots when the warm
+    request shares a prefix with a previously-served cold request.
+    Beyond ``cached_tokens`` positions both passes may have allocated
+    distinct slots (suffix tokens for the warm pass; the full prompt
+    for cold). Comparing only the cached prefix avoids a false
+    mismatch when one side's capture includes extra decode-allocated
+    slots and the other does not.
+
+    Returns ``{ok, first_diverging_position, divergence_kind}``.
+    ``divergence_kind`` is one of:
+      * ``"slot"`` — the physical slot at that position differs
+        (radix cache did not reuse the slot);
+      * ``"label"`` — the slot agrees but at least one layer's
+        per-token label SHA differs at that position;
+      * ``""`` — no divergence in the cached-prefix range.
+    """
+    if cached_tokens <= 0:
+        return {
+            "ok": False,
+            "first_diverging_position": -1,
+            "divergence_kind": "no_cached_prefix",
+            "reason": "cached_tokens <= 0; nothing to compare",
+        }
+    c_slots = cold.get("per_token_slot_sha") or []
+    w_slots = warm.get("per_token_slot_sha") or []
+    n = min(cached_tokens, len(c_slots), len(w_slots))
+    if n == 0:
+        return {
+            "ok": False,
+            "first_diverging_position": -1,
+            "divergence_kind": "empty_capture",
+            "reason": (
+                f"capture too short for cached_tokens={cached_tokens}: "
+                f"cold={len(c_slots)} warm={len(w_slots)}"
+            ),
+        }
+    for t in range(n):
+        if c_slots[t] != w_slots[t]:
+            return {
+                "ok": False,
+                "first_diverging_position": t,
+                "divergence_kind": "slot",
+                "reason": (
+                    f"per_token_slot_sha differs at position {t}: "
+                    f"cold={c_slots[t]!r} warm={w_slots[t]!r}"
+                ),
+            }
+    c_pll = cold.get("per_layer_per_token_label_sha") or []
+    w_pll = warm.get("per_layer_per_token_label_sha") or []
+    if len(c_pll) != len(w_pll):
+        return {
+            "ok": False,
+            "first_diverging_position": -1,
+            "divergence_kind": "layer_count",
+            "reason": (
+                f"per_layer_per_token_label_sha layer count mismatch: "
+                f"cold={len(c_pll)} warm={len(w_pll)}"
+            ),
+        }
+    for layer_id in range(len(c_pll)):
+        c_layer = c_pll[layer_id]
+        w_layer = w_pll[layer_id]
+        m = min(n, len(c_layer), len(w_layer))
+        for t in range(m):
+            if c_layer[t] != w_layer[t]:
+                return {
+                    "ok": False,
+                    "first_diverging_position": t,
+                    "divergence_kind": "label",
+                    "reason": (
+                        f"per_layer_per_token_label_sha differs at "
+                        f"layer={layer_id} position={t}: "
+                        f"cold={c_layer[t]!r} warm={w_layer[t]!r}"
+                    ),
+                }
+    return {
+        "ok": True,
+        "first_diverging_position": -1,
+        "divergence_kind": "",
+        "reason": "",
+    }

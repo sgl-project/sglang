@@ -319,6 +319,60 @@ _DSA_IMPL_T: TypeAlias = Literal[
 ]
 
 
+def _ds_radix_publish_extend_snapshot(*, backend, forward_batch) -> None:
+    """M3-B radix-capture publish hook (extend-only, post-write).
+
+    Called from ``_write_token_labels`` after the current layer's
+    labels have been written. Each call overwrites
+    ``forward_batch.ds_per_request_summary["double_sparsity_radix_capture"]``;
+    the LAST DS layer to fire in this extend forward wins, at which
+    point all layers' label rows for the prompt slots are fresh.
+
+    Default-off zero-cost contract preserved by the caller's
+    ``is_capture_enabled()`` gate. This helper itself is best-effort:
+    any failure is recorded as a string into
+    ``ds_per_request_summary["double_sparsity_radix_capture_error"]``
+    and re-raises nothing — capture must not break production.
+    """
+    from sglang.srt.layers.attention.double_sparsity import (
+        radix_fixture_capture as _ds_radix_capture,
+    )
+
+    table = getattr(backend, "_ds_token_label_table", None)
+    if table is None:
+        return
+    req_pool = getattr(forward_batch, "req_to_token_pool", None)
+    req_to_token = req_pool.req_to_token if req_pool is not None else None
+    req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
+    seq_lens = getattr(forward_batch, "seq_lens", None)
+    if (
+        req_to_token is None
+        or req_pool_indices is None
+        or seq_lens is None
+    ):
+        return
+
+    summary = getattr(forward_batch, "ds_per_request_summary", None)
+    if summary is None:
+        summary = {}
+        setattr(forward_batch, "ds_per_request_summary", summary)
+
+    try:
+        summary["double_sparsity_radix_capture"] = (
+            _ds_radix_capture.build_request_capture(
+                signatures=table.signatures,
+                written=table.written,
+                req_to_token=req_to_token,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — fixture-only branch
+        summary["double_sparsity_radix_capture_error"] = (
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
 class DeepseekSparseAttnBackend(
     DeepseekSparseAttnBackendMTPPrecomputeMixin, AttentionBackend
 ):
@@ -1498,6 +1552,20 @@ class DeepseekSparseAttnBackend(
         )
         # M3-B radix-cache fixture capture (env-gated, zero-cost when
         # off — `is_capture_enabled` is one `os.environ.get` lookup).
+        # The capture publishes the post-forward per-request snapshot
+        # via the existing per-request summary transport
+        # (forward_batch.ds_per_request_summary ->
+        # BatchTokenIDOutput.per_request_summary -> response meta_info).
+        #
+        # Publishing here (after token_label_write returns) means the
+        # current layer's labels are FRESH; later layers will publish
+        # again with their own freshness, and "latest snapshot per
+        # request" semantics naturally selects the last DS layer's
+        # call to win — at which point all layers are fresh.
+        #
+        # Restricted to extend-mode forwards so decode steps do NOT
+        # overwrite the prefill capture with later snapshots that
+        # include decode-allocated slots.
         from sglang.srt.layers.attention.double_sparsity import (
             radix_fixture_capture as _ds_radix_capture,
         )
@@ -1510,6 +1578,19 @@ class DeepseekSparseAttnBackend(
                     layer_id, cache_loc.long()
                 ],
             )
+            try:
+                forward_mode = getattr(forward_batch, "forward_mode", None)
+                is_extend = bool(
+                    forward_mode is not None
+                    and getattr(forward_mode, "is_extend", lambda: False)()
+                )
+            except Exception:
+                is_extend = False
+            if is_extend:
+                _ds_radix_publish_extend_snapshot(
+                    backend=self,
+                    forward_batch=forward_batch,
+                )
         # AC-12 zero-signature fault injection: zero the just-written
         # row but keep written=True so the selector treats the slot as
         # populated with intentionally bad labels (not absent).
