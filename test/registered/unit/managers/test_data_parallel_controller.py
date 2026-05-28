@@ -1,40 +1,67 @@
-"""Unit tests for DataParallelController dispatch + DPBudget.dispatch.
+"""Unit tests for DataParallelController + DPBudget.
 
-Covers the simpler LB algorithms:
-  - round_robin (counter + active-worker skip)
-  - follow_bootstrap_room (bootstrap_room modulo, prefill default)
-  - total_requests (DPBudget argmin)
+Covers:
+  - DPBudget.update_budget — GetLoadsReqOutput field mapping regression guard
+  - DPBudget.dispatch — TOTAL_REQUESTS / TOTAL_TOKENS argmin + tie-break
+  - DataParallelController dispatch methods:
+      * round_robin (counter + active-worker skip)
+      * follow_bootstrap_room (bootstrap_room modulo, prefill default)
+      * total_requests (DPBudget argmin)
 
 The most complex algorithm, total_tokens, is exercised end-to-end in
-test/registered/disaggregation/test_disaggregation_dp_attention.py — its
+test/registered/disaggregation/test_disaggregation_dp_attention.py. Its
 tie-breaking on total_requests transitively covers total_requests state
 as well.
 
-DPBudget.update_budget field mapping is tested separately in
-test_dp_budget.py (same directory); this file focuses on dispatch logic.
-
-Fragility note:
-  The scheduler-method tests bypass ``DataParallelController.__init__``
-  via ``__new__`` and inject only the attributes the schedulers read:
+Fragility note (scheduler tests only):
+  Scheduler-method tests bypass ``DataParallelController.__init__`` via
+  ``__new__`` and inject only the attributes the schedulers read:
   ``workers``, ``status``, ``round_robin_counter``, ``dp_budget``. If a
   scheduler method starts reading a new instance attribute, add it here.
   ``maybe_external_dp_rank_routing`` is exercised as a real method (no
   mock) so its bypass-on-``routed_dp_rank`` logic stays covered.
 """
 
+import dataclasses
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
     DPBudget,
     LoadBalanceMethod,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.srt.managers.io_struct import GetLoadsReqOutput, WatchLoadUpdateReq
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+# --- Helpers --------------------------------------------------------------
+
+_BASE_LOAD = GetLoadsReqOutput(
+    dp_rank=0,
+    timestamp=0.0,
+    num_running_reqs=0,
+    num_waiting_reqs=0,
+    num_used_tokens=0,
+    num_total_tokens=0,
+    max_total_num_tokens=4096,
+    token_usage=0.0,
+    gen_throughput=0.0,
+    cache_hit_rate=0.0,
+    utilization=0.0,
+    max_running_requests=128,
+)
+
+
+def _load(**overrides) -> GetLoadsReqOutput:
+    return dataclasses.replace(_BASE_LOAD, **overrides)
 
 
 def _make_controller(dp_size: int) -> DataParallelController:
@@ -66,11 +93,58 @@ def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None):
     )
 
 
-class TestDPBudgetDispatch(CustomTestCase):
-    """DPBudget.dispatch picks rank from current state and increments counters.
+# --- DPBudget -------------------------------------------------------------
 
-    update_budget field mapping is covered separately by test_dp_budget.py.
-    """
+
+class TestDPBudgetUpdateBudget(CustomTestCase):
+    def test_maps_running_plus_waiting_to_total_requests(self):
+        budget = DPBudget(dp_size=2)
+        budget.update_budget(
+            WatchLoadUpdateReq(
+                loads=[
+                    _load(dp_rank=0, num_running_reqs=3, num_waiting_reqs=2),
+                    _load(dp_rank=1, num_running_reqs=5, num_waiting_reqs=1),
+                ]
+            )
+        )
+        self.assertEqual(budget.total_requests, [5, 6])
+
+    def test_maps_num_total_tokens_not_num_used_tokens(self):
+        # Reads num_total_tokens (used + pending prefill), NOT num_used_tokens.
+        # A silent swap here would break DP balance for long-prompt workloads.
+        budget = DPBudget(dp_size=2)
+        budget.update_budget(
+            WatchLoadUpdateReq(
+                loads=[
+                    _load(dp_rank=0, num_used_tokens=100, num_total_tokens=150),
+                    _load(dp_rank=1, num_used_tokens=80, num_total_tokens=80),
+                ]
+            )
+        )
+        self.assertEqual(budget.total_tokens, [150, 80])
+
+    def test_partial_update_only_affects_reported_rank(self):
+        budget = DPBudget(dp_size=3)
+        budget.total_requests = [10, 20, 30]
+        budget.total_tokens = [100, 200, 300]
+        budget.update_budget(
+            WatchLoadUpdateReq(
+                loads=[
+                    _load(
+                        dp_rank=1,
+                        num_running_reqs=1,
+                        num_waiting_reqs=1,
+                        num_total_tokens=50,
+                    )
+                ]
+            )
+        )
+        self.assertEqual(budget.total_requests, [10, 2, 30])
+        self.assertEqual(budget.total_tokens, [100, 50, 300])
+
+
+class TestDPBudgetDispatch(CustomTestCase):
+    """DPBudget.dispatch picks a rank from current state and updates counters."""
 
     def test_total_requests_dispatch_picks_min_and_increments(self):
         budget = DPBudget(dp_size=3)
@@ -115,6 +189,9 @@ class TestDPBudgetDispatch(CustomTestCase):
         budget = DPBudget(dp_size=3)
         self.assertIsNone(budget.dispatch(LoadBalanceMethod.ROUND_ROBIN))
         self.assertIsNone(budget.dispatch(LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM))
+
+
+# --- DataParallelController dispatch methods -------------------------------
 
 
 class TestRoundRobinScheduler(CustomTestCase):

@@ -27,7 +27,7 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
     per-worker token accounting, tie-breaking on total_requests, and
     estimated_tokens at dispatch time. Simpler dispatch algorithms
     (round_robin, follow_bootstrap_room, total_requests) are covered by
-    unit tests in test/registered/unit/managers/test_lb_dispatch.py.
+    unit tests in test/registered/unit/managers/test_data_parallel_controller.py.
     """
 
     PREFILL_DP_SIZE = 4
