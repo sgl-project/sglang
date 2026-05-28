@@ -65,7 +65,6 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
 )
-from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -117,6 +116,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
+from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     maybe_fuse_routed_scale_and_shared_add,
 )
@@ -2463,7 +2463,11 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         # Quant configs like Quark may rely on the model to provide fused-module
         # mappings so exclusion checks can unfuse derived names back to the
         # checkpoint's source layer names.
-        if quant_config is not None and not isinstance(quant_config, ModelSlimConfig) and hasattr(quant_config, "packed_modules_mapping"):
+        if (
+            quant_config is not None
+            and not isinstance(quant_config, ModelSlimConfig)
+            and hasattr(quant_config, "packed_modules_mapping")
+        ):
             quant_config.packed_modules_mapping = self.packed_modules_mapping
 
         self.pp_group = get_pp_group()
