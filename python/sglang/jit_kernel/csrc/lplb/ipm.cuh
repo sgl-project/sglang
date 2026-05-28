@@ -57,7 +57,12 @@ __device__ __forceinline__ void cholesky_factor(float a[N][N]) {
   const int tid = threadIdx.x;
   for (int k = 0; k < N; k++) {
     if (tid == 0) {
-      a[k][k] = sqrtf(a[k][k]);
+      // Clamp the pivot away from zero before sqrtf. Numerical drift in
+      // the IPM iterations can push a[k][k] slightly negative on
+      // otherwise-PSD matrices, which would produce NaN and propagate
+      // through the rest of the solve. The convergence check at the end
+      // of the kernel writes 0.5 on non-convergence regardless.
+      a[k][k] = sqrtf(fmaxf(a[k][k], 1e-12f));
     }
     __syncthreads();
     const float pivot = a[k][k];
@@ -191,7 +196,13 @@ __global__ void ipm_solve_kernel(
         d_max = fmaxf(d_max, __shfl_xor_sync(0xffffffff, d_max, offset));
       }
       if (tid == 0) {
-        alpha = 0.999f / d_max;
+        // Guard against d_max <= 0 from a degenerate / numerically-stuck
+        // iteration. A non-positive d_max would yield inf/NaN from the
+        // division and corrupt x on the next update. The 1.0 fallback
+        // produces a no-op step (x *= 1 - 1*0 = x) so the solver simply
+        // stalls rather than diverges, and the convergence check at the
+        // end of the kernel writes 0.5 if d_max stays small.
+        alpha = (d_max > 1e-9f) ? (0.999f / d_max) : 1.0f;
       }
     }
     __syncthreads();
