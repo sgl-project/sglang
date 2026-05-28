@@ -7,10 +7,16 @@ import torch.nn.functional as F
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
+def _channels_last_3d_supported_by_platform() -> bool:
+    return hasattr(torch, "channels_last_3d") and (
+        current_platform.is_cuda() or current_platform.is_rocm()
+    )
+
+
 def _conv3d_weight_is_channels_last_3d(weight: torch.Tensor) -> bool:
     return (
         weight.dim() == 5
-        and hasattr(torch, "channels_last_3d")
+        and _channels_last_3d_supported_by_platform()
         and weight.is_contiguous(memory_format=torch.channels_last_3d)
     )
 

@@ -129,11 +129,6 @@ class DeepseekV4ModelNextN(nn.Module):
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
         return y.to(dtype)
 
-    def prewarm_mhc_token_count_buckets(
-        self, max_num_tokens: int, device: torch.device
-    ) -> Tuple[int, ...]:
-        return self.decoder.prewarm_mhc_token_count_buckets(max_num_tokens, device)
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -249,6 +244,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
+                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
                 if is_dsa_prefill_cp_round_robin_split():
                     attn_backend = get_attn_backend()
