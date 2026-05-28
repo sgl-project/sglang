@@ -87,6 +87,9 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
+from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
+    try_fused_hc_post_pre,
+)
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
 
 if not _is_hip:
@@ -131,6 +134,28 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
         output_unquantized_inp1=True,
     )
     return x_quant, x_bf16
+
+
+_FREQS_CIS_TO_COS_SIN: dict[
+    Tuple[int, torch.dtype, torch.device], Tuple[torch.Tensor, torch.Tensor]
+] = {}
+
+
+def _freqs_cis_to_cos_sin(
+    freqs_cis: torch.Tensor, dtype: torch.dtype, device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Derive (cos, sin) bf16 contiguous tables from a complex64 `freqs_cis`,
+    cached by `(id(freqs_cis), dtype, device)` so that all layers sharing the
+    same `freqs_cis` (via `precompute_freqs_cis`'s lru_cache) reuse one pair."""
+    key = (id(freqs_cis), dtype, device)
+    cached = _FREQS_CIS_TO_COS_SIN.get(key)
+    if cached is not None:
+        return cached
+    fr = torch.view_as_real(freqs_cis)
+    cos = fr[..., 0].to(device=device, dtype=dtype).contiguous()
+    sin = fr[..., 1].to(device=device, dtype=dtype).contiguous()
+    _FREQS_CIS_TO_COS_SIN[key] = (cos, sin)
+    return cos, sin
 
 
 if TYPE_CHECKING:
@@ -319,7 +344,7 @@ class MQALayer(nn.Module):
                 )
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
-        self.fuse_wqa_wkv = not _is_hip and envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        self.fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         if self.fuse_wqa_wkv:
             self.wqkv_a = ReplicatedLinear(
                 self.hidden_size,
@@ -536,6 +561,119 @@ class MQALayer(nn.Module):
 
         return q
 
+    def _forward_prepare_multi_stream_hip(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+        q_out: Optional[torch.Tensor] = None,
+        x_quant=None,
+    ) -> torch.Tensor:
+        """ATOM-style ROCm path: overlap compressors, keep Q/KV on main stream."""
+        assert self.alt_streams is not None
+        assert len(self.alt_streams) >= 1
+
+        current_stream = torch.cuda.current_stream()
+        stream_compressor = self.alt_streams[0]
+        stream_indexer_compressor = (
+            self.alt_streams[1] if len(self.alt_streams) > 1 else None
+        )
+
+        if self.compressor is not None:
+            stream_compressor.wait_stream(current_stream)
+            with torch.cuda.stream(stream_compressor):
+                attn_backend.forward_core_compressor(
+                    x, forward_batch, self.layer_id, self.compressor
+                )
+
+        if self.indexer is not None and stream_indexer_compressor is not None:
+            stream_indexer_compressor.wait_stream(current_stream)
+            with torch.cuda.stream(stream_indexer_compressor):
+                attn_backend.forward_indexer_compressor(
+                    x=x,
+                    forward_batch=forward_batch,
+                    layer_id=self.indexer.layer_id,
+                    compressor=self.indexer.compressor,
+                )
+
+        x_linear = x_quant if x_quant is not None else x
+        if self.fuse_wqa_wkv:
+            qkv_a, _ = self.wqkv_a(x_linear)
+            q_lora = qkv_a[..., : self.q_lora_rank]
+        else:
+            q_lora, _ = self.wq_a(x_linear)
+            qkv_a = None
+
+        if self.use_fused_qk_norm_rope:
+            if _is_gfx95_supported:
+                q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
+                    q_lora,
+                    self.q_norm.weight,
+                    self.q_norm.variance_epsilon,
+                )
+                q, _ = self.wq_b(q_for_wqb)
+            else:
+                q_lora = self.q_norm(q_lora)
+                q, _ = self.wq_b(q_lora)
+
+            kv = (
+                qkv_a[..., self.q_lora_rank :]
+                if qkv_a is not None
+                else self.wkv(x_linear)[0]
+            )
+
+            from sglang.srt.layers.fused_qk_norm_rope_store import (
+                fused_qk_norm_rope_swa_store,
+            )
+
+            token_to_kv_pool = get_token_to_kv_pool()
+            swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(
+                forward_batch.out_cache_loc
+            )
+            swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
+            swa_page_size = token_to_kv_pool.swa_kv_pool.page_size
+
+            q = fused_qk_norm_rope_swa_store(
+                q=q,
+                kv=kv,
+                q_norm_weight=None,
+                kv_norm_weight=self.kv_norm.weight,
+                q_rms_eps=self.eps,
+                kv_rms_eps=self.eps,
+                rope_head_dim=self.qk_rope_head_dim,
+                cos_cache=self.cos_cache,
+                sin_cache=self.sin_cache,
+                positions=positions,
+                swa_cache=swa_cache,
+                swa_loc=swa_loc,
+                swa_page_size=swa_page_size,
+                q_out=q_out,
+                dtype=x.dtype,
+            )
+        else:
+            q_lora = self.q_norm(q_lora)
+            q = self._compute_q_b(q_lora, positions, q_out)
+            self._compute_kv_to_cache(x_linear, positions, forward_batch, qkv_a=qkv_a)
+
+        del qkv_a
+
+        if self.indexer is not None:
+            current_stream.wait_stream(stream_compressor)
+            if stream_indexer_compressor is not None:
+                current_stream.wait_stream(stream_indexer_compressor)
+            self.indexer(
+                x=x,
+                q_lora=q_lora,
+                forward_batch=forward_batch,
+                attn_backend=attn_backend,
+                skip_compressor=True,
+            )
+        elif self.compressor is not None:
+            current_stream.wait_stream(stream_compressor)
+
+        return q
+
     def _forward_prepare(
         self,
         x: torch.Tensor,
@@ -683,6 +821,7 @@ class MQALayer(nn.Module):
             and get_is_capture_mode()
             and x.shape[0] <= self._multi_stream_bs_limit
             and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
+            and not (_is_hip and self.compressor is None)
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
@@ -695,14 +834,24 @@ class MQALayer(nn.Module):
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
             # so the bf16 KV intermediate is gone.
-            q = self._forward_prepare_multi_stream(
-                x,
-                positions,
-                forward_batch,
-                attn_backend,
-                q_out,
-                x_quant=x_quant,
-            )
+            if _is_hip:
+                q = self._forward_prepare_multi_stream_hip(
+                    x,
+                    positions,
+                    forward_batch,
+                    attn_backend,
+                    q_out,
+                    x_quant=x_quant,
+                )
+            else:
+                q = self._forward_prepare_multi_stream(
+                    x,
+                    positions,
+                    forward_batch,
+                    attn_backend,
+                    q_out,
+                    x_quant=x_quant,
+                )
             kv = None
         else:
             q, kv = self._forward_prepare(
@@ -792,12 +941,20 @@ class DeepseekV4DecoderLayer(nn.Module):
             alt_streams=alt_streams,
             compress_ratio_override=compress_ratio_override,
         )
+        moe_alt_stream = (
+            alt_streams[0]
+            if (
+                alt_streams is not None
+                and (_is_cuda or envs.SGLANG_ROCM_USE_MULTI_STREAM.get())
+            )
+            else None
+        )
         self.mlp = deepseek_v2.DeepseekV2MoE(
             config=config,
             quant_config=moe_quant_config_override or quant_config,
             prefix=add_prefix("mlp", prefix),
             layer_id=self.layer_id,
-            alt_stream=alt_streams[0] if alt_streams is not None else None,
+            alt_stream=moe_alt_stream,
             is_nextn=is_nextn,
             is_deepseek_v4=True,
         )
@@ -1057,15 +1214,33 @@ class DeepseekV4DecoderLayer(nn.Module):
             x_quant=x_quant,
         )
 
-        hidden_states = self.hc_post(hidden_states, residual, post, comb)
-        residual = hidden_states
-        hidden_states, post, comb, norm_fused = self.hc_pre(
+        fused_mhc = try_fused_hc_post_pre(
             hidden_states,
-            self.hc_ffn_fn,
+            residual,
+            post,
+            comb,
+            self.hc_ffn_fn.T,
             self.hc_ffn_scale,
             self.hc_ffn_base,
-            norm=self.post_attention_layernorm,
+            self.hc_mult,
+            self.rms_norm_eps,
+            self.hc_eps,
+            2.0,
+            self.hc_sinkhorn_iters,
+            _is_gfx95_supported,
         )
+        if fused_mhc is not None:
+            residual, hidden_states, post, comb, norm_fused = fused_mhc
+        else:
+            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            residual = hidden_states  # [n, hc, d]
+            hidden_states, post, comb, norm_fused = self.hc_pre(
+                hidden_states,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                norm=self.post_attention_layernorm,
+            )  # -> [n, d]
         if not norm_fused:
             hidden_states = self.post_attention_layernorm(hidden_states)
 
@@ -1147,7 +1322,19 @@ class DeepseekV4Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
         self.rms_norm_eps = config.rms_norm_eps
-        self.alt_streams = [torch.cuda.Stream() for _ in range(5)] if _is_cuda else None
+        use_stream_pool = _is_cuda or (
+            _is_hip
+            and (
+                envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
+                or envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+            )
+        )
+        num_alt_streams = 5 if _is_cuda else 2
+        self.alt_streams = (
+            [torch.cuda.Stream() for _ in range(num_alt_streams)]
+            if use_stream_pool
+            else None
+        )
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV4DecoderLayer(
@@ -1435,7 +1622,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
-                    extend_lens=forward_batch.extend_seq_lens_cpu,
+                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
                 if is_dsa_prefill_cp_round_robin_split():
                     attn_backend = get_attn_backend()
@@ -1617,7 +1804,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         cache_compressor_weight = {}
         COMPRESSOR_PART = ".compressor.w"
 
-        fuse_wqa_wkv = not _is_hip and envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
 
         def auto_weight_loader(module):
