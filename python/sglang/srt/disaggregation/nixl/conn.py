@@ -308,7 +308,9 @@ class NixlKVManager(CommonKVManager):
             self._num_slots_src = (
                 self.kv_args.kv_data_lens[0] // self.kv_args.kv_item_lens[0]
             )
-            self._init_prep_handle("", self.kv_args.kv_data_ptrs, self.kv_args.gpu_id)
+            self._init_equal_tp_prep_handle(
+                "", self.kv_args.kv_data_ptrs, self.kv_args.gpu_id
+            )
             transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
@@ -512,7 +514,7 @@ class NixlKVManager(CommonKVManager):
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
 
-    def _init_prep_handle(
+    def _init_equal_tp_prep_handle(
         self,
         peer_name: str,
         kv_ptrs: list[int],
@@ -548,7 +550,7 @@ class NixlKVManager(CommonKVManager):
             self.prep_handles[peer_name] is not None
         ), f"prep_xfer_dlist returned None for peer '{peer_name}'"
 
-    def _init_prep_handle_slice(
+    def _init_hetero_tp_slice_prep_handle(
         self, peer_name: str, decode_kv_args: KVArgsRegisterInfo
     ):
         """Pre-build NIXL dlists for TP-heterogeneous slice transfers.
@@ -677,14 +679,14 @@ class NixlKVManager(CommonKVManager):
             # Safe to use prefill's kv_item_lens for the dst dlist stride:
             # equal_tp guarantees identical heads-per-rank (same item_len);
             # MLA latent shape is TP-invariant.
-            self._init_prep_handle(
+            self._init_equal_tp_prep_handle(
                 peer_info.agent_name,
                 peer_info.dst_kv_ptrs,
                 peer_info.gpu_id,
                 num_slots=peer_info.dst_num_slots,
             )
         else:
-            self._init_prep_handle_slice(peer_info.agent_name, peer_info)
+            self._init_hetero_tp_slice_prep_handle(peer_info.agent_name, peer_info)
 
     def transfer_worker(self, queue: FastQueue, staging_buffer=None):
         # Per-worker staging strategy: lazy-created on first chunk so we
