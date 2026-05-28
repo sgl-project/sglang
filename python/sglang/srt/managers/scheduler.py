@@ -2553,13 +2553,13 @@ class Scheduler(
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
-        # Chunked-resume admission: handled by the small block at the top of this
-        # method, which feeds the single chunked-resume req (if any) through
-        # `adder.add_one_req`. PrefillAdder.add_one_req detects chunked-resume via
-        # the `is_resume` flag (has_pending_chunk and not is_dllm) and handles all
-        # budget bookkeeping in one place — no special add_chunked_req method
-        # resurrected. The main waiting_queue loop below admits ONLY truly-waiting
-        # reqs.
+        # Chunked-resume admission: scheduler-side dispatch. The single
+        # chunked-resume req (if any) is routed to
+        # `adder.add_non_first_chunk_req` by the inline block below; the
+        # main waiting_queue loop admits ONLY truly-waiting (fresh) reqs
+        # via `adder.add_first_chunk_req`. PrefillAdder does NOT inspect
+        # `has_pending_chunk` to pick a path; the caller (this function)
+        # owns dispatch.
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -2643,18 +2643,13 @@ class Scheduler(
             # No tree_cache: chunked-resume MUST NOT re-match prefix (H7).
             # Its row + KV + lock_ref are already held from prior admission.
             chunked_req.init_next_round_input()
-            # Use the standard adder.add_one_req — its `is_resume` branch
-            # (schedule_policy.py) handles chunked-resume correctly:
-            # - budget_prefix=0 (don't double-count prefix)
-            # - skip _req_inc_lock_ref (already held)
-            # - bump scheduled_extend_len (advances has_pending_chunk view)
-            # By running BEFORE the main waiting_queue loop, the chunked req
-            # also skips LoRA drainer / hicache prefetch checks that the
-            # main loop applies to fresh reqs.
-            adder.add_one_req(
-                chunked_req,
-                truncation_align_size=self.truncation_align_size,
-            )
+            # Explicitly dispatch to add_non_first_chunk_req: no
+            # host_hit_length handling, no _req_inc_lock_ref (already held),
+            # no fresh admission gate, budget_prefix=0. By running BEFORE
+            # the main waiting_queue loop, the chunked req also skips LoRA
+            # drainer / hicache prefetch checks that the main loop applies
+            # to fresh reqs.
+            adder.add_non_first_chunk_req(chunked_req)
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
@@ -2701,7 +2696,7 @@ class Scheduler(
             # Chunked-resume is handled in the inline admission block above;
             # this main loop is unconditional.
             req.init_next_round_input(self.tree_cache)
-            res = adder.add_one_req(
+            res = adder.add_first_chunk_req(
                 req,
                 truncation_align_size=self.truncation_align_size,
             )

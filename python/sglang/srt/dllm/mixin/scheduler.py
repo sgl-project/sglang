@@ -256,7 +256,7 @@ class SchedulerDllmMixin:
 
             # Prepare and add request
             req.init_next_round_input(self.tree_cache)
-            res = adder.add_one_req(
+            res = adder.add_first_chunk_req(
                 req,
                 truncation_align_size=self.truncation_align_size,
             )

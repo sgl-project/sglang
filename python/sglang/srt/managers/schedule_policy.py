@@ -649,7 +649,7 @@ class PrefillAdder:
         # chunked-prefill; DLLM's has_pending_chunk is always False (the
         # property short-circuits is_dllm()), so this only affects audit
         # views. Snapshot the post-admit position the same way as
-        # add_one_req.
+        # add_first_chunk_req.
         req.set_scheduled_extend_len(len(req.prefix_indices) + req.extend_input_len)
         self.can_run_list.append(req)
 
@@ -778,13 +778,13 @@ class PrefillAdder:
             self._update_prefill_budget(0, trunc_len, 0)
 
         # Plan-time advance: snapshot how far fill_ids has been scheduled.
-        # See add_one_req for the rationale (prefix_indices + admitted
+        # See add_first_chunk_req for the rationale (prefix_indices + admitted
         # tokens yields the right last-vs-middle comparison).
         req.set_scheduled_extend_len(len(req.prefix_indices) + req.extend_input_len)
 
         return self.budget_state()
 
-    def _add_chunked_req_restored(self, req):
+    def add_non_first_chunk_req(self, req):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -819,10 +819,7 @@ class PrefillAdder:
         # Return if chunked prefill not finished
         return req if truncated else None
 
-    def add_one_req(self, req: Req, truncation_align_size: Optional[int]):
-        if req.has_pending_chunk and not req.is_dllm():
-            return self._add_chunked_req_restored(req)
-
+    def add_first_chunk_req(self, req: Req, truncation_align_size: Optional[int]):
         # Reuse path: this req's previous chunk left lock_ref held, prefix
         # already in tree, and init_load_back already consumed host KV. We
         # must skip fresh-req setup. Gate on `has_pending_chunk` (the

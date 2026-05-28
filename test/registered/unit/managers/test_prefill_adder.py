@@ -77,12 +77,13 @@ class TestPrefillAdder(CustomTestCase):
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.finished.return_value = False
-        # v2 add_one_req reads these on the reuse-branch gate; MagicMock(spec=Req)
-        # doesn't surface attributes set only in Req.__init__, so seed them.
-        # has_pending_chunk is a derived @property on Req now but MagicMock
-        # turns property accesses into a fresh Mock by default; override to a
-        # concrete bool so add_one_req's is_resume gate sees False for the
-        # mock reqs in this unit test.
+        # add_first_chunk_req reads these on its admission gates;
+        # MagicMock(spec=Req) doesn't surface attributes set only in
+        # Req.__init__, so seed them. has_pending_chunk is a derived
+        # @property on Req now but MagicMock turns property accesses into a
+        # fresh Mock by default; override to a concrete bool so the
+        # scheduler-side dispatch (and add_first_chunk_req's defensive
+        # assert) see False for the mock reqs in this unit test.
         req.has_pending_chunk = False
         req.scheduled_extend_len = 0
         req.is_dllm.return_value = False
@@ -393,7 +394,7 @@ class TestPrefillAdder(CustomTestCase):
         req1.last_node = MagicMock()
         req1.sampling_params.ignore_eos = False
 
-        result1 = adder.add_one_req(req1, truncation_align_size=None)
+        result1 = adder.add_first_chunk_req(req1, truncation_align_size=None)
 
         self.assertEqual(len(adder.can_run_list), 1)
         self.assertEqual(adder.rem_chunk_tokens, 0)  # 56 - 56
@@ -425,7 +426,7 @@ class TestPrefillAdder(CustomTestCase):
         req2.last_node = MagicMock()
         req2.sampling_params.ignore_eos = False
 
-        result2 = adder2.add_one_req(req2, truncation_align_size=None)
+        result2 = adder2.add_first_chunk_req(req2, truncation_align_size=None)
 
         self.assertEqual(len(adder2.can_run_list), 1)
         self.assertEqual(adder2.rem_chunk_tokens, 3)  # 59 - 56 = 3 remaining
@@ -440,7 +441,7 @@ class TestPrefillAdder(CustomTestCase):
         req3.last_node = MagicMock()
         req3.sampling_params.ignore_eos = False
 
-        result3 = adder2.add_one_req(req3, truncation_align_size=None)
+        result3 = adder2.add_first_chunk_req(req3, truncation_align_size=None)
 
         self.assertEqual(len(adder2.can_run_list), 2)
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
