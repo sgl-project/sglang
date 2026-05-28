@@ -521,9 +521,13 @@ class TopK(MultiPlatformOp):
         collective and deadlock under DP-attention.
         """
         if layer_id is not None:
-            info = ExpertLocationDispatchInfo.init_new(layer_id=layer_id)
-            if info is not None and info.lplb_solver is not None:
-                info.lplb_solver.solve(
+            # Skip the full ExpertLocationDispatchInfo allocation — we only
+            # need the per-layer solver to participate in the EP all-reduce.
+            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+            lplb_solver = get_global_lplb_solver(layer_id)
+            if lplb_solver is not None:
+                lplb_solver.solve(
                     torch.empty(
                         (0, self.topk_config.top_k),
                         dtype=torch.int32,
