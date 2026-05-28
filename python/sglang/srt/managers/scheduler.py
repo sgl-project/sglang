@@ -656,6 +656,7 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             get_running_batch=lambda: self.running_batch,
             get_waiting_queue=lambda: self.waiting_queue,
+            get_chunked_reqs=self.chunked_reqs,
             get_stats=lambda: self.metrics_reporter.stats,
             get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
             get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
@@ -2721,13 +2722,9 @@ class Scheduler(
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
                 # lifecycle and freeing them here causes double-free.
-                # Chunked-resume reqs inherit mamba_pool_idx from their first
-                # admission; freeing it on a transient NO_TOKEN this iter would
-                # discard a live mamba state still needed by subsequent chunks.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if (
                     not added
-                    and not req.has_pending_chunk
                     and req.mamba_pool_idx is not None
                     and not getattr(req, "session", None)
                 ):

@@ -43,6 +43,7 @@ class SchedulerLoadInquirer:
     spec_algorithm: "SpeculativeAlgorithm"
     get_running_batch: Callable
     get_waiting_queue: Callable
+    get_chunked_reqs: Callable
     get_stats: Callable
     get_disagg_prefill_bootstrap_queue: Callable
     get_disagg_prefill_inflight_queue: Callable
@@ -54,8 +55,8 @@ class SchedulerLoadInquirer:
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
 
-        This includes tokens from waiting queue requests plus remaining tokens
-        from the currently chunked request.
+        Includes tokens from waiting queue requests plus remaining tokens
+        from the (<=1) currently chunked-resume request.
 
         Args:
             chunk_deduct: extra tokens to subtract from the chunked request's
@@ -65,14 +66,13 @@ class SchedulerLoadInquirer:
                 time ``prefix_indices`` is already up-to-date, so the default
                 0 is correct.
         """
-        num_pending_tokens = sum(
-            req.seqlen - len(req.prefix_indices) for req in self.get_waiting_queue()
-        )
-        # The chunked-resume req (if any) is now in waiting_queue, so it's
-        # already counted in the sum above. chunk_deduct subtracts the
-        # current chunk's extend that has been planned but not yet reflected
-        # in prefix_indices.
-        return num_pending_tokens - chunk_deduct
+        num_pending_tokens = sum(req.seqlen for req in self.get_waiting_queue())
+        chunked_req = next(iter(self.get_chunked_reqs()), None)
+        if chunked_req is not None:
+            num_pending_tokens += (
+                chunked_req.seqlen - len(chunked_req.prefix_indices) - chunk_deduct
+            )
+        return num_pending_tokens
 
     def get_loads(self, req: GetLoadsReqInput = None) -> GetLoadsReqOutput:
         """
