@@ -819,6 +819,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             ].update_weights_from_disk(
                 recv_req.model_path,
                 recv_req.load_format,
+                files=recv_req.files,
                 recapture_cuda_graph=recv_req.recapture_cuda_graph,
             )
             if not success:

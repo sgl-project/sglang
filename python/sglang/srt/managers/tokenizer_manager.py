@@ -1581,7 +1581,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_update_result = asyncio.Future()
         if self.server_args.dp_size == 1:
             result = await self.model_update_result
-            if result.success:
+            if result.success and obj.load_format != "delta":
                 self._update_model_path_info(obj.model_path, obj.load_format)
             return result.success, result.message, result.num_paused_requests
         else:  # self.server_args.dp_size > 1
@@ -1589,7 +1589,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             result = await self.model_update_result
 
             all_success = all([r.success for r in result])
-            if all_success is True:
+            if all_success is True and obj.load_format != "delta":
                 self._update_model_path_info(obj.model_path, obj.load_format)
             all_message = [r.message for r in result]
             all_message = " | ".join(all_message)
