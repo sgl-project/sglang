@@ -1,7 +1,40 @@
+import logging
 from typing import Dict, List, Optional, Tuple, Type
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.harmony_parser import HarmonyParser
+
+logger = logging.getLogger(__name__)
+
+
+def resolve_think_end_id(tokenizer, reasoning_parser, enable_strict_thinking=False):
+    """Resolve think_end_token to a single token ID, or None if not possible.
+
+    Raises ValueError when enable_strict_thinking is set and the token
+    cannot be represented as a single ID.
+    """
+    think_end_ids = tokenizer.encode(
+        reasoning_parser.detector.think_end_token, add_special_tokens=False
+    )
+    if len(think_end_ids) == 1:
+        return think_end_ids[0]
+    if enable_strict_thinking:
+        raise ValueError(
+            f"--enable-strict-thinking requires think_end_token "
+            f"'{reasoning_parser.detector.think_end_token}' to encode "
+            f"to exactly one token, but this tokenizer produces "
+            f"{len(think_end_ids)}. Use a model whose tokenizer has "
+            f"the think_end_token as a single vocabulary entry."
+        )
+    logger.warning(
+        "think_end_token '%s' encodes to %d tokens (expected 1). "
+        "Constrained reasoning grammar and reasoning token counting "
+        "will be disabled for this model. The reasoning parser will "
+        "still function for output parsing.",
+        reasoning_parser.detector.think_end_token,
+        len(think_end_ids),
+    )
+    return None
 
 
 class StreamingParseResult:

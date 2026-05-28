@@ -229,7 +229,7 @@ from sglang.srt.observability.req_time_stats import (
     set_time_batch,
 )
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
-from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.reasoning_parser import ReasoningParser, resolve_think_end_id
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -669,28 +669,11 @@ class Scheduler(
             reasoning_parser = ReasoningParser(
                 model_type=self.server_args.reasoning_parser, stream_reasoning=False
             )
-            think_end_ids = self.tokenizer.encode(
-                reasoning_parser.detector.think_end_token, add_special_tokens=False
+            self.model_config.think_end_id = resolve_think_end_id(
+                self.tokenizer,
+                reasoning_parser,
+                self.server_args.enable_strict_thinking,
             )
-            if len(think_end_ids) == 1:
-                self.model_config.think_end_id = think_end_ids[0]
-            elif self.server_args.enable_strict_thinking:
-                raise ValueError(
-                    f"--enable-strict-thinking requires think_end_token "
-                    f"'{reasoning_parser.detector.think_end_token}' to encode "
-                    f"to exactly one token, but this tokenizer produces "
-                    f"{len(think_end_ids)}. Use a model whose tokenizer has "
-                    f"the think_end_token as a single vocabulary entry."
-                )
-            else:
-                logger.warning(
-                    "think_end_token '%s' encodes to %d tokens (expected 1). "
-                    "Constrained reasoning grammar and reasoning token counting "
-                    "will be disabled for this model. The reasoning parser will "
-                    "still function for output parsing.",
-                    reasoning_parser.detector.think_end_token,
-                    len(think_end_ids),
-                )
 
     def init_mamba_backend(self) -> None:
         initialize_mamba_selective_state_update_backend(self.server_args)
