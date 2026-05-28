@@ -52,3 +52,29 @@ decode attention reads garbage → repetition.
 
 ## Round-2 code-read refinement
 `_compute_logical_token_scores` (the eager logical scorer) DOES mask positions >= seq_len to -inf (selection_kernel.py:495-496), so the over-count is NOT a missing seq_len bound in that scorer. The bug must be in its INPUTS (the `seq_lens` actually passed during decode) or in `select_topk_sequence_order`'s valid count. Round-3 MUST instrument the live values (seq_lens, max_seq_len, finite-score count, valid_lengths) rather than blind-patch the scorer, which reads correct.
+
+## RESOLUTION UPDATE — #16 is TWO bugs (bug #1 fixed, bug #2 open)
+
+On-hardware instrumentation (env-gated DS_DEBUG_SELECT / DS_DEBUG_WRITE, since removed)
+decomposed the degeneration into two independent bugs:
+
+### Bug #1 — req_to_token None during decode → wrong selection domain (FIXED, commit 2af5f4e65)
+`_select_topk_indices` read `req_to_token` from `forward_batch.req_to_token_pool`, which
+is None on the decode path. Effects: (a) the selector fell into physical-domain mode
+(returned physical slot indices, e.g. sel_head=[64,65,66,67,68] instead of logical
+[0,1,2,3,4]); (b) `logical_to_physical` was skipped (`ds_out.fill_(-1)`) so decode
+attention had no valid slots. Fix: resolve `req_to_token` from the ForwardContext
+attention backend (caches model_runner.req_to_token_pool at init). Validated:
+sel_head→[0,1,2,3,4,...]; output "Paris. DDDD" → "Paris. The capital of France...".
+
+### Bug #2 — decode tokens are never label-written (OPEN)
+After bug #1, `written_in_seq` stays frozen at the prompt length (e.g. 5) even as
+seq_len grows to 28, so DS can only ever select the prompt tokens; the model can't see
+its own generated tokens and loops. Write-side probe (DS_DEBUG_WRITE in
+dsa_backend._write_token_labels) showed EVERY call is `mode=EXTEND`; there are ZERO
+`mode=DECODE` label writes. So `_write_token_labels` is not invoked on the decode path.
+On H200/CUDA the aiter/tilelang fused branches are off, so `forward_absorb_core` calls
+`attn_mqa` (→ forward_decode) with k not None and save_kv_cache True — yet the label
+write still does not fire on decode. Next step: instrument `forward_decode` directly
+(log reached?/k is None?/save_kv_cache) for a decode step, then add the decode-token
+label write (the projected K-noPE is available as `k_nope` in forward_absorb_core).
