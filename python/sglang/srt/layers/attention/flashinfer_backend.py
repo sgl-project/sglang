@@ -1089,6 +1089,7 @@ class FlashInferAttnBackend(AttentionBackend):
             self.is_nvfp4_kvcache and layer.is_cross_attention
         ), "NVFP4 dequant KV cache is not supported for cross-attention"
 
+        # We perform dequant for chunk prefill/cache reuse.
         pool = self.token_to_kv_pool
         if self.is_nvfp4_kvcache:
             if self.dq_page_table is not None:

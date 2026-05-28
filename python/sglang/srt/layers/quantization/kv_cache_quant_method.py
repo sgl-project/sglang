@@ -20,7 +20,7 @@ Three-player design:
 Adding a new FP4 scheme only requires:
   1. Implement a KVCacheQuantMethod subclass
   2. Register in KV_CACHE_QUANT_REGISTRY
-  3. Add to --fp4-kv-cache-recipe choices in server_args.py
+  3. Resolve it internally from --kv-cache-dtype when appropriate
 """
 
 from abc import ABC, abstractmethod
@@ -76,6 +76,8 @@ class KVCacheQuantMethod(ABC):
         cache_v: Tensor,
         k_scale=None,
         v_scale=None,
+        device_module=None,
+        alt_stream=None,
     ) -> None:
         """Quantize cache_k / cache_v and write into buffers at loc."""
 
@@ -126,6 +128,8 @@ class NoneMethod(KVCacheQuantMethod):
         cache_v,
         k_scale=None,
         v_scale=None,
+        device_module=None,
+        alt_stream=None,
     ) -> None:
         pass  # base class set_kv_buffer handles this
 
@@ -273,6 +277,8 @@ class NVFP4Method(KVCacheQuantMethod):
         cache_v: Tensor,
         k_scale=None,
         v_scale=None,
+        device_module=None,
+        alt_stream=None,
     ) -> None:
         from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4QuantizeUtil
 
@@ -283,10 +289,27 @@ class NVFP4Method(KVCacheQuantMethod):
             cache_v.contiguous(), v_scale
         )
 
-        k_buffer[loc] = cache_k.view(torch.uint8)
-        v_buffer[loc] = cache_v.view(torch.uint8)
-        k_scale_buffer[loc] = cache_k_fp4_sf.view(torch.uint8)
-        v_scale_buffer[loc] = cache_v_fp4_sf.view(torch.uint8)
+        cache_k = cache_k.view(torch.uint8)
+        cache_v = cache_v.view(torch.uint8)
+        cache_k_fp4_sf = cache_k_fp4_sf.view(torch.uint8)
+        cache_v_fp4_sf = cache_v_fp4_sf.view(torch.uint8)
+
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        if get_is_capture_mode() and alt_stream is not None:
+            current_stream = device_module.current_stream()
+            alt_stream.wait_stream(current_stream)
+            k_buffer[loc] = cache_k
+            k_scale_buffer[loc] = cache_k_fp4_sf
+            with device_module.stream(alt_stream):
+                v_buffer[loc] = cache_v
+                v_scale_buffer[loc] = cache_v_fp4_sf
+            current_stream.wait_stream(alt_stream)
+        else:
+            k_buffer[loc] = cache_k
+            v_buffer[loc] = cache_v
+            k_scale_buffer[loc] = cache_k_fp4_sf
+            v_scale_buffer[loc] = cache_v_fp4_sf
 
     def dequantize_prev_kv(
         self,
@@ -328,6 +351,14 @@ class MXFP4Method(KVCacheQuantMethod):
 
     name = "mxfp4"
     scale_block_size = 16
+
+    def __init__(
+        self,
+        num_layers: Optional[int] = None,
+        device: Optional[str] = None,
+        sm_version: Optional[int] = None,
+    ):
+        pass
 
     def needs_dequant_workspace(self) -> bool:
         return True
@@ -392,15 +423,30 @@ class MXFP4Method(KVCacheQuantMethod):
         cache_v,
         k_scale=None,
         v_scale=None,
+        device_module=None,
+        alt_stream=None,
     ) -> None:
         from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
 
         cache_k_fp4, cache_k_sf = KVFP4QuantizeUtil.batched_quantize(cache_k)
         cache_v_fp4, cache_v_sf = KVFP4QuantizeUtil.batched_quantize(cache_v)
-        k_buffer[loc] = cache_k_fp4
-        v_buffer[loc] = cache_v_fp4
-        k_scale_buffer[loc] = cache_k_sf
-        v_scale_buffer[loc] = cache_v_sf
+
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        if get_is_capture_mode() and alt_stream is not None:
+            current_stream = device_module.current_stream()
+            alt_stream.wait_stream(current_stream)
+            k_buffer[loc] = cache_k_fp4
+            k_scale_buffer[loc] = cache_k_sf
+            with device_module.stream(alt_stream):
+                v_buffer[loc] = cache_v_fp4
+                v_scale_buffer[loc] = cache_v_sf
+            current_stream.wait_stream(alt_stream)
+        else:
+            k_buffer[loc] = cache_k_fp4
+            v_buffer[loc] = cache_v_fp4
+            k_scale_buffer[loc] = cache_k_sf
+            v_scale_buffer[loc] = cache_v_sf
 
     def dequantize_prev_kv(
         self,
@@ -434,11 +480,35 @@ KV_CACHE_QUANT_REGISTRY: dict[str, type[KVCacheQuantMethod]] = {
 }
 
 
+def _is_fp4_kv_cache_dtype(kv_cache_dtype) -> bool:
+    if isinstance(kv_cache_dtype, str):
+        return kv_cache_dtype == "fp4_e2m1"
+    return (
+        hasattr(torch, "float4_e2m1fn_x2")
+        and kv_cache_dtype == torch.float4_e2m1fn_x2
+    )
+
+
+def resolve_kv_cache_quant(
+    kv_cache_dtype, sm_version: Optional[int] = None
+) -> Optional[str]:
+    """Resolve the internal quant method from the public KV cache dtype.
+
+    The user-facing API remains a single parameter: --kv-cache-dtype.
+    """
+    if not _is_fp4_kv_cache_dtype(kv_cache_dtype):
+        return None
+
+    if sm_version is None or sm_version in (100, 120):
+        return "nvfp4"
+    return "mxfp4"
+
+
 def get_kv_cache_quant_method(name: str, **kwargs) -> KVCacheQuantMethod:
-    """Instantiate a KVCacheQuantMethod by recipe name."""
+    """Instantiate a KVCacheQuantMethod by internal method name."""
     if name not in KV_CACHE_QUANT_REGISTRY:
         raise ValueError(
-            f"Unknown fp4_kv_cache_recipe: '{name}'. "
+            f"Unknown KV cache quantization method: '{name}'. "
             f"Available: {list(KV_CACHE_QUANT_REGISTRY)}"
         )
     return KV_CACHE_QUANT_REGISTRY[name](**kwargs)

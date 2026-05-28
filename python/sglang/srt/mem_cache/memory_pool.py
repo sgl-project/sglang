@@ -45,6 +45,7 @@ from sglang.srt.layers.attention.dsa.quant_k_cache import (
 )
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
+from sglang.srt.layers.quantization.kv_cache_quant_method import NoneMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.dcp_utils import (
     dcp_enabled,
@@ -1297,6 +1298,7 @@ class MHATokenToKVPool(KVCache):
         )
 
 
+
         # Layout: NHD (default) | HND (SGLANG_USE_HND_KVCACHE) | vectorized_5d (ROCm AITER).
         # HND folds (page, head) into one paged index for per-kv-head sparse page tables
         # (paged backends like trtllm_mha consume directly). vectorized_5d SHUFFLE 5D:
@@ -1422,10 +1424,8 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
-        from sglang.srt.layers.quantization.kv_cache_quant_method import NoneMethod
-
         if not isinstance(self.quant_method, NoneMethod):
-            # Delegate buffer creation to quant_method (e.g. NVFP4Method, MXFP4Method)
+            # Delegate buffer creation to quant_method (e.g. NVFP4Method, MXFP4Method).
             with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
                 with (
                     torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -1443,7 +1443,40 @@ class MHATokenToKVPool(KVCache):
             self.dq_k_buffer = buf.get("dq_k_buffer")
             self.dq_v_buffer = buf.get("dq_v_buffer")
             self.store_dtype = buf.get("store_dtype", torch.uint8)
-            return
+        else:
+            self.k_scale_buffer = None
+            self.v_scale_buffer = None
+            self.dq_k_buffer = None
+            self.dq_v_buffer = None
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                with (
+                    torch.cuda.use_mem_pool(self.custom_mem_pool)
+                    if self.enable_custom_mem_pool
+                    else nullcontext()
+                ):
+                    # [size, head_num, head_dim] for each layer
+                    # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                    self.k_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_buffer = [
+                        torch.zeros(
+                            (
+                                self.size + self.page_size,
+                                self.head_num,
+                                self.v_head_dim,
+                            ),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -1531,6 +1564,15 @@ class MHATokenToKVPool(KVCache):
                         for _ in range(self.layer_num)
                     ]
 
+        self._init_data_ptrs_and_strides()
+
+    def _cache_move_buffers(self):
+        buffers = self.k_buffer + self.v_buffer
+        if getattr(self, "k_scale_buffer", None) is not None:
+            buffers += self.k_scale_buffer + self.v_scale_buffer
+        return buffers
+
+    def _init_data_ptrs_and_strides(self):
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
             dtype=torch.uint64,
@@ -1541,12 +1583,14 @@ class MHATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
-        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        copy_buffers = self._cache_move_buffers()
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in copy_buffers],
+            dtype=torch.uint64,
+            device=self.device,
+        )
         self.data_strides = torch.tensor(
-            [
-                np.prod(x.shape[1:]) * x.dtype.itemsize
-                for x in self.k_buffer + self.v_buffer
-            ],
+            [np.prod(x.shape[1:]) * x.dtype.itemsize for x in copy_buffers],
             device=self.device,
         )
 
@@ -1565,12 +1609,14 @@ class MHATokenToKVPool(KVCache):
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
         assert hasattr(self, "v_buffer")
-        k_size_bytes = 0
-        for k_cache in self.k_buffer:
-            k_size_bytes += get_tensor_size_bytes(k_cache)
-        v_size_bytes = 0
-        for v_cache in self.v_buffer:
-            v_size_bytes += get_tensor_size_bytes(v_cache)
+        k_size_bytes = get_tensor_size_bytes(self.k_buffer)
+        v_size_bytes = get_tensor_size_bytes(self.v_buffer)
+        if getattr(self, "k_scale_buffer", None) is not None:
+            k_size_bytes += get_tensor_size_bytes(self.k_scale_buffer)
+            v_size_bytes += get_tensor_size_bytes(self.v_scale_buffer)
+        if getattr(self, "dq_k_buffer", None) is not None:
+            k_size_bytes += get_tensor_size_bytes(self.dq_k_buffer)
+            v_size_bytes += get_tensor_size_bytes(self.dq_v_buffer)
         return k_size_bytes, v_size_bytes
 
     # for disagg
@@ -1707,8 +1753,6 @@ class MHATokenToKVPool(KVCache):
             global_layer_id = global_layer_id_override
             layer_id = layer_id_override
 
-        from sglang.srt.layers.quantization.kv_cache_quant_method import NoneMethod
-
         if not isinstance(self.quant_method, NoneMethod):
             # Delegate quantization + write to quant_method.
             # Always use global_layer_id for scale lookup (scales are indexed by global layer id).
@@ -1730,6 +1774,8 @@ class MHATokenToKVPool(KVCache):
                 cache_v,
                 k_scale,
                 v_scale,
+                device_module=self.device_module,
+                alt_stream=self.alt_stream,
             )
             return
 
@@ -1928,14 +1974,25 @@ class MHATokenToKVPool(KVCache):
     # Backward-compatible accessors for attention backends
     def get_fp4_key_buffer(self, layer_id: int):
         raw = self.get_raw_kv_buffer(layer_id)
+        if "k_scale" not in raw:
+            raise RuntimeError("FP4 key buffer requested from a non-FP4 KV pool.")
         return raw["k"], raw["k_scale"]
 
     def get_fp4_value_buffer(self, layer_id: int):
         raw = self.get_raw_kv_buffer(layer_id)
+        if "v_scale" not in raw:
+            raise RuntimeError("FP4 value buffer requested from a non-FP4 KV pool.")
         return raw["v"], raw["v_scale"]
 
     def get_dq_kv_buffer(self) -> tuple:
         """Return the shared dequant workspace (dq_k_buffer, dq_v_buffer)."""
+        if (
+            getattr(self, "dq_k_buffer", None) is None
+            or getattr(self, "dq_v_buffer", None) is None
+        ):
+            raise RuntimeError(
+                "Dequant workspace requested from a KV pool without FP4 dequant buffers."
+            )
         return self.dq_k_buffer, self.dq_v_buffer
 
     def dequant_kv_for_extend(
@@ -2053,6 +2110,10 @@ class MHATokenToKVPool(KVCache):
         # per-layer buffers here ignore page_size in move_kv_cache_native.
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
+            if getattr(self, "k_scale_buffer", None) is not None:
+                move_kv_cache_native(
+                    self.k_scale_buffer, self.v_scale_buffer, tgt_loc, src_loc
+                )
             return
 
         N = tgt_loc.numel()
@@ -2678,11 +2739,11 @@ class HybridLinearKVPool(KVCache):
 
     def get_fp4_value_buffer(self, layer_id: int):
         layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool._get_value_nvfp4_from_nvfp4_buffer(layer_id)
+        return self.full_kv_pool.get_fp4_value_buffer(layer_id)
 
     def get_fp4_key_buffer(self, layer_id: int):
         layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool._get_key_nvfp4_from_nvfp4_buffer(layer_id)
+        return self.full_kv_pool.get_fp4_key_buffer(layer_id)
 
     def get_raw_kv_buffer(self, layer_id: int):
         layer_id = self._transfer_full_attention_id(layer_id)

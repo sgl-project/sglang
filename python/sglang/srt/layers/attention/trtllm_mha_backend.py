@@ -947,8 +947,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         kv_cache = (k_cache, v_cache)
 
-        # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
+
         bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
@@ -969,7 +969,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 window_left=layer.sliding_window_size,
                 sinks=attention_sink,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-                out_dtype=self.q_data_type,  # model_runner.dtype
+                out_dtype=self.q_data_type,
                 q_len_per_req=self.forward_metadata.max_seq_len_q,
             )
         else:
@@ -983,13 +983,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 max_kv_len=self.max_context_len,
                 bmm1_scale=bmm1_scale,
                 bmm2_scale=bmm2_scale,
-                batch_size=self.forward_metadata.cu_seqlens_q.shape[0] - 1,
-                cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
-                cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
                 window_left=layer.sliding_window_size,
                 sinks=attention_sink,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
-                out_dtype=self.q_data_type,  # model_runner.dtype
+                out_dtype=self.q_data_type,
+                is_causal=True,
             )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)

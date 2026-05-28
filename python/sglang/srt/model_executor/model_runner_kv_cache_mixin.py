@@ -22,6 +22,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.kv_cache_quant_method import (
     get_kv_cache_quant_method,
+    resolve_kv_cache_quant,
 )
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
@@ -793,16 +794,25 @@ class ModelRunnerKVCacheMixin:
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                     from sglang.srt.utils.common import (
                         is_sm100_supported,
+                        is_sm120_supported,
                     )
 
-                    sm_version = 100 if is_sm100_supported() else 120
-                    recipe = self.server_args.fp4_kv_cache_recipe
-                    hybrid_quant_method = get_kv_cache_quant_method(
-                        recipe,
-                        num_layers=len(hybrid_full_layer_ids),
-                        device=self.device,
-                        sm_version=sm_version,
+                    if is_sm100_supported():
+                        sm_version = 100
+                    elif is_sm120_supported():
+                        sm_version = 120
+                    else:
+                        sm_version = 0
+                    quant_name = resolve_kv_cache_quant(
+                        self.kv_cache_dtype, sm_version
                     )
+                    if quant_name is not None:
+                        hybrid_quant_method = get_kv_cache_quant_method(
+                            quant_name,
+                            num_layers=len(hybrid_full_layer_ids),
+                            device=self.device,
+                            sm_version=sm_version,
+                        )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=self.max_total_num_tokens,
@@ -832,16 +842,27 @@ class ModelRunnerKVCacheMixin:
                     assert (
                         not enable_page_major
                     ), "page-major KV layout is not supported with fp4 KV cache"
-                    from sglang.srt.utils.common import is_sm100_supported
-
-                    sm_version = 100 if is_sm100_supported() else 120
-                    recipe = self.server_args.fp4_kv_cache_recipe
-                    quant_method = get_kv_cache_quant_method(
-                        recipe,
-                        num_layers=self.num_effective_layers,
-                        device=self.device,
-                        sm_version=sm_version,
+                    from sglang.srt.utils.common import (
+                        is_sm100_supported,
+                        is_sm120_supported,
                     )
+
+                    if is_sm100_supported():
+                        sm_version = 100
+                    elif is_sm120_supported():
+                        sm_version = 120
+                    else:
+                        sm_version = 0
+                    quant_name = resolve_kv_cache_quant(
+                        self.kv_cache_dtype, sm_version
+                    )
+                    if quant_name is not None:
+                        quant_method = get_kv_cache_quant_method(
+                            quant_name,
+                            num_layers=self.num_effective_layers,
+                            device=self.device,
+                            sm_version=sm_version,
+                        )
 
                 pool_cls = (
                     NoOpMHATokenToKVPool
