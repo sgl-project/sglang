@@ -1657,12 +1657,7 @@ class DecodeTransferQueue:
         )
         decode_req.req.last_node = decode_req.hicache_restored_node
 
-    def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> bool:
-        """
-        Returns:
-            True if the request should be removed from the queue (success or corruption)
-            False if metadata not ready yet (keep in queue for next poll)
-        """
+    def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         idx = decode_req.metadata_buffer_index
         (
             output_id,
