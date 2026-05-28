@@ -86,7 +86,6 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -1475,7 +1474,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
-    is_hybrid_swa: bool = False
 
     # Batch configs
     model_config: ModelConfig = None
@@ -1637,16 +1635,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
-        is_hybrid_swa = False
-        if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-            is_hybrid_swa = True
-
         batch = cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
-            is_hybrid_swa=is_hybrid_swa,
             model_config=model_config,
             enable_overlap=enable_overlap,
             return_logprob=return_logprob,
