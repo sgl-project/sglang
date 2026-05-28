@@ -62,7 +62,13 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 ), f"seq_len={seq_len}, pre_len={pre_len}, req.extend_input_len={req.extend_input_len}"
 
             if not req.retracted_stain:
-                req.cached_tokens += pre_len - req.already_computed
+                # Clamp to avoid double-counting: already_computed is seeded from
+                # the prefill-reported cached_tokens in _commit_transfer_to_req, so
+                # a decode-side prefix shorter than the prefill report must not
+                # subtract from cached_tokens.
+                delta = max(0, pre_len - req.already_computed)
+                req.cached_tokens += delta
+                req.cached_tokens_device += delta
                 req.already_computed = seq_len
             req.is_retracted = False
             pre_lens.append(pre_len)
