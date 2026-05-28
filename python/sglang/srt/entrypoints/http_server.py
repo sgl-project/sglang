@@ -54,6 +54,7 @@ from fastapi import (
     Query,
     Request,
     UploadFile,
+    WebSocket,
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -1603,6 +1604,17 @@ async def openai_v1_audio_transcriptions(
             raw_request=raw_request,
         )
     )
+
+
+@app.websocket("/v1/realtime")
+async def openai_v1_realtime_transcription(ws: WebSocket):
+    """OpenAI Realtime transcription WebSocket endpoint."""
+    # /v1/realtime is OpenAI's unified Realtime URL covering transcription +
+    # chat modes. This handler implements the transcription subset only;
+    # chat-mode session.update payloads are rejected by the
+    # `Literal["transcription"]` constraint on TranscriptionSessionConfig.type
+    # (see realtime/protocol.py).
+    await ws.app.state.openai_serving_transcription.handle_websocket(ws)
 
 
 @app.get("/v1/models", response_class=ORJSONResponse)
