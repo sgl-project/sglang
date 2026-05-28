@@ -221,7 +221,7 @@ class GptOssSparseMoeBlock(nn.Module):
             bias=True,
             quant_config=None,
             prefix=add_prefix("gate", prefix),
-            params_dtype=config.torch_dtype,
+            params_dtype=config.dtype,
         )
 
     def forward(
@@ -470,7 +470,7 @@ class GptOssDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             sliding_window_size=self.sliding_window_size,
             layer_type=config.layer_types[layer_id],
-            params_dtype=config.torch_dtype,
+            params_dtype=config.dtype,
         )
 
         self.layer_id = layer_id

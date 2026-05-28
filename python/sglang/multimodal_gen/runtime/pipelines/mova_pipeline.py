@@ -63,7 +63,12 @@ class MOVAPipeline(ComposedPipelineBase):
         self.add_stage(InputValidationStage())
         self.add_standard_text_encoding_stage()
         if getattr(self.get_module("video_dit"), "require_vae_embedding", True):
-            self.add_stage(ImageVAEEncodingStage(vae=self.get_module("video_vae")))
+            self.add_stage(
+                ImageVAEEncodingStage(
+                    vae=self.get_module("video_vae"),
+                    component_name="video_vae",
+                )
+            )
         self.add_stage(
             MOVALatentPreparationStage(
                 audio_vae=self.get_module("audio_vae"),

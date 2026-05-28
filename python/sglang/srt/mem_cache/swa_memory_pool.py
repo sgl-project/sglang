@@ -173,7 +173,7 @@ class SWAKVPool(BaseSWAKVPool):
         key = (kv_indices.data_ptr(), kv_indices.numel())
         if key != self._cached_loc_key:
             if self._cached_loc_key is not None:
-                logger.warning(
+                logger.debug(
                     "translate_loc_from_full_to_swa: loc tensor changed mid-forward "
                     "without invalidate_loc_cache() — possible missing call site"
                 )
@@ -561,6 +561,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[alloc_full_indices[-swa_tail_len:]] = (
             alloc_swa_indices
         )
+        if swa_tail_len < extend_num_tokens:
+            self.full_to_swa_index_mapping[alloc_full_indices[:-swa_tail_len]] = 0
         return alloc_full_indices
 
     def alloc_decode(
