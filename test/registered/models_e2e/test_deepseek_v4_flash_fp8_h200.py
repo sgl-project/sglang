@@ -5,7 +5,7 @@ with FP4 experts disabled via SGLANG_DSV4_FP4_EXPERTS=0.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
 plus a GSM8K accuracy gate.
 
-Registry: base-c-test-dsv4-8-gpu-h200 (per-commit, 8x H200 — only 4 used by TP=4)
+Registry: extra-b-test-deepep-8-gpu-h200 (label-gated, 8x H200 — only 4 used by TP=4)
 """
 
 import unittest
