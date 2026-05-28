@@ -69,18 +69,23 @@ class MooncakeHostTensorAllocator(HostTensorAllocator):
         return tensor.view(dims)
 
 
-def _parse_global_segment_size(value) -> int:
+def _parse_global_segment_size(value, default=None) -> int:
+    if value is None and default is not None:
+        value = default
     if isinstance(value, int):
         return value
     if isinstance(value, str):
         s = value.strip().lower()
-        if s.endswith("gb"):
-            num = s[:-2].strip()
-            if not num:
-                raise ValueError(
-                    "Invalid global_segment_size: missing number before 'gb'"
-                )
-            return int(num) * 1024 * 1024 * 1024
+        for suffix, multiplier in (
+            ("gb", 1024 * 1024 * 1024),
+            ("mb", 1024 * 1024),
+            ("kb", 1024),
+        ):
+            if s.endswith(suffix):
+                num = s[: -len(suffix)].strip()
+                if not num:
+                    raise ValueError(f"Invalid size: missing number before '{suffix}'")
+                return int(num) * multiplier
         return int(s)
     return int(value)
 
@@ -136,7 +141,8 @@ class MooncakeStoreConfig:
                 )
             ),
             local_buffer_size=_parse_global_segment_size(
-                config.get("local_buffer_size", envs.MOONCAKE_LOCAL_BUFFER_SIZE.default)
+                config.get("local_buffer_size"),
+                envs.MOONCAKE_LOCAL_BUFFER_SIZE.default,
             ),
             protocol=config.get("protocol", envs.MOONCAKE_PROTOCOL.default),
             device_name=config.get("device_name", envs.MOONCAKE_DEVICE.default),
@@ -192,7 +198,8 @@ class MooncakeStoreConfig:
                 envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.get()
             ),
             local_buffer_size=_parse_global_segment_size(
-                envs.MOONCAKE_LOCAL_BUFFER_SIZE.get()
+                envs.MOONCAKE_LOCAL_BUFFER_SIZE.get(),
+                envs.MOONCAKE_LOCAL_BUFFER_SIZE.default,
             ),
             protocol=envs.MOONCAKE_PROTOCOL.get(),
             device_name=envs.MOONCAKE_DEVICE.get(),
@@ -230,8 +237,9 @@ class MooncakeStoreConfig:
             ),
             local_buffer_size=_parse_global_segment_size(
                 extra_config.get(
-                    "local_buffer_size", envs.MOONCAKE_LOCAL_BUFFER_SIZE.default
-                )
+                    "local_buffer_size",
+                ),
+                envs.MOONCAKE_LOCAL_BUFFER_SIZE.default,
             ),
             protocol=extra_config.get("protocol", envs.MOONCAKE_PROTOCOL.default),
             device_name=extra_config.get("device_name", envs.MOONCAKE_DEVICE.default),

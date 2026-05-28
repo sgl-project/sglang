@@ -2,6 +2,7 @@ import json
 import sys
 
 import pytest
+
 from sglang.srt.environ import envs, temp_set_env
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
     DEFAULT_LOCAL_BUFFER_SIZE,
@@ -48,6 +49,46 @@ def test_mooncake_local_buffer_size_loads_from_file(tmp_path):
         config = MooncakeStoreConfig.from_file()
 
     assert config.local_buffer_size == 8 * 1024 * 1024 * 1024
+
+
+def test_mooncake_local_buffer_size_file_none_uses_default(tmp_path):
+    config_path = tmp_path / "mooncake.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "master_server_address": "127.0.0.1:50051",
+                "local_buffer_size": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.override(str(config_path)):
+        config = MooncakeStoreConfig.from_file()
+
+    assert config.local_buffer_size == DEFAULT_LOCAL_BUFFER_SIZE
+
+
+def test_mooncake_local_buffer_size_accepts_mb_suffix():
+    config = MooncakeStoreConfig.load_from_extra_config(
+        {
+            "master_server_address": "127.0.0.1:50051",
+            "local_buffer_size": "32mb",
+        }
+    )
+
+    assert config.local_buffer_size == 32 * 1024 * 1024
+
+
+def test_mooncake_local_buffer_size_accepts_kb_suffix():
+    config = MooncakeStoreConfig.load_from_extra_config(
+        {
+            "master_server_address": "127.0.0.1:50051",
+            "local_buffer_size": "512kb",
+        }
+    )
+
+    assert config.local_buffer_size == 512 * 1024
 
 
 def test_mooncake_local_buffer_size_loads_from_extra_config():
