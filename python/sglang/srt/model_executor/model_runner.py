@@ -2322,17 +2322,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         parallel across PP stages instead of serially via the warmup
         ``/generate`` request flowing through the pipeline.
         """
-        # Sweep representative batch sizes so kernels whose num_groups
-        # depends on num_tokens (e.g. TF32_HC_PRENORM_GEMM on DSv4) get
-        # compiled for both small-decode and large-prefill regimes.
-        batch_sizes = {1}
-        max_run = max(self.server_args.max_running_requests or 0, 1)
-        batch_sizes.add(max(max_run // max(self.pp_size, 1), 1))
-        chunked = self.server_args.chunked_prefill_size
-        if chunked and chunked > 0:
-            batch_sizes.add(chunked)
-        batch_sizes.add(1024)
-        batch_sizes = sorted(batch_sizes)
+        # n_splits ~= n_sms // ceil(bs/64); pick bs to cover 4 brackets.
+        n_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        block_m = 64
+        batch_sizes = sorted(
+            {
+                1,
+                2 * block_m,
+                max(n_sms // 8, 2) * block_m,
+                max(n_sms // 4, 4) * block_m,
+            }
+        )
 
         logger.info(
             "PP-parallel DeepGEMM warmup start (pp_rank=%d, tp_rank=%d, batch_sizes=%s).",
@@ -2341,9 +2341,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             batch_sizes,
         )
         t0 = time.perf_counter()
-        try:
-            with torch.inference_mode():
-                for bs in batch_sizes:
+        for bs in batch_sizes:
+            try:
+                with torch.inference_mode():
                     if self.is_generation:
                         self._dummy_run(
                             batch_size=bs,
@@ -2353,9 +2353,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         batch_size=bs,
                         forward_mode_override=ForwardMode.EXTEND,
                     )
-        except Exception as e:
-            logger.warning("PP-parallel DeepGEMM warmup skipped: %r", e)
-            return
+            except torch.cuda.OutOfMemoryError as e:
+                logger.warning(
+                    "PP-parallel DeepGEMM warmup OOM at batch_size=%d, stopping sweep: %r",
+                    bs,
+                    e,
+                )
+                torch.cuda.empty_cache()
+                break
+            except Exception as e:
+                logger.warning(
+                    "PP-parallel DeepGEMM warmup skipped at batch_size=%d: %r",
+                    bs,
+                    e,
+                )
+                break
 
         logger.info(
             "PP-parallel DeepGEMM warmup done in %.2fs (pp_rank=%d).",
