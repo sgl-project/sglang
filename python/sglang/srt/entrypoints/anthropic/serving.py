@@ -276,6 +276,25 @@ class AnthropicServing:
         if anthropic_request.stream:
             request_data["stream_options"] = StreamOptions(include_usage=True)
 
+        # Translate Anthropic `thinking` into `chat_template_kwargs.enable_thinking`
+        # so reasoning-parser models (Qwen3 / DeepSeek-R1 / Hermes-3 / Phi-4 ...)
+        # honour the Anthropic Messages API spec: thinking is opt-in, not opt-out.
+        # Precedence: metadata override > thinking field > false default.
+        _ctk_override = (
+            (anthropic_request.metadata or {}).get("chat_template_kwargs")
+            if anthropic_request.metadata
+            else None
+        )
+        if _ctk_override and isinstance(_ctk_override, dict):
+            request_data["chat_template_kwargs"] = _ctk_override
+        elif anthropic_request.thinking is not None:
+            request_data["chat_template_kwargs"] = {
+                "enable_thinking": anthropic_request.thinking.type
+                in ("enabled", "adaptive"),
+            }
+        else:
+            request_data["chat_template_kwargs"] = {"enable_thinking": False}
+
         chat_request = ChatCompletionRequest(**request_data)
 
         # Convert tools. Deferred tools stay in the list with defer_loading=True;

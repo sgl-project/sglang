@@ -147,6 +147,95 @@ class TestAnthropicServer(CustomTestCase):
             "data:image/png;base64,abcd",
         )
 
+    def test_thinking_field_roundtrip(self):
+        """Anthropic `thinking` field is parsed onto AnthropicMessagesRequest."""
+        # Default (no thinking field) parses to None.
+        req_default = AnthropicMessagesRequest(
+            model=self.model,
+            max_tokens=16,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        self.assertIsNone(req_default.thinking)
+
+        # `thinking: {type: enabled}` round-trips.
+        req_enabled = AnthropicMessagesRequest(
+            model=self.model,
+            max_tokens=16,
+            messages=[{"role": "user", "content": "hi"}],
+            thinking={"type": "enabled", "budget_tokens": 1024},
+        )
+        self.assertIsNotNone(req_enabled.thinking)
+        self.assertEqual(req_enabled.thinking.type, "enabled")
+        self.assertEqual(req_enabled.thinking.budget_tokens, 1024)
+
+        # `thinking: {type: disabled}` round-trips.
+        req_disabled = AnthropicMessagesRequest(
+            model=self.model,
+            max_tokens=16,
+            messages=[{"role": "user", "content": "hi"}],
+            thinking={"type": "disabled"},
+        )
+        self.assertEqual(req_disabled.thinking.type, "disabled")
+
+        # `thinking: {type: adaptive}` round-trips.
+        req_adaptive = AnthropicMessagesRequest(
+            model=self.model,
+            max_tokens=16,
+            messages=[{"role": "user", "content": "hi"}],
+            thinking={"type": "adaptive"},
+        )
+        self.assertEqual(req_adaptive.thinking.type, "adaptive")
+
+    def test_thinking_field_translation_to_chat_template_kwargs(self):
+        """`thinking` is translated to `chat_template_kwargs.enable_thinking`.
+
+        Precedence (matches the Anthropic Messages API default-off semantics):
+            metadata.chat_template_kwargs > thinking field > false default.
+        """
+        serving = AnthropicServing(openai_serving_chat=object())
+        base_kwargs = dict(
+            model=self.model,
+            max_tokens=16,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+        # No `thinking` -> enable_thinking=False (Anthropic spec default).
+        req = AnthropicMessagesRequest(**base_kwargs)
+        chat_request = serving._convert_to_chat_completion_request(req)
+        self.assertEqual(chat_request.chat_template_kwargs, {"enable_thinking": False})
+
+        # `thinking: enabled` -> enable_thinking=True.
+        req = AnthropicMessagesRequest(**base_kwargs, thinking={"type": "enabled"})
+        chat_request = serving._convert_to_chat_completion_request(req)
+        self.assertEqual(chat_request.chat_template_kwargs, {"enable_thinking": True})
+
+        # `thinking: adaptive` -> enable_thinking=True (treated as opt-in).
+        req = AnthropicMessagesRequest(**base_kwargs, thinking={"type": "adaptive"})
+        chat_request = serving._convert_to_chat_completion_request(req)
+        self.assertEqual(chat_request.chat_template_kwargs, {"enable_thinking": True})
+
+        # `thinking: disabled` -> enable_thinking=False.
+        req = AnthropicMessagesRequest(**base_kwargs, thinking={"type": "disabled"})
+        chat_request = serving._convert_to_chat_completion_request(req)
+        self.assertEqual(chat_request.chat_template_kwargs, {"enable_thinking": False})
+
+        # `metadata.chat_template_kwargs` overrides the thinking field.
+        req = AnthropicMessagesRequest(
+            **base_kwargs,
+            thinking={"type": "disabled"},
+            metadata={
+                "chat_template_kwargs": {
+                    "enable_thinking": True,
+                    "custom_flag": "x",
+                }
+            },
+        )
+        chat_request = serving._convert_to_chat_completion_request(req)
+        self.assertEqual(
+            chat_request.chat_template_kwargs,
+            {"enable_thinking": True, "custom_flag": "x"},
+        )
+
     def test_simple_messages(self):
         """Test basic non-streaming message request."""
         payload = self._default_payload()

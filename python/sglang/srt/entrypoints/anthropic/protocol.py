@@ -88,6 +88,14 @@ class AnthropicToolChoice(BaseModel):
     name: Optional[str] = None
 
 
+class AnthropicThinking(BaseModel):
+    """Anthropic extended-thinking configuration (Messages API)."""
+
+    type: Literal["enabled", "disabled", "adaptive"] = "disabled"
+    # Per Anthropic spec; ignored for templates with binary on/off support.
+    budget_tokens: Optional[int] = None
+
+
 class AnthropicCountTokensRequest(BaseModel):
     """Anthropic Count Tokens API request"""
 
@@ -116,6 +124,7 @@ class AnthropicMessagesRequest(BaseModel):
     system: Optional[str | list[AnthropicContentBlock]] = None
     temperature: Optional[float] = None
     tool_choice: Optional[AnthropicToolChoice] = None
+    thinking: Optional[AnthropicThinking] = None
     tools: Optional[list[AnthropicTool]] = None
     top_k: Optional[int] = None
     top_p: Optional[float] = None
