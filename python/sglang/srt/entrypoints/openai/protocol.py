@@ -1231,6 +1231,14 @@ class ResponseReasoningParam(BaseModel):
         default="medium",
         description="Constrains effort on reasoning for reasoning models.",
     )
+    summary: Optional[Literal["auto", "concise", "detailed"]] = Field(
+        default=None,
+        description=(
+            "Whether to include a summary of the model's reasoning trace on "
+            "the response output. Codex CLI requests ``auto`` to render the "
+            "reasoning bubble in the TUI."
+        ),
+    )
 
 
 # Schema-accepted Responses tool types. Only ``function``,
@@ -1249,6 +1257,10 @@ RESPONSE_TOOL_TYPES = Literal[
     "mcp",
     "custom",
     "namespace",
+    # ``tool_search`` is a Codex CLI builtin that lets gpt-5.5-class models
+    # browse plugin/skill catalogs; it has no chat-side execution here and
+    # is silently dropped in ``_response_tools_to_chat_tools``.
+    "tool_search",
 ]
 
 
@@ -1294,7 +1306,11 @@ class ResponsesRequest(BaseModel):
             ]
         ]
     ] = None
-    input: Union[str, List[ResponseInputOutputItem]]
+    # ``ResponseInputOutputItem`` is the openai SDK Union; multi-turn clients
+    # (Codex CLI) replay assistant ``output_text`` and tool-call items that
+    # don't pass every required openai TypedDict. Accept dict-shaped items so
+    # the request lands; downstream normalization filters unknown shapes.
+    input: Union[str, List[ResponseInputOutputItem], List[Dict[str, Any]]]
     instructions: Optional[str] = None
     max_output_tokens: Optional[int] = None
     max_tool_calls: Optional[int] = None
@@ -1328,13 +1344,16 @@ class ResponsesRequest(BaseModel):
         default=None, description="Cache salt for request caching"
     )
 
-    # SGLang-specific sampling parameters
+    # SGLang-specific sampling parameters. ``None`` defers to the server's
+    # ``--preferred-sampling-params``/``_DEFAULT_SAMPLING_PARAMS`` fallback so
+    # operators can tune e.g. ``repetition_penalty`` per-model without every
+    # request overriding it back to a fixed literal.
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
     stop: Optional[Union[str, List[str]]] = None
-    top_k: int = -1
-    min_p: float = 0.0
-    repetition_penalty: float = 1.0
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
+    repetition_penalty: Optional[float] = None
 
     # Default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
@@ -1423,17 +1442,24 @@ class ResponsesRequest(BaseModel):
         if top_p is None:
             top_p = default_params.get("top_p", self._DEFAULT_SAMPLING_PARAMS["top_p"])
 
-        params = {
+        # Omit keys we want falling through to ``--preferred-sampling-params``
+        # (tokenizer_manager merges ``{**preferred, **obj.sampling_params}``,
+        # so any non-None entry here wins — even a literal default would
+        # clobber a per-model knob like ``repetition_penalty=1.05``).
+        params: dict[str, Any] = {
             "max_new_tokens": max_tokens,
             "temperature": temperature,
             "top_p": top_p,
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
             "stop": self.stop if stop is None else stop,
-            "top_k": self.top_k,
-            "min_p": self.min_p,
-            "repetition_penalty": self.repetition_penalty,
         }
+        if self.top_k is not None:
+            params["top_k"] = self.top_k
+        if self.min_p is not None:
+            params["min_p"] = self.min_p
+        if self.repetition_penalty is not None:
+            params["repetition_penalty"] = self.repetition_penalty
 
         # Apply any additional default parameters
         for key, value in default_params.items():
