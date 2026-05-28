@@ -91,7 +91,7 @@ jobs:
           echo "CANN_image_910b=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-910b-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
 
   stage-b-test-1-npu-a2:
-    needs: [check-changes, pr-gate]
+    needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a2-1
     strategy:
@@ -144,7 +144,7 @@ jobs:
           python3 run_suite.py --hw npu --suite stage-b-test-1-npu-a2 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   stage-b-test-2-npu-a2:
-    needs: [check-changes, pr-gate]
+    needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a2-2
     strategy:
@@ -197,7 +197,7 @@ jobs:
           python3 run_suite.py --hw npu --suite stage-b-test-2-npu-a2 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   stage-b-test-4-npu-a3:
-    needs: [check-changes, pr-gate]
+    needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a3-4
     container:
@@ -247,7 +247,7 @@ jobs:
 
 
   stage-b-test-16-npu-a3:
-    needs: [check-changes, pr-gate]
+    needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a3-16
     container:
@@ -296,7 +296,7 @@ jobs:
           python3 run_suite.py --hw npu --suite stage-b-test-16-npu-a3 --timeout-per-file 3600
 
   multimodal-gen-test-1-npu-a3:
-    needs: [check-changes, pr-gate]
+    needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: linux-aarch64-a3-2
     container:
@@ -353,7 +353,7 @@ jobs:
           retention-days: 7
 
   multimodal-gen-test-2-npu-a3:
-    needs: [check-changes, pr-gate]
+    needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: linux-aarch64-a3-16
     container:
@@ -410,7 +410,7 @@ jobs:
           retention-days: 7
 
   multimodal-gen-test-8-npu-a3:
-    needs: [check-changes, pr-gate]
+    needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: linux-aarch64-a3-8
     container:
