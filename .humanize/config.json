@@ -1,0 +1,8 @@
+{
+  "codex_model": "gpt-5.5",
+  "codex_effort": "xhigh",
+  "bitlesson_model": "sonnet",
+  "agent_teams": false,
+  "alternative_plan_language": "",
+  "gen_plan_mode": "discussion"
+}
