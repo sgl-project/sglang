@@ -52,13 +52,11 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import (
-    add_prometheus_middleware,
     configure_logger,
     load_audio,
     load_image,
     load_video,
     random_uuid,
-    set_prometheus_multiproc_dir,
 )
 from sglang.srt.utils.common import configure_logger
 from sglang.srt.utils.network import (
@@ -2381,7 +2379,7 @@ encoder_scheduler: Optional[EncoderScheduler] = None
 dp_dispatcher: Optional["DPDispatcher"] = None
 
 
-async def _push_embedding_to_p(enc: MMEncoder, request: dict) -> None:
+async def _push_embedding_to_prefill(enc: MMEncoder, request: dict) -> None:
     # No-op for mooncake (its /send is separate). embedding_port=None is
     # rejected upfront, so ports is always a concrete list here.
     req_id = request["req_id"]
@@ -2445,7 +2443,7 @@ async def _dp_worker_encode_and_send(
         # zmq backends still forward an error EmbeddingData to P so it
         # doesn't block; send failures here are swallowed.
         try:
-            await _push_embedding_to_p(enc, request)
+            await _push_embedding_to_prefill(enc, request)
         except Exception as e:
             logger.error(
                 f"DP error-send failed for req_id={req_id}: {e}", exc_info=True
@@ -2461,7 +2459,7 @@ async def _dp_worker_encode_and_send(
         )
         return request
 
-    await _push_embedding_to_p(enc, request)
+    await _push_embedding_to_prefill(enc, request)
     return None
 
 
@@ -2474,7 +2472,6 @@ class DPDispatcher:
         dispatch_sockets: List,
         result_socket,
         worker_processes: List[mp.Process],
-        enable_metrics: bool = False,
     ):
         self.dp_size = dp_size
         self.dispatch_sockets = dispatch_sockets
@@ -2487,45 +2484,16 @@ class DPDispatcher:
         self.req_id_to_rank: Dict[str, int] = {}
         self._rr_counter = 0
         self._broadcast_counter = 0
-        self._req_id_warn_threshold = (
-            envs.SGLANG_ENCODER_DP_REQ_ID_MAP_WARN_THRESHOLD.get()
-        )
         self._dead_ranks: Set[int] = set()
-
-        self.pending_gauge = None
-        if enable_metrics:
-            try:
-                from prometheus_client import Gauge
-
-                self.pending_gauge = Gauge(
-                    name="sglang:encoder_dp_pending_requests",
-                    documentation="Number of pending requests per encoder DP rank.",
-                    labelnames=["dp_rank"],
-                    multiprocess_mode="mostrecent",
-                )
-            except Exception as e:
-                logger.warning(f"Failed to create encoder DP pending gauge: {e}")
 
     @property
     def pending_counts(self) -> List[int]:
         return [len(d) for d in self.pending_futures]
 
-    def all_workers_alive(self) -> bool:
-        return all(p.is_alive() for p in self.worker_processes)
-
-    def _update_pending_gauge(self) -> None:
-        if self.pending_gauge is not None:
-            for i, c in enumerate(self.pending_counts):
-                self.pending_gauge.labels(dp_rank=str(i)).set(c)
-
     def start(self) -> None:
         logger.info(f"DP dispatcher started: {self.dp_size} ranks (all remote)")
         asyncio.create_task(self._result_listener())
         asyncio.create_task(self._worker_watchdog())
-
-    def _drop_pending_only(self, rank: int, key: str) -> None:
-        # dispatch_send failure: keep mapping so caller can retry /send.
-        self.pending_futures[rank].pop(key, None)
 
     def _drop_pending_and_mapping(self, rank: int, req_id: str) -> None:
         # dispatch / broadcast failure: no follow-up /send expected.
@@ -2560,22 +2528,12 @@ class DPDispatcher:
         self.req_id_to_rank[req_id] = rank
         future = asyncio.get_running_loop().create_future()
         self.pending_futures[rank][req_id] = future
-        # mooncake keeps the mapping until /send; if P crashes it leaks.
-        if len(self.req_id_to_rank) > self._req_id_warn_threshold:
-            logger.warning(
-                f"DP req_id_to_rank size = {len(self.req_id_to_rank)}; "
-                f"likely leaked from mooncake /send never arriving. "
-                f"Restart the encoder to reclaim memory."
-            )
-        if logger.isEnabledFor(logging.DEBUG):
-            log_counts = list(counts)
-            log_counts[rank] += 1
-            logger.debug(
-                f"MM-Encoder DP dispatch: req_id={req_id}, "
-                f"modality={request.get('modality', 'image')}, "
-                f"dp_rank={rank}, pending={log_counts}"
-            )
-        self._update_pending_gauge()
+        logger.info(
+            f"MM-Encoder DP dispatch: req_id={req_id}, "
+            f"modality={request.get('modality', 'image')}, "
+            f"dp_rank={rank}, pending={self.pending_counts}"
+        )
+
         try:
             await self.dispatch_sockets[rank].send_pyobj(request)
             # An alive-but-stuck worker (NCCL deadlock etc.) wouldn't trip
@@ -2613,7 +2571,7 @@ class DPDispatcher:
         future = asyncio.get_running_loop().create_future()
         self.pending_futures[rank][key] = future
         request["_dp_type"] = "send"
-        logger.debug(
+        logger.info(
             f"MM-Encoder DP dispatch_send: req_id={req_id}, "
             f"dp_rank={rank}, pending={self.pending_counts}"
         )
@@ -2621,14 +2579,16 @@ class DPDispatcher:
             await self.dispatch_sockets[rank].send_pyobj(request)
             return await asyncio.wait_for(future, timeout=ENCODER_REQ_TIMEOUT)
         except asyncio.TimeoutError:
-            self._drop_pending_only(rank, key)
+            self.pending_futures[rank].pop(key, None)
+            self.req_id_to_rank.pop(req_id, None)
             return self._timeout_envelope(
                 req_id,
                 "send",
                 f"Encoder DP rank={rank} /send timed out after {ENCODER_REQ_TIMEOUT}s",
             )
         except BaseException:
-            self._drop_pending_only(rank, key)
+            self.pending_futures[rank].pop(key, None)
+            self.req_id_to_rank.pop(req_id, None)
             raise
 
     async def broadcast(self, request: dict) -> List[dict]:
@@ -2647,10 +2607,6 @@ class DPDispatcher:
                 request_copy = {**request, "req_id": req_id}
                 await self.dispatch_sockets[rank].send_pyobj(request_copy)
                 futures.append(future)
-            logger.debug(
-                f"MM-Encoder DP broadcast: dp_type={dp_type}, "
-                f"batch_id={batch_id}, pending={self.pending_counts}"
-            )
             # Concurrent wait → total bounded by ENCODER_REQ_TIMEOUT, not
             # dp_size × ENCODER_REQ_TIMEOUT.
             outcomes = await asyncio.gather(
@@ -2682,29 +2638,6 @@ class DPDispatcher:
             for rank, req_id in rank_keys:
                 self._drop_pending_and_mapping(rank, req_id)
             raise
-
-    def _fail_pending_for_rank(self, rank: int, reason: str) -> None:
-        # Resolve outstanding futures so awaiters don't hang on a dead rank.
-        pending = self.pending_futures[rank]
-        for key, future in list(pending.items()):
-            if not future.done():
-                msg = {
-                    "req_id": key.removesuffix("_send"),
-                    "_dp_type": "send" if key.endswith("_send") else "encode",
-                    "content": None,
-                    "_error": reason,
-                    "_error_type": "WorkerDied",
-                    "_error_code": int(HTTPStatus.SERVICE_UNAVAILABLE),
-                }
-                try:
-                    future.set_result(msg)
-                except asyncio.InvalidStateError:
-                    pass
-            pending.pop(key, None)
-        self.req_id_to_rank = {
-            r: rk for r, rk in self.req_id_to_rank.items() if rk != rank
-        }
-        self._update_pending_gauge()
 
     async def _worker_watchdog(self) -> None:
         # proc.sentinel becomes readable on process exit; fail this rank's
@@ -2742,9 +2675,22 @@ class DPDispatcher:
                     f"with code={proc.exitcode}; failing pending requests"
                 )
                 self._dead_ranks.add(rank)
-                self._fail_pending_for_rank(
-                    rank, f"DP worker rank={rank} died (exitcode={proc.exitcode})"
-                )
+                reason = f"DP worker rank={rank} died (exitcode={proc.exitcode})"
+                pending = self.pending_futures[rank]
+                for key, future in list(pending.items()):
+                    if not future.done():
+                        future.set_result({
+                            "req_id": key.removesuffix("_send"),
+                            "_dp_type": "send" if key.endswith("_send") else "encode",
+                            "content": None,
+                            "_error": reason,
+                            "_error_type": "WorkerDied",
+                            "_error_code": int(HTTPStatus.SERVICE_UNAVAILABLE),
+                        })
+                    pending.pop(key, None)
+                self.req_id_to_rank = {
+                    r: rk for r, rk in self.req_id_to_rank.items() if rk != rank
+                }
                 watch.pop(rank, None)
 
     async def _result_listener(self) -> None:
@@ -2785,7 +2731,7 @@ class DPDispatcher:
                 self.req_id_to_rank.pop(req_id, None)
             try:
                 future.set_result(msg)
-                self._update_pending_gauge()
+
             except asyncio.InvalidStateError:
                 logger.warning(
                     f"_result_listener: future already done for "
@@ -3067,19 +3013,6 @@ def launch_server(server_args: ServerArgs):
     uvicorn.run(app, host=server_args.host, port=server_args.port)
 
 
-@contextlib.contextmanager
-def _scoped_env(key: str, value: str):
-    # os.environ is process-global; caller must invoke serially.
-    orig = os.environ.get(key)
-    os.environ[key] = value
-    try:
-        yield
-    finally:
-        if orig is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = orig
-
 
 def _launch_server_dp(server_args: ServerArgs):
     global dp_dispatcher
@@ -3091,9 +3024,6 @@ def _launch_server_dp(server_args: ServerArgs):
         )
     dp_size = server_args.dp_size
     logger.info(f"Launching encoder in DP mode: dp_size={dp_size}")
-
-    if server_args.enable_metrics:
-        set_prometheus_multiproc_dir()
 
     ctx = mp.get_context("spawn")
     ipc_prefix = random_uuid()
@@ -3114,23 +3044,34 @@ def _launch_server_dp(server_args: ServerArgs):
     import atexit
 
     worker_processes: List[mp.Process] = []
-    atexit.register(_terminate_dp_workers, worker_processes)
+    def _kill_workers():
+        for p in worker_processes:
+            if p.is_alive():
+                p.kill()
+        for p in worker_processes:
+            p.join(timeout=5)
 
-    # spawn copies env at process creation → pin per-worker GPU, restore after.
+    atexit.register(_kill_workers)
+
     for dp_rank in range(dp_size):
         gpu_id = server_args.base_gpu_id + dp_rank
-        with _scoped_env("CUDA_VISIBLE_DEVICES", str(gpu_id)):
-            proc = ctx.Process(
-                target=launch_dp_worker,
-                args=(
-                    server_args,
-                    dp_rank,
-                    f"ipc:///tmp/{ipc_prefix}_dp_dispatch_{dp_rank}",
-                    result_path,
-                ),
-                daemon=False,
-            )
-            proc.start()
+        orig = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        proc = ctx.Process(
+            target=launch_dp_worker,
+            args=(
+                server_args,
+                dp_rank,
+                f"ipc:///tmp/{ipc_prefix}_dp_dispatch_{dp_rank}",
+                result_path,
+            ),
+            daemon=False,
+        )
+        proc.start()
+        if orig is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = orig
         worker_processes.append(proc)
 
     dp_dispatcher = DPDispatcher(
@@ -3138,34 +3079,10 @@ def _launch_server_dp(server_args: ServerArgs):
         dispatch_sockets,
         result_socket,
         worker_processes,
-        enable_metrics=server_args.enable_metrics,
     )
 
-    if server_args.enable_metrics:
-        add_prometheus_middleware(app)
+    uvicorn.run(app, host=server_args.host, port=server_args.port)
 
-    try:
-        uvicorn.run(app, host=server_args.host, port=server_args.port)
-    finally:
-        _terminate_dp_workers(worker_processes)
-
-
-def _terminate_dp_workers(processes: List[mp.Process]) -> None:
-    # SIGTERM → join → SIGKILL.
-    for p in processes:
-        if p.is_alive():
-            try:
-                p.terminate()
-            except Exception as e:
-                logger.debug(f"terminate failed for pid={p.pid}: {e}")
-    for p in processes:
-        p.join(timeout=5)
-        if p.is_alive():
-            logger.warning(f"DP worker pid={p.pid} did not exit after SIGTERM; killing")
-            try:
-                p.kill()
-            except Exception as e:
-                logger.debug(f"kill failed for pid={p.pid}: {e}")
 
 
 def _summarise_dp_broadcast(results: List[dict]) -> Response:
@@ -3460,9 +3377,6 @@ async def health_generate():
     Returns 200 if the encoder is healthy, 503 otherwise.
     """
     if dp_dispatcher is not None:
-        # Crashed workers hang dispatched requests until timeout otherwise.
-        if not dp_dispatcher.all_workers_alive():
-            return Response(status_code=503)
         return Response(status_code=200)
     if encoder is None:
         return Response(status_code=503)

@@ -739,7 +739,6 @@ class Envs:
     # Persistent receiver-side GPU embedding pool size for mooncake EPD transport.
     # 0 disables (per-request register/deregister). 4096 = 4GB default per TP
     SGLANG_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
-    SGLANG_ENCODER_DP_REQ_ID_MAP_WARN_THRESHOLD = EnvInt(10000)
     SGLANG_ENCODER_DP_WORKER_MAX_INFLIGHT = EnvInt(64)
 
     # Elastic EP Backup Port
