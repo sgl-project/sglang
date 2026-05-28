@@ -20,14 +20,10 @@ register_cuda_ci(est_time=443, stage="base-c", runner_config="8-gpu-h20")
 
 
 class TestDisaggregationDPAttention(PDDisaggregationServerBase):
-    """PD-disagg + DP-attention e2e with the load-aware LB method.
-
-    LOAD_BALANCE_METHOD="total_tokens" exercises the most complex dispatch
-    path: the DPBudget state machine (shared with total_requests),
-    per-worker token accounting, tie-breaking on total_requests, and
-    estimated_tokens at dispatch time. Simpler dispatch algorithms
-    (round_robin, follow_bootstrap_room, total_requests) are covered by
-    unit tests in test/registered/unit/managers/test_data_parallel_controller.py.
+    """PD-disagg + DP-attention e2e on `total_tokens` LB — the most complex
+    dispatch (token accounting + tie-break + estimated_tokens). Simpler
+    algorithms are unit-tested in
+    test/registered/unit/managers/test_data_parallel_controller.py.
     """
 
     PREFILL_DP_SIZE = 4

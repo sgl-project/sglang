@@ -1,25 +1,14 @@
-"""Unit tests for DataParallelController + DPBudget.
+"""DPBudget + DataParallelController dispatch tests.
 
-Covers:
-  - DPBudget.update_budget — GetLoadsReqOutput field mapping regression guard
-  - DPBudget.dispatch — TOTAL_REQUESTS / TOTAL_TOKENS argmin + tie-break
-  - DataParallelController dispatch methods:
-      * round_robin (counter + active-worker skip)
-      * follow_bootstrap_room (bootstrap_room modulo, prefill default)
-      * total_requests (DPBudget argmin)
+`total_tokens` (the most complex algorithm) is exercised end-to-end in
+test/registered/disaggregation/test_disaggregation_dp_attention.py; its
+tie-break on `total_requests` transitively covers that state.
 
-The most complex algorithm, total_tokens, is exercised end-to-end in
-test/registered/disaggregation/test_disaggregation_dp_attention.py. Its
-tie-breaking on total_requests transitively covers total_requests state
-as well.
-
-Fragility note (scheduler tests only):
-  Scheduler-method tests bypass ``DataParallelController.__init__`` via
-  ``__new__`` and inject only the attributes the schedulers read:
-  ``workers``, ``status``, ``round_robin_counter``, ``dp_budget``. If a
-  scheduler method starts reading a new instance attribute, add it here.
-  ``maybe_external_dp_rank_routing`` is exercised as a real method (no
-  mock) so its bypass-on-``routed_dp_rank`` logic stays covered.
+Fragility: scheduler tests bypass `DataParallelController.__init__` via
+`__new__` and inject only the attrs the schedulers read (`workers`,
+`status`, `round_robin_counter`, `dp_budget`). Update `_make_controller`
+if a scheduler starts reading another attr. `maybe_external_dp_rank_routing`
+is exercised as the real method, no mock.
 """
 
 import dataclasses
@@ -42,8 +31,6 @@ from sglang.srt.managers.io_struct import GetLoadsReqOutput, WatchLoadUpdateReq
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-# --- Helpers --------------------------------------------------------------
-
 _BASE_LOAD = GetLoadsReqOutput(
     dp_rank=0,
     timestamp=0.0,
@@ -65,12 +52,7 @@ def _load(**overrides) -> GetLoadsReqOutput:
 
 
 def _make_controller(dp_size: int) -> DataParallelController:
-    """Build a DataParallelController bypassing __init__.
-
-    Only fields actually read by the dispatch path are populated:
-    ``workers`` (zmq socket replacements), ``status`` (active flags),
-    ``round_robin_counter``, and ``dp_budget``.
-    """
+    """Bypass __init__; inject only the attrs dispatch methods read."""
     ctl = DataParallelController.__new__(DataParallelController)
     ctl.workers = [MagicMock(name=f"worker_{i}") for i in range(dp_size)]
     ctl.status = [True] * dp_size
@@ -80,20 +62,12 @@ def _make_controller(dp_size: int) -> DataParallelController:
 
 
 def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None):
-    """Minimal Req stand-in for dispatch testing.
-
-    Schedulers only read ``routed_dp_rank``, ``bootstrap_room``, and
-    ``input_ids``. Duck-typing via SimpleNamespace avoids pinning to the
-    full Req dataclass schema.
-    """
+    """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema."""
     return SimpleNamespace(
         routed_dp_rank=routed_dp_rank,
         bootstrap_room=bootstrap_room,
         input_ids=input_ids or [],
     )
-
-
-# --- DPBudget -------------------------------------------------------------
 
 
 class TestDPBudgetUpdateBudget(CustomTestCase):
@@ -191,9 +165,6 @@ class TestDPBudgetDispatch(CustomTestCase):
         self.assertIsNone(budget.dispatch(LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM))
 
 
-# --- DataParallelController dispatch methods -------------------------------
-
-
 class TestRoundRobinScheduler(CustomTestCase):
     def test_cycles_through_active_workers_in_order(self):
         ctl = _make_controller(dp_size=4)
@@ -223,8 +194,7 @@ class TestRoundRobinScheduler(CustomTestCase):
         ctl.workers[3].send_pyobj.assert_not_called()
 
     def test_routed_dp_rank_bypasses_counter(self):
-        """External dp-rank routing should not advance the round-robin
-        counter. Tests the real maybe_external_dp_rank_routing branch."""
+        """External dp-rank routing must not advance the counter."""
         ctl = _make_controller(dp_size=4)
         ctl.round_robin_scheduler(_req(routed_dp_rank=2))
         ctl.workers[2].send_pyobj.assert_called_once()
