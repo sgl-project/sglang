@@ -51,7 +51,7 @@ from sglang.srt.observability.trace import (
     TraceReqContext,
     trace_set_thread_info,
 )
-from sglang.srt.server_args import ServerArgs, get_global_server_args
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
@@ -173,6 +173,7 @@ class MooncakeKVManager(CommonKVManager):
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self.enable_trace = server_args.enable_trace
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
@@ -1151,7 +1152,7 @@ class MooncakeKVManager(CommonKVManager):
         worker_index=0,
     ):
         staging_strategy = None
-        if get_global_server_args().enable_trace:
+        if self.enable_trace:
             trace_set_thread_info(
                 f"mooncake transfer worker {worker_index}",
                 tp_rank=self.attn_tp_rank,
@@ -1161,7 +1162,7 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
-                if get_global_server_args().enable_trace:
+                if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
@@ -1332,14 +1333,14 @@ class MooncakeKVManager(CommonKVManager):
                         if kv_chunk.is_last_chunk and req.room in self.request_status:
                             self.update_status(req.room, KVPoll.Success)
 
-                    if get_global_server_args().enable_trace:
+                    if self.enable_trace:
                         mooncake_trace_slice(
                             kv_chunk.trace_ctx,
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND_SESSION,
                             start_ts,
                         )
 
-                if get_global_server_args().enable_trace:
+                if self.enable_trace:
                     kv_chunk.trace_ctx.trace_slice_end(
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
@@ -1693,7 +1694,7 @@ class MooncakeKVSender(CommonKVSender):
         raise KVTransferError(self.bootstrap_room, failure_reason)
 
     def _init_trace_ctx(self):
-        if get_global_server_args().enable_trace:
+        if self.kv_mgr.enable_trace:
             self.trace_ctx = TraceReqContext(
                 rid=str(hex(self.bootstrap_room)),
                 bootstrap_room=self.bootstrap_room,
