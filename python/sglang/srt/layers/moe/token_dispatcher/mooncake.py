@@ -76,6 +76,11 @@ class EPBuffer:
             return cls._buffer
 
         # Lazy import Buffer to avoid creating CUDA context at module import time
+        from sglang.srt.distributed.mooncake_loader import (
+            preload_mooncake_engine_global,
+        )
+
+        preload_mooncake_engine_global()
         from mooncake.mooncake_ep_buffer import Buffer
 
         cls._hidden_size = hidden_size
@@ -115,6 +120,11 @@ class _MooncakeEPDispatcherImpl:
         deepep_mode: DeepEPMode,
     ):
         try:
+            from sglang.srt.distributed.mooncake_loader import (
+                preload_mooncake_engine_global,
+            )
+
+            preload_mooncake_engine_global()
             from mooncake.mooncake_ep_buffer import Buffer  # noqa: F401
         except ImportError:
             raise ImportError(

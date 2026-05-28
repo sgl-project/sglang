@@ -134,6 +134,21 @@ class DeepseekMLAForwardMixin:
             get_global_server_args().flashinfer_mla_disable_ragged
         )
 
+    def _use_capture_alt_stream(self: DeepseekV2AttentionMLA, num_tokens: int) -> bool:
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        server_args = get_global_server_args()
+        return (
+            self.alt_stream is not None
+            and get_is_capture_mode()
+            and not (
+                server_args.enable_torch_compile
+                and num_tokens
+                <= server_args.torch_compile_max_bs
+                * (server_args.speculative_num_draft_tokens or 1)
+            )
+        )
+
     def forward_absorb_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -159,7 +174,7 @@ class DeepseekMLAForwardMixin:
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
             # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
+            if self._use_capture_alt_stream(q.shape[0]):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
@@ -230,10 +245,9 @@ class DeepseekMLAForwardMixin:
 
             # overlap q_b_proj and indexer during decode
             if (
-                self.alt_stream is not None
-                and get_is_capture_mode()
+                q_lora is not None
+                and self._use_capture_alt_stream(q_lora.shape[0])
                 and forward_batch.forward_mode.is_decode_or_idle()
-                and q_lora is not None
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)

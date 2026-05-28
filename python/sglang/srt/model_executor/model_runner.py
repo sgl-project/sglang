@@ -1052,6 +1052,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.server_args.mooncake_ib_device:
                 mooncake_ib_device = self.server_args.mooncake_ib_device.split(",")
                 try:
+                    from sglang.srt.distributed.mooncake_loader import (
+                        preload_mooncake_engine_global,
+                    )
+
+                    preload_mooncake_engine_global()
                     from mooncake import ep as mooncake_ep
 
                     mooncake_ep.set_device_filter(mooncake_ib_device)
