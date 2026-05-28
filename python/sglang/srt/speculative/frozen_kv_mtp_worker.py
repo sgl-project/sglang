@@ -34,6 +34,7 @@ from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -122,8 +123,8 @@ class FrozenKVMTPWorker(TpModelWorker):
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
         # Defer cuda graph capture; we do it ourselves below.
-        backup_disable_cuda_graph = server_args.disable_cuda_graph
-        server_args.disable_cuda_graph = True
+        backup_decode_mode = server_args.cuda_graph_config[Phase.DECODE]["backend"]
+        server_args.cuda_graph_config[Phase.DECODE]["backend"] = Backend.DISABLED
 
         # Draft attention uses target req_to_token + KV allocator (read-only).
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -171,9 +172,9 @@ class FrozenKVMTPWorker(TpModelWorker):
         if hasattr(self.draft_model_runner.model, "bind_frozen_kv_context"):
             self._bind_kv_context()
 
-        self.draft_model_runner.server_args.disable_cuda_graph = (
-            backup_disable_cuda_graph
-        )
+        self.draft_model_runner.server_args.cuda_graph_config[Phase.DECODE][
+            "backend"
+        ] = backup_decode_mode
 
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
