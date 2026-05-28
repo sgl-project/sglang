@@ -211,9 +211,34 @@ else:
 
 logger = logging.getLogger(__name__)
 
+_enable_pcg_dsa_eager_fusion = (
+    _is_cuda and envs.SGLANG_ENABLE_PCG_DSA_EAGER_FUSION.get()
+)
 _enable_pcg_dsv2_dual_stream = (
     _is_cuda and envs.SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM.get()
 )
+_logged_pcg_dsa_dsv2_flags = False
+
+
+def _log_pcg_dsa_dsv2_flags_once() -> None:
+    global _logged_pcg_dsa_dsv2_flags
+    if (
+        _logged_pcg_dsa_dsv2_flags
+        or not _enable_pcg_dsa_eager_fusion
+        or not _enable_pcg_dsv2_dual_stream
+    ):
+        return
+
+    _logged_pcg_dsa_dsv2_flags = True
+    msg = (
+        "SGLANG_ENABLE_PCG_DSA_EAGER_FUSION=1 and "
+        "SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM=1; PCG DSA eager fusion and "
+        "DSV2 dual-stream MoE are both enabled."
+    )
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        log_info_on_rank0(logger, msg)
+    else:
+        logger.info(msg)
 
 
 if _is_cuda:
@@ -2538,6 +2563,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        _log_pcg_dsa_dsv2_flags_once()
 
         # for quark model load
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
