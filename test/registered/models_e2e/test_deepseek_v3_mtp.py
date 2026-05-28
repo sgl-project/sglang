@@ -1,19 +1,13 @@
 import unittest
-from types import SimpleNamespace
 
-import requests
-
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.send_one import BenchArgs, send_one_prompt
+from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
     is_in_amd_ci,
     is_in_ci,
-    popen_launch_server,
     write_github_step_summary,
 )
 
@@ -21,73 +15,36 @@ register_cuda_ci(est_time=300, stage="base-c", runner_config="8-gpu-h200")
 
 FULL_DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 
+_OTHER_ARGS = [
+    "--tp",
+    "8",
+    "--trust-remote-code",
+    "--speculative-algorithm",
+    "EAGLE",
+    "--speculative-num-steps",
+    "3",
+    "--speculative-eagle-topk",
+    "1",
+    "--speculative-num-draft-tokens",
+    "4",
+    "--model-loader-extra-config",
+    '{"enable_multithread_load": true, "num_threads": 64}',
+]
+if not is_in_amd_ci():
+    _OTHER_ARGS += ["--mem-frac", "0.7"]
 
-class TestDeepseekV3MTP(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = FULL_DEEPSEEK_V3_MODEL_PATH
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        other_args = [
-            "--tp",
-            "8",
-            "--trust-remote-code",
-            "--speculative-algorithm",
-            "EAGLE",
-            "--speculative-num-steps",
-            "3",
-            "--speculative-eagle-topk",
-            "1",
-            "--speculative-num-draft-tokens",
-            "4",
-            "--model-loader-extra-config",
-            '{"enable_multithread_load": true, "num_threads": 64}',
-        ]
-        if not is_in_amd_ci():
-            other_args += ["--mem-frac", "0.7"]
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 5,
-            other_args=other_args,
-        )
 
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+class TestDeepseekV3MTP(GSM8KMixin, DefaultServerBase):
+    model = FULL_DEEPSEEK_V3_MODEL_PATH
+    other_args = _OTHER_ARGS
+    timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 5
 
-    def test_a_gsm8k(
-        self,
-    ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
-        requests.get(self.base_url + "/flush_cache")
+    gsm8k_accuracy_thres = 0.935
+    gsm8k_accept_length_thres = 2.8
 
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
-        )
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-
-        server_info = requests.get(self.base_url + "/server_info")
-        avg_spec_accept_length = server_info.json()["internal_states"][0][
-            "avg_spec_accept_length"
-        ]
-        print(f"{avg_spec_accept_length=}")
-
-        if is_in_ci():
-            write_github_step_summary(
-                f"### test_gsm8k (deepseek-v3 mtp)\n"
-                f'{metrics["score"]=:.3f}\n'
-                f"{avg_spec_accept_length=:.2f}\n"
-            )
-            self.assertGreater(metrics["score"], 0.935)
-            self.assertGreater(avg_spec_accept_length, 2.8)
-
-    def test_bs_1_speed(self):
+    # `test_z_bs_1_speed` runs after `test_gsm8k` (alphabetical) so it
+    # measures steady-state speed on a warmed server.
+    def test_z_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
         acc_length, speed = send_one_prompt(args)
 
