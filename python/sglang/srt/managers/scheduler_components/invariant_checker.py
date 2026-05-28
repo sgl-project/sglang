@@ -167,7 +167,6 @@ class SchedulerInvariantChecker:
         # (kv_committed_len - cache_protected_len, < page_size) that
         # filter_batch just removed from last_batch but haven't been
         # re-admitted to running_batch yet. The leak invariant must count it.
-        # C10: chunked-resume now lives in active_reqs (post-C4).
         seen_ids = {id(req) for group in req_groups for req in group}
         chunked_in_active = [
             req

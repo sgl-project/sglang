@@ -232,7 +232,6 @@ class SchedulerBatchResultProcessor:
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
-                        # audit D1: sync prefill finish
                         self.deactivate_req(req)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -318,7 +317,6 @@ class SchedulerBatchResultProcessor:
 
                     if req.finished():
                         release_kv_cache(req, self.tree_cache)
-                        # audit D2: embedding/reward prefill finish
                         self.deactivate_req(req)
                         req.time_stats.set_completion_time()
                     else:
@@ -805,9 +803,8 @@ class SchedulerBatchResultProcessor:
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
-                # audit D3: sync decode finish (non-offload path). The DECODE
-                # offload branch (D4) does not call _deactivate — disagg DECODE
-                # is not in active_reqs (Q1=(c)).
+                # Non-offload path. The DECODE offload branch does not call
+                # _deactivate — disagg DECODE is not in active_reqs.
                 self.deactivate_req(req)
 
             req.time_stats.set_completion_time()

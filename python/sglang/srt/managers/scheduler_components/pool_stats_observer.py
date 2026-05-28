@@ -179,7 +179,6 @@ class SchedulerPoolStatsObserver:
         # Chunked-resume reqs in active_reqs still own their row across iters
         # (filter_batch may have just moved them out of last_batch but they
         # haven't yet been re-admitted to running_batch).
-        # C10: chunked-resume now lives in active_reqs (post-C4).
         for req in self.get_active_reqs().values():
             if req.has_pending_chunk and req.req_pool_idx is not None:
                 idxs.add(req.req_pool_idx)

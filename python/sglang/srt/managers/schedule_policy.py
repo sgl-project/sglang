@@ -234,7 +234,6 @@ class SchedulePolicy:
         temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
 
-        # C10: chunked-resume no longer in waiting_queue (post-C4); revert to main-upstream sort.
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
@@ -278,7 +277,6 @@ class SchedulePolicy:
         waiting_queue: List[Req], temporary_deprioritized: Set[int]
     ) -> None:
         """Sorts the waiting queue based on the longest prefix match."""
-        # C10: chunked-resume no longer in waiting_queue (post-C4); revert to main-upstream sort.
         waiting_queue.sort(
             key=lambda r: (
                 -len(r.prefix_indices)
@@ -292,7 +290,6 @@ class SchedulePolicy:
         waiting_queue: List[Req], tree_cache: BasePrefixCache
     ) -> None:
         """Sorts the waiting queue based on a depth-first search weighting."""
-        # C10: chunked-resume no longer in waiting_queue (post-C4); revert to main-upstream sort.
         last_node_to_reqs = defaultdict(list)
         for req in waiting_queue:
             last_node_to_reqs[req.last_node].append(req)

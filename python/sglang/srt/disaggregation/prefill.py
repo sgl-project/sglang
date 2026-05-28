@@ -556,7 +556,6 @@ class SchedulerDisaggregationPrefillMixin:
                         # This can happen if the grammar is not set correctly or the token is invalid.
                         error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                         release_kv_cache(req, self.tree_cache)
-                        # audit D-prefill-1: disagg PREFILL release path
                         self._deactivate(req)
                         prepare_abort(
                             req,
@@ -642,7 +641,6 @@ class SchedulerDisaggregationPrefillMixin:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
-                # audit D-prefill-2: disagg PREFILL release path
                 self._deactivate(req)
                 req.finished_reason = FINISH_LENGTH(length=0)
                 # FIXME: clean up req's data in transfer engine
@@ -659,7 +657,6 @@ class SchedulerDisaggregationPrefillMixin:
                 logger.warning(error_message)
                 req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
-                # audit D-prefill-3: disagg PREFILL release path
                 self._deactivate(req)
                 prepare_abort(
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
@@ -731,8 +728,8 @@ class SchedulerDisaggregationPrefillMixin:
         return transferred_rids
 
     def process_prefill_chunk(self: Scheduler) -> None:
-        # audit C10: disagg PREFILL chunked-resume now lives in active_reqs
-        # (same as sync mode post-C4); iterate chunked_reqs() view.
+        # Disagg PREFILL chunked-resume lives in active_reqs (same as sync
+        # mode); iterate chunked_reqs() view.
         for req in self.chunked_reqs():
             if not req.is_dllm():
                 maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)

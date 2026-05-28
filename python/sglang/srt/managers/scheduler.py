@@ -1001,25 +1001,23 @@ class Scheduler(
         # lifecycle of (admitted, not finished, not retracted, not aborted-
         # released). by-rid indexed.
         #
-        # Definition (Plan §7-Q7): admitted via `_get_new_batch_prefill_raw`
-        # and not yet released through finish/retract/abort. Includes normal
-        # decode reqs AND mid-prefill chunked-resume reqs AND PP cross-mb
-        # in-flight reqs (the last two: NOT in running_batch.reqs but still
-        # holding row + KV + lock_ref).
+        # Definition: admitted via `_get_new_batch_prefill_raw` and not yet
+        # released through finish/retract/abort. Includes normal decode reqs
+        # AND mid-prefill chunked-resume reqs AND PP cross-mb in-flight reqs
+        # (the last two: NOT in running_batch.reqs but still holding row +
+        # KV + lock_ref).
         #
         # Invariants:
         # * `waiting_queue ∩ active_reqs == ∅` (sync mode; disagg modes use
-        #    their own ownership managers, see Q1=(c)).
+        #    their own ownership managers).
         # * `set(running_batch.reqs) ⊆ active_reqs` (in-batch always active).
         # * `set(chunked_reqs()) ⊆ active_reqs` (by definition).
-        # * `len(list(chunked_reqs())) <= 1` (Q5 single-flight; asserted at
+        # * `len(list(chunked_reqs())) <= 1` (single-flight; asserted at
         #    inline chunked admission entry).
         # * `active_reqs` keys are in 1:1 correspondence with allocated
         #    `req_to_token_pool` rows (sync mode).
         #
         # Maintained at: `_activate` / `_deactivate` (only entry points).
-        # See agent-drafts/2026-05-25-waiting-queue-refactor-plan.md and
-        # 2026-05-25-scheduler-lifecycle-audit.md.
         self.active_reqs: Dict[str, Req] = {}
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
@@ -1043,8 +1041,7 @@ class Scheduler(
 
         Gated: only sync mode + disagg PREFILL + non-DLLM reqs enter
         active_reqs. Disagg DECODE has its own prealloc/transfer queue
-        ownership; DLLM has its own staging_queue. See plan §2 Scope and
-        C10 fix plan §2 (disagg PREFILL bug).
+        ownership; DLLM has its own staging_queue.
         """
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             return
@@ -1128,12 +1125,10 @@ class Scheduler(
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         # Chunked-resume tracking: per-Req (has_pending_chunk +
-        # pending_middle_outputs). After the C1-C7 refactor, chunked-resume
-        # reqs live exclusively in `active_reqs` (not waiting_queue); Stage A
-        # iterates `chunked_reqs()` derived from active_reqs. The inline
-        # chunked admission block at the top of `_get_new_batch_prefill_raw`
-        # re-admits them each iter. See agent-drafts/
-        # 2026-05-25-waiting-queue-refactor-plan.md.
+        # pending_middle_outputs). Chunked-resume reqs live exclusively in
+        # `active_reqs` (not waiting_queue); Stage A iterates `chunked_reqs()`
+        # derived from active_reqs. The inline chunked admission block at the
+        # top of `_get_new_batch_prefill_raw` re-admits them each iter.
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
@@ -2249,7 +2244,6 @@ class Scheduler(
 
         deleted_reqs = set()
         deadline = time.perf_counter() - timeout_s
-        # audit AB7: chunked-resume no longer in waiting_queue (C4), bypass removed.
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
@@ -2446,9 +2440,7 @@ class Scheduler(
         # for the duration of the scheduling pass. vLLM / TokenSpeed do not
         # need this because their admission reads a single monotone counter
         # (num_computed_tokens / FSM state), not a prefix-indices splice.
-        # audit P1: Stage A — stash chunked-resume KV into radix tree at iter
-        # boundary. Switch from scanning waiting_queue (H3 hack) to iterating
-        # the chunked_reqs() view directly.
+        # Stage A: stash chunked-resume KV into radix tree at iter boundary.
         for req in self.chunked_reqs():
             if not req.is_dllm():
                 maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
@@ -2510,8 +2502,8 @@ class Scheduler(
             # drops chunked-resume reqs from last_batch, so running_batch
             # shouldn't normally hold one. Keep the flag set so any leak in
             # that invariant doesn't survive here; the dropped req remains
-            # in active_reqs (post-C4) and is re-admitted next iter via the
-            # inline chunked admission block in _get_new_batch_prefill_raw.
+            # in active_reqs and is re-admitted next iter via the inline
+            # chunked admission block in _get_new_batch_prefill_raw.
             self.running_batch.filter_batch(
                 exclude_chunked_req=True,
                 exclude_in_flight_other_mb=self._in_flight_other_mb_rids(),
@@ -2601,8 +2593,7 @@ class Scheduler(
         # the `is_resume` flag (has_pending_chunk and not is_dllm) and handles all
         # budget bookkeeping in one place — no special add_chunked_req method
         # resurrected. The main waiting_queue loop below admits ONLY truly-waiting
-        # reqs. See agent-drafts/2026-05-25-waiting-queue-refactor-plan.md §C3 (and
-        # C9 follow-up).
+        # reqs.
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -2616,10 +2607,10 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
-        # audit H4 + Q5: chunked-resume now lives in active_reqs (not
-        # waiting_queue, post-C4). Compute the single-flight view once here
-        # and reuse below for early-exit relaxation, dynamic chunking, and
-        # the inline chunked admission entry.
+        # Chunked-resume lives in active_reqs (not waiting_queue). Compute
+        # the single-flight view once here and reuse below for early-exit
+        # relaxation, dynamic chunking, and the inline chunked admission
+        # entry.
         chunked_in_active = list(self.chunked_reqs())
         assert len(chunked_in_active) <= 1, (
             f"single-flight violated: {len(chunked_in_active)} chunked reqs "
@@ -2657,8 +2648,7 @@ class Scheduler(
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
         if self.enable_dynamic_chunking and chunked_in_active:
-            # audit H5: chunked-resume lives in active_reqs; reuse the
-            # single-flight view computed above instead of scanning
+            # Reuse the single-flight view computed above instead of scanning
             # waiting_queue.
             chunked_resume = chunked_in_active[0]
             history_len = len(chunked_resume.prefix_indices)
@@ -2714,8 +2704,8 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            # audit H6: chunked-resume no longer flows through main loop;
-            # drainer check applies uniformly.
+            # Chunked-resume does not flow through this loop; the drainer
+            # check applies uniformly to all waiting reqs here.
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -2745,8 +2735,8 @@ class Scheduler(
                     req.rid
                 )
 
-            # audit H7: chunked-resume handled in inline admission above;
-            # main loop unconditional.
+            # Chunked-resume is handled in the inline admission block above;
+            # this main loop is unconditional.
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
@@ -2790,28 +2780,27 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
-        # audit A1: mark newly-admitted reqs as active. Post-C3/C4 the main
-        # admission loop (the for-loop over waiting_queue above) only
-        # produces brand-new admissions. The inline chunked admission block
-        # also appends to `can_run_list` for chunked-resume re-admit, and
-        # those reqs are already in active_reqs from a prior iter (the
-        # inline block does NOT call _activate). Skip them here so the
-        # strict `_activate` assert (post-C7) catches accidental
-        # double-admission for everything else.
+        # Mark newly-admitted reqs as active. The main admission loop (the
+        # for-loop over waiting_queue above) only produces brand-new
+        # admissions. The inline chunked admission block also appends to
+        # `can_run_list` for chunked-resume re-admit, and those reqs are
+        # already in active_reqs from a prior iter (the inline block does
+        # NOT call _activate). Skip them here so the strict `_activate`
+        # assert catches accidental double-admission for everything else.
         for req in can_run_list:
             if req.rid in self.active_reqs:
                 continue
             self._activate(req)
 
-        # audit H2: retention removed. chunked-resume reqs are no longer
-        # anchored in waiting_queue — they live in active_reqs and are
-        # re-admitted via the inline chunked admission loop (C3).
+        # Chunked-resume reqs are not anchored in waiting_queue — they live
+        # in active_reqs and are re-admitted via the inline chunked
+        # admission loop.
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:
             for req in adder.preempt_list:
-                # audit R2: PrefillAdder.preempt_to_schedule already released
-                # the victim's resources via running_batch.release_req. Drop
+                # PrefillAdder.preempt_to_schedule already released the
+                # victim's resources via running_batch.release_req. Drop
                 # from active_reqs before re-enqueueing as a waiting req.
                 self._deactivate(req)
                 self._add_request_to_queue(req)
@@ -2987,8 +2976,8 @@ class Scheduler(
                 )
             logger.warning(msg_prefix + msg_details)
 
-            # audit R1: retract_decode released row + KV via release_req for
-            # both retracted_reqs (re-enqueued as waiting) and reqs_to_abort
+            # retract_decode released row + KV via release_req for both
+            # retracted_reqs (re-enqueued as waiting) and reqs_to_abort
             # (final OOM eviction). Drop both from active_reqs.
             for req in reqs_to_abort:
                 self._deactivate(req)
@@ -3507,7 +3496,7 @@ class Scheduler(
             self.last_batch = None
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
-            self.active_reqs.clear()  # audit: keep parallel to req_to_token_pool reset (C8)
+            self.active_reqs.clear()  # Keep parallel to req_to_token_pool reset.
             self.token_to_kv_pool_allocator.clear()
             self.grammar_manager.clear()
             self.metrics_reporter.reset_metrics()
@@ -3686,18 +3675,17 @@ class Scheduler(
                     req, self.req_to_metadata_buffer_idx_allocator
                 )
 
-            # audit AB4 simplified post-C4: only mamba radix cache reqs can be
-            # in waiting_queue with mamba_pool_idx held. Chunked-resume reqs
-            # are NOT in waiting_queue anymore (live in active_reqs); their
-            # abort-time release happens in the active_reqs loop below.
+            # Only mamba radix cache reqs can be in waiting_queue with
+            # mamba_pool_idx held. Chunked-resume reqs are NOT in
+            # waiting_queue (they live in active_reqs); their abort-time
+            # release happens in the active_reqs loop below.
             if (
                 req.mamba_pool_idx is not None
                 and self.disaggregation_mode != DisaggregationMode.DECODE
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
-                # audit D6 (mamba branch): drop from active set if present.
-                # (mamba-radix path may or may not put req in active_reqs;
-                # _deactivate is idempotent.)
+                # Drop from active set if present. (mamba-radix path may or
+                # may not put req in active_reqs; _deactivate is idempotent.)
                 self._deactivate(req)
             logger.debug(f"Abort queued request. {req.rid=}")
 
@@ -3750,13 +3738,12 @@ class Scheduler(
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
-        # audit finding 2 (Plan §C6 Edit 3): iterate active_reqs instead of
-        # batch_reqs so that stashed chunked-resume reqs (in active_reqs but
-        # NOT in any current batch) get their resources released immediately.
-        # batch_rids was built above and includes cur_batch + running_batch +
-        # PP mbs[*]; "in-batch" reqs go through to_finish, "stashed-chunked"
-        # reqs need explicit release because no batch result path will pick
-        # them up.
+        # Iterate active_reqs instead of batch_reqs so that stashed
+        # chunked-resume reqs (in active_reqs but NOT in any current batch)
+        # get their resources released immediately. batch_rids was built
+        # above and includes cur_batch + running_batch + PP mbs[*];
+        # "in-batch" reqs go through to_finish, "stashed-chunked" reqs need
+        # explicit release because no batch result path will pick them up.
         for rid in list(self.active_reqs.keys()):
             req = self.active_reqs[rid]
             if req.finished():
@@ -3771,19 +3758,19 @@ class Scheduler(
                 req.to_finish = FINISH_ABORT()
             else:
                 # Active but not in any batch — the only legitimate case is
-                # a stashed chunked-resume mid-prefill (audit finding 2).
-                # Release immediately, else row+KV+lock_ref leak.
+                # a stashed chunked-resume mid-prefill. Release immediately,
+                # else row+KV+lock_ref leak.
                 assert req.has_pending_chunk and req.req_pool_idx is not None, (
                     f"unexpected active-but-not-in-batch req: {rid} "
                     f"has_pending_chunk={req.has_pending_chunk} "
                     f"req_pool_idx={req.req_pool_idx}"
                 )
                 if self.disaggregation_mode != DisaggregationMode.DECODE:
-                    # C11: disagg PREFILL stashed-chunked req has already been
-                    # sending KV chunks to the peer decode node. Signal abort so
-                    # the peer doesn't wait forever for the remaining chunks.
-                    # Mirrors pause_generation(retract) PREFILL handling
-                    # (scheduler.py pause section).
+                    # Disagg PREFILL stashed-chunked req has already been
+                    # sending KV chunks to the peer decode node. Signal
+                    # abort so the peer doesn't wait forever for the
+                    # remaining chunks. Mirrors pause_generation(retract)
+                    # PREFILL handling (scheduler.py pause section).
                     if (
                         self.disaggregation_mode == DisaggregationMode.PREFILL
                         and req.disagg_kv_sender is not None
@@ -3794,8 +3781,9 @@ class Scheduler(
 
                     release_kv_cache(req, self.tree_cache, is_insert=False)
 
-                    # C11: PREFILL mode also needs to release the metadata buffer
-                    # slot. Mirrors abort_request waiting-segment PREFILL handling.
+                    # PREFILL mode also needs to release the metadata
+                    # buffer slot. Mirrors abort_request waiting-segment
+                    # PREFILL handling.
                     if self.disaggregation_mode == DisaggregationMode.PREFILL:
                         release_req_to_metadata_buffer(
                             req, self.req_to_metadata_buffer_idx_allocator
@@ -3853,8 +3841,8 @@ class Scheduler(
                 self.running_batch.filter_batch(v1_spec_info_filtered=True)
                 if len(self.running_batch.reqs) != 0:
                     retracted_reqs = self.running_batch.retract_all(self.server_args)
-                    # audit R3: retract_all released resources via release_req
-                    # for every running req; drop from active_reqs before
+                    # retract_all released resources via release_req for
+                    # every running req; drop from active_reqs before
                     # re-enqueueing as waiting.
                     for req in retracted_reqs:
                         self._deactivate(req)
@@ -3867,11 +3855,8 @@ class Scheduler(
             # 'flush_cache can succeed' contract (see PauseGenerationReqInput
             # docstring) is violated. Release in-place and reset their chunked
             # state so continue_generation re-prefills them from
-            # origin_input_ids.
-            #
-            # audit C7: chunked-resume lives in active_reqs (post-C4),
-            # iterate chunked_reqs() directly. list(...) because we mutate
-            # active_reqs via _deactivate inside the loop.
+            # origin_input_ids. list(...) because we mutate active_reqs via
+            # _deactivate inside the loop.
             for req in list(self.chunked_reqs()):
                 if req.req_pool_idx is not None:
                     # Disagg-prefill: signal the decode side that the send was
@@ -3887,17 +3872,14 @@ class Scheduler(
                         req.disagg_kv_sender = None
                     release_kv_cache(req, self.tree_cache, is_insert=False)
                     req.reset_for_retract()
-                    # audit D7: chunked-resume req released via reset_for_retract
-                    # no longer holds row/KV, so it leaves the active set.
+                    # Chunked-resume req released via reset_for_retract no
+                    # longer holds row/KV, so it leaves the active set.
                     self._deactivate(req)
-                    # TODO(post-refactor follow-up): plan §10 flag — after
-                    # reset_for_retract, this req is NOT re-enqueued to
-                    # waiting_queue. Either the design relies on the original
-                    # reference staying in waiting_queue (but C4 removed
-                    # retention!) or this is a pre-existing latent bug from
-                    # before the refactor. Investigate separately. See
-                    # agent-drafts/2026-05-25-waiting-queue-refactor-plan.md
-                    # §10.
+                    # TODO: after reset_for_retract, this req is NOT
+                    # re-enqueued to waiting_queue. Either the design relies
+                    # on the original reference staying in waiting_queue (but
+                    # retention was removed) or this is a pre-existing latent
+                    # bug. Investigate separately.
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         if recv_req.torch_empty_cache:
