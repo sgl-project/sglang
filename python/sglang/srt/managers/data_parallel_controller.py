@@ -14,6 +14,7 @@
 """A controller that dispatches requests to multiple data parallel workers."""
 
 import faulthandler
+import hashlib
 import logging
 import multiprocessing as mp
 import signal
@@ -76,6 +77,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    PREFIX_MATCH = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -149,6 +151,7 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.PREFIX_MATCH: self.prefix_match_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
 
@@ -606,6 +609,33 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
         self.workers[target_worker].send_pyobj(req)
+
+    def prefix_match_scheduler(self, req: Req):
+        """Route by stable hash of the first N input tokens.
+
+        Same prefix (e.g. shared system+tools) -> same DP rank -> radix cache
+        hit. Different prefixes spread evenly across ranks via stable hash.
+        No cross-rank state required; the decision is a pure function of the
+        request's leading tokens, so concurrent requests with the same prefix
+        all land on the same rank without coordination.
+        """
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
+        dp_size = len(self.workers)
+        N = 4096
+        ids = getattr(req, "input_ids", None) or []
+        if len(ids) == 0:
+            target_rank = self.round_robin_counter % dp_size
+            self.round_robin_counter = (self.round_robin_counter + 1) % dp_size
+        else:
+            head = ids[:N]
+            h = hashlib.blake2b(
+                bytes(b & 0xFF for b in head[:256]) + len(head).to_bytes(4, "little"),
+                digest_size=8,
+            ).digest()
+            target_rank = int.from_bytes(h, "little") % dp_size
+        self.workers[target_rank].send_pyobj(req)
 
     def event_loop(self):
         while True:
