@@ -743,20 +743,20 @@ class SchedulerDisaggregationPrefillMixin:
 
     def process_prefill_chunk(self: Scheduler) -> None:
         # Disagg PREFILL chunked-resume lives in active_reqs (same as sync
-        # mode); iterate chunked_reqs() view.
-        for req in self.chunked_reqs():
-            if not req.is_dllm():
-                maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
-                if self.enable_overlap:
-                    # Delay KV transfer to process_batch_result_disagg_prefill
-                    # when overlap is enabled to ensure results are resolved.
-                    req.tmp_end_idx = min(
-                        len(req.fill_ids),
-                        len(req.origin_input_ids),
-                    )
-                else:
-                    self.send_kv_chunk(req)
-                self.running_batch.batch_is_full = False
+        # mode); pull the single-flight chunked-resume req via chunked_reqs().
+        # DLLM is excluded by has_pending_chunk's own short-circuit.
+        chunked_req = next(iter(self.chunked_reqs()), None)
+        if chunked_req is not None:
+            maybe_cache_unfinished_req(chunked_req, self.tree_cache, chunked=True)
+            if self.enable_overlap:
+                # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
+                chunked_req.tmp_end_idx = min(
+                    len(chunked_req.fill_ids),
+                    len(chunked_req.origin_input_ids),
+                )
+            else:
+                self.send_kv_chunk(chunked_req)
+            self.running_batch.batch_is_full = False
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             last_bs = self.last_batch.batch_size()

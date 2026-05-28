@@ -2396,10 +2396,10 @@ class Scheduler(
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
-        # Stage A: stash any in-flight chunked prefill KV into radix tree.
-        # Per-req loop over waiting_queue covers chunked-resume; DLLM staging
-        # reqs are owned by DllmManager (not in waiting_queue), handled
-        # separately below.
+        # Stage A: stash any in-flight chunked prefill KV into radix tree at
+        # the iter boundary. Iterates `chunked_reqs()` for sync / disagg
+        # PREFILL chunked-resume; DLLM staging reqs are owned by DllmManager
+        # (not in active_reqs) and handled separately below.
         #
         # Why this runs at the iter boundary (not at the end of the prior iter):
         # admission inside get_new_batch_prefill_raw reads req.prefix_indices to
@@ -2410,10 +2410,8 @@ class Scheduler(
         # for the duration of the scheduling pass. vLLM / TokenSpeed do not
         # need this because their admission reads a single monotone counter
         # (num_computed_tokens / FSM state), not a prefix-indices splice.
-        # Stage A: stash chunked-resume KV into radix tree at iter boundary.
         for req in self.chunked_reqs():
-            if not req.is_dllm():
-                maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+            maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
             for req in self.dllm_manager.staging_queue:
@@ -2574,30 +2572,31 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
-        # Chunked-resume lives in active_reqs (not waiting_queue). Compute
-        # the single-flight view once here and reuse below for early-exit
+        # Chunked-resume lives in active_reqs (not waiting_queue). Materialize
+        # the single-flight view once and reuse below for early-exit
         # relaxation, dynamic chunking, and the inline chunked admission
-        # entry.
-        chunked_in_active = list(self.chunked_reqs())
-        assert len(chunked_in_active) <= 1, (
-            f"single-flight violated: {len(chunked_in_active)} chunked reqs "
-            f"in active ({[r.rid for r in chunked_in_active]})"
+        # entry. Single-flight invariant is asserted on the underlying list.
+        _chunked_in_active = list(self.chunked_reqs())
+        assert len(_chunked_in_active) <= 1, (
+            f"single-flight violated: {len(_chunked_in_active)} chunked reqs "
+            f"in active ({[r.rid for r in _chunked_in_active]})"
         )
+        chunked_req = _chunked_in_active[0] if _chunked_in_active else None
 
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and not chunked_in_active:
+        ) and chunked_req is None:
             return None
 
         running_bs = len(self.running_batch.reqs)
 
-        # Ignore the check if there is a chunked-resume in flight.
+        # Ignore the check if chunked_req is not None.
         # In the non-PP case the row was just released so the count is fine;
         # in PP case, chunked reqs span microbatches so the per-mb max_running
         # check should not block them.
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
-            and not chunked_in_active
+            and chunked_req is None
             and not self.enable_priority_preemption
         ):
             self.running_batch.batch_is_full = True
@@ -2614,11 +2613,8 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
-        if self.enable_dynamic_chunking and chunked_in_active:
-            # Reuse the single-flight view computed above instead of scanning
-            # waiting_queue.
-            chunked_resume = chunked_in_active[0]
-            history_len = len(chunked_resume.prefix_indices)
+        if chunked_req is not None and self.enable_dynamic_chunking:
+            history_len = len(chunked_req.prefix_indices)
             dynamic_size = self.predict_next_chunk_size(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
@@ -2642,8 +2638,7 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
         )
 
-        if chunked_in_active:
-            chunked_req = chunked_in_active[0]
+        if chunked_req is not None:
             # No tree_cache: chunked-resume MUST NOT re-match prefix (H7).
             # Its row + KV + lock_ref are already held from prior admission.
             chunked_req.init_next_round_input()
@@ -3617,10 +3612,7 @@ class Scheduler(
                     req, self.req_to_metadata_buffer_idx_allocator
                 )
 
-            # Only mamba radix cache reqs can be in waiting_queue with
-            # mamba_pool_idx held. Chunked-resume reqs are NOT in
-            # waiting_queue (they live in active_reqs); their abort-time
-            # release happens in the active_reqs loop below.
+            # For mamba radix cache
             if (
                 req.mamba_pool_idx is not None
                 and self.disaggregation_mode != DisaggregationMode.DECODE
@@ -3699,14 +3691,15 @@ class Scheduler(
         # sender.abort; the abort-side disagg_prefill_inflight_queue scan
         # only sees reqs that completed their last chunk, not mid-prefill
         # ones). The decode peer may wait indefinitely. Fix in a separate PR.
-        for rid in list(self.active_reqs.keys()):
-            req = self.active_reqs[rid]
-            if req.finished():
-                continue
-            if not (recv_req.abort_all or rid.startswith(recv_req.rid)):
-                continue
-            logger.debug(f"Abort running request. {req.rid=}")
-            req.to_finish = FINISH_ABORT()
+        for req in list(self.active_reqs.values()):
+            if not req.finished() and (
+                recv_req.abort_all or req.rid.startswith(recv_req.rid)
+            ):
+                # Abort method 3: set `to_finish`
+                # The request will still run one decode forward pass.
+                # Then we reuse all existing code to clean up the KV cache allocation.
+                logger.debug(f"Abort running request. {req.rid=}")
+                req.to_finish = FINISH_ABORT()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
