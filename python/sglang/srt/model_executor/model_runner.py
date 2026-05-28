@@ -2341,33 +2341,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             batch_sizes,
         )
         t0 = time.perf_counter()
-        for bs in batch_sizes:
-            try:
-                with torch.inference_mode():
-                    if self.is_generation:
-                        self._dummy_run(
-                            batch_size=bs,
-                            forward_mode_override=ForwardMode.DECODE,
-                        )
+        with torch.inference_mode():
+            for bs in batch_sizes:
+                if self.is_generation:
                     self._dummy_run(
                         batch_size=bs,
-                        forward_mode_override=ForwardMode.EXTEND,
+                        forward_mode_override=ForwardMode.DECODE,
                     )
-            except torch.cuda.OutOfMemoryError as e:
-                logger.warning(
-                    "PP-parallel DeepGEMM warmup OOM at batch_size=%d, stopping sweep: %r",
-                    bs,
-                    e,
+                self._dummy_run(
+                    batch_size=bs,
+                    forward_mode_override=ForwardMode.EXTEND,
                 )
-                torch.cuda.empty_cache()
-                break
-            except Exception as e:
-                logger.warning(
-                    "PP-parallel DeepGEMM warmup skipped at batch_size=%d: %r",
-                    bs,
-                    e,
-                )
-                break
 
         logger.info(
             "PP-parallel DeepGEMM warmup done in %.2fs (pp_rank=%d).",
