@@ -319,6 +319,43 @@ _DSA_IMPL_T: TypeAlias = Literal[
 ]
 
 
+def _resolve_req_to_token_for_capture(forward_batch, backend):
+    """Resolve the request→physical-slot map for the radix-capture publish.
+
+    Production ``ForwardBatch`` does not carry a ``req_to_token_pool`` field, so
+    reading it returns None and the capture silently never publishes. Resolve in
+    order: (1) ``forward_batch.req_to_token_pool`` when present (unit fixtures /
+    some paths set it), (2) the backend's own cached map (the attention backend —
+    ``self`` from the DSA path, or the ForwardContext backend from the MHA path —
+    sets ``self.req_to_token`` at init), (3) the active ForwardContext attention
+    backend (TBO-unwrapped) as a final fallback. Mirrors the selector's resolver
+    (see deepseek_v2._select_topk_indices) per BL ds-metadata-via-forward-context.
+    """
+    req_pool = getattr(forward_batch, "req_to_token_pool", None)
+    if req_pool is not None and getattr(req_pool, "req_to_token", None) is not None:
+        return req_pool.req_to_token
+    rtt = getattr(backend, "req_to_token", None)
+    if rtt is not None:
+        return rtt
+    try:
+        from sglang.srt.layers.attention.tbo_backend import (
+            TboAttnBackend as _TboAttnBackend,
+        )
+        from sglang.srt.model_executor.forward_context import (
+            get_attn_backend as _get_attn_backend,
+            has_forward_context as _has_forward_context,
+        )
+
+        if _has_forward_context():
+            _b = _get_attn_backend()
+            if isinstance(_b, _TboAttnBackend):
+                _b = _b.primary
+            return getattr(_b, "req_to_token", None)
+    except Exception:  # noqa: BLE001 — capture must not break production
+        return None
+    return None
+
+
 def _ds_radix_publish_extend_snapshot(*, backend, forward_batch) -> None:
     """M3-B radix-capture publish hook (extend-only, post-write).
 
@@ -341,8 +378,7 @@ def _ds_radix_publish_extend_snapshot(*, backend, forward_batch) -> None:
     table = getattr(backend, "_ds_token_label_table", None)
     if table is None:
         return
-    req_pool = getattr(forward_batch, "req_to_token_pool", None)
-    req_to_token = req_pool.req_to_token if req_pool is not None else None
+    req_to_token = _resolve_req_to_token_for_capture(forward_batch, backend)
     req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
     seq_lens = getattr(forward_batch, "seq_lens", None)
     if (

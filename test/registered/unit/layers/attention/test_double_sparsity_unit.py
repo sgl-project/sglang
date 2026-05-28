@@ -6982,6 +6982,38 @@ class TestRadixCaptureExtendSnapshotProducer(unittest.TestCase):
         self.assertEqual(len(rec["per_token_slot_sha"]), 3)
         self.assertTrue(all(rec["per_layer_written_all_true"]))
 
+    def test_publishes_when_forward_batch_lacks_req_to_token_pool(self):
+        """Production-shaped regression (AC-0 hardware-probe gap): production
+        ``ForwardBatch`` has NO ``req_to_token_pool`` field, so the capture used to
+        return before publishing. The publish must resolve ``req_to_token`` from
+        the backend's cached map (set at init, also the ForwardContext backend on
+        the MHA path) and still publish ``double_sparsity_radix_capture``."""
+        from sglang.srt.layers.attention.double_sparsity import radix_fixture_capture
+
+        backend, layer, cache_loc, k, table, _ = self._build(T=3, max_tokens=64)
+        # The backend caches req_to_token at init in production; the SimpleNamespace
+        # forward batch below deliberately omits req_to_token_pool.
+        req_to_token = torch.zeros((2, 64), dtype=torch.int64)
+        req_to_token[0, :3] = cache_loc
+        backend.req_to_token = req_to_token
+        fb = SimpleNamespace(
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([3], dtype=torch.int64),
+            forward_mode=SimpleNamespace(is_extend=lambda: True),
+        )
+        self.assertFalse(hasattr(fb, "req_to_token_pool"))
+        with mock.patch.dict(os.environ, {"SGLANG_DS_RADIX_FIXTURE_CAPTURE": "1"}):
+            radix_fixture_capture.clear_log()
+            backend._write_token_labels(layer, cache_loc, k, forward_batch=fb)
+        summary = getattr(fb, "ds_per_request_summary", None)
+        self.assertIsNotNone(summary)
+        self.assertIn("double_sparsity_radix_capture", summary)
+        self.assertNotIn("double_sparsity_radix_capture_error", summary)
+        rec = summary["double_sparsity_radix_capture"][0]
+        self.assertEqual(rec["prompt_len"], 3)
+        self.assertEqual(len(rec["per_token_slot_sha"]), 3)
+        self.assertTrue(all(rec["per_layer_written_all_true"]))
+
     def test_capture_disabled_publishes_no_key(self):
         backend, layer, cache_loc, k, table, make_fb = self._build(T=3)
         fb = make_fb(is_extend=True)

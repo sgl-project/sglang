@@ -71,10 +71,16 @@ def _sha256_bytes(buf: bytes) -> str:
 def _tensor_bytes_sha(t: torch.Tensor) -> str:
     """SHA256 of a tensor's raw bytes. Tensor is moved to CPU + made
     contiguous so the hash is layout-stable across capture sites.
+
+    Hash through a flat uint8 byte view rather than ``.numpy()`` on the native
+    dtype: the production token-label signatures are fp16 (and K-noPE may be
+    bf16/fp8), and ``torch.Tensor.numpy()`` raises on dtypes NumPy cannot bridge
+    (observed as ``UntypedStorage has no attribute 'dtype'`` / unsupported
+    ScalarType). The uint8 reinterpret is byte-exact and dtype-agnostic, so cold
+    and warm captures still compare identically.
     """
-    return _sha256_bytes(
-        t.detach().to(torch.device("cpu")).contiguous().numpy().tobytes()
-    )
+    cpu = t.detach().to(torch.device("cpu")).contiguous().reshape(-1)
+    return _sha256_bytes(cpu.view(torch.uint8).numpy().tobytes())
 
 
 def record_write(
