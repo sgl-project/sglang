@@ -46,7 +46,6 @@ from sglang.srt.utils.common import (
     cpu_has_amx_support,
     get_device,
     get_device_memory_capacity,
-    get_device_name,
     get_device_sm,
     get_int_env_var,
     get_nvidia_driver_version,
@@ -2516,11 +2515,7 @@ class ServerArgs:
         # for models with explicit support (DeepseekV3, GptOss, Glm4Moe,
         # MistralLarge3, Qwen3/Qwen3Next/Qwen3.5 MoE families)
         # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
-        # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
-        device_name = get_device_name()
-        is_h20_device = (
-            device_name and "H20" in device_name and "H200" not in device_name
-        )
+
         if (
             not self.enable_flashinfer_allreduce_fusion
             and model_arch
@@ -2543,7 +2538,6 @@ class ServerArgs:
             and self.tp_size > 1
             and not self.enable_dp_attention
             and self.nnodes == 1
-            and not is_h20_device
             and self.moe_a2a_backend == "none"
         ):
             self.enable_flashinfer_allreduce_fusion = True
