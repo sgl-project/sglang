@@ -1,9 +1,3 @@
-"""Schema- and model-only tests for the Responses API.
-
-Anything that touches the serving layer (mocks, async, SSE state) lives in
-``test_serving_responses.py`` or ``test_serving_responses_stream.py``.
-"""
-
 from _responses_helpers import make_serving  # noqa: F401 — bootstrap import
 
 import unittest

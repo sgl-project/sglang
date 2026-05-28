@@ -1,9 +1,5 @@
-"""Shared bootstrap and helpers for /v1/responses tests.
-
-Import this module BEFORE any ``sglang.srt`` import — it stubs out the
-heavy CUDA-only paths so the CPU test environment can collect the
-serving-layer modules without pulling in ``sgl_kernel`` / ``torch._inductor``.
-"""
+"""Stub CUDA-only deps before importing sglang.srt serving modules. Must
+be imported first by every /v1/responses test that runs on CPU."""
 
 try:
     import torch

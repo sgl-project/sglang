@@ -256,11 +256,8 @@ class Qwen3Detector(BaseReasoningFormatDetector):
             think_excluded_tokens=think_excluded_tokens,
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
-            # Qwen3.5 sometimes emits ``<tool_call>`` without closing
-            # ``</think>`` first when the chat template prefilled ``<think>``.
-            # Treat the opening tool-call tag as an implicit reasoning close
-            # so the tool-call parser still gets the block as normal text and
-            # downstream emits a ``function_call`` output item.
+            # Qwen3.5 sometimes opens ``<tool_call>`` without closing
+            # ``</think>``; treat it as an implicit reasoning close.
             tool_start_token="<tool_call>",
             continue_final_message=continue_final_message,
             previous_content=previous_content,

@@ -95,13 +95,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
 
-        # ``self.default_sampling_params`` is already populated by
-        # ``OpenAIServingChat.__init__`` (model_config.get_default_sampling_params,
-        # which incorporates ``--preferred-sampling-params`` and
-        # ``--sampling-defaults``) — don't re-fetch and bypass the parent's
-        # one-shot logging gate.
+        # Parent OpenAIServingChat.__init__ already populated default_sampling_params.
         if not isinstance(self.default_sampling_params, dict):
-            # Defensive: keep mutate-safe even if parent ever switches type.
             self.default_sampling_params = {}
 
         self.supports_browsing = (
@@ -188,8 +183,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         # FIXME: If the engine is dead, raise an error
         # This is required for the streaming case
 
-        # ``tool_choice="required"`` only works with ``function`` tools;
-        # reject the request instead of silently degrading to ``"none"``.
+        # ``tool_choice="required"`` only works with ``function`` tools.
         if request.tool_choice == "required" and not any(
             tool.type == "function" for tool in (request.tools or [])
         ):
@@ -450,8 +444,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         prev_response: Optional[ResponsesResponse],
         tokenizer: Any,
     ):
-        # Errors propagate to ``create_responses`` which renders them as
-        # FastAPI error responses; no ad-hoc string concatenation fallback.
         messages = self._construct_input_messages(request, prev_response)
 
         chat_tools = self._response_tools_to_chat_tools(request)
@@ -520,9 +512,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         if self.use_harmony:
             assert isinstance(context, HarmonyContext)
             output = self._make_response_output_items_with_harmony(context)
-            # HarmonyContext.append_output populates prompt / cached /
-            # output counts from the engine's meta_info; num_reasoning_tokens
-            # is not yet wired through and remains 0.
+            # num_reasoning_tokens isn't wired through HarmonyContext yet; stays 0.
             num_prompt_tokens = context.num_prompt_tokens
             num_generated_tokens = context.num_output_tokens
             num_cached_tokens = context.num_cached_tokens
@@ -613,20 +603,12 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _wants_reasoning_summary(request: ResponsesRequest) -> bool:
-        """Whether the caller opted into ``reasoning_summary_text.*`` SSE
-        events (and their ``ResponseReasoningSummary`` echo in the final
-        reasoning item) via ``reasoning.summary``."""
         return (
             request.reasoning is not None and request.reasoning.summary is not None
         )
 
     def _is_thinking_enabled_for_request(self, request: ResponsesRequest) -> bool:
-        """Decide whether to start the reasoning detector in thinking mode.
-
-        Mirrors serving_chat._get_reasoning_from_request, but the Responses API
-        has no ``chat_template_kwargs`` field — the only per-request signal is
-        ``request.reasoning.effort``. Without an explicit opt-out we honor the
-        chat template's auto-detected ``default_enabled``."""
+        """Whether to start the reasoning detector in thinking mode."""
         if not self.reasoning_parser:
             return False
         effort = (
@@ -640,9 +622,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             return True
         config = self.template_manager.reasoning_config
         if config is None:
-            # Parser-only models (DeepSeek-R1, etc.) carry their default in
-            # the detector itself. Mirror serving_chat's fallback so the
-            # Responses path doesn't silently drop CoT for them.
+            # Parser-only models (DeepSeek-R1, …) carry the thinking default in
+            # the detector itself.
             detector = getattr(self, "_reasoning_detector", None)
             mode = getattr(detector, "reasoning_default", None) if detector else None
             if mode is None or mode == "always":
@@ -670,13 +651,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         final_output: Any,
         tokenizer: Any,
     ):
-        # Handle reasoning parsing if enabled
         if self.reasoning_parser:
-            # Use standard reasoning parser (openai maps to T4Detector internally).
-            # Chat templates that auto-inject ``<think>\n`` (Qwen3.5, GLM, …) only
-            # emit the close tag; mirror serving_chat's is_force_reasoning so the
-            # detector starts in thinking mode instead of dropping reasoning into
-            # the message body.
+            # Templates that prefill ``<think>`` only emit the close tag, so
+            # start the detector in thinking mode.
             reasoning_parser = ReasoningParser(
                 model_type=self.reasoning_parser,
                 stream_reasoning=False,
@@ -690,11 +667,8 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         output_items = []
         if reasoning_content:
-            # The Responses spec splits the trace into ``summary`` (always
-            # readable, what TUIs like Codex render) and ``content`` (the
-            # encrypted/full trace, gated by ``include=reasoning.encrypted_content``).
-            # We have only one parser-extracted blob, so mirror it into
-            # ``summary`` when the caller opts in via ``reasoning.summary``.
+            # Mirror the single parsed blob into ``summary`` when the caller opts
+            # in via ``reasoning.summary``; full trace stays in ``content``.
             wants_summary = self._wants_reasoning_summary(request)
             reasoning_item = ResponseReasoningItem(
                 id=f"rs_{random_uuid()}",
@@ -717,9 +691,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             output_items.append(reasoning_item)
 
-        # Mirror OpenAIServingChat._process_tool_calls: native parser when
-        # available, JSON-array fallback when ``tool_choice="required"`` is
-        # constrained to a json_schema instead of structural_tag.
         chat_tools = self._response_tools_to_chat_tools(request)
         is_required = request.tool_choice == "required"
         tool_call_items: list[ResponseFunctionToolCall] = []
@@ -778,7 +749,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             except Exception as e:
                 logger.error("Required tool JSON parse error: %s", e)
 
-        # Prose-then-tool-call order matches the SSE stream's emit order.
         if content:
             output_text = ResponseOutputText(
                 text=content,
@@ -813,9 +783,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _response_tools_to_chat_tools(request: ResponsesRequest) -> list[Tool]:
-        # Built-in tools (web_search_preview, code_interpreter) flow through
-        # the harmony/tool_server path; an empty return is the caller's
-        # signal to force tool_choice="none" on the chat request.
+        # Only ``function`` tools flow to chat; built-ins go through harmony.
         chat_tools = []
         for tool in request.tools:
             if tool.type != "function":
@@ -835,18 +803,14 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _normalize_response_content_part_for_chat(content_part: Any) -> Any:
-        # `detail` is defaulted to "auto" because the chat-templating layer
-        # treats absence as ambiguous; flat `min_dynamic_patch` /
-        # `max_dynamic_patch` are lifted onto the `image_url` object so the
-        # downstream image preprocessor sees them.
+        # Default detail=\"auto\" and lift flat min/max_dynamic_patch onto
+        # image_url so the image preprocessor sees them.
         if hasattr(content_part, "model_dump"):
             content_part = content_part.model_dump(exclude_none=True)
         if not isinstance(content_part, dict):
             return content_part
 
         part_type = content_part.get("type")
-        # ``input_text`` (user side) and ``output_text`` (Codex CLI replays
-        # of assistant turns) both map to plain ``text`` for chat templates.
         if part_type in ("input_text", "output_text"):
             return {"type": "text", "text": content_part.get("text", "")}
 
@@ -883,44 +847,22 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @classmethod
     def _normalize_response_message_for_chat(cls, message: Any) -> Any:
-        """Convert one Responses-API input item to a chat-completions message.
-
-        Handles the three input shapes the Responses API allows:
-        - ``type=message`` (or no ``type``): a chat-style user/assistant/system
-          turn — content parts are normalized via
-          ``_normalize_response_content_part_for_chat``.
-        - ``type=function_call``: a prior assistant tool call. Rendered as
-          ``{role: assistant, tool_calls: [...]}`` for chat templating.
-        - ``type=function_call_output``: the result of a prior tool call.
-          Rendered as ``{role: tool, tool_call_id, content}``.
-
-        ``id`` / ``status`` are stripped because chat-template processing does
-        not consume them. Unknown ``type`` values raise rather than silently
-        passing through as malformed chat messages.
-        """
+        """Convert one Responses-API input item to a chat-completions message."""
         if hasattr(message, "model_dump"):
             message = message.model_dump(exclude_none=True)
         if not isinstance(message, dict):
             return message
 
-        # Responses API exposes ``developer`` as a distinct role (system-like
-        # instructions from the application layer; Codex CLI relies on this).
-        # Most chat templates only recognize ``system``/``user``/``assistant``/
-        # ``tool``, so collapse ``developer`` into ``system`` at the boundary.
+        # Most chat templates only recognize system/user/assistant/tool;
+        # collapse ``developer`` to ``system`` at the boundary.
         if message.get("role") == "developer":
             message = {**message, "role": "system"}
 
         msg_type = message.get("type")
         if msg_type == "function_call":
-            # serving_chat's chat-template prep calls ``orjson.loads`` on every
-            # replayed tool-call ``arguments`` string and expects an object.
-            # Codex CLI sometimes echoes back a function_call whose JSON was
-            # truncated mid-emission (model hit ``max_output_tokens`` while
-            # writing the arguments block); non-OpenAI clients sometimes send
-            # ``arguments`` as a dict literal instead of a string. Normalize
-            # every shape to a valid JSON-object string so the chat template's
-            # unconditional ``orjson.loads`` never raises and a recovered
-            # turn renders as a no-arg tool call rather than a 500.
+            # Coerce ``arguments`` to a valid JSON-object string so the chat
+            # template's unconditional ``orjson.loads`` survives truncated or
+            # dict-shaped echoes.
             raw = message.get("arguments")
             if isinstance(raw, str):
                 try:
@@ -952,19 +894,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "tool_call_id": message.get("call_id"),
                 "content": message.get("output", ""),
             }
-        # Reasoning items carry the model's prior thinking. Preserve their
-        # text as ``{role: assistant, reasoning_content: ...}`` so chat
-        # templates (Qwen3 reads ``reasoning_content`` and re-emits a
-        # ``<think>`` block) can keep the history aligned across turns.
-        # Empty reasoning items (Codex CLI sends ``summary: []`` placeholders
-        # alongside its real assistant turns) collapse to nothing — drop them
-        # rather than inject an empty assistant block.
+        # Reasoning items render as {role: assistant, reasoning_content};
+        # empty ones drop instead of injecting an empty assistant block.
         if msg_type == "reasoning":
-            # Codex CLI populates ``summary`` and ``content`` with the same
-            # text (summary is the user-facing trace, content is the
-            # encrypted full trace). Prefer ``summary``; only fall back to
-            # ``content`` when summary is empty, to avoid replaying the same
-            # paragraph twice.
+            # Prefer ``summary``; fall back to ``content`` only when summary
+            # is empty, since clients often populate both with the same text.
             def _collect(parts):
                 out: list[str] = []
                 for entry in parts or []:
@@ -1008,16 +942,8 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _output_message_text(output_item: Any) -> Optional[str]:
-        """Return the assistant text payload of an output item, or None.
-
-        Used during ``previous_response_id`` history replay. Only true
-        assistant ``message`` items with ``output_text`` content parts produce
-        text; reasoning items, tool calls (``function_call``,
-        ``web_search_call``, ``code_interpreter_call``, …) and any other
-        non-message outputs return ``None`` so the caller can skip them.
-        Multiple ``output_text`` parts are joined with newlines so the result
-        can be appended as a single assistant chat turn.
-        """
+        """Return assistant text from a ``message`` output item (joining
+        ``output_text`` parts with newlines), or None for non-message items."""
         if isinstance(output_item, ResponseReasoningItem):
             return None
         if hasattr(output_item, "model_dump"):
@@ -1045,13 +971,9 @@ class OpenAIServingResponses(OpenAIServingChat):
     def _merge_consecutive_assistant_messages(
         messages: list,
     ) -> list:
-        """Collapse runs of ``{role: assistant, …}`` dicts into one entry.
-
-        Combines ``content`` (string-join with a blank line, matching the
-        sglang chat-template flatten) and concatenates ``tool_calls`` lists
-        so a logical assistant turn renders as a single chat-template block.
-        Non-assistant messages and any other roles pass through unchanged.
-        """
+        """Collapse runs of consecutive ``assistant`` dicts into one entry,
+        joining ``content`` and concatenating ``tool_calls`` and
+        ``reasoning_content`` so a logical turn renders as a single block."""
         merged: list = []
         for msg in messages:
             if (
@@ -1062,11 +984,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 and merged[-1].get("role") == "assistant"
             ):
                 prev = merged[-1] = dict(merged[-1])
-                # Merge content. Both sides may be missing / ``""`` / ``str`` /
-                # ``list[dict]``. To preserve non-text parts (``image_url``,
-                # ``file``…) when one side is a list and the other a string,
-                # lift the string into a ``[{type: text, text: ...}]`` part
-                # and concat as lists.
+                # Lift mixed str/list content to list parts so non-text parts
+                # (e.g. image_url) survive when the two sides differ in shape.
                 new_content = msg.get("content")
                 if new_content is not None and new_content != "":
                     prev_content = prev.get("content")
@@ -1084,13 +1003,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                             return []
 
                         prev["content"] = _as_parts(prev_content) + _as_parts(new_content)
-                # Merge tool_calls.
                 new_calls = msg.get("tool_calls")
                 if new_calls:
                     prev_calls = prev.get("tool_calls") or []
                     prev["tool_calls"] = prev_calls + list(new_calls)
-                # Merge reasoning_content (one logical turn can carry a prior
-                # reasoning item *and* a subsequent message/function_call).
                 new_reasoning = msg.get("reasoning_content")
                 if new_reasoning:
                     prev_reasoning = prev.get("reasoning_content")
@@ -1123,8 +1039,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             prev_msg = self.msg_store[prev_response.id]
             messages.extend(prev_msg)
 
-            # Only assistant ``output_text`` items are replayed; reasoning
-            # and tool-call items are dropped from the chat-format history.
             for output_item in prev_response.output:
                 assistant_text = self._output_message_text(output_item)
                 if assistant_text is None:
@@ -1141,23 +1055,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if normalized is not None:
                     messages.append(normalized)  # type: ignore
 
-        # Codex CLI (and the OpenAI Responses spec) splits one logical
-        # assistant turn into multiple input items: a ``message`` carrying the
-        # narrative ``output_text`` plus one or more ``function_call`` items.
-        # Each item normalizes to its own ``{role: assistant, …}`` dict, and
-        # chat templates render every assistant dict as its own turn — Qwen3
-        # produces two ``<|im_start|>assistant`` blocks per logical turn, the
-        # first one effectively empty narration. Replayed across many turns
-        # the model learns "tool_response → short narrative assistant → stop"
-        # and terminates after one chatty reply. Merge consecutive assistant
-        # entries (and parallel ``tool_calls``) into a single chat message.
+        # One Responses-API assistant turn maps to multiple input items
+        # (message + function_call(s)); collapse them into one chat message
+        # so chat templates render a single assistant block per turn.
         messages = self._merge_consecutive_assistant_messages(messages)
 
-        # Most chat templates (Qwen3, Llama, …) require a single ``system``
-        # message at position 0. Codex CLI sends top-level ``instructions``
-        # plus ``developer`` (renamed to ``system`` above) interleaved with
-        # user turns, so merge every system content into one leading
-        # message and keep the rest in their original order.
+        # Most chat templates expect a single leading ``system`` message;
+        # coalesce any ``instructions`` + interleaved ``developer`` entries.
         system_chunks: list[str] = []
         other_msgs: list = []
         for m in messages:
@@ -1840,10 +1744,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 f"data: {event.model_dump_json(indent=None)}\n\n"
             )
 
-        # OpenAI SDK Tool union (used by Response* events) doesn't always
-        # know the full Responses spec; strip the echoed ``tools`` to avoid
-        # pydantic failing mid-stream on extended types (namespace, custom,
-        # …). Clients don't rely on this echo for execution.
+        # The streaming Response* event models echo ``tools`` through a
+        # narrower OpenAI SDK Tool union; strip it to avoid pydantic
+        # validation failures on extended tool types.
         def _sanitize_response_dict(d: dict) -> dict:
             d["tools"] = []
             return d
@@ -1876,8 +1779,6 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         chat_tools = self._response_tools_to_chat_tools(request)
         is_required = request.tool_choice == "required"
-        # Mirror chat streaming's parser selection: native when configured
-        # and structural_tag-capable, JsonArrayParser otherwise for required.
         tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
         if chat_tools and request.tool_choice != "none":
             native_supports_structural_tag = False
@@ -1913,10 +1814,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             "text": "",
         }
         tool_call_states: dict[int, dict[str, Any]] = {}
-        # Items closed during the stream, in wire order; feeds the terminal
-        # ``response.completed`` event and the stored response so the
-        # snapshot matches what clients saw and survives repeated
-        # reasoning / message segments closing and reopening.
+        # Items closed during the stream, in wire order. Feeds the final
+        # ``response.completed`` snapshot and the stored response.
         emitted_items: list = []
 
         prompt_tokens = 0
@@ -2106,7 +2005,6 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         try:
             async for ctx in result_generator:
-                # SimpleContext stashes the raw engine chunk on ``last_output``.
                 if isinstance(ctx, dict):
                     chunk = ctx
                 else:
@@ -2159,11 +2057,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 ),
                             )
                         )
-                        # Codex CLI (and any client that opted into a summary
-                        # via ``reasoning.summary``) renders the reasoning
-                        # bubble off the ``reasoning_summary_text.*`` event
-                        # stream, not ``reasoning_text.*``. Mirror the trace
-                        # into a summary part so the TUI has something to draw.
+                        # Clients that opt into ``reasoning.summary`` render
+                        # off the ``reasoning_summary_text.*`` event stream,
+                        # so mirror the trace into a summary part.
                         if wants_summary:
                             yield _send_event(
                                 openai_responses_types.ResponseReasoningSummaryPartAddedEvent(
@@ -2211,9 +2107,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else:
                     normal_text, tool_calls = delta, []
 
-                # Prose flushed before tool calls to preserve text→tool order;
-                # any open tool-call item is finalized first so its
-                # ``output_item.done`` lands before the next message opens.
+                # Close any open tool-call item before opening a message so
+                # ``output_item.done`` lands before the next ``added``.
                 if normal_text:
                     if reasoning_state["open"]:
                         for ev in _close_reasoning_item():
@@ -2294,10 +2189,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                         tool_call_states[tool_index] = state
                     if not state["added"]:
                         state["added"] = True
-                        # ``call.name`` arrives on the first chunk for every
-                        # parser today; capture it before emitting the
-                        # ``output_item.added`` so consumers see the name on
-                        # the same event.
+                        # Capture ``call.name`` before the ``added`` event so
+                        # the name is set on the first emitted item.
                         if call.name and not state["name"]:
                             state["name"] = call.name
                         yield _send_event(
@@ -2348,7 +2241,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             return
 
-        # Drain trailing open items so emitted_items captures them.
         for ev in _close_reasoning_item():
             yield ev
         for ev in _close_message_item():

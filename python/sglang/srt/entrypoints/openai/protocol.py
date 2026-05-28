@@ -1233,18 +1233,12 @@ class ResponseReasoningParam(BaseModel):
     )
     summary: Optional[Literal["auto", "concise", "detailed"]] = Field(
         default=None,
-        description=(
-            "Whether to include a summary of the model's reasoning trace on "
-            "the response output. Codex CLI requests ``auto`` to render the "
-            "reasoning bubble in the TUI."
-        ),
+        description="Include a summary of the model's reasoning trace on the response.",
     )
 
 
-# Schema-accepted Responses tool types. Only ``function``,
-# ``web_search`` / ``web_search_preview`` and ``code_interpreter`` are
-# wired to execution paths; the rest pass validation so clients that
-# advertise them aren't rejected.
+# Only ``function`` / ``web_search*`` / ``code_interpreter`` are wired to
+# execution paths; the rest pass validation so clients aren't rejected.
 RESPONSE_TOOL_TYPES = Literal[
     "function",
     "web_search",
@@ -1257,9 +1251,6 @@ RESPONSE_TOOL_TYPES = Literal[
     "mcp",
     "custom",
     "namespace",
-    # ``tool_search`` is a Codex CLI builtin that lets gpt-5.5-class models
-    # browse plugin/skill catalogs; it has no chat-side execution here and
-    # is silently dropped in ``_response_tools_to_chat_tools``.
     "tool_search",
 ]
 
@@ -1306,10 +1297,8 @@ class ResponsesRequest(BaseModel):
             ]
         ]
     ] = None
-    # ``ResponseInputOutputItem`` is the openai SDK Union; multi-turn clients
-    # (Codex CLI) replay assistant ``output_text`` and tool-call items that
-    # don't pass every required openai TypedDict. Accept dict-shaped items so
-    # the request lands; downstream normalization filters unknown shapes.
+    # Accept dict-shaped items as the loose arm; downstream normalization
+    # handles replayed shapes that don't satisfy every openai TypedDict.
     input: Union[str, List[ResponseInputOutputItem], List[Dict[str, Any]]]
     instructions: Optional[str] = None
     max_output_tokens: Optional[int] = None
@@ -1344,10 +1333,7 @@ class ResponsesRequest(BaseModel):
         default=None, description="Cache salt for request caching"
     )
 
-    # SGLang-specific sampling parameters. ``None`` defers to the server's
-    # ``--preferred-sampling-params``/``_DEFAULT_SAMPLING_PARAMS`` fallback so
-    # operators can tune e.g. ``repetition_penalty`` per-model without every
-    # request overriding it back to a fixed literal.
+    # SGLang sampling extras. ``None`` defers to ``--preferred-sampling-params``.
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
     stop: Optional[Union[str, List[str]]] = None
@@ -1426,12 +1412,9 @@ class ResponsesRequest(BaseModel):
         else:
             max_tokens = default_max_tokens
 
-        # Headroom for the BOS/EOS / harmony marker the engine appends on top
-        # of the rendered prompt + budget; without it a tight max_tokens that
-        # exactly fills context_len trips the length check.
+        # Headroom for BOS/EOS the engine appends on top of prompt+budget.
         max_tokens -= 2
 
-        # Get parameters with defaults
         temperature = self.temperature
         if temperature is None:
             temperature = default_params.get(
@@ -1442,10 +1425,8 @@ class ResponsesRequest(BaseModel):
         if top_p is None:
             top_p = default_params.get("top_p", self._DEFAULT_SAMPLING_PARAMS["top_p"])
 
-        # Omit keys we want falling through to ``--preferred-sampling-params``
-        # (tokenizer_manager merges ``{**preferred, **obj.sampling_params}``,
-        # so any non-None entry here wins — even a literal default would
-        # clobber a per-model knob like ``repetition_penalty=1.05``).
+        # Omit None entries so they fall through to ``--preferred-sampling-params``
+        # rather than overriding it with a literal default.
         params: dict[str, Any] = {
             "max_new_tokens": max_tokens,
             "temperature": temperature,
@@ -1473,10 +1454,7 @@ class ResponsesRequest(BaseModel):
             or params.get("json_schema")
         )
         if tool_call_constraint and has_existing_constraints:
-            # Refuse the request rather than silently dropping the tool-call
-            # grammar: leaving the user-supplied constraint active while the
-            # tool-call constraint is never installed would silently disable
-            # tool calling and the caller would never know.
+            # Refuse rather than silently drop the tool-call grammar.
             raise ValueError(
                 "Cannot combine tool calls with constrained decoding "
                 "(regex / ebnf / structural_tag / json_schema). Remove one."

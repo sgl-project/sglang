@@ -1,5 +1,3 @@
-"""SSE event-stream tests for the non-harmony /v1/responses path."""
-
 from _responses_helpers import (
     collect_stream_events,
     event_payloads,
@@ -23,9 +21,6 @@ register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 class _StreamFixture:
-    """Helper to drive ``responses_stream_generator_non_harmony`` from a list
-    of canned engine chunks (each a ``meta_info`` dict)."""
-
     def __init__(self, serving, request):
         self.serving = serving
         self.request = request

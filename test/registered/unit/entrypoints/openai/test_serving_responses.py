@@ -1,9 +1,3 @@
-"""Serving-layer tests for /v1/responses (non-streaming and harmony).
-
-Schema-only tests live in ``test_responses_protocol.py``. SSE streaming
-tests live in ``test_serving_responses_stream.py``.
-"""
-
 from _responses_helpers import make_serving
 
 import asyncio
@@ -125,8 +119,6 @@ class InputMessageConstructionTestCase(unittest.TestCase):
         )
 
     def test_previous_response_id_input_list_does_not_call_copy_module(self):
-        # Regression for ``copy(...)`` (the module) being called as a
-        # function; once we recover from that, any subsequent failure is OK.
         serving = make_serving()
         serving.use_harmony = True
         prev = Mock(id="resp_prev")
@@ -382,9 +374,6 @@ class MultimodalRequestTestCase(unittest.TestCase):
 
 
 class OutputItemsTestCase(unittest.TestCase):
-    """Tests for ``_make_response_output_items`` — tool-call extraction
-    and the prose-before-tool ordering invariant."""
-
     def _function_tool_request(self):
         return ResponsesRequest(
             model="x",

@@ -383,7 +383,6 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         self.assertEqual(len(image_data), 1)
 
     def test_process_content_v32_encoding_accepts_responses_input_text(self):
-        """Responses API input_text parts should survive v32 text flattening."""
         msg_dict = {
             "role": "user",
             "content": [
