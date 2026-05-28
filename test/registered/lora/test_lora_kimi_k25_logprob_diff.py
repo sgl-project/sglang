@@ -40,11 +40,13 @@ register_cuda_ci(
 )
 
 BASE_MODEL = "moonshotai/Kimi-K2.5"
+NVFP4_BASE_MODEL = "nvidia/Kimi-K2.5-NVFP4"
 LORA_HF_REPO = "yushengsu/lora-diff-Kimi-K2.5"
 LORA_BACKEND = "triton"
 MAX_LORA_RANK = 32
 TP_SIZE = 8
 MOE_RUNNER_BACKEND = "triton"
+NVFP4_MOE_RUNNER_BACKEND = "flashinfer_cutlass"
 EXPERTS_SHARED_OUTER_LORAS = True
 PREFILL_ATTENTION_BACKEND = "fa4"
 DECODE_ATTENTION_BACKEND = "flashinfer"
@@ -130,6 +132,63 @@ class TestLoRAKimiK25LogprobDiff(CustomTestCase):
                 KL_THRESHOLD,
                 f"KL(sglang, trainer) = {kl_sglang_trainer:.6e} exceeds "
                 f"threshold {KL_THRESHOLD}",
+            )
+
+        finally:
+            engine.shutdown()
+
+
+class TestLoRAKimiK25Nvfp4Logprob(CustomTestCase):
+    """Validate the NVFP4 FlashInfer-Cutlass MoE LoRA serving path."""
+
+    def test_lora_kimi_k25_nvfp4_flashinfer_cutlass_virtual_experts(self):
+        adapter_path = snapshot_download(
+            LORA_HF_REPO,
+            repo_type="dataset",
+        )
+
+        engine = sgl.Engine(
+            model_path=NVFP4_BASE_MODEL,
+            tp_size=TP_SIZE,
+            enable_lora=True,
+            max_lora_rank=MAX_LORA_RANK,
+            lora_paths={"my_lora": adapter_path},
+            lora_backend=LORA_BACKEND,
+            quantization="modelopt_fp4",
+            attention_backend="trtllm_mla",
+            moe_runner_backend=NVFP4_MOE_RUNNER_BACKEND,
+            lora_use_virtual_experts=True,
+            trust_remote_code=True,
+            reasoning_parser="kimi_k2",
+            tool_call_parser="kimi_k2",
+            mem_fraction_static=0.8,
+        )
+
+        try:
+            cdata = torch.load(
+                os.path.join(adapter_path, "compare_sample_train_data.pt"),
+                weights_only=False,
+            )
+
+            base_logprobs = get_prompt_logprobs(engine, cdata["tokens"], lora_path=None)
+            lora_logprobs = get_prompt_logprobs(
+                engine, cdata["tokens"], lora_path="my_lora"
+            )
+
+            base_t = torch.tensor(base_logprobs)
+            lora_t = torch.tensor(lora_logprobs)
+            diff = (base_t - lora_t).abs()
+            print(
+                f"[VERIFY][NVFP4] base vs lora: mean_diff={diff.mean().item():.6f}, "
+                f"max_diff={diff.max().item():.6f}, "
+                f"identical={torch.equal(base_t, lora_t)}"
+            )
+
+            self.assertTrue(torch.isfinite(base_t).all().item())
+            self.assertTrue(torch.isfinite(lora_t).all().item())
+            self.assertFalse(
+                torch.equal(base_t, lora_t),
+                "NVFP4 LoRA logprobs should differ from base model logprobs",
             )
 
         finally:
