@@ -93,6 +93,8 @@ def _assert_dsv4_decode_cached_tokens(result, history_len, output_len, label):
 class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """DeepSeek V4 Flash FP8 + HiCache + UnifiedRadixCache."""
 
+    tp_size = 4
+    pp_size = 1
     hicache_io_backend = "direct"
     hicache_mem_layout = "page_first_direct"
     max_running_requests = 4
@@ -119,7 +121,9 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
             other_args=[
                 "--trust-remote-code",
                 "--tp-size",
-                "4",
+                str(cls.tp_size),
+                "--pp-size",
+                str(cls.pp_size),
                 "--attention-backend",
                 "compressed",
                 "--page-size",
@@ -164,6 +168,13 @@ class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
 
     hicache_io_backend = "kernel"
     hicache_mem_layout = "layer_first"
+
+
+class TestUnifiedDeepSeekV4FlashHiCachePP2(TestUnifiedDeepSeekV4FlashHiCache):
+    """DeepSeek V4 Flash FP8 + HiCache + UnifiedRadixCache with PP=2."""
+
+    tp_size = 4
+    pp_size = 2
 
 
 if __name__ == "__main__":
