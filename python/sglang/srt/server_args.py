@@ -46,7 +46,6 @@ from sglang.srt.utils.common import (
     cpu_has_amx_support,
     get_device,
     get_device_memory_capacity,
-    get_device_name,
     get_device_sm,
     get_int_env_var,
     get_nvidia_driver_version,
@@ -512,6 +511,8 @@ class ServerArgs:
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
     sampling_defaults: str = "model"
+    asr_max_buffer_seconds: int = 60
+    asr_max_concurrent_sessions: int = 32
 
     # Data parallelism
     dp_size: int = 1
@@ -864,6 +865,8 @@ class ServerArgs:
         self._handle_multimodal()
         # Validate SSL arguments early (before dummy-model short-circuit).
         self._handle_ssl_validation()
+        # Validate transcription/ASR-specific server args (model-independent).
+        self._handle_asr_validation()
 
         # Validate PD disaggregation flags early (before dummy-model short-circuit).
         from sglang.srt.arg_groups.pd_disaggregation_hook import (
@@ -2356,7 +2359,7 @@ class ServerArgs:
                 support_mamba_cache=True,
                 support_mamba_cache_extra_buffer=True,
             )
-        elif model_arch in ["NemotronHForCausalLM"]:
+        elif model_arch in ["NemotronHForCausalLM", "NemotronHPuzzleForCausalLM"]:
             from sglang.srt.arg_groups.nemotron_h_hook import (
                 apply_nemotron_h_defaults,
             )
@@ -2512,11 +2515,7 @@ class ServerArgs:
         # for models with explicit support (DeepseekV3, GptOss, Glm4Moe,
         # MistralLarge3, Qwen3/Qwen3Next/Qwen3.5 MoE families)
         # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
-        # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
-        device_name = get_device_name()
-        is_h20_device = (
-            device_name and "H20" in device_name and "H200" not in device_name
-        )
+
         if (
             not self.enable_flashinfer_allreduce_fusion
             and model_arch
@@ -2539,7 +2538,6 @@ class ServerArgs:
             and self.tp_size > 1
             and not self.enable_dp_attention
             and self.nnodes == 1
-            and not is_h20_device
             and self.moe_a2a_backend == "none"
         ):
             self.enable_flashinfer_allreduce_fusion = True
@@ -3093,6 +3091,22 @@ class ServerArgs:
                 "--linear-attn-decode-backend flashinfer on SM100+ requires "
                 "--mamba-ssm-dtype bfloat16, "
                 f"got {self.mamba_ssm_dtype!r}"
+            )
+
+        # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel)
+        # for correctness and best performance.
+        prefill = self.linear_attn_prefill_backend or self.linear_attn_backend
+        cuda_version = torch.version.cuda
+        cuda_major = int(cuda_version.split(".")[0]) if cuda_version is not None else 0
+        if (
+            prefill == "flashinfer"
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] >= 10
+            and cuda_major < 13
+        ):
+            raise ValueError(
+                "--linear-attn-prefill-backend flashinfer on SM100+ requires CUDA 13+, "
+                f"got CUDA {cuda_version or 'unknown'}"
             )
 
     def _handle_context_parallelism(self):
@@ -4143,6 +4157,19 @@ class ServerArgs:
             )
             self.enable_mixed_chunk = False
 
+    def _handle_asr_validation(self):
+        """Validate transcription/ASR-specific server args."""
+        if self.asr_max_buffer_seconds <= 0:
+            raise ValueError(
+                f"--asr-max-buffer-seconds must be positive "
+                f"(got {self.asr_max_buffer_seconds})."
+            )
+        if self.asr_max_concurrent_sessions <= 0:
+            raise ValueError(
+                f"--asr-max-concurrent-sessions must be positive "
+                f"(got {self.asr_max_concurrent_sessions})."
+            )
+
     def _handle_other_validations(self):
         # Handle model inference tensor dump.
         if self.debug_tensor_dump_output_folder is not None:
@@ -5191,6 +5218,24 @@ class ServerArgs:
             "'openai' uses SGLang/OpenAI defaults (temperature=1.0, top_p=1.0, etc.). "
             "'model' uses the model's generation_config.json to get the recommended "
             "sampling parameters if available. Default is 'model'.",
+        )
+        parser.add_argument(
+            "--asr-max-buffer-seconds",
+            type=int,
+            default=ServerArgs.asr_max_buffer_seconds,
+            help="Maximum seconds of PCM audio the streaming ASR WebSocket handler "
+            "will accumulate before closing the session with a buffer_overflow "
+            "error. Guards against OOM when a client streams audio faster than "
+            "inference can consume it. Default 60s.",
+        )
+        parser.add_argument(
+            "--asr-max-concurrent-sessions",
+            type=int,
+            default=ServerArgs.asr_max_concurrent_sessions,
+            help="Maximum number of concurrent realtime ASR WebSocket sessions "
+            "served by /v1/realtime. New connections beyond this cap are "
+            "accepted, sent an error{code:too_many_sessions} frame, and closed. "
+            "Default 32.",
         )
 
         # Data parallelism
