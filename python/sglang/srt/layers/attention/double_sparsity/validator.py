@@ -27,6 +27,7 @@ Enforces, at server startup:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -234,7 +235,11 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
     _ds_metrics.mark_channel_mask_valid(True)
 
 
-def record_radix_fixture_passed(server_args: "ServerArgs") -> None:
+def record_radix_fixture_passed(
+    server_args: "ServerArgs",
+    *,
+    artifact_path: "str | None" = None,
+) -> None:
     """Record that the M3-B radix-cache stability fixture has passed
     for the current ServerArgs configuration.
 
@@ -245,23 +250,44 @@ def record_radix_fixture_passed(server_args: "ServerArgs") -> None:
 
     The intended flow:
 
-    1. Operator runs ``test/manual/test_dsv32_radix_cache_fixture.py``
-       against a paired DS server with radix cache ON; the test
-       verifies cold-prefix vs warm-prefix continuations are identical
-       (proxy for label bit-stability) and records an artifact.
-    2. Operator calls this helper from the launcher (or sets the
-       attribute directly on the parsed ``ServerArgs``) so the DEC-2
-       guard accepts the configuration at boot.
+    1. Operator runs the M3-B fixture pair:
+       ``test/manual/test_dsv32_radix_label_capture_fixture.py``
+       (direct label SHA bit-equality between cold + warm requests)
+       and
+       ``test/manual/test_dsv32_fp8_scale_stability.py``
+       (singleton vs packed-block FP8 scale-factor equality).
+    2. On both passing, the operator's launcher (or a small init
+       module) calls this helper with the capture fixture's artifact
+       path so the DEC-2 guard accepts radix-cache ON at boot and
+       the server log records exactly which fixture artifact
+       authorized the flip.
     3. ``serve_double_sparsity.sh`` removes the
-       ``--disable-radix-cache`` flag (marker comment makes the edit
-       point easy to find).
+       ``--disable-radix-cache`` flag (the ``AC-10-FIXTURE-MARKER``
+       comment names the exact line).
 
-    The helper sets the attribute and emits a WARNING-level audit log
-    line so a grep over server logs surfaces every flip event.
+    ``artifact_path`` is optional but recommended: when supplied, the
+    audit WARNING records the path + SHA256 of its contents so a grep
+    over server logs surfaces both the flip event AND the evidence
+    it claims.
     """
     setattr(server_args, "_double_sparsity_radix_fixture_passed", True)
+
+    artifact_suffix = ""
+    if artifact_path is not None:
+        try:
+            with open(artifact_path, "rb") as fh:
+                artifact_sha = hashlib.sha256(fh.read()).hexdigest()
+            artifact_suffix = (
+                f" artifact={artifact_path} artifact_sha256={artifact_sha}"
+            )
+        except OSError as exc:
+            artifact_suffix = (
+                f" artifact={artifact_path} artifact_sha256=<unreadable:{exc}>"
+            )
+
     logger.warning(
         "DS radix-cache fixture recorded as PASSED for this ServerArgs; "
         "validator will now accept --disable-radix-cache removal. "
-        "Source: record_radix_fixture_passed()."
+        "Source: record_radix_fixture_passed().%s",
+        artifact_suffix,
     )

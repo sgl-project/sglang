@@ -1496,6 +1496,20 @@ class DeepseekSparseAttnBackend(
             k_nope=k_nope,
             channel_selection_layer=self._ds_channel_selection[layer_id],
         )
+        # M3-B radix-cache fixture capture (env-gated, zero-cost when
+        # off — `is_capture_enabled` is one `os.environ.get` lookup).
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as _ds_radix_capture,
+        )
+        if _ds_radix_capture.is_capture_enabled():
+            _ds_radix_capture.record_write(
+                layer_id=layer_id,
+                cache_loc=cache_loc,
+                k_nope=k_nope,
+                written_after=self._ds_token_label_table.written[
+                    layer_id, cache_loc.long()
+                ],
+            )
         # AC-12 zero-signature fault injection: zero the just-written
         # row but keep written=True so the selector treats the slot as
         # populated with intentionally bad labels (not absent).

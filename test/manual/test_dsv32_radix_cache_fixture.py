@@ -1,47 +1,51 @@
-"""AC-10 M3-B radix-cache stability fixture — manual hardware harness.
+"""AC-10 M3-B radix-cache continuation-smoke fixture (PRE-FLIGHT ONLY).
 
-Plan §AC-10 / DEC-2 gates Double Sparsity from running with the radix
-cache enabled until a hardware fixture has proven that cold-prefix and
-warm-prefix labels are bit-stable for the production model + channel
-mask + FP8 KV configuration.
+**This file is the lightweight pre-flight smoke check, not the M3-B
+evidence the AC-10 guard flip requires.**
 
-This harness is the operator-runnable side of that gate. It issues a
-pair of requests against a DS-on server with radix cache ENABLED:
+The full M3-B-conformant evidence (per-layer label hash bit-equality
+between cold and warm requests, plus FP8 block scale-factor stability)
+lives in two companion fixtures:
 
-* **Cold request** — a unique shared prefix that the server has never
-  seen, so the KV slots for the shared prefix are freshly allocated
-  and the DS label-write path produces labels from a single-pass FP8
-  dequant of the just-written K-noPE.
-* **Warm request** — the same shared prefix re-sent immediately after
-  the cold request. With radix cache ON, the server reuses the
-  shared-prefix KV slots; the DS label table must therefore yield
-  identical labels for the reused slots.
+* ``test/manual/test_dsv32_radix_label_capture_fixture.py`` — direct
+  label SHA bit-equality between cold and warm; requires
+  ``SGLANG_DS_RADIX_FIXTURE_CAPTURE=1`` to enable the in-process
+  capture log inside the DS write hook.
+* ``test/manual/test_dsv32_fp8_scale_stability.py`` — singleton vs
+  packed-block FP8 quantization scale-factor equality.
 
-At temperature=0 with `max_new_tokens` long enough to exercise multiple
-decode steps, divergent labels would manifest as divergent
-continuations. Equal continuations are the operator-observable proxy
-for label bit-stability (the unit-level proof of the labeling code's
-determinism given identical K-noPE lives in
-``test/registered/unit/layers/attention/test_double_sparsity_unit.py``
-under ``TestAC10RadixCacheLabelBitStability``).
+What this smoke fixture does: issue paired cold + warm requests with
+IDENTICAL prompts at temperature=0 and assert the continuations are
+byte-identical. A pass here is necessary but NOT sufficient for the
+guard flip:
 
-Operator runbook:
+* If continuations diverge → labels almost certainly diverge → DEC-2
+  guard MUST remain in place.
+* If continuations agree → labels MAY still diverge (e.g. divergence
+  masked by argmax). The capture fixture is required to clear that
+  ambiguity.
 
-  # 1. Boot the DS server with radix cache ON (remove
-  #    --disable-radix-cache from serve_double_sparsity.sh and set
-  #    SGLANG_DS_RADIX_OVERRIDE=1 to bypass the boot guard for this
-  #    one-shot fixture run).
-  SGLANG_DS_RADIX_OVERRIDE=1 bash development/serve_double_sparsity.sh
-  # 2. Run this fixture.
+Operator runbook (pre-flight, then full M3-B):
+
+  # 0. Boot DS server with radix cache ON for the one-shot fixture run.
+  SGLANG_DS_RADIX_OVERRIDE=1 \\
+    SGLANG_DS_RADIX_FIXTURE_CAPTURE=1 \\
+    bash development/serve_double_sparsity.sh
+  # 1. Smoke (this file).
   DS_BASE_URL=http://localhost:30000 \\
     pytest test/manual/test_dsv32_radix_cache_fixture.py -v
-  # 3. On pass, the artifact at
-  #    development/results/dsv32_radix_fixture_<ts>.json records
-  #    pass/fail + payloads. After verifying the artifact, the
-  #    operator removes --disable-radix-cache from the launcher
-  #    (marker comment names the exact edit point) and the launcher
-  #    invokes record_radix_fixture_passed(server_args) so future
-  #    boots no longer need SGLANG_DS_RADIX_OVERRIDE.
+  # 2. Full M3-B label-capture fixture.
+  DS_BASE_URL=http://localhost:30000 \\
+    SGLANG_DS_RADIX_FIXTURE_CAPTURE=1 \\
+    pytest test/manual/test_dsv32_radix_label_capture_fixture.py -v
+  # 3. FP8 scale-stability proof.
+  pytest test/manual/test_dsv32_fp8_scale_stability.py -v
+  # 4. On all three passing, the launcher calls
+  #    record_radix_fixture_passed(server_args, artifact_path=...)
+  #    BEFORE validate_double_sparsity runs (boots the post-AC-10
+  #    state without SGLANG_DS_RADIX_OVERRIDE).
+  # 5. Remove --disable-radix-cache from serve_double_sparsity.sh
+  #    (AC-10-FIXTURE-MARKER comment points at the line).
 """
 
 from __future__ import annotations
@@ -50,6 +54,7 @@ import datetime
 import json
 import os
 import pathlib
+import subprocess
 import unittest
 import urllib.error
 import urllib.request
@@ -123,10 +128,11 @@ def _record_artifact(payload: Dict[str, Any], *, suffix: str) -> None:
 
 # A shared-prefix payload long enough to allocate multiple physical KV
 # slots and to make a continuation divergence detectable at
-# temperature=0. The trailing unique suffix prevents the *outer* cache
-# (radix or KV) from auto-matching this exact prompt across runs; the
-# shared prefix portion is what the warm pass re-uses.
-_SHARED_PREFIX_TEMPLATE = (
+# temperature=0. The prompt is IDENTICAL across cold and warm passes —
+# the run/pass distinction lives in the artifact metadata only.
+# Otherwise the radix cache cannot reuse slots, and the comparison
+# conflates prompt change with label change.
+_SHARED_PREFIX_PROMPT = (
     "You are a careful technical reviewer. The following document "
     "describes a distributed key-value cache used by a large language "
     "model server. Read the document and continue the description in "
@@ -141,9 +147,23 @@ _SHARED_PREFIX_TEMPLATE = (
     "  projects each slot's K-noPE through a precomputed channel "
     "  selection. Operators verify that cold-prefix vs warm-prefix "
     "  label rows are bit-equal before enabling the radix cache "
-    "  under Double Sparsity.\n\n"
-    "Continue (run-id {run_id}, pass-id {pass_id}):"
+    "  under Double Sparsity.\n\nContinue:"
 )
+
+
+def _local_commit_sha() -> Optional[str]:
+    """Local repo HEAD SHA. Best-effort; None on any failure."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True,
+            timeout=10,
+        )
+        if out.returncode == 0:
+            return out.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
 
 
 @unittest.skipUnless(
@@ -151,20 +171,26 @@ _SHARED_PREFIX_TEMPLATE = (
     "DS_BASE_URL env var must point at a running DS server with radix "
     "cache enabled (this fixture is operator-driven against H200).",
 )
-class TestDSv32RadixCacheStability(unittest.TestCase):
-    """Cold-prefix vs warm-prefix continuation equality fixture.
+class TestDSv32RadixCacheContinuationSmoke(unittest.TestCase):
+    """Cold-prefix vs warm-prefix continuation-equality SMOKE fixture.
 
-    Pass = continuations are identical at temperature=0 ⇒ DS label rows
-    for the shared-prefix slots are bit-equal between the freshly
-    allocated (cold) and the radix-cache-reused (warm) paths.
-    Fail = continuations diverge ⇒ DEC-2 guard MUST remain in place;
-    do not remove `--disable-radix-cache` from the DS launcher.
+    A passing run is NECESSARY but NOT SUFFICIENT for the AC-10 guard
+    flip. The proper M3-B evidence (per-layer label SHA bit-equality
+    via the in-process capture log + FP8 block scale-factor equality)
+    lives in the two companion fixtures named in the module docstring.
+
+    Failure here means cold and warm continuations diverge under
+    temperature=0 — DS labels for the shared-prefix slots almost
+    certainly diverge under radix-cache reuse. DEC-2 guard MUST
+    remain in place; do not run the M3-B label-capture fixture until
+    this smoke passes.
     """
 
     @classmethod
     def setUpClass(cls):
         cls.ds_url = _env("DS_BASE_URL")
         cls.server_info = _get_server_info(cls.ds_url)
+        cls.local_commit_sha = _local_commit_sha()
         # The fixture's whole point is to verify the radix-on path; if
         # the server is still running with --disable-radix-cache, the
         # warm pass would also allocate fresh slots and the test would
@@ -179,50 +205,57 @@ class TestDSv32RadixCacheStability(unittest.TestCase):
                 "SGLANG_DS_RADIX_OVERRIDE=1 for this one-shot run)."
             )
 
-    def test_cold_then_warm_continuation_is_bit_equal(self):
+    def test_cold_warm_continuation_smoke(self):
         run_id = uuid.uuid4().hex[:12]
-        cold_prompt = _SHARED_PREFIX_TEMPLATE.format(
-            run_id=run_id, pass_id="cold",
-        )
-        warm_prompt = _SHARED_PREFIX_TEMPLATE.format(
-            run_id=run_id, pass_id="warm",
-        )
+        prompt = _SHARED_PREFIX_PROMPT  # identical for both passes
 
         # Best-effort flush so any prior request's KV state does not
         # warm-prime the shared-prefix slots before the cold pass.
         _flush_cache(self.ds_url)
 
-        cold_text = _generate(
-            self.ds_url, cold_prompt, max_new_tokens=128,
-        )
+        cold_text = _generate(self.ds_url, prompt, max_new_tokens=128)
         # No flush between requests — the radix cache must retain the
         # shared-prefix slots so the warm pass exercises the reuse path.
-        warm_text = _generate(
-            self.ds_url, warm_prompt, max_new_tokens=128,
-        )
+        warm_text = _generate(self.ds_url, prompt, max_new_tokens=128)
 
         equal = cold_text == warm_text
+        sa = (self.server_info.get("server_args")
+              if isinstance(self.server_info, dict) else None)
+        # Record the SERVER's commit SHA when /get_server_info exposes
+        # it (added in a future round); always record the local repo
+        # SHA as well so the operator can confirm the deployed image
+        # matches their checkout.
+        server_commit = None
+        if isinstance(sa, dict):
+            server_commit = sa.get("commit_sha")
         payload = {
+            "fixture_kind": "continuation_smoke",
+            "fixture_caveat": (
+                "NECESSARY-BUT-NOT-SUFFICIENT pre-flight; the AC-10 "
+                "guard flip requires the M3-B label-capture fixture "
+                "AND the FP8 scale-stability fixture to also pass."
+            ),
             "run_id": run_id,
             "ds_base_url": self.ds_url,
-            "server_args": (self.server_info.get("server_args")
-                            if isinstance(self.server_info, dict) else None),
-            "cold_prompt": cold_prompt,
-            "warm_prompt": warm_prompt,
+            "local_commit_sha": self.local_commit_sha,
+            "server_commit_sha": server_commit,
+            "server_args": sa,
+            "prompt": prompt,
             "cold_text": cold_text,
             "warm_text": warm_text,
-            "bit_equal": equal,
+            "continuation_bit_equal": equal,
         }
-        _record_artifact(payload, suffix="cold_warm")
+        _record_artifact(payload, suffix="continuation_smoke")
 
         self.assertTrue(
             equal,
-            "AC-10 radix-cache stability fixture FAILED: cold and warm "
-            "continuations diverge under temperature=0. DS label rows "
-            "for the shared-prefix slots are NOT bit-stable across the "
-            "radix-cache reuse path. Keep --disable-radix-cache in the "
-            "DS launcher and do NOT call record_radix_fixture_passed. "
-            f"Diagnostic artifact written under {RESULTS_DIR}/.",
+            "AC-10 continuation-smoke FAILED: cold and warm "
+            "continuations diverge under temperature=0 with identical "
+            "prompts. DS labels for the shared-prefix slots almost "
+            "certainly diverge across the radix-cache reuse path. Keep "
+            "--disable-radix-cache in the DS launcher and do NOT run "
+            "the M3-B label-capture fixture. Diagnostic artifact "
+            f"written under {RESULTS_DIR}/."
         )
 
 

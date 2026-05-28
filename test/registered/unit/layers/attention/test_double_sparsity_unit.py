@@ -252,6 +252,91 @@ class TestValidator(unittest.TestCase):
                 os.environ.pop("SGLANG_DS_ALLOW_PLACEHOLDER", None)
                 os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
 
+    def test_record_radix_fixture_passed_logs_artifact_sha(self):
+        """The audit log line names the artifact path + its SHA256 so
+        a server-log grep surfaces both the flip event AND the
+        evidence that authorized it."""
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            record_radix_fixture_passed,
+        )
+        import logging as _logging
+        import tempfile
+        import hashlib as _hashlib
+
+        with tempfile.NamedTemporaryFile(
+            "wb", delete=False, suffix=".json",
+        ) as fh:
+            fh.write(b'{"verdict": "PASS"}')
+            artifact_path = fh.name
+        try:
+            expected_sha = _hashlib.sha256(
+                b'{"verdict": "PASS"}',
+            ).hexdigest()
+
+            args = SimpleNamespace()
+            with self.assertLogs(
+                "sglang.srt.layers.attention.double_sparsity.validator",
+                level=_logging.WARNING,
+            ) as ctx:
+                record_radix_fixture_passed(
+                    args, artifact_path=artifact_path,
+                )
+            self.assertTrue(
+                getattr(
+                    args, "_double_sparsity_radix_fixture_passed", False,
+                )
+            )
+            joined = "\n".join(ctx.output)
+            self.assertIn("PASSED", joined)
+            self.assertIn(artifact_path, joined)
+            self.assertIn(expected_sha, joined)
+        finally:
+            os.unlink(artifact_path)
+
+    def test_record_radix_fixture_passed_no_artifact_path(self):
+        """The helper still works when no artifact path is supplied
+        (back-compat with the Round-35 call shape)."""
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            record_radix_fixture_passed,
+        )
+        import logging as _logging
+        args = SimpleNamespace()
+        with self.assertLogs(
+            "sglang.srt.layers.attention.double_sparsity.validator",
+            level=_logging.WARNING,
+        ) as ctx:
+            record_radix_fixture_passed(args)
+        self.assertTrue(
+            getattr(args, "_double_sparsity_radix_fixture_passed", False)
+        )
+        joined = "\n".join(ctx.output)
+        self.assertIn("PASSED", joined)
+        # No artifact-related text when path not supplied.
+        self.assertNotIn("artifact=", joined)
+
+    def test_record_radix_fixture_passed_handles_unreadable_artifact(self):
+        """A bad artifact path must not crash the helper — the flip
+        still records, the audit line marks the artifact as
+        unreadable."""
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            record_radix_fixture_passed,
+        )
+        import logging as _logging
+        args = SimpleNamespace()
+        bad_path = "/nonexistent/path/to/artifact.json"
+        with self.assertLogs(
+            "sglang.srt.layers.attention.double_sparsity.validator",
+            level=_logging.WARNING,
+        ) as ctx:
+            record_radix_fixture_passed(args, artifact_path=bad_path)
+        self.assertTrue(
+            getattr(args, "_double_sparsity_radix_fixture_passed", False)
+        )
+        joined = "\n".join(ctx.output)
+        self.assertIn("PASSED", joined)
+        self.assertIn(bad_path, joined)
+        self.assertIn("<unreadable:", joined)
+
     def test_radix_on_refused_until_fixture_recorded(self):
         """AC-10 DEC-2 guard: DS launch with radix cache ON
         (``disable_radix_cache=False``) must refuse until the M3-B
@@ -7890,6 +7975,238 @@ class TestAC10RadixCacheLabelBitStability(unittest.TestCase):
             "invalidate must not touch the signature bytes — only the "
             "written flag governs reachability",
         )
+
+
+class TestRadixFixtureCapture(unittest.TestCase):
+    """AC-10 (M3-B) capture primitive — produces the per-write and
+    per-snapshot fingerprints the capture-aware manual fixture asserts
+    on. CPU-only; env-gated to keep the production hot path at one
+    ``os.environ.get`` lookup when capture is off."""
+
+    def setUp(self):
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as cap,
+        )
+        cap.clear_log()
+        self._prev_env = os.environ.get(
+            "SGLANG_DS_RADIX_FIXTURE_CAPTURE",
+        )
+
+    def tearDown(self):
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as cap,
+        )
+        cap.clear_log()
+        if self._prev_env is None:
+            os.environ.pop("SGLANG_DS_RADIX_FIXTURE_CAPTURE", None)
+        else:
+            os.environ["SGLANG_DS_RADIX_FIXTURE_CAPTURE"] = self._prev_env
+
+    def test_record_write_noop_when_env_unset(self):
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as cap,
+        )
+        os.environ.pop("SGLANG_DS_RADIX_FIXTURE_CAPTURE", None)
+        self.assertFalse(cap.is_capture_enabled())
+        cap.record_write(
+            layer_id=0,
+            cache_loc=torch.tensor([0, 1, 2], dtype=torch.int64),
+            k_nope=torch.zeros(3, 2, 16),
+        )
+        self.assertEqual(cap.get_log(), [])
+
+    def test_record_write_appends_when_env_set(self):
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as cap,
+        )
+        os.environ["SGLANG_DS_RADIX_FIXTURE_CAPTURE"] = "1"
+        cap.record_write(
+            layer_id=3,
+            cache_loc=torch.tensor([0, 1, 2], dtype=torch.int64),
+            k_nope=torch.zeros(3, 2, 16),
+            written_after=torch.ones(3, dtype=torch.bool),
+        )
+        log = cap.get_log()
+        self.assertEqual(len(log), 1)
+        self.assertEqual(log[0]["kind"], "write")
+        self.assertEqual(log[0]["layer_id"], 3)
+        self.assertEqual(log[0]["num_tokens"], 3)
+        self.assertIn("cache_loc_sha", log[0])
+        self.assertIn("k_nope_sha", log[0])
+        self.assertTrue(log[0]["written_after_all_true"])
+
+    def test_identical_inputs_produce_identical_hashes(self):
+        """Foundation of the bit-equality check: writing the same
+        K-noPE + cache_loc twice must hash to the same SHAs."""
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as cap,
+        )
+        os.environ["SGLANG_DS_RADIX_FIXTURE_CAPTURE"] = "1"
+        torch.manual_seed(0)
+        k = torch.randn(4, 2, 16)
+        loc = torch.tensor([10, 11, 12, 13], dtype=torch.int64)
+        cap.record_write(layer_id=0, cache_loc=loc, k_nope=k)
+        cap.record_write(layer_id=0, cache_loc=loc, k_nope=k)
+        log = cap.get_log()
+        self.assertEqual(len(log), 2)
+        self.assertEqual(log[0]["cache_loc_sha"], log[1]["cache_loc_sha"])
+        self.assertEqual(log[0]["k_nope_sha"], log[1]["k_nope_sha"])
+
+    def test_different_cache_loc_produces_different_hash(self):
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as cap,
+        )
+        os.environ["SGLANG_DS_RADIX_FIXTURE_CAPTURE"] = "1"
+        torch.manual_seed(0)
+        k = torch.randn(2, 2, 16)
+        loc_a = torch.tensor([0, 1], dtype=torch.int64)
+        loc_b = torch.tensor([99, 100], dtype=torch.int64)
+        cap.record_write(layer_id=0, cache_loc=loc_a, k_nope=k)
+        cap.record_write(layer_id=0, cache_loc=loc_b, k_nope=k)
+        log = cap.get_log()
+        self.assertNotEqual(log[0]["cache_loc_sha"], log[1]["cache_loc_sha"])
+        # Same K → same k_nope_sha.
+        self.assertEqual(log[0]["k_nope_sha"], log[1]["k_nope_sha"])
+
+    def test_different_k_nope_produces_different_hash(self):
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as cap,
+        )
+        os.environ["SGLANG_DS_RADIX_FIXTURE_CAPTURE"] = "1"
+        torch.manual_seed(0)
+        loc = torch.tensor([0, 1], dtype=torch.int64)
+        k_a = torch.randn(2, 2, 16)
+        k_b = torch.randn_like(k_a) + 1.0
+        cap.record_write(layer_id=0, cache_loc=loc, k_nope=k_a)
+        cap.record_write(layer_id=0, cache_loc=loc, k_nope=k_b)
+        log = cap.get_log()
+        self.assertEqual(log[0]["cache_loc_sha"], log[1]["cache_loc_sha"])
+        self.assertNotEqual(log[0]["k_nope_sha"], log[1]["k_nope_sha"])
+
+    def test_int32_vs_int64_cache_loc_hashes_equal(self):
+        """cache_loc indices may arrive as int32 or int64 depending on
+        the call site. The capture hash must be dtype-stable so a cold
+        run with int32 and a warm run with int64 cannot spuriously
+        disagree."""
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as cap,
+        )
+        os.environ["SGLANG_DS_RADIX_FIXTURE_CAPTURE"] = "1"
+        k = torch.zeros(2, 2, 4)
+        loc_i32 = torch.tensor([0, 1], dtype=torch.int32)
+        loc_i64 = torch.tensor([0, 1], dtype=torch.int64)
+        cap.record_write(layer_id=0, cache_loc=loc_i32, k_nope=k)
+        cap.record_write(layer_id=0, cache_loc=loc_i64, k_nope=k)
+        log = cap.get_log()
+        self.assertEqual(log[0]["cache_loc_sha"], log[1]["cache_loc_sha"])
+
+    def test_snapshot_equals_across_identical_label_writes(self):
+        """``record_table_snapshot`` produces equal per-layer hashes
+        when the underlying table is unchanged between snapshots.
+        Foundation of the cold/warm fixture's per-layer bit-equality
+        assertion."""
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as cap,
+        )
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
+        )
+        os.environ["SGLANG_DS_RADIX_FIXTURE_CAPTURE"] = "1"
+        table = allocate_token_label_table(
+            num_layers_local=2, max_tokens=8, num_heads_local=2,
+            label_dim=4, page_size=64, dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        torch.manual_seed(7)
+        k = torch.randn(2, 2, 16)
+        sel = (torch.arange(4, dtype=torch.int32)
+               .unsqueeze(0).expand(2, -1).contiguous())
+        loc = torch.tensor([3, 4], dtype=torch.int64)
+        for layer_id in (0, 1):
+            token_label_write(table.signatures, table.written,
+                              layer_id=layer_id, cache_loc=loc,
+                              k_nope=k, channel_selection_layer=sel)
+        cap.record_table_snapshot(
+            signatures=table.signatures, written=table.written,
+            slots=loc, label="cold",
+        )
+        # Take a second snapshot without modifying the table.
+        cap.record_table_snapshot(
+            signatures=table.signatures, written=table.written,
+            slots=loc, label="warm",
+        )
+        log = cap.get_log()
+        cold = next(r for r in log if r.get("label") == "cold")
+        warm = next(r for r in log if r.get("label") == "warm")
+        self.assertEqual(cold["per_layer_label_sha"],
+                         warm["per_layer_label_sha"])
+        self.assertEqual(cold["per_layer_written_sha"],
+                         warm["per_layer_written_sha"])
+
+    def test_snapshot_differs_when_a_layer_row_changes(self):
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as cap,
+        )
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
+        )
+        os.environ["SGLANG_DS_RADIX_FIXTURE_CAPTURE"] = "1"
+        table = allocate_token_label_table(
+            num_layers_local=2, max_tokens=8, num_heads_local=2,
+            label_dim=4, page_size=64, dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        torch.manual_seed(7)
+        k = torch.randn(1, 2, 16)
+        sel = (torch.arange(4, dtype=torch.int32)
+               .unsqueeze(0).expand(2, -1).contiguous())
+        loc = torch.tensor([3], dtype=torch.int64)
+        token_label_write(table.signatures, table.written,
+                          layer_id=0, cache_loc=loc,
+                          k_nope=k, channel_selection_layer=sel)
+        cap.record_table_snapshot(
+            signatures=table.signatures, written=table.written,
+            slots=loc, label="before",
+        )
+        # Mutate layer 1 only.
+        torch.manual_seed(8)
+        k2 = torch.randn(1, 2, 16)
+        token_label_write(table.signatures, table.written,
+                          layer_id=1, cache_loc=loc,
+                          k_nope=k2, channel_selection_layer=sel)
+        cap.record_table_snapshot(
+            signatures=table.signatures, written=table.written,
+            slots=loc, label="after",
+        )
+        log = cap.get_log()
+        before = next(r for r in log if r.get("label") == "before")
+        after = next(r for r in log if r.get("label") == "after")
+        # Layer 0 unchanged.
+        self.assertEqual(before["per_layer_label_sha"][0],
+                         after["per_layer_label_sha"][0])
+        # Layer 1 changed.
+        self.assertNotEqual(before["per_layer_label_sha"][1],
+                            after["per_layer_label_sha"][1])
+
+    def test_clear_log_resets_state(self):
+        from sglang.srt.layers.attention.double_sparsity import (
+            radix_fixture_capture as cap,
+        )
+        os.environ["SGLANG_DS_RADIX_FIXTURE_CAPTURE"] = "1"
+        cap.record_write(
+            layer_id=0,
+            cache_loc=torch.tensor([0], dtype=torch.int64),
+            k_nope=torch.zeros(1, 2, 4),
+        )
+        self.assertEqual(len(cap.get_log()), 1)
+        cap.clear_log()
+        self.assertEqual(cap.get_log(), [])
 
 
 if __name__ == "__main__":
