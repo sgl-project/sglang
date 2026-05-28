@@ -181,7 +181,6 @@ class TestEAGLEServerAdditional(TestEAGLEServerBasic):
                     "return_logprob": return_logprob,
                     "return_text_in_logprobs": True,
                     "logprob_start_len": logprob_start_len,
-                    "temp_scaled_logprobs": True,
                 },
             )
             return response.json()
