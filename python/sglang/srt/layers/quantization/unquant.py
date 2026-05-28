@@ -286,6 +286,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     self._cache_permute_indices,
                     layer.w13_weight.data[i].view(torch.uint8),
                     epilogue_tile_m,
+                    is_gated_act_gemm=layer.moe_runner_config.is_gated,
                 )
                 tmp_weights1 = (
                     layer.w13_weight.data[i]

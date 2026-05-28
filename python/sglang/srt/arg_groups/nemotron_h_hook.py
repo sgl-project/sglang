@@ -38,6 +38,18 @@ def apply_nemotron_h_defaults(server_args: "ServerArgs", model_arch: str) -> Non
                 )
             else:
                 server_args.moe_runner_backend = "flashinfer_cutlass"
+    elif model_config.quantization is None:
+        # Unquantized (e.g. bf16) NemotronH: use flashinfer_trtllm on sm100.
+        if (
+            server_args.moe_runner_backend == "auto"
+            and is_sm100_supported()
+            and server_args.moe_a2a_backend == "none"
+        ):
+            server_args.moe_runner_backend = "flashinfer_trtllm"
+            logger.info(
+                "Use flashinfer_trtllm as MoE runner backend on sm100 for "
+                f"{model_arch}"
+            )
 
     server_args._handle_mamba_radix_cache(
         model_arch=model_arch,

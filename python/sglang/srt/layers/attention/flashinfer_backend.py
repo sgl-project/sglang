@@ -243,13 +243,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         fmha_backend = "auto"
         if is_sm100_supported():
-            if not model_runner.server_args.disable_piecewise_cuda_graph:
-                logger.info(
-                    "CUTLASS backend is disabled when piecewise cuda graph is enabled "
-                    "due to TMA descriptor initialization issues on SM100 GPUs. "
-                    "Using auto backend instead for stability."
-                )
-            else:
+            if model_runner.server_args.disable_piecewise_cuda_graph:
                 fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
