@@ -144,7 +144,10 @@ def vllm_resize(
     return new_h, new_w
 
 def _compute_sampled_frame_indices(
-    total_frames: int, video_fps: float, fps: float
+    total_frames: int,
+    video_fps: float,
+    fps: float,
+    max_frames: Optional[int] = None,
 ) -> List[int]:
     """
     Pick frame indices that match the SFT extract_frame.py constant-mode
@@ -179,6 +182,11 @@ def _compute_sampled_frame_indices(
 
     if not indices:
         indices = [0]
+    if max_frames is not None and len(indices) > max_frames > 0:
+        last = indices[-1]
+        step = len(indices) / (max_frames - 1)
+        indices = [indices[int(i * step)] for i in range(max_frames - 1)]
+        indices.append(last)
     return indices
 
 
@@ -188,6 +196,7 @@ async def get_video_tensor(
     max_size: Tuple[int, int],
     fps: Optional[float] = None,
     frame_max_size: Optional[int] = None,
+    max_frames: Optional[int] = None,
 ) -> Tuple[torch.Tensor, dict]:
     """Sample/resize one MiniMax video and return text-expansion metadata."""
     if fps is None:
@@ -221,7 +230,7 @@ async def get_video_tensor(
         raise ValueError(
             f"Invalid video metadata: fps={video_fps}, frames={total_frames}"
         )
-    indices = _compute_sampled_frame_indices(total_frames, video_fps, fps)
+    indices = _compute_sampled_frame_indices(total_frames, video_fps, fps, max_frames)
     video_tchw = vr.get_frames_as_tensor(indices)
     # NHWC uint8 -> NCHW float
     video_tchw = video_tchw.permute(0, 3, 1, 2).float()
@@ -303,6 +312,7 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
         self.IM_END_TOKEN_ID = self._token_id(tokenizer, self.IMAGE_END_TOKEN)
         self.video_fps = self.video_config.get("fps")
         self.video_frame_max_size = self.video_config.get("frame_max_size")
+        self.video_max_frames = self.video_config.get("max_frames")
 
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=self.IMAGE_TOKEN,
@@ -360,6 +370,7 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
                     max_size=max_size,
                     fps=self.video_fps,
                     frame_max_size=self.video_frame_max_size,
+                    max_frames=self.video_max_frames,
                 )
                 for video in base_output.videos
             ]
