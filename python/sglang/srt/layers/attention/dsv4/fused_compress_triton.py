@@ -805,18 +805,21 @@ def _compress_norm_rope_hadamard_kernel(
     tl.store(kv_ptr + base + rope_start + 2 * pair_offs, out_real, mask=pair_mask)
     tl.store(kv_ptr + base + rope_start + 2 * pair_offs + 1, out_imag, mask=pair_mask)
 
-    # Walsh-Hadamard butterfly transform via store-reload through L1 cache
+    # Walsh-Hadamard butterfly transform via store-reload through L1 cache.
+    # Barriers are required because multiple warps share the same row in memory;
+    # without them a fast warp can overwrite a partner value before a slow warp reads it.
     for stage in tl.static_range(LOG2_HEAD_DIM):
         stride = 1 << stage
         is_even = ((offs >> stage) & 1) == 0
         partner = tl.where(is_even, offs + stride, offs - stride)
+        tl.debug_barrier()
         x_self = tl.load(kv_ptr + base + offs, mask=mask)
         x_partner = tl.load(kv_ptr + base + partner, mask=mask)
         result = tl.where(is_even, x_self + x_partner, x_partner - x_self)
+        if stage == LOG2_HEAD_DIM - 1:
+            result = result * hadamard_scale
+        tl.debug_barrier()
         tl.store(kv_ptr + base + offs, result, mask=mask)
-
-    x_final = tl.load(kv_ptr + base + offs, mask=mask) * hadamard_scale
-    tl.store(kv_ptr + base + offs, x_final, mask=mask)
 
 
 def _plan_as_i32(plan: torch.Tensor) -> torch.Tensor:
