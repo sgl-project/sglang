@@ -170,9 +170,8 @@ class DeepseekV4ModelNextN(nn.Module):
         if dsa_use_prefill_cp(forward_batch):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
-            if get_moe_a2a_backend().is_none():
-                input_ids = cp_round_robin_input_ids(input_ids)
-                input_ids_global = input_ids
+            input_ids = cp_round_robin_input_ids(input_ids)
+            input_ids_global = input_ids
 
         hidden_states = self.decoder(
             positions=positions,

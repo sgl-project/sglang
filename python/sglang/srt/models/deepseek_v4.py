@@ -1206,10 +1206,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                     "CP requires DeepEP (moe_a2a_backend == deepep). "
                     "Only DeepEP is tested with CP's per-rank token split."
                 )
-                cp_rank = get_attention_cp_rank()
-                cp_size = get_attention_cp_size()
-                input_ids = input_ids[cp_rank::cp_size].contiguous()
-                input_ids_global = input_ids
         elif _use_tp_moe_gather:
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(get_tp_group()),
@@ -1377,9 +1373,8 @@ class DeepseekV4Model(nn.Module):
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
-            if get_moe_a2a_backend().is_none():
-                input_ids = cp_round_robin_input_ids(input_ids)
-                input_ids_global = input_ids
+            input_ids = cp_round_robin_input_ids(input_ids)
+            input_ids_global = input_ids
 
         # Reset Compressor's per-step freqs_cis cache from any previous step.
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
