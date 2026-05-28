@@ -16,6 +16,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _SHARED_HICACHE_PREPARE_LOOKAHEAD_EXTRA_REQS = 1
+_SHARED_HICACHE_STATUS_FAILED = 0
+_SHARED_HICACHE_STATUS_SKIP = 1
+_SHARED_HICACHE_STATUS_PENDING = 2
+_SHARED_HICACHE_STATUS_READY = 3
 
 
 class SharedHiCacheSchedulerMixin:
@@ -53,42 +57,51 @@ class SharedHiCacheSchedulerMixin:
         for req in reqs:
             req.shared_hicache_max_prefix_len = None
 
-        local_has_plan = [shared_hicache_manager.has_reuse_plan(req) for req in reqs]
-        any_rank_has_plan, all_ranks_have_plan = self._sync_shared_hicache_bool_batch(
-            local_has_plan
-        )
-
-        local_reqs: list[tuple["Req", int]] = []
+        probe_statuses: list[int] = []
+        local_prefix_lens: list[int] = []
         pending_rids: set[str] = set()
 
-        for req, any_has_plan, all_have_plan in zip(
-            reqs, any_rank_has_plan, all_ranks_have_plan
-        ):
-            if not any_has_plan:
+        for req in reqs:
+            if not shared_hicache_manager.has_reuse_plan(req):
+                probe_statuses.append(_SHARED_HICACHE_STATUS_SKIP)
+                local_prefix_lens.append(0)
                 continue
-            if not all_have_plan:
-                logger.warning(
-                    "SharedHiCache plan availability diverged across TP ranks for rid=%s; "
-                    "falling back to local prefill",
-                    req.rid,
-                )
-                req.shared_hicache_plan = None
-                self._release_shared_hicache_request(req.rid)
-                continue
-
-            local_prefix_len = 0
             try:
                 # Probe the current local prefix without taking COW allocations.
                 req.init_next_round_input(self.tree_cache, cow_mamba=False)
                 local_prefix_len = len(req.prefix_indices) + int(
                     getattr(req, "host_hit_length", 0) or 0
                 )
+                probe_status = _SHARED_HICACHE_STATUS_READY
             except Exception:
                 logger.exception(
                     "SharedHiCache failed while probing local prefix for rid=%s; "
-                    "continuing with local prefill",
+                    "falling back to local prefill on all TP ranks",
                     req.rid,
                 )
+                local_prefix_len = 0
+                probe_status = _SHARED_HICACHE_STATUS_FAILED
+            probe_statuses.append(probe_status)
+            local_prefix_lens.append(local_prefix_len)
+
+        local_reqs: list[tuple["Req", int]] = []
+        reduced_probe_statuses = self._sync_shared_hicache_status_min_batch(
+            probe_statuses
+        )
+        for req, local_status, reduced_status, local_prefix_len in zip(
+            reqs, probe_statuses, reduced_probe_statuses, local_prefix_lens
+        ):
+            if reduced_status == _SHARED_HICACHE_STATUS_FAILED:
+                req.shared_hicache_plan = None
+                self._release_shared_hicache_request(req.rid)
+                continue
+            if reduced_status == _SHARED_HICACHE_STATUS_SKIP:
+                if local_status == _SHARED_HICACHE_STATUS_READY:
+                    logger.warning(
+                        "SharedHiCache plan availability diverged across TP ranks for rid=%s; "
+                        "falling back to local prefill",
+                        req.rid,
+                    )
                 req.shared_hicache_plan = None
                 self._release_shared_hicache_request(req.rid)
                 continue
@@ -102,12 +115,11 @@ class SharedHiCacheSchedulerMixin:
         )
 
         prepared_reqs: list[tuple["Req", SharedHiCacheResult | None, int]] = []
-        pending_values = []
+        prepare_statuses: list[int] = []
 
         for (req, _), common_local_prefix_len in zip(
             local_reqs, common_local_prefix_lens
         ):
-            pending = False
             result = None
             try:
                 req.shared_hicache_max_prefix_len = common_local_prefix_len
@@ -115,25 +127,34 @@ class SharedHiCacheSchedulerMixin:
                 # SharedHiCache prepare, so all ranks fetch/insert the same suffix.
                 req.init_next_round_input(self.tree_cache, cow_mamba=False)
                 result = shared_hicache_manager.prepare_reuse(req)
-                pending = result.pending
+                prepare_status = (
+                    _SHARED_HICACHE_STATUS_PENDING
+                    if result.pending
+                    else _SHARED_HICACHE_STATUS_READY
+                )
             except Exception:
                 logger.exception(
-                    "SharedHiCache failed for rid=%s; continuing with local prefill",
+                    "SharedHiCache failed for rid=%s; falling back to local prefill on all TP ranks",
                     req.rid,
                 )
-                req.shared_hicache_plan = None
-                self._release_shared_hicache_request(req.rid)
+                prepare_status = _SHARED_HICACHE_STATUS_FAILED
 
             prepared_reqs.append((req, result, common_local_prefix_len))
-            pending_values.append(pending)
+            prepare_statuses.append(prepare_status)
 
-        any_rank_pending, _ = self._sync_shared_hicache_bool_batch(pending_values)
+        reduced_prepare_statuses = self._sync_shared_hicache_status_min_batch(
+            prepare_statuses
+        )
         ready_reqs = []
         local_prefix_lens = []
-        for (req, result, local_prefix_len), pending in zip(
-            prepared_reqs, any_rank_pending
+        for (req, result, local_prefix_len), reduced_status in zip(
+            prepared_reqs, reduced_prepare_statuses
         ):
-            if pending:
+            if reduced_status == _SHARED_HICACHE_STATUS_FAILED:
+                req.shared_hicache_plan = None
+                self._release_shared_hicache_request(req.rid)
+                continue
+            if reduced_status == _SHARED_HICACHE_STATUS_PENDING:
                 pending_rids.add(str(req.rid))
                 continue
             ready_reqs.append(req)
@@ -155,26 +176,9 @@ class SharedHiCacheSchedulerMixin:
 
         return pending_rids
 
-    def _sync_shared_hicache_bool_batch(
-        self, values: list[bool]
-    ) -> tuple[list[bool], list[bool]]:
-        if not values:
-            return [], []
-        group_size, group = self._shared_hicache_sync_group()
-        if group_size <= 1:
-            return list(values), list(values)
-
-        flags = torch.tensor([1 if value else 0 for value in values], dtype=torch.int32)
-        torch.distributed.all_reduce(
-            flags,
-            op=torch.distributed.ReduceOp.SUM,
-            group=group,
-        )
-        counts = [int(count) for count in flags.tolist()]
-        return (
-            [count > 0 for count in counts],
-            [count == group_size for count in counts],
-        )
+    def _sync_shared_hicache_status_min_batch(self, values: list[int]) -> list[int]:
+        # Match disagg polling: lower status is less advanced and dominates.
+        return self._sync_shared_hicache_int_min_batch(values)
 
     def _sync_shared_hicache_int_min_batch(self, values: list[int]) -> list[int]:
         if not values:

@@ -14,6 +14,9 @@ from sglang.srt.mem_cache.shared_hicache.manager import SharedHiCacheManager
 from sglang.srt.mem_cache.shared_hicache.plan import SharedHiCachePlan
 from sglang.srt.mem_cache.shared_hicache.scheduler_mixin import (
     SharedHiCacheSchedulerMixin,
+    _SHARED_HICACHE_STATUS_FAILED,
+    _SHARED_HICACHE_STATUS_PENDING,
+    _SHARED_HICACHE_STATUS_READY,
 )
 from sglang.srt.mem_cache.shared_hicache.service import (
     _decode_control_payload,
@@ -112,19 +115,21 @@ class FakeSharedHiCacheReq:
 
 
 class FakeScheduleManager:
-    def __init__(self, prefix_len):
+    def __init__(self, prefix_len, *, pending=False):
         self.prefix_len = prefix_len
+        self.pending = pending
         self.prepared = []
+        self.released = []
 
     def has_reuse_plan(self, req):
         return True
 
     def prepare_reuse(self, req):
         self.prepared.append(req.rid)
-        return SimpleNamespace(pending=False, prefix_len=self.prefix_len)
+        return SimpleNamespace(pending=self.pending, prefix_len=self.prefix_len)
 
     def release_request(self, rid):
-        pass
+        self.released.append(rid)
 
 
 class FakeScheduler(SharedHiCacheSchedulerMixin):
@@ -138,6 +143,27 @@ class FakeScheduler(SharedHiCacheSchedulerMixin):
 
     def get_num_allocatable_reqs(self, running_bs):
         return 1
+
+
+class FakeConsensusScheduler(FakeScheduler):
+    def __init__(self, manager, *, status_overrides=None, prefix_overrides=None):
+        super().__init__(manager)
+        self.status_overrides = list(status_overrides or [])
+        self.prefix_overrides = list(prefix_overrides or [])
+        self.status_inputs = []
+        self.prefix_inputs = []
+
+    def _sync_shared_hicache_status_min_batch(self, values):
+        self.status_inputs.append(list(values))
+        if self.status_overrides:
+            return list(self.status_overrides.pop(0))
+        return list(values)
+
+    def _sync_shared_hicache_int_min_batch(self, values):
+        self.prefix_inputs.append(list(values))
+        if self.prefix_overrides:
+            return list(self.prefix_overrides.pop(0))
+        return list(values)
 
 
 def _make_manager():
@@ -352,6 +378,70 @@ class TestSharedHiCache(unittest.TestCase):
         self.assertEqual(manager.prepared, ["rid-1"])
         self.assertEqual(req.shared_hicache_max_prefix_len, 24)
         self.assertEqual(req.init_calls, [None, 24])
+
+    def test_scheduler_tp_probe_failure_falls_back_all_ranks(self):
+        manager = FakeScheduleManager(prefix_len=8)
+        scheduler = FakeConsensusScheduler(
+            manager,
+            status_overrides=[
+                [_SHARED_HICACHE_STATUS_FAILED],
+            ],
+        )
+        req = FakeSharedHiCacheReq("rid-1", local_prefix_len=24)
+
+        pending_rids = scheduler._prepare_shared_hicache_for_schedule_batch([req])
+
+        self.assertEqual(pending_rids, set())
+        self.assertEqual(scheduler.status_inputs, [[_SHARED_HICACHE_STATUS_READY]])
+        self.assertEqual(scheduler.prefix_inputs, [])
+        self.assertEqual(manager.prepared, [])
+        self.assertEqual(manager.released, ["rid-1"])
+        self.assertIsNone(req.shared_hicache_plan)
+
+    def test_scheduler_tp_prepare_failure_falls_back_all_ranks(self):
+        manager = FakeScheduleManager(prefix_len=8)
+        scheduler = FakeConsensusScheduler(
+            manager,
+            status_overrides=[
+                [_SHARED_HICACHE_STATUS_READY],
+                [_SHARED_HICACHE_STATUS_FAILED],
+            ],
+        )
+        req = FakeSharedHiCacheReq("rid-1", local_prefix_len=24)
+
+        pending_rids = scheduler._prepare_shared_hicache_for_schedule_batch([req])
+
+        self.assertEqual(pending_rids, set())
+        self.assertEqual(
+            scheduler.status_inputs,
+            [[_SHARED_HICACHE_STATUS_READY], [_SHARED_HICACHE_STATUS_READY]],
+        )
+        self.assertEqual(scheduler.prefix_inputs, [[24], []])
+        self.assertEqual(manager.prepared, ["rid-1"])
+        self.assertEqual(manager.released, ["rid-1"])
+        self.assertIsNone(req.shared_hicache_plan)
+
+    def test_scheduler_tp_pending_status_dominates_ready(self):
+        manager = FakeScheduleManager(prefix_len=8)
+        scheduler = FakeConsensusScheduler(
+            manager,
+            status_overrides=[
+                [_SHARED_HICACHE_STATUS_READY],
+                [_SHARED_HICACHE_STATUS_PENDING],
+            ],
+        )
+        req = FakeSharedHiCacheReq("rid-1", local_prefix_len=24)
+
+        pending_rids = scheduler._prepare_shared_hicache_for_schedule_batch([req])
+
+        self.assertEqual(pending_rids, {"rid-1"})
+        self.assertEqual(
+            scheduler.status_inputs,
+            [[_SHARED_HICACHE_STATUS_READY], [_SHARED_HICACHE_STATUS_READY]],
+        )
+        self.assertEqual(scheduler.prefix_inputs, [[24], []])
+        self.assertEqual(manager.prepared, ["rid-1"])
+        self.assertEqual(manager.released, [])
 
 
 if __name__ == "__main__":
