@@ -1708,6 +1708,11 @@ class MooncakeKVSender(CommonKVSender):
 
         self.trace_ctx.trace_req_start()
 
+    def abort(self):
+        super().abort()
+        self.trace_ctx.abort(abort_info={"reason": "Aborted"})
+        self.trace_ctx.trace_req_finish()
+
 
 class MooncakeKVReceiver(CommonKVReceiver):
     def __init__(

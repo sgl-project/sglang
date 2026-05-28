@@ -79,6 +79,8 @@ class TestTraceDisaggregation(CustomTestCase):
             "--enable-trace",
             "--otlp-traces-endpoint",
             "localhost:4317",
+            "--trace-modules",
+            "request,mooncake",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -102,8 +104,6 @@ class TestTraceDisaggregation(CustomTestCase):
             "--enable-trace",
             "--otlp-traces-endpoint",
             "localhost:4317",
-            "--trace-modules",
-            "request,mooncake",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -222,14 +222,14 @@ class TestTraceDisaggregation(CustomTestCase):
 
         # Check for transfer-related spans
         self.assertTrue(
-            self.collector.has_any_span(
+            self.collector.has_all_spans(
                 [
                     RequestStage.PREFILL_TRANSFER_KV_CACHE.stage_name,
                     RequestStage.DECODE_TRANSFERRED.stage_name,
                     MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
                 ]
             ),
-            f"Expected disaggregation transfer spans, got {sorted(span_names)}",
+            f"Expected all disaggregation transfer spans, got {sorted(span_names)}",
         )
 
 
