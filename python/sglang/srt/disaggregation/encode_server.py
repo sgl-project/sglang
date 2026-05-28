@@ -913,7 +913,7 @@ class MMEncoder:
             if prefetch_status.item() == 1 and hit_indices:
                 # Only release hashes that were successfully loaded from cache
                 loaded_hashes = [
-                    mm_hashes[idx]
+                    str_mm_hashes[idx]
                     for idx in hit_indices
                     if idx not in set(cache_miss_indices)
                 ]
@@ -928,7 +928,7 @@ class MMEncoder:
                 all_new_hashes += [str_mm_hashes[i] for i in hit_indices]
                 all_new_slices += list(fallback_slices)
             if cache_miss_indices:
-                all_new_hashes += [mm_hashes[i] for i in cache_miss_indices]
+                all_new_hashes += [str_mm_hashes[i] for i in cache_miss_indices]
                 all_new_slices += [final_slices[i] for i in cache_miss_indices]
 
             if all_new_hashes:
