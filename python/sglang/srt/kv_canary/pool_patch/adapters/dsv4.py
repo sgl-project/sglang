@@ -20,8 +20,7 @@ def attach_dsv4(
     c4_indexer_kv_pool / compress state pools are left uncovered.
     TODO: even on swa_kv_pool, real-KV fingerprint is disabled (read_bytes is
     ignored). DSV4 stores 584 B/token which is not 16-aligned, and the current
-    RealKvSource conflates per-slot stride with fingerprint width; enabling
-    real-KV here needs a separate slot_stride_bytes field on RealKvSource.
+    RealKvSource conflates per-slot stride with fingerprint width.
     """
     del read_bytes
 
