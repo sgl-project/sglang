@@ -820,22 +820,13 @@ class PrefillAdder:
         return req if truncated else None
 
     def add_first_chunk_req(self, req: Req, truncation_align_size: Optional[int]):
-        # Reuse path: this req's previous chunk left lock_ref held, prefix
-        # already in tree, and init_load_back already consumed host KV. We
-        # must skip fresh-req setup. Gate on `has_pending_chunk` (the
-        # persistent chunked-resume flag) — `kv_committed_len > 0` alone is
-        # wider (streaming-session turn N>1 also has it without being
-        # chunked-resume) and would skip _req_inc_lock_ref incorrectly.
-        is_resume = req.has_pending_chunk and not req.is_dllm()
-
-        # req.host_hit_length is the last match_prefix output. For reuse
-        # admissions, the previous (fresh) admission already consumed it
-        # via init_load_back, so locally treat it as zero — both for
-        # budget accounting and to skip the redundant init_load_back call.
-        # We do NOT mutate req.host_hit_length: keeping the field as a
-        # pure match_prefix output preserves single-writer semantics and
-        # avoids cross-function reset contracts.
-        effective_host_hit_length = 0 if is_resume else req.host_hit_length
+        # Scheduler-side dispatch invariant: chunked-resume reqs are routed
+        # to `add_non_first_chunk_req`. This function only admits fresh
+        # reqs (and DLLM, whose `has_pending_chunk` is always False).
+        assert not req.has_pending_chunk or req.is_dllm(), (
+            f"add_first_chunk_req called on chunked-resume req {req.rid}; "
+            f"scheduler-side dispatch broken"
+        )
 
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
@@ -873,7 +864,7 @@ class PrefillAdder:
         total_tokens = req.extend_input_len + max_new + self.page_size
 
         # adjusting the input_tokens based on host_hit_length and page_size
-        real_input_tokens = req.extend_input_len - effective_host_hit_length
+        real_input_tokens = req.extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
@@ -905,13 +896,11 @@ class PrefillAdder:
                 if swa_needed >= self.rem_swa_tokens:
                     return AddReqResult.NO_TOKEN
 
-            # Fresh-only init_load_back. effective_host_hit_length is 0 for
-            # reuse (see top of function), so the predicate skips reuse.
-            if effective_host_hit_length > 0:
+            if req.host_hit_length > 0:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
-                        host_hit_length=effective_host_hit_length,
+                        host_hit_length=req.host_hit_length,
                         req=req,
                     )
                 )
@@ -932,10 +921,6 @@ class PrefillAdder:
                 # - if the can_run_list is empty, always accept the first prefill request
                 return AddReqResult.OTHER
 
-            # Budget prefix_len: 0 for reuse (already counted by previous
-            # admission's stash into tree); actual prefix_len for fresh.
-            budget_prefix = 0 if is_resume else prefix_len
-
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
@@ -947,13 +932,12 @@ class PrefillAdder:
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
-                # Non-chunked prefill (or last chunk of a chunked-resume req).
+                # Non-chunked prefill (first-and-only chunk).
                 self.can_run_list.append(req)
 
-                if not is_resume:
-                    self._req_inc_lock_ref(req)
+                self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
-                    budget_prefix,
+                    prefix_len,
                     input_tokens,
                     min(
                         req.sampling_params.max_new_tokens,
@@ -991,9 +975,8 @@ class PrefillAdder:
 
                 self.can_run_list.append(req)
 
-                if not is_resume:
-                    self._req_inc_lock_ref(req)
-                self._update_prefill_budget(budget_prefix, trunc_len, 0)
+                self._req_inc_lock_ref(req)
+                self._update_prefill_budget(prefix_len, trunc_len, 0)
 
         # Plan-time advance: snapshot how far this req's fill_ids has been
         # scheduled. After this admit, fill_ids covers `prefix_indices`
