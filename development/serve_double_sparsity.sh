@@ -76,6 +76,7 @@ exec python3 -m sglang.launch_server \
   `# pass + record_radix_fixture_passed(server_args) flip (DEC-2).` \
   --disable-radix-cache \
   --trust-remote-code \
+  ${EXTRA_SERVER_ARGS:-} \
   2>&1 | tee "${LOG_FILE}"
 # --disable-radix-cache is required by the DS validator (DEC-2): radix cache
 # is gated until the M3-B page-stability fixture has been recorded as passing
