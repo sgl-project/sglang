@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_CI_DATA_REVISION = "94eab4fcca6d4ddc77cdb3622f13033b61e81002"
+SGL_TEST_FILES_CI_DATA_REVISION = "68a42bf2229361497e6c4ff22ce89a157bf2f531"
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
     f"sgl-project/ci-data/{SGL_TEST_FILES_CI_DATA_REVISION}/"
@@ -58,6 +58,7 @@ SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES = frozenset(
         "ltx_2_3_two_stage_ti2v_2gpus",
     }
 )
+
 CONSISTENCY_THRESHOLD_JSON_PATH = (
     Path(__file__).resolve().parent / "server" / "consistency_threshold.json"
 )

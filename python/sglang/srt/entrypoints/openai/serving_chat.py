@@ -60,7 +60,10 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
-from sglang.srt.function_call.utils import get_json_schema_constraint
+from sglang.srt.function_call.utils import (
+    get_json_schema_constraint,
+    normalize_json_schema_types,
+)
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
@@ -180,6 +183,18 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Per-request response parser for custom decoding (set by _encode_messages)
         self._response_parser: Optional[ResponseParserProtocol] = None
+
+        # Probe whether ``encode("")`` returns specials. If it does, we must
+        # keep ``add_special_tokens=False`` at the chat-template encode site
+        # to avoid double BOS; otherwise the kwarg is a no-op and dropping it
+        # lets slow tokenizers (e.g. Kimi's TikTokenTokenizer) stay on the
+        # fast internal path.
+        try:
+            self._tokenizer_auto_adds_specials = (
+                len(self.tokenizer_manager.tokenizer.encode("")) > 0
+            )
+        except Exception:
+            self._tokenizer_auto_adds_specials = True
 
     def _handle_last_assistant_message(
         self,
@@ -404,9 +419,19 @@ class OpenAIServingChat(OpenAIServingBase):
             if tool.function.parameters is None:
                 continue
             try:
+                # Rewrite DB/ORM-style aliases (e.g. "varchar", "enum", "int")
+                # to standard JSON Schema types before validation. RecursionError
+                # guards against hand-crafted cyclic schemas so the request gets
+                # a 400 instead of crashing into a 500.
+                normalize_json_schema_types(tool.function.parameters)
                 Draft202012Validator.check_schema(tool.function.parameters)
             except SchemaError as e:
                 return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
+            except RecursionError:
+                return (
+                    f"Tool {i} function 'parameters' schema is too deeply nested "
+                    "or contains a cycle."
+                )
 
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = self.tokenizer_manager.server_args.context_length
@@ -729,14 +754,27 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
 
+            # Split apply_chat_template(tokenize=True) into render + encode so we
+            # can skip add_special_tokens=False on tokenizers that don't auto-add
+            # specials (Kimi-like, OpenAI-chat analogue of #25265). Chat
+            # templates already include role/special tokens, so the encode must
+            # avoid double BOS on tokenizers that would add it.
+            encode_kwargs = (
+                {"add_special_tokens": False}
+                if self._tokenizer_auto_adds_specials
+                else {}
+            )
             try:
-                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
-                    tokenize=True,
+                    tokenize=False,
                     add_generation_prompt=True,
                     tools=tools,
                     return_dict=False,
                     **extra_template_kwargs,
+                )
+                prompt_ids = self.tokenizer_manager.tokenizer.encode(
+                    rendered_prompt, **encode_kwargs
                 )
             except Exception as e:
                 # If the first attempt fails, try with flat function-only format.
@@ -747,16 +785,22 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 )
                 try:
-                    prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-                        openai_compatible_messages,
-                        tokenize=True,
-                        add_generation_prompt=True,
-                        tools=tools,
-                        return_dict=False,
-                        **extra_template_kwargs,
+                    rendered_prompt = (
+                        self.tokenizer_manager.tokenizer.apply_chat_template(
+                            openai_compatible_messages,
+                            tokenize=False,
+                            add_generation_prompt=True,
+                            tools=tools,
+                            return_dict=False,
+                            **extra_template_kwargs,
+                        )
                     )
-                except jinja2.TemplateError as template_error:
+                    prompt_ids = self.tokenizer_manager.tokenizer.encode(
+                        rendered_prompt, **encode_kwargs
+                    )
+                except (jinja2.TemplateError, TypeError) as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
+                    # and TypeError (e.g., tojson filter on Jinja2 Undefined variables)
                     # should be treated as client errors (400 BadRequest)
                     raise ValueError(str(template_error)) from template_error
 
