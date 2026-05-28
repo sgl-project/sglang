@@ -39,7 +39,14 @@ needed before the next defect could even surface.
        `attn_mqa` + derive `head_width` from the projection output. Commit 8375b76a5.
    Validated: coherent decode, `selected_tokens` grows with seq, dense_fallback=0.
 
-### OPEN — the central architectural defect (#18, task #18)
+### RESOLVED (commit eba4c640e) — the central architectural defect (#18)
+   Resolution: classic Double Sparsity is dense-prefill / sparse-decode (per the
+   legacy SGLang DS design). `set_dsa_prefill_impl` now keeps the dense MHA_ONE_SHOT
+   prefill for DS regardless of the length threshold, so DS selection is skipped during
+   prefill and runs only at decode (where bs==num_reqs is correct). Verified: 2272-token
+   (>top_k) prompt serves without crash, decode sparsity_rate=0.105, dense_fallback=0,
+   coherent — AC-1.1 satisfied. The decode-shape/prefill description below is retained
+   as the root-cause record.
 8. **DS selection uses the DECODE batch shape; breaks on PREFILL.**
    `forward_mla.py:268` makes `q_nope_for_ds` shape `[num_tokens, H, dim]` (one query
    per token), but `_select_topk_indices` + the selection kernels take per-REQUEST
