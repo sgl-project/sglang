@@ -3592,28 +3592,10 @@ class Scheduler(
 
     def abort_request(self, recv_req: AbortReq):
         # todo hisparse, release resources for abort requests in hisparse coordinator
-        # Post-C4: chunked-resume reqs live in active_reqs only, never in waiting_queue.
-        if self.cur_batch is self.running_batch or self.cur_batch is None:
-            batch_reqs = list(self.running_batch.reqs)
-        else:
-            batch_reqs = list(self.running_batch.reqs) + list(self.cur_batch.reqs)
-        # PP: every in-flight microbatch's reqs count as 'in batch' so they
-        # take the running-path abort (sets req.to_finish). The waiting-path
-        # abort would release_kv_cache while the forward is still launched,
-        # corrupting the KV pool under it.
-        if self.ps.pp_size > 1 and hasattr(self, "mbs"):
-            for mb_list in (self.mbs, self.last_mbs, self.running_mbs):
-                for mb in mb_list:
-                    if mb is not None and not mb.is_empty():
-                        batch_reqs.extend(mb.reqs)
-        batch_rids = {r.rid for r in batch_reqs}
-
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
-            if (recv_req.abort_all or req.rid.startswith(recv_req.rid)) and (
-                req.rid not in batch_rids
-            ):
+            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 to_del.append(i)
 
         # Sort in reverse order to avoid index issues when deleting
@@ -3698,7 +3680,7 @@ class Scheduler(
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
-        # Active段: iterate active_reqs (includes both in-batch reqs and
+        # Active phase: iterate active_reqs (includes both in-batch reqs and
         # stashed chunked-resume between iters). Uniformly set to_finish;
         # release happens in batch_result_processor on the next forward,
         # matching main-upstream's delayed-release pattern.
