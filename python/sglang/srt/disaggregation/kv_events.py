@@ -93,7 +93,8 @@ class BlockStored(KVCacheEvent):
     swa_sliding_window_size: Optional[int] = None
     # Scoped to this block's node. Consumers matching a longer prefix should
     # aggregate this metadata along the matched block path and use the deepest
-    # non-None value.
+    # non-None value. A refreshed None value clears any previous tombstone marker
+    # for this block.
     swa_valid_from: Optional[int] = None
 
 
