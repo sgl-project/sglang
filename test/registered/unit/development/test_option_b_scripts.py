@@ -96,6 +96,32 @@ class TestOptionBLockedFlagsServerScripts(unittest.TestCase):
             "until AC-10 (radix-cache fixture) passes.",
         )
 
+    def test_ds_server_has_ac10_fixture_marker(self):
+        """A marker comment above the ``--disable-radix-cache`` line
+        names the exact edit point operators delete after the M3-B
+        fixture passes + ``record_radix_fixture_passed`` is wired into
+        the launcher. The marker keeps the comment-only audit trail
+        permanent so the next operator can grep for it years later."""
+        # Read the FULL script (including comments) so the inline
+        # marker is visible — `_non_comment_lines` strips comments by
+        # design.
+        text = DS_SERVER.read_text()
+        self.assertIn(
+            "AC-10-FIXTURE-MARKER", text,
+            "serve_double_sparsity.sh must carry the # AC-10-FIXTURE-MARKER "
+            "comment above --disable-radix-cache so the post-AC-10 flag "
+            "removal is a mechanical one-line edit.",
+        )
+        # The marker must sit ABOVE the radix-cache flag (operator
+        # deletes the next line; the marker stays).
+        marker_idx = text.index("AC-10-FIXTURE-MARKER")
+        flag_idx = text.index("--disable-radix-cache")
+        self.assertLess(
+            marker_idx, flag_idx,
+            "the marker must appear before --disable-radix-cache so "
+            "operators see the edit-point context",
+        )
+
 
 class TestOptionBBenchmarkSweeps(unittest.TestCase):
     """Both benchmark scripts must default to conc 16 / 32 / 64 and emit a

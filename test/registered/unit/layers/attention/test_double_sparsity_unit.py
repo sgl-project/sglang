@@ -252,6 +252,73 @@ class TestValidator(unittest.TestCase):
                 os.environ.pop("SGLANG_DS_ALLOW_PLACEHOLDER", None)
                 os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
 
+    def test_radix_on_refused_until_fixture_recorded(self):
+        """AC-10 DEC-2 guard: DS launch with radix cache ON
+        (``disable_radix_cache=False``) must refuse until the M3-B
+        page-stability fixture has been recorded via
+        ``record_radix_fixture_passed``. After the helper runs, the
+        same args validate cleanly."""
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            record_radix_fixture_passed,
+        )
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            save_channel_mask,
+        )
+        import tempfile, os as _os
+
+        sel_t = torch.randint(0, 128, (2, 4, 16), dtype=torch.int32)
+        w_t = torch.randn(2, 4, 16, dtype=torch.float32)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _os.path.join(tmp, "cm.safetensors")
+            save_channel_mask(
+                path, sel_t, w_t, dtype="fp8_e4m3", head_dim=128,
+                page_size=64, label_dim=16,
+                created_at="2026-05-20T00:00:00Z",
+            )
+
+            def _fresh_args():
+                return self._args(
+                    enable_double_sparsity=True,
+                    double_sparsity_config=_valid_payload(path),
+                    page_size=64,
+                    kv_cache_dtype="fp8_e4m3",
+                    dsa_prefill_backend="flashmla_kv",
+                    dsa_decode_backend="flashmla_kv",
+                    # radix cache ON (the post-AC-10 target state).
+                    disable_radix_cache=False,
+                )
+
+            os.environ["SGLANG_DS_ALLOW_PLACEHOLDER"] = "1"
+            os.environ["SGLANG_DS_ALLOW_NO_ADAPTER"] = "1"
+            # Belt-and-suspenders: make sure the dev override env var
+            # is not leaking in from the shell so the refusal path is
+            # really exercised.
+            os.environ.pop("SGLANG_DS_RADIX_OVERRIDE", None)
+            try:
+                # 1. Without the fixture record, the validator refuses.
+                refused_args = _fresh_args()
+                with self.assertRaises(ValueError) as ctx:
+                    validate_double_sparsity(refused_args)
+                self.assertIn(
+                    "M3-B page-stability fixture", str(ctx.exception),
+                )
+                # 2. After record_radix_fixture_passed(), validation
+                # passes for fresh args carrying the same launch flags.
+                accepted_args = _fresh_args()
+                record_radix_fixture_passed(accepted_args)
+                self.assertTrue(
+                    getattr(
+                        accepted_args,
+                        "_double_sparsity_radix_fixture_passed",
+                        False,
+                    ),
+                    "helper must set the guard attribute to True",
+                )
+                validate_double_sparsity(accepted_args)
+            finally:
+                os.environ.pop("SGLANG_DS_ALLOW_PLACEHOLDER", None)
+                os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
+
     def test_marks_channel_mask_valid_on_success(self):
         """Round-13 fix [P2]: a healthy validator pass must set the AC-10
         ``sglang_double_sparsity_channel_mask_valid`` gauge to 1.
@@ -7654,6 +7721,175 @@ class TestAC12FaultInjection(unittest.TestCase):
             return torch.stack(rows, dim=0)
         self.assertTrue(torch.equal(_corrupt(7), _corrupt(7)))
         self.assertFalse(torch.equal(_corrupt(7), _corrupt(8)))
+
+
+class TestAC10RadixCacheLabelBitStability(unittest.TestCase):
+    """AC-10 (M3-B radix-cache fixture) — CPU unit-level proof that DS
+    label writes are bit-stable when a KV slot is reused.
+
+    The hardware fixture verifies cold/warm prefix labels are bit-stable
+    against real V3.2 + generated channel mask on H200. That hardware
+    property reduces, at the labeling level, to the deterministic
+    property tested here: given the SAME projected K-noPE input, the
+    label-write at the same slot is bit-equal, even if the slot was
+    just invalidated (the radix-cache reuse semantic). The FP8 scale-
+    factor stability check is a separate kernel-level concern handled
+    by the hardware fixture.
+    """
+
+    def _setup(self, *, num_heads=2, label_dim=4, nope_dim=16,
+               num_layers=1, max_tokens=8, dtype=torch.float32):
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+        table = allocate_token_label_table(
+            num_layers_local=num_layers, max_tokens=max_tokens,
+            num_heads_local=num_heads, label_dim=label_dim,
+            page_size=64, dtype=dtype, device=torch.device("cpu"),
+        )
+        torch.manual_seed(42)
+        k_nope = torch.randn(
+            1, num_heads, nope_dim, dtype=torch.float32,
+        )
+        # Stable channel selection: per-head pick of the first label_dim
+        # channels. The selection is what the production calibrator
+        # publishes per layer.
+        sel = (
+            torch.arange(label_dim, dtype=torch.int32)
+            .unsqueeze(0)
+            .expand(num_heads, -1)
+            .contiguous()
+        )
+        return table, k_nope, sel
+
+    def test_token_label_write_is_deterministic_for_same_kv_input(self):
+        """Writing the same K-noPE twice to the same slot must produce
+        bit-equal label rows. This is the foundational radix-cache
+        bit-stability property: identical input → identical output."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
+        )
+        table, k_nope, sel = self._setup()
+        cache_loc = torch.tensor([3], dtype=torch.int64)
+        token_label_write(
+            table.signatures, table.written,
+            layer_id=0, cache_loc=cache_loc,
+            k_nope=k_nope, channel_selection_layer=sel,
+        )
+        first = table.signatures[0, 3].clone()
+        # Second write with same input (no invalidation, just an
+        # overwrite — mirrors the kernel call pattern).
+        token_label_write(
+            table.signatures, table.written,
+            layer_id=0, cache_loc=cache_loc,
+            k_nope=k_nope, channel_selection_layer=sel,
+        )
+        second = table.signatures[0, 3]
+        self.assertTrue(
+            torch.equal(first, second),
+            "label rows from repeated identical writes must be bit-equal",
+        )
+
+    def test_invalidate_then_rewrite_same_input_yields_equal_labels(self):
+        """The radix-cache reuse path: a shared-prefix KV slot is freed
+        and re-allocated for a new request whose prefix tokens are
+        identical. Label invalidation followed by re-write with the
+        same K-noPE must produce a row bit-equal to the original write
+        — otherwise selection diverges between cold and warm requests.
+        """
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write, invalidate_token_label_slots,
+        )
+        table, k_nope, sel = self._setup()
+        cache_loc = torch.tensor([3], dtype=torch.int64)
+        token_label_write(
+            table.signatures, table.written,
+            layer_id=0, cache_loc=cache_loc,
+            k_nope=k_nope, channel_selection_layer=sel,
+        )
+        cold = table.signatures[0, 3].clone()
+        self.assertTrue(table.written[0, 3].item())
+
+        # Simulate radix-cache reuse: slot freed, ``invalidate`` clears
+        # ``written`` so the selector cannot pick the slot until the
+        # next write completes; then the same prefix re-fills the same
+        # slot with the same K_nope.
+        invalidate_token_label_slots(
+            table.written, layer_id=0, cache_loc=cache_loc,
+        )
+        self.assertFalse(table.written[0, 3].item())
+
+        token_label_write(
+            table.signatures, table.written,
+            layer_id=0, cache_loc=cache_loc,
+            k_nope=k_nope, channel_selection_layer=sel,
+        )
+        warm = table.signatures[0, 3]
+        self.assertTrue(table.written[0, 3].item())
+        self.assertTrue(
+            torch.equal(cold, warm),
+            "invalidated-then-rewritten label rows must be bit-equal to "
+            "the cold write (AC-10 radix-cache reuse bit-stability)",
+        )
+
+    def test_different_kv_input_yields_different_labels(self):
+        """Negative counterpart: writing different K-noPE at the same
+        slot must produce a different label row. This proves the
+        bit-equality test above is testing real label-derivation
+        determinism rather than the trivial case of two zeros."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
+        )
+        table, k_nope_a, sel = self._setup()
+        torch.manual_seed(43)
+        k_nope_b = torch.randn_like(k_nope_a)
+        cache_loc = torch.tensor([3], dtype=torch.int64)
+        token_label_write(
+            table.signatures, table.written,
+            layer_id=0, cache_loc=cache_loc,
+            k_nope=k_nope_a, channel_selection_layer=sel,
+        )
+        row_a = table.signatures[0, 3].clone()
+        token_label_write(
+            table.signatures, table.written,
+            layer_id=0, cache_loc=cache_loc,
+            k_nope=k_nope_b, channel_selection_layer=sel,
+        )
+        row_b = table.signatures[0, 3]
+        self.assertFalse(
+            torch.equal(row_a, row_b),
+            "different K-noPE inputs must produce different label rows",
+        )
+
+    def test_invalidate_does_not_clear_signature_bytes(self):
+        """``invalidate_token_label_slots`` clears only the ``written``
+        flag, leaving the signature bytes intact. This matters because
+        a stale-but-valid signature is masked off by selection until
+        the next write restores ``written=True``. If the invalidate
+        path zeroed signatures, a partial re-write would mix old and
+        new bytes — exactly the cold/warm bit-stability hazard."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write, invalidate_token_label_slots,
+        )
+        table, k_nope, sel = self._setup()
+        cache_loc = torch.tensor([3], dtype=torch.int64)
+        token_label_write(
+            table.signatures, table.written,
+            layer_id=0, cache_loc=cache_loc,
+            k_nope=k_nope, channel_selection_layer=sel,
+        )
+        snapshot = table.signatures[0, 3].clone()
+        self.assertTrue(snapshot.abs().sum().item() > 0,
+                         "fixture sanity: written labels must be non-zero")
+
+        invalidate_token_label_slots(
+            table.written, layer_id=0, cache_loc=cache_loc,
+        )
+        self.assertTrue(
+            torch.equal(snapshot, table.signatures[0, 3]),
+            "invalidate must not touch the signature bytes — only the "
+            "written flag governs reachability",
+        )
 
 
 if __name__ == "__main__":

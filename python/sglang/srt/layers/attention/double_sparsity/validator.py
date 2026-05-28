@@ -232,3 +232,36 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
     from sglang.srt.layers.attention.double_sparsity import metrics as _ds_metrics
 
     _ds_metrics.mark_channel_mask_valid(True)
+
+
+def record_radix_fixture_passed(server_args: "ServerArgs") -> None:
+    """Record that the M3-B radix-cache stability fixture has passed
+    for the current ServerArgs configuration.
+
+    After this is called, ``validate_double_sparsity`` will accept a
+    DS launch with ``--disable-radix-cache`` removed (radix cache ON),
+    without requiring the developer override
+    ``SGLANG_DS_RADIX_OVERRIDE=1``.
+
+    The intended flow:
+
+    1. Operator runs ``test/manual/test_dsv32_radix_cache_fixture.py``
+       against a paired DS server with radix cache ON; the test
+       verifies cold-prefix vs warm-prefix continuations are identical
+       (proxy for label bit-stability) and records an artifact.
+    2. Operator calls this helper from the launcher (or sets the
+       attribute directly on the parsed ``ServerArgs``) so the DEC-2
+       guard accepts the configuration at boot.
+    3. ``serve_double_sparsity.sh`` removes the
+       ``--disable-radix-cache`` flag (marker comment makes the edit
+       point easy to find).
+
+    The helper sets the attribute and emits a WARNING-level audit log
+    line so a grep over server logs surfaces every flip event.
+    """
+    setattr(server_args, "_double_sparsity_radix_fixture_passed", True)
+    logger.warning(
+        "DS radix-cache fixture recorded as PASSED for this ServerArgs; "
+        "validator will now accept --disable-radix-cache removal. "
+        "Source: record_radix_fixture_passed()."
+    )

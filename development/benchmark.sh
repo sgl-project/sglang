@@ -78,9 +78,9 @@ for CONCURRENCY in ${CONCURRENCIES}; do
       --output-file "${OUTPUT_FILE}" \
       --output-details
 
-    # Round 33 (AC-11): refuse the run if the observed JSONL `duration`
-    # is below MEASUREMENT_WINDOW_S — guards against bench_serving
-    # bailing out early before the time-based loop met its threshold.
+    # Refuse the run if the observed JSONL `duration` is below
+    # MEASUREMENT_WINDOW_S — guards against bench_serving bailing out
+    # early before the time-based loop met its threshold.
     OBSERVED_DURATION="$(python3 -c "
 import json,sys
 with open('${OUTPUT_FILE}') as fh:

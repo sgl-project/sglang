@@ -64,10 +64,15 @@ exec python3 -m sglang.launch_server \
   --disable-piecewise-cuda-graph \
   --enable-double-sparsity \
   --double-sparsity-config "${DS_CONFIG}" \
+  `# AC-10-FIXTURE-MARKER: remove the next line after M3-B fixture` \
+  `# pass + record_radix_fixture_passed(server_args) flip (DEC-2).` \
   --disable-radix-cache \
   --trust-remote-code \
   2>&1 | tee "${LOG_FILE}"
 # --disable-radix-cache is required by the DS validator (DEC-2): radix cache
 # is gated until the M3-B page-stability fixture has been recorded as passing
-# for this configuration. Set SGLANG_DS_RADIX_OVERRIDE=1 in the environment
-# only if you have explicitly run that fixture on this hardware.
+# for this configuration. The operator flips the gate by calling
+# `record_radix_fixture_passed(server_args)` after the fixture
+# (`test/manual/test_dsv32_radix_cache_fixture.py`) passes against this
+# hardware + configuration. SGLANG_DS_RADIX_OVERRIDE=1 is a developer
+# escape hatch only.
