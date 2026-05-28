@@ -423,8 +423,8 @@ class DeepseekV4AscendAttnBackend(
         # Page tables are 2-D (max_bs, max_pages); -1 the tail per row so
         # unused slots are an invalid-page sentinel (matches reference impl
         # and the initial fill in _init_dsv4_graph_buffers).
-        def _copy_2d(dst: torch.Tensor, src: torch.Tensor) -> None:
-            dst.fill_(-1)
+        def _copy_2d(dst: torch.Tensor, src: torch.Tensor, val: int) -> None:
+            dst.fill_(val)
             dst[: src.shape[0], : src.shape[1]].copy_(src)
 
         # Loc tensors are 1-D flat; zero the tail (loc arrays are token-level
@@ -438,7 +438,7 @@ class DeepseekV4AscendAttnBackend(
             "c4_state_page_table", "c128_state_page_table",
         ):
             if key in result:
-                _copy_2d(getattr(fm, key), result[key])
+                _copy_2d(getattr(fm, key), result[key], 0 if 'state' in key else -1)
         for key in ("c4_loc", "c128_loc", "c4_state_loc", "c128_state_loc"):
             if key in result:
                 _copy_1d(getattr(fm, key), result[key])
