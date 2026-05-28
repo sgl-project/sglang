@@ -1,11 +1,11 @@
 ---
 name: env-var-conventions
-description: Conventions for SGLang environment variables — where to define, how to access, how to name, and how to deprecate. Use when adding, renaming, or reviewing any `SGLANG_*` / `SGL_*` environment variable, or when touching `python/sglang/srt/environ.py`.
+description: Conventions for SGLang environment variables — where to define, how to access, how to name, and how to deprecate. Use when adding, renaming, or reviewing any `SGLANG_*` environment variable (or migrating a legacy `SGL_*` alias), or when touching `python/sglang/srt/environ.py`.
 ---
 
 # Environment Variables — Conventions
 
-Apply this skill when adding, renaming, or reviewing any sglang-owned environment variable (anything that would read or write `SGLANG_*` / `SGL_*`), or when touching `python/sglang/srt/environ.py`.
+Apply this skill when adding, renaming, or reviewing any sglang-owned environment variable (`SGLANG_*`, or a legacy `SGL_*` alias being phased out), or when touching `python/sglang/srt/environ.py`.
 
 ## Rule 1 — Define in the `Envs` class in `python/sglang/srt/environ.py`
 
@@ -17,11 +17,13 @@ Group the new entry under an existing section comment (e.g. `# Logging Options`,
 
 | Variable | Owner | Goes through `Envs`? |
 |---|---|---|
-| `SGLANG_*`, `SGL_*` | sglang | **Always.** `SGL_*` auto-translated with deprecation. |
+| `SGLANG_*` | sglang | **Always.** The canonical prefix for all new entries. |
 | `MOONCAKE_*`, `ASCEND_*`, `DEEP_NORMAL_*`, `IS_H200`, `USE_TRITON_W8A8_FP8_KERNEL`, `HF_HUB_DISABLE_XET`, `DISABLE_OPENAPI_DOC` | Upstream/vendor alias that sglang wants to centralize | **Yes** — register in `Envs` so `.get()` / `.override()` work uniformly. Keep the upstream prefix. |
 | `CUDA_*`, `NCCL_*`, `TORCH_*`, `OMP_*`, `HF_HUB_*` (raw upstream) | External tooling | **No.** Read with `os.getenv` — they're set by the launcher / driver, not by sglang. |
 | `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT`, `HOME`, `PATH` | Distributed launcher / OS | **No.** `os.getenv` only. |
 | Test runner internals (`PYTEST_CURRENT_TEST`, etc.) | Test framework | **No.** `os.getenv` only. |
+
+`SGL_*` is **not** a parallel valid prefix — it's a deprecated legacy alias. `_convert_SGL_to_SGLANG` rewrites `SGL_*` to `SGLANG_*` at import time with a `DeprecationWarning`. Never define a new `SGL_*` descriptor or `os.getenv("SGL_...")` call site; if you see one in code, it's tech debt to migrate.
 
 The rule of thumb: if the value's lifecycle is owned by sglang code (we read it, we may want to override it in tests, we may want to rename it), put it in `Envs`. If the value is set by something outside sglang and we only consume it as-is, use `os.getenv`.
 
