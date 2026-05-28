@@ -2384,6 +2384,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     E(f"node {nid} {ct} device present but Full.value=None")
                 if cd.host_value is not None and not full_hst:
                     E(f"node {nid} {ct} host present but Full.host_value=None")
+                # write-through invariant: once Full is backed up, any aux
+                # device value must also have a host backup. Violations point
+                # to evict-then-restore paths that fail to re-trigger backup.
+                if (
+                    not write_back
+                    and full_hst
+                    and cd.value is not None
+                    and cd.host_value is None
+                ):
+                    E(
+                        f"node {nid} {ct} device present and Full backed up "
+                        f"but {ct} host backup missing"
+                    )
 
             # Every node must keep Full data on at least one layer.
             if not full_dev and not full_hst:
