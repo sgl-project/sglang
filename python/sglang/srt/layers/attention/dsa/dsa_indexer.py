@@ -162,12 +162,7 @@ if _is_cuda:
         softmax_scale: float,
         q_scale: torch.Tensor,
     ) -> torch.Tensor:
-        from sglang.srt.layers.deep_gemm_wrapper import entrypoint as deep_gemm_wrapper
-
-        out = torch.empty(
-            (x.shape[0], weight.shape[0]), dtype=torch.float32, device=x.device
-        )
-        deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, weight, out)
+        out = torch.mm(x, weight.t(), out_dtype=torch.float32)
         weights = out * n_heads_inv_sqrt
         weights = weights.unsqueeze(-1) * q_scale * softmax_scale
         return weights
@@ -1455,10 +1450,14 @@ class Indexer(MultiPlatformOp):
                     forward_batch.attn_cp_metadata is not None
                     and is_dsa_prefill_cp_in_seq_split()
                 ):
-                    kv_len_prev = forward_batch.attn_cp_metadata.kv_len_prev
-                    kv_len_next = forward_batch.attn_cp_metadata.kv_len_next
-                    actual_seq_q_prev = forward_batch.attn_cp_metadata.actual_seq_q_prev
-                    actual_seq_q_next = forward_batch.attn_cp_metadata.actual_seq_q_next
+                    kv_len_prev = forward_batch.attn_cp_metadata.kv_len_prev_list[0]
+                    kv_len_next = forward_batch.attn_cp_metadata.kv_len_next_list[0]
+                    actual_seq_q_prev = (
+                        forward_batch.attn_cp_metadata.actual_seq_q_prev_list[0]
+                    )
+                    actual_seq_q_next = (
+                        forward_batch.attn_cp_metadata.actual_seq_q_next_list[0]
+                    )
 
                     # TODO support mutil-batch
                     # cp_batch_seq_index_prev = forward_batch.attn_cp_metadata["cp_batch_seq_index_prev"]

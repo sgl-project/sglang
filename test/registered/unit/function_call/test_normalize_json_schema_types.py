@@ -9,7 +9,7 @@ from sglang.srt.function_call.utils import normalize_json_schema_types
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(1.0, "stage-a-test-cpu")
+register_cpu_ci(1.0, "base-a-test-cpu")
 
 
 class TestNormalizeJsonSchemaTypes(CustomTestCase):
@@ -158,17 +158,25 @@ class TestNormalizeJsonSchemaTypes(CustomTestCase):
         self.assertEqual(rows["unevaluatedItems"]["type"], "integer")
         self._assert_accepts(schema)
 
-    def test_binary_and_arr_aliases(self):
+    def test_bytes_and_arr_aliases(self):
         schema = {
             "type": "object",
             "properties": {
-                "flag": {"type": "binary"},
+                "payload": {"type": "binary"},
+                "raw": {"type": "bytea"},
                 "items": {"type": "arr"},
             },
         }
         normalize_json_schema_types(schema)
-        self.assertEqual(schema["properties"]["flag"]["type"], "boolean")
+        self.assertEqual(schema["properties"]["payload"]["type"], "string")
+        self.assertEqual(schema["properties"]["raw"]["type"], "string")
         self.assertEqual(schema["properties"]["items"]["type"], "array")
+        self._assert_accepts(schema)
+
+    def test_bool_alias_becomes_boolean(self):
+        schema = {"type": "object", "properties": {"flag": {"type": "bool"}}}
+        normalize_json_schema_types(schema)
+        self.assertEqual(schema["properties"]["flag"]["type"], "boolean")
         self._assert_accepts(schema)
 
     def test_case_insensitive(self):
@@ -229,6 +237,12 @@ class TestNormalizeJsonSchemaTypes(CustomTestCase):
         self.assertEqual(schema["type"], ["string", "null"])
         self._assert_accepts(schema)
 
+    def test_type_list_deduplicates_after_normalization(self):
+        schema = {"type": ["varchar", "string", "null", "int", "integer"]}
+        normalize_json_schema_types(schema)
+        self.assertEqual(schema["type"], ["string", "null", "integer"])
+        self._assert_accepts(schema)
+
     def test_standard_types_untouched(self):
         schema = {
             "type": "object",
@@ -280,6 +294,10 @@ class TestNormalizeJsonSchemaTypes(CustomTestCase):
             "boolean",
             "bool",
             "binary",
+            "bytea",
+            "bytes",
+            "blob",
+            "varbinary",
             # compound
             "object",
             "array",
@@ -295,7 +313,7 @@ class TestNormalizeJsonSchemaTypes(CustomTestCase):
             try:
                 self._assert_accepts(schema)
             except SchemaError as e:
-                self.fail(f"type {t!r} → {schema['properties']['x']['type']!r}: {e}")
+                self.fail(f"type {t!r} -> {schema['properties']['x']['type']!r}: {e}")
 
     def test_pre_existing_400_schema_now_accepted(self):
         schema = {
@@ -345,7 +363,7 @@ class TestNormalizeJsonSchemaTypes(CustomTestCase):
             "else": {"type": "decimal"},
             "not": {"type": "uuid"},
             "contains": {"type": "enum"},
-            "additionalProperties": {"type": "binary"},
+            "additionalProperties": {"type": "bool"},
         }
         normalize_json_schema_types(schema)
         self.assertEqual(schema["patternProperties"]["^x_"]["type"], "string")
@@ -360,7 +378,7 @@ class TestNormalizeJsonSchemaTypes(CustomTestCase):
         self.assertEqual(schema["additionalProperties"]["type"], "boolean")
 
     def test_cyclic_schema_raises_recursion_error(self):
-        """A pathological cyclic schema surfaces as RecursionError — caller
+        """A pathological cyclic schema surfaces as RecursionError; caller
         (``_validate_request``) converts it to a 400, not a 500."""
         schema = {"type": "object"}
         schema["items"] = schema
