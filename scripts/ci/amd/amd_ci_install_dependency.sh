@@ -268,7 +268,7 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
         git fetch --all && \
-        git checkout ${REPO_AITER_COMMIT} && \
+        git checkout -f ${REPO_AITER_COMMIT} && \
         git submodule update --init --recursive && \
         pip install -r requirements.txt
     "
