@@ -25,6 +25,13 @@ from openai.types.responses import (
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai.types.responses.response_reasoning_item import (
     Content as ResponseReasoningTextContent,
+    Summary as ResponseReasoningSummary,
+)
+from openai.types.responses.response_reasoning_summary_part_added_event import (
+    Part as ResponseReasoningSummaryAddedPart,
+)
+from openai.types.responses.response_reasoning_summary_part_done_event import (
+    Part as ResponseReasoningSummaryDonePart,
 )
 from openai_harmony import Message as OpenAIMessage
 
@@ -88,8 +95,14 @@ class OpenAIServingResponses(OpenAIServingChat):
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
 
-        # Get default sampling params from model config if available
-        self.default_sampling_params = {}
+        # ``self.default_sampling_params`` is already populated by
+        # ``OpenAIServingChat.__init__`` (model_config.get_default_sampling_params,
+        # which incorporates ``--preferred-sampling-params`` and
+        # ``--sampling-defaults``) — don't re-fetch and bypass the parent's
+        # one-shot logging gate.
+        if not isinstance(self.default_sampling_params, dict):
+            # Defensive: keep mutate-safe even if parent ever switches type.
+            self.default_sampling_params = {}
 
         self.supports_browsing = (
             tool_server.has_tool("browser") if tool_server else False
@@ -598,6 +611,59 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         return response
 
+    @staticmethod
+    def _wants_reasoning_summary(request: ResponsesRequest) -> bool:
+        """Whether the caller opted into ``reasoning_summary_text.*`` SSE
+        events (and their ``ResponseReasoningSummary`` echo in the final
+        reasoning item) via ``reasoning.summary``."""
+        return (
+            request.reasoning is not None and request.reasoning.summary is not None
+        )
+
+    def _is_thinking_enabled_for_request(self, request: ResponsesRequest) -> bool:
+        """Decide whether to start the reasoning detector in thinking mode.
+
+        Mirrors serving_chat._get_reasoning_from_request, but the Responses API
+        has no ``chat_template_kwargs`` field — the only per-request signal is
+        ``request.reasoning.effort``. Without an explicit opt-out we honor the
+        chat template's auto-detected ``default_enabled``."""
+        if not self.reasoning_parser:
+            return False
+        effort = (
+            request.reasoning.effort
+            if request.reasoning is not None
+            else None
+        )
+        if self.reasoning_parser == "hunyuan":
+            return effort not in (None, "none", "no_think")
+        if self.template_manager.force_reasoning:
+            return True
+        config = self.template_manager.reasoning_config
+        if config is None:
+            # Parser-only models (DeepSeek-R1, etc.) carry their default in
+            # the detector itself. Mirror serving_chat's fallback so the
+            # Responses path doesn't silently drop CoT for them.
+            detector = getattr(self, "_reasoning_detector", None)
+            mode = getattr(detector, "reasoning_default", None) if detector else None
+            if mode is None or mode == "always":
+                return mode == "always"
+            if mode == "mistral":
+                return effort is not None and effort != "none"
+            if mode in ("thinking", "enable_thinking"):
+                return effort != "none"
+            if mode in ("explicit_thinking", "explicit_enable_thinking"):
+                return False
+            return False
+        if config.special_case == "always":
+            return True
+        if config.special_case == "mistral":
+            return effort is not None and effort != "none"
+        if config.toggle_param is None or config.default_enabled is None:
+            return False
+        if effort == "none":
+            return False
+        return bool(config.default_enabled)
+
     def _make_response_output_items(
         self,
         request: ResponsesRequest,
@@ -606,10 +672,15 @@ class OpenAIServingResponses(OpenAIServingChat):
     ):
         # Handle reasoning parsing if enabled
         if self.reasoning_parser:
-            # Use standard reasoning parser (openai maps to T4Detector internally)
+            # Use standard reasoning parser (openai maps to T4Detector internally).
+            # Chat templates that auto-inject ``<think>\n`` (Qwen3.5, GLM, …) only
+            # emit the close tag; mirror serving_chat's is_force_reasoning so the
+            # detector starts in thinking mode instead of dropping reasoning into
+            # the message body.
             reasoning_parser = ReasoningParser(
                 model_type=self.reasoning_parser,
                 stream_reasoning=False,
+                force_reasoning=self._is_thinking_enabled_for_request(request),
                 request=request,
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
@@ -619,10 +690,24 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         output_items = []
         if reasoning_content:
+            # The Responses spec splits the trace into ``summary`` (always
+            # readable, what TUIs like Codex render) and ``content`` (the
+            # encrypted/full trace, gated by ``include=reasoning.encrypted_content``).
+            # We have only one parser-extracted blob, so mirror it into
+            # ``summary`` when the caller opts in via ``reasoning.summary``.
+            wants_summary = self._wants_reasoning_summary(request)
             reasoning_item = ResponseReasoningItem(
                 id=f"rs_{random_uuid()}",
                 type="reasoning",
-                summary=[],
+                summary=(
+                    [
+                        ResponseReasoningSummary(
+                            type="summary_text", text=reasoning_content
+                        )
+                    ]
+                    if wants_summary
+                    else []
+                ),
                 content=[
                     ResponseReasoningTextContent(
                         type="reasoning_text", text=reasoning_content
@@ -760,7 +845,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             return content_part
 
         part_type = content_part.get("type")
-        if part_type == "input_text":
+        # ``input_text`` (user side) and ``output_text`` (Codex CLI replays
+        # of assistant turns) both map to plain ``text`` for chat templates.
+        if part_type in ("input_text", "output_text"):
             return {"type": "text", "text": content_part.get("text", "")}
 
         if part_type == "input_image":
@@ -816,8 +903,36 @@ class OpenAIServingResponses(OpenAIServingChat):
         if not isinstance(message, dict):
             return message
 
+        # Responses API exposes ``developer`` as a distinct role (system-like
+        # instructions from the application layer; Codex CLI relies on this).
+        # Most chat templates only recognize ``system``/``user``/``assistant``/
+        # ``tool``, so collapse ``developer`` into ``system`` at the boundary.
+        if message.get("role") == "developer":
+            message = {**message, "role": "system"}
+
         msg_type = message.get("type")
         if msg_type == "function_call":
+            # serving_chat's chat-template prep calls ``orjson.loads`` on every
+            # replayed tool-call ``arguments`` string and expects an object.
+            # Codex CLI sometimes echoes back a function_call whose JSON was
+            # truncated mid-emission (model hit ``max_output_tokens`` while
+            # writing the arguments block); non-OpenAI clients sometimes send
+            # ``arguments`` as a dict literal instead of a string. Normalize
+            # every shape to a valid JSON-object string so the chat template's
+            # unconditional ``orjson.loads`` never raises and a recovered
+            # turn renders as a no-arg tool call rather than a 500.
+            raw = message.get("arguments")
+            if isinstance(raw, str):
+                try:
+                    parsed = orjson.loads(raw) if raw else None
+                except orjson.JSONDecodeError:
+                    parsed = None
+                if not isinstance(parsed, dict):
+                    raw = "{}"
+            elif isinstance(raw, dict):
+                raw = orjson.dumps(raw).decode("utf-8")
+            else:
+                raw = "{}"
             return {
                 "role": "assistant",
                 "tool_calls": [
@@ -826,7 +941,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         "type": "function",
                         "function": {
                             "name": message.get("name"),
-                            "arguments": message.get("arguments", ""),
+                            "arguments": raw,
                         },
                     }
                 ],
@@ -836,6 +951,37 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "role": "tool",
                 "tool_call_id": message.get("call_id"),
                 "content": message.get("output", ""),
+            }
+        # Reasoning items carry the model's prior thinking. Preserve their
+        # text as ``{role: assistant, reasoning_content: ...}`` so chat
+        # templates (Qwen3 reads ``reasoning_content`` and re-emits a
+        # ``<think>`` block) can keep the history aligned across turns.
+        # Empty reasoning items (Codex CLI sends ``summary: []`` placeholders
+        # alongside its real assistant turns) collapse to nothing — drop them
+        # rather than inject an empty assistant block.
+        if msg_type == "reasoning":
+            # Codex CLI populates ``summary`` and ``content`` with the same
+            # text (summary is the user-facing trace, content is the
+            # encrypted full trace). Prefer ``summary``; only fall back to
+            # ``content`` when summary is empty, to avoid replaying the same
+            # paragraph twice.
+            def _collect(parts):
+                out: list[str] = []
+                for entry in parts or []:
+                    if isinstance(entry, dict):
+                        text = entry.get("text")
+                        if text:
+                            out.append(text)
+                return out
+
+            text_parts = _collect(message.get("summary"))
+            if not text_parts:
+                text_parts = _collect(message.get("content"))
+            if not text_parts:
+                return None
+            return {
+                "role": "assistant",
+                "reasoning_content": "\n".join(text_parts),
             }
         if msg_type not in (None, "message"):
             raise ValueError(f"Unsupported Responses API input item type: {msg_type!r}")
@@ -895,6 +1041,68 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         return "\n".join(text_parts) if text_parts else None
 
+    @staticmethod
+    def _merge_consecutive_assistant_messages(
+        messages: list,
+    ) -> list:
+        """Collapse runs of ``{role: assistant, …}`` dicts into one entry.
+
+        Combines ``content`` (string-join with a blank line, matching the
+        sglang chat-template flatten) and concatenates ``tool_calls`` lists
+        so a logical assistant turn renders as a single chat-template block.
+        Non-assistant messages and any other roles pass through unchanged.
+        """
+        merged: list = []
+        for msg in messages:
+            if (
+                isinstance(msg, dict)
+                and msg.get("role") == "assistant"
+                and merged
+                and isinstance(merged[-1], dict)
+                and merged[-1].get("role") == "assistant"
+            ):
+                prev = merged[-1] = dict(merged[-1])
+                # Merge content. Both sides may be missing / ``""`` / ``str`` /
+                # ``list[dict]``. To preserve non-text parts (``image_url``,
+                # ``file``…) when one side is a list and the other a string,
+                # lift the string into a ``[{type: text, text: ...}]`` part
+                # and concat as lists.
+                new_content = msg.get("content")
+                if new_content is not None and new_content != "":
+                    prev_content = prev.get("content")
+                    if prev_content is None or prev_content == "":
+                        prev["content"] = new_content
+                    elif isinstance(prev_content, str) and isinstance(new_content, str):
+                        sep = "\n\n" if prev_content and new_content else ""
+                        prev["content"] = prev_content + sep + new_content
+                    else:
+                        def _as_parts(c):
+                            if isinstance(c, list):
+                                return list(c)
+                            if isinstance(c, str) and c:
+                                return [{"type": "text", "text": c}]
+                            return []
+
+                        prev["content"] = _as_parts(prev_content) + _as_parts(new_content)
+                # Merge tool_calls.
+                new_calls = msg.get("tool_calls")
+                if new_calls:
+                    prev_calls = prev.get("tool_calls") or []
+                    prev["tool_calls"] = prev_calls + list(new_calls)
+                # Merge reasoning_content (one logical turn can carry a prior
+                # reasoning item *and* a subsequent message/function_call).
+                new_reasoning = msg.get("reasoning_content")
+                if new_reasoning:
+                    prev_reasoning = prev.get("reasoning_content")
+                    prev["reasoning_content"] = (
+                        f"{prev_reasoning}\n{new_reasoning}"
+                        if prev_reasoning
+                        else new_reasoning
+                    )
+                continue
+            merged.append(msg)
+        return merged
+
     def _construct_input_messages(
         self,
         request: ResponsesRequest,
@@ -928,11 +1136,48 @@ class OpenAIServingResponses(OpenAIServingChat):
         if isinstance(request.input, str):
             messages.append({"role": "user", "content": request.input})
         else:
-            messages.extend(
-                self._normalize_response_message_for_chat(input_item)
-                for input_item in request.input
-            )  # type: ignore
-        return messages
+            for input_item in request.input:
+                normalized = self._normalize_response_message_for_chat(input_item)
+                if normalized is not None:
+                    messages.append(normalized)  # type: ignore
+
+        # Codex CLI (and the OpenAI Responses spec) splits one logical
+        # assistant turn into multiple input items: a ``message`` carrying the
+        # narrative ``output_text`` plus one or more ``function_call`` items.
+        # Each item normalizes to its own ``{role: assistant, …}`` dict, and
+        # chat templates render every assistant dict as its own turn — Qwen3
+        # produces two ``<|im_start|>assistant`` blocks per logical turn, the
+        # first one effectively empty narration. Replayed across many turns
+        # the model learns "tool_response → short narrative assistant → stop"
+        # and terminates after one chatty reply. Merge consecutive assistant
+        # entries (and parallel ``tool_calls``) into a single chat message.
+        messages = self._merge_consecutive_assistant_messages(messages)
+
+        # Most chat templates (Qwen3, Llama, …) require a single ``system``
+        # message at position 0. Codex CLI sends top-level ``instructions``
+        # plus ``developer`` (renamed to ``system`` above) interleaved with
+        # user turns, so merge every system content into one leading
+        # message and keep the rest in their original order.
+        system_chunks: list[str] = []
+        other_msgs: list = []
+        for m in messages:
+            if isinstance(m, dict) and m.get("role") == "system":
+                content = m.get("content")
+                if isinstance(content, str):
+                    system_chunks.append(content)
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict):
+                            text = part.get("text")
+                            if isinstance(text, str):
+                                system_chunks.append(text)
+            else:
+                other_msgs.append(m)
+        if system_chunks:
+            return [
+                {"role": "system", "content": "\n\n".join(system_chunks)}
+            ] + other_msgs
+        return other_msgs
 
     def _construct_input_messages_with_harmony(
         self,
@@ -1539,6 +1784,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
         # Convert final_response to the format expected by ResponseCompletedEvent
         response_dict = final_response.model_dump()
+        # OpenAI SDK's Tool union may not know extended types; drop echo.
+        response_dict["tools"] = []
 
         # Convert UsageInfo to ResponseUsage format
         if response_dict.get("usage"):
@@ -1593,15 +1840,25 @@ class OpenAIServingResponses(OpenAIServingChat):
                 f"data: {event.model_dump_json(indent=None)}\n\n"
             )
 
-        initial_response = ResponsesResponse.from_request(
-            request,
-            sampling_params,
-            model_name=model_name,
-            created_time=created_time,
-            output=[],
-            status="in_progress",
-            usage=None,
-        ).model_dump()
+        # OpenAI SDK Tool union (used by Response* events) doesn't always
+        # know the full Responses spec; strip the echoed ``tools`` to avoid
+        # pydantic failing mid-stream on extended types (namespace, custom,
+        # …). Clients don't rely on this echo for execution.
+        def _sanitize_response_dict(d: dict) -> dict:
+            d["tools"] = []
+            return d
+
+        initial_response = _sanitize_response_dict(
+            ResponsesResponse.from_request(
+                request,
+                sampling_params,
+                model_name=model_name,
+                created_time=created_time,
+                output=[],
+                status="in_progress",
+                usage=None,
+            ).model_dump()
+        )
         yield _send_event(
             openai_responses_types.ResponseCreatedEvent(
                 type="response.created",
@@ -1638,6 +1895,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             reasoning_parser_obj = ReasoningParser(
                 model_type=self.reasoning_parser,
                 stream_reasoning=True,
+                force_reasoning=self._is_thinking_enabled_for_request(request),
                 request=request,
             )
 
@@ -1679,6 +1937,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             return item_id
 
+        wants_summary = self._wants_reasoning_summary(request)
+
         def _close_reasoning_item():
             if not reasoning_state["open"]:
                 return []
@@ -1686,7 +1946,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             completed_item = ResponseReasoningItem(
                 id=reasoning_state["item_id"],
                 type="reasoning",
-                summary=[],
+                summary=(
+                    [ResponseReasoningSummary(type="summary_text", text=text)]
+                    if wants_summary
+                    else []
+                ),
                 content=[
                     ResponseReasoningTextContent(type="reasoning_text", text=text),
                 ],
@@ -1703,6 +1967,35 @@ class OpenAIServingResponses(OpenAIServingChat):
                         text=text,
                     )
                 ),
+            ]
+            if wants_summary:
+                events.append(
+                    _send_event(
+                        openai_responses_types.ResponseReasoningSummaryTextDoneEvent(
+                            type="response.reasoning_summary_text.done",
+                            item_id=reasoning_state["item_id"],
+                            sequence_number=-1,
+                            output_index=reasoning_state["output_index"],
+                            summary_index=0,
+                            text=text,
+                        )
+                    )
+                )
+                events.append(
+                    _send_event(
+                        openai_responses_types.ResponseReasoningSummaryPartDoneEvent(
+                            type="response.reasoning_summary_part.done",
+                            item_id=reasoning_state["item_id"],
+                            sequence_number=-1,
+                            output_index=reasoning_state["output_index"],
+                            summary_index=0,
+                            part=ResponseReasoningSummaryDonePart(
+                                type="summary_text", text=text
+                            ),
+                        )
+                    )
+                )
+            events += [
                 _send_event(
                     openai_responses_types.ResponseOutputItemDoneEvent(
                         type="response.output_item.done",
@@ -1866,6 +2159,24 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 ),
                             )
                         )
+                        # Codex CLI (and any client that opted into a summary
+                        # via ``reasoning.summary``) renders the reasoning
+                        # bubble off the ``reasoning_summary_text.*`` event
+                        # stream, not ``reasoning_text.*``. Mirror the trace
+                        # into a summary part so the TUI has something to draw.
+                        if wants_summary:
+                            yield _send_event(
+                                openai_responses_types.ResponseReasoningSummaryPartAddedEvent(
+                                    type="response.reasoning_summary_part.added",
+                                    item_id=item_id,
+                                    output_index=reasoning_state["output_index"],
+                                    summary_index=0,
+                                    part=ResponseReasoningSummaryAddedPart(
+                                        type="summary_text", text=""
+                                    ),
+                                    sequence_number=-1,
+                                )
+                            )
                     reasoning_state["text"] += reasoning_chunk
                     yield _send_event(
                         openai_responses_types.ResponseReasoningTextDeltaEvent(
@@ -1877,6 +2188,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                             sequence_number=-1,
                         )
                     )
+                    if wants_summary:
+                        yield _send_event(
+                            openai_responses_types.ResponseReasoningSummaryTextDeltaEvent(
+                                type="response.reasoning_summary_text.delta",
+                                item_id=reasoning_state["item_id"],
+                                output_index=reasoning_state["output_index"],
+                                summary_index=0,
+                                delta=reasoning_chunk,
+                                sequence_number=-1,
+                            )
+                        )
 
                 if not delta:
                     continue
@@ -2006,15 +2328,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                         )
         except Exception:
             logger.exception("Error while streaming /v1/responses")
-            failed = ResponsesResponse.from_request(
-                request,
-                sampling_params,
-                model_name=model_name,
-                created_time=created_time,
-                output=[],
-                status="failed",
-                usage=None,
-            ).model_dump()
+            failed = _sanitize_response_dict(
+                ResponsesResponse.from_request(
+                    request,
+                    sampling_params,
+                    model_name=model_name,
+                    created_time=created_time,
+                    output=[],
+                    status="failed",
+                    usage=None,
+                ).model_dump()
+            )
             yield _send_event(
                 openai_responses_types.ResponseFailedEvent(
                     type="response.failed",
@@ -2062,7 +2386,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if stored is None or stored.status != "cancelled":
                     self.response_store[final_response.id] = final_response
 
-        response_dict = final_response.model_dump()
+        response_dict = _sanitize_response_dict(final_response.model_dump())
         if response_dict.get("usage"):
             usage_info = response_dict["usage"]
             response_dict["usage"] = {
