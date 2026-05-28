@@ -386,7 +386,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
                 "SGLANG_LTX2_SNAPSHOT_RELEASE_EMPTY_CACHE": "true",
             },
         ),
-        T2I_sampling_params,
         run_component_accuracy_check=False,
     ),
 ]
