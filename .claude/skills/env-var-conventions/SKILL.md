@@ -9,7 +9,7 @@ Apply this skill when adding, renaming, or reviewing any sglang-owned environmen
 
 ## Rule 1 — Define in the `Envs` class in `python/sglang/srt/environ.py`
 
-All sglang-owned env vars live as `EnvField` descriptors on the `Envs` class. Never add a new `os.getenv("SGLANG_...")` or `get_bool_env_var("SGLANG_...")` call site — the helpers in `python/sglang/srt/utils/common.py` carry an explicit `FIXME: move your environment variable to sglang.srt.environ` and exist only for pre-existing call sites.
+All sglang-owned env vars live as `EnvField` descriptors on the `Envs` class. Never add a new `os.getenv("SGLANG_...")`, `get_bool_env_var("SGLANG_...")`, or `get_int_env_var("SGLANG_...")` call site — the helpers in `python/sglang/srt/utils/common.py` carry an explicit `FIXME: move your environment variable to sglang.srt.environ` and exist only for pre-existing call sites.
 
 Group the new entry under an existing section comment (e.g. `# Logging Options`, `# Scheduler: recv interval`, `# Flashinfer`). Add a new section comment only when none fits — never drop a new entry at the bottom of an unrelated block.
 
@@ -144,14 +144,16 @@ The second token signals intent. Pick the right verb up front — renames requir
 | `LOG_FOO` | Logging-only knob | `SGLANG_LOG_GC`, `SGLANG_LOG_MS` |
 | `TEST_FOO` | Test-only hook | `SGLANG_TEST_RETRACT`, `SGLANG_TEST_MAX_RETRY` |
 | `DEBUG_FOO` | Debug-only instrumentation | `SGLANG_DEBUG_MEMORY_POOL`, `SGLANG_DEBUG_SYMM_MEM` |
-| `OPT_FOO` | DSV4 perf-optimization toggle | `SGLANG_OPT_USE_FUSED_HASH_TOPK`, `SGLANG_OPT_USE_TOPK_V2` |
+| `OPT_FOO` | Perf-optimization toggle (heavily used by DSV4 work) | `SGLANG_OPT_USE_FUSED_HASH_TOPK`, `SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2` |
 
-Picking between `ENABLE_FOO` and `DISABLE_FOO`: the env-var name plus its default should read naturally. Prefer:
+Picking between `ENABLE_FOO` and `DISABLE_FOO`: both verbs are valid. The only forbidden combination is `DISABLE_FOO = EnvBool(True)`, because it produces a true double-negative at the call site (`if not envs.SGLANG_DISABLE_FOO.get():` reads as "if not disabled"). All other combinations are fine:
 
-- Opt-in feature: `SGLANG_ENABLE_FOO = EnvBool(False)` (off in prod, user opts in by setting `True`)
-- Opt-out kill-switch: `SGLANG_DISABLE_FOO = EnvBool(False)` (on in prod, user opts out by setting `True`)
-
-Avoid double-negatives like `ENABLE_FOO = EnvBool(True)` ("set to False to disable") — it's allowed (a few legacy entries do this) but harder to read.
+| Pattern | Call site | Verdict |
+|---|---|---|
+| `ENABLE_FOO = EnvBool(False)` | `if envs.SGLANG_ENABLE_FOO.get():` | OK — opt-in feature |
+| `ENABLE_FOO = EnvBool(True)`  | `if envs.SGLANG_ENABLE_FOO.get():` | OK — on in prod, user opts out via `False` |
+| `DISABLE_FOO = EnvBool(False)` | `if not envs.SGLANG_DISABLE_FOO.get():` | OK — single negation, reads as "if enabled" |
+| `DISABLE_FOO = EnvBool(True)`  | `if not envs.SGLANG_DISABLE_FOO.get():` | **Forbidden** — true double-negative |
 
 `SGLANG_*` is the canonical sglang prefix. Vendor-integration keys (`MOONCAKE_*`, `ASCEND_*`, `DEEP_NORMAL_*`, `IS_H200`) keep their upstream prefix and live in the same `Envs` class — these are integration aliases, not sglang-owned feature flags.
 
@@ -198,4 +200,4 @@ Don't add a CLI flag that just forwards to an env var, and don't add an env var 
 
 - **External / vendor env vars consumed raw** (`HF_HUB_*`, `CUDA_*`, `NCCL_*`, `TORCH_*`, `OMP_*`, `RANK`, `MASTER_ADDR`, etc.): see the decision table in Rule 1 — `os.getenv` is correct, don't pull them into `Envs`.
 - **Pre-existing `get_bool_env_var(...)` / `get_int_env_var(...)` call sites**: leave them as is; new code shouldn't add more, but mass-migration is out of scope for a feature PR.
-- **Upstream-aliased keys already in `Envs`** (`MOONCAKE_*`, `ASCEND_*`, `DEEP_NORMAL_*`, `IS_H200`): the `SGLANG_` prefix rules in Rule 4 don't apply — the upstream prefix is the canonical name.
+- **Upstream-aliased keys already in `Envs`** (`MOONCAKE_*`, `ASCEND_*`, `DEEP_NORMAL_*`, `IS_H200`, `USE_TRITON_W8A8_FP8_KERNEL`, `HF_HUB_DISABLE_XET`, `DISABLE_OPENAPI_DOC` — see Rule 1 decision table): the `SGLANG_` prefix rules in Rule 4 don't apply — the upstream prefix is the canonical name.
