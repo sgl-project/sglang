@@ -3636,16 +3636,10 @@ class Scheduler(
             batch_reqs = list(self.running_batch.reqs)
         else:
             batch_reqs = list(self.running_batch.reqs) + list(self.cur_batch.reqs)
-        # PP: rids from every in-flight microbatch must also be treated as
-        # 'in batch'. Each mb's forward was launched against the req's
-        # req_pool_idx + KV slots; the output processor on a different mb
-        # iteration consumes the result later. Without this, a still-
-        # mid-prefill chunked-resume req sitting outside any current batch
-        # would fall into the waiting-only abort path, release_kv_cache
-        # would free the row + KV underneath the still-launched forward,
-        # and the delayed output processor would crash on a None
-        # req_pool_idx (or mistake the middle-chunk result for a full
-        # output and append garbage tokens).
+        # PP: every in-flight microbatch's reqs count as 'in batch' so they
+        # take the running-path abort (sets req.to_finish). The waiting-path
+        # abort would release_kv_cache while the forward is still launched,
+        # corrupting the KV pool under it.
         if self.ps.pp_size > 1 and hasattr(self, "mbs"):
             for mb_list in (self.mbs, self.last_mbs, self.running_mbs):
                 for mb in mb_list:
