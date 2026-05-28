@@ -2249,7 +2249,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return {}
 
         metadata: dict[str, object] = {
-            "group_idx": 0,
             "kv_cache_spec_kind": "full_attention",
             "kv_cache_spec_sliding_window": int(sliding_window_size),
         }

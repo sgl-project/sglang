@@ -374,7 +374,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         self, node: TreeNode, medium=None
     ) -> dict[str, object]:
         metadata: dict[str, object] = {
-            "group_idx": 0,
             "kv_cache_spec_kind": "full_attention",
             "kv_cache_spec_sliding_window": int(self.sliding_window_size),
         }
