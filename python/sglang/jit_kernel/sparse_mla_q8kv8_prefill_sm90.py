@@ -95,20 +95,21 @@ _get_current_stream_raw = torch._C._cuda_getCurrentRawStream
 
 # Module-level cache for kernel-write-only output tensors. The active s_q rows
 # are overwritten every call; buffers grow monotonically by device/head shape.
-_q8kv8_outbuf_cache: dict = {}
-
-
-def _q8kv8_get_outbufs(s_q: int, h_q: int, d_v: int, device: torch.device):
-    key = (device, h_q, d_v)
-    entry = _q8kv8_outbuf_cache.get(key)
-    if entry is None or entry[0].shape[0] < s_q:
-        out = torch.empty(s_q, h_q, d_v, dtype=torch.bfloat16, device=device)
-        max_logits = torch.empty(s_q, h_q, dtype=torch.float32, device=device)
-        lse = torch.empty(s_q, h_q, dtype=torch.float32, device=device)
-        _q8kv8_outbuf_cache[key] = (out, max_logits, lse)
-    else:
-        out, max_logits, lse = entry
-    return out[:s_q], max_logits[:s_q], lse[:s_q]
+def _check_out_buffer(
+    t: torch.Tensor,
+    name: str,
+    shape: tuple,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> None:
+    if tuple(t.shape) != tuple(shape):
+        raise ValueError(f"{name} must have shape {tuple(shape)}, got {tuple(t.shape)}")
+    if t.dtype != dtype:
+        raise ValueError(f"{name} must have dtype {dtype}, got {t.dtype}")
+    if t.device != device:
+        raise ValueError(f"{name} must be on device {device}, got {t.device}")
+    if not t.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
 
 
 # Internal custom-op wrappers so the JIT kernel calls participate in
@@ -220,8 +221,18 @@ def sparse_mla_q8kv8_prefill_fwd(
     d_v: int = 512,
     attn_sink: Optional[torch.Tensor] = None,  # [h_q], float32
     topk_length: Optional[torch.Tensor] = None,  # [s_q], int32
+    *,
+    out: Optional[torch.Tensor] = None,  # [s_q, h_q, d_v], bfloat16
+    max_logits: Optional[torch.Tensor] = None,  # [s_q, h_q], float32
+    lse: Optional[torch.Tensor] = None,  # [s_q, h_q], float32
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run Q8KV8 (FP8) sparse prefill attention on SM90.
+
+    The kernel writes into three output tensors. By default fresh tensors
+    are allocated and returned; callers that want to reuse buffers (e.g.
+    for CUDA graph capture) may pass pre-allocated ``out`` / ``max_logits``
+    / ``lse`` tensors of the expected shape/dtype/device. The three output
+    tensors must not alias each other.
 
     Returns:
         out:        [s_q, h_q, d_v], bfloat16
@@ -241,7 +252,27 @@ def sparse_mla_q8kv8_prefill_fwd(
     if (attn_sink is None) != (topk_length is None):
         raise ValueError("attn_sink and topk_length must be provided together")
 
-    out, max_logits, lse = _q8kv8_get_outbufs(s_q, h_q, d_v, q.device)
+    device = q.device
+    if out is None:
+        out = torch.empty(s_q, h_q, d_v, dtype=torch.bfloat16, device=device)
+    else:
+        _check_out_buffer(out, "out", (s_q, h_q, d_v), torch.bfloat16, device)
+    if max_logits is None:
+        max_logits = torch.empty(s_q, h_q, dtype=torch.float32, device=device)
+    else:
+        _check_out_buffer(max_logits, "max_logits", (s_q, h_q), torch.float32, device)
+    if lse is None:
+        lse = torch.empty(s_q, h_q, dtype=torch.float32, device=device)
+    else:
+        _check_out_buffer(lse, "lse", (s_q, h_q), torch.float32, device)
+
+    # The three output tensors are written independently by the kernel; any
+    # aliasing among them would corrupt results, so reject it explicitly.
+    out_ptr = out.data_ptr()
+    ml_ptr = max_logits.data_ptr()
+    lse_ptr = lse.data_ptr()
+    if out_ptr == ml_ptr or out_ptr == lse_ptr or ml_ptr == lse_ptr:
+        raise ValueError("out, max_logits and lse must not alias each other")
 
     cuda_stream = _get_current_stream_raw(q.device.index)
 
