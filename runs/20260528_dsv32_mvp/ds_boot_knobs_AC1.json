@@ -1,0 +1,15 @@
+{
+  "model_path": "/cluster-storage/models/deepseek-ai/DeepSeek-V3.2",
+  "tp_size": "8",
+  "kv_cache_dtype": "fp8_e4m3",
+  "page_size": "64",
+  "enable_double_sparsity": "True",
+  "disable_radix_cache": "True",
+  "disable_cuda_graph": "False",
+  "disable_piecewise_cuda_graph": "True",
+  "disable_overlap_schedule": "True",
+  "attention_backend": "dsa",
+  "mem_fraction_static": "0.6",
+  "dsa_prefill_backend": "flashmla_kv",
+  "dsa_decode_backend": "flashmla_kv"
+}
