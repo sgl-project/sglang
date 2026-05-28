@@ -3,119 +3,23 @@
 The wrapper module is designed to import cleanly even without Ray installed; we
 inject a fake ``ray``/``ray.util.metrics``/``ray.serve`` triple into
 ``sys.modules`` before importing the module so the tests run on the CPU CI
-runners that don't ship Ray.
+runners that don't ship Ray. The fakes are shared with the DI integration
+tests in ``test_stat_loggers_di.py``.
 """
 
 from __future__ import annotations
 
-import importlib
 import sys
-import types
 import unittest
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.observability.fake_ray import (
+    clear_fake_ray_modules,
+    load_ray_wrappers_with_fake_ray,
+    load_ray_wrappers_without_ray,
+)
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
-
-
-# ---------------------------------------------------------------------------
-# Fake Ray primitives used by every test below.
-# ---------------------------------------------------------------------------
-
-
-class _FakeRayMetric:
-    """Stand-in for ray.util.metrics.{Counter,Gauge,Histogram}.
-
-    Records every ``inc``/``set``/``observe`` call so tests can assert on the
-    forwarded value and tags dict.
-    """
-
-    def __init__(
-        self,
-        name: str = "",
-        description: str = "",
-        tag_keys: tuple = (),
-        boundaries=None,
-    ):
-        self.name = name
-        self.description = description
-        self._tag_keys = tuple(tag_keys)
-        self.boundaries = list(boundaries) if boundaries is not None else None
-        self.calls = []  # list of (op, value, tags)
-
-    def inc(self, value, tags=None):
-        self.calls.append(("inc", value, dict(tags or {})))
-
-    def set(self, value, tags=None):
-        self.calls.append(("set", value, dict(tags or {})))
-
-    def observe(self, value, tags=None):
-        self.calls.append(("observe", value, dict(tags or {})))
-
-
-class _FakeRayServeException(Exception):
-    pass
-
-
-def _make_fake_ray(replica_id: str = "test-replica") -> dict:
-    """Return a dict of fake modules to be injected into ``sys.modules``."""
-
-    ray_pkg = types.ModuleType("ray")
-    ray_util = types.ModuleType("ray.util")
-    ray_util_metrics = types.ModuleType("ray.util.metrics")
-    ray_util_metrics.Counter = _FakeRayMetric
-    ray_util_metrics.Gauge = _FakeRayMetric
-    ray_util_metrics.Histogram = _FakeRayMetric
-    ray_util_metrics.Metric = _FakeRayMetric
-
-    ray_serve = types.ModuleType("ray.serve")
-    ray_serve_exc = types.ModuleType("ray.serve.exceptions")
-    ray_serve_exc.RayServeException = _FakeRayServeException
-    ray_serve.exceptions = ray_serve_exc
-
-    class _ReplicaCtx:
-        class _Id:
-            unique_id = replica_id
-
-        replica_id = _Id()
-
-    ray_serve.get_replica_context = lambda: _ReplicaCtx()
-
-    return {
-        "ray": ray_pkg,
-        "ray.util": ray_util,
-        "ray.util.metrics": ray_util_metrics,
-        "ray.serve": ray_serve,
-        "ray.serve.exceptions": ray_serve_exc,
-    }
-
-
-def _load_wrappers_with_fake_ray(replica_id: str = "test-replica"):
-    """Inject fake ray modules and (re)import ``ray_wrappers``."""
-
-    fake = _make_fake_ray(replica_id=replica_id)
-    sys.modules.update(fake)
-    sys.modules.pop("sglang.srt.observability.ray_wrappers", None)
-    module = importlib.import_module("sglang.srt.observability.ray_wrappers")
-    return module
-
-
-def _load_wrappers_without_ray():
-    """Make ``import ray`` fail and (re)import ``ray_wrappers`` cleanly."""
-
-    for name in (
-        "ray",
-        "ray.util",
-        "ray.util.metrics",
-        "ray.serve",
-        "ray.serve.exceptions",
-    ):
-        sys.modules.pop(name, None)
-        # Set to None so ``import ray`` raises ImportError immediately.
-        sys.modules[name] = None  # type: ignore[assignment]
-    sys.modules.pop("sglang.srt.observability.ray_wrappers", None)
-    module = importlib.import_module("sglang.srt.observability.ray_wrappers")
-    return module
 
 
 # ---------------------------------------------------------------------------
@@ -125,18 +29,10 @@ def _load_wrappers_without_ray():
 
 class TestRayWrapperBase(unittest.TestCase):
     def setUp(self) -> None:
-        self.rw = _load_wrappers_with_fake_ray(replica_id="rep-001")
+        self.rw = load_ray_wrappers_with_fake_ray(replica_id="rep-001")
 
     def tearDown(self) -> None:
-        for name in (
-            "ray",
-            "ray.util",
-            "ray.util.metrics",
-            "ray.serve",
-            "ray.serve.exceptions",
-            "sglang.srt.observability.ray_wrappers",
-        ):
-            sys.modules.pop(name, None)
+        clear_fake_ray_modules()
 
 
 class TestNameSanitization(TestRayWrapperBase):
@@ -363,18 +259,10 @@ class TestRayMissingImportError(unittest.TestCase):
     wrapper without Ray must raise ImportError with a clear message."""
 
     def setUp(self) -> None:
-        self.rw = _load_wrappers_without_ray()
+        self.rw = load_ray_wrappers_without_ray()
 
     def tearDown(self) -> None:
-        for name in (
-            "ray",
-            "ray.util",
-            "ray.util.metrics",
-            "ray.serve",
-            "ray.serve.exceptions",
-            "sglang.srt.observability.ray_wrappers",
-        ):
-            sys.modules.pop(name, None)
+        clear_fake_ray_modules()
 
     def test_module_imports_without_ray(self):
         # If we got here without exception, the import succeeded.

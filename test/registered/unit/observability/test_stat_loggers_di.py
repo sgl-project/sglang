@@ -22,6 +22,10 @@ from sglang.srt.observability.metrics_collector import (
     TokenizerMetricsCollector,
     resolve_collector_class,
 )
+from sglang.test.observability.fake_ray import (
+    clear_fake_ray_modules,
+    load_ray_wrappers_with_fake_ray,
+)
 
 
 class _StubArgs:
@@ -195,6 +199,104 @@ class TestDISwap(unittest.TestCase):
         self.assertIsInstance(
             collector.eviction_duration_seconds, prometheus_client.Histogram
         )
+
+
+# ── End-to-end DI emission flow with the Ray-backed wrappers ──
+#
+# The TestDISwap cases above prove the collector swap took effect by counting
+# instantiations. These cases go one layer deeper: they construct a Ray-backed
+# collector subclass through ``resolve_collector_class``, drive an actual
+# ``inc``/``set``/``observe`` call, and verify the value and tags landed on
+# the underlying (fake) Ray metric instance. This exercises the full chain:
+#
+#     stat_loggers → resolve_collector_class → Ray-backed collector
+#     → RayCounterWrapper / RayGaugeWrapper / RayHistogramWrapper
+#     → FakeRayMetric.calls
+#
+# The fakes used here are the same ones the wrapper unit tests use, kept in
+# ``sglang.test.observability.fake_ray`` so both suites stay in sync.
+
+
+class TestDIEmissionFlow(unittest.TestCase):
+    """DI swap propagates all the way down to metric emission."""
+
+    REPLICA_ID = "rep-di-emit"
+
+    def setUp(self) -> None:
+        self.rw = load_ray_wrappers_with_fake_ray(replica_id=self.REPLICA_ID)
+
+    def tearDown(self) -> None:
+        clear_fake_ray_modules()
+
+    def test_radix_cache_counter_emit_reaches_fake_ray_metric(self):
+        """Counter path: stat_loggers selects the Ray-backed RadixCache
+        collector; an ``inc`` call lands on the FakeRayMetric with the
+        ReplicaId tag injected by the wrapper."""
+
+        cls = resolve_collector_class(
+            _StubArgs(
+                stat_loggers={
+                    STAT_LOGGER_ROLE_RADIX_CACHE: self.rw.RayRadixCacheMetricsCollector
+                }
+            ),
+            STAT_LOGGER_ROLE_RADIX_CACHE,
+            RadixCacheMetricsCollector,
+        )
+        self.assertIs(cls, self.rw.RayRadixCacheMetricsCollector)
+
+        labels = {"cache_type": "test_emit"}
+        collector = cls(labels=labels)
+        collector.eviction_num_tokens.labels(**labels).inc(42)
+
+        op, value, tags = collector.eviction_num_tokens.metric.calls[-1]
+        self.assertEqual(op, "inc")
+        self.assertEqual(value, 42)
+        self.assertEqual(tags["cache_type"], "test_emit")
+        self.assertEqual(tags["ReplicaId"], self.REPLICA_ID)
+
+    def test_radix_cache_histogram_emit_reaches_fake_ray_metric(self):
+        """Histogram path: same flow as above but with ``observe``."""
+
+        cls = resolve_collector_class(
+            _StubArgs(
+                stat_loggers={
+                    STAT_LOGGER_ROLE_RADIX_CACHE: self.rw.RayRadixCacheMetricsCollector
+                }
+            ),
+            STAT_LOGGER_ROLE_RADIX_CACHE,
+            RadixCacheMetricsCollector,
+        )
+        labels = {"cache_type": "test_observe"}
+        collector = cls(labels=labels)
+        collector.eviction_duration_seconds.labels(**labels).observe(0.25)
+
+        op, value, tags = collector.eviction_duration_seconds.metric.calls[-1]
+        self.assertEqual(op, "observe")
+        self.assertEqual(value, 0.25)
+        self.assertEqual(tags["cache_type"], "test_observe")
+        self.assertEqual(tags["ReplicaId"], self.REPLICA_ID)
+
+    def test_expert_dispatch_emit_reaches_fake_ray_metric(self):
+        """Smallest collector (a single Histogram) — proves the DI path works
+        when only ``_histogram_cls`` is overridden, with no other class hooks."""
+
+        cls = resolve_collector_class(
+            _StubArgs(
+                stat_loggers={
+                    STAT_LOGGER_ROLE_EXPERT_DISPATCH: self.rw.RayExpertDispatchCollector
+                }
+            ),
+            STAT_LOGGER_ROLE_EXPERT_DISPATCH,
+            ExpertDispatchCollector,
+        )
+        collector = cls(ep_size=4)
+        collector.eplb_gpu_physical_count.labels(layer="layer0").observe(2)
+
+        op, value, tags = collector.eplb_gpu_physical_count.metric.calls[-1]
+        self.assertEqual(op, "observe")
+        self.assertEqual(value, 2)
+        self.assertEqual(tags["layer"], "layer0")
+        self.assertEqual(tags["ReplicaId"], self.REPLICA_ID)
 
 
 if __name__ == "__main__":
