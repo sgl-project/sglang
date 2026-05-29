@@ -32,6 +32,24 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
         yield from run_until_finished(r)
         assert r.finished, "req did not finish"
 
+    _CHUNK_BOUNDARY_OFFSETS = (-2, -1, 1, 2)
+
+    def test_chunked_prefill_smoke_at_chunk_boundary_offsets(self):
+        """Prompt lengths just off a chunk-size multiple (+/-1, +/-2) still finish cleanly."""
+        for offset in self._CHUNK_BOUNDARY_OFFSETS:
+            prompt_len = 2 * _CHUNK_SIZE + offset
+            with self.subTest(offset=offset, prompt_len=prompt_len):
+                self.runtime.run(
+                    self._script_chunked_prefill_smoke_at_offset,
+                    args=(prompt_len,),
+                )
+
+    @staticmethod
+    def _script_chunked_prefill_smoke_at_offset(t: ScriptedRuntime, prompt_len: int):
+        r = t.start_req(prompt_len=prompt_len, max_new_tokens=3)
+        yield from run_until_finished(r)
+        assert r.finished, f"req with prompt_len={prompt_len} did not finish"
+
     def test_chunked_req_scheduled_last_iter_observed_true_then_false(self):
         """While chunking, the scheduler flag flips True at least once; after finish it clears to False."""
         self.runtime.run(
