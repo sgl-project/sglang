@@ -84,6 +84,16 @@ _SERVER_ARGS_ATTRS = {
     "attn_cp_size": 1,
     "moe_dp_size": 1,
     "device": "cpu",
+    "disable_chunked_prefix_cache": True,
+    "chunked_prefix_cache_threshold": 0,
+    "ep_size": 1,
+    "tp_size": 1,
+    "flashinfer_mla_disable_ragged": True,
+    "disable_flashinfer_cutlass_moe_fp4_allgather": True,
+    "enable_flashinfer_cutlass_moe": False,
+    "enable_flashinfer_trtllm_moe": False,
+    "enable_triton_kernel_moe": False,
+    "enable_triton_kernel_moe_with_router_fusion": False,
 }
 
 
@@ -99,6 +109,25 @@ class _FakeExperts(nn.Module):
         # Some block-level code reads `.should_fuse_routed_scaling_factor_in_topk`
         # off the experts attribute before it constructs TopK.
         self.should_fuse_routed_scaling_factor_in_topk = False
+
+
+class _FakeRotaryEmbedding(nn.Module):
+    """Stands in for `get_rope_wrapper(...)` / `get_rope(...)` returns.
+
+    The construction-test host runs with `_SERVER_ARGS_ATTRS["device"] =
+    "cpu"`, which forces `get_rope_wrapper` into the `get_rope_cpu` branch
+    at `rotary_embedding/factory.py:441`. That branch asserts
+    `rope_scaling is not None` and only supports `deepseek_yarn`. Several
+    decoder layers under test pass `rope_scaling=None`, which surfaces as
+    a bare `AssertionError` from the constructor.
+
+    Patching the rope factory at the fixture boundary keeps the constructor
+    under test (and its `TopK` instantiation) intact while hiding an
+    incidental CPU-host quirk that has nothing to do with the opt-out
+    plumbing."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__()
 
 
 @contextlib.contextmanager
@@ -117,7 +146,17 @@ def construction_fixture() -> Iterator[None]:
     saved_server_args = sa_mod._global_server_args
     sa_mod._global_server_args = SimpleNamespace(**_SERVER_ARGS_ATTRS)
 
-    group_names = ["_WORLD", "_TP", "_DP", "_PP", "_MOE_EP", "_MOE_TP", "_ATTN_TP"]
+    group_names = [
+        "_WORLD",
+        "_TP",
+        "_DP",
+        "_PP",
+        "_MOE_EP",
+        "_MOE_TP",
+        "_MOE_DP",
+        "_ATTN_TP",
+        "_ATTN_CP",
+    ]
     saved_groups = {}
     for name in group_names:
         if hasattr(ps, name):
@@ -152,6 +191,10 @@ def construction_fixture() -> Iterator[None]:
     # the source module would leave the model-local symbol pointing at
     # the real backend, defeating the fixture.
     fake_a2a = MagicMock(is_none=lambda: True, is_deepep=lambda: False)
+
+    def _fake_rope_factory(*args, **kwargs):
+        return _FakeRotaryEmbedding()
+
     patches = [
         patch(
             "sglang.srt.distributed.get_tensor_model_parallel_world_size",
@@ -192,22 +235,38 @@ def construction_fixture() -> Iterator[None]:
         ),
         patch.object(ep_layer, "get_moe_impl_class", return_value=_FakeExperts),
         patch.object(moe_utils, "get_moe_a2a_backend", return_value=fake_a2a),
+        patch(
+            "sglang.srt.layers.rotary_embedding.factory.get_rope_wrapper",
+            side_effect=_fake_rope_factory,
+        ),
+        patch(
+            "sglang.srt.layers.rotary_embedding.factory.get_rope",
+            side_effect=_fake_rope_factory,
+        ),
     ]
 
     # Patch every already-loaded sglang.srt.models.* module's local
-    # binding of `get_moe_impl_class` to point at our fake. This makes
-    # the fixture robust to import order: even when the model module is
-    # imported before `construction_fixture()` is entered, its module-
-    # local symbol is rebound for the lifetime of the fixture.
+    # binding of `get_moe_impl_class` / `get_rope_wrapper` / `get_rope`
+    # to point at our fakes. This makes the fixture robust to import
+    # order: even when the model module is imported before
+    # `construction_fixture()` is entered, its module-local symbol is
+    # rebound for the lifetime of the fixture.
     model_local_patches = []
     for mod_name, mod in list(sys.modules.items()):
         if not mod_name.startswith("sglang.srt.models."):
             continue
-        if not hasattr(mod, "get_moe_impl_class"):
-            continue
-        model_local_patches.append(
-            patch.object(mod, "get_moe_impl_class", return_value=_FakeExperts)
-        )
+        if hasattr(mod, "get_moe_impl_class"):
+            model_local_patches.append(
+                patch.object(mod, "get_moe_impl_class", return_value=_FakeExperts)
+            )
+        if hasattr(mod, "get_rope_wrapper"):
+            model_local_patches.append(
+                patch.object(mod, "get_rope_wrapper", side_effect=_fake_rope_factory)
+            )
+        if hasattr(mod, "get_rope"):
+            model_local_patches.append(
+                patch.object(mod, "get_rope", side_effect=_fake_rope_factory)
+            )
 
     for p in patches + model_local_patches:
         p.start()
@@ -467,14 +526,8 @@ class NewPlumbingChainTest(unittest.TestCase):
             moe_latent_size=None,
             layer_norm_epsilon=1e-6,
         )
-        try:
-            with construction_fixture():
+        with construction_fixture():
                 layer = NemotronHMTPMoEDecoderLayer(cfg, layer_idx=0)
-        except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-            self.skipTest(
-                f"NemotronHMTPMoEDecoderLayer fixture gap: "
-                f"{type(exc).__name__}: {exc}"
-            )
         topks = _collect_topks(layer)
         self.assertEqual(len(topks), 1)
         self.assertFalse(
@@ -530,12 +583,7 @@ class DeepseekV2MoEConstructionTest(unittest.TestCase):
 
         cfg = self._config()
         with construction_fixture():
-            try:
-                blk = DeepseekV2MoE(cfg, layer_id=0, is_nextn=True)
-            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-                self.skipTest(
-                    f"DeepseekV2MoE fixture gap: {type(exc).__name__}: {exc}"
-                )
+            blk = DeepseekV2MoE(cfg, layer_id=0, is_nextn=True)
         topks = _collect_topks(blk)
         self.assertEqual(len(topks), 1)
         self.assertFalse(topks[0].topk_config.capture_routed_experts)
@@ -548,17 +596,12 @@ class DeepseekV2MoEConstructionTest(unittest.TestCase):
 
         cfg = self._config()
         with construction_fixture():
-            try:
-                blk = DeepseekV2MoE(
-                    cfg,
-                    layer_id=0,
-                    is_nextn=False,
-                    capture_routed_experts=False,
-                )
-            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-                self.skipTest(
-                    f"DeepseekV2MoE fixture gap: {type(exc).__name__}: {exc}"
-                )
+            blk = DeepseekV2MoE(
+                cfg,
+                layer_id=0,
+                is_nextn=False,
+                capture_routed_experts=False,
+            )
         topks = _collect_topks(blk)
         self.assertEqual(len(topks), 1)
         self.assertFalse(topks[0].topk_config.capture_routed_experts)
@@ -587,15 +630,9 @@ class GLM4MoEConstructionTest(unittest.TestCase):
 
         cfg = self._config()
         with construction_fixture():
-            try:
-                blk = Glm4MoeSparseMoeBlock(
-                    cfg, layer_id=0, is_nextn=True
-                )
-            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-                self.skipTest(
-                    f"Glm4MoeSparseMoeBlock fixture gap: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+            blk = Glm4MoeSparseMoeBlock(
+                cfg, layer_id=0, is_nextn=True
+            )
         topks = _collect_topks(blk)
         self.assertEqual(len(topks), 1)
         self.assertFalse(topks[0].topk_config.capture_routed_experts)
@@ -638,14 +675,8 @@ class DenseInnerBlockConstructionTest(unittest.TestCase):
         from sglang.srt.models.qwen2 import Qwen2DecoderLayer
 
         cfg = self._qwen2_config()
-        try:
-            with construction_fixture():
+        with construction_fixture():
                 layer = Qwen2DecoderLayer(cfg, layer_id=0)
-        except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-            self.skipTest(
-                f"Qwen2DecoderLayer requires extra infrastructure not "
-                f"covered by the fixture: {type(exc).__name__}: {exc}"
-            )
         self.assertEqual(
             len(_collect_topks(layer)),
             0,
@@ -678,14 +709,8 @@ class DenseInnerBlockConstructionTest(unittest.TestCase):
             tie_word_embeddings=False,
             mlp_bias=False,
         )
-        try:
-            with construction_fixture():
+        with construction_fixture():
                 layer = LlamaDecoderLayer(cfg, layer_id=0)
-        except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-            self.skipTest(
-                f"LlamaDecoderLayer fixture gap: "
-                f"{type(exc).__name__}: {exc}"
-            )
         self.assertEqual(
             len(_collect_topks(layer)),
             0,
@@ -728,14 +753,8 @@ class DenseInnerBlockConstructionTest(unittest.TestCase):
             num_shared_experts=0,
             norm_topk_prob=True,
         )
-        try:
-            with construction_fixture():
+        with construction_fixture():
                 layer = Ernie4DecoderLayer(cfg, layer_id=0, is_mtp=True)
-        except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-            self.skipTest(
-                f"Ernie4DecoderLayer fixture gap: "
-                f"{type(exc).__name__}: {exc}"
-            )
         self.assertEqual(
             len(_collect_topks(layer)),
             0,
@@ -760,6 +779,7 @@ def _attn_common() -> dict:
         rope_theta=10000.0,
         rope_scaling=None,
         rms_norm_eps=1e-6,
+        layernorm_epsilon=1e-6,
         head_dim=16,
         attention_bias=False,
         attention_dropout=0.0,
@@ -780,11 +800,16 @@ def _attn_common() -> dict:
         v_head_dim=8,
         kv_lora_rank=16,
         q_lora_rank=None,
-        # Other attrs occasionally read by various families
-        swa_num_attention_heads=None,
-        swa_num_key_value_heads=None,
+        # Other attrs occasionally read by various families. SWA heads
+        # default to non-None integers so MiMoV2's SWA-aware MTP layer
+        # (`mimo_v2_nextn.py:84` reads `config.swa_num_attention_heads`)
+        # can compute `num_heads % tp_size` without `%`-ing `NoneType`.
+        swa_num_attention_heads=4,
+        swa_num_key_value_heads=4,
         swa_head_dim=16,
         sliding_window=None,
+        sliding_window_size=-1,
+        sliding_window_pattern=None,
         mlp_bias=False,
         use_bias=False,
         rope_is_neox_style=True,
@@ -831,14 +856,7 @@ class BailingMoEConstructionTest(unittest.TestCase):
 
         cfg = self._config()
         with construction_fixture():
-            try:
-                blk = BailingMoEBlock(cfg, layer_id=0, is_nextn=True)
-            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-                raise unittest.SkipTest(
-                    f"BailingMoEBlock fixture gap: {type(exc).__name__}: {exc}. "
-                    "Construction-test infra needs additional config attrs; "
-                    "the source/AST tests still verify the wrapper opt-out."
-                )
+            blk = BailingMoEBlock(cfg, layer_id=0, is_nextn=True)
         topks = _collect_topks(blk)
         self.assertEqual(len(topks), 1)
         self.assertFalse(topks[0].topk_config.capture_routed_experts)
@@ -848,13 +866,7 @@ class BailingMoEConstructionTest(unittest.TestCase):
 
         cfg = self._config()
         with construction_fixture():
-            try:
-                blk = BailingMoEBlock(cfg, layer_id=0, is_nextn=False)
-            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-                raise unittest.SkipTest(
-                    f"BailingMoEBlock target fixture gap: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+            blk = BailingMoEBlock(cfg, layer_id=0, is_nextn=False)
         topks = _collect_topks(blk)
         # The target path may construct a sparse block or skip if the first
         # layer is dense. If sparse, the flag must be True; if dense, no
@@ -891,40 +903,37 @@ class Gemma4DecoderLayerConstructionTest(unittest.TestCase):
 
         cfg = self._config()
         with construction_fixture():
-            try:
-                layer = Gemma4DecoderLayer(
-                    layer_id=0, config=cfg, capture_routed_experts=False
-                )
-            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-                raise unittest.SkipTest(
-                    f"Gemma4DecoderLayer fixture gap: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+            layer = Gemma4DecoderLayer(
+                layer_id=0, config=cfg, capture_routed_experts=False
+            )
         topks = _collect_topks(layer)
-        # Gemma4MoE constructs exactly one TopK when enable_moe_block=True.
-        # If the fixture's enable_moe_block path is skipped at runtime,
-        # zero TopK means draft-safe. Either case is acceptable; mixing
-        # would indicate a regression.
-        if topks:
-            for t in topks:
-                self.assertFalse(t.topk_config.capture_routed_experts)
+        # `enable_moe_block=True` forces `Gemma4MoE` construction; the
+        # chain MUST yield at least one `TopK`, otherwise the test passes
+        # vacuously and a future regression that drops the MoE block
+        # would slip through.
+        self.assertGreaterEqual(
+            len(topks),
+            1,
+            "Gemma4 draft chain test must construct at least one TopK; "
+            "got zero, indicating the MoE branch was bypassed.",
+        )
+        for t in topks:
+            self.assertFalse(t.topk_config.capture_routed_experts)
 
     def test_target_chain_default_true(self):
         from sglang.srt.models.gemma4_causal import Gemma4DecoderLayer
 
         cfg = self._config()
         with construction_fixture():
-            try:
-                layer = Gemma4DecoderLayer(layer_id=0, config=cfg)
-            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-                raise unittest.SkipTest(
-                    f"Gemma4DecoderLayer target fixture gap: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+            layer = Gemma4DecoderLayer(layer_id=0, config=cfg)
         topks = _collect_topks(layer)
-        if topks:
-            for t in topks:
-                self.assertTrue(t.topk_config.capture_routed_experts)
+        self.assertGreaterEqual(
+            len(topks),
+            1,
+            "Gemma4 target chain test must construct at least one TopK.",
+        )
+        for t in topks:
+            self.assertTrue(t.topk_config.capture_routed_experts)
 
 
 class ExaoneChainConstructionTest(unittest.TestCase):
@@ -956,15 +965,9 @@ class ExaoneChainConstructionTest(unittest.TestCase):
 
         cfg = self._config()
         with construction_fixture():
-            try:
-                layer = ExaoneMoEDecoderLayer(
-                    cfg, layer_id=0, capture_routed_experts=False
-                )
-            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-                raise unittest.SkipTest(
-                    f"ExaoneMoEDecoderLayer fixture gap: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+            layer = ExaoneMoEDecoderLayer(
+                cfg, layer_id=0, capture_routed_experts=False
+            )
         topks = _collect_topks(layer)
         self.assertEqual(len(topks), 1)
         self.assertFalse(topks[0].topk_config.capture_routed_experts)
@@ -974,13 +977,7 @@ class ExaoneChainConstructionTest(unittest.TestCase):
 
         cfg = self._config()
         with construction_fixture():
-            try:
-                layer = ExaoneMoEDecoderLayer(cfg, layer_id=0)
-            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-                raise unittest.SkipTest(
-                    f"ExaoneMoEDecoderLayer target fixture gap: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+            layer = ExaoneMoEDecoderLayer(cfg, layer_id=0)
         topks = _collect_topks(layer)
         self.assertEqual(len(topks), 1)
         self.assertTrue(topks[0].topk_config.capture_routed_experts)
@@ -1015,15 +1012,9 @@ class HunyuanV3ChainConstructionTest(unittest.TestCase):
 
         cfg = self._config()
         with construction_fixture():
-            try:
-                layer = HYV3DecoderLayer(
-                    cfg, layer_id=0, capture_routed_experts=False
-                )
-            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-                raise unittest.SkipTest(
-                    f"HYV3DecoderLayer fixture gap: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+            layer = HYV3DecoderLayer(
+                cfg, layer_id=0, capture_routed_experts=False
+            )
         topks = _collect_topks(layer)
         self.assertEqual(len(topks), 1)
         self.assertFalse(topks[0].topk_config.capture_routed_experts)
@@ -1033,13 +1024,7 @@ class HunyuanV3ChainConstructionTest(unittest.TestCase):
 
         cfg = self._config()
         with construction_fixture():
-            try:
-                layer = HYV3DecoderLayer(cfg, layer_id=0)
-            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-                raise unittest.SkipTest(
-                    f"HYV3DecoderLayer target fixture gap: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+            layer = HYV3DecoderLayer(cfg, layer_id=0)
         topks = _collect_topks(layer)
         self.assertEqual(len(topks), 1)
         self.assertTrue(topks[0].topk_config.capture_routed_experts)
@@ -1053,6 +1038,10 @@ class Step3p5ChainConstructionTest(unittest.TestCase):
 
     def _config(self) -> SimpleNamespace:
         common = _attn_common()
+        # Step3p5 indexes `config.rope_theta[layer_id]` and
+        # `config.partial_rotary_factors[layer_id]` at step3p5.py:536-541,
+        # so both must be per-layer sequences aligned with `layer_types`.
+        num_layers = 1
         return SimpleNamespace(
             moe_num_experts=8,
             moe_top_k=2,
@@ -1063,18 +1052,23 @@ class Step3p5ChainConstructionTest(unittest.TestCase):
             swiglu_limits=[0.0] * 64,
             swiglu_limits_shared=[None] * 64,
             moe_layers_enum="0",
-            layer_types=["full_attention"] * 8,
+            layer_types=["full_attention"] * num_layers,
             yarn_only_types=set(),
             num_attention_groups=4,
-            num_hidden_layers=1,
-            partial_rotary_factors=[1.0] * 8,
+            num_hidden_layers=num_layers,
+            partial_rotary_factors=[1.0] * num_layers,
             share_expert_dim=128,
             use_head_wise_attn_gate=False,
             attention_other_setting={
                 "num_attention_heads": 4,
                 "num_attention_groups": 4,
             },
-            **{k: v for k, v in common.items() if k not in {"layer_types"}},
+            **{
+                k: v
+                for k, v in common.items()
+                if k not in {"layer_types", "rope_theta"}
+            },
+            rope_theta=[10000.0] * num_layers,
         )
 
     def test_decoder_chain_draft_propagates_false(self):
@@ -1082,20 +1076,9 @@ class Step3p5ChainConstructionTest(unittest.TestCase):
 
         cfg = self._config()
         with construction_fixture():
-            try:
-                layer = Step3p5DecoderLayer(
-                    cfg, layer_id=0, capture_routed_experts=False
-                )
-            except (
-                AttributeError,
-                AssertionError,
-                TypeError,
-                ValueError,
-            ) as exc:
-                raise unittest.SkipTest(
-                    f"Step3p5DecoderLayer fixture gap (narrow exc): "
-                    f"{type(exc).__name__}: {exc}"
-                )
+            layer = Step3p5DecoderLayer(
+                cfg, layer_id=0, capture_routed_experts=False
+            )
         topks = _collect_topks(layer)
         self.assertEqual(len(topks), 1)
         self.assertFalse(topks[0].topk_config.capture_routed_experts)
@@ -1129,6 +1112,7 @@ class MistralLarge3ChainConstructionTest(unittest.TestCase):
             n_hash_layers=0,
             ep_size=1,
             intermediate_size=128,
+            moe_layer_freq=1,
             **common,
         )
 
@@ -1137,25 +1121,20 @@ class MistralLarge3ChainConstructionTest(unittest.TestCase):
 
         cfg = self._config()
         with construction_fixture():
-            try:
-                layer = DeepseekV2DecoderLayer(
-                    cfg, layer_id=0, capture_routed_experts=False
-                )
-            except (
-                AttributeError,
-                AssertionError,
-                TypeError,
-                ValueError,
-            ) as exc:
-                raise unittest.SkipTest(
-                    f"DeepseekV2DecoderLayer fixture gap (narrow exc): "
-                    f"{type(exc).__name__}: {exc}"
-                )
+            layer = DeepseekV2DecoderLayer(
+                cfg, layer_id=0, capture_routed_experts=False
+            )
         topks = _collect_topks(layer)
-        # DeepseekV2DecoderLayer constructs DeepseekV2MoE when the layer
-        # is sparse (first_k_dense_replace=0 makes layer 0 sparse). If
-        # the layer ends up dense in the fixture, zero TopK is also fine
-        # — but mixed states or any TopK with True would be a regression.
+        # `first_k_dense_replace=0` + `moe_layer_freq=1` forces layer 0
+        # sparse, so the constructor MUST build at least one `TopK` —
+        # otherwise the test is vacuous and a future regression that
+        # silently drops the MoE block would slip through.
+        self.assertGreaterEqual(
+            len(topks),
+            1,
+            "MistralLarge3 chain test must construct at least one TopK; "
+            "got zero, suggesting the sparse branch was skipped.",
+        )
         for t in topks:
             self.assertFalse(t.topk_config.capture_routed_experts)
 
@@ -1206,13 +1185,7 @@ class MoETargetDefaultConstructionTest(unittest.TestCase):
             rms_norm_eps=1e-6,
         )
         with construction_fixture():
-            try:
-                blk = DeepseekV2MoE(cfg, layer_id=0, is_nextn=False)
-            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-                raise unittest.SkipTest(
-                    f"DeepseekV2MoE target fixture gap: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+            blk = DeepseekV2MoE(cfg, layer_id=0, is_nextn=False)
         topks = _collect_topks(blk)
         self.assertEqual(len(topks), 1)
         self.assertTrue(topks[0].topk_config.capture_routed_experts)
@@ -1233,13 +1206,7 @@ class MoETargetDefaultConstructionTest(unittest.TestCase):
             routed_scaling_factor=1.0,
         )
         with construction_fixture():
-            try:
-                blk = Glm4MoeSparseMoeBlock(cfg, layer_id=0, is_nextn=False)
-            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-                raise unittest.SkipTest(
-                    f"Glm4MoeSparseMoeBlock target fixture gap: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+            blk = Glm4MoeSparseMoeBlock(cfg, layer_id=0, is_nextn=False)
         topks = _collect_topks(blk)
         self.assertEqual(len(topks), 1)
         self.assertTrue(topks[0].topk_config.capture_routed_experts)
@@ -1271,13 +1238,7 @@ class DenseEagleInnerClassConstructionTest(unittest.TestCase):
 
         cfg = self._llama_config()
         with construction_fixture():
-            try:
-                layer = EagleLayer(cfg, layer_id=0)
-            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-                raise unittest.SkipTest(
-                    f"llama_eagle.LlamaDecoderLayer fixture gap: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+            layer = EagleLayer(cfg, layer_id=0)
         self.assertEqual(len(_collect_topks(layer)), 0)
 
     def test_llama_eagle3_decoder_layer_has_no_topk(self):
@@ -1285,13 +1246,7 @@ class DenseEagleInnerClassConstructionTest(unittest.TestCase):
 
         cfg = self._llama_config()
         with construction_fixture():
-            try:
-                layer = Eagle3Layer(cfg, layer_id=0)
-            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-                raise unittest.SkipTest(
-                    f"llama_eagle3.LlamaDecoderLayer fixture gap: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+            layer = Eagle3Layer(cfg, layer_id=0)
         self.assertEqual(len(_collect_topks(layer)), 0)
 
     def test_qwen2_eagle_decoder_layer_has_no_topk(self):
@@ -1304,32 +1259,25 @@ class DenseEagleInnerClassConstructionTest(unittest.TestCase):
             **_attn_common(),
         )
         with construction_fixture():
-            try:
-                layer = EagleLayer(cfg, layer_id=0)
-            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-                raise unittest.SkipTest(
-                    f"qwen2_eagle.Qwen2DecoderLayer fixture gap: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+            layer = EagleLayer(cfg, layer_id=0)
         self.assertEqual(len(_collect_topks(layer)), 0)
 
     def test_eagle3_mla_decoder_layer_has_no_topk(self):
         from sglang.srt.models.kimi_k25_eagle3 import Eagle3MLADecoderLayer
 
+        common = _attn_common()
+        # Eagle3MLA validates `q_lora_rank` is set (it's a real MLA-draft
+        # requirement, not an incidental CPU-host quirk). Provide a value
+        # so the constructor proceeds; the test then asserts no TopK.
+        common["q_lora_rank"] = 16
         cfg = SimpleNamespace(
             intermediate_size=128,
             num_hidden_layers=1,
             hidden_act="silu",
-            **_attn_common(),
+            **common,
         )
         with construction_fixture():
-            try:
-                layer = Eagle3MLADecoderLayer(cfg, layer_id=0)
-            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-                raise unittest.SkipTest(
-                    f"Eagle3MLADecoderLayer fixture gap: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+            layer = Eagle3MLADecoderLayer(cfg, layer_id=0)
         self.assertEqual(len(_collect_topks(layer)), 0)
 
 
@@ -1347,13 +1295,7 @@ class DenseNextNInnerClassConstructionTest(unittest.TestCase):
             **_attn_common(),
         )
         with construction_fixture():
-            try:
-                layer = Glm4DecoderLayer(cfg, layer_id=0)
-            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-                raise unittest.SkipTest(
-                    f"glm4.Glm4DecoderLayer fixture gap: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+            layer = Glm4DecoderLayer(cfg, layer_id=0)
         self.assertEqual(len(_collect_topks(layer)), 0)
 
     def test_longcat_flash_dense_decoder_layer_has_no_topk(self):
@@ -1368,13 +1310,7 @@ class DenseNextNInnerClassConstructionTest(unittest.TestCase):
             **_attn_common(),
         )
         with construction_fixture():
-            try:
-                layer = LongcatFlashDenseDecoderLayer(cfg, layer_id=0)
-            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-                raise unittest.SkipTest(
-                    f"LongcatFlashDenseDecoderLayer fixture gap: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+            layer = LongcatFlashDenseDecoderLayer(cfg, layer_id=0)
         self.assertEqual(len(_collect_topks(layer)), 0)
 
     def test_mimo_v2_mtp_layer_has_no_topk(self):
@@ -1387,13 +1323,7 @@ class DenseNextNInnerClassConstructionTest(unittest.TestCase):
             **_attn_common(),
         )
         with construction_fixture():
-            try:
-                layer = MiMoV2MTPLayer(cfg, layer_id=0)
-            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
-                raise unittest.SkipTest(
-                    f"MiMoV2MTPLayer fixture gap: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+            layer = MiMoV2MTPLayer(cfg, layer_id=0)
         self.assertEqual(len(_collect_topks(layer)), 0)
 
 
