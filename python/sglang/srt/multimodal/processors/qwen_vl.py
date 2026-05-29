@@ -34,6 +34,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.utils import cpu_has_amx_support, is_cpu
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.utils import logger
 
@@ -57,6 +58,23 @@ FRAME_FACTOR = 2
 FPS = 2.0
 FPS_MIN_FRAMES = 4
 FPS_MAX_FRAMES = 768
+
+
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
+if _is_cpu and _is_cpu_amx_available:
+    try:
+        import transformers
+
+        from sglang.srt.layers.amx_utils import fast_preprocess_cpu
+
+        transformers.models.qwen2_vl.image_processing_qwen2_vl_fast.Qwen2VLImageProcessorFast._preprocess = (
+            fast_preprocess_cpu
+        )
+    except Exception as e:
+        logger.warning(
+            f"Failed to hack Qwen2VLImageProcessorFast with AMX optimization: {e}"
+        )
 
 
 def smart_resize(
