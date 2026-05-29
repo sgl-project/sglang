@@ -79,7 +79,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
-from sglang.srt.layers.utils.dcp_utils import dcp_enabled, get_attention_dcp_world_size
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -529,8 +528,6 @@ class Scheduler(
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
 
-        # Init prefill truncation_align_size for chunked prefill with dcp
-        self.init_truncation_align_size_for_dcp()
         self.weight_updater = SchedulerWeightUpdaterManager(
             tp_worker=self.tp_worker,
             draft_worker=self.draft_worker,
@@ -767,19 +764,6 @@ class Scheduler(
             )
         else:
             self.idle_sleeper = None
-
-    def init_truncation_align_size_for_dcp(self):
-        if dcp_enabled():
-            if self.truncation_align_size is None:
-                self.truncation_align_size = get_attention_dcp_world_size()
-            else:
-                import math
-
-                self.truncation_align_size = (
-                    self.truncation_align_size * get_attention_dcp_world_size()
-                ) // (
-                    math.gcd(self.truncation_align_size, get_attention_dcp_world_size())
-                )
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -2534,9 +2518,7 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(
-                self.chunked_req, truncation_align_size=self.truncation_align_size
-            )
+            self.chunked_req = adder.add_chunked_req(self.chunked_req)
             self._chunked_req_scheduled_last_iter = (
                 self.chunked_req in adder.can_run_list
             )
