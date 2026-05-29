@@ -177,7 +177,7 @@ class MlxTpModelWorker(TpModelWorker):
                 else:
                     # New prefill
                     prefix_slot_ids = req.prefix_indices.tolist()
-                    full_token_ids = list(req.fill_ids)
+                    full_token_ids = list(req.build_fill_token_ids())
                     next_token = self._mlx_runner.prefill(
                         req_id=req.rid,
                         new_token_ids=req_token_ids,
@@ -321,7 +321,7 @@ class MlxTpModelWorker(TpModelWorker):
             else:
                 # New prefill
                 prefix_slot_ids = req.prefix_indices.tolist()
-                full_token_ids = list(req.fill_ids)
+                full_token_ids = list(req.build_fill_token_ids())
                 pending_prefills.append(
                     self._mlx_runner.prefill_start(
                         req_id=req.rid,

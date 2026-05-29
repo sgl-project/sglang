@@ -510,7 +510,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 
-        token_ids = req.fill_ids
+        token_ids = req.build_fill_token_ids()
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[

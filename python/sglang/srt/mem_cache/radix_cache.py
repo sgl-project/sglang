@@ -490,7 +490,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return
 
-        token_ids = req.fill_ids
+        token_ids = req.build_fill_token_ids()
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]

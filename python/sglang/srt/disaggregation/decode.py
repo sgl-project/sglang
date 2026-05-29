@@ -1008,7 +1008,7 @@ class DecodePreallocQueue:
     @property
     def num_tokens_pre_allocated(self):
         return sum(
-            len(decode_req.req.fill_ids) for decode_req in self.transfer_queue.queue
+            decode_req.req.fill_len for decode_req in self.transfer_queue.queue
         )
 
     def _need_space_for_single_req(
@@ -1321,10 +1321,10 @@ class DecodePreallocQueue:
             (req.req_pool_idx, slice(prefix_len, prefix_len + len(kv_loc))), kv_loc
         )
 
-        # Truncate fill_ids to kv_committed_len so cache_unfinished_req only
+        # Truncate fill_len to kv_committed_len so cache_unfinished_req only
         # inserts committed KV into the radix tree. The last output token
-        # hasn't had KV committed yet (fill_ids is 1 ahead).
-        req.fill_ids = (req.origin_input_ids + req.output_ids)[: req.kv_committed_len]
+        # hasn't had KV committed yet (full token sequence is 1 ahead).
+        req.fill_len = req.kv_committed_len
         # Set prefix_indices so downstream consumers (init_next_round_input,
         # prepare_for_extend) see the correct prefix length. In the agg path
         # this is done inside init_next_round_input, but decode-disagg needs
@@ -1332,7 +1332,7 @@ class DecodePreallocQueue:
         req.prefix_indices = (
             prefix_indices if prefix_len > 0 else torch.empty((0,), dtype=torch.int64)
         )
-        req.set_extend_input_len(len(req.fill_ids) - prefix_len)
+        req.set_extend_input_len(req.fill_len - prefix_len)
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:
@@ -1724,12 +1724,12 @@ class SchedulerDisaggregationDecodeMixin:
                     else self.tree_cache
                 )
                 req.init_next_round_input(tree_cache)
-                # Truncate fill_ids to kv_committed_len so cache_unfinished_req
-                # only sees committed KV (fill_ids includes one uncommitted token).
+                # Truncate fill_len to kv_committed_len so cache_unfinished_req
+                # only sees committed KV (full token sequence is one ahead).
                 if req.kv_committed_len is not None:
-                    req.fill_ids = req.fill_ids[: req.kv_committed_len]
+                    req.fill_len = req.kv_committed_len
                     req.set_extend_input_len(
-                        len(req.fill_ids) - len(req.prefix_indices)
+                        req.fill_len - len(req.prefix_indices)
                     )
             else:
                 waiting_queue.append(req)

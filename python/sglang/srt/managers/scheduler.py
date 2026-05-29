@@ -1036,7 +1036,7 @@ class Scheduler(
         # req_pool_idx from prepare_for_extend). Used to gate the
         # stash_chunked_request call at the top of get_next_batch_to_run:
         # if add_chunked_req early-returned under hybrid-SWA pressure,
-        # the req_pool_idx was already freed and fill_ids was reset by
+        # the req_pool_idx was already freed and fill_len was reset by
         # init_next_round_input, so running stash would double-free and
         # corrupt prefix_indices.
         self._chunked_req_scheduled_last_iter = False
@@ -2031,12 +2031,14 @@ class Scheduler(
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
-            req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            full_token_ids = req.init_next_round_input(
+                self.tree_cache, cow_mamba=False
+            )
             last_host_node = req.last_host_node
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
                 last_hash = last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
-                new_input_tokens = req.fill_ids[matched_len:]
+                new_input_tokens = full_token_ids[matched_len:]
 
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)
