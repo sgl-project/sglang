@@ -1066,6 +1066,155 @@ class TestKimiK2EndToEnd(unittest.TestCase):
 
 
 # ============================================================
+# Part 2b: OpenAI streaming-spec compliance for ``tool_index``
+# ============================================================
+
+
+class TestKimiK2DetectorOpenAIIndexCompliance(unittest.TestCase):
+    """The detector must emit ``tool_index`` as a dense, 0-based position
+    within the *current response* (per the OpenAI streaming spec), regardless
+    of the value of the model's conversation-level ``:N`` counter in the
+    tool_call header. The serving layer is responsible for adding any
+    history offset back when synthesizing the public ``id`` field.
+
+    These tests pin the detector contract so multi-turn conversations
+    (where the model continues an auto-incrementing counter across turns)
+    can never produce sparse / non-zero-based ``index`` values in the
+    streamed delta.
+    """
+
+    def setUp(self):
+        self.tools = [
+            _make_tool(
+                "get_weather",
+                {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            ),
+        ]
+
+    def _run(self, chunks):
+        det = KimiK2FuncDetector()
+        events = []
+        for chunk in chunks:
+            r = det.parse_streaming_increment(chunk, self.tools)
+            events.extend(r.calls)
+        return events
+
+    def test_single_call_with_nonzero_model_counter_starts_at_index_0(self):
+        """Model continues a conversation-level counter (``:5``) across turns.
+        The detector must still emit ``tool_index=0`` for the first call in
+        this response — the model's ``:N`` suffix MUST NOT leak into ``index``.
+        """
+        chunks = [
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.get_weather:5"
+            '<|tool_call_argument_begin|>{"city":',
+            ' "Paris"}<|tool_call_end|><|tool_calls_section_end|>',
+        ]
+        events = self._run(chunks)
+
+        self.assertGreaterEqual(len(events), 1)
+        # Every emitted delta (name event + arg deltas) must use index 0.
+        for ev in events:
+            self.assertEqual(
+                ev.tool_index,
+                0,
+                f"tool_index must be 0-based per response, got {ev.tool_index}",
+            )
+        first = events[0]
+        self.assertEqual(first.name, "get_weather")
+
+    def test_multi_call_response_uses_dense_0_based_indices(self):
+        """Two calls in one response, model emits ``:7`` then ``:8``. The
+        detector must emit ``tool_index=0`` then ``tool_index=1`` (dense,
+        0-based), independent of the model's counter.
+        """
+        chunks = [
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.get_weather:7"
+            '<|tool_call_argument_begin|>{"city": "London"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.get_weather:8"
+            '<|tool_call_argument_begin|>{"city": "Berlin"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        ]
+        events = self._run(chunks)
+
+        name_events = [e for e in events if e.name]
+        self.assertEqual(len(name_events), 2)
+        self.assertEqual(name_events[0].tool_index, 0)
+        self.assertEqual(name_events[1].tool_index, 1)
+
+        # Every delta for call N must carry tool_index == N.
+        for ev in events:
+            self.assertIn(ev.tool_index, (0, 1))
+
+    def test_continuation_chunks_keep_same_tool_index(self):
+        """Per OpenAI spec, all argument-delta chunks for a given call
+        must share the same ``index``. Split the args across multiple
+        chunks and verify ``tool_index`` stays at 0 throughout.
+        """
+        chunks = [
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.get_weather:10"
+            '<|tool_call_argument_begin|>{"city":',
+            ' "Pa',
+            'ris"}',
+            "<|tool_call_end|><|tool_calls_section_end|>",
+        ]
+        events = self._run(chunks)
+
+        self.assertGreater(len(events), 1, "expected name event + arg deltas")
+        for ev in events:
+            self.assertEqual(ev.tool_index, 0)
+
+        # Reassembled args must round-trip.
+        joined = "".join(ev.parameters or "" for ev in events)
+        self.assertEqual(joined, '{"city": "Paris"}')
+
+    def test_three_calls_with_nonzero_model_counter_indices_are_dense(self):
+        """Multi-turn worst case: model continues at ``:10`` and emits three
+        calls in this response. Indices must be 0, 1, 2 — not 10, 11, 12.
+        """
+        sections = []
+        for offset, city in enumerate(("Paris", "Berlin", "Madrid")):
+            sections.append(
+                "<|tool_calls_section_begin|>"
+                f"<|tool_call_begin|>functions.get_weather:{10 + offset}"
+                f'<|tool_call_argument_begin|>{{"city": "{city}"}}'
+                "<|tool_call_end|>"
+                "<|tool_calls_section_end|>"
+            )
+        events = self._run(["".join(sections)])
+
+        name_events = [e for e in events if e.name]
+        self.assertEqual([e.tool_index for e in name_events], [0, 1, 2])
+
+    def test_bare_counter_id_also_starts_at_index_0(self):
+        """Same invariant for the bare-counter ID form (model omits function
+        name and emits just a numeric counter, e.g. ``:5``).
+        """
+        chunks = [
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>5"
+            '<|tool_call_argument_begin|>{"city": "Paris"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        ]
+        events = self._run(chunks)
+
+        self.assertGreaterEqual(len(events), 1)
+        for ev in events:
+            self.assertEqual(ev.tool_index, 0)
+
+
+# ============================================================
 # Part 3: Bare-counter tool call ID parsing
 # ============================================================
 
