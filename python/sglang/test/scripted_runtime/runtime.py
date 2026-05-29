@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import sys
 import traceback
 from array import array
 from typing import (
@@ -61,6 +62,17 @@ class ScriptedRuntimeFinished(Exception):
         super().__init__(f"ScriptedRuntime finished (ok={ok})")
 
 
+def _ensure_script_importable(sys_path_entry: Optional[str]) -> None:
+    """Forward the script module's directory onto ``sys.path``.
+
+    Spawn-mode mp subprocesses don't inherit the parent's ``sys.path``, so
+    the script can't be imported by qualified name without this. No-op when
+    the entry is unset or already present.
+    """
+    if sys_path_entry and sys_path_entry not in sys.path:
+        sys.path.insert(0, sys_path_entry)
+
+
 def _resolve_fn(qualified: str) -> Callable:
     """Resolve ``"module.path:qualname"`` to the function object.
 
@@ -108,6 +120,9 @@ class ScriptedRuntime:
         self._script_fn_path = script_fn_path
 
         if self._is_driver:
+            _ensure_script_importable(
+                scheduler.server_args.scripted_runtime_sys_path_entry
+            )
             script_fn = _resolve_fn(script_fn_path)
             generator = script_fn(self)
             if not hasattr(generator, "__next__"):
