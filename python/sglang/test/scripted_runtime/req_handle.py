@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 
 
@@ -37,6 +38,18 @@ class ReqHandle:
     @property
     def status(self) -> ReqStatus:
         return self.runtime._lookup_req_status(self.rid)
+
+    @property
+    def req(self) -> Optional["Req"]:
+        """The raw engine ``Req`` this handle tracks, or ``None`` if the
+        scheduler no longer holds it (finished / not yet admitted).
+
+        Escape hatch for assertions on engine-internal fields not surfaced as
+        named handle properties — see the module docstring on direct internals
+        access. Re-fetched on every access since the req moves between
+        scheduler structures.
+        """
+        return self.runtime._find_req_by_rid(self.rid)
 
     # ============================================================
     # Wishlist properties (NotImplementedError stubs).
