@@ -1371,9 +1371,6 @@ class DeepseekV4Model(nn.Module):
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
-        # Upgrade lazy raw metadata on the main stream once before any layer
-        # forks alt-streams; later per-layer calls become no-ops.
-        get_attn_backend()._maybe_upgrade_forward_metadata()
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]

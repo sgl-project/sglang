@@ -477,7 +477,6 @@ class CompressorBackendMixin:
         if forward_batch.forward_mode.is_idle():
             return
 
-        self._maybe_upgrade_forward_metadata()
         token_to_kv_pool = self.token_to_kv_pool
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
