@@ -1219,6 +1219,71 @@ class BaseMultimodalProcessor(ABC):
             return tensor
         return tensor.cpu()
 
+    def resolve_image_token_counts(self, images: List) -> Optional[List[int]]:
+        """Per-image expanded token counts, computed without re-tokenizing.
+
+        Default implementation uses the transformers in-tree convention
+        ``_get_num_multimodal_tokens(image_sizes=...)`` (present on the in-tree
+        VLM processors, e.g. Qwen-VL, Gemma3, GLM4V). Models whose processor
+        does not implement it (e.g. Kimi) override this method.
+
+        Returns ``None`` if unavailable or it raises, so the caller can fall back
+        to the HF re-tokenized ids.
+        """
+        if not images:
+            return None
+
+        get_num_multimodal_tokens = getattr(
+            self._processor, "_get_num_multimodal_tokens", None
+        )
+        if not callable(get_num_multimodal_tokens):
+            return None
+
+        try:
+            image_sizes = [(image.height, image.width) for image in images]
+            num_image_tokens = get_num_multimodal_tokens(
+                image_sizes=image_sizes
+            ).num_image_tokens
+            return [int(count) for count in num_image_tokens]
+        except Exception:
+            return None
+
+    @staticmethod
+    def _expand_input_ids(
+        original_ids: List[int],
+        counts: List[int],
+        image_token_id: Optional[int],
+    ) -> Optional[List[int]]:
+        """Rebuild final input_ids for a pre-tokenized (list[int]) prompt.
+
+        Keep the user's ORIGINAL tokens verbatim and expand the i-th image
+        placeholder into ``counts[i]`` copies of ``image_token_id``. The HF
+        processor's re-tokenization is discarded, so non-media tokens cannot
+        drift.
+
+        Returns ``None`` when the number of image placeholders in
+        ``original_ids`` does not match ``len(counts)`` (cannot align), so the
+        caller can fall back to the HF re-tokenized ids.
+        """
+        if image_token_id is None:
+            return None
+
+        num_placeholders = sum(
+            1 for token_id in original_ids if token_id == image_token_id
+        )
+        if num_placeholders != len(counts):
+            return None
+
+        rebuilt: List[int] = []
+        next_image_idx = 0
+        for token_id in original_ids:
+            if token_id == image_token_id:
+                rebuilt.extend([image_token_id] * counts[next_image_idx])
+                next_image_idx += 1
+            else:
+                rebuilt.append(token_id)
+        return rebuilt
+
     def process_and_combine_mm_data(
         self,
         base_output: BaseMultiModalProcessorOutput,
@@ -1268,6 +1333,39 @@ class BaseMultimodalProcessor(ABC):
                 **kwargs,
             )
             all_collected_items = collected_items
+
+            # Pre-tokenized request: keep the user's exact tokens instead of the
+            # HF re-tokenized prompt (decode + re-tokenize is not identity, which
+            # would drift the prompt length). base_output.input_ids is set only
+            # when the prompt arrived as a list[int] (see load_mm_data), so this
+            # is a no-op for text prompts.
+            if (
+                envs.SGLANG_MM_AVOID_RETOKENIZE.get()
+                and base_output.input_ids is not None
+                and input_ids is not None
+            ):
+                original_ids = self._ensure_input_ids_is_tensor(base_output.input_ids)
+                counts = self.resolve_image_token_counts(raw_images)
+                rebuilt = (
+                    self._expand_input_ids(
+                        original_ids.tolist(),
+                        counts,
+                        mm_tokens.image_token_id,
+                    )
+                    if counts is not None
+                    else None
+                )
+                # O(1) safety check: the rebuilt prompt must match the length the
+                # HF processor actually produced; otherwise the count source and
+                # the real processing disagree and we must not emit it.
+                if rebuilt is not None and len(rebuilt) == input_ids.numel():
+                    input_ids = torch.tensor(rebuilt, dtype=input_ids.dtype)
+                else:
+                    logger.warning(
+                        "Token-id multimodal prompt could not be aligned with the "
+                        "processor expansion; falling back to decode+retokenize, "
+                        "which may change prompt length (token drift)."
+                    )
         else:
             ret = None
 

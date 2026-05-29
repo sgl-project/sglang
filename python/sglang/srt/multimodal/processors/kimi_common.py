@@ -23,6 +23,31 @@ class KimiGridMMDataMixin:
       - self._tokenizer (with .encode())
     """
 
+    def resolve_image_token_counts(self, images):
+        """Kimi's processor is remote-code and does not implement the
+        transformers ``_get_num_multimodal_tokens`` convention; use its
+        ``media_tokens_calculator`` instead.
+
+        Returns ``None`` if unavailable or it raises, so the caller falls back.
+        """
+        if not images:
+            return None
+
+        media_processor = getattr(self._processor, "media_processor", None)
+        media_tokens_calculator = getattr(
+            media_processor, "media_tokens_calculator", None
+        )
+        if not callable(media_tokens_calculator):
+            return None
+
+        try:
+            return [
+                int(media_tokens_calculator({"type": "image", "image": image}))
+                for image in images
+            ]
+        except Exception:
+            return None
+
     def _num_image_tokens_from_grid(
         self, grid_thw: Union[torch.Tensor, np.ndarray, list, tuple]
     ) -> int:

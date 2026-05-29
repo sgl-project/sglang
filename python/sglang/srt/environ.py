@@ -539,6 +539,10 @@ class Envs:
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
+    # For pre-tokenized (list[int]) multimodal prompts, rebuild the final
+    # input_ids from the user's original tokens instead of the HF re-tokenized
+    # prompt, to avoid decode/re-tokenize length drift. Set to 0 to disable.
+    SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
 
 
     # VLM Item CUDA IPC Transport
