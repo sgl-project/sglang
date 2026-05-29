@@ -1,11 +1,8 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-import asyncio
 import dataclasses
-import os
 import pickle
-import tempfile
 import time
 from collections import deque
 from contextlib import contextmanager
@@ -20,10 +17,6 @@ from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
 )
 from sglang.multimodal_gen.runtime.distributed import get_world_group
-from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
-    _parse_size,
-    save_image_to_path,
-)
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
     UpdateWeightFromDiskReqInput,
@@ -55,21 +48,21 @@ from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     set_global_server_args,
 )
+from sglang.multimodal_gen.runtime.server_warmup import (
+    build_warmup_reqs,
+    get_first_generation_req,
+    is_server_based_warmup,
+    is_warmup_req,
+    prepare_warmup_image_path_sync,
+    should_include_warmup_image,
+    should_return_warmup_result,
+)
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
 
 logger = init_logger(__name__)
-
-MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
-
-# Placeholder negative_prompt used in synthesized warmup Reqs when
-# --enable-cfg-parallel is on. A non-empty, real word (vs "" or " ") so
-# every tokenizer backend emits a predictable, non-degenerate token
-# sequence — rank 1's uncond branch then produces a valid tensor for
-# _combine_cfg_parallel's all-reduce.
-DEFAULT_PLACEHOLDER_PROMPT = "warmup"
 
 _MAX_RECV_REQS_PER_POLL = 1024
 _BATCH_METRICS_LOG_INTERVAL = 5
@@ -237,22 +230,6 @@ class Scheduler(SchedulerDisaggMixin):
             return reqs[0]
         return reqs
 
-    @staticmethod
-    def _first_generation_req(req_or_group: Any) -> Req | None:
-        """Extract the first req"""
-        if isinstance(req_or_group, Req):
-            return req_or_group
-        if isinstance(req_or_group, list) and req_or_group:
-            first_req = req_or_group[0]
-            if isinstance(first_req, Req):
-                return first_req
-        return None
-
-    @classmethod
-    def _is_warmup_item(cls, req_or_group: Any) -> bool:
-        req = cls._first_generation_req(req_or_group)
-        return req.is_warmup if req is not None else False
-
     def _dispatch_single_request(self, req_or_group: Any) -> OutputBatch:
         if isinstance(req_or_group, list):
             if not all(isinstance(req, Req) for req in req_or_group):
@@ -277,9 +254,16 @@ class Scheduler(SchedulerDisaggMixin):
             return [self._dispatch_single_request(req) for req in reqs]
         return self._dispatch_single_request(reqs[0])
 
-    def _log_warmup_result(self, output_batch: OutputBatch, is_warmup: bool) -> None:
+    def _log_warmup_result(
+        self,
+        output_batch: OutputBatch,
+        req_or_group: Any,
+        is_warmup: bool,
+    ) -> None:
         if not is_warmup:
             return
+
+        server_based_warmup = is_server_based_warmup(req_or_group)
 
         if output_batch.error is None:
             total_duration_s = (
@@ -297,8 +281,13 @@ class Scheduler(SchedulerDisaggMixin):
                     f"Warmup req processed in {GREEN}%.2f{RESET} seconds",
                     total_duration_s,
                 )
-            if not self._logged_server_ready_after_warmup and (
-                self._warmup_total <= 0 or self._warmup_processed >= self._warmup_total
+            if (
+                not server_based_warmup
+                and not self._logged_server_ready_after_warmup
+                and (
+                    self._warmup_total <= 0
+                    or self._warmup_processed >= self._warmup_total
+                )
             ):
                 logger.info("The server is fired up and ready to roll!")
                 self._logged_server_ready_after_warmup = True
@@ -617,12 +606,12 @@ class Scheduler(SchedulerDisaggMixin):
         self,
         output_batch: OutputBatch,
         identity: bytes | None = None,
-        is_warmup: bool = False,
+        should_not_return: bool = False,
     ):
         """
         replies to client, only on rank 0
         """
-        if not is_warmup and self.receiver is not None and identity is not None:
+        if not should_not_return and self.receiver is not None and identity is not None:
             # if the server is local, use temp file to spill the frame array instead of
             # leaving it in OutputBatch to be pickled later
             if is_local_endpoint(self.server_args.scheduler_endpoint):
@@ -917,46 +906,29 @@ class Scheduler(SchedulerDisaggMixin):
 
     def prepare_server_warmup_reqs(self):
         if (
-            self.server_args.warmup
-            and not self.warmed_up
-            and self.server_args.warmup_resolutions is not None
+            not self.server_args.warmup
+            or self.warmed_up
+            or self.server_args.warmup_resolutions is None
         ):
-            # insert warmup reqs constructed with each warmup-resolution
-            self._warmup_total = len(self.server_args.warmup_resolutions)
-            self._warmup_processed = 0
-            task_type = self.server_args.pipeline_config.task_type
+            return
 
-            requires_warmup_image = task_type.accepts_image_input()
-            warmup_input_path = None
-            if requires_warmup_image:
-                warmup_input_path = self._prepare_shared_warmup_image_path()
+        self._warmup_total = len(self.server_args.warmup_resolutions)
+        self._warmup_processed = 0
 
-            for resolution in self.server_args.warmup_resolutions:
-                width, height = _parse_size(resolution)
+        warmup_input_path = None
+        if should_include_warmup_image(self.server_args, server_based_warmup=False):
+            warmup_input_path = self._prepare_shared_warmup_image_path()
 
-                # CFG-parallel splits cond/uncond across ranks, so rank 1
-                # needs a real uncond pass. Force do_classifier_free_guidance
-                # + non-empty negative_prompt when cfg-parallel is on, so the
-                # synthesized warmup Req exercises both ranks' denoising paths.
-                # When cfg-parallel is off, the Req construction is
-                # byte-identical to the pre-fix behavior.
-                req_kwargs = dict(
-                    data_type=task_type.data_type(),
-                    width=width,
-                    height=height,
-                    prompt="",
-                )
-                if requires_warmup_image:
-                    req_kwargs["negative_prompt"] = ""
-                    req_kwargs["image_path"] = [warmup_input_path]
-                if self.server_args.enable_cfg_parallel:
-                    req_kwargs["negative_prompt"] = DEFAULT_PLACEHOLDER_PROMPT
-                    req_kwargs["do_classifier_free_guidance"] = True
-                req = Req(**req_kwargs)
-                req.set_as_warmup(self.server_args.warmup_steps)
-                self.waiting_queue.append((None, req, time.monotonic()))
-            # if server is warmed-up, set this flag to avoid req-based warmup
-            self.warmed_up = True
+        warmup_reqs = build_warmup_reqs(
+            self.server_args,
+            warmup_resolutions=self.server_args.warmup_resolutions,
+            warmup_input_path=warmup_input_path,
+        )
+        for req in warmup_reqs:
+            self.waiting_queue.append((None, req, time.monotonic()))
+
+        # if server is warmed-up, set this flag to avoid req-based warmup
+        self.warmed_up = True
 
     def _prepare_shared_warmup_image_path(self) -> str:
         world_group = get_world_group()
@@ -965,18 +937,7 @@ class Scheduler(SchedulerDisaggMixin):
         warmup_sync: dict[str, str | None]
         if world_group.rank == src_rank:
             try:
-                if self.server_args.input_save_path is not None:
-                    uploads_dir = self.server_args.input_save_path
-                    os.makedirs(uploads_dir, exist_ok=True)
-                else:
-                    uploads_dir = tempfile.mkdtemp(prefix="sglang_input_")
-                warmup_image_base = os.path.join(uploads_dir, "warmup_image")
-                input_path = asyncio.run(
-                    save_image_to_path(
-                        MINIMUM_PICTURE_BASE64_FOR_WARMUP,
-                        warmup_image_base,
-                    )
-                )
+                input_path = prepare_warmup_image_path_sync(self.server_args)
                 warmup_sync = {"input_path": input_path, "error": None}
             except Exception as e:
                 warmup_sync = {"input_path": None, "error": str(e)}
@@ -1013,13 +974,14 @@ class Scheduler(SchedulerDisaggMixin):
             or not self.server_args.warmup
             or not recv_reqs
             or self.server_args.warmup_resolutions is not None
+            or self.server_args.server_warmup
         ):
             return recv_reqs
 
         # handle server req-based warmup by inserting an identical req to the beginning of the waiting queue
         # only the very first req through server's lifetime will be warmed up
         identity, req_or_group = recv_reqs[0]
-        req = self._first_generation_req(req_or_group)
+        req = get_first_generation_req(req_or_group)
         if req is not None:
             warmup_req = req.copy_as_warmup(self.server_args.warmup_steps)
             recv_reqs.insert(0, (identity, warmup_req))
@@ -1200,10 +1162,19 @@ class Scheduler(SchedulerDisaggMixin):
                 for (identity, processed_req), output_batch in zip(
                     items, output_batches, strict=True
                 ):
-                    is_warmup = self._is_warmup_item(processed_req)
-                    self._log_warmup_result(output_batch, is_warmup)
+                    is_warmup = is_warmup_req(processed_req)
+                    self._log_warmup_result(output_batch, processed_req, is_warmup)
 
-                    self.return_result(output_batch, identity, is_warmup=is_warmup)
+                    if is_warmup and should_return_warmup_result(processed_req):
+                        # only keep the necessary lightweight payloads
+                        output_batch.drop_payload_for_warmup()
+                        self.return_result(
+                            output_batch, identity, should_not_return=False
+                        )
+                    else:
+                        self.return_result(
+                            output_batch, identity, should_not_return=is_warmup
+                        )
             except zmq.ZMQError as e:
                 # Reply failed; log and keep loop alive to accept future requests
                 logger.error(f"ZMQ error sending reply: {e}")

@@ -1,26 +1,41 @@
 """Unit tests for the --enable-cfg-parallel warmup fix and guard.
 
-Covers two code paths introduced alongside this file:
+Covers three code paths introduced alongside this file:
 - Scheduler.prepare_server_warmup_reqs synthesizes warmup Reqs that
   actually enable classifier-free guidance when cfg-parallel is on.
 - InputValidationStage.forward rejects non-CFG requests when the server
   has cfg-parallel on.
+- Server-based warmup can opt into model-default negative prompts so warmup
+  populates the negative text embedding cache.
 
 All tests are CPU-only; no model loading, no distributed init.
 """
 
 import unittest
 from collections import deque
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-from sglang.multimodal_gen.runtime.managers.scheduler import (
-    DEFAULT_PLACEHOLDER_PROMPT,
-    Scheduler,
+from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
+    Flux2FinetunedPipelineConfig,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
+    ImageVAEEncodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
+)
+from sglang.multimodal_gen.runtime.server_warmup import (
+    DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION,
+    DEFAULT_PLACEHOLDER_PROMPT,
+    build_warmup_reqs,
+    should_include_warmup_image,
 )
 
 # Patch path for get_global_server_args used by Stage.__init__
@@ -48,6 +63,7 @@ def _make_bare_scheduler(enable_cfg_parallel: bool) -> Scheduler:
     # branch entirely, so we don't need to mock
     # _prepare_shared_warmup_image_path.
     task_type = MagicMock()
+    task_type.requires_image_input.return_value = False
     task_type.accepts_image_input.return_value = False
     task_type.data_type.return_value = ModelTaskType.T2I.data_type()
     server_args.pipeline_config.task_type = task_type
@@ -98,6 +114,272 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         _, req, _ = scheduler.waiting_queue[0]
         self.assertIs(req.do_classifier_free_guidance, False)
         self.assertNotEqual(req.negative_prompt, DEFAULT_PLACEHOLDER_PROMPT)
+
+    def test_server_based_warmup_uses_model_default_negative_prompt(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+
+        task_type = MagicMock()
+        task_type.requires_image_input.return_value = False
+        task_type.accepts_image_input.return_value = False
+        task_type.is_image_gen.return_value = True
+        task_type.data_type.return_value = ModelTaskType.T2I.data_type()
+        server_args.pipeline_config.task_type = task_type
+
+        sampling_defaults = SamplingParams(
+            negative_prompt="model default negative",
+            guidance_scale=4.0,
+            num_inference_steps=20,
+        )
+        with patch(
+            "sglang.multimodal_gen.runtime.server_warmup.get_model_sampling_defaults",
+            return_value=sampling_defaults,
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                use_model_sampling_defaults=True,
+                return_warmup_result=True,
+                server_based_warmup=True,
+            )
+
+        self.assertEqual(len(reqs), 1)
+        req = reqs[0]
+        self.assertTrue(req.is_warmup)
+        self.assertEqual(req.negative_prompt, "model default negative")
+        self.assertIs(req.do_classifier_free_guidance, True)
+        self.assertTrue(req.extra["return_warmup_result"])
+        self.assertTrue(req.extra["server_based_warmup"])
+
+    def test_server_based_warmup_uses_model_default_resolution(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+
+        task_type = MagicMock()
+        task_type.requires_image_input.return_value = False
+        task_type.accepts_image_input.return_value = False
+        task_type.is_image_gen.return_value = True
+        task_type.data_type.return_value = ModelTaskType.T2I.data_type()
+        server_args.pipeline_config.task_type = task_type
+
+        sampling_defaults = SamplingParams(width=640, height=640)
+        with patch(
+            "sglang.multimodal_gen.runtime.server_warmup.get_model_sampling_defaults",
+            return_value=sampling_defaults,
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                use_model_sampling_defaults=True,
+                server_based_warmup=True,
+            )
+
+        req = reqs[0]
+        self.assertEqual(req.width, 640)
+        self.assertEqual(req.height, 640)
+
+    def test_server_based_warmup_keeps_lightweight_image_fallback(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+
+        task_type = MagicMock()
+        task_type.requires_image_input.return_value = False
+        task_type.accepts_image_input.return_value = False
+        task_type.is_image_gen.return_value = True
+        task_type.data_type.return_value = ModelTaskType.T2I.data_type()
+        server_args.pipeline_config.task_type = task_type
+
+        with patch(
+            "sglang.multimodal_gen.runtime.server_warmup.get_model_sampling_defaults",
+            return_value=SamplingParams(),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                use_model_sampling_defaults=True,
+                server_based_warmup=True,
+            )
+
+        req = reqs[0]
+        self.assertEqual(
+            (req.width, req.height),
+            DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION,
+        )
+
+    def test_warmup_image_inclusion_policy_all_task_types(self):
+        server_based_expected = {
+            ModelTaskType.T2I: False,
+            ModelTaskType.T2V: False,
+            ModelTaskType.TI2I: True,
+            ModelTaskType.TI2V: True,
+            ModelTaskType.I2I: True,
+            ModelTaskType.I2V: True,
+            ModelTaskType.I2M: True,
+        }
+
+        for task_type in ModelTaskType:
+            server_args = MagicMock()
+            server_args.pipeline_config.task_type = task_type
+
+            self.assertEqual(
+                should_include_warmup_image(server_args, server_based_warmup=True),
+                server_based_expected[task_type],
+                task_type.name,
+            )
+            self.assertEqual(
+                should_include_warmup_image(server_args, server_based_warmup=False),
+                task_type.accepts_image_input(),
+                task_type.name,
+            )
+
+    def test_server_based_warmup_keeps_ti2i_image_input(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+        server_args.pipeline_config.task_type = ModelTaskType.TI2I
+
+        with patch(
+            "sglang.multimodal_gen.runtime.server_warmup.get_model_sampling_defaults",
+            return_value=SamplingParams(width=512, height=512),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                warmup_input_path="/tmp/warmup.png",
+                use_model_sampling_defaults=True,
+                server_based_warmup=True,
+            )
+
+        self.assertEqual(reqs[0].image_path, ["/tmp/warmup.png"])
+
+    def test_server_based_warmup_keeps_required_image_input(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+        server_args.pipeline_config.task_type = ModelTaskType.I2I
+
+        with patch(
+            "sglang.multimodal_gen.runtime.server_warmup.get_model_sampling_defaults",
+            return_value=SamplingParams(width=512, height=512),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                warmup_input_path="/tmp/warmup.png",
+                use_model_sampling_defaults=True,
+                server_based_warmup=True,
+            )
+
+        self.assertEqual(reqs[0].image_path, ["/tmp/warmup.png"])
+
+    def test_server_based_warmup_keeps_ti2v_image_input(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+        server_args.pipeline_config.task_type = ModelTaskType.TI2V
+
+        with patch(
+            "sglang.multimodal_gen.runtime.server_warmup.get_model_sampling_defaults",
+            return_value=SamplingParams(width=512, height=512),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                warmup_input_path="/tmp/warmup.png",
+                use_model_sampling_defaults=True,
+                server_based_warmup=True,
+            )
+
+        self.assertEqual(reqs[0].image_path, ["/tmp/warmup.png"])
+
+
+class TestFlux2FinetunedVaeEncodePreprocess(unittest.TestCase):
+    def test_single_frame_custom_vae_encode_input_is_4d(self):
+        config = Flux2FinetunedPipelineConfig()
+        vae = MagicMock()
+        vae.bn = None
+
+        image = torch.zeros(1, 3, 1, 32, 32)
+        output = config.preprocess_vae_encode(image, vae)
+
+        self.assertEqual(tuple(output.shape), (1, 3, 32, 32))
+
+    def test_standard_flux2_vae_encode_input_stays_5d(self):
+        config = Flux2FinetunedPipelineConfig()
+        vae = MagicMock()
+        vae.bn = object()
+
+        image = torch.zeros(1, 3, 1, 32, 32)
+        output = config.preprocess_vae_encode(image, vae)
+
+        self.assertIs(output, image)
+
+    def test_custom_vae_already_patchified_encode_latents_stay_128_channels(self):
+        config = Flux2FinetunedPipelineConfig()
+        config.dit_config.arch_config.in_channels = 128
+        vae = MagicMock()
+        vae.bn = None
+
+        image_latents = torch.zeros(1, config.dit_config.arch_config.in_channels, 8, 8)
+        output = config.postprocess_vae_encode(image_latents, vae)
+
+        self.assertIs(output, image_latents)
+
+    def test_standard_flux2_vae_encode_latents_are_patchified(self):
+        config = Flux2FinetunedPipelineConfig()
+        vae = MagicMock()
+        vae.bn = object()
+
+        image_latents = torch.zeros(1, 32, 8, 8)
+        output = config.postprocess_vae_encode(image_latents, vae)
+
+        self.assertEqual(
+            tuple(output.shape),
+            (1, image_latents.shape[1] * 4, 4, 4),
+        )
+
+
+class TestImageVaeEncodingLatentRetrieval(unittest.TestCase):
+    def test_encode_scale_and_shift_allows_missing_shift(self):
+        latents = torch.ones(1, 4, 2, 2)
+        scaling_factor = torch.full((1, 1, 1, 1), 2.0)
+
+        output = ImageVAEEncodingStage.scale_and_shift_encode_latents(
+            latents, scaling_factor, None
+        )
+
+        self.assertTrue(torch.equal(output, torch.full_like(latents, 2.0)))
+
+    def test_retrieve_latents_accepts_encoder_output_latent(self):
+        stage = object.__new__(ImageVAEEncodingStage)
+        latents = torch.zeros(1, 32, 8, 8)
+        encoder_output = SimpleNamespace(latent=latents)
+
+        self.assertIs(
+            stage.retrieve_latents(encoder_output, sample_mode="argmax"),
+            latents,
+        )
+        self.assertIs(
+            stage.retrieve_latents(encoder_output, sample_mode="sample"),
+            latents,
+        )
+
+    def test_retrieve_latents_accepts_encoder_output_latents(self):
+        stage = object.__new__(ImageVAEEncodingStage)
+        latents = torch.zeros(1, 32, 8, 8)
+        encoder_output = SimpleNamespace(latents=latents)
+
+        self.assertIs(
+            stage.retrieve_latents(encoder_output, sample_mode="argmax"),
+            latents,
+        )
+        self.assertIs(
+            stage.retrieve_latents(encoder_output, sample_mode="sample"),
+            latents,
+        )
 
 
 class TestInputValidationCfgParallelGuard(unittest.TestCase):
