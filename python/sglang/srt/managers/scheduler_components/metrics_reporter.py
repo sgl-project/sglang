@@ -50,11 +50,11 @@ class PrefillStats:
 
     log_input_tokens: int
     log_hit_tokens: int
-    reprocessed_log_input_tokens: int
-    reprocessed_log_hit_tokens: int
     new_token_ratio: float
     num_running_reqs: QueueCount
     num_new_seqs: int  # len(can_run_list)
+    reprocessed_log_input_tokens: int = 0
+    reprocessed_log_hit_tokens: int = 0
     num_pending_tokens: int = 0
 
     @classmethod

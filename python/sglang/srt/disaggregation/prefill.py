@@ -820,7 +820,8 @@ class SchedulerDisaggregationPrefillMixin:
             error_message += f" with exception {e}"
         logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        release_kv_cache(req, self.tree_cache)
+        if req.req_pool_idx is not None or self.tree_cache.supports_mamba():
+            release_kv_cache(req, self.tree_cache)
         release_req_to_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
