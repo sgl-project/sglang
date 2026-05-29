@@ -2577,6 +2577,14 @@ class DeepseekSparseAttnMultiStepBackend:
                     out_cache_loc=None,
                 )
 
+    def init_forward_data_in_graph(self, forward_batch: ForwardBatch) -> None:
+        # MultiStep dispatcher: fan out to inner backends. Default ABC
+        # impl on inner backends is no-op; this exists so callers (e.g.
+        # EAGLEDraftCudaGraphRunner) can invoke it uniformly without
+        # type-checking the wrapper type.
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_data_in_graph(forward_batch)
+
 
 # Backward-compat aliases (deprecated: use DSA class names)
 DeepseekSparseAttnBackend = DeepseekSparseAttnBackend

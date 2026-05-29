@@ -1035,6 +1035,14 @@ class FlashInferMLAMultiStepDraftBackend:
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
 
+    def init_forward_data_in_graph(self, forward_batch: ForwardBatch) -> None:
+        # MultiStep dispatcher: fan out to inner backends. Default ABC
+        # impl on inner backends is no-op; this exists so callers (e.g.
+        # EAGLEDraftCudaGraphRunner) can invoke it uniformly without
+        # type-checking the wrapper type.
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_data_in_graph(forward_batch)
+
 
 def fast_mla_decode_plan(
     self,
