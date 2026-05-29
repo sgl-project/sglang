@@ -92,7 +92,9 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedRuntimeTestCase):
                 break
             yield
 
-        assert r.finished, "chunked req did not finish after the competitor freed its KV"
+        assert (
+            r.finished
+        ), "chunked req did not finish after the competitor freed its KV"
         assert observed_early_return, (
             "test must exercise the add_chunked_req early-return branch: no iter "
             "observed r parked as scheduler.chunked_req while absent from the "
