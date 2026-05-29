@@ -1,6 +1,7 @@
 """Regression tests for the SWA chunked-req stash gate (#24252)."""
 
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -15,7 +16,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
-register_cpu_ci(est_time=6, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 def _make_req(
@@ -27,13 +28,13 @@ def _make_req(
 ) -> Req:
     req = Req.__new__(Req)
     req.rid = "test-req"
-    req.origin_input_ids = list(fill_ids)
-    req.output_ids = []
-    req.fill_ids = list(fill_ids)
+    req.origin_input_ids = array("q", fill_ids)
+    req.output_ids = array("q")
+    req.fill_ids = array("q", fill_ids)
     req.prefix_indices = prefix_indices
     req.req_pool_idx = req_pool_idx
     req.extend_input_len = extend_input_len
-    req.is_chunked = 0
+    req.inflight_middle_chunks = 0
     req.host_hit_length = 0
     req.cache_protected_len = 0
     req.skip_radix_cache_insert = False
@@ -77,6 +78,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.dllm_config = None
     s.dllm_manager = None
     s.enable_hisparse = False
+    s.enable_fpm = False
     s.last_batch = None
     s.require_mlp_sync = False
     s.spec_algorithm = MagicMock()
@@ -87,7 +89,10 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.running_batch.batch_is_full = False
     s.running_batch.reqs = []
     s.get_new_batch_prefill = MagicMock(return_value=None)
-    s.maybe_prepare_mlp_sync_batch = MagicMock(side_effect=lambda batch, **_: batch)
+    s.dp_attn_adapter = MagicMock()
+    s.dp_attn_adapter.maybe_prepare_mlp_sync_batch = MagicMock(
+        side_effect=lambda batch, **_: batch
+    )
     s._maybe_prepare_ngram_embedding = MagicMock(side_effect=lambda batch: batch)
     s.update_running_batch = MagicMock(side_effect=lambda batch: batch)
     s.tree_cache = tree_cache

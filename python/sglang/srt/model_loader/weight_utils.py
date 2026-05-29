@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/model_loader/weight_utils.py
 
 """Utilities for downloading and initializing model weights."""
@@ -683,7 +685,13 @@ def maybe_add_mtp_safetensors(
         getattr(hf_config, "num_nextn_predict_layers", 0),
     )
     if not (
-        arch in ["Glm4MoeForCausalLM", "Glm4MoeForCausalLMNextN"]
+        arch
+        in [
+            "Glm4MoeForCausalLM",
+            "Glm4MoeForCausalLMNextN",
+            "Glm4MoeLiteForCausalLM",
+            "Glm4MoeLiteForCausalLMNextN",
+        ]
         and num_nextn_layers > 0
     ):
         return hf_weights_files

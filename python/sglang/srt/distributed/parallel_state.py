@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/parallel_state.py
 
 # Copyright 2023 The vLLM team.
@@ -382,7 +384,10 @@ class GroupCoordinator:
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
-                CAClass = dispatch_custom_allreduce()
+                CAClass = dispatch_custom_allreduce(
+                    group=self.cpu_group,
+                    device=self.device,
+                )
                 self.ca_comm = CAClass(
                     group=self.cpu_group,
                     device=self.device,
@@ -1559,9 +1564,10 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    with get_tp_group().graph_capture(
-        stream=stream
-    ) as context, get_pp_group().graph_capture(context):
+    with (
+        get_tp_group().graph_capture(stream=stream) as context,
+        get_pp_group().graph_capture(context),
+    ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP)}
             for group in (_MOE_EP, _MOE_TP):
@@ -1598,7 +1604,7 @@ _DEVICE_TO_DISTRIBUTED_BACKEND = {
     "xpu": "xccl",
     "hpu": "hccl",
     "cpu": "gloo",
-    "npu": "hccl",
+    "npu": "hccl" if not envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0 else "zbal",
     "musa": "mccl",
 }
 
