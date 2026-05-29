@@ -355,6 +355,7 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, float, has_bias, BLOC
     Unroll<ROWS * COLS>{}(storec);
   }
 };
+
 template <int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
   static inline void apply(
@@ -841,6 +842,7 @@ void tinygemm_kernel2(
     }
   }
 }
+
 // NB: fp8/fp4 scaled mm kernel implementation
 //
 //        scalar_t     packed_t     param_t
@@ -1166,6 +1168,7 @@ INSTANTIATE_TINYGEMM_TEMPLATE(at::Half, uint8_t, uint8_t);
       bool brg)
 
 INSTANTIATE_TINYGEMM_TEMPLATE2(at::BFloat16);
+
 inline const float* get_bias_data(const std::optional<at::Tensor>& bias, int64_t N) {
   if (bias.has_value()) {
     const auto& bias_ref = bias.value();

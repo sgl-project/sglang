@@ -225,6 +225,7 @@ at::Tensor fused_linear_sigmoid_mul(
 void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, const std::optional<at::Tensor>& scale);
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
+
 // fused moe
 at::Tensor fused_experts_cpu(
     at::Tensor& hidden_states,
