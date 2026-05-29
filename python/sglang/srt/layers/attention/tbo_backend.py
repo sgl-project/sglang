@@ -1,14 +1,11 @@
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Callable, List, Optional
-
-import torch
+from typing import TYPE_CHECKING, Callable, List
 
 from sglang.srt.batch_overlap import two_batch_overlap
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.speculative.spec_info import SpecInput
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class TboAttnBackend(AttentionBackend):
@@ -154,15 +151,13 @@ def _build_tbo_child_replay_fb_view(
     capture-time buffers are sliced per child, spec_info is split, and
     seq_lens_sum is recomputed from the sliced ``seq_lens_cpu``.
     """
-    assert getattr(fb_view, "encoder_lens", None) is None, (
-        "TBO replay split does not support encoder_lens yet"
-    )
+    assert (
+        getattr(fb_view, "encoder_lens", None) is None
+    ), "TBO replay split does not support encoder_lens yet"
     spec_info = getattr(fb_view, "spec_info", None)
     if spec_info is not None:
         start_seq = seq_slice.start or 0
-        end_seq = (
-            seq_slice.stop if seq_slice.stop is not None else start_seq + child_bs
-        )
+        end_seq = seq_slice.stop if seq_slice.stop is not None else start_seq + child_bs
         child_spec_info = two_batch_overlap.split_spec_info(
             spec_info=spec_info,
             start_seq_index=start_seq,

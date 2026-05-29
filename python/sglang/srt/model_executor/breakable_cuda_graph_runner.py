@@ -401,9 +401,7 @@ class BreakableCudaGraphRunner:
             # In-graph metadata step (recordable companion to the out-of-graph
             # init that ran above with in_capture=True). Default ABC impl is
             # no-op; DSV4 uses it for Raw→Full upgrade.
-            self.model_runner.attn_backend.init_forward_metadata_in_graph(
-                forward_batch
-            )
+            self.model_runner.attn_backend.init_forward_metadata_in_graph(forward_batch)
             return self._run_forward(forward_batch, num_tokens)
 
         with forward_context(

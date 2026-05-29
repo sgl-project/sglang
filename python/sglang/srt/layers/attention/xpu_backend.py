@@ -906,7 +906,10 @@ class XPUAttentionBackend(AttentionBackend):
         return 1
 
     def _init_local_attn_metadata(
-        self, forwardbatch: ForwardBatch, metadata: FlashAttentionForwardMetadata, device
+        self,
+        forwardbatch: ForwardBatch,
+        metadata: FlashAttentionForwardMetadata,
+        device,
     ):
         """Centralized utility to initialize local_attn_metadata if chunked attention is enabled."""
         if self.attention_chunk_size is None:

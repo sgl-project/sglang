@@ -293,7 +293,9 @@ class FlashInferAttnBackend(AttentionBackend):
         self.indices_updater_decode = FlashInferIndicesUpdaterDecode(model_runner, self)
 
         # Other metadata
-        self.forward_metadata: Union[FlashInferPrefillForwardMetadata, FlashInferDecodeForwardMetadata] = None
+        self.forward_metadata: Union[
+            FlashInferPrefillForwardMetadata, FlashInferDecodeForwardMetadata
+        ] = None
 
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
@@ -448,9 +450,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if in_capture:
             # Pre-step: create per-bs wrappers (capture-only).
             num_tokens = forward_batch.positions.numel()
-            self._prepare_cuda_graph_metadata(
-                bs, num_tokens, forward_mode, spec_info
-            )
+            self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
 
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -498,7 +498,6 @@ class FlashInferAttnBackend(AttentionBackend):
             for w in self.decode_cuda_graph_metadata[bs]:
                 w.begin_forward = partial(fast_decode_plan, w)
 
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -512,7 +511,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=self.decode_split_tile_size,
                 disable_split_kv=False,
             )
-            self.forward_metadata = FlashInferDecodeForwardMetadata(self.decode_wrappers)
+            self.forward_metadata = FlashInferDecodeForwardMetadata(
+                self.decode_wrappers
+            )
         elif forward_batch.forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -1637,9 +1638,7 @@ class FlashInferMultiStepDraftBackend:
         bs = forward_batch.batch_size
 
         def call_fn(i, fb):
-            inner_fb = build_inner_fb_view(
-                fb, bs=bs, forward_mode=ForwardMode.DECODE
-            )
+            inner_fb = build_inner_fb_view(fb, bs=bs, forward_mode=ForwardMode.DECODE)
             self.attn_backends[i].init_forward_metadata_out_graph(
                 inner_fb, in_capture=in_capture
             )

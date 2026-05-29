@@ -285,7 +285,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         )
 
         # Other metadata
-        self.forward_metadata: Union[FlashInferMLAPrefillForwardMetadata, FlashInferMLADecodeForwardMetadata] = None
+        self.forward_metadata: Union[
+            FlashInferMLAPrefillForwardMetadata, FlashInferMLADecodeForwardMetadata
+        ] = None
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
 
@@ -326,7 +328,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     spec_info=spec_info,
                 )
                 self.decode_cuda_graph_metadata[bs] = decode_wrapper
-                self.forward_metadata = FlashInferMLADecodeForwardMetadata(decode_wrapper)
+                self.forward_metadata = FlashInferMLADecodeForwardMetadata(
+                    decode_wrapper
+                )
                 # fast_mla_decode_plan requires _cached_module set by the initial
                 # begin_forward above; install it only after that call completes.
                 decode_wrapper.plan = partial(fast_mla_decode_plan, decode_wrapper)
@@ -342,7 +346,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     backend="auto",
                 )
                 self.prefill_cuda_graph_metadata[bs] = prefill_wrapper
-                self.forward_metadata = FlashInferMLAPrefillForwardMetadata(prefill_wrapper, False)
+                self.forward_metadata = FlashInferMLAPrefillForwardMetadata(
+                    prefill_wrapper, False
+                )
             else:
                 raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -375,7 +381,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 decode_wrapper=self.decode_wrapper,
                 init_metadata_replay=False,
             )
-            self.forward_metadata = FlashInferMLADecodeForwardMetadata(self.decode_wrapper)
+            self.forward_metadata = FlashInferMLADecodeForwardMetadata(
+                self.decode_wrapper
+            )
         elif forward_batch.forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -386,7 +394,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 use_ragged=False,
                 spec_info=forward_batch.spec_info,
             )
-            self.forward_metadata = FlashInferMLAPrefillForwardMetadata(self.prefill_wrapper_paged, False)
+            self.forward_metadata = FlashInferMLAPrefillForwardMetadata(
+                self.prefill_wrapper_paged, False
+            )
         elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -397,7 +407,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 use_ragged=False,
                 spec_info=forward_batch.spec_info,
             )
-            self.forward_metadata = FlashInferMLAPrefillForwardMetadata(self.prefill_wrapper_verify, False)
+            self.forward_metadata = FlashInferMLAPrefillForwardMetadata(
+                self.prefill_wrapper_verify, False
+            )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)

@@ -21,7 +21,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +103,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
         else:
             # Prefill / draft-extend: fall back to FlashInferMLA parent.
-            super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
+            super().init_forward_metadata_out_graph(
+                forward_batch, in_capture=in_capture
+            )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size

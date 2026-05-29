@@ -1125,9 +1125,7 @@ class CudaGraphRunner:
             # forward_batch was constructed above from `buffers` and already
             # carries the padded capture-time tensors, so it can be passed
             # straight to the new init API.
-            attn_backend.init_forward_metadata_out_graph(
-                forward_batch, in_capture=True
-            )
+            attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
                 # Without this, warmup-1 caches the translation; the capture

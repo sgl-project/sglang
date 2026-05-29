@@ -419,9 +419,7 @@ class DeepseekSparseAttnBackend(
         # supplies them at replay-from-graph-runner; spec runners pass them
         # explicitly via a SimpleNamespace fb_view).
         seq_lens_cpu = (
-            forward_batch.seq_lens.cpu()
-            if in_capture
-            else forward_batch.seq_lens_cpu
+            forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
         self._apply_cuda_graph_metadata(
             bs=forward_batch.batch_size,
@@ -431,9 +429,7 @@ class DeepseekSparseAttnBackend(
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
             out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
-            actual_forward_mode=getattr(
-                forward_batch, "actual_forward_mode", None
-            ),
+            actual_forward_mode=getattr(forward_batch, "actual_forward_mode", None),
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):

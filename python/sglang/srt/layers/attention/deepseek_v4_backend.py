@@ -54,7 +54,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
-from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import ceil_align
 
 if TYPE_CHECKING:
@@ -379,6 +378,7 @@ class DeepseekV4AttnBackend(
             DSV4RawVerifyForwardMetadata,
             DSV4RawDecodeForwardMetadata,
         ] = None
+
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
         return pin_tensor.to(self.device, non_blocking=True)
@@ -690,9 +690,7 @@ class DeepseekV4AttnBackend(
             if bucket == _GraphBucket.DECODE_OR_IDLE:
                 out_cache_loc = torch.zeros_like(seq_lens)
             elif bucket == _GraphBucket.TARGET_VERIFY:
-                out_cache_loc = torch.zeros(
-                    num_tokens, **self.cuda_int32_kwargs
-                )
+                out_cache_loc = torch.zeros(num_tokens, **self.cuda_int32_kwargs)
             else:
                 out_cache_loc = None
             actual_forward_mode = forward_batch.forward_mode
@@ -786,7 +784,10 @@ class DeepseekV4AttnBackend(
             metadata = self.forward_metadata
             self._current_capture_raw = (
                 metadata
-                if isinstance(metadata, (DSV4RawDecodeForwardMetadata, DSV4RawVerifyForwardMetadata))
+                if isinstance(
+                    metadata,
+                    (DSV4RawDecodeForwardMetadata, DSV4RawVerifyForwardMetadata),
+                )
                 else None
             )
 
@@ -863,7 +864,11 @@ class DeepseekV4AttnBackend(
             _GraphBucket,
             Dict[
                 int,
-                Union[DSV4ForwardMetadata, DSV4RawDecodeForwardMetadata, DSV4RawVerifyForwardMetadata],
+                Union[
+                    DSV4ForwardMetadata,
+                    DSV4RawDecodeForwardMetadata,
+                    DSV4RawVerifyForwardMetadata,
+                ],
             ],
         ] = {bucket: {} for bucket in _GraphBucket}
         self.draft_extend_num_tokens_per_bs = (

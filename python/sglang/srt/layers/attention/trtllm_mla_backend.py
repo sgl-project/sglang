@@ -38,7 +38,6 @@ if is_flashinfer_available():
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
 
@@ -499,7 +498,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if forward_mode.is_target_verify():
             seq_lens = seq_lens[:bs] + self.num_draft_tokens
             metadata.seq_lens_k.copy_(seq_lens.to(dtype=torch.int32))
-            del seq_lens_sum  # not handle "num_draft_tokens" but we do not need it
         elif forward_mode.is_draft_extend(include_v2=True):
             num_tokens_per_bs = self.num_draft_tokens
             metadata.max_seq_len_q = num_tokens_per_bs

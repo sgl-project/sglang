@@ -2385,7 +2385,10 @@ class FlashAttentionBackend(AttentionBackend):
         return 1
 
     def _maybe_init_local_attn_metadata(
-        self, forwardbatch: ForwardBatch, metadata: FlashAttentionForwardMetadata, device
+        self,
+        forwardbatch: ForwardBatch,
+        metadata: FlashAttentionForwardMetadata,
+        device,
     ):
         """Centralized utility to initialize local_attn_metadata if chunked attention is enabled."""
         if not self.has_local_attention:
@@ -2479,12 +2482,14 @@ class FlashAttentionBackend(AttentionBackend):
             "local_block_table"
         ][:b0, :b1]
 
-        metadata.local_attn_metadata = FlashAttentionForwardMetadata.LocalAttentionMetadata(
-            local_query_start_loc=local_query_start_loc,
-            local_seqused_k=local_seqused_k,
-            local_block_table=local_block_table,
-            local_max_query_len=1,
-            local_max_seq_len=max_seq_len,
+        metadata.local_attn_metadata = (
+            FlashAttentionForwardMetadata.LocalAttentionMetadata(
+                local_query_start_loc=local_query_start_loc,
+                local_seqused_k=local_seqused_k,
+                local_block_table=local_block_table,
+                local_max_query_len=1,
+                local_max_seq_len=max_seq_len,
+            )
         )
 
     def _maybe_update_local_attn_metadata_for_replay(

@@ -828,9 +828,7 @@ class AiterAttnBackend(AttentionBackend):
         # Aiter's legacy capture variant was a thin pass-through to replay,
         # so a single helper call covers both branches.
         seq_lens_cpu = (
-            forward_batch.seq_lens.cpu()
-            if in_capture
-            else forward_batch.seq_lens_cpu
+            forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
         self._apply_cuda_graph_metadata(
             bs=forward_batch.batch_size,

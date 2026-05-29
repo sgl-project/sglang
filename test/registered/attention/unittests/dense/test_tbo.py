@@ -222,9 +222,7 @@ class TestTboAttnDenseAttentionBackendCorrectness(CustomTestCase):
         ]
         self.assertEqual(child_fbs[0].batch_size, split_seq_index)
         self.assertEqual(child_fbs[1].batch_size, capture_bs - split_seq_index)
-        self.assertEqual(
-            child_fbs[0].req_pool_indices.shape[0], split_seq_index
-        )
+        self.assertEqual(child_fbs[0].req_pool_indices.shape[0], split_seq_index)
         self.assertEqual(
             child_fbs[1].req_pool_indices.shape[0], capture_bs - split_seq_index
         )

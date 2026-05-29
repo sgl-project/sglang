@@ -910,7 +910,6 @@ class TritonAttnBackend(AttentionBackend):
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph replay."
             )
 
-
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 

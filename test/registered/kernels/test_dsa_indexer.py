@@ -23,8 +23,8 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
 )
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
-    DSAIndexerMetadata,
     DSAForwardMetadata,
+    DSAIndexerMetadata,
 )
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import LinearBase
