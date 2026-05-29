@@ -139,18 +139,29 @@ def _get_text(url: str, *, timeout: float = 10.0) -> Optional[str]:
 
 
 def generate(base_url: str, prompt: str, *, max_new_tokens: int = SMOKE_MAX_NEW_TOKENS) -> str:
-    """Issue a deterministic (temperature=0) /generate POST against sglang."""
+    """Deterministic (temperature=0) chat completion against sglang.
+
+    Uses the OpenAI-compatible ``/v1/chat/completions`` endpoint so the
+    model's chat template is applied server-side. The raw ``/generate``
+    endpoint feeds the prompt as a bare completion, which makes a non-chat
+    base continuation degenerate (the instruction-style smoke prompts come
+    back as dataset/JSON scaffolding, and the long NIAH prompts return an
+    empty string) — agreement gates would still pass on the matching
+    garbage, but NIAH recall could not. Chat templating makes every gate
+    meaningful while keeping DS and DSA on the identical request path.
+    """
     body = {
-        "text": prompt,
-        "sampling_params": {"temperature": 0.0, "max_new_tokens": max_new_tokens},
+        "model": "default",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0,
+        "max_tokens": max_new_tokens,
     }
-    out = _post_json(f"{base_url.rstrip('/')}/generate", body, timeout=120.0)
-    # sglang /generate returns {"text": "..."} (optionally with meta_info)
-    # or an OpenAI-style {"choices": [{"text": ...}]}.
-    text = out.get("text")
-    if text is None and "choices" in out:
-        text = out["choices"][0].get("text", "")
-    return text or ""
+    out = _post_json(f"{base_url.rstrip('/')}/v1/chat/completions", body, timeout=120.0)
+    choices = out.get("choices")
+    if isinstance(choices, list) and choices:
+        msg = choices[0].get("message") or {}
+        return msg.get("content") or choices[0].get("text") or ""
+    return ""
 
 
 def server_commit_sha(base_url: str) -> Optional[str]:
