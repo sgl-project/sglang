@@ -249,8 +249,7 @@ def _get_quantization_config(
             # nvidia/DeepSeek-V4-Pro-NVFP4): wrap the built Fp8Config in
             # HybridFp8NvFp4Config (a subclass) so FusedMoE layers dispatch
             # to ModelOptNvFp4FusedMoEMethod while linear/attention stay on
-            # the FP8 path. The wrapper is a Fp8Config subclass so existing
-            # `isinstance(quant_config, Fp8Config)` checks still hold.
+            # the FP8 path.
             nvfp4_meta = model_config.nvfp4_moe_meta
             if nvfp4_meta is not None:
                 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -258,10 +257,14 @@ def _get_quantization_config(
                     ModelOptFp4Config,
                 )
 
+                # MTP MoE layers (model.decoder.*) are not NVFP4 quantized.
+                nvfp4_exclude_modules = list(
+                    nvfp4_meta.get("exclude_modules") or []
+                ) + ["model.decoder.*"]
                 nvfp4_config = ModelOptFp4Config(
                     is_checkpoint_nvfp4_serialized=True,
                     group_size=int(nvfp4_meta["group_size"]),
-                    exclude_modules=list(nvfp4_meta.get("exclude_modules") or []),
+                    exclude_modules=nvfp4_exclude_modules,
                     packed_modules_mapping=quant_config.packed_modules_mapping,
                 )
                 quant_config = HybridFp8NvFp4Config(
