@@ -23,7 +23,6 @@ class RealtimeGenerateSession:
         self.id = uuid4().hex
         self.request_id = None
         self.request: RealtimeVideoInitRequest | None = None
-        self.input_temp_dir: str | None = None
         self.generate_chunk_cnt = 0
         self.realtime_session = RealtimeSession()
         self.adapter: RealtimeModelAdapter | None = None
@@ -41,7 +40,6 @@ class RealtimeGenerateSession:
             self.adapter.dispose(self)
         self.request = None
         self.request_id = None
-        self.input_temp_dir = None
         self.generate_chunk_cnt = 0
         self.adapter = None
         self.adapter_state = None

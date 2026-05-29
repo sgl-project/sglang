@@ -133,15 +133,13 @@ class VideoRemixRequest(BaseModel):
 
 
 class RealtimeVideoInitRequest(VideoGenerationsRequest):
+    """Initial WebSocket message for a realtime video session.
+
+    Reuses VideoGenerationsRequest fields such as prompt, input_reference,
+    reference_url.
+    """
+
     type: Literal["init"]
-    # WebSocket does not support multipart/form-data image uploads.
-    first_frame: Optional[bytes | str] = None
-    seed: Optional[int] = 42
-    guidance_scale: Optional[float] = 1.0
-    size: Optional[str] = "832x480"
-    profile: Optional[bool] = False
-    num_profiled_timesteps: Optional[int] = None
-    profile_all_stages: Optional[bool] = False
 
 
 class RealtimeEvent(BaseModel):
