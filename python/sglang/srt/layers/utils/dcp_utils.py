@@ -480,10 +480,13 @@ def all_gather_kv_cache_for_mha_extend(
         attn_mqa, dcp_local_prefix_kv_indices
     )
     extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
-    prefix_kv_a, prefix_k_pe = all_gather_kv_cache_for_dcp(
+    gathered_kv_cache = all_gather_kv_cache_for_dcp(
         prefix_kv_a,
         prefix_k_pe,
         extend_prefix_lens_cpu,
+    )
+    prefix_kv_a, prefix_k_pe = gathered_kv_cache.split(
+        [kv_a.shape[-1], k_pe.shape[-1]], dim=-1
     )
 
     # re-organize kv with query orders
