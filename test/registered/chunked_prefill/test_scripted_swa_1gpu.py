@@ -2,7 +2,7 @@ import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
+from sglang.test.scripted_runtime.test_case import ScriptedRuntimeTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     base_engine_kwargs,
     run_until,

@@ -9,7 +9,7 @@ any state-machine surprises.
 import unittest
 
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
+from sglang.test.scripted_runtime.test_case import ScriptedRuntimeTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,

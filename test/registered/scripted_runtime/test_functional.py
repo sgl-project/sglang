@@ -9,7 +9,7 @@ import unittest
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.scripted_runtime.req_handle import ReqHandle
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
+from sglang.test.scripted_runtime.test_case import ScriptedRuntimeTestCase
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 register_cuda_ci(est_time=180, stage="base-b", runner_config="1-gpu-small")

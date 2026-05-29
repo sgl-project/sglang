@@ -17,7 +17,7 @@ across (default / greedy / high temperature / top-k / top-p) ×
 import unittest
 
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
+from sglang.test.scripted_runtime.test_case import ScriptedRuntimeTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
