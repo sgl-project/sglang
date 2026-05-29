@@ -61,7 +61,7 @@
 // Historical note on the migration: cells originally carried separate
 // `latency` (concurrency=1) and `throughput` (concurrency=100) blocks.
 // These have been unified into the `speed` array — low-latency-only
-// cells now have one entry at c=1, max-throughput-only cells have one
+// cells now have one entry at c=1, high-throughput-only cells have one
 // entry at c=100, and balanced cells have both. The "—" cells in the
 // rendered table mark metrics not measured at that particular workload
 // and are candidates for the next benchmark sweep.
@@ -88,7 +88,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" },
+    match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.12",
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
@@ -116,7 +116,7 @@ export const benchmarks = [
     notes: "Throughput bench pending re-validation on this cell.",
   },
   {
-    match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" },
+    match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.12",
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
@@ -146,7 +146,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" },
+    match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.12",
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
@@ -174,7 +174,7 @@ export const benchmarks = [
     notes: "Throughput bench pending re-validation on this cell.",
   },
   {
-    match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" },
+    match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.12",
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
@@ -204,7 +204,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" },
+    match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.12",
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
@@ -219,12 +219,9 @@ export const benchmarks = [
         ttft_ms: 263, tpot_ms: 6.91 },
     ],
   },
-  // GB200 Pro balanced: no cookbook recipe completed both lat+thp on 2
-  // nodes — §3.1 cell carries the yellow Auto-Estimated badge, no benchmark
-  // numbers written. Re-run once the deepep / megamoe-w4a8 bench finishes.
   { match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "multi-2" } },
   {
-    match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "multi-2" },
+    match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "multi-2" },
     sglang_version: "0.5.12",
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
@@ -254,7 +251,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" },
+    match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.12",
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
@@ -280,7 +277,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" },
+    match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.12",
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
@@ -291,22 +288,16 @@ export const benchmarks = [
   // ====================================================================
   // H200 + FP8
   // ====================================================================
-  // FP8 sweep on H200 has not been benchmarked yet — all FP8 cells render
-  // the pending-state empty card. Fill these in once the H200 FP8 deploy
-  // (sgl-project repackaging on Hopper) is re-verified.
   { match: { hw: "h200", variant: "flash", quant: "fp8", strategy: "low-latency",    nodes: "single"  } },
   { match: { hw: "h200", variant: "flash", quant: "fp8", strategy: "balanced",       nodes: "single"  } },
-  { match: { hw: "h200", variant: "flash", quant: "fp8", strategy: "max-throughput", nodes: "single"  } },
+  { match: { hw: "h200", variant: "flash", quant: "fp8", strategy: "high-throughput", nodes: "single"  } },
   { match: { hw: "h200", variant: "pro",   quant: "fp8", strategy: "low-latency",    nodes: "single"  } },
   { match: { hw: "h200", variant: "pro",   quant: "fp8", strategy: "low-latency",    nodes: "multi-2" } },
   { match: { hw: "h200", variant: "pro",   quant: "fp8", strategy: "balanced",       nodes: "multi-2" } },
-  { match: { hw: "h200", variant: "pro",   quant: "fp8", strategy: "max-throughput", nodes: "multi-2" } },
+  { match: { hw: "h200", variant: "pro",   quant: "fp8", strategy: "high-throughput", nodes: "multi-2" } },
 
   // ====================================================================
   // H200 + FP4
-  //   Flash low-latency / max-throughput → marlin (cookbook)
-  //   Flash balanced                     → flashinfer_mxfp4 (playground, +26% thp)
-  //   Pro all 3 strategies               → flashinfer_mxfp4 (playground TP=4 sweep)
   // ====================================================================
   {
     match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
@@ -327,17 +318,13 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" },
+    match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.12",
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
         tokens_per_sec_per_gpu: 644 },
     ],
   },
-  // H200 Pro on FP4: numbers transcribed from the dsv4-benchmark playground
-  // sweep (TP=4, flashinfer-mxfp4 runner). The cookbook command in §3.1
-  // mirrors the same backend; cookbook bench re-run on TP=8 is the next
-  // round of work.
   {
     match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.12",
@@ -358,7 +345,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" },
+    match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.12",
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
@@ -367,12 +354,12 @@ export const benchmarks = [
   },
 
   // ====================================================================
-  // H100 + FP4 (all cells pending — H100 was not part of the v0.5.12 sweep)
+  // H100 + FP4
   // ====================================================================
   { match: { hw: "h100", variant: "flash", quant: "fp4", strategy: "low-latency",    nodes: "single"  } },
   { match: { hw: "h100", variant: "flash", quant: "fp4", strategy: "balanced",       nodes: "single"  } },
-  { match: { hw: "h100", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single"  } },
+  { match: { hw: "h100", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single"  } },
   { match: { hw: "h100", variant: "pro",   quant: "fp4", strategy: "low-latency",    nodes: "multi-2" } },
   { match: { hw: "h100", variant: "pro",   quant: "fp4", strategy: "balanced",       nodes: "multi-2" } },
-  { match: { hw: "h100", variant: "pro",   quant: "fp4", strategy: "max-throughput", nodes: "multi-2" } },
+  { match: { hw: "h100", variant: "pro",   quant: "fp4", strategy: "high-throughput", nodes: "multi-2" } },
 ];

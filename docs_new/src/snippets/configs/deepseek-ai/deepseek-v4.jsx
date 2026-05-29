@@ -37,7 +37,7 @@ export const config = {
   strategies: [
     { id: "low-latency",    label: "Low-Latency"    },
     { id: "balanced",       label: "Balanced"       },
-    { id: "max-throughput", label: "Max-Throughput" },
+    { id: "high-throughput", label: "High-Throughput" },
   ],
   // Nodes dimension. The id format `multi-N` carries the node count so the
   // renderer can emit `--nnodes N` automatically.
@@ -294,17 +294,25 @@ export const config = {
     // engine only shows this card when §3.3's PD-Disagg mode is `decode`, and
     // only emits its flags on a decode-role command.
     //
+    // DeepSeek V4 specifics (per PR sgl-project/sglang#26249 — "[hisparse]:
+    // update user guide"):
+    //   DeepSeek V4 uses its own `dsv4` attention backend and defaults to
+    //   `fp8_e4m3` KV cache, so the DSA-family companions
+    //   `--kv-cache-dtype bfloat16` / `--dsa-decode-backend flashmla_sparse`
+    //   DO NOT apply here — those are for DSA models (DeepSeek-V3.2 /
+    //   GLM-5.1). The only extra companion the V4 hisparse recipe needs is
+    //   `--disable-radix-cache` (matches the canonical V4 decode example
+    //   in docs/advanced_features/hisparse_guide.mdx).
+    //
     //   requiredFlags    — decode-side companions emitted alongside
     //                      --enable-hisparse (engine strips + re-adds them).
     //   config           — base hisparse-config JSON; the engine adds the
     //                      selected host_to_device_ratio before serializing.
     //   hostRatios       — host_to_device_ratio options. Tune by host RAM
     //                      (~1TB → 5, ~2TB → 10) per the HiSparse guide.
-    // See docs/advanced_features/hisparse_guide.mdx.
     hisparse: {
       requiredFlags: [
-        "--kv-cache-dtype bfloat16",
-        "--nsa-decode-backend flashmla_sparse",
+        "--disable-radix-cache",
       ],
       config: { top_k: 2048, device_buffer_size: 6144 },
       hostRatios: [
@@ -338,7 +346,11 @@ export const config = {
     // kernel; `w4a4` additionally enables the FP4-acts variant.
     megamoe: {
       requiresHw: ["b200", "b300", "gb200", "gb300"],
-      excludesStrategy: ["low-latency"],
+      // Per sgl-project/sglang#26451, MegaMoE is only wired into the
+      // `high-throughput` recipe on Blackwell — `balanced` joined `low-latency`
+      // on the unsupported list. (PD-Disagg is also unsupported upstream;
+      // we don't have a separate PD recipe axis, so no entry needed.)
+      excludesStrategy: ["low-latency", "balanced"],
       stripEnv: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"],
       options: [
         { id: "disabled", label: "Disabled" },
@@ -406,9 +418,7 @@ export const config = {
       ],
     },
     {
-      // Verified best for B200 Flash max-throughput: MegaMoE W4A4 (FP4-acts variant).
-      // +66% throughput vs the DeepEP baseline at iso-latency on Blackwell.
-      match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" },
+      match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
@@ -449,26 +459,16 @@ export const config = {
       ],
     },
     {
-      // Verified best for B200 Pro balanced: keeps the flashinfer-mxfp4 runner
-      // but routes A2A through MegaMoE. Throughput bench is still being
-      // re-validated, so the benchmark card surfaces latency-only.
-      // MegaMoE + balanced MTP (1/1/2) needs a smaller per-rank dispatch cap
-      // than max-throughput's 8320 — the MTP draft pass eats extra GMEM budget,
-      // so cap at 4096 to keep MoE memory in budget.
       match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096"],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--moe-runner-backend flashinfer_mxfp4",
-        "--moe-a2a-backend megamoe",
-        "--disable-flashinfer-autotune",
-        "--chunked-prefill-size 32768",
-        "--swa-full-tokens-ratio 0.1",
+        "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
         "--speculative-eagle-topk 1",
@@ -481,10 +481,7 @@ export const config = {
       ],
     },
     {
-      // Verified best for B200 Pro max-throughput: MegaMoE W4A4 (FP4-acts).
-      // +124% throughput vs DeepEP on this cell — that is the optimal recipe
-      // and the W4A4-vs-W4A8 gap is within trial noise on B200.
-      match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" },
+      match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
@@ -510,11 +507,6 @@ export const config = {
       ],
     },
 
-    // ====================================================================
-    // B300 + FP4 — same launch recipes as B200, different docker image SKU.
-    // The cells below are line-for-line copies of the B200 cells above with
-    // only `match.hw` changed; keep them in sync when editing B200.
-    // ====================================================================
     {
       match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: true,
@@ -556,8 +548,7 @@ export const config = {
       ],
     },
     {
-      // Verified best for B300 Flash max-throughput: mirrors B200 — MegaMoE W4A4.
-      match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" },
+      match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
@@ -598,25 +589,16 @@ export const config = {
       ],
     },
     {
-      // Verified best for B300 Pro balanced: mirrors B200 Pro balanced — keep
-      // flashinfer-mxfp4 runner, route A2A through MegaMoE. Throughput is
-      // still pending re-verification.
-      // MegaMoE + balanced MTP needs the same 4096 per-rank dispatch cap as
-      // B200 Pro balanced (see that cell's comment).
       match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096"],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--moe-runner-backend flashinfer_mxfp4",
-        "--moe-a2a-backend megamoe",
-        "--disable-flashinfer-autotune",
-        "--chunked-prefill-size 32768",
-        "--swa-full-tokens-ratio 0.1",
+        "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
         "--speculative-eagle-topk 1",
@@ -629,10 +611,7 @@ export const config = {
       ],
     },
     {
-      // Verified best for B300 Pro max-throughput: MegaMoE W4A8 (B300's
-      // higher-throughput pick — the W4A4 acts variant did not help on B300
-      // Pro within trial noise; W4A8 was the highest measured throughput).
-      match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" },
+      match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"],
       flags: [
@@ -698,10 +677,7 @@ export const config = {
       ],
     },
     {
-      // Verified best for GB200 Flash max-throughput: MegaMoE W4A4.
-      // +66% throughput vs the DeepEP baseline; W4A4 edges W4A8 by 1.4% on
-      // GB200 Flash, both well ahead of DeepEP.
-      match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" },
+      match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
@@ -747,11 +723,6 @@ export const config = {
       ],
     },
     {
-      // Auto-estimated: no GB200 Pro balanced cookbook recipe has both the
-      // latency AND throughput benches pass on 2 nodes (deepep / megamoe-w4a4
-      // timed out; megamoe-w4a8 ran latency but the throughput bench failed).
-      // Command kept as the documented deepep recipe; treat numbers as
-      // unmeasured until the next 2-node round lands.
       match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
       env: [
         "NCCL_MNNVL_ENABLE=1",
@@ -777,10 +748,7 @@ export const config = {
       ],
     },
     {
-      // Verified best for GB200 Pro max-throughput: MegaMoE W4A8 (the only
-      // backend whose 2-node cookbook bench completed cleanly — the DeepEP
-      // baseline failed at second-node startup; W4A8 edges W4A4 by +3.3%).
-      match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "multi-2" },
+      match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "multi-2" },
       verified: true,
       env: [
         "NCCL_MNNVL_ENABLE=1",
@@ -846,10 +814,7 @@ export const config = {
       ],
     },
     {
-      // Verified best for GB300 Flash max-throughput: MegaMoE W4A8 (on GB300
-      // Flash, W4A8 edged W4A4 by ~2.5%; both are far ahead of the DeepEP
-      // baseline).
-      match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" },
+      match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"],
       flags: [
@@ -909,9 +874,7 @@ export const config = {
       ],
     },
     {
-      // Verified best for GB300 Pro max-throughput: MegaMoE W4A4 (W4A4 vs
-      // W4A8 within 0.5% — both add +33% throughput over the DeepEP baseline).
-      match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" },
+      match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
@@ -979,7 +942,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "h200", variant: "flash", quant: "fp8", strategy: "max-throughput", nodes: "single" },
+      match: { hw: "h200", variant: "flash", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [
         "SGLANG_DSV4_FP4_EXPERTS=0",
@@ -999,17 +962,7 @@ export const config = {
         "--port {{PORT}}",
       ],
     },
-    // H200 Pro FP8: low-latency exposes BOTH single-node (TP=8 Marlin) and
-    // multi-2 (TP=16 DP-attn + DeepEP) — the old combined block, split.
     {
-      // h200 Pro FP8 SINGLE-NODE runs the FP4-native repo with Marlin's W4A16
-      // path (no FP8 conversion needed when sharded over only 8 GPUs). The
-      // sibling MULTI-2 cell below uses the sgl-project FP8 repackaging
-      // because Hopper TP=16 with DP-attn + DeepEP needs uniform FP8 weights.
-      // Because the two variants need DIFFERENT --model-path strings on the
-      // same (hw, variant, quant) tuple, this cell hard-codes the path
-      // verbatim instead of relying on {{MODEL_NAME}} (which would resolve
-      // to the FP8 repackaging via modelNames["h200|pro|fp8"]).
       match: { hw: "h200", variant: "pro", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [],
@@ -1080,7 +1033,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "h200", variant: "pro", quant: "fp8", strategy: "max-throughput", nodes: "multi-2" },
+      match: { hw: "h200", variant: "pro", quant: "fp8", strategy: "high-throughput", nodes: "multi-2" },
       verified: true,
       env: [
         "SGLANG_DSV4_FP4_EXPERTS=0",
@@ -1101,15 +1054,6 @@ export const config = {
       ],
     },
 
-    // ====================================================================
-    // H200 + FP4 (single-node only)
-    //   Runner choice splits per-strategy on H200 — pick whatever scored
-    //   best in the v0.5.12 sweep:
-    //     low-latency      → marlin            (TPOT −6% vs flashinfer_mxfp4)
-    //     balanced         → flashinfer_mxfp4  (throughput +26% vs marlin)
-    //     max-throughput   → marlin            (throughput +6% vs flashinfer_mxfp4)
-    //   Pro shares the flashinfer_mxfp4 path across all three strategies.
-    // ====================================================================
     {
       match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: true,
@@ -1128,8 +1072,6 @@ export const config = {
       ],
     },
     {
-      // Verified best for H200 Flash balanced: flashinfer_mxfp4 (+26% throughput
-      // vs marlin at the same EAGLE 1-1-2 spec config; TPOT cost is ~+5%).
       match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
@@ -1147,7 +1089,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" },
+      match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -1196,7 +1138,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" },
+      match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -1248,7 +1190,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "h100", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" },
+      match: { hw: "h100", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -1301,7 +1243,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "h100", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "multi-2" },
+      match: { hw: "h100", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "multi-2" },
       verified: true,
       env: ["SGLANG_SHARED_EXPERT_TP1=1"],
       flags: [

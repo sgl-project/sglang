@@ -98,7 +98,7 @@ and any non-literal value crashes with `ReferenceError`.
 | `supportedHardware` | `string[]` | Which hw ids appear in the catalog. Subset of the keys in `HARDWARE_CATALOG` in `_deployment.jsx`. Listing an id makes its button appear; if no cell uses it, the engine greys it out automatically. |
 | `variants` | `{id, label, subtitle?}[]` | 2nd-dim option list. Use `default` / single-element if the model has no variant axis. |
 | `quantizations` | `{id, label}[]` | 3rd-dim option list. |
-| `strategies` | `{id, label}[]` | 4th-dim option list. Common ids: `low-latency`, `balanced`, `max-throughput`. |
+| `strategies` | `{id, label}[]` | 4th-dim option list. Common ids: `low-latency`, `balanced`, `high-throughput`. |
 | `nodesOptions` | `{id, label}[]` | 5th-dim option list. The `id` MUST be `single` or `multi-N` — the engine parses N from the id for `--nnodes`. |
 | `cells` | `{match, verified?, env, flags}[]` | One per supported (hw × variant × quant × strategy × nodes) combination. See §2.2. |
 | `modelNames` | `{[key]: string}` | HF slug lookup. Keys are either `hw\|variant\|quant` (most specific) or `variant\|quant` (fallback). |

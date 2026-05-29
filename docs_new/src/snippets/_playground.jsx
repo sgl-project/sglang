@@ -561,7 +561,7 @@ export const Playground = ({ config }) => {
 
       // Recover MoE backend choice from the base cell's flags. When BOTH
       // `--moe-a2a-backend` and `--moe-runner-backend` are present (e.g.
-      // h200 fp8 max-throughput layers both), we prefer `--moe-a2a-backend`
+      // h200 fp8 high-throughput layers both), we prefer `--moe-a2a-backend`
       // — it's the "louder" architectural pick and matches the
       // single-select dropdown's semantics.
       deriveFromBase: (cell, fc, h) => {
