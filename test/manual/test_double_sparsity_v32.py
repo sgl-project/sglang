@@ -93,26 +93,25 @@ def _generate(
 ) -> str:
     """Issue a generation request and return the completion text.
 
-    Two transports, chosen per task because the V3.2 checkpoint is
+    Two transports, chosen per task because the checkpoint is
     instruction-tuned:
 
     * ``use_chat=True`` → ``/v1/chat/completions`` (applies the model's
-      chat template server-side). Required for the NIAH gate: the NIAH
-      prompt is an instruction ("Question: ... Output only the value."),
-      and raw ``/generate`` returns an immediate-EOS **empty string** for
-      these long instruction-style prompts, which would make the paired
-      recall vacuously 0/0 on BOTH servers and the gate falsely "pass"
-      (BL-20260529-dsv32-quality-smoke-needs-chat-template; same fix the
-      AC-Q smoke adopted). Verified live: DS NIAH-4K → exact-needle recall
+      chat template server-side). Required for the needle-in-haystack
+      recall prompts: each is an instruction ("Question: ... Output only
+      the value."), and raw ``/generate`` returns an immediate-EOS **empty
+      string** for these long instruction-style prompts, which would make
+      the paired recall vacuously 0/0 on BOTH servers and the gate falsely
+      "pass". Verified live: a 4K needle prompt recalls the exact needle
       via chat vs empty via raw.
 
-    * ``use_chat=False`` (default) → raw ``/generate``. MMLU 5-shot is a
-      genuine few-shot *completion* benchmark (5 answered examples then
-      the test question ending in ``Answer:``); the model completes the
-      gold letter as the leading token. Applying the chat template here is
-      actively harmful — the model answers conversationally and the letter
-      is no longer the leading token (verified: raw parsed 10/10 correct,
-      chat 0/10). The locked MMLU transport stays raw to match
+    * ``use_chat=False`` (default) → raw ``/generate``. The MMLU 5-shot
+      check is a genuine few-shot *completion* benchmark (5 answered
+      examples then the test question ending in ``Answer:``); the model
+      completes the gold letter as the leading token. Applying the chat
+      template here is actively harmful — the model answers conversationally
+      and the letter is no longer the leading token (verified: raw parsed
+      10/10 correct, chat 0/10). The MMLU transport stays raw to match
       ``benchmark/mmlu/bench_sglang.py``.
     """
     if use_chat:
@@ -554,6 +553,55 @@ def _record_artifact(payload: Dict[str, Any], *, suffix: str) -> None:
 
 
 @dataclass
+class _GenAttempt:
+    """One generation attempt against a server.
+
+    ``ok`` is False when the server rejected the request (e.g. a
+    context-length 400 when the prompt exceeds the server's KV pool); the
+    HTTP status / response body / error string are then captured so the gate
+    can still record a durable per-length artifact instead of letting the
+    HTTP error escape before the artifact is written.
+    """
+    text: str
+    ok: bool
+    http_status: Optional[int] = None
+    error: Optional[str] = None
+    body: Optional[str] = None
+
+
+def _generate_attempt(
+    base_url: str, prompt: str, *, max_new_tokens: int, use_chat: bool = False,
+) -> _GenAttempt:
+    """``_generate`` wrapped so a server rejection is captured, not raised.
+
+    Returns ``_GenAttempt(ok=True, text=...)`` on success, or
+    ``_GenAttempt(ok=False, ...)`` carrying the HTTP status / response body /
+    error string on a 4xx/5xx (``HTTPError``) or a transport failure
+    (``URLError``). An unservable prompt is therefore a recorded miss, never
+    an uncaught exception that skips the per-length artifact.
+    """
+    try:
+        text = _generate(
+            base_url, prompt, max_new_tokens=max_new_tokens, use_chat=use_chat,
+        )
+        return _GenAttempt(text=text, ok=True)
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:
+            body = None
+        return _GenAttempt(
+            text="", ok=False, http_status=exc.code,
+            error=f"HTTP {exc.code}: {exc.reason}", body=body,
+        )
+    except urllib.error.URLError as exc:
+        return _GenAttempt(
+            text="", ok=False, http_status=None,
+            error=f"URLError: {exc.reason}",
+        )
+
+
+@dataclass
 class _NIAHRunResult:
     length_tokens: int
     num_prompts: int
@@ -562,14 +610,41 @@ class _NIAHRunResult:
     dsa_recall_pct: float
     ds_recall_pct: float
     delta_pct: float  # dsa_recall_pct - ds_recall_pct (positive = DS lost quality)
+    dsa_served: int = 0   # prompts the DSA server actually answered
+    ds_served: int = 0    # prompts the DS server actually answered
+    dsa_error: Optional[str] = None  # first DSA rejection (status/reason/body), if any
+    ds_error: Optional[str] = None   # first DS rejection (status/reason/body), if any
+
+
+def _summarize_attempts(
+    attempts: List[_GenAttempt],
+) -> Tuple[int, Optional[str]]:
+    """Return ``(num_served, first_error_or_None)`` for a list of attempts."""
+    served = sum(1 for a in attempts if a.ok)
+    first_err = next((a for a in attempts if not a.ok), None)
+    if first_err is None:
+        return served, None
+    msg = first_err.error or "request failed"
+    if first_err.body:
+        msg = f"{msg} | body={first_err.body.strip()[:300]}"
+    return served, msg
 
 
 def _run_niah(
     ds_url: str, dsa_url: str, *,
     length_tokens: int, num_prompts: int, max_new_tokens: int,
 ) -> _NIAHRunResult:
-    """Generate ``num_prompts`` NIAH prompts at ``length_tokens``, query
-    both servers, compute paired recall and delta."""
+    """Generate ``num_prompts`` NIAH prompts at ``length_tokens``, query both
+    servers, and compute paired recall + delta.
+
+    The prompts are instruction-style ("... output only the value"), so they
+    use the chat-template path (``use_chat=True``) — the raw completion
+    endpoint returns an empty string for them. Each request is an error-aware
+    attempt: a server that cannot admit the prompt (a context-length 400 when
+    the prompt exceeds the KV pool) is recorded as a failed attempt with its
+    served count and error and counts as a recall miss, rather than aborting
+    the gate before the artifact is written.
+    """
     needles = [_niah_needle(length_tokens, i) for i in range(num_prompts)]
     prompts = [
         _make_niah_prompt(
@@ -577,20 +652,21 @@ def _run_niah(
         )
         for i in range(num_prompts)
     ]
-    # DSA first per the plan §9.4 "same session, DSA immediately before DS"
-    # convention used by the lightweight smoke harness. NIAH is an
-    # instruction-style prompt → chat template (use_chat=True); raw
-    # /generate returns empty for these (see _generate docstring).
-    dsa_responses = [
-        _generate(dsa_url, p, max_new_tokens=max_new_tokens, use_chat=True)
+    # DSA first, then DS (same-session convention: DSA is the reference
+    # measured immediately before DS).
+    dsa_attempts = [
+        _generate_attempt(dsa_url, p, max_new_tokens=max_new_tokens, use_chat=True)
         for p in prompts
     ]
-    ds_responses = [
-        _generate(ds_url, p, max_new_tokens=max_new_tokens, use_chat=True)
+    ds_attempts = [
+        _generate_attempt(ds_url, p, max_new_tokens=max_new_tokens, use_chat=True)
         for p in prompts
     ]
-    dsa_hits = _niah_recall_hits(needles, dsa_responses)
-    ds_hits = _niah_recall_hits(needles, ds_responses)
+    dsa_served, dsa_error = _summarize_attempts(dsa_attempts)
+    ds_served, ds_error = _summarize_attempts(ds_attempts)
+    # Recall is over num_prompts: an unservable prompt is a miss (text="").
+    dsa_hits = _niah_recall_hits(needles, [a.text for a in dsa_attempts])
+    ds_hits = _niah_recall_hits(needles, [a.text for a in ds_attempts])
     dsa_recall = (dsa_hits / num_prompts) * 100.0
     ds_recall = (ds_hits / num_prompts) * 100.0
     return _NIAHRunResult(
@@ -601,6 +677,10 @@ def _run_niah(
         dsa_recall_pct=dsa_recall,
         ds_recall_pct=ds_recall,
         delta_pct=dsa_recall - ds_recall,
+        dsa_served=dsa_served,
+        ds_served=ds_served,
+        dsa_error=dsa_error,
+        ds_error=ds_error,
     )
 
 
@@ -633,25 +713,51 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
             num_prompts=self.num_prompts,
             max_new_tokens=self.max_new_tokens,
         )
+        # A server rejection (e.g. a DS context-length 400) is BOTH a hard
+        # recall failure for that side and a distinct admission failure we
+        # surface; the gate also fails on a recall delta over threshold.
+        server_error = (r.ds_error is not None) or (r.dsa_error is not None)
+        passed = (not server_error) and (r.delta_pct <= self.NIAH_TOLERANCE_PP)
+        # Always record the per-length artifact BEFORE asserting, so a server
+        # rejection still leaves durable evidence (status/body/served counts).
         _record_artifact(
             {
                 "length_tokens": r.length_tokens,
                 "num_prompts": r.num_prompts,
+                "dsa_served": r.dsa_served,
+                "ds_served": r.ds_served,
                 "dsa_hits": r.dsa_hits,
                 "ds_hits": r.ds_hits,
                 "dsa_recall_pct": r.dsa_recall_pct,
                 "ds_recall_pct": r.ds_recall_pct,
                 "delta_pct": r.delta_pct,
                 "threshold_pp": self.NIAH_TOLERANCE_PP,
+                "dsa_error": r.dsa_error,
+                "ds_error": r.ds_error,
+                "verdict": "PASS" if passed else "FAIL",
             },
             suffix=f"niah_{length_tokens}",
         )
-        self.assertLessEqual(
-            r.delta_pct, self.NIAH_TOLERANCE_PP,
-            f"NIAH @ {length_tokens}: DS recall {r.ds_recall_pct:.1f}% < "
-            f"DSA recall {r.dsa_recall_pct:.1f}% by {r.delta_pct:.1f} pp "
-            f"(> {self.NIAH_TOLERANCE_PP} pp threshold).",
-        )
+        if r.ds_error is not None:
+            msg = (
+                f"NIAH @ {length_tokens}: DS could not serve the prompt "
+                f"(served {r.ds_served}/{r.num_prompts}); DS error: {r.ds_error}. "
+                f"DSA served {r.dsa_served}/{r.num_prompts}, "
+                f"recall {r.dsa_recall_pct:.1f}%."
+            )
+        elif r.dsa_error is not None:
+            msg = (
+                f"NIAH @ {length_tokens}: DSA reference could not serve the "
+                f"prompt (served {r.dsa_served}/{r.num_prompts}); "
+                f"DSA error: {r.dsa_error}."
+            )
+        else:
+            msg = (
+                f"NIAH @ {length_tokens}: DS recall {r.ds_recall_pct:.1f}% < "
+                f"DSA recall {r.dsa_recall_pct:.1f}% by {r.delta_pct:.1f} pp "
+                f"(> {self.NIAH_TOLERANCE_PP} pp threshold)."
+            )
+        self.assertTrue(passed, msg)
         return r
 
     def test_niah_at_4k(self):

@@ -30,8 +30,9 @@ MODEL_PATH="${MODEL_PATH:-/cluster-storage/models/deepseek-ai/DeepSeek-V3.2}"
 PORT="${PORT:-30000}"
 # Bind address. Default 127.0.0.1 (localhost-only, the sglang default). Set
 # HOST=0.0.0.0 to make this DS server reachable from another node (symmetry
-# with serve_native_nsa.sh; used by the AC-12 two-node quality gate). The
-# locked Option B flags below are unchanged by this knob.
+# with serve_native_nsa.sh; used when a paired DS-vs-baseline quality run
+# spans two nodes). The dense-prefill/sparse-decode flags below are unchanged
+# by this knob.
 HOST="${HOST:-127.0.0.1}"
 TP_SIZE="${TP_SIZE:-8}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"

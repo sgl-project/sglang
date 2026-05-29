@@ -616,5 +616,97 @@ class TestAC12HarnessHelpers(unittest.TestCase):
             self.assertIn("missing data/", str(ctx.exception))
 
 
+    def test_niah_64k_ds_rejection_records_failure_artifact(self):
+        """#L regression: when DS rejects a NIAH prompt (e.g. a
+        context-length 400 because the prompt exceeds the DS KV pool), the
+        gate must still RECORD a per-length artifact (with the DS error +
+        served counts + verdict=FAIL) and fail cleanly, instead of letting
+        ``urllib.error.HTTPError`` escape before ``_record_artifact`` runs
+        (which previously left NIAH-64K with no ``ac12_niah_65536`` artifact).
+        """
+        import io
+        import re
+        import sys
+        import unittest as _ut
+        import urllib.error
+        from unittest.mock import patch
+
+        ds_url = "http://ds-server:1"
+        dsa_url = "http://dsa-server:2"
+
+        # DSA answers with the planted needle (parsed from the prompt) so the
+        # reference recall is non-trivial; DS rejects every prompt with a
+        # context-length 400 carrying a realistic sglang error body.
+        _needle_re = re.compile(r"The hidden value is (\S+?)\.")
+
+        def fake_generate(base_url, prompt, *, max_new_tokens=64, use_chat=False):
+            if base_url == ds_url:
+                body = (
+                    b'{"object":"error","message":"Input length (69970 tokens) '
+                    b'exceeds the maximum allowed length (53050 tokens). Use a '
+                    b'shorter input or enable --allow-auto-truncate.","code":400}'
+                )
+                raise urllib.error.HTTPError(
+                    base_url, 400, "Bad Request", {}, io.BytesIO(body),
+                )
+            m = _needle_re.search(prompt)
+            return m.group(1) if m else ""
+
+        captured: List[Dict[str, Any]] = []
+
+        def fake_record(payload, *, suffix):
+            captured.append({"payload": payload, "suffix": suffix})
+
+        env_overrides = {
+            "DS_BASE_URL": ds_url,
+            "DSA_BASE_URL": dsa_url,
+            "AC12_NIAH_NUM_PROMPTS": "2",  # small: prompt-length is fixed at 65536
+        }
+
+        cls = self._h.TestDoubleSparsityV32Quality
+        orig_skip = cls.__dict__.get("__unittest_skip__", False)
+        orig_why = cls.__dict__.get("__unittest_skip_why__", "")
+        cls.__unittest_skip__ = False
+        cls.__unittest_skip_why__ = ""
+        try:
+            with patch.dict(os.environ, env_overrides), \
+                 patch.object(self._h, "_generate", fake_generate), \
+                 patch.object(self._h, "_record_artifact", fake_record):
+                suite = _ut.TestSuite([cls("test_niah_at_64k")])
+                result = _ut.TextTestRunner(
+                    stream=open(os.devnull, "w"), verbosity=0,
+                ).run(suite)
+        finally:
+            cls.__unittest_skip__ = orig_skip
+            cls.__unittest_skip_why__ = orig_why
+
+        # Clean failure: a recall/admission FAIL (assertion), NOT an uncaught
+        # HTTPError (which would land in result.errors).
+        self.assertEqual(
+            len(result.errors), 0,
+            f"DS rejection must fail cleanly, not error out: {result.errors}",
+        )
+        self.assertEqual(
+            len(result.failures), 1,
+            f"expected exactly one assertion failure: {result.failures}",
+        )
+
+        # Exactly one durable niah_65536 artifact with the DS error details.
+        niah = [c for c in captured if c["suffix"] == "niah_65536"]
+        self.assertEqual(
+            len(niah), 1,
+            f"expected exactly one niah_65536 artifact, got {len(niah)}",
+        )
+        payload = niah[0]["payload"]
+        self.assertEqual(payload["length_tokens"], 65536)
+        self.assertEqual(payload["num_prompts"], 2)
+        self.assertEqual(payload["verdict"], "FAIL")
+        self.assertEqual(payload["ds_served"], 0)
+        self.assertEqual(payload["dsa_served"], 2)
+        self.assertIsNotNone(payload["ds_error"])
+        self.assertIn("HTTP 400", payload["ds_error"])
+        self.assertIn("exceeds the maximum allowed", payload["ds_error"])
+
+
 if __name__ == "__main__":
     unittest.main()
