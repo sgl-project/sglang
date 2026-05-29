@@ -2308,16 +2308,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         parallel across PP stages instead of serially via the warmup
         ``/generate`` request flowing through the pipeline.
         """
-        # n_splits ~= n_sms // ceil(bs/64); pick bs to cover 4 brackets.
+        # n_splits ~= n_sms // ceil(bs/64); pick bs to cover 5 brackets.
         n_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         block_m = 64
+        cp = max(self.attn_cp_size, 1)
         batch_sizes = sorted(
             {
-                1,
-                2 * block_m,
-                max(n_sms // 8, 2) * block_m,
-                max(n_sms // 4, 4) * block_m,
-                n_sms * block_m,
+                ceil_align(bs, cp)
+                for bs in (
+                    1,
+                    2 * block_m,
+                    max(n_sms // 8, 2) * block_m,
+                    max(n_sms // 4, 4) * block_m,
+                    n_sms * block_m,
+                )
             }
         )
 
