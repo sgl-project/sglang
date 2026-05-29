@@ -658,11 +658,13 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         Returns a dict ready to populate a CacheDigest dataclass.
         """
+        from collections import deque
+
         prefix_entries: dict = {}
 
-        stack: list = [(self.root_node, [], b"", 0)]
-        while stack:
-            node, parent_tokens, parent_chain_hash, parent_boundary = stack.pop()
+        queue = deque([(self.root_node, [], b"", 0)])
+        while queue:
+            node, parent_tokens, parent_chain_hash, parent_boundary = queue.popleft()
 
             for child in node.children.values():
                 if self._skip_node_in_digest(child):
@@ -695,9 +697,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                     break
 
                 if len(path_tokens) < max_prefix_tokens and child.children:
-                    stack.append(
-                        (child, path_tokens, chain_hash, last_boundary)
-                    )
+                    queue.append((child, path_tokens, chain_hash, last_boundary))
 
             if len(prefix_entries) >= max_entries:
                 break
