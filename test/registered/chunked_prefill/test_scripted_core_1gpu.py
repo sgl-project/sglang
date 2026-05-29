@@ -29,10 +29,9 @@ _NUM_MIDDLE_CHUNKS = (_PROMPT_LEN - 1) // _CHUNK_SIZE
 _LIFECYCLE_MAX_NEW_TOKENS = 4
 
 
-def _advance_to_stage(t: ScriptedRuntime, r, stage: str):
+def _advance_to_stage(r, stage: str):
     """Yield until the req reaches ``stage``, wired to this file's prompt config."""
     yield from advance_to_lifecycle_stage(
-        t,
         r,
         stage,
         num_middle_chunks=_NUM_MIDDLE_CHUNKS,
@@ -83,13 +82,7 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
         r = t.start_req(
             prompt_len=_PROMPT_LEN, max_new_tokens=_LIFECYCLE_MAX_NEW_TOKENS
         )
-        yield from _advance_to_stage(t, r, stage)
-
-        # Decode progress so far; retract preserves output_ids, so a correctly
-        # paused engine must not advance this while paused.
-        req = t._find_req_by_rid(r.rid)
-        assert req is not None, f"stage={stage}: req vanished before pause"
-        output_tokens_before_pause = len(req.output_ids)
+        yield from _advance_to_stage(r, stage)
 
         t.pause_generation(mode="retract")
         # Retract state is reflected in the scheduler on the next event-loop iter.
@@ -98,22 +91,23 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
         # _lookup_req_status is pending reimplementation, so check the retract
         # landing directly against the scheduler: the req must be parked back
         # in waiting_queue rather than still running or finished.
-        req = t._find_req_by_rid(r.rid)
+        req = r.req
         assert req is not None and req in t._scheduler.waiting_queue, (
             f"stage={stage}: pause(retract) should park the req back in "
             f"waiting_queue; found={req!r}"
         )
 
-        # Sit paused for a few iters: the engine must make no forward progress.
+        # retract releases committed KV, so kv_committed_len drops here; a
+        # correctly paused engine then makes no forward progress, so it must
+        # stay put across the paused iters.
+        committed_while_paused = req.kv_committed_len
         for _ in range(3):
             yield
-            req = t._find_req_by_rid(r.rid)
-            assert (
-                req is not None and len(req.output_ids) == output_tokens_before_pause
-            ), (
+            req = r.req
+            assert req is not None and req.kv_committed_len == committed_while_paused, (
                 f"stage={stage}: paused engine advanced the req "
-                f"({len(req.output_ids) if req is not None else None} output tokens, "
-                f"expected {output_tokens_before_pause})"
+                f"(kv_committed_len={req.kv_committed_len if req is not None else None}, "
+                f"expected {committed_while_paused})"
             )
 
         t.continue_generation()
@@ -131,7 +125,7 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
         r = t.start_req(
             prompt_len=_PROMPT_LEN, max_new_tokens=_LIFECYCLE_MAX_NEW_TOKENS
         )
-        yield from _advance_to_stage(t, r, stage)
+        yield from _advance_to_stage(r, stage)
 
         t.abort_all()
         # abort_request marks the req FINISH_ABORT but the chunked_req slot
