@@ -37,7 +37,7 @@ class TestMiniMaxM2(GSM8KAscendMixin, CustomTestCase):
         "--chunked-prefill-size",
         "-1",
     ]
-    timeout_for_server_launch = 3600
+    timeout_for_server_launch = 1800
 
 
 if __name__ == "__main__":
