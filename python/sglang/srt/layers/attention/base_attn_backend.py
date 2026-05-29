@@ -133,7 +133,31 @@ class AttentionBackend(ABC):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        """Run forward on an attention layer."""
+        """Run forward on an attention layer.
+
+        All aux data is sourced from backend-internal channels, NOT
+        ``**kwargs``:
+
+          - ``forward_batch.spec_info`` (e.g. ``spec_info.custom_mask``)
+          - ``self.forward_metadata`` (set in
+            :py:meth:`init_forward_metadata_out_graph`)
+          - ``self.cuda_graph_*`` (backend-private buffers; set in
+            :py:meth:`init_cuda_graph_state`)
+          - :py:meth:`get_indexer_metadata` /
+            :py:meth:`get_compressor_state` (opt-in reverse-query helpers)
+
+        ``**kwargs`` is reserved for **layer-level extras** that the model
+        layer (RadixAttention / RadixLinearAttention) injects per-call —
+        e.g. ``q_rope`` / ``k_rope`` (MLA rotary), ``sinks`` (sink-token
+        attention), ``cos_sin_cache`` / ``is_neox`` / ``llama_4_scaling``
+        (rotary variants), ``topk_indices`` (DSA). It MUST NOT carry spec
+        / mask / page table / indexer / compressor data — those are aux
+        data with explicit channels above.
+
+        Step 08 follow-up: enumerate layer-level extras explicitly and
+        drop ``**kwargs`` catch-all once the backend signatures are
+        aligned (see ``attention/08-decouple-aux-data.md``).
+        """
         if forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         elif forward_batch.forward_mode.is_decode():
