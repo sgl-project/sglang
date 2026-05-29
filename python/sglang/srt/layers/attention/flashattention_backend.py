@@ -2776,18 +2776,6 @@ class FlashAttentionMultiStepBackend:
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        # MultiStep uses custom signatures (fb-only / fb+bs).
-        if in_capture:
-            self.init_forward_metadata_capture_cuda_graph(forward_batch)
-        else:
-            self.init_forward_metadata_replay_cuda_graph(
-                forward_batch, forward_batch.batch_size
-            )
-
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        forward_batch: ForwardBatch,
-    ):
         from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
 
         assert forward_batch.spec_info is not None
@@ -2800,28 +2788,11 @@ class FlashAttentionMultiStepBackend:
             encoder_lens=forward_batch.encoder_lens,
         )
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_data_out_graph(
-                inner_fb, in_capture=True
-            )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self, forward_batch: ForwardBatch, bs: int
-    ):
-        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
-
-        assert forward_batch.spec_info is not None
-        assert forward_batch.spec_info.is_draft_input()
-
-        inner_fb = build_inner_fb_view(
-            forward_batch,
-            bs=bs,
-            forward_mode=ForwardMode.DECODE,
-            encoder_lens=forward_batch.encoder_lens,
-        )
-        for i in range(self.speculative_num_steps - 1):
             # TODO: incrementally update the metadata for the later steps,
             # so that they do not need to recompute everything from scratch.
-            self.attn_backends[i].init_forward_data_out_graph(inner_fb)
+            self.attn_backends[i].init_forward_data_out_graph(
+                inner_fb, in_capture=in_capture
+            )
 
 
 @triton.jit
