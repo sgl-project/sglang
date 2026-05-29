@@ -3475,6 +3475,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
     params_dict = dict(model.named_parameters())
     for name, tensor in named_tensors:
+        print(name)
         default_weight_loader(params_dict[name], tensor)
 
 
