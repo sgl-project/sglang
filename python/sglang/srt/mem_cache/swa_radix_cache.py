@@ -370,30 +370,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         ), "sliding_window_size must be set for SWARadixCache"
         return True
 
-    def _kv_event_store_metadata(
-        self, node: TreeNode, medium=None
-    ) -> dict[str, object]:
-        metadata: dict[str, object] = {
-            "swa_sliding_window_size": int(self.sliding_window_size),
-        }
-        swa_valid_from = self._swa_valid_from_for_event(node)
-        if swa_valid_from is not None:
-            metadata["swa_valid_from"] = int(swa_valid_from)
-        return metadata
-
-    def _node_end_position(self, node: TreeNode) -> int:
-        position = 0
-        cur = node
-        while cur is not None and cur != self.root_node:
-            position += len(cur.key)
-            cur = cur.parent
-        return position
-
-    def _swa_valid_from_for_event(self, node: TreeNode) -> Optional[int]:
-        if node.swa_tombstone:
-            return self._node_end_position(node)
-        return None
-
     def reset(self) -> None:
         self.root_node = TreeNode()
         self.root_node.key = []
@@ -663,7 +639,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
                     self.swa_evictable_size_ -= len(x.value)
                     x.swa_tombstone = True
-                    self._record_store_event(x)
                 else:
                     assert (
                         x.full_lock_ref == 0
@@ -828,7 +803,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     self.token_to_kv_pool_allocator.free_swa(node.value)
                     self.swa_lru_list.remove_node(node)
                     node.swa_tombstone = True
-                    self._record_store_event(node)
                 else:
                     # Internal: standard protected -> evictable.
                     self.swa_evictable_size_ += len(node.value)
@@ -1147,8 +1121,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
                 node = new_node
-                if node.swa_tombstone:
-                    self._record_store_event(node)
 
             # if tombstone after update_kv_after_len, update node.value to be the input value.
             # This is needed because it is possible that the last sliding window size tokens
@@ -1173,15 +1145,13 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                         node.swa_tombstone = False
                         self.swa_lru_list.insert_mru(node)
                         self.swa_evictable_size_ += len(node.value)
-                        self._record_store_event(node)
                     elif swa_evicted_seqlen < total_prefix_length + prefix_len:
                         # Branch 2: part of swa tokens of value[:prefix_len] are evicted, so we need to split the node and insert the value to new node.
                         start_update_idx = swa_evicted_seqlen - total_prefix_length
                         self.token_to_kv_pool_allocator.free(
                             node.value[start_update_idx:prefix_len]
                         )
-                        parent = self._split_node(node.key, node, start_update_idx)
-                        self._record_store_event(parent)
+                        self._split_node(node.key, node, start_update_idx)
                         # Here node is the new node after split, so we can overwrite the value to the new node.
                         # The old node is still swa tombstone and the full token is not freed.
                         node.value = value[start_update_idx:prefix_len].clone()
@@ -1189,7 +1159,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                         node.swa_tombstone = False
                         self.swa_lru_list.insert_mru(node)
                         self.swa_evictable_size_ += len(node.value)
-                        self._record_store_event(node)
                     else:
                         # Branch 3: all swa tokens of value[:prefix_len] are evicted, so we don't need to update the node.
                         self.token_to_kv_pool_allocator.free(value[:prefix_len])
@@ -1309,7 +1278,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
         node.swa_tombstone = True
         self.swa_evictable_size_ -= len(node.key)
-        self._record_store_event(node)
 
     def _delete_tombstone_leaf(self, node: TreeNode) -> None:
         assert (

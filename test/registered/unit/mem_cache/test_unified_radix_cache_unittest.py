@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Optional
 from unittest import mock
 
+import msgspec
 import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
@@ -307,6 +308,55 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         for _, finish_event, _ in list(tree.cache_controller.ack_load_queue):
             finish_event.synchronize()
         tree.loading_check()
+
+    def test_kv_events_swa_metadata_wire_order(self):
+        event = BlockStored(
+            block_hashes=[1],
+            parent_block_hash=None,
+            token_ids=[10],
+            block_size=1,
+            lora_id=None,
+            medium="GPU",
+            swa_sliding_window_size=4,
+            swa_valid_from=2,
+        )
+        self.assertEqual(
+            msgspec.msgpack.decode(msgspec.msgpack.encode(event)),
+            [
+                "BlockStored",
+                [1],
+                None,
+                [10],
+                1,
+                None,
+                "GPU",
+                4,
+                2,
+            ],
+        )
+
+        event = BlockStored(
+            block_hashes=[1],
+            parent_block_hash=None,
+            token_ids=[10],
+            block_size=1,
+            lora_id=None,
+            medium="GPU",
+            swa_sliding_window_size=4,
+        )
+        self.assertEqual(
+            msgspec.msgpack.decode(msgspec.msgpack.encode(event)),
+            [
+                "BlockStored",
+                [1],
+                None,
+                [10],
+                1,
+                None,
+                "GPU",
+                4,
+            ],
+        )
 
     def test_kv_events_store_and_remove_full_blocks(self):
         tree, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)

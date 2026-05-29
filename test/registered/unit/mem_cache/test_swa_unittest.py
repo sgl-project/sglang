@@ -1,7 +1,6 @@
 import unittest
 from array import array
 
-import msgspec
 import torch
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
@@ -138,55 +137,6 @@ class TestSWA(unittest.TestCase):
     def tearDownClass(cls):
         pass
 
-    def test_kv_events_swa_metadata_wire_order(self):
-        event = BlockStored(
-            block_hashes=[1],
-            parent_block_hash=None,
-            token_ids=[10],
-            block_size=1,
-            lora_id=None,
-            medium="GPU",
-            swa_sliding_window_size=4,
-            swa_valid_from=2,
-        )
-        self.assertEqual(
-            msgspec.msgpack.decode(msgspec.msgpack.encode(event)),
-            [
-                "BlockStored",
-                [1],
-                None,
-                [10],
-                1,
-                None,
-                "GPU",
-                4,
-                2,
-            ],
-        )
-
-        event = BlockStored(
-            block_hashes=[1],
-            parent_block_hash=None,
-            token_ids=[10],
-            block_size=1,
-            lora_id=None,
-            medium="GPU",
-            swa_sliding_window_size=4,
-        )
-        self.assertEqual(
-            msgspec.msgpack.decode(msgspec.msgpack.encode(event)),
-            [
-                "BlockStored",
-                [1],
-                None,
-                [10],
-                1,
-                None,
-                "GPU",
-                4,
-            ],
-        )
-
     def test_swa_radix_cache_kv_events(self):
         tree, allocator, _ = _build_swa_tree(
             is_eagle=False, enable_kv_cache_events=True
@@ -199,10 +149,6 @@ class TestSWA(unittest.TestCase):
         ]
         self.assertEqual(len(first_insert_events), 4)
         self.assertEqual([e.token_ids[0] for e in first_insert_events], [1, 2, 3, 4])
-        self.assertTrue(
-            all(e.swa_sliding_window_size == 4 for e in first_insert_events)
-        )
-        self.assertTrue(all(e.swa_valid_from is None for e in first_insert_events))
 
         _insert(tree, allocator, [1, 2, 3, 4, 5, 6])
         second_insert_events = [
@@ -219,33 +165,9 @@ class TestSWA(unittest.TestCase):
         result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
         self.assertEqual(result.num_tokens_evicted, 0)
         self.assertGreaterEqual(result.swa_num_tokens_evicted, 1)
-        swa_update_events = tree.take_events()
         self.assertEqual(
-            [e for e in swa_update_events if isinstance(e, BlockRemoved)], []
+            [e for e in tree.take_events() if isinstance(e, BlockRemoved)], []
         )
-        swa_update_stores = [e for e in swa_update_events if isinstance(e, BlockStored)]
-        self.assertEqual({e.swa_valid_from for e in swa_update_stores}, {4})
-
-        partial_value = _swa_alloc(allocator, 4)
-        self.assertIsNotNone(partial_value)
-        tree.insert(
-            InsertParams(
-                key=RadixKey(array("q", [1, 2, 3, 4])),
-                value=partial_value,
-                swa_evicted_seqlen=2,
-            )
-        )
-        partial_restore_events = [
-            e for e in tree.take_events() if isinstance(e, BlockStored)
-        ]
-        self.assertEqual({e.swa_valid_from for e in partial_restore_events}, {2, None})
-
-        _insert(tree, allocator, [1, 2, 3, 4, 5, 6])
-        swa_restore_events = [
-            e for e in tree.take_events() if isinstance(e, BlockStored)
-        ]
-        self.assertGreater(len(swa_restore_events), 0)
-        self.assertEqual({e.swa_valid_from for e in swa_restore_events}, {None})
 
         result = tree.evict(EvictParams(num_tokens=1, swa_num_tokens=0))
         self.assertGreaterEqual(result.num_tokens_evicted, 1)
