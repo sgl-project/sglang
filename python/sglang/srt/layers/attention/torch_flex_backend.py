@@ -27,10 +27,6 @@ class TorchFlexAttnBackend(AttentionBackend):
         torch._dynamo.config.cache_size_limit = 1024
         torch._dynamo.config.accumulated_cache_size_limit = 1024
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         # TODO: find a more elegant way to save memory

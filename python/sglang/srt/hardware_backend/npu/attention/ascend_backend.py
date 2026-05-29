@@ -362,11 +362,7 @@ class AscendAttnBackend(AttentionBackend):
     ):
         pass
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -576,7 +572,7 @@ class AscendAttnBackend(AttentionBackend):
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
-        Public entry: :py:meth:`init_forward_data_out_graph`.
+        Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
         metadata = self.graph_metadata[bs]
         max_len = seq_lens_cpu[:bs].max().item()
@@ -2392,11 +2388,7 @@ class AscendAttnMultiStepDraftBackend:
         for i in range(self.speculative_num_steps - 1):
             call_fn(i, forward_batch)
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -2410,19 +2402,19 @@ class AscendAttnMultiStepDraftBackend:
         )
 
         def call_fn(i, _forward_batch):
-            self.attn_backends[i].init_forward_data_out_graph(
+            self.attn_backends[i].init_forward_metadata_out_graph(
                 inner_fb, in_capture=in_capture
             )
 
         self.common_template(forward_batch, call_fn)
 
-    def init_forward_data_in_graph(self, forward_batch: ForwardBatch) -> None:
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         # MultiStep dispatcher: fan out to inner backends. Default ABC
         # impl on inner backends is no-op; this exists so callers (e.g.
         # EAGLEDraftCudaGraphRunner) can invoke it uniformly without
         # type-checking the wrapper type.
         def call_fn(i, _forward_batch):
-            self.attn_backends[i].init_forward_data_in_graph(forward_batch)
+            self.attn_backends[i].init_forward_metadata_in_graph(forward_batch)
 
         self.common_template(forward_batch, call_fn)
 

@@ -426,7 +426,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             # forward_batch above already carries bs, num_tokens, the
             # padded buffers, forward_mode and spec_info; pass it straight
             # through the new init API.
-            self.draft_extend_attn_backend.init_forward_data_out_graph(
+            self.draft_extend_attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=True
             )
             self.deepep_adapter.capture(is_extend_in_batch=True)
@@ -551,7 +551,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             out_cache_loc=forward_batch.out_cache_loc,
             spec_info=forward_batch.spec_info,
         )
-        self.draft_extend_attn_backend.init_forward_data_out_graph(fb_view)
+        self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
         # Replay
         self.raw_bs = raw_bs

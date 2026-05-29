@@ -197,11 +197,7 @@ class WaveAttnBackend(AttentionBackend):
             MAX_NUM_SEQ=SCHEDULE_SEQ,
         )
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -485,7 +481,7 @@ class WaveAttnBackend(AttentionBackend):
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
-        Public entry: :py:meth:`init_forward_data_out_graph`.
+        Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
         if forward_mode.is_decode_or_idle():
             kv_indptr = self.kv_indptr

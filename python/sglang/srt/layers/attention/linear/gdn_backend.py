@@ -281,10 +281,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:

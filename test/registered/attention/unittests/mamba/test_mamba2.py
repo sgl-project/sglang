@@ -216,7 +216,7 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
     # padding the `forward_batch.input_ids` / `out_cache_loc`.
 
     def test_mamba2_replay_metadata_padding_indices(self):
-        # Drive `init_forward_data_out_graph` (replay path) directly with
+        # Drive `init_forward_metadata_out_graph` (replay path) directly with
         # `seq_lens_cpu=[5, 1, 1]` (two trailing rows at the cuda-graph
         # fill value 1) so the padding-row count is observable in
         # `state_indices_list[bs - 1]`.
@@ -255,7 +255,7 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
             spec_info=None,
             encoder_lens=None,
         )
-        backend.init_forward_data_out_graph(fb)
+        backend.init_forward_metadata_out_graph(fb)
 
         state_indices = backend.state_indices_list[bs - 1].cpu().tolist()
         self.assertEqual(
@@ -348,11 +348,11 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
         )
 
         fb = self._make_sentinel_fb()
-        backend.init_forward_data_out_graph(fb)
+        backend.init_forward_metadata_out_graph(fb)
 
         for sub_backend in (full_attn_backend, linear_attn_backend):
             self._assert_fanout_forwarded(
-                sub_backend.init_forward_data_out_graph, fb
+                sub_backend.init_forward_metadata_out_graph, fb
             )
 
     def test_hybrid_dispatch_capture_init_forward_data_fan_out(self):
@@ -360,11 +360,11 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
             self._make_dispatch_spy_backend()
         )
         fb = self._make_sentinel_fb()
-        backend.init_forward_data_out_graph(fb, in_capture=True)
+        backend.init_forward_metadata_out_graph(fb, in_capture=True)
 
         for sub_backend in (full_attn_backend, linear_attn_backend):
             self._assert_fanout_forwarded(
-                sub_backend.init_forward_data_out_graph, fb
+                sub_backend.init_forward_metadata_out_graph, fb
             )
 
 

@@ -79,11 +79,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         self.q_data_type = model_runner.dtype
         self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -112,7 +108,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                 )
         else:
             # Prefill / spec / draft-extend: fall back to FlashInferMLA parent.
-            super().init_forward_data_out_graph(forward_batch, in_capture=in_capture)
+            super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
 

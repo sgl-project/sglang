@@ -1163,7 +1163,7 @@ def build_inner_fb_view(
     MultiStep draft wrappers (FlashInferMultiStepDraftBackend,
     AiterMultiStepDraftBackend, TritonMultiStepDraftBackend, etc.) need
     to dispatch to per-step inner backends'
-    :py:meth:`AttentionBackend.init_forward_data_out_graph` with an
+    :py:meth:`AttentionBackend.init_forward_metadata_out_graph` with an
     overridden ``forward_mode`` (typically pinned to ``DECODE``) and
     sometimes overridden ``encoder_lens``. The result is a thin
     namespace mirroring just the fields backend init reads, avoiding

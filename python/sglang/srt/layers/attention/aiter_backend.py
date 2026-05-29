@@ -820,11 +820,7 @@ class AiterAttnBackend(AttentionBackend):
         )
         return output
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -2872,11 +2868,7 @@ class AiterMultiStepDraftBackend:
                 max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
             )
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -2890,16 +2882,16 @@ class AiterMultiStepDraftBackend:
         )
 
         def call_fn(i, _forward_batch):
-            self.attn_backends[i].init_forward_data_out_graph(
+            self.attn_backends[i].init_forward_metadata_out_graph(
                 inner_fb, in_capture=in_capture
             )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
 
-    def init_forward_data_in_graph(self, forward_batch: ForwardBatch) -> None:
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         # MultiStep dispatcher: fan out to inner backends. Default ABC
         # impl on inner backends is no-op; this exists so callers (e.g.
         # EAGLEDraftCudaGraphRunner) can invoke it uniformly without
         # type-checking the wrapper type.
         for attn_backend in self.attn_backends:
-            attn_backend.init_forward_data_in_graph(forward_batch)
+            attn_backend.init_forward_metadata_in_graph(forward_batch)

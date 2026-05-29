@@ -86,11 +86,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.cuda_graph_mla_metadata_view = None
         self.cuda_graph_num_splits_view = None
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -108,7 +104,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
         else:
             # Prefill / draft-extend: fall back to FlashInferMLA parent.
-            super().init_forward_data_out_graph(forward_batch, in_capture=in_capture)
+            super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
@@ -219,7 +215,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
     ):
         """Shared decode/target-verify capture+replay body.
 
-        Public entry: :py:meth:`init_forward_data_out_graph` (which routes
+        Public entry: :py:meth:`init_forward_metadata_out_graph` (which routes
         to this helper for decode/target-verify and falls back to the
         FlashInferMLA parent for prefill/draft-extend).
         """
@@ -500,11 +496,7 @@ class FlashMLAMultiStepDraftBackend:
                 max_bs, max_num_tokens, block_kv_indices=None
             )
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -521,16 +513,16 @@ class FlashMLAMultiStepDraftBackend:
         )
 
         def call_fn(i, _forward_batch):
-            self.attn_backends[i].init_forward_data_out_graph(
+            self.attn_backends[i].init_forward_metadata_out_graph(
                 inner_fb, in_capture=in_capture
             )
 
         self.common_template(forward_batch, call_fn)
 
-    def init_forward_data_in_graph(self, forward_batch: ForwardBatch) -> None:
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         # MultiStep dispatcher: fan out to inner backends. Default ABC
         # impl on inner backends is no-op; this exists so callers (e.g.
         # EAGLEDraftCudaGraphRunner) can invoke it uniformly without
         # type-checking the wrapper type.
         for attn_backend in self.attn_backends:
-            attn_backend.init_forward_data_in_graph(forward_batch)
+            attn_backend.init_forward_metadata_in_graph(forward_batch)

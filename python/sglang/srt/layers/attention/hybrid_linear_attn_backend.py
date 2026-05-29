@@ -258,11 +258,7 @@ class MambaAttnBackendBase(AttentionBackend):
             has_mamba_track_mask=has_mamba_track_mask,
         )
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -682,11 +678,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
                 model_runner.server_args.mamba_track_interval >= self.mamba_chunk_size
             ), f"mamba_track_interval ({model_runner.server_args.mamba_track_interval}) must be >= mamba_chunk_size ({self.mamba_chunk_size})"
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -814,17 +806,13 @@ class HybridLinearAttnBackend(AttentionBackend):
         assert layer_id is not None, "either layer or layer_id must be provided"
         return layer_id in self.full_attn_layers
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
         for attn_backend in self.attn_backend_list:
-            attn_backend.init_forward_data_out_graph(
+            attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )
 

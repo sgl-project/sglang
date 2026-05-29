@@ -420,14 +420,14 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
         )
 
         fb = self._make_sentinel_fb()
-        backend.init_forward_data_out_graph(fb)
+        backend.init_forward_metadata_out_graph(fb)
 
         # We assert sentinel identity rather than exact (args, kwargs) shape
         # so a positional↔keyword refactor inside `HybridLinearAttnBackend`
         # doesn't trip the test as long as the fb still flows through.
         for sub_backend in (full_attn_backend, linear_attn_backend):
             self._assert_fanout_forwarded(
-                sub_backend.init_forward_data_out_graph, fb
+                sub_backend.init_forward_metadata_out_graph, fb
             )
 
     def test_hybrid_dispatch_capture_init_forward_data_fan_out(self):
@@ -437,11 +437,11 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
             self._make_dispatch_spy_backend()
         )
         fb = self._make_sentinel_fb()
-        backend.init_forward_data_out_graph(fb, in_capture=True)
+        backend.init_forward_metadata_out_graph(fb, in_capture=True)
 
         for sub_backend in (full_attn_backend, linear_attn_backend):
             self._assert_fanout_forwarded(
-                sub_backend.init_forward_data_out_graph, fb
+                sub_backend.init_forward_metadata_out_graph, fb
             )
 
 

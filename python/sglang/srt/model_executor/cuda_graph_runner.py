@@ -1125,7 +1125,7 @@ class CudaGraphRunner:
             # forward_batch was constructed above from `buffers` and already
             # carries the padded capture-time tensors, so it can be passed
             # straight to the new init API.
-            attn_backend.init_forward_data_out_graph(
+            attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=True
             )
 
@@ -1143,7 +1143,7 @@ class CudaGraphRunner:
                 # inside the capture block (and inside warmup, which is the
                 # rehearsal — on_after_cuda_graph_warmup undoes any state
                 # mutated here so capture starts from the same Raw view).
-                attn_backend.init_forward_data_in_graph(forward_batch)
+                attn_backend.init_forward_metadata_in_graph(forward_batch)
 
                 forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
                     None
@@ -1306,7 +1306,7 @@ class CudaGraphRunner:
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
-        attn_backend.init_forward_data_out_graph(fb_view)
+        attn_backend.init_forward_metadata_out_graph(fb_view)
         attn_backend._replay_forward_batch = None
 
         # Store fields

@@ -27,24 +27,13 @@ class TboAttnBackend(AttentionBackend):
             children=[creator() for _ in range(2)],
         )
 
-    def init_forward_data(self, forward_batch: "ForwardBatch"):
-        # TBO dispatcher: dispatch new entry to primary + children explicitly
-        # so each piece sees its own sub-fb (rather than the dispatcher fb).
-        self.primary.init_forward_data(forward_batch=forward_batch)
-        if forward_batch.tbo_children is not None:
-            for child, forward_batch_child in zip(
-                self.children, forward_batch.tbo_children, strict=True
-            ):
-                if forward_batch_child.batch_size > 0:
-                    child.init_forward_data(forward_batch=forward_batch_child)
-
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: "ForwardBatch",
         in_capture: bool = False,
     ):
         # TBO dispatcher: forward in_capture flag to primary + children.
-        self.primary.init_forward_data_out_graph(
+        self.primary.init_forward_metadata_out_graph(
             forward_batch=forward_batch, in_capture=in_capture
         )
         if forward_batch.tbo_children is not None:
@@ -52,7 +41,7 @@ class TboAttnBackend(AttentionBackend):
                 self.children, forward_batch.tbo_children, strict=True
             ):
                 if forward_batch_child.batch_size > 0:
-                    child.init_forward_data_out_graph(
+                    child.init_forward_metadata_out_graph(
                         forward_batch=forward_batch_child, in_capture=in_capture
                     )
 

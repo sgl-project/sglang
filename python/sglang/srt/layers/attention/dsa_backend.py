@@ -408,11 +408,7 @@ class DeepseekSparseAttnBackend(
         )
         return page_table[:, strided_indices] // page_size
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -1016,7 +1012,7 @@ class DeepseekSparseAttnBackend(
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
-        Public entry: :py:meth:`init_forward_data_out_graph`. Spec runners
+        Public entry: :py:meth:`init_forward_metadata_out_graph`. Spec runners
         also call this directly via _apply_cuda_graph_metadata when they
         need to pass out_cache_loc / actual_forward_mode explicitly.
         """
@@ -2383,11 +2379,7 @@ class DeepseekSparseAttnMultiStepBackend:
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -2401,7 +2393,7 @@ class DeepseekSparseAttnMultiStepBackend:
                 forward_mode=ForwardMode.DECODE,
             )
             for i in range(self.speculative_num_steps - 1):
-                self.attn_backends[i].init_forward_data_out_graph(
+                self.attn_backends[i].init_forward_metadata_out_graph(
                     inner_fb, in_capture=True
                 )
             return
@@ -2577,13 +2569,13 @@ class DeepseekSparseAttnMultiStepBackend:
                     out_cache_loc=None,
                 )
 
-    def init_forward_data_in_graph(self, forward_batch: ForwardBatch) -> None:
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         # MultiStep dispatcher: fan out to inner backends. Default ABC
         # impl on inner backends is no-op; this exists so callers (e.g.
         # EAGLEDraftCudaGraphRunner) can invoke it uniformly without
         # type-checking the wrapper type.
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_data_in_graph(forward_batch)
+            self.attn_backends[i].init_forward_metadata_in_graph(forward_batch)
 
 
 # Backward-compat aliases (deprecated: use DSA class names)

@@ -71,11 +71,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             f"linear_backend for linear attention in hybrid_linear_backend: {self.linear_backend}"
         )
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,

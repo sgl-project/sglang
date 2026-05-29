@@ -488,7 +488,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             # forward_batch already carries the padded capture-time tensors
             # plus forward_mode + spec_info; pass it straight through the
             # new init API.
-            attn_backend.init_forward_data_out_graph(
+            attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=True
             )
             self.deepep_adapter.capture(is_extend_in_batch=True)
@@ -586,7 +586,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         )
         self.eagle_worker.draft_extend_attn_backend_list[
             self.step
-        ].init_forward_data_out_graph(fb_view)
+        ].init_forward_metadata_out_graph(fb_view)
 
         # Replay
         self.raw_bs = raw_bs

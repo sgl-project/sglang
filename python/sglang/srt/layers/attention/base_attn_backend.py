@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import warnings
 from abc import ABC
 from typing import TYPE_CHECKING, Optional
 
@@ -21,35 +20,33 @@ class AttentionBackend(ABC):
 
     Forward-data init contract (3 methods):
 
-      - ``init_forward_data(fb)`` — eager entry point. Default is a wrapper
+      - ``init_forward_metadata(fb)`` — eager entry point. Default is a wrapper
         that calls ``_out_graph(fb)`` then ``_in_graph(fb)``. Backends may
         override to keep an independent eager body.
-      - ``init_forward_data_out_graph(fb, in_capture=False)`` — per-iter
+      - ``init_forward_metadata_out_graph(fb, in_capture=False)`` — per-iter
         metadata prep, runs outside ``with graph.capture():``. Capture
         sites pass ``in_capture=True``; replay/eager use the default
         ``False``. Backends read ``in_capture`` only when capture / replay
         bodies diverge.
-      - ``init_forward_data_in_graph(fb)`` — graph-recordable static-shape
+      - ``init_forward_metadata_in_graph(fb)`` — graph-recordable static-shape
         GPU op, runs inside ``with graph.capture():`` at capture time and
         is auto-replayed by ``graph.replay()``. Default is no-op.
 
-    The legacy ``init_forward_metadata`` is retained as a deprecation shim
-    (warns + forwards to ``init_forward_data``) for one release window.
     The legacy ``init_forward_metadata_capture_cuda_graph`` and
     ``init_forward_metadata_replay_cuda_graph`` overrides are fully
     deprecated and removed from the ABC: out-of-tree backends overriding
-    those must migrate to ``init_forward_data_out_graph(fb, in_capture)``.
+    those must migrate to ``init_forward_metadata_out_graph(fb, in_capture)``.
     """
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 
         Backends may override to keep an independent eager body.
         """
-        self.init_forward_data_out_graph(forward_batch)
-        self.init_forward_data_in_graph(forward_batch)
+        self.init_forward_metadata_out_graph(forward_batch)
+        self.init_forward_metadata_in_graph(forward_batch)
 
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -60,7 +57,7 @@ class AttentionBackend(ABC):
           * capture: before ``with graph.capture():`` (caller passes
             ``in_capture=True``).
           * replay: before ``graph.replay()`` (``in_capture=False``).
-          * eager: via :py:meth:`init_forward_data` default wrapper
+          * eager: via :py:meth:`init_forward_metadata` default wrapper
             (``in_capture=False``).
 
         Backends read ``in_capture`` only when capture / replay bodies
@@ -71,7 +68,7 @@ class AttentionBackend(ABC):
         Default: no-op.
         """
 
-    def init_forward_data_in_graph(self, forward_batch: ForwardBatch):
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         """Graph-recordable static-shape GPU op.
 
         Runs inside ``with graph.capture():`` at capture time; recorded
@@ -79,7 +76,7 @@ class AttentionBackend(ABC):
 
         Lint contract for overrides: body must NOT call ``.item()`` /
         ``.cpu()`` / ``.tolist()`` / dynamic-shape ``torch.empty()``.
-        Such ops belong in :py:meth:`init_forward_data_out_graph`; they
+        Such ops belong in :py:meth:`init_forward_metadata_out_graph`; they
         cannot be recorded into a cuda graph.
 
         Default: no-op.
@@ -87,22 +84,6 @@ class AttentionBackend(ABC):
 
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
-
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Deprecated — use :py:meth:`init_forward_data` instead.
-
-        Default impl forwards to ``init_forward_data(fb)`` with a
-        :class:`DeprecationWarning`. Backends still overriding this method
-        keep their own body called; the warning fires only on the ABC
-        default path.
-        """
-        warnings.warn(
-            "AttentionBackend.init_forward_metadata is deprecated; "
-            "override init_forward_data instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        self.init_forward_data(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""

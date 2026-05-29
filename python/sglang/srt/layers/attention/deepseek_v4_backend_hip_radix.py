@@ -659,14 +659,7 @@ class DeepseekV4HipRadixBackend(
             use_prefill_cuda_graph=use_prefill_cuda_graph,
         )
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Eager path: build host-side metadata then run the in-graph step
-        # so PREP_IN_CUDA_GRAPH=1 still upgrades Raw→Full (no-op when
-        # init_forward_metadata already produced a Full DSV4Metadata).
-        self.init_forward_metadata(forward_batch)
-        self.init_forward_data_in_graph(forward_batch)
-
-    def init_forward_data_in_graph(self, forward_batch: ForwardBatch) -> None:
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         # In-graph step: with SGLANG_PREP_IN_CUDA_GRAPH=1, init_forward_metadata_*
         # returned Raw metadata so the Raw→Full upgrade is recorded inside the
         # cuda graph (per-replay materialization of c4/c128 compress + core_attn
@@ -674,7 +667,7 @@ class DeepseekV4HipRadixBackend(
         # already Full and this is a no-op via the isinstance check.
         self._maybe_upgrade_forward_metadata()
 
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -851,6 +844,10 @@ class DeepseekV4HipRadixBackend(
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
 
         self.forward_metadata = metadata
+        # Chain the recordable in-graph step so PREP_IN_CUDA_GRAPH=1 upgrades
+        # Raw→Full (no-op when init_forward_metadata_decode/verify already
+        # produced a Full DSV4Metadata).
+        self.init_forward_metadata_in_graph(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[
@@ -1201,20 +1198,15 @@ class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
                 )
             )
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-        self.init_forward_data_in_graph(forward_batch)
-
-    def init_forward_data_in_graph(self, forward_batch: ForwardBatch) -> None:
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         # MultiStep dispatcher: fan out the in-graph step to every inner
         # backend so each per-step Raw metadata gets upgraded to Full
         # inside graph capture (the parent ABC override operates on
         # self.forward_metadata, which the inner backends don't share).
         for attn_backend in self.attn_backends:
-            attn_backend.init_forward_data_in_graph(forward_batch)
+            attn_backend.init_forward_metadata_in_graph(forward_batch)
 
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -1241,13 +1233,13 @@ class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
         )
         if in_capture:
             for i in range(self.speculative_num_steps):
-                self.attn_backends[i].init_forward_data_out_graph(
+                self.attn_backends[i].init_forward_metadata_out_graph(
                     inner_fb, in_capture=True
                 )
         else:
             if self.speculative_num_steps == 1:
                 return
-            self.attn_backends[0].init_forward_data_out_graph(inner_fb)
+            self.attn_backends[0].init_forward_metadata_out_graph(inner_fb)
             temp_metadata = self.attn_backends[0].forward_metadata
             for i in range(1, self.speculative_num_steps - 1):
                 self.attn_backends[i].replay_cuda_graph_metadata_from(

@@ -193,7 +193,7 @@ def run_speculative_cuda_graph_case(
         )
 
         with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
-            backend.init_forward_data(graph_batch)
+            backend.init_forward_metadata(graph_batch)
             graph_eager_actual = adapter.run_forward(
                 graph_fixture,
                 graph_batch,

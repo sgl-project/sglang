@@ -95,7 +95,7 @@ class TestTboAttnDenseAttentionBackendCorrectness(CustomTestCase):
     )
     def test_tbo_target_verify_cuda_graph_capture_delegates_to_primary_capture(self):
         """TBO capture must dispatch primary's
-        ``init_forward_data_out_graph(fb, in_capture=True)`` (the capture
+        ``init_forward_metadata_out_graph(fb, in_capture=True)`` (the capture
         path), not the replay path.
 
         Backends like FlashAttention store per-bs metadata in dicts populated
@@ -130,7 +130,7 @@ class TestTboAttnDenseAttentionBackendCorrectness(CustomTestCase):
         # This is the failing call before the fix: TBO dispatching to
         # primary's replay path (instead of capture) reads an unpopulated
         # ``target_verify_metadata[bs]`` dict and raises KeyError.
-        wrapper.init_forward_data_out_graph(batch, in_capture=True)
+        wrapper.init_forward_metadata_out_graph(batch, in_capture=True)
 
 
 if __name__ == "__main__":

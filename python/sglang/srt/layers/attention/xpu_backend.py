@@ -97,10 +97,6 @@ class XPUAttentionBackend(AttentionBackend):
             self.sliding_window_size is not None and self.sliding_window_size > -1
         )
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()

@@ -846,7 +846,7 @@ def run_dsv4_attention_case(
     q_input, _ = fixture.actual_module.project(fixture.input_hidden)
 
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
-        fixture.backend.init_forward_data(fixture.forward_batch)
+        fixture.backend.init_forward_metadata(fixture.forward_batch)
         actual = fixture.backend.forward(
             q=q_input,
             k=q_input,  # k is v sentinel; save_kv_cache=False so it's unread
@@ -1098,7 +1098,7 @@ def run_dsv4_fixture_eager(fixture: DSV4AttentionFixture) -> torch.Tensor:
         _populate_extra_kv_cache(fixture, layer_id=0, num_entries=_DSV4_EXTRA_ENTRIES)
     q_input, _ = fixture.actual_module.project(fixture.input_hidden)
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
-        fixture.backend.init_forward_data(fixture.forward_batch)
+        fixture.backend.init_forward_metadata(fixture.forward_batch)
         _seed_c4_if_needed(fixture)
         actual = fixture.backend.forward(
             q=q_input,
@@ -1266,7 +1266,7 @@ def _pure_torch_dsv4_combined_reference(
     current_batch = getattr(fixture, "_current_batch", None)
     if current_batch is None:
         current_batch = fixture.forward_batch
-    fixture.backend.init_forward_data(current_batch)
+    fixture.backend.init_forward_metadata(current_batch)
     # Re-apply the C4 seeding too, since `on_after_cuda_graph_warmup` rolls
     # `forward_metadata` back to the raw captured value (which clears
     # `c4_sparse_page_indices` back to all -1 on the next upgrade) — the
@@ -1429,7 +1429,7 @@ def run_dsv4_target_verify_attention_case(
 
     q_input, _ = fixture.actual_module.project(fixture.input_hidden)
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
-        fixture.backend.init_forward_data(fixture.forward_batch)
+        fixture.backend.init_forward_metadata(fixture.forward_batch)
         _seed_c4_if_needed(fixture)
         actual = fixture.backend.forward(
             q=q_input,
@@ -1494,7 +1494,7 @@ def run_dsv4_draft_extend_attention_case(
 
     q_input, _ = fixture.actual_module.project(fixture.input_hidden)
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
-        fixture.backend.init_forward_data(fixture.forward_batch)
+        fixture.backend.init_forward_metadata(fixture.forward_batch)
         actual = fixture.backend.forward(
             q=q_input,
             k=q_input,
@@ -1552,7 +1552,7 @@ def run_dsv4_compress_attention_case(
 
     q_input, _ = fixture.actual_module.project(fixture.input_hidden)
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
-        fixture.backend.init_forward_data(fixture.forward_batch)
+        fixture.backend.init_forward_metadata(fixture.forward_batch)
         # Trigger lazy upgrade so we can patch the metadata that the smoke
         # case relies on (specifically c4_sparse_page_indices).
         fixture.backend._maybe_upgrade_forward_metadata()

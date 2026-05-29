@@ -41,10 +41,6 @@ class IntelAMXAttnBackend(AttentionBackend):
         self.decode_attention_fwd = torch.ops.sgl_kernel.decode_attention_cpu
         self.extend_attention_fwd = torch.ops.sgl_kernel.extend_attention_cpu
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
 

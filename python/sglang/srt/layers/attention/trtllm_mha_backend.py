@@ -408,7 +408,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
-        Public entry: :py:meth:`init_forward_data_out_graph`.
+        Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
         seq_lens = seq_lens[:bs]
         seq_lens_cpu = seq_lens_cpu[:bs]
@@ -540,11 +540,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             page_size=self.page_size,
         )
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -914,7 +910,7 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
 
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -933,6 +929,6 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
             encoder_lens=forward_batch.encoder_lens,
         )
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_data_out_graph(
+            self.attn_backends[i].init_forward_metadata_out_graph(
                 inner_fb, in_capture=in_capture
             )

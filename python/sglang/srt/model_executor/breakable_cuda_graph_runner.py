@@ -331,7 +331,7 @@ class BreakableCudaGraphRunner:
             ForwardContext(attn_backend=self.model_runner.attn_backend)
         ):
             # Warmup runs eager-style (not under graph.capture).
-            self.model_runner.attn_backend.init_forward_data(forward_batch)
+            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             self._run_forward(forward_batch, num_tokens)
 
     def _capture_all(self):
@@ -390,7 +390,7 @@ class BreakableCudaGraphRunner:
         forward_batch = self._build_capture_forward_batch(num_tokens)
         # Capture-side init: out-of-graph metadata prep + in_capture=True so
         # backends with capture/replay divergence can branch on the flag.
-        self.model_runner.attn_backend.init_forward_data_out_graph(
+        self.model_runner.attn_backend.init_forward_metadata_out_graph(
             forward_batch, in_capture=True
         )
 
@@ -401,7 +401,7 @@ class BreakableCudaGraphRunner:
             # In-graph metadata step (recordable companion to the out-of-graph
             # init that ran above with in_capture=True). Default ABC impl is
             # no-op; DSV4 uses it for Raw→Full upgrade.
-            self.model_runner.attn_backend.init_forward_data_in_graph(
+            self.model_runner.attn_backend.init_forward_metadata_in_graph(
                 forward_batch
             )
             return self._run_forward(forward_batch, num_tokens)
@@ -475,7 +475,7 @@ class BreakableCudaGraphRunner:
             self.layer_model.forward = replay_layer_forward
             try:
                 # Replay path: in_capture defaults to False.
-                self.model_runner.attn_backend.init_forward_data_out_graph(
+                self.model_runner.attn_backend.init_forward_metadata_out_graph(
                     forward_batch
                 )
                 with set_forward_context(

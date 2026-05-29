@@ -282,14 +282,14 @@ class FrozenKVMTPWorker(TpModelWorker):
         else:
             forward_batch.seq_lens_sum = torch.sum(forward_batch.seq_lens).item()
         with self._frozen_kv_target_view(forward_batch):
-            self.draft_attn_backend.init_forward_data(forward_batch)
+            self.draft_attn_backend.init_forward_metadata(forward_batch)
 
     def _init_frozen_kv_metadata_capture_cuda_graph(
         self, forward_batch: ForwardBatch
     ) -> None:
         with self._frozen_kv_target_view(forward_batch):
             # forward_batch already carries the capture-time tensors.
-            self.draft_attn_backend.init_forward_data_out_graph(
+            self.draft_attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=True
             )
 
@@ -317,7 +317,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             spec_info=None,
         )
         with self._frozen_kv_target_view(forward_batch):
-            self.draft_attn_backend.init_forward_data_out_graph(fb_view)
+            self.draft_attn_backend.init_forward_metadata_out_graph(fb_view)
 
     def init_cuda_graphs(self) -> None:
         if self.server_args.disable_cuda_graph or self.speculative_num_steps <= 1:

@@ -491,7 +491,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """Shared decode / target-verify / draft-extend capture+replay body.
 
-        Public entry: :py:meth:`init_forward_data_out_graph` (which routes
+        Public entry: :py:meth:`init_forward_metadata_out_graph` (which routes
         the non-decode-family modes to the FlashInferMLA parent).
         """
         metadata = self.decode_cuda_graph_metadata[bs]
@@ -542,11 +542,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if fallback_to_flashinfer_impl:
             super().init_mha_chunk_metadata(forward_batch)
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -559,7 +555,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and not forward_mode.is_target_verify()
             and not forward_mode.is_draft_extend(include_v2=True)
         ):
-            return super().init_forward_data_out_graph(
+            return super().init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )
 
@@ -1250,7 +1246,7 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -1259,9 +1255,9 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
 
         # Only the replay path was overridden by this wrapper historically.
         # Capture inherits from FlashInferMLAMultiStepDraftBackend's
-        # init_forward_data_out_graph; we intercept only in_capture=False.
+        # init_forward_metadata_out_graph; we intercept only in_capture=False.
         if in_capture:
-            return super().init_forward_data_out_graph(
+            return super().init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )
         inner_fb = build_inner_fb_view(
@@ -1270,4 +1266,4 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
             forward_mode=ForwardMode.DECODE,
         )
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_data_out_graph(inner_fb)
+            self.attn_backends[i].init_forward_metadata_out_graph(inner_fb)

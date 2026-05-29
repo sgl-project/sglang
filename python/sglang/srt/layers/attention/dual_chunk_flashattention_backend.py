@@ -172,11 +172,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         end_head = start_head + self.num_heads
         return [layer_sparse_attention_config[i] for i in range(start_head, end_head)]
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -619,7 +615,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
-        Public entry: :py:meth:`init_forward_data_out_graph`.
+        Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
         assert forward_mode.is_decode()
         seq_lens = seq_lens[:bs]

@@ -456,11 +456,7 @@ class TritonAttnBackend(AttentionBackend):
         )
         return qo_indptr, kv_indptr, num_tokens_per_bs
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -887,7 +883,7 @@ class TritonAttnBackend(AttentionBackend):
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
-        Public entry: :py:meth:`init_forward_data_out_graph`.
+        Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
         # NOTE: encoder_lens expected to be zeros or None
         if forward_mode.is_decode_or_idle():
@@ -1412,11 +1408,7 @@ class TritonMultiStepDraftBackend:
                 cuda_graph_num_kv_splits_buf=self.cuda_graph_num_kv_splits,
             )
 
-    def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
-        self.init_forward_metadata(forward_batch)
-
-    def init_forward_data_out_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
@@ -1431,7 +1423,7 @@ class TritonMultiStepDraftBackend:
             )
 
             def call_fn(i, _forward_batch):
-                self.attn_backends[i].init_forward_data_out_graph(
+                self.attn_backends[i].init_forward_metadata_out_graph(
                     inner_fb, in_capture=True
                 )
 
@@ -1452,13 +1444,13 @@ class TritonMultiStepDraftBackend:
                 forward_batch.seq_lens[:bs],
             )
 
-    def init_forward_data_in_graph(self, forward_batch: ForwardBatch) -> None:
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         # MultiStep dispatcher: fan out to inner backends. Default ABC
         # impl on inner backends is no-op; this exists so callers (e.g.
         # EAGLEDraftCudaGraphRunner) can invoke it uniformly without
         # type-checking the wrapper type.
         for attn_backend in self.attn_backends:
-            attn_backend.init_forward_data_in_graph(forward_batch)
+            attn_backend.init_forward_metadata_in_graph(forward_batch)
 
 
 @triton.jit
