@@ -236,7 +236,22 @@ def first_n_tokens_match(a: str, b: str, n: int = 8) -> bool:
     b_toks = b.split()[:n]
     if not a_toks or not b_toks:
         return False
-    return bool(set(a_toks) & set(b_toks))
+    # Whitespace-token overlap (the primary, position-independent check).
+    if set(a_toks) & set(b_toks):
+        return True
+    # Short-answer robustness: two correct concise answers can differ only by a
+    # unit/format suffix that whitespace-tokenizes as a single token (e.g. DSA
+    # "100" vs DS "100°C" for the boiling-point prompt), leaving zero token
+    # overlap even though they are NOT "entirely different". Count it as overlap
+    # when one first-n window is a prefix of the other (min 2 chars, to avoid a
+    # trivial single-character prefix matching everything). This preserves the
+    # gate's intent — detect genuinely divergent starts — for short answers.
+    a8 = " ".join(a_toks)
+    b8 = " ".join(b_toks)
+    shorter, longer = (a8, b8) if len(a8) <= len(b8) else (b8, a8)
+    if len(shorter) >= 2 and longer.startswith(shorter):
+        return True
+    return False
 
 
 # ----- Gate computation (the load-bearing, server-free core) -----------

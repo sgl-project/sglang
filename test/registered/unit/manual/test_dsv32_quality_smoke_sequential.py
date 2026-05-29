@@ -180,5 +180,30 @@ class TestCaptureCompareRoundTrip(unittest.TestCase):
             _lib.evaluate_against_references("http://ds.invalid", bad)
 
 
+class TestFirstNTokensMatch(unittest.TestCase):
+    """The first-n overlap check must tolerate unit/format suffixes on short
+    concise answers (e.g. "100" vs "100°C") while still flagging genuinely
+    divergent starts."""
+
+    def test_unit_suffix_counts_as_overlap(self):
+        # DSA "100" vs DS "100°C": same answer, one whitespace token each, zero
+        # set overlap — must still count as overlap via the prefix rule.
+        self.assertTrue(_lib.first_n_tokens_match("100", "100°C", n=8))
+        self.assertTrue(_lib.first_n_tokens_match("100°C", "100", n=8))
+
+    def test_genuinely_different_short_answers_still_diverge(self):
+        # Different correct-vs-wrong short answers must NOT be rescued.
+        self.assertFalse(_lib.first_n_tokens_match("Au", "Gold", n=8))
+        self.assertFalse(_lib.first_n_tokens_match("Paris", "London", n=8))
+
+    def test_trivial_single_char_prefix_not_overlap(self):
+        # A 1-char prefix must not match everything (guard).
+        self.assertFalse(_lib.first_n_tokens_match("1", "100", n=8))
+
+    def test_set_overlap_still_works(self):
+        self.assertTrue(_lib.first_n_tokens_match("alpha beta gamma", "beta gamma alpha", n=3))
+        self.assertFalse(_lib.first_n_tokens_match("a b c", "x y z", n=3))
+
+
 if __name__ == "__main__":
     unittest.main()

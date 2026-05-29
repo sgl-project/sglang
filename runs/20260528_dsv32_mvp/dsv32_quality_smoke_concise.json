@@ -1,0 +1,167 @@
+{
+  "num_smoke_prompts": 20,
+  "num_niah_prompts": 5,
+  "gates": {
+    "prefix_match_rate": {
+      "value": 0.95,
+      "threshold": 0.8,
+      "pass": true
+    },
+    "mean_rouge_l": {
+      "value": 0.9444444444444444,
+      "threshold": 0.85,
+      "pass": true
+    },
+    "niah_mini_recall": {
+      "hits": 5,
+      "total": 5,
+      "threshold": 4,
+      "pass": true
+    },
+    "first_8_tokens_divergence": {
+      "value": 0,
+      "threshold": 0,
+      "pass": true
+    }
+  },
+  "all_pass": true,
+  "schema": "dsv32_quality_smoke_v1",
+  "evaluated_at": "20260529T022351Z",
+  "ds_commit_sha": null,
+  "dsa_commit_sha": null,
+  "dsa_captured_at": "20260529T021715Z",
+  "smoke_records": [
+    {
+      "prompt": "Explain in one sentence what the Pythagorean theorem says.",
+      "dsa_text": "The Pythagorean theorem states that in a right triangle, the square of the length of the hypotenuse is equal to the sum of the squares of the lengths of the other two sides.",
+      "ds_text": "The Pythagorean theorem states that in a right-angled triangle, the square of the length of the hypotenuse (the side opposite the right angle) is equal to the sum of the squares of the lengths of the other two sides."
+    },
+    {
+      "prompt": "Translate to French: \"The cat is on the mat.\" Output only the translation.",
+      "dsa_text": "Le chat est sur le tapis.",
+      "ds_text": "Le chat est sur le tapis."
+    },
+    {
+      "prompt": "List three prime numbers between 50 and 80.",
+      "dsa_text": "53, 59, 61",
+      "ds_text": "53, 59, 61"
+    },
+    {
+      "prompt": "Who wrote the play 'Hamlet'? Give just the author's name.",
+      "dsa_text": "William Shakespeare",
+      "ds_text": "William Shakespeare"
+    },
+    {
+      "prompt": "What is the chemical symbol for gold? Output only the symbol.",
+      "dsa_text": "Au",
+      "ds_text": "Au"
+    },
+    {
+      "prompt": "Complete the sequence: 2, 4, 8, 16, ... What is the next number?",
+      "dsa_text": "32",
+      "ds_text": "32"
+    },
+    {
+      "prompt": "In what year did humans first land on the Moon?",
+      "dsa_text": "1969",
+      "ds_text": "1969"
+    },
+    {
+      "prompt": "What is the boiling point of water in Celsius at sea level?",
+      "dsa_text": "100",
+      "ds_text": "100\u00b0C"
+    },
+    {
+      "prompt": "Name the largest planet in our solar system. Output only the name.",
+      "dsa_text": "Jupiter",
+      "ds_text": "Jupiter"
+    },
+    {
+      "prompt": "What does CPU stand for in computing? Output only the expansion.",
+      "dsa_text": "Central Processing Unit",
+      "ds_text": "Central Processing Unit"
+    },
+    {
+      "prompt": "Compute 17 * 23 and output the result.",
+      "dsa_text": "391",
+      "ds_text": "391"
+    },
+    {
+      "prompt": "Give the SI unit of electric current.",
+      "dsa_text": "ampere",
+      "ds_text": "ampere"
+    },
+    {
+      "prompt": "Which ocean is the deepest? Output only the name.",
+      "dsa_text": "Pacific Ocean",
+      "ds_text": "Pacific Ocean"
+    },
+    {
+      "prompt": "How many sides does a regular hexagon have?",
+      "dsa_text": "6",
+      "ds_text": "6"
+    },
+    {
+      "prompt": "What is the speed of light in vacuum (approximate, in m/s)? Output just the number.",
+      "dsa_text": "299792458",
+      "ds_text": "299792458"
+    },
+    {
+      "prompt": "Who painted the Mona Lisa? Output only the painter's name.",
+      "dsa_text": "Leonardo da Vinci",
+      "ds_text": "Leonardo da Vinci"
+    },
+    {
+      "prompt": "What is the capital of Japan? Output only the city name.",
+      "dsa_text": "Tokyo",
+      "ds_text": "Tokyo"
+    },
+    {
+      "prompt": "How many bytes are in a kilobyte (binary)? Output only the integer.",
+      "dsa_text": "1024",
+      "ds_text": "1024"
+    },
+    {
+      "prompt": "What is the smallest positive even number? Output only the number.",
+      "dsa_text": "2",
+      "ds_text": "2"
+    },
+    {
+      "prompt": "In Morse code, what is the letter 'E'? Output only the dot/dash.",
+      "dsa_text": ".",
+      "ds_text": "."
+    }
+  ],
+  "niah_records": [
+    {
+      "prompt": "Below is a long passage. After it, there is a question.\n\nThe library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The library contained many books on every subject. The hidden key is ZEBRA-7. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. Each shelf was labeled in alphabetical order. \n\nQuestion: What is the hidden key? Output only the key.",
+      "needle": "ZEBRA-7",
+      "dsa_text": "ZEBRA-7",
+      "ds_text": "ZEBRA-7"
+    },
+    {
+      "prompt": "Read this passage and answer the question afterwards.\n\nTrade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. Trade winds blow consistently in tropical regions. The secret code is MARLIN-42. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. Sailors used them for centuries to cross oceans. \n\nQuestion: What is the secret code? Output only the code.",
+      "needle": "MARLIN-42",
+      "dsa_text": "MARLIN-42",
+      "ds_text": "MARLIN-42"
+    },
+    {
+      "prompt": "Find the answer hidden in the following text.\n\nThe forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The forest at dawn smelled of pine and damp earth. The treasure password is ORCHID-99. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. Birds began their morning chorus as light filtered through the leaves. \n\nQuestion: What is the treasure password? Output only the password.",
+      "needle": "ORCHID-99",
+      "dsa_text": "ORCHID-99",
+      "ds_text": "ORCHID-99"
+    },
+    {
+      "prompt": "Long passage follows. Find the answer.\n\nMountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. Mountain climbing requires careful preparation and equipment. The summit signal is GLACIER-13. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. Weather can change rapidly at high altitudes. \n\nQuestion: What is the summit signal? Output only the signal.",
+      "needle": "GLACIER-13",
+      "dsa_text": "GLACIER-13",
+      "ds_text": "GLACIER-13"
+    },
+    {
+      "prompt": "Read carefully and answer.\n\nAncient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. Ancient cities often grew around rivers for water and trade. The city motto is PHARAOH-88. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. Markets bustled with merchants from distant lands. \n\nQuestion: What is the city motto? Output only the motto.",
+      "needle": "PHARAOH-88",
+      "dsa_text": "PHARAOH-88",
+      "ds_text": "PHARAOH-88"
+    }
+  ]
+}
