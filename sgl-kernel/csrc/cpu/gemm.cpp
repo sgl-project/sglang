@@ -837,5 +837,6 @@ at::Tensor fused_linear_sigmoid_mul(
         mat1_strideM,
         out_strideM);
   });
+
   return out;
 }
