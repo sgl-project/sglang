@@ -175,12 +175,12 @@ class AdaptiveController:
 
     def _pad_to_cuda_graph_bs(self, batch_size: int) -> int:
         """Round batch_size up to the nearest CUDA graph batch size."""
-        if self._cuda_graph_bs is None:
+        bs_list = self._cuda_graph_bs
+        if bs_list is None:
             return batch_size
-        idx = bisect.bisect_left(self._cuda_graph_bs, batch_size)
-        if idx < len(self._cuda_graph_bs):
-            return self._cuda_graph_bs[idx]
-        return self._cuda_graph_bs[-1]
+
+        idx = bisect.bisect_left(bs_list, batch_size)
+        return bs_list[idx] if idx < len(bs_list) else batch_size
 
     def _get_steps_for_batch(self, batch_size: int) -> int:
         """Get the current optimal step count for a given batch size."""

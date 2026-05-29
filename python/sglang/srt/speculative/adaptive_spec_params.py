@@ -129,37 +129,30 @@ def _resolve_candidate_steps(config: dict) -> dict[int, dict] | None:
 def _load_validated_config(
     cfg_path: str | None,
 ) -> tuple[dict, dict[int, dict]]:
-    """Load, parse, and validate adaptive config. Falls back to default on error.
+    """Load and validate adaptive config.
 
-    Returns ``(cfg, bs_config)`` where *cfg* is the full config dict and
-    *bs_config* is the validated ``{bs_int: entry_dict}`` mapping.
-    Both ``resolve_candidate_steps_from_config`` and ``build_per_bs_params``
-    use this so that allocation sizing and runtime controller always agree.
+    Uses ``DEFAULT_ADAPTIVE_CONFIG`` when *cfg_path* is ``None``.
     """
-    try:
-        cfg = load_adaptive_config(cfg_path) if cfg_path else DEFAULT_ADAPTIVE_CONFIG
-        bs_config = _resolve_candidate_steps(cfg)
-        if bs_config is None:
-            raise ValueError("no per-BS entries found")
-        for bs, entry in bs_config.items():
-            steps = entry.get("candidate_steps")
-            if steps is not None and (
-                not isinstance(steps, list)
-                or not steps
-                # TODO: allow step=0 (nospec fallback) once supported
-                or not all(isinstance(s, int) and s > 0 for s in steps)
-            ):
-                raise ValueError(
-                    f"BS {bs}: 'steps' must be a non-empty list of positive ints, "
-                    f"got {steps!r}"
-                )
-    except Exception as e:
-        log_info_on_rank0(
-            logger,
-            f"Invalid adaptive config ({e}), falling back to default",
+    cfg = load_adaptive_config(cfg_path) if cfg_path else DEFAULT_ADAPTIVE_CONFIG
+    bs_config = _resolve_candidate_steps(cfg)
+    if bs_config is None:
+        raise ValueError(
+            "speculative_adaptive_config must contain at least one integer-string "
+            'BS key, e.g. {"1": {"candidate_steps": [1,3,7]}}. '
+            f"Got keys: {list(cfg.keys())}"
         )
-        cfg = DEFAULT_ADAPTIVE_CONFIG
-        bs_config = _resolve_candidate_steps(cfg)
+
+    for bs, entry in bs_config.items():
+        steps = entry.get("candidate_steps")
+        if steps is not None and (
+            not isinstance(steps, list)
+            or not steps
+            or not all(isinstance(s, int) and s > 0 for s in steps)
+        ):
+            raise ValueError(
+                f"BS {bs}: 'candidate_steps' must be a non-empty list of "
+                f"positive ints, got {steps!r}"
+            )
     return cfg, bs_config
 
 
