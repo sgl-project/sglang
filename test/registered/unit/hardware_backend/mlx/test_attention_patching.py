@@ -74,6 +74,12 @@ def _set_runner_cache_layout(
     runner._cache_layout = MlxModelCacheLayout.from_attention_discovery(layers, attrs)
 
 
+def _set_dummy_server_args_for_auxiliary_state_tests() -> None:
+    server_args = ServerArgs(model_path="dummy", page_size=1)
+    server_args._mamba_cache_chunk_size = 64
+    set_global_server_args_for_scheduler(server_args)
+
+
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
 class TestMlxAttentionPatching(unittest.TestCase):
     def test_standard_attention_is_patched_once(self):
@@ -571,9 +577,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(restored[0].state[0].tolist(), [1.0])
 
     def test_auxiliary_state_prefill_tracks_chunk_aligned_auxiliary_state(self):
-        set_global_server_args_for_scheduler(
-            ServerArgs(model_path="dummy", page_size=1)
-        )
+        _set_dummy_server_args_for_auxiliary_state_tests()
         runner = object.__new__(MlxModelRunner)
         runner.model = FakeAuxiliaryStateModel()
         _set_runner_cache_layout(
@@ -630,9 +634,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
     def test_auxiliary_state_prefill_advances_tracked_boundary_after_cached_prefix(
         self,
     ):
-        set_global_server_args_for_scheduler(
-            ServerArgs(model_path="dummy", page_size=1)
-        )
+        _set_dummy_server_args_for_auxiliary_state_tests()
         runner = object.__new__(MlxModelRunner)
         runner.model = FakeAuxiliaryStateModel()
         _set_runner_cache_layout(
@@ -1313,3 +1315,7 @@ if _HAS_MLX:
         def process_batch_result(self, batch, result):
             self.processed_batch = batch
             self.processed_result = result
+
+
+if __name__ == "__main__":
+    unittest.main()
