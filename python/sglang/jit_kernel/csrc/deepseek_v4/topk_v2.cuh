@@ -40,7 +40,8 @@ namespace impl = device::topk;
 using impl::TopKProblem;
 
 using Trivial = impl::TopKTrivial;
-using Register = impl::TopKRegister;
+using Register2 = impl::TopKRegister<2>;  // <= 8192, register-resident, 1 read
+using Register4 = impl::TopKRegister<4>;  // <= 16384, register-resident, 1 read
 using Streaming = impl::TopKStreaming;
 using Cluster = impl::TopKCluster<8>;
 
@@ -48,7 +49,8 @@ constexpr uint32_t kBlockSize = impl::TopKConfig::kBlockSize;
 constexpr uint32_t kOccupancy = impl::TopKConfig::kOccupancy;
 constexpr uint32_t kMaxTopK = impl::TopKConfig::kMaxTopK;
 constexpr uint32_t kClusterSize = Cluster::kClusterSize;
-constexpr uint32_t kRegisterMaxSeqLen = Register::kMaxSeqLen;  // 8192
+constexpr uint32_t kReg2MaxSeqLen = Register2::kMaxSeqLen;  // 8192
+constexpr uint32_t kReg4MaxSeqLen = Register4::kMaxSeqLen;  // 16384 (max_register_vecs=4)
 
 // Below this context length the 8-way cluster split is too fine to beat plain
 // streaming, so never cluster (also the smallest plan candidate threshold).
@@ -110,12 +112,15 @@ __global__ __launch_bounds__(kBlockSize, kOccupancy) void topk_kernel(
   alignas(alignof(Streaming::Smem)) __shared__ uint8_t smem[sizeof(Streaming::Smem)];
   if (problem.seq_len <= problem.topk) {
     Trivial::forward<kPDL>(problem);
-  } else if (problem.seq_len <= kRegisterMaxSeqLen) {
-    Register::forward<kPDL>(problem, &smem);
+  } else if (problem.seq_len <= kReg2MaxSeqLen) {
+    Register2::forward<kPDL>(problem, &smem);
+  } else if (problem.seq_len <= kReg4MaxSeqLen) {
+    Register4::forward<kPDL>(problem, &smem);
   } else {
     Streaming::forward<kPDL>(problem, &smem);
   }
-  // Pipelined page-table transform pass (gathers kept out of the hot scatter loop).
+  // Pipelined page-table transform pass (gathers kept out of the hot scatter loop),
+  // then trigger the dependent kernel only after the full output is written.
   __syncthreads();
   for (uint32_t t = threadIdx.x; t < problem.topk; t += kBlockSize) impl::transform_output(problem, t);
   device::PDLTriggerSecondary<kPDL>();
@@ -134,7 +139,7 @@ __global__ __launch_bounds__(kBlockSize, kOccupancy) __cluster_dims__(1, kCluste
   if (problem.seq_len <= params.cluster_threshold()) return;  // short item -> topk_kernel handles it
   alignas(alignof(Cluster::Smem)) __shared__ uint8_t smem[sizeof(Cluster::Smem)];
   Cluster::forward<kPDL>(problem, &smem);
-  // Pipelined page-table transform pass: all 8 ranks split the topk slots.
+  // Pipelined transform pass: all 8 ranks split the topk slots.
   cooperative_groups::this_cluster().sync();
   for (uint32_t t = blockIdx.y * kBlockSize + threadIdx.x; t < problem.topk; t += kClusterSize * kBlockSize)
     impl::transform_output(problem, t);

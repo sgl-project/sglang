@@ -130,10 +130,10 @@ struct TopKProblem {
   uint32_t seq_len;
   uint32_t page_bits;
 
-  // Write the raw selected index. The page-table transform is applied afterwards
-  // by transform_output() in a separate, pipelined pass -- keeping the per-element
-  // page_table gather out of the hot scatter/tie loops (which are serialized by
-  // shared-memory atomics).
+  // Write the raw selected index; the page-table transform is applied afterwards
+  // by transform_output() in a separate, pipelined pass. Keeping the per-element
+  // page_table gather off the atomic-serialized scatter loop is measurably faster
+  // for both short and long context.
   SGL_DEVICE void emit(uint32_t pos, uint32_t raw_idx) const {
     out[pos] = static_cast<int32_t>(raw_idx);
   }
@@ -142,9 +142,9 @@ struct TopKProblem {
   }
 };
 
-/// In-place page-table transform of one output slot, plus the optional raw side
-/// output. `out[t]` holds a raw index (or -1) on entry. Caller must have a block-
-/// (or cluster-) wide barrier after all emit()s and before calling this.
+/// In-place page-table transform of one output slot + the optional raw side
+/// output. out[t] holds a raw index (or -1) on entry. The caller must barrier
+/// after all emit()s and before calling this.
 SGL_DEVICE void transform_output(const TopKProblem& p, uint32_t t) {
   const auto raw = p.out[t];
   if (p.raw_out != nullptr) p.raw_out[t] = raw;
@@ -441,14 +441,15 @@ struct TopKRadixBase : TopKConfig {
 };
 
 // ---------------------------------------------------------------------------
-// Register path: seq_len <= 8192 -- scores stay resident in registers
+// Register path: scores stay resident in registers across both passes (read
+// once). Templated on kLocalVecs so the caller picks the smallest covering
+// kernel -- a larger kLocalVecs raises kMaxSeqLen but its fixed-unrolled loop
+// wastes work on shorter sequences.
 // ---------------------------------------------------------------------------
 
+template <uint32_t kLocalVecs_>
 struct TopKRegister : TopKRadixBase<12> {
- private:
-  static constexpr uint32_t kLocalVecs = 8 / kVecSize;
-
- public:
+  static constexpr uint32_t kLocalVecs = kLocalVecs_;
   static constexpr uint32_t kMaxSeqLen = kBlockSize * kVecSize * kLocalVecs;
   using Smem = typename TopKRadixBase<12>::Smem;
 
@@ -470,62 +471,68 @@ struct TopKRegister : TopKRadixBase<12> {
     __syncthreads();
     device::PDLWaitPrimary<kUsePDL>();
 
-    // Phase 1: Load and build histogram
+    // A vector `vi` is fully in bounds iff vi < num_full; only full vectors are
+    // vector-loaded (16B aligned, never straddling seq_len). The <kVecSize tail is
+    // a scalar remainder on the LAST lanes (which own the fewest full vectors, so
+    // it overlaps the busy lanes' extra vector). The full path has no per-element
+    // bounds check, keeping register pressure low enough to hold all vectors.
+    const uint32_t num_full = problem.seq_len / kVecSize;
+    const uint32_t tail_start = num_full * kVecSize;
+    const uint32_t tail = problem.seq_len - tail_start;
+
+    // Phase 1: load full vectors + build histogram
     vec_t local_vecs[kLocalVecs];
 #pragma unroll
     for (uint32_t i = 0; i < kLocalVecs; ++i) {
-      const auto vec_idx = tx + kBlockSize * i;
-      if (vec_idx * kVecSize < problem.seq_len) {
-        local_vecs[i].load(problem.in, vec_idx);
-      }
+      const auto vi = tx + kBlockSize * i;
+      if (vi >= num_full) break;
+      local_vecs[i].load(problem.in, vi);
     }
-
 #pragma unroll
     for (uint32_t i = 0; i < kLocalVecs; ++i) {
+      const auto vi = tx + kBlockSize * i;
+      if (vi >= num_full) break;
 #pragma unroll
-      for (uint32_t j = 0; j < kVecSize; ++j) {
-        const auto idx = (tx + kBlockSize * i) * kVecSize + j;
-        if (idx >= problem.seq_len) break;
-        const auto val = local_vecs[i][j];
-        const auto bin = extract_coarse_bin<kHistBits>(val);
-        atomicAdd(&smem->histogram[bin], 1);
-      }
+      for (uint32_t j = 0; j < kVecSize; ++j)
+        atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(local_vecs[i][j])], 1);
     }
-
+    if (tx >= kBlockSize - tail) {
+      const uint32_t idx = tail_start + tx - (kBlockSize - tail);
+      atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(problem.in[idx])], 1);
+    }
     __syncthreads();
 
     // Phase 2: Find the threshold bin
     find_threshold(problem.topk, problem.seq_len, smem);
 
-    // Phase 3: Collect candidates by two fp32 boundaries (see TopKStreaming) rather
-    // than recomputing the fp16 bin per element.
+    // Phase 3: collect by two fp32 boundaries (raw indices; transform applied later)
     const auto topk = problem.topk;
     const auto threshold_bin = smem->threshold_bin;
     const auto v_hi = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
     const auto v_lo = coarse_bin_lower_bound<kHistBits>(threshold_bin);
+    const auto collect = [&](float val, uint32_t idx) {
+      if (val >= v_hi) {
+        const auto pos = atomicAdd(&smem->count_gt, 1);
+        if (pos < topk) [[likely]] problem.emit(pos, idx);
+      } else if (val >= v_lo) {
+        const auto count_eq = atomicAdd(&smem->count_eq, 1);
+        if (count_eq < kMaxNumTie) [[likely]] smem->tie_values[count_eq] = {val, idx};
+      }
+    };
 #pragma unroll
     for (uint32_t i = 0; i < kLocalVecs; ++i) {
+      const auto vi = tx + kBlockSize * i;
+      const auto base = vi * kVecSize;
+      if (vi >= num_full) break;
 #pragma unroll
-      for (uint32_t j = 0; j < kVecSize; ++j) {
-        const auto idx = (tx + kBlockSize * i) * kVecSize + j;
-        if (idx >= problem.seq_len) break;
-        const auto val = local_vecs[i][j];
-        if (val >= v_hi) {
-          const auto pos = atomicAdd(&smem->count_gt, 1);
-          if (pos < topk) [[likely]] {
-            problem.emit(pos, idx);
-          }
-        } else if (val >= v_lo) {
-          const auto count_eq = atomicAdd(&smem->count_eq, 1);
-          if (count_eq < kMaxNumTie) [[likely]] {
-            smem->tie_values[count_eq] = {val, idx};
-          }
-        }
-      }
+      for (uint32_t j = 0; j < kVecSize; ++j) collect(local_vecs[i][j], base + j);
+    }
+    if (tx >= kBlockSize - tail) {
+      const uint32_t idx = tail_start + tx - (kBlockSize - tail);
+      collect(problem.in[idx], idx);
     }
 
-    // Phase 4: Handle ties. Layout driven by the collect counts for consistency
-    // with the fp32 classification.
+    // Phase 4: Handle ties.
     __syncthreads();
     const auto above_count = smem->count_gt;
     const auto equal_count = smem->count_eq;
@@ -533,15 +540,13 @@ struct TopKRegister : TopKRadixBase<12> {
     const auto tie_count = min(equal_count, kMaxNumTie);
     handle_tie(smem->tie_values, problem, above_count, tie_count, remain_topk, &smem->tie_handle_smem);
   }
-
-  SGL_DEVICE static void transform(const TopKProblem&) {}  // emit is fused into forward
 };
 
 // ---------------------------------------------------------------------------
 // Streaming path: seq_len > 8192 -- two vectorized passes over global memory
 // ---------------------------------------------------------------------------
 
-struct TopKStreaming : TopKRegister {
+struct TopKStreaming : TopKRegister<2> {
  public:
   static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
 
