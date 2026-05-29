@@ -419,8 +419,9 @@ class PiecewiseCudaGraphRunner:
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
 
-        # Attention backend
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        # Attention backend (warmup_compile path — torch.compile trace
+        # runs eager-style, not under graph.capture).
+        self.model_runner.attn_backend.init_forward_data(forward_batch)
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
         set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
         set_is_extend_in_batch(False)
@@ -596,7 +597,12 @@ class PiecewiseCudaGraphRunner:
             if lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            # PCG capture path — align with full-graph runner: out-of-graph
+            # init runs with in_capture=True so backends with capture/replay
+            # divergences can branch on it.
+            self.model_runner.attn_backend.init_forward_data_out_graph(
+                forward_batch, in_capture=True
+            )
 
             # Run and capture
             def run_once():
@@ -798,8 +804,12 @@ class PiecewiseCudaGraphRunner:
                 self.moe_fusions,
                 dsa_indexers=self.dsa_indexers,
             ):
-                # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
-                self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+                # Due to the dispatch kernel for MLA model, we init the metadata
+                # with the original forward_batch. This is the replay path —
+                # in_capture defaults to False so backends use their replay branch.
+                self.model_runner.attn_backend.init_forward_data_out_graph(
+                    forward_batch
+                )
                 output = self.model_runner.model.forward(
                     static_forward_batch.input_ids,
                     static_forward_batch.positions,
