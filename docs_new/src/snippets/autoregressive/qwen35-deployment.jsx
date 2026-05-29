@@ -296,12 +296,13 @@ export const Qwen35Deployment = () => {
     }
 
     // 35B / 27B H100 BF16 with MTP: bump TP to 2 and skip --mem-fraction-static.
+    // Spread the base spec so any future fields (multinode, ep, ...) survive.
     if ((model === '35b' || model === '27b') && hardware === 'h100' && quantization === 'bf16' && speculative === 'enabled') {
-      hwConfig = { tp: 2 };
+      hwConfig = { ...hwConfig, tp: 2, mem: undefined };
     }
     // 122B H100 FP8 with MTP: bump TP to 4 and skip --mem-fraction-static.
     if (model === '122b' && hardware === 'h100' && quantization === 'fp8' && speculative === 'enabled') {
-      hwConfig = { tp: 4 };
+      hwConfig = { ...hwConfig, tp: 4, mem: undefined };
     }
 
     let modelName;
