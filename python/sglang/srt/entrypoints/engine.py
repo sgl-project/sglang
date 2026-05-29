@@ -888,6 +888,11 @@ class Engine(EngineScoreMixin, EngineBase):
             and self.tokenizer_manager._subprocess_watchdog is not None
         ):
             self.tokenizer_manager._subprocess_watchdog.stop()
+
+        if self.send_to_rpc is not None:
+            self.send_to_rpc.close()
+            self.send_to_rpc = None
+
         kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
 
     def __enter__(self):
