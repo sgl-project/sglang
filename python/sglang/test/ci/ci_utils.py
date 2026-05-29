@@ -10,7 +10,7 @@ from typing import Callable, Dict, List, Optional, Union
 
 from sglang.srt.debug_utils import cuda_coredump
 from sglang.srt.utils.common import kill_process_tree
-from sglang.test.ci.ci_register import CIRegistry
+from sglang.test.ci.ci_register import CIBundle, CIRegistry
 
 # Configure logger to output to stdout
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -111,12 +111,188 @@ def write_github_step_summary(content: str):
             f.write(content)
 
 
+def _filename_to_module(filename: str) -> str:
+    """Convert a test path to a dotted module name importable by
+    ``python3 -m unittest``.
+
+    ``run_unittest_files`` is invoked from cwd=``test/`` (see
+    ``.github/workflows/_pr-test-stage.yml:157`` and
+    ``test/run_suite.py``). ``CIRegistry.filename`` is sometimes
+    test-relative (legacy ``TestFile`` shape) and sometimes absolute
+    (``run_suite.py`` builds the glob from ``os.path.join(script_dir,
+    'registered', '**', '*.py')`` so every path is absolute under the
+    repo). We normalize against cwd before stripping ``.py`` and
+    converting separators, so ``/.../test/registered/foo/test_x.py``
+    → ``registered.foo.test_x``.
+    """
+    if os.path.isabs(filename):
+        try:
+            filename = os.path.relpath(filename, os.getcwd())
+        except ValueError:
+            # Different drive on Windows or similar; leave as-is and
+            # let unittest report the import failure.
+            pass
+    if filename.endswith(".py"):
+        filename = filename[:-3]
+    return filename.replace(os.sep, ".").replace("/", ".")
+
+
+def _run_one_bundle(
+    *,
+    bundle: "CIBundle",
+    idx: int,
+    total: int,
+    timeout_per_file: float,
+    enable_retry: bool,
+    max_attempts: int,
+    retry_wait_seconds: int,
+    passed_tests: List[str],
+    failed_tests: List[tuple],
+    retried_tests: List[tuple],
+    file_elapsed: Dict[str, float],
+) -> bool:
+    """Run an in-process bundle (one ``python3 -m unittest`` invocation).
+
+    Returns True iff the bundle succeeded. On failure, marks every member
+    as failed (with the bundle's reason) so downstream summary lists the
+    individual files. v1 does not yet do per-member fallback re-runs;
+    that's a follow-up.
+
+    Timing: records the bundle wall under ``file_elapsed[bundle.filename]``
+    (key ``"group:<group_key>"``) so the partition model can read it for
+    future bin-packing. Member files don't get individual elapsed entries
+    in v1 — unittest's default runner doesn't surface per-module wall time.
+    """
+    dotted_modules = [_filename_to_module(m.filename) for m in bundle.members]
+    cmd = ["python3", "-m", "unittest", "-f", *dotted_modules]
+    # Allow generous slack: the bundle's est_time already accounts for
+    # amortized import; CI's `timeout_per_file` may be sized for a single
+    # heavy file, so use whichever is larger.
+    bundle_timeout = max(float(timeout_per_file), bundle.est_time * 2 + 60)
+    bundle_label = bundle.filename  # e.g. "group:attention_unittest"
+
+    logger.info(
+        f".\n.\nBegin ({idx}/{total - 1}) BUNDLE {bundle_label} "
+        f"({len(dotted_modules)} files, est={bundle.est_time:.0f}s): "
+        f"{' '.join(cmd[:4])} <{len(dotted_modules)} modules>\n.\n."
+    )
+
+    process_holder: Dict[str, subprocess.Popen] = {}
+    output_holder: Dict[str, list] = {"lines": []}
+
+    def run_bundle_once(capture_output: bool):
+        full_cmd = list(cmd)
+        bundle_tic = time.perf_counter()
+        if capture_output:
+            p = subprocess.Popen(
+                full_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="ignore",
+            )
+            process_holder["p"] = p
+            output_holder["lines"] = []
+            for line in p.stdout:
+                logger.info(line.rstrip())
+                output_holder["lines"].append(line)
+            p.wait()
+        else:
+            p = subprocess.Popen(full_cmd, stdout=None, stderr=None)
+            process_holder["p"] = p
+            p.wait()
+        elapsed = time.perf_counter() - bundle_tic
+        file_elapsed[bundle_label] = elapsed
+        logger.info(
+            f".\n.\nEnd ({idx}/{total - 1}) BUNDLE {bundle_label}: "
+            f"elapsed={elapsed:.0f}s\n.\n."
+        )
+        return p.returncode
+
+    attempt = 1
+    was_retried = False
+    while attempt <= (max_attempts if enable_retry else 1):
+        if attempt > 1:
+            logger.info(
+                f"\n[CI Retry] Attempt {attempt}/{max_attempts} for {bundle_label}\n"
+            )
+            was_retried = True
+        try:
+            ret_code = run_with_timeout(
+                run_bundle_once,
+                args=(enable_retry,),
+                timeout=bundle_timeout,
+            )
+            if ret_code == 0:
+                if was_retried:
+                    logger.info(
+                        f"\n✓ PASSED on retry (attempt {attempt}): {bundle_label}\n"
+                    )
+                    retried_tests.append((bundle_label, attempt, "passed"))
+                # Credit the bundle key itself (so TIMINGS marks it passed)
+                # plus every member (so the PASSED summary lists them).
+                passed_tests.append(bundle_label)
+                for m in bundle.members:
+                    passed_tests.append(m.filename)
+                return True
+
+            if enable_retry and attempt < max_attempts:
+                output = "".join(output_holder["lines"])
+                is_retriable, reason = is_retriable_failure(output)
+                if is_retriable:
+                    logger.info(f"\n[CI Retry] {bundle_label} failed with {reason}")
+                    logger.info(
+                        f"[CI Retry] Waiting {retry_wait_seconds}s before retry...\n"
+                    )
+                    time.sleep(retry_wait_seconds)
+                    attempt += 1
+                    continue
+                else:
+                    logger.info(
+                        f"\n[CI Retry] {bundle_label} failed with {reason} "
+                        f"- not retrying\n"
+                    )
+
+            logger.info(
+                f"\n✗ FAILED: {bundle_label} returned exit code {ret_code} "
+                f"({len(dotted_modules)} files marked failed)\n"
+            )
+            if was_retried:
+                retried_tests.append((bundle_label, attempt, "failed"))
+            reason = f"bundle exit code {ret_code}"
+            for m in bundle.members:
+                failed_tests.append((m.filename, reason))
+            return False
+
+        except TimeoutError:
+            p = process_holder.get("p")
+            if p is not None:
+                kill_process_tree(p.pid)
+            time.sleep(5)
+            file_elapsed[bundle_label] = float(bundle_timeout)
+            logger.info(
+                f"\n✗ TIMEOUT: {bundle_label} after {bundle_timeout:.0f} seconds\n"
+            )
+            if was_retried:
+                retried_tests.append((bundle_label, attempt, "timeout"))
+            reason = f"bundle timeout after {bundle_timeout:.0f}s"
+            for m in bundle.members:
+                failed_tests.append((m.filename, reason))
+            return False
+
+    return False
+
+
 def _repo_relative_path(p: str) -> str:
     """Return path stripped to repo-relative form (e.g. 'test/srt/foo.py').
 
     Used in the machine-readable TIMINGS block so downstream scrapers
-    get a stable key regardless of CI runner checkout layout.
+    get a stable key regardless of CI runner checkout layout. Group
+    keys (``group:<group_key>``) emitted for in_process bundles are
+    not filesystem paths and are returned verbatim.
     """
+    if p.startswith("group:"):
+        return p
     if not os.path.isabs(p):
         p = os.path.join(os.getcwd(), p)
     marker = "/sglang/"
@@ -157,8 +333,38 @@ def run_unittest_files(
     # Per-file elapsed seconds, latest attempt wins. Consumed by the
     # TIMINGS block emitted at the end of this function.
     file_elapsed: Dict[str, float] = {}
+    # Unit-level counters for the summary line. A bundle is one unit
+    # (regardless of member count); a CIRegistry/TestFile is one unit.
+    units_passed_count = 0
 
     for i, file in enumerate(files):
+        if isinstance(file, CIBundle):
+            # In-process bundle: one `python3 -m unittest <mod1> <mod2> ...`
+            # invocation that shares `import sglang` across all members.
+            # Per-member retry/timing is intentionally simplified to per-bundle
+            # for v1; on failure we fall back to running each member as its
+            # own `python3 file.py -f` so blame attribution is preserved.
+            bundle_passed = _run_one_bundle(
+                bundle=file,
+                idx=i,
+                total=len(files),
+                timeout_per_file=timeout_per_file,
+                enable_retry=enable_retry,
+                max_attempts=max_attempts,
+                retry_wait_seconds=retry_wait_seconds,
+                passed_tests=passed_tests,
+                failed_tests=failed_tests,
+                retried_tests=retried_tests,
+                file_elapsed=file_elapsed,
+            )
+            if bundle_passed:
+                units_passed_count += 1
+            else:
+                success = False
+                if not continue_on_error:
+                    break
+            continue
+
         if isinstance(file, CIRegistry):
             filename, estimated_time = file.filename, file.est_time
         else:
@@ -233,6 +439,7 @@ def run_unittest_files(
                         )
                         retried_tests.append((filename, attempt, "passed"))
                     passed_tests.append(filename)
+                    units_passed_count += 1
                     break
                 else:
                     # Check if we should retry
@@ -294,7 +501,7 @@ def run_unittest_files(
 
     # Print summary
     logger.info(f"\n{'='*60}")
-    logger.info(f"Test Summary: {len(passed_tests)}/{len(files)} passed")
+    logger.info(f"Test Summary: {units_passed_count}/{len(files)} unit(s) passed")
     if enable_retry and retried_tests:
         logger.info(f"Retries: {len(retried_tests)} test(s) were retried")
     logger.info(f"{'='*60}")
