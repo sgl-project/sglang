@@ -22,6 +22,7 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 | File | Role |
 |------|------|
 | `.github/workflows/pr-test.yml` | Main workflow — all stages, jobs, conditions, matrix definitions |
+| `.github/workflows/pr-test-extra.yml` | Extra workflow — gated by BOTH `run-ci` and `run-ci-extra` labels |
 | `.github/workflows/pr-gate.yml` | PR gating: draft check, `run-ci` label, per-user rate limiting |
 | `.github/actions/check-pr-test-health/action.yml` | Cross-job fast-fail: queries API for any failed job |
 | `.github/actions/wait-for-jobs/action.yml` | Stage gating: polls API until stage jobs complete |
@@ -381,10 +382,23 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 | Command | Effect |
 |---------|--------|
 | `/tag-run-ci-label` | Adds `run-ci` label to PR |
+| `/tag-run-ci-label extra` | Adds both `run-ci` and `run-ci-extra` labels |
 | `/rerun-failed-ci` | Reruns failed jobs in the latest workflow run |
-| `/tag-and-rerun-ci` | Adds label + reruns |
-| `/rerun-stage <stage>` | Dispatches `pr-test.yml` with `target_stage=<stage>` |
-| `/rerun-test <test-file>` | Reruns a specific test file via `rerun-test.yml` |
+| `/tag-and-rerun-ci` | Adds `run-ci` label + reruns failed |
+| `/tag-and-rerun-ci extra` | Adds both `run-ci` and `run-ci-extra` labels + reruns failed |
+| `/rerun-stage <stage>` | Deprecated; posts deprecation notice |
+| `/rerun-test <test-file> [<test-file> ...]` | Reruns specific test file(s) via `rerun-test.yml`. A file arg containing a glob metacharacter (`*`, `?`, `[...]`) expands against `test/registered/` and the multimodal test dir to every matching `test_*.py` (e.g. `/rerun-test test_*backend*.py` — wrap in backticks so GitHub doesn't italicize the `*`); matches are deduped, grouped by dispatch shape, and can't carry a `::test` selector. No match → single ⛔ reply, nothing dispatched. Each reply echoes its originating command (`Results for …`) so concurrent commands stay distinguishable |
 | `/rerun-group <group> [<group> ...]` | Expands registered test groups, then reuses `/rerun-test` |
 
 Handled by `scripts/ci/utils/slash_command_handler.py` → `.github/workflows/slash-command-handler.yml`.
+
+### Label-gated workflow dispatch (pr-test, pr-test-extra)
+
+`pr-test.yml` and `pr-test-extra.yml` both listen for `pull_request.labeled` (in addition to `opened`/`synchronize`/`reopened`). The `check-changes.if` gate has two clauses:
+
+1. **For `labeled` events**: the just-added label must be one of the gating labels (`run-ci` for pr-test, `run-ci` or `run-ci-extra` for pr-test-extra) — otherwise every unrelated label addition would dispatch a full CI run.
+2. **All events**: the PR must currently carry the required labels.
+
+This is what lets `/tag-run-ci-label` (and the `extra` variant) trigger a fresh CI run without an extra push.
+
+**Caveat — skipped runs cannot be un-skipped by `run.rerun()`:** GitHub's rerun API reuses the original event payload, so rerunning a `pull_request`-event run that was skipped because of missing labels will skip again (label set in the frozen payload doesn't update). The only way to recover a label-skipped run is to add the missing label, which fires a fresh `labeled` event with the current label set. `handle_rerun_failed_ci` in the slash handler is for rerunning failed/non-label-skipped runs; it cannot revive label-skipped ones.

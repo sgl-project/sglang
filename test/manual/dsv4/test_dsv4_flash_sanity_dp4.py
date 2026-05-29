@@ -3,7 +3,7 @@
 import unittest
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.kits.server_sanity_kit import ServerSanityMixin
+from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -46,7 +46,10 @@ _EAGLE_SPEC_ARGS = [
 ]
 
 
-class TestDSV4FlashTP4DP4(ServerSanityMixin, CustomTestCase):
+class TestDSV4FlashTP4DP4(
+    BasicDecodeCorrectnessMixin,
+    CustomTestCase,
+):
     """TP4 + DP4 + deepep + EAGLE MTP."""
 
     @classmethod
@@ -79,7 +82,10 @@ class TestDSV4FlashTP4DP4(ServerSanityMixin, CustomTestCase):
         kill_process_tree(cls.process.pid)
 
 
-class TestDSV4FlashTP4EP(ServerSanityMixin, CustomTestCase):
+class TestDSV4FlashTP4EP(
+    BasicDecodeCorrectnessMixin,
+    CustomTestCase,
+):
     """TP attn + EP MoE (no DP attn) — exercises the DeepEP + TP-attn path."""
 
     @classmethod
@@ -112,7 +118,10 @@ class TestDSV4FlashTP4EP(ServerSanityMixin, CustomTestCase):
         kill_process_tree(cls.process.pid)
 
 
-class TestDSV4FlashTP4DP4ChunkedPrefillLarge(ServerSanityMixin, CustomTestCase):
+class TestDSV4FlashTP4DP4ChunkedPrefillLarge(
+    BasicDecodeCorrectnessMixin,
+    CustomTestCase,
+):
     """TP4 + DP4 with --chunked-prefill-size 16384 — large chunked prefill."""
 
     @classmethod

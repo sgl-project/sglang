@@ -17,7 +17,10 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
 from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
-from sglang.srt.layers.quantization.marlin_utils import marlin_moe_permute_scales
+from sglang.srt.layers.quantization.marlin_utils import (
+    marlin_make_workspace,
+    marlin_moe_permute_scales,
+)
 from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
 
@@ -334,6 +337,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         )
         replace_tensor("w2_weight_scale", marlin_w2_scales)
 
+        layer.workspace = marlin_make_workspace(layer.w13_weight_packed.device, 4)
         layer.is_marlin_converted = True
 
     def restore_weights_before_loading(self, layer: torch.nn.Module):
@@ -419,6 +423,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             num_bits=self.num_bits,
             is_k_full=self.is_k_full,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
+            workspace=layer.workspace,
         )
         return StandardCombineInput(hidden_states=output)
 
