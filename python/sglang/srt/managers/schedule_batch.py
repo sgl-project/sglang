@@ -1078,7 +1078,7 @@ class Req(ReqDllmMixin):
             )
             self.logprob_start_len = -1
 
-        token_ids_to_match = self.full_untruncated_fill_ids[
+        token_ids_to_match = self.get_fill_ids()[
             : self._compute_max_prefix_len(input_len)
         ]
 
