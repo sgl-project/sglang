@@ -92,7 +92,7 @@ class IpcModelLoader(BaseModelLoader):
             _get_quantization_config,
             device_loading_context,
         )
-        from sglang.srt.utils import set_default_torch_dtype
+        from sglang.srt.model_loader.utils import set_default_torch_dtype
 
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
