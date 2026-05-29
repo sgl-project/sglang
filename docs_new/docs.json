@@ -1034,6 +1034,7 @@
                   {
                     "group": "StepFun",
                     "pages": [
+                      "cookbook/autoregressive/StepFun/Step-3.7-Flash",
                       "cookbook/autoregressive/StepFun/Step3.5",
                       "cookbook/autoregressive/StepFun/Step3-VL-10B"
                     ]

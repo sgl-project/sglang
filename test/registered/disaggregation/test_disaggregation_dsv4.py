@@ -1,8 +1,7 @@
 import unittest
-from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -12,7 +11,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=250, stage="base-c", runner_config="dsv4-8-gpu-h200")
+register_cuda_ci(est_time=250, stage="base-c", runner_config="deepep-8-gpu-h200")
 
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 
@@ -35,7 +34,10 @@ _EAGLE_SPEC_ARGS = [
 ]
 
 
-class TestDisaggregationDSV4(PDDisaggregationServerBase):
+class TestDisaggregationDSV4(PDDisaggregationServerBase, GSM8KMixin):
+
+    gsm8k_accuracy_thres = 0.93
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -70,10 +72,10 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase):
             "--cuda-graph-max-bs",
             "128",
             "--max-running-requests",
-            "256",
-            "--mem-fraction-static",
-            "0.7",
+            "128",
             *_EAGLE_SPEC_ARGS,
+            "--watchdog-timeout",
+            "900",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -106,10 +108,10 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase):
             "--cuda-graph-max-bs",
             "128",
             "--max-running-requests",
-            "256",
-            "--mem-fraction-static",
-            "0.7",
+            "128",
             *_EAGLE_SPEC_ARGS,
+            "--watchdog-timeout",
+            "900",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -119,21 +121,6 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase):
             other_args=decode_args,
             env=DSV4_FLASH_ENV,
         )
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
-        )
-        metrics = run_eval(args)
-        print(f"Evaluation metrics: {metrics}")
-
-        self.assertGreater(metrics["score"], 0.95)
 
 
 if __name__ == "__main__":
