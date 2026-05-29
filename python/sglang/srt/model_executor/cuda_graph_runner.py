@@ -1136,6 +1136,15 @@ class CudaGraphRunner:
                 if self.model_runner.is_hybrid_swa:
                     self.model_runner.token_to_kv_pool.invalidate_loc_cache()
 
+                # In-graph metadata step. Out-of-graph init ran above with
+                # in_capture=True; this is the recordable companion that
+                # backends like DSV4 use for the Raw→Full upgrade. Default
+                # ABC impl is a no-op. Lives inside run_once so it executes
+                # inside the capture block (and inside warmup, which is the
+                # rehearsal — on_after_cuda_graph_warmup undoes any state
+                # mutated here so capture starts from the same Raw view).
+                attn_backend.init_forward_data_in_graph(forward_batch)
+
                 forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
                     None
                 )

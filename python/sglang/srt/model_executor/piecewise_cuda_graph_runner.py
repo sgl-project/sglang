@@ -610,6 +610,13 @@ class PiecewiseCudaGraphRunner:
                 if self.model_runner.is_hybrid_swa:
                     self.model_runner.token_to_kv_pool.invalidate_loc_cache()
 
+                # In-graph metadata step (recordable companion to the
+                # out-of-graph init that ran above with in_capture=True).
+                # Default ABC impl is no-op; DSV4 uses it for Raw→Full upgrade.
+                self.model_runner.attn_backend.init_forward_data_in_graph(
+                    forward_batch
+                )
+
                 # Clean intermediate result cache for DP attention
                 forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
                     None
