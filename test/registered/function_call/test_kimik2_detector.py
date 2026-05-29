@@ -628,7 +628,11 @@ class TestKimiK2EndToEnd(unittest.TestCase):
         self.assertEqual(name_calls[0].name, "get_weather")
 
     def test_e2e_normal_think_close_then_content_overlap_tool_call(self):
-        """Standard case with </think> — should also work correctly."""
+        """Trailing content between ``</think>`` and the tool-call markers
+        (e.g. ``"This is a content:"``) must be surfaced as ``normal_text``
+        by the tool-call parser and not stripped — this is the exact bug the
+        PR fixes.
+        """
         reasoning_det = KimiK2ReasoningDetector(stream_reasoning=True)
         tc_det = KimiK2FuncDetector()
 
@@ -645,7 +649,6 @@ class TestKimiK2EndToEnd(unittest.TestCase):
 
         all_reasoning = ""
         all_content = ""
-        all_tc_calls = []
 
         toolcall_chunks = []
         for chunk in chunks:
@@ -683,7 +686,6 @@ class TestKimiK2EndToEnd(unittest.TestCase):
 
         all_reasoning = ""
         all_content = ""
-        all_tc_calls = []
         toolcall_chunks = []
 
         for chunk in chunks:
@@ -707,8 +709,10 @@ class TestKimiK2EndToEnd(unittest.TestCase):
         self,
     ):
         """Speculative decoding: a single chunk may contain normal text followed
-        by tool-call markers and even the tool_call_begin/id. The normal-text
-        prefix must still be emitted (not stripped) by the tool-call parser.
+        by tool-call markers and even the tool_call_begin/id. Additionally, this
+        single chunk packs two complete tool-call sections back-to-back, which
+        exercises the ``while True:`` drain loop introduced by this PR — both
+        calls must be emitted from one ``parse_streaming_increment`` invocation.
         """
         reasoning_det = KimiK2ReasoningDetector(stream_reasoning=True)
         tc_det = KimiK2FuncDetector()
@@ -723,7 +727,6 @@ class TestKimiK2EndToEnd(unittest.TestCase):
 
         all_reasoning = ""
         all_content = ""
-        all_tc_calls = []
         toolcall_chunks = []
 
         for chunk in chunks:
@@ -818,6 +821,212 @@ class TestKimiK2EndToEnd(unittest.TestCase):
                 self.assertEqual(all_reasoning, expected_reasoning)
                 self.assertEqual(all_content, expected_content)
                 self.assertEqual(tool_calls, expected_calls)
+
+    def test_e2e_normal_text_between_two_tool_calls(self):
+        """Normal text appearing BETWEEN two tool-call sections must be
+        surfaced as ``normal_text``.
+        """
+        tc_det = KimiK2FuncDetector()
+        chunks = [
+            "Prefix text:"
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.get_weather:0"
+            '<|tool_call_argument_begin|>{"city": "London"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+            " Now calling next: "
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.get_weather:1"
+            "<|tool_call_argument_begin|>"
+            '{"city":'
+            ' "Delhi"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        ]
+
+        tool_calls, all_content = _collect_streaming_tool_calls(
+            tc_det, chunks, self.tools
+        )
+
+        self.assertIn("Prefix text:", all_content)
+        self.assertIn("Now calling next:", all_content)
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(tool_calls[0]["parameters"], '{"city": "London"}')
+        self.assertEqual(tool_calls[1]["name"], "get_weather")
+        self.assertEqual(tool_calls[1]["parameters"], '{"city": "Delhi"}')
+
+    def test_e2e_unparsable_tool_id_does_not_wedge_stream(self):
+        """A tool_call header with an unparsable ID must not wedge the
+        streaming parser.
+        """
+        tc_det = KimiK2FuncDetector()
+
+        # ``weird@id`` matches the broad ``[^\\s<|]+`` capture in
+        # ``stream_tool_call_portion_regex`` but fails both the standard
+        # ``name:idx`` form and the bare-counter form, so
+        # ``_parse_tool_call_id`` returns ``(None, 0)``.
+        chunks = [
+            "normal text before",
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>weird@id"
+            '<|tool_call_argument_begin|>{"city"'
+            ': "London"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>",
+            # A valid follow-up call: must still be parsed.
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.get_weather:0"
+            '<|tool_call_argument_begin|>{"city": "Delhi"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>",
+        ]
+
+        tool_calls, all_content = _collect_streaming_tool_calls(
+            tc_det, chunks, self.tools
+        )
+
+        # The bad call may be skipped/logged, but the follow-up MUST be
+        # emitted. The stream must not be wedged on the bad header.
+        valid = [c for c in tool_calls if c.get("name") == "get_weather"]
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(valid[0]["parameters"], '{"city": "Delhi"}')
+        self.assertIn("normal text before", all_content)
+
+    def test_e2e_malformed_json_args_passes_through_to_client(self):
+        """A tool call with malformed JSON args (e.g. unclosed brace,
+        spelling mistake) is the **client's** problem to
+        validate/repair — the parser's job is to locate boundaries and
+        hand back the raw argument string. This mirrors the
+        ``detect_and_parse`` (non-streaming) contract.
+
+        Required behavior:
+
+        1. The malformed call is emitted unchanged (raw bytes
+           preserved, name + index intact) so the client can decide
+           how to handle it (reject, repair, replay-prompt, etc).
+        2. The stream is not wedged — the trailing valid call must
+           still parse.
+        3. ``current_tool_id`` advances normally — the trailing valid
+           call sits at index 2, not 1 or 3.
+
+        Asserts the SAME outcome under three chunk layouts:
+
+        * **single-chunk / MTP path** — all three sections in one
+          forward step (mimics speculative / multi-token-prediction).
+        * **per-call split path** — one section per chunk.
+        * **bad section split mid-payload** — the malformed section
+          itself is fragmented across three chunks (header + partial
+          args; more args; end-token + trailing valid call). Verifies
+          the atomic-section buffer correctly defers emission until
+          ``<|tool_call_end|>`` arrives.
+        """
+        good_args_0 = '{"city": "London"}'
+        # JSON keyword (the model misspelled ``false``).
+        bad_args = '{"city": "Bad", "valid": fasle'
+        good_args_1 = '{"city": "Delhi"}'
+
+        good_section_0 = (
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.get_weather:0"
+            f"<|tool_call_argument_begin|>{good_args_0}"
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        )
+        bad_section = (
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.get_weather:1"
+            f"<|tool_call_argument_begin|>{bad_args}"
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        )
+        good_section_1 = (
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.get_weather:2"
+            f"<|tool_call_argument_begin|>{good_args_1}"
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        )
+
+        layouts = {
+            "mtp_single_chunk": [good_section_0 + bad_section + good_section_1],
+            "per_call_chunks": [good_section_0, bad_section, good_section_1],
+            "bad_section_split_mid_payload": [
+                good_section_0,
+                "<|tool_calls_section_begin|>"
+                "<|tool_call_begin|>functions.get_weather:1"
+                f'<|tool_call_argument_begin|>{{"city":',
+                ' "Bad", "valid": fasle',
+                "<|tool_call_end|>" "<|tool_calls_section_end|>" + good_section_1,
+            ],
+        }
+
+        for layout_name, chunks in layouts.items():
+            with self.subTest(layout=layout_name):
+                tc_det = KimiK2FuncDetector()
+                tool_calls, _ = _collect_streaming_tool_calls(
+                    tc_det, chunks, self.tools
+                )
+
+                # Three contiguous tool calls (good, bad-passthrough, good).
+                self.assertEqual(
+                    len(tool_calls),
+                    3,
+                    f"[{layout_name}] expected 3 calls, got: {tool_calls!r}",
+                )
+                self.assertEqual(tool_calls[0]["name"], "get_weather")
+                self.assertEqual(tool_calls[1]["name"], "get_weather")
+                self.assertEqual(tool_calls[2]["name"], "get_weather")
+                self.assertEqual(tool_calls[0]["parameters"], good_args_0)
+                # Bad payload preserved byte-for-byte for the client.
+                self.assertEqual(tool_calls[1]["parameters"], bad_args)
+                self.assertEqual(tool_calls[2]["parameters"], good_args_1)
+
+    def test_e2e_exception_mid_drain_preserves_accumulated_calls(self):
+        """An exception raised mid-drain must not discard tool calls already
+        finalized in the same ``parse_streaming_increment`` invocation.
+        """
+        import unittest.mock as mock
+
+        tc_det = KimiK2FuncDetector()
+
+        chunks = [
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.get_weather:0"
+            '<|tool_call_argument_begin|>{"city": "London"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.get_weather:1"
+            '<|tool_call_argument_begin|>{"city": "Delhi"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        ]
+
+        # Force an exception on the SECOND drain iteration by making
+        # ``_parse_tool_call_id`` raise the second time it is invoked.
+        call_count = {"n": 0}
+        real_parse = tc_det._parse_tool_call_id
+
+        def flaky_parse(function_id, tools, function_args=None):
+            call_count["n"] += 1
+            if call_count["n"] >= 2:
+                raise RuntimeError("forced mid-drain failure")
+            return real_parse(function_id, tools, function_args)
+
+        with mock.patch.object(tc_det, "_parse_tool_call_id", side_effect=flaky_parse):
+            tool_calls, all_content = _collect_streaming_tool_calls(
+                tc_det, chunks, self.tools
+            )
+
+        # First call must survive the mid-drain exception.
+        named = [c for c in tool_calls if c.get("name")]
+        self.assertGreaterEqual(len(named), 1)
+        self.assertEqual(named[0]["name"], "get_weather")
+        self.assertEqual(named[0]["parameters"], '{"city": "London"}')
+        # Already-finalized call payload must NOT leak into normal_text.
+        self.assertNotIn('{"city": "London"}', all_content)
+        self.assertNotIn("<|tool_call_begin|>", all_content)
 
     def test_e2e_multiple_tool_calls_without_think_close(self):
         """Multiple tool calls inside <think> without </think>."""
