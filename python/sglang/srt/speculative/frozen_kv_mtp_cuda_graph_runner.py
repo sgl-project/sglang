@@ -6,17 +6,22 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
-from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
-from sglang.srt.model_executor.cuda_graph_runner import (
+from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.layers.dp_attention import (
+    DpPaddingMode,
+    set_dp_buffer_len,
+    set_is_extend_in_batch,
+)
+from sglang.srt.model_executor.cuda_graph_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
-    CudaGraphRunner,
+)
+from sglang.srt.model_executor.cuda_graph_runner import (
+    DecodeCudaGraphRunner,
     DeepEPCudaGraphRunnerAdapter,
     get_batch_sizes_to_capture,
     get_global_graph_memory_pool,
     model_capture_mode,
     set_global_graph_memory_pool,
-    set_is_extend_in_batch,
-    set_torch_compile_config,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -188,7 +193,7 @@ class FrozenKVMTPCudaGraphRunner:
         self.graphs[self.bs].replay()
 
     def capture(self):
-        CudaGraphRunner.capture(self)
+        DecodeCudaGraphRunner.capture(self)
 
     def capture_one_batch_size(
         self, num_seqs: int, forward: Callable, stream_idx: int = 0
