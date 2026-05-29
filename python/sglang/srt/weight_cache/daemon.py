@@ -142,13 +142,16 @@ class WeightCacheDaemon:
         """Full loading pipeline: disk → TP shard → quantize → export IPC handles."""
         torch.cuda.set_device(self.gpu_id)
 
+        # Reduce thread contention during multi-process loading
+        torch.set_num_threads(1)
+
         # Lazy imports to avoid circular dependencies and speed up startup
         from sglang.srt.configs.device_config import DeviceConfig
         from sglang.srt.configs.model_config import ModelConfig
         from sglang.srt.model_loader.loader import get_model_loader
         from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
-        # Set up global server args (required by model __init__)
+        # Set up global server args (required by model __init__ and weight loading)
         server_args = ServerArgs(
             model_path=self.model_path,
             dtype=self.dtype,
@@ -156,6 +159,7 @@ class WeightCacheDaemon:
             trust_remote_code=self.trust_remote_code,
             tp_size=self.tp_size,
             load_format=self.load_format,
+            model_loader_extra_config=self.model_loader_extra_config,
         )
         set_global_server_args_for_scheduler(server_args)
 
@@ -211,8 +215,8 @@ class WeightCacheDaemon:
 
         self.config = CacheConfig(
             model_path=self.model_path,
-            model_arch=model_config.architectures[0]
-            if model_config.architectures
+            model_arch=model_config.hf_config.architectures[0]
+            if model_config.hf_config.architectures
             else "",
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,

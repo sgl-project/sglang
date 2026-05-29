@@ -191,8 +191,8 @@ class IpcModelLoader(BaseModelLoader):
 
             engine_config = CacheConfig(
                 model_path=model_config.model_path,
-                model_arch=model_config.architectures[0]
-                if model_config.architectures
+                model_arch=model_config.hf_config.architectures[0]
+                if model_config.hf_config.architectures
                 else "",
                 tp_size=tp_size,
                 tp_rank=tp_rank,
