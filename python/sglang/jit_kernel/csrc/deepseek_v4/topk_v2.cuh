@@ -98,10 +98,15 @@ struct TopKLaunchParams {
   }
 };
 
-// One block per batch element (no cluster). When kSkipLong, items routed to the
-// cluster path (seq_len > cluster_threshold) are skipped here. Short items get
-// full one-block-per-element parallelism (no cluster co-scheduling cap).
-template <bool kPDL, bool kSkipLong>
+// One block per batch element (no cluster). Specialized on the host-known
+// max_seq_len bucket `kLevel` so a small-max_seq_len launch only compiles the
+// paths it needs (leaner kernel, less register/smem-spill reservation):
+//   kLevel 0: max_seq_len <= 8192   -> trivial + register<2>
+//   kLevel 1: max_seq_len <= 16384  -> + register<4>
+//   kLevel 2: max_seq_len  > 16384  -> + streaming  (the "main" kernel)
+// When kSkipLong, items routed to the cluster path are skipped (full
+// one-block-per-element parallelism for the short items, no cluster cap).
+template <bool kPDL, bool kSkipLong, int kLevel>
 __global__ __launch_bounds__(kBlockSize, kOccupancy) void topk_kernel(
     const __grid_constant__ TopKLaunchParams params) {
   impl::enable_smem_spilling();
@@ -114,10 +119,14 @@ __global__ __launch_bounds__(kBlockSize, kOccupancy) void topk_kernel(
     Trivial::forward<kPDL>(problem);
   } else if (problem.seq_len <= kReg2MaxSeqLen) {
     Register2::forward<kPDL>(problem, &smem);
-  } else if (problem.seq_len <= kReg4MaxSeqLen) {
-    Register4::forward<kPDL>(problem, &smem);
-  } else {
-    Streaming::forward<kPDL>(problem, &smem);
+  } else if constexpr (kLevel == 1) {
+    Register4::forward<kPDL>(problem, &smem);  // max_seq_len <= 16384 guarantees seq <= 16384
+  } else if constexpr (kLevel >= 2) {
+    if (problem.seq_len <= kReg4MaxSeqLen) {
+      Register4::forward<kPDL>(problem, &smem);
+    } else {
+      Streaming::forward<kPDL>(problem, &smem);
+    }
   }
   // Pipelined page-table transform pass (gathers kept out of the hot scatter loop),
   // then trigger the dependent kernel only after the full output is written.
@@ -296,14 +305,21 @@ struct CombinedTopKKernel {
     const bool use_cluster = (max_seq_len > kClusterFloor) && (batch_size <= kClusterMaxBatch);
     if (use_cluster) {
       // Long items -> cluster pool; short items -> one block each (full parallelism).
+      // Short items can be up to kClusterFloor, so the per-element kernel is level 2.
       LaunchKernel(dim3{batch_size, kClusterSize}, kBlockSize, device)
           .enable_cluster(dim3{1, kClusterSize})
           .enable_pdl(kUsePDL)(topk_cluster_kernel<kUsePDL>, params);
       LaunchKernel(batch_size, kBlockSize, device)  //
-          .enable_pdl(kUsePDL)(topk_kernel<kUsePDL, /*kSkipLong=*/true>, params);
+          .enable_pdl(kUsePDL)(topk_kernel<kUsePDL, /*kSkipLong=*/true, /*kLevel=*/2>, params);
+    } else if (max_seq_len <= kReg2MaxSeqLen) {
+      LaunchKernel(batch_size, kBlockSize, device)  //
+          .enable_pdl(kUsePDL)(topk_kernel<kUsePDL, /*kSkipLong=*/false, /*kLevel=*/0>, params);
+    } else if (max_seq_len <= kReg4MaxSeqLen) {
+      LaunchKernel(batch_size, kBlockSize, device)  //
+          .enable_pdl(kUsePDL)(topk_kernel<kUsePDL, /*kSkipLong=*/false, /*kLevel=*/1>, params);
     } else {
       LaunchKernel(batch_size, kBlockSize, device)  //
-          .enable_pdl(kUsePDL)(topk_kernel<kUsePDL, /*kSkipLong=*/false>, params);
+          .enable_pdl(kUsePDL)(topk_kernel<kUsePDL, /*kSkipLong=*/false, /*kLevel=*/2>, params);
     }
   }
 };
