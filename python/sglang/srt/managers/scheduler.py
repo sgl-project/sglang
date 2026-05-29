@@ -145,6 +145,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -1142,11 +1143,11 @@ class Scheduler(
             self.future_map = None
             return
 
-        needs_cpu_seq_lens = (
-            getattr(self.draft_worker, "needs_cpu_seq_lens", True)
-            if self.draft_worker is not None
-            else self.tp_worker.model_runner.attn_backend.needs_cpu_seq_lens
-        )
+        if self.draft_worker is not None:
+            attn_backends = self.draft_worker.spec_v2_attn_backends
+        else:
+            attn_backends = (self.tp_worker.model_runner.attn_backend,)
+        needs_cpu_seq_lens = decide_needs_cpu_seq_lens(self.server_args, attn_backends)
         self.future_map = self.spec_algorithm.create_future_map(
             self.device,
             self.req_to_token_pool,

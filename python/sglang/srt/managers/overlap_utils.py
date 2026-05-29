@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 import torch
 
@@ -9,10 +9,36 @@ from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+
+def decide_needs_cpu_seq_lens(
+    server_args: "ServerArgs",
+    attn_backends: Sequence["AttentionBackend"],
+) -> bool:
+    """Decide whether the overlap scheduler must produce seq_lens_cpu / sum.
+
+    Returns True (safe default) when any consumer in the spec_v2 forward path
+    reads the CPU mirror; False only when every consumer opts out, in which
+    case `FutureMap.resolve_seq_lens_cpu` skips the D2H sync.
+
+    Sources of truth, in order:
+    - Feature-level forced-True: features that read seq_lens_cpu in code
+      paths the backend capability flag cannot speak for (TBO, piecewise CG).
+    - Per-backend capability: AttentionBackend.needs_cpu_seq_lens, OR-ed
+      over every backend a spec_v2 forward touches.
+    """
+    if server_args.enable_two_batch_overlap:
+        return True
+    if not server_args.disable_piecewise_cuda_graph:
+        return True
+    return any(b.needs_cpu_seq_lens for b in attn_backends)
+
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -94,8 +120,8 @@ class FutureMap:
         # CUDA-graph padded batches (req_pool_idx == 0) are harmless.
         self.device = device
         self.spec_algo = spec_algo
-        # OR over the spec_v2 forward backends: when all opt out, resolve skips
-        # the seq_lens_cpu D2H and downstream takes the GPU-only path.
+        # Computed by decide_needs_cpu_seq_lens(); see that helper for the
+        # full decision (per-backend flag + TBO / piecewise CG overrides).
         self.needs_cpu_seq_lens = needs_cpu_seq_lens
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
 

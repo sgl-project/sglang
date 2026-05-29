@@ -795,16 +795,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self.adaptive_controller.init_states()
 
     @property
-    def needs_cpu_seq_lens(self) -> bool:
-        # OR over every backend a spec_v2 forward touches; the overlap scheduler
-        # only skips the seq_lens_cpu produce when all of them opt out.
-        backends = (
+    def spec_v2_attn_backends(self) -> tuple:
+        # Every attn backend a spec_v2 forward touches; consumed by
+        # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
+        return (
             self._target_worker.model_runner.attn_backend,
             self._draft_worker.draft_attn_backend,
             self._draft_worker.draft_extend_attn_backend,
-        )
-        return any(
-            getattr(b, "needs_cpu_seq_lens", True) for b in backends if b is not None
         )
 
     @property
