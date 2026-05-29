@@ -605,15 +605,24 @@ class Apertus2509Detector(BaseReasoningFormatDetector):
         <|inner_prefix|> ... <|inner_suffix|>
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
         super().__init__(
             "<|inner_prefix|>",
             "<|inner_suffix|>",
             force_reasoning=False,
             stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
         )
         self._force_reasoning = force_reasoning
-        self._in_reasoning = False
+        self._force_nonempty_content = force_nonempty_content
         self._tool_start_token = "<|tools_prefix|>["
         self._tool_end_token = "<|tools_suffix|>"
         self._reasoning_acc: str = ""
@@ -630,10 +639,13 @@ class Apertus2509Detector(BaseReasoningFormatDetector):
         blocks = self.detect_and_parse_block_sequence(text)
         reasoning_parts = [t for k, t in blocks if k == "reasoning"]
         text_parts = [t for k, t in blocks if k == "text"]
-        return StreamingParseResult(
+        ret = StreamingParseResult(
             normal_text="".join(text_parts),
             reasoning_text="".join(reasoning_parts),
         )
+        if self._force_nonempty_content and not ret.normal_text:
+            ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
+        return ret
 
     def detect_and_parse_block_sequence(self, text: str) -> list[tuple[str, str]]:
         """Return an ordered sequence of blocks: [("reasoning"|"text", content), ...]"""
@@ -641,6 +653,15 @@ class Apertus2509Detector(BaseReasoningFormatDetector):
         end_tok = self.think_end_token
         blocks: list[tuple[str, str]] = []
         cursor = 0
+
+        # continue_final_message can resume inside an existing inner
+        if self._in_reasoning:
+            if (e := text.find(end_tok, cursor)) == -1:
+                blocks.extend(self._split_inner_reasoning(text[cursor:]))
+                blocks.append(("text", ""))
+                return blocks
+            blocks.extend(self._split_inner_reasoning(text[cursor:e]))
+            cursor = e + len(end_tok)
 
         while True:
             if (s := text.find(start_tok, cursor)) == -1:

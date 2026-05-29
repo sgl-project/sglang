@@ -182,6 +182,19 @@ class Apertus2509Detector(BaseFormatDetector):
             self._in_tools_block = False
 
             if out_calls:
+                # Flush normal text after the tools block, but keep a tool marker or its partial prefix in the buffer for the next stream
+                if (marker_pos := self._buffer.find(self.bot)) > 0:
+                    out_normal += self._buffer[:marker_pos]
+                    self._buffer = self._buffer[marker_pos:]
+                elif marker_pos == -1:
+                    if partial_bot := self._ends_with_partial_token(
+                        self._buffer, self.bot
+                    ):
+                        out_normal += self._buffer[:-partial_bot]
+                        self._buffer = self._buffer[-partial_bot:]
+                    else:
+                        out_normal += self._buffer
+                        self._buffer = ""
                 return StreamingParseResult(normal_text=out_normal, calls=out_calls)
 
             continue
