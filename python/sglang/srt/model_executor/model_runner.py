@@ -925,7 +925,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.remote_instance_transfer_engine = TransferEngine()
         local_ip = get_local_ip_auto()
         self.remote_instance_transfer_engine.initialize(
-            local_ip, "P2PHANDSHAKE", "rdma", envs.MOONCAKE_DEVICE.get()
+            local_ip,
+            "P2PHANDSHAKE",
+            envs.MOONCAKE_PROTOCOL.get(),
+            envs.MOONCAKE_DEVICE.get(),
         )
         self.remote_instance_transfer_engine_session_id = NetworkAddress(
             local_ip, self.remote_instance_transfer_engine.get_rpc_port()
@@ -1052,7 +1055,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cuda" and self.server_args.elastic_ep_backend == "mooncake":
             backend = "mooncake"
             if self.server_args.mooncake_ib_device:
-                mooncake_ib_device = self.server_args.mooncake_ib_device.split(",")
+                from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+                    get_ib_devices_for_gpu,
+                )
+
+                ib_device_for_gpu = get_ib_devices_for_gpu(
+                    self.server_args.mooncake_ib_device, self.gpu_id
+                )
+                mooncake_ib_device = (
+                    ib_device_for_gpu.split(",") if ib_device_for_gpu else []
+                )
                 try:
                     from mooncake import ep as mooncake_ep
 
