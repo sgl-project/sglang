@@ -26,7 +26,7 @@ class TestQwen3Next(GSM8KAscendMixin, TestMMLU, CustomTestCase):
     """
 
     model = QWEN3_NEXT_80B_A3B_INSTRUCT_WEIGHTS_PATH
-    other_args=[
+    other_args = [
         "--trust-remote-code",
         "--attention-backend",
         "ascend",
@@ -57,7 +57,7 @@ class TestQwen3Next(GSM8KAscendMixin, TestMMLU, CustomTestCase):
         "--chunked-prefill-size",
         -1,
     ]
-    env={
+    env = {
         # In NPU scenarios, operators only support BF16 precision.
         # This environment variable needs to be set for quantizing weights.
         "SGLANG_DEEPEP_BF16_DISPATCH": "1",

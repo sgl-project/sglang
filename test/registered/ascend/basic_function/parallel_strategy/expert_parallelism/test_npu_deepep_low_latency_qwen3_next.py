@@ -26,7 +26,7 @@ class TestQwen3Next(GSM8KAscendMixin, TestMMLU, CustomTestCase):
     """
 
     model = QWEN3_NEXT_80B_A3B_INSTRUCT_WEIGHTS_PATH
-    other_args=[
+    other_args = [
         "--trust-remote-code",
         "--attention-backend",
         "ascend",
@@ -57,7 +57,7 @@ class TestQwen3Next(GSM8KAscendMixin, TestMMLU, CustomTestCase):
         "--deepep-mode",
         "low_latency",
     ]
-    env={
+    env = {
         # The product of the following two environment variables must be greater than --max-prefill-tokens
         # divide by dp size
         "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "3000",
