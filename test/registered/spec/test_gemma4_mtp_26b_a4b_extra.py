@@ -34,8 +34,7 @@ SERVER_LAUNCH_TIMEOUT = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3
 # Calibrated from deterministic-inference GSM8K runs (200 examples, 5-shot,
 # greedy, triton, TP=2). With --enable-deterministic-inference the per-topk
 # score is reproducible run-to-run (std=0 over N=20): topk=1 -> 0.445,
-# topk=3 -> 0.440. Without deterministic inference the same configs swing
-# ~0.33-0.50 due to batch-nondeterminism, which is why this test pins it.
+# topk=3 -> 0.440.
 OBSERVED_GSM8K_SCORES = {1: 0.445, 3: 0.440}
 GSM8K_SCORE_THRESHOLD = min(OBSERVED_GSM8K_SCORES.values()) - GSM8K_SCORE_MARGIN
 ACCEPT_LENGTH_THRESHOLD = 1.5
