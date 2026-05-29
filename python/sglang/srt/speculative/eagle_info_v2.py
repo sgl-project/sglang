@@ -226,9 +226,7 @@ class EagleDraftInputV2Mixin:
     ):
         bs = len(batch.seq_lens)
         extend_num_tokens = bs * num_draft_tokens
-        # When resolve_seq_lens skipped the CPU mirror, seq_lens_cpu is None;
-        # stay on the GPU-only path (prefix_lens / extend_lens as device tensors,
-        # no .tolist()/.cpu()).
+        # When seq_lens_cpu is absent, stay on GPU-only path -- no .tolist()/.cpu().
         gpu_only = batch.seq_lens_cpu is None
 
         batch.spec_info = self
@@ -239,9 +237,8 @@ class EagleDraftInputV2Mixin:
             batch.model_config.vocab_size,
             "v2 prepare_for_extend_to_fill_draft_kvcache input_ids",
         )
-        # ForwardBatch.init_new requires extend_seq_lens / extend_prefix_lens to
-        # be either both list or both Tensor; gpu_only emits device tensors to
-        # bypass H2D copies entirely.
+        # init_new requires both list or both Tensor;
+        # gpu_only emits device tensors to skip H2D.
         if gpu_only:
             batch.prefix_lens = batch.seq_lens.to(torch.int32)
             batch.extend_lens = torch.full(

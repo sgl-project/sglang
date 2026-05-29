@@ -443,8 +443,7 @@ class TritonAttnBackend(AttentionBackend):
                 forward_batch.extend_prefix_lens, dim=0
             )
             kv_indptr = kv_indptr[: bs + 1]
-            # extend_prefix_lens_cpu is None on the no-verify-sync path; eager
-            # already syncs, so recover the total from the GPU tensor.
+            # Eager already syncs; recover the sum from GPU when *_cpu is absent.
             kv_indices_len = (
                 sum(forward_batch.extend_prefix_lens_cpu)
                 if forward_batch.extend_prefix_lens_cpu is not None
@@ -1313,13 +1312,8 @@ class TritonMultiStepDraftBackend:
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
         if seq_lens_sum is None:
-            # No-verify-sync path: seq_lens_sum only bounds the kv_indices slice
-            # below, which the draft attn reads via ragged kv_indptr offsets -- an
-            # over-estimate is safe (the slice clamps to the buffer length and the
-            # tail is never indexed). This runs on every draft decode step (eager
-            # and cuda-graph replay alike), so recovering it via seq_lens.sum().item()
-            # is a per-iter D2H sync; use a static host upper bound instead
-            # (sum(seq_lens) <= num_seqs * max_context_len).
+            # seq_lens_sum here only slice-clamps a preallocated kv_indices buffer;
+            # over-estimate is safe. Use a static UB to skip the per-iter .sum().item() D2H.
             seq_lens_sum = num_seqs * self.max_context_len
 
         generate_draft_decode_kv_indices[

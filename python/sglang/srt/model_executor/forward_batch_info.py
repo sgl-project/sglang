@@ -631,9 +631,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
-            # gpu_only path (prepare_for_extend_to_fill_draft_kvcache under the
-            # no-verify-sync path) hands these in as device tensors directly;
-            # skip H2D and leave *_cpu mirrors unset.
+            # gpu_only path hands device tensors directly; skip H2D, leave *_cpu unset.
             if isinstance(extend_seq_lens, torch.Tensor):
                 ret.extend_seq_lens = extend_seq_lens
                 ret.extend_prefix_lens = extend_prefix_lens
