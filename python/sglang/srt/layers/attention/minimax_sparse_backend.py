@@ -210,7 +210,17 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # In DP attention mode, q may be padded beyond the actual token count
         # for collective communication alignment. Trim to actual tokens so
         # the sparse attention kernel sees consistent shapes.
-        actual_num_tokens = int(cu_seqlens[-1].item())
+        #
+        # Source the token count from CPU-side metadata when available so we do
+        # not force a GPU->CPU sync (cu_seqlens[-1].item()) on every sparse
+        # layer of every prefill. extend_seq_lens_cpu is a plain list of ints
+        # (ForwardBatch sets it from extend_seq_lens.cpu()), so sum() is a host
+        # op and the result is identical to cu_seqlens[-1]. Fall back to the
+        # device tensor only when CPU metadata is absent.
+        if forward_batch.extend_seq_lens_cpu is not None:
+            actual_num_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
+        else:
+            actual_num_tokens = int(cu_seqlens[-1].item())
         original_num_tokens = q.shape[0]
         if actual_num_tokens < original_num_tokens:
             q = q[:actual_num_tokens]
