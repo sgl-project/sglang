@@ -1328,9 +1328,7 @@ def _slice_model_data(
     return sliced
 
 
-def _compute_patch_slices(
-    model_specific_data: dict, num_items: int
-) -> tuple:
+def _compute_patch_slices(model_specific_data: dict, num_items: int) -> tuple:
     """Compute per-item patch slice boundaries from 'num_patches' metadata.
 
     Returns (patch_slices, total_num_patches) where patch_slices is a list of
