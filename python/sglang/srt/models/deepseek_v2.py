@@ -234,55 +234,12 @@ if _is_cuda:
 
         moe_fusion = forward_context.moe_fusions[layer_id]
         assert moe_fusion is not None
-        assert moe_fusion.alt_stream is not None
-        assert moe_fusion.num_fused_shared_experts == 0
-        assert not moe_fusion._enable_a2a_moe
-        assert not moe_fusion._fuse_shared_experts_inside_sbo
-        assert not getattr(moe_fusion, "is_hash", False)
-        assert hasattr(moe_fusion, "shared_experts")
-        assert get_moe_runner_backend().is_flashinfer_trtllm()
-        assert moe_fusion.experts.use_flashinfer_trtllm_moe
-        assert not get_global_server_args().enable_eplb
-
-        current_stream = torch.cuda.current_stream()
-        alt_stream = moe_fusion.alt_stream
-        alt_stream.wait_stream(current_stream)
-
-        shared_output = moe_fusion._forward_shared_experts(hidden_states)
-        with torch.cuda.stream(alt_stream):
-            router_logits = moe_fusion.gate(hidden_states)
-            topk_output = BypassedTopKOutput(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_config=moe_fusion.topk.topk_config,
-            )
-            final_hidden_states = moe_fusion.experts.forward_impl(
-                hidden_states, topk_output
-            )
-            if not (_is_cuda or _is_musa) or isinstance(
-                moe_fusion.experts.quant_method, KTEPWrapperMethod
-            ):
-                final_hidden_states *= moe_fusion.routed_scaling_factor
-
-        current_stream.wait_stream(alt_stream)
-        final_hidden_states.record_stream(current_stream)
-
-        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
-            moe_fusion.experts,
-            final_hidden_states,
-            None if moe_fusion._shared_expert_tp1 else shared_output,
-            moe_fusion.routed_scaling_factor,
-        )
-
-        if moe_fusion.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
+        return moe_fusion.forward_normal_dual_stream(
+            hidden_states,
             should_allreduce_fusion=should_allreduce_fusion,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-        if moe_fusion._shared_expert_tp1:
-            final_hidden_states += shared_output
-        return final_hidden_states
+            use_reduce_scatter=use_reduce_scatter,
+            use_flashinfer_trtllm_bypass=True,
+        )
 
 
 class DeepseekV2MLP(nn.Module):
@@ -827,6 +784,26 @@ class DeepseekV2MoE(nn.Module):
             )
         ]
 
+    def _can_dual_stream_pcg(
+        self, hidden_states: torch.Tensor, server_args=None
+    ) -> bool:
+        if server_args is None:
+            server_args = get_global_server_args()
+        return (
+            _enable_pcg_dsv2_dual_stream
+            and (is_in_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
+            and get_moe_runner_backend().is_flashinfer_trtllm()
+            and self.alt_stream is not None
+            and self.num_fused_shared_experts == 0
+            and hidden_states.shape[0] > 0
+            and hasattr(self, "shared_experts")
+            and getattr(self.experts, "use_flashinfer_trtllm_moe", False)
+            and not self._enable_a2a_moe
+            and not self._fuse_shared_experts_inside_sbo
+            and not getattr(self, "is_hash", False)
+            and not server_args.enable_eplb
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -849,19 +826,7 @@ class DeepseekV2MoE(nn.Module):
 
         if not self._enable_a2a_moe:
             server_args = get_global_server_args()
-            if (
-                _enable_pcg_dsv2_dual_stream
-                and (is_in_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
-                and get_moe_runner_backend().is_flashinfer_trtllm()
-                and self.alt_stream is not None
-                and self.num_fused_shared_experts == 0
-                and hidden_states.shape[0] > 0
-                and hasattr(self, "shared_experts")
-                and self.experts.use_flashinfer_trtllm_moe
-                and not self._fuse_shared_experts_inside_sbo
-                and not getattr(self, "is_hash", False)
-                and not server_args.enable_eplb
-            ):
+            if self._can_dual_stream_pcg(hidden_states, server_args):
                 return dsv2_flashinfer_moe_dual_stream_pcg(
                     hidden_states,
                     self.layer_id,
@@ -910,6 +875,8 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
+        *,
+        use_flashinfer_trtllm_bypass: bool = False,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
@@ -925,18 +892,28 @@ class DeepseekV2MoE(nn.Module):
         with torch.cuda.stream(self.alt_stream):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-            topk_kwargs = (
-                {"input_ids": input_ids_global}
-                if getattr(self, "is_hash", False)
-                else {}
-            )
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                expert_location_dispatch_info=dispatch_info,
-                **topk_kwargs,
-            )
-            final_hidden_states = self.experts(hidden_states, topk_output)
+            if use_flashinfer_trtllm_bypass:
+                topk_output = BypassedTopKOutput(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_config=self.topk.topk_config,
+                )
+                final_hidden_states = self.experts.forward_impl(
+                    hidden_states, topk_output
+                )
+            else:
+                topk_kwargs = (
+                    {"input_ids": input_ids_global}
+                    if getattr(self, "is_hash", False)
+                    else {}
+                )
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    expert_location_dispatch_info=dispatch_info,
+                    **topk_kwargs,
+                )
+                final_hidden_states = self.experts(hidden_states, topk_output)
             if (
                 not _is_cuda
                 and not _is_musa
