@@ -76,6 +76,10 @@ class ForwardMetadata:
 
 
 class TritonAttnBackend(AttentionBackend):
+    # CUDA-graph replay rebuilds metadata from preallocated kv_indptr/kv_indices
+    # buffers; it never reads seq_lens_cpu / seq_lens_sum.
+    needs_cpu_seq_lens: bool = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -575,11 +579,19 @@ class TritonAttnBackend(AttentionBackend):
             attn_lse = None
 
         elif forward_batch.forward_mode.is_draft_extend():
+            # Eager only (CG replay bypasses init); explicit D2H here instead of
+            # letting torch.empty inside generate_attn_arg_prefill .item() on a
+            # GPU cumsum tensor.
+            seq_lens_sum = (
+                forward_batch.seq_lens_sum
+                if forward_batch.seq_lens_sum is not None
+                else int(forward_batch.seq_lens.sum())
+            )
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
-                    None,
+                    seq_lens_sum,
                     self.req_to_token,
                 )
             )
@@ -1263,6 +1275,8 @@ class TritonMultiStepDraftBackend:
     draft decoding steps.
     """
 
+    needs_cpu_seq_lens: bool = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -1311,6 +1325,10 @@ class TritonMultiStepDraftBackend:
         num_seqs = forward_batch.batch_size
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
+        if seq_lens_sum is None:
+            # seq_lens_sum here only slice-clamps a preallocated kv_indices buffer;
+            # over-estimate is safe. Use a static UB to skip the per-iter .sum().item() D2H.
+            seq_lens_sum = num_seqs * self.max_context_len
 
         generate_draft_decode_kv_indices[
             (self.speculative_num_steps, num_seqs, self.topk)
