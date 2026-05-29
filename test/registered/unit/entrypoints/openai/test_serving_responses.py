@@ -1,5 +1,3 @@
-from _responses_helpers import make_serving
-
 import asyncio
 import unittest
 from unittest.mock import Mock, patch
@@ -10,6 +8,7 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+from utils import make_serving
 
 from sglang.srt.entrypoints.context import SimpleContext
 from sglang.srt.entrypoints.openai.protocol import (

@@ -1,6 +1,6 @@
-from _responses_helpers import make_serving  # noqa: F401 — bootstrap import
-
 import unittest
+
+from utils import make_serving  # noqa: F401 — bootstrap import
 
 from sglang.srt.entrypoints.openai.protocol import ResponsesRequest, UsageInfo
 from sglang.test.ci.ci_register import register_cpu_ci

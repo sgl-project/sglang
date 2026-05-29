@@ -25,6 +25,8 @@ from openai.types.responses import (
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai.types.responses.response_reasoning_item import (
     Content as ResponseReasoningTextContent,
+)
+from openai.types.responses.response_reasoning_item import (
     Summary as ResponseReasoningSummary,
 )
 from openai.types.responses.response_reasoning_summary_part_added_event import (
@@ -603,19 +605,13 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _wants_reasoning_summary(request: ResponsesRequest) -> bool:
-        return (
-            request.reasoning is not None and request.reasoning.summary is not None
-        )
+        return request.reasoning is not None and request.reasoning.summary is not None
 
     def _is_thinking_enabled_for_request(self, request: ResponsesRequest) -> bool:
         """Whether to start the reasoning detector in thinking mode."""
         if not self.reasoning_parser:
             return False
-        effort = (
-            request.reasoning.effort
-            if request.reasoning is not None
-            else None
-        )
+        effort = request.reasoning.effort if request.reasoning is not None else None
         if self.reasoning_parser == "hunyuan":
             return effort not in (None, "none", "no_think")
         if self.template_manager.force_reasoning:
@@ -995,6 +991,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         sep = "\n\n" if prev_content and new_content else ""
                         prev["content"] = prev_content + sep + new_content
                     else:
+
                         def _as_parts(c):
                             if isinstance(c, list):
                                 return list(c)
@@ -1002,7 +999,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 return [{"type": "text", "text": c}]
                             return []
 
-                        prev["content"] = _as_parts(prev_content) + _as_parts(new_content)
+                        prev["content"] = _as_parts(prev_content) + _as_parts(
+                            new_content
+                        )
                 new_calls = msg.get("tool_calls")
                 if new_calls:
                     prev_calls = prev.get("tool_calls") or []

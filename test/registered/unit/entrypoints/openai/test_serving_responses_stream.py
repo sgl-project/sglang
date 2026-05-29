@@ -1,15 +1,14 @@
-from _responses_helpers import (
+import asyncio
+import unittest
+from unittest.mock import Mock, patch
+
+from utils import (
     collect_stream_events,
     event_payloads,
     event_types,
     find_completed_event,
     make_serving,
 )
-
-import asyncio
-import json
-import unittest
-from unittest.mock import Mock, patch
 
 from sglang.srt.entrypoints.openai.protocol import (
     RequestResponseMetadata,
