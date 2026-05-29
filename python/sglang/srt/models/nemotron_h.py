@@ -164,7 +164,6 @@ class NemotronHMoE(nn.Module):
             config.hidden_size,
             config.n_routed_experts,
             bias=False,
-            params_dtype=torch.float32,
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
@@ -243,7 +242,10 @@ class NemotronHMoE(nn.Module):
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # router_scores: [num_tokens, num_experts]
-        router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
+        # bf16 gemm on tensor cores with fp32 accumulation/output for sigmoid/topk.
+        router_logits = torch.mm(
+            hidden_states, self.gate.weight.t(), out_dtype=torch.float32
+        )
         if self.shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
         else:
@@ -269,7 +271,10 @@ class NemotronHMoE(nn.Module):
 
         with self.device_module.stream(alt_stream):
             # router_scores: [num_tokens, num_experts]
-            router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
+            # bf16 gemm on tensor cores with fp32 accumulation/output for sigmoid/topk.
+            router_logits = torch.mm(
+                hidden_states, self.gate.weight.t(), out_dtype=torch.float32
+            )
             topk_output = self.topk(hidden_states, router_logits)
             if self.use_latent_moe:
                 hidden_states, _ = self.fc1_latent_proj(hidden_states)

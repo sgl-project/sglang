@@ -6,6 +6,7 @@ from sgl_kernel import silu_and_mul as silu_and_mul_aot
 
 from sglang.jit_kernel.activation import gelu_and_mul as gelu_and_mul_jit
 from sglang.jit_kernel.activation import gelu_tanh_and_mul as gelu_tanh_and_mul_jit
+from sglang.jit_kernel.activation import relu2 as relu2_jit
 from sglang.jit_kernel.activation import silu_and_mul as silu_and_mul_jit
 from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.benchmark.utils import create_random
@@ -87,6 +88,21 @@ def benchmark_filter(
     )
 
 
+@torch.compile
+def relu2_torch(input: torch.Tensor) -> torch.Tensor:
+    return F.relu(input).pow(2)
+
+
+@marker.parametrize("dim", [1024, 4096, 6144, 8192], [4096])
+@marker.parametrize("batch_size", [2**x for x in range(0, 15)], [8, 512])
+@marker.benchmark("impl", ["jit", "torch"])
+def benchmark_unary(dim: int, batch_size: int, impl: str):
+    x = create_random(batch_size, dim)
+    fn = {"jit": relu2_jit, "torch": relu2_torch}[impl]
+    return marker.do_bench(fn, input_args=(x,))
+
+
 if __name__ == "__main__":
     benchmark.run()
     benchmark_filter.run()
+    benchmark_unary.run()

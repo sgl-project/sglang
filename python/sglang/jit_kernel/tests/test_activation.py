@@ -4,7 +4,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.jit_kernel.activation import SUPPORTED_ACTIVATIONS, run_activation
+from sglang.jit_kernel.activation import (
+    SUPPORTED_ACTIVATIONS,
+    relu2,
+    run_activation,
+)
 from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -153,6 +157,48 @@ def test_activation_filter_expert_none_skipped(op_name: str) -> None:
     out_filtered = run_activation(op_name, x, None, expert_ids, 1)
     out_unfiltered = run_activation(op_name, x, None)
     torch.testing.assert_close(out_filtered, out_unfiltered, atol=0.0, rtol=0.0)
+
+
+UNARY_SHAPES = get_ci_test_range(
+    full_range=[
+        (7, 16),
+        (83, 1024),
+        (3, 5, 16),
+        (2, 3, 512),
+        (1, 17, 4096),
+        *[(2**x, 2048) for x in range(0, 15, 2)],
+    ],
+    ci_range=[(7, 16), (2, 3, 512)],
+)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", UNARY_SHAPES)
+def test_relu2_correctness(dtype: torch.dtype, shape: tuple[int, ...]) -> None:
+    x = torch.randn(shape, dtype=dtype, device="cuda")
+    out = relu2(x)
+    expected = F.relu(x.float()).pow(2).to(dtype=dtype)
+    atol, rtol = _tolerances(dtype)
+    torch.testing.assert_close(out, expected, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", UNARY_SHAPES)
+def test_relu2_out_param(dtype: torch.dtype, shape: tuple[int, ...]) -> None:
+    x = torch.randn(shape, dtype=dtype, device="cuda")
+    out = torch.empty(shape, dtype=dtype, device="cuda")
+    result = relu2(x, out)
+    assert result is out
+    expected = F.relu(x.float()).pow(2).to(dtype=dtype)
+    atol, rtol = _tolerances(dtype)
+    torch.testing.assert_close(out, expected, atol=atol, rtol=rtol)
+
+
+def test_relu2_negative_inputs_zeroed() -> None:
+    """All-negative input must produce an all-zero output."""
+    x = -torch.rand((64, 512), dtype=torch.bfloat16, device="cuda") - 1e-3
+    out = relu2(x)
+    assert torch.count_nonzero(out) == 0
 
 
 if __name__ == "__main__":
