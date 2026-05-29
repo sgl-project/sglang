@@ -10,6 +10,7 @@ from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
+    from sglang.srt.layers.attention.dsv4.compressor import FusedCompressMetadata
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.speculative.spec_info import SpecInput
@@ -214,4 +215,23 @@ class AttentionBackend(ABC):
         forward_batch: ForwardBatch,
     ) -> Optional[BaseIndexerMetadata]:
         """Get the indexer metadata. None means don't support indexer."""
+        return None
+
+    def get_compressor_state(
+        self,
+        layer_id: int,
+        forward_batch: ForwardBatch,
+    ) -> Optional[FusedCompressMetadata]:
+        """Get the per-layer compressor state (DSV4 mhc / hisparse).
+
+        Symmetric opt-in helper to :py:meth:`get_indexer_metadata`. Default
+        ``None`` means this backend does not produce compressor state; the
+        caller (Compressor / mHC layer) should fall back to its own path.
+
+        Backends override to return their per-iter compressor metadata
+        (e.g. ``FusedCompressMetadata`` for DSV4) computed in
+        :py:meth:`init_forward_metadata_out_graph`. This routes compressor
+        data via a backend-internal explicit API instead of leaking it
+        through ``forward(**kwargs)``.
+        """
         return None
