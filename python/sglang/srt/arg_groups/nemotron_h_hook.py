@@ -12,12 +12,13 @@ logger = logging.getLogger(__name__)
 def apply_nemotron_h_defaults(server_args: "ServerArgs", model_arch: str) -> None:
     """Apply NemotronH model-specific server arg defaults and constraints."""
     model_config = server_args.get_model_config()
-    if model_config.quantization in [
+    is_modelopt = model_config.quantization in [
         "modelopt",
         "modelopt_fp8",
         "modelopt_fp4",
         "modelopt_mixed",
-    ]:
+    ]
+    if is_modelopt:
         assert model_config.hf_config.mlp_hidden_act == "relu2"
         if model_config.quantization == "modelopt":
             quant_algo = model_config.hf_config.quantization_config["quant_algo"]
@@ -29,26 +30,17 @@ def apply_nemotron_h_defaults(server_args: "ServerArgs", model_arch: str) -> Non
                 )
         else:
             server_args.quantization = model_config.quantization
-        if server_args.moe_runner_backend == "auto":
-            if is_sm100_supported() and server_args.moe_a2a_backend == "none":
-                server_args.moe_runner_backend = "flashinfer_trtllm"
-                logger.info(
-                    "Use flashinfer_trtllm as MoE runner backend on sm100 for "
-                    f"{model_arch}"
-                )
-            else:
-                server_args.moe_runner_backend = "flashinfer_cutlass"
-    elif model_config.quantization is None:
-        if (
-            server_args.moe_runner_backend == "auto"
-            and is_sm100_supported()
-            and server_args.moe_a2a_backend == "none"
-        ):
+
+    if (is_modelopt or model_config.quantization is None) and (
+        server_args.moe_runner_backend == "auto"
+    ):
+        if is_sm100_supported() and server_args.moe_a2a_backend == "none":
             server_args.moe_runner_backend = "flashinfer_trtllm"
             logger.info(
-                "Use flashinfer_trtllm as MoE runner backend on sm100 for "
-                f"{model_arch}"
+                f"Use flashinfer_trtllm as MoE runner backend on sm100 for {model_arch}"
             )
+        else:
+            server_args.moe_runner_backend = "flashinfer_cutlass"
 
     server_args._handle_mamba_radix_cache(
         model_arch=model_arch,
