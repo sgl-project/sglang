@@ -42,6 +42,7 @@ replaced by a call into it; the epilogue (silu * x_up) doesn't change.
 from __future__ import annotations
 
 import logging
+import weakref
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -413,7 +414,13 @@ class FusedSwitchSwiGLU(nn.Module):
 
     def __init__(self, switch_mlp):
         super().__init__()
-        self._switch_mlp = switch_mlp  # weak association — we read its modules
+        # Hold the SwitchGLU weakly. The patch helper assigns
+        # sw._path_b_call = FusedSwitchSwiGLU(sw).fused_forward, which would
+        # otherwise form a cycle (sw -> bound method -> self -> sw). Proxy
+        # access is transparent for the gate_proj / up_proj / down_proj
+        # reads in fused_forward, and sw is always alive while __call__
+        # dispatches into the bound method.
+        self._switch_mlp = weakref.proxy(switch_mlp)
 
     def fused_forward(self, x, indices):
         """Same contract as SwitchGLU.__call__ but with fused activation."""
