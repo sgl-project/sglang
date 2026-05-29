@@ -2059,6 +2059,8 @@ class ServerArgs:
                     self.attention_backend = "trtllm_mha"
                 elif is_sm90_supported():
                     self.attention_backend = "fa3"
+                elif is_cpu() and cpu_has_amx_support():
+                    self.attention_backend = "intel_amx"
                 elif is_xpu():
                     self.attention_backend = "intel_xpu"
                 elif is_hip():
@@ -2084,6 +2086,7 @@ class ServerArgs:
                 "fa3",
                 "fa4",
                 "ascend",
+                "intel_amx",
                 "intel_xpu",
                 "aiter",
             ]
@@ -2147,6 +2150,7 @@ class ServerArgs:
                     self.ep_size == 1
                     and is_triton_kernels_available()
                     and self.quantization is None
+                    and not (is_cpu() and cpu_has_amx_support())
                 ):
                     # The triton_kernels package segfaults on Blackwell (B200)
                     # with NVIDIA driver >= 595. Fall back to triton backend.
@@ -2211,7 +2215,21 @@ class ServerArgs:
                 logger.warning(
                     "Disable hybrid SWA memory for MiMoV2 model with hierarchical cache"
                 )
-        elif "Step3p5ForCausalLM" in model_arch:
+        elif (
+            "Step3p5ForCausalLM" in model_arch
+            or "Step3p7ForConditionalGeneration" in model_arch
+        ):
+            if self.is_attention_backend_not_set():
+                if is_blackwell_supported():
+                    self.attention_backend = "fa4"
+                    logger.info(
+                        "Auto-select fa4 attention backend for Step3p7 on Blackwell."
+                    )
+                elif is_sm90_supported():
+                    self.attention_backend = "fa3"
+                    logger.info(
+                        "Auto-select fa3 attention backend for Step3p7 on Hopper."
+                    )
             if self.speculative_algorithm == "EAGLE":
                 self.enable_multi_layer_eagle = True
                 logger.info(

@@ -138,8 +138,10 @@ class FutureMap:
             (self.req_pool_size,), dtype=torch.int64, device=self.device
         )
         # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
-        # D2H pulls (gated only on publish, off the schedule stream).
-        if _is_cuda or _is_hip:
+        # D2H pulls (gated only on publish, off the schedule stream). CUDA-only:
+        # recovers occupancy lost to the WAR barrier (also CUDA-only); other
+        # platforms have no barrier and use the plain .cpu() bootstrap path.
+        if _is_cuda:
             self.new_seq_lens_cpu_pinned = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, pin_memory=True
             )
@@ -236,7 +238,11 @@ class FutureMap:
         if fi is None:
             return
         if self.publish_ready is not None:
-            self.publish_ready.wait()
+            if _is_hip:
+                # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
+                self.publish_ready.synchronize()
+            else:
+                self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
         if not self.needs_cpu_seq_lens:
