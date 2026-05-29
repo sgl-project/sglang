@@ -2,10 +2,11 @@
 """IPC Model Loader — loads model weights from a Weight Cache Daemon via CUDA IPC.
 
 Two modes:
-- Copy mode (default): imports IPC handle, copies to own allocation, releases handle.
-  Engine is fully independent after loading. ~0.3s for 70B FP16.
-- Zero-copy mode: param.data points directly to IPC-mapped GPU memory.
-  Fastest (<0.1s), but engine depends on daemon staying alive.
+- Copy mode: imports IPC handle, copies to own allocation, releases handle.
+  Engine is fully independent after loading. Requires 2x GPU memory during load.
+- Zero-copy mode (default for daemon): param.data points directly to IPC-mapped
+  GPU memory. Only 1x GPU memory needed — engine and daemon share the same
+  physical GPU memory via CUDA IPC. Engine depends on daemon staying alive.
 """
 
 import logging
@@ -83,12 +84,7 @@ class IpcModelLoader(BaseModelLoader):
             f"in {time.perf_counter() - tic:.2f}s"
         )
 
-        # Build model on CUDA and run process_weights_after_loading
-        # to establish the correct parameter structure (shapes, dtypes, new params).
-        # The data will be overwritten by IPC imports, so correctness of the
-        # intermediate values doesn't matter — only the structure matters.
         from sglang.srt.model_loader.loader import (
-            DefaultModelLoader,
             _get_quantization_config,
             device_loading_context,
         )
@@ -97,9 +93,132 @@ class IpcModelLoader(BaseModelLoader):
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
 
+        if self.copy_mode:
+            model = self._load_copy_mode(
+                model_config, device_config, entries,
+                target_device, quant_config,
+            )
+        else:
+            model = self._load_zero_copy_mode(
+                model_config, device_config, entries,
+                target_device, quant_config,
+            )
+
+        # Post-load hooks (e.g., model-specific finalization)
+        _post_load_weights(model)
+
+        logger.info(
+            f"[IpcModelLoader] Loaded model via IPC ({self.copy_mode=}), "
+            f"total={time.perf_counter() - tic:.2f}s"
+        )
+
+        return model.eval()
+
+    def _load_zero_copy_mode(
+        self, model_config, device_config, entries, target_device, quant_config,
+    ) -> nn.Module:
+        """Zero-copy load: map IPC tensors directly as param.data.
+
+        The model is initialized on the meta device (no memory allocation),
+        then each parameter's data is replaced with the IPC-mapped GPU tensor.
+        This avoids the 2x GPU memory overhead of copy mode — the engine and
+        daemon share the same physical GPU memory via CUDA IPC.
+        """
+        from sglang.srt.model_loader.utils import set_default_torch_dtype
+
+        # Initialize model on meta device to avoid any GPU/CPU memory allocation.
+        # This creates the model structure with the correct parameter shapes/dtypes
+        # but without allocating actual storage.
+        with set_default_torch_dtype(model_config.dtype):
+            with torch.device("meta"):
+                model = _initialize_model(
+                    model_config, self.load_config, quant_config,
+                )
+
+        # Replace parameter/buffer data with IPC-imported GPU tensors.
+        # The daemon's state_dict already includes post-quantization parameters
+        # (e.g. weight_scale from FP8), so we don't need to run
+        # process_weights_after_loading again.
+        imported_refs = []
+        imported_count = 0
+        skipped_count = 0
+        map_tic = time.perf_counter()
+
+        # Build a lookup for entries
+        for name, param in model.named_parameters():
+            if name in entries:
+                entry = entries[name]
+                imported_tensor = MultiprocessingSerializer.deserialize(entry["handle"])
+                if imported_tensor.shape != param.shape or imported_tensor.dtype != param.dtype:
+                    logger.warning(
+                        f"[IpcModelLoader] Shape/dtype mismatch for param {name}: "
+                        f"IPC={imported_tensor.shape}/{imported_tensor.dtype} "
+                        f"vs model={param.shape}/{param.dtype}"
+                    )
+                    del imported_tensor
+                    skipped_count += 1
+                    continue
+                # Zero-copy: replace meta param.data with IPC-mapped GPU tensor
+                param.data = imported_tensor
+                imported_refs.append(imported_tensor)
+                imported_count += 1
+            else:
+                # Parameter not in daemon entries — allocate on GPU
+                param.data = torch.empty(
+                    param.shape, dtype=param.dtype, device=target_device
+                )
+
+        for name, buf in model.named_buffers():
+            if name in entries:
+                entry = entries[name]
+                imported_tensor = MultiprocessingSerializer.deserialize(entry["handle"])
+                if imported_tensor.shape != buf.shape or imported_tensor.dtype != buf.dtype:
+                    logger.warning(
+                        f"[IpcModelLoader] Shape/dtype mismatch for buffer {name}: "
+                        f"IPC={imported_tensor.shape}/{imported_tensor.dtype} "
+                        f"vs model={buf.shape}/{buf.dtype}"
+                    )
+                    del imported_tensor
+                    skipped_count += 1
+                    continue
+                buf.data = imported_tensor
+                imported_refs.append(imported_tensor)
+                imported_count += 1
+            else:
+                # Buffer not in daemon entries — allocate on GPU
+                buf.data = torch.empty(
+                    buf.shape, dtype=buf.dtype, device=target_device
+                )
+
+        map_elapsed = time.perf_counter() - map_tic
+
+        # Stash IPC refs on the model to prevent GC (which would unmap the memory)
+        if imported_refs:
+            model._ipc_imported_tensors = imported_refs
+
+        logger.info(
+            f"[IpcModelLoader] Zero-copy: mapped {imported_count} tensors, "
+            f"skipped {skipped_count}, time={map_elapsed:.3f}s"
+        )
+
+        return model
+
+    def _load_copy_mode(
+        self, model_config, device_config, entries, target_device, quant_config,
+    ) -> nn.Module:
+        """Copy mode: initialize model on GPU, then copy IPC weights over.
+
+        This requires enough GPU memory for both the daemon's weights and
+        the engine's model during the copy phase. After copying, the daemon
+        can release its GPU memory.
+        """
+        from sglang.srt.model_loader.utils import set_default_torch_dtype
+
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
-                model = _initialize_model(model_config, self.load_config, quant_config)
+                model = _initialize_model(
+                    model_config, self.load_config, quant_config,
+                )
                 # Run quant post-processing to create parameters like weight_scale
                 for _, module in model.named_modules():
                     quant_method = getattr(module, "quant_method", None)
@@ -107,10 +226,8 @@ class IpcModelLoader(BaseModelLoader):
                         with device_loading_context(module, target_device):
                             quant_method.process_weights_after_loading(module)
 
-        # Replace parameter data with IPC-imported tensors
+        # Replace parameter data with IPC-imported tensors (copy)
         state_dict = model.state_dict()
-        imported_refs = []  # Keep refs alive for zero-copy mode
-
         imported_count = 0
         skipped_count = 0
         copy_tic = time.perf_counter()
@@ -121,35 +238,39 @@ class IpcModelLoader(BaseModelLoader):
                 continue
 
             imported_tensor = MultiprocessingSerializer.deserialize(entry["handle"])
-
-            if self.copy_mode:
-                # Copy to own allocation, then release IPC handle
-                state_dict[name].data.copy_(imported_tensor)
-                del imported_tensor
-            else:
-                # Zero-copy: replace param.data with IPC-mapped tensor
-                state_dict[name].data = imported_tensor
-                imported_refs.append(imported_tensor)
-
+            state_dict[name].data.copy_(imported_tensor)
+            del imported_tensor
             imported_count += 1
 
         copy_elapsed = time.perf_counter() - copy_tic
 
-        # For zero-copy mode, stash refs on the model to prevent GC
-        if not self.copy_mode and imported_refs:
-            model._ipc_imported_tensors = imported_refs
-
-        # Post-load hooks (e.g., model-specific finalization)
-        _post_load_weights(model)
+        # Tell the daemon to release GPU memory since we've copied all weights.
+        self._notify_daemon_release()
 
         logger.info(
-            f"[IpcModelLoader] Loaded {imported_count} tensors via IPC "
-            f"({self.copy_mode=}), skipped {skipped_count}, "
-            f"copy/mapping time={copy_elapsed:.3f}s, "
-            f"total={time.perf_counter() - tic:.2f}s"
+            f"[IpcModelLoader] Copy: imported {imported_count} tensors, "
+            f"skipped {skipped_count}, time={copy_elapsed:.3f}s"
         )
 
-        return model.eval()
+        return model
+
+    def _notify_daemon_release(self):
+        """Tell the daemon to release its GPU memory after copy-mode load."""
+        import socket as socket_mod
+
+        try:
+            sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+            sock.settimeout(10)
+            sock.connect(self.socket_path)
+            send_msg(sock, {"type": "release"})
+            result = recv_msg(sock)
+            sock.close()
+            if result.get("status") == "ok":
+                logger.info("[IpcModelLoader] Daemon released GPU memory after copy")
+            else:
+                logger.warning(f"[IpcModelLoader] Daemon release response: {result}")
+        except Exception as e:
+            logger.warning(f"[IpcModelLoader] Failed to notify daemon to release: {e}")
 
     def _fetch_from_cache(self, model_config) -> Optional[dict]:
         """Connect to daemon, validate config, fetch IPC handles."""

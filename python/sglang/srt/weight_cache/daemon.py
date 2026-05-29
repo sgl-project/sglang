@@ -347,6 +347,15 @@ class WeightCacheDaemon:
         elif req.get("type") == "ping":
             send_msg(conn, {"status": "ok"})
 
+        elif req.get("type") == "release":
+            # Engine has copied weights; release GPU memory to free space.
+            logger.info(
+                f"[WeightCacheDaemon gpu={self.gpu_id}] "
+                f"Release requested, freeing GPU memory"
+            )
+            self.shutdown()
+            send_msg(conn, {"status": "ok"})
+
         else:
             send_msg(conn, {"status": "error", "message": f"Unknown request type: {req.get('type')}"})
 
