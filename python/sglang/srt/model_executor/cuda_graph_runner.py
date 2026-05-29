@@ -24,6 +24,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -105,6 +106,47 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
+
+
+def build_replay_fb_view(
+    forward_batch: "ForwardBatch",
+    buffers: "DecodeInputBuffers",
+    bs: int,
+    raw_bs: int,
+    num_tokens: int,
+    seq_len_fill_value: int,
+    capture_forward_mode: "ForwardMode",
+    is_encoder_decoder: bool,
+) -> SimpleNamespace:
+    """Construct a ForwardBatch-like view for backend replay-side init.
+
+    Combines the original ``forward_batch`` (for unpadded / per-iter
+    fields like ``spec_info`` and ``out_cache_loc``) with the padded
+    capture-time buffers from ``buffers`` (for ``req_pool_indices``,
+    ``seq_lens``, ``seq_lens_cpu``, ``encoder_lens``). The returned
+    namespace exposes only the fields the new
+    ``init_forward_data_out_graph(fb)`` contract reads, mirroring what
+    the legacy ``init_forward_metadata_replay_cuda_graph`` signature
+    used to pass explicitly.
+
+    The ``_replay_forward_batch`` side channel that DSV4 still reads in
+    its replay metadata prep is **not** subsumed here; step 04 will
+    remove that out-of-band attribute by extending this view to cover
+    everything DSV4 needs.
+    """
+    return SimpleNamespace(
+        batch_size=bs,
+        forward_mode=capture_forward_mode,
+        input_ids=buffers.input_ids[:num_tokens],
+        req_pool_indices=buffers.req_pool_indices[:bs],
+        seq_lens=buffers.seq_lens[:bs],
+        seq_lens_sum=forward_batch.seq_lens_sum
+        + (bs - raw_bs) * seq_len_fill_value,
+        seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+        encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
+        out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+        spec_info=forward_batch.spec_info,
+    )
 
 
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
