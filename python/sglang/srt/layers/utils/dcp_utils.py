@@ -457,6 +457,7 @@ def all_gather_kv_cache_for_mha_chunk_extend(
     prefix_starts_cpu: torch.Tensor = None,
 ):
     if dcp_enabled():
+        kv_a = kv_a.unsqueeze(1)
         gathered_kv = all_gather_kv_cache_for_dcp(
             kv_a,
             k_pe,
@@ -464,7 +465,7 @@ def all_gather_kv_cache_for_mha_chunk_extend(
             prefix_starts_cpu,
         )
         kv_a, k_pe = gathered_kv.split([kv_a.shape[-1], k_pe.shape[-1]], dim=-1)
-        kv_a = kv_a.unsqueeze(1)
+        kv_a = kv_a.squeeze(1)
     return kv_a, k_pe
 
 
@@ -483,7 +484,7 @@ def all_gather_kv_cache_for_mha_extend(
         attn_mqa, dcp_local_prefix_kv_indices
     )
     extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
-    prefix_kv_a, prefix_k_pe = all_gather_kv_cache_for_mha_chunk_extend(
+    prefix_kv_a, prefix_k_pe = all_gather_kv_cache_for_dcp(
         prefix_kv_a,
         prefix_k_pe,
         extend_prefix_lens_cpu,
@@ -511,7 +512,7 @@ def all_gather_kv_cache_for_mha_extend(
         )
     kv_a = torch.cat(kv_a_tuple, dim=0)
     k_pe = torch.cat(k_pe_tuple, dim=0)
-    return kv_a, k_pe
+    return kv_a.squeeze(1).contiguous(), k_pe
 
 
 def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
@@ -647,6 +648,11 @@ def all_gather_kv_cache_for_dcp(
     prefix_kv_lens_cpu: torch.Tensor,
     prefix_starts_cpu: torch.Tensor = None,
 ):
+    """
+    prefix_kv_a and prefix_k_pe should have same shape, expect for last dim
+    """
+    if not dcp_enabled():
+        return torch.cat([prefix_kv_a, prefix_k_pe], dim=-1)
     # 1. compute max kv_lens for each seq
     dcp_world_size = get_dcp_world_size()
     dcp_rank = get_dcp_rank()
@@ -661,7 +667,7 @@ def all_gather_kv_cache_for_dcp(
     ) % dcp_world_size < dcp_rank
     right_pads = right_pads.to(torch.int32)
     padded_lens = (
-        prefix_kv_lens_cpu + dcp_world_size + (prefix_starts_cpu % dcp_world_size)
+        prefix_kv_lens_cpu + (prefix_starts_cpu % dcp_world_size) + dcp_world_size - 1
     ) // dcp_world_size
 
     local_kv_lens = padded_lens - left_pads - right_pads
@@ -672,7 +678,6 @@ def all_gather_kv_cache_for_dcp(
     local_kv_lens_cu[1:] = torch.cumsum(local_kv_lens, dim=0)
 
     padded_kv_cache_arr = []
-    prefix_kv_a = prefix_kv_a.squeeze(1)
     prefix_kv_cache = torch.cat([prefix_kv_a, prefix_k_pe], dim=-1)
     for req_idx in range(len(prefix_kv_lens_cpu)):
         padded_tensor = prefix_kv_cache.new_empty(
@@ -703,4 +708,4 @@ def all_gather_kv_cache_for_dcp(
         )
     gatherd_kv_cache = torch.cat(kv_cache_tuple, dim=0)
 
-    return gatherd_kv_cache.split([prefix_kv_a.size(-1), prefix_k_pe.size(-1)], dim=-1)
+    return gatherd_kv_cache
