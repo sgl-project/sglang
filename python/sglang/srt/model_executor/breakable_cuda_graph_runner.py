@@ -330,7 +330,8 @@ class BreakableCudaGraphRunner:
         with forward_context(
             ForwardContext(attn_backend=self.model_runner.attn_backend)
         ):
-            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            # Warmup runs eager-style (not under graph.capture).
+            self.model_runner.attn_backend.init_forward_data(forward_batch)
             self._run_forward(forward_batch, num_tokens)
 
     def _capture_all(self):
@@ -387,7 +388,11 @@ class BreakableCudaGraphRunner:
     def _capture_one(self, num_tokens, pool, stream):
         """Capture a breakable CUDA graph for one token size."""
         forward_batch = self._build_capture_forward_batch(num_tokens)
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        # Capture-side init: out-of-graph metadata prep + in_capture=True so
+        # backends with capture/replay divergence can branch on the flag.
+        self.model_runner.attn_backend.init_forward_data_out_graph(
+            forward_batch, in_capture=True
+        )
 
         def run_once():
             # Invalidate SWA loc cache — same fix as in cuda_graph_runner.run_once.
@@ -463,7 +468,10 @@ class BreakableCudaGraphRunner:
             original_layer_forward = self.layer_model.forward
             self.layer_model.forward = replay_layer_forward
             try:
-                self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+                # Replay path: in_capture defaults to False.
+                self.model_runner.attn_backend.init_forward_data_out_graph(
+                    forward_batch
+                )
                 with set_forward_context(
                     static_forward_batch,
                     self.attention_layers,
