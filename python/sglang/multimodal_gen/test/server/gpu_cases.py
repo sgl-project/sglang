@@ -546,6 +546,8 @@ TWO_GPU_CASES = [
             extras=[
                 "--lora-weight-name",
                 "985347-wan22_14B-low-Nfj1nx-e65.safetensors",
+                "--lora-merge-mode",
+                "dynamic",
             ],
         ),
         DiffusionSamplingParams(
