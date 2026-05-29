@@ -462,7 +462,7 @@ def all_gather_kv_cache_for_mha_chunk_extend(
         )
         kv_a, k_pe = gathered_kv.split([kv_a.shape[-1], k_pe.shape[-1]], dim=-1)
         kv_a = kv_a.squeeze(1)
-    return kv_a, k_pe
+    return kv_a.contiguous(), k_pe
 
 
 def all_gather_kv_cache_for_mha_extend(
