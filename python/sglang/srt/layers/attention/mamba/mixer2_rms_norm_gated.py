@@ -99,9 +99,7 @@ class Mixer2RMSNormGated(MultiPlatformOp):
                 # To handle the general case, redundantly apply the variance
                 if self.use_attn_tp_group:
                     parts = [torch.empty_like(x) for _ in range(self.tp_size)]
-                    get_attention_tp_group().all_gather(
-                        x, output_tensor_list=parts
-                    )
+                    get_attention_tp_group().all_gather(x, output_tensor_list=parts)
                     x = torch.cat(parts, dim=-1)
                 else:
                     x = tensor_model_parallel_all_gather(x, -1)

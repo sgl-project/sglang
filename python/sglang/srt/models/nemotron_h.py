@@ -33,7 +33,6 @@ from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
 from sglang.srt.distributed import (
     get_moe_ep_group,
     get_pp_group,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -43,11 +42,6 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerScatterModes,
-    ScatterMode,
-)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     get_attention_tp_rank,
@@ -352,9 +346,7 @@ class NemotronHMLPDecoderLayer(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.layer_communicator = _make_layer_communicator(
-            self.norm, for_attn=False
-        )
+        self.layer_communicator = _make_layer_communicator(self.norm, for_attn=False)
 
     def forward(
         self,
@@ -407,9 +399,7 @@ class NemotronHMoEDecoderLayer(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.layer_communicator = _make_layer_communicator(
-            self.norm, for_attn=False
-        )
+        self.layer_communicator = _make_layer_communicator(self.norm, for_attn=False)
 
     def forward(
         self,
@@ -466,9 +456,7 @@ class NemotronHMambaDecoderLayer(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.layer_communicator = _make_layer_communicator(
-            self.norm, for_attn=True
-        )
+        self.layer_communicator = _make_layer_communicator(self.norm, for_attn=True)
         self.prev_layer_is_attn = layer_idx > 0 and _is_attn_layer(
             config.hybrid_override_pattern[layer_idx - 1]
         )
@@ -678,9 +666,7 @@ class NemotronHAttentionDecoderLayer(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.layer_communicator = _make_layer_communicator(
-            self.norm, for_attn=True
-        )
+        self.layer_communicator = _make_layer_communicator(self.norm, for_attn=True)
         self.prev_layer_is_attn = layer_idx > 0 and _is_attn_layer(
             config.hybrid_override_pattern[layer_idx - 1]
         )

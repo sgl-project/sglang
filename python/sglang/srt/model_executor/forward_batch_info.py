@@ -909,7 +909,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         setattr(self, "_original_batch_size", self.batch_size)
         self.original_global_num_tokens_cpu = list(self.original_global_num_tokens_cpu)
-        self.global_num_tokens_for_logprob_cpu = list(self.global_num_tokens_for_logprob_cpu)
+        self.global_num_tokens_for_logprob_cpu = list(
+            self.global_num_tokens_for_logprob_cpu
+        )
         global_num_tokens = list(self.global_num_tokens_cpu)
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_attention_tp_size()

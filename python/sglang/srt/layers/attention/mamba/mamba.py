@@ -690,9 +690,7 @@ class MambaMixer2(torch.nn.Module):
             D_d = self.D[:, None, ...].expand(-1, self.head_dim)
             B_d = B_d.view(-1, n_groups, B_d.shape[1] // n_groups)
             C_d = C_d.view(-1, n_groups, C_d.shape[1] // n_groups)
-            hidden_states_d = hidden_states_d.view(
-                -1, local_num_heads, self.head_dim
-            )
+            hidden_states_d = hidden_states_d.view(-1, local_num_heads, self.head_dim)
 
             if is_target_verify:
                 selective_state_update(
