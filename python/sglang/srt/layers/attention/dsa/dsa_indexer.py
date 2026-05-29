@@ -26,7 +26,6 @@ from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -1320,18 +1319,12 @@ class Indexer(MultiPlatformOp):
         else:
             metadata = None
 
-        server_args = get_global_server_args()
         enable_dual_stream = (
             self.alt_stream is not None
             and get_is_capture_mode()
+            and not torch.compiler.is_compiling()
             and q_lora.shape[0] > 0
             and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
-            and not (
-                server_args.enable_torch_compile
-                and q_lora.shape[0]
-                <= server_args.torch_compile_max_bs
-                * (server_args.speculative_num_draft_tokens or 1)
-            )
         )
 
         # Determine if should skip topk based on sequence length

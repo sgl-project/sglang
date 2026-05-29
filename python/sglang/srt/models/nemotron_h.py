@@ -233,7 +233,11 @@ class NemotronHMoE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # torch.compile cannot trace CUDA streams, so use the non-overlapping
         # path when inside piecewise CUDA graph compilation.
-        if _is_cuda and not is_in_piecewise_cuda_graph():
+        if (
+            _is_cuda
+            and not is_in_piecewise_cuda_graph()
+            and not torch.compiler.is_compiling()
+        ):
             return self._forward_core_shared_routed_overlap(hidden_states)
         else:
             return self._forward_core_normal(hidden_states)

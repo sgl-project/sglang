@@ -124,6 +124,7 @@ def forward_mega_moe(
         and moe.num_fused_shared_experts == 0
         and num_tokens > 0
         and get_is_capture_mode()
+        and not torch.compiler.is_compiling()
     )
 
     if sbo_overlap_flag:

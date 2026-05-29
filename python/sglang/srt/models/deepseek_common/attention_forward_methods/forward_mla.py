@@ -137,16 +137,10 @@ class DeepseekMLAForwardMixin:
     def _use_capture_alt_stream(self: DeepseekV2AttentionMLA, num_tokens: int) -> bool:
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
-        server_args = get_global_server_args()
         return (
             self.alt_stream is not None
             and get_is_capture_mode()
-            and not (
-                server_args.enable_torch_compile
-                and num_tokens
-                <= server_args.torch_compile_max_bs
-                * (server_args.speculative_num_draft_tokens or 1)
-            )
+            and not torch.compiler.is_compiling()
         )
 
     def forward_absorb_prepare(

@@ -485,12 +485,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         elif (
             self.alt_stream is not None
             and get_is_capture_mode()
-            and not (
-                get_global_server_args().enable_torch_compile
-                and hidden_states.shape[0]
-                <= get_global_server_args().torch_compile_max_bs
-                * (get_global_server_args().speculative_num_draft_tokens or 1)
-            )
+            and not torch.compiler.is_compiling()
         ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
                 hidden_states
