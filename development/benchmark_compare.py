@@ -80,6 +80,12 @@ class RunMetrics:
     # 600s floor — the sidecar `measurement_window_seconds` is a knob,
     # `duration` is the observation.
     duration_s: Optional[float] = None
+    # Achieved (effective) concurrency that bench_serving actually sustained
+    # (the JSONL ``concurrency`` float), as opposed to the nominal
+    # ``--max-concurrency``. Surfaced in the AC-11 report so a DS column that
+    # is admission/queue-bound (e.g. DS at mem 0.6 with a small KV pool) is
+    # visible against DSA's near-nominal concurrency, not hidden (#F).
+    achieved_concurrency: Optional[float] = None
 
 
 @dataclass
@@ -234,6 +240,10 @@ def _read_bench_jsonl(path: str) -> Tuple[RunContext, RunMetrics]:
         dense_fallback_total=_int("dense_fallback_total"),
         total_tokens_mean=_float("total_tokens_mean"),
         duration_s=_float("duration"),
+        # JSONL ``concurrency`` is the achieved/effective concurrency
+        # bench_serving sustained; the nominal value above comes from
+        # ``max_concurrency`` / the filename tag.
+        achieved_concurrency=_float("concurrency"),
     )
     return context, metrics
 
@@ -335,6 +345,7 @@ def _median_metrics(trials: List[RunMetrics]) -> RunMetrics:
         dense_fallback_total=df_total,
         total_tokens_mean=_median([t.total_tokens_mean for t in trials]),
         duration_s=_median([t.duration_s for t in trials]),
+        achieved_concurrency=_median([t.achieved_concurrency for t in trials]),
     )
 
 
@@ -450,13 +461,29 @@ AC11_MIN_WARMUP_SECONDS = 120.0
 AC11_MIN_MEASUREMENT_WINDOW_SECONDS = 600.0
 
 # Server-args keys that legitimately differ between DSA and DS — the
-# only sanctioned variation per plan §AC-11 is the DS-enablement pair.
-# AC-10 separately guarantees DS runs with radix cache ON, so
-# ``disable_radix_cache`` is NOT in this set: AC-11 must refuse a
-# radix-cache mismatch, not absorb it.
+# DS-enablement fields plus the DS-only radix-flip artifact path (the DSA
+# baseline has no such field). The locked Option B set (radix cache, TP,
+# page, dtype, backends, overlap/piecewise graph) is still enforced, so a
+# radix-cache mismatch is refused, not absorbed.
 _DS_ONLY_SERVER_ARG_KEYS = frozenset({
     "enable_double_sparsity",
     "double_sparsity_config",
+    "double_sparsity_radix_fixture_artifact",
+})
+
+# Server-args fields that are NOT operating-point knobs for the DS-vs-DSA
+# comparison and so must not refuse the run:
+#   - ``random_seed``: a per-boot RNG seed (pure telemetry; the workload seed
+#     is matched separately via the sidecar ``seed``).
+#   - ``mem_fraction_static``: DS and DSA legitimately differ here — DS
+#     reserves a per-rank TokenLabelTable on top of the V3.2 FP8 weights and
+#     serves at 0.6, while the baseline serves at ~0.85. This asymmetry is the
+#     root of the effective-vs-nominal concurrency gap, which the AC-11 report
+#     surfaces explicitly (achieved concurrency per side) rather than hiding —
+#     it is NOT a locked Option B field, so it is recorded, not used to refuse.
+_AC11_IGNORED_SERVER_ARG_KEYS = frozenset({
+    "random_seed",
+    "mem_fraction_static",
 })
 
 
@@ -604,23 +631,24 @@ def _read_ac11_meta(result_path: str, *, side: str = "?") -> Dict:
 
 def _normalize_ac11_server_args(meta: Dict) -> Dict:
     """Project ``meta["server_args"]`` onto the full ``ServerArgs`` field
-    set minus the DS-only keys.
+    set minus the DS-only keys and the non-operating-point ignored keys.
 
-    DS may legitimately differ from DSA on the DS-enablement flags only
-    (``enable_double_sparsity`` + ``double_sparsity_config``). All other
-    launch args — TP size, page size, dtype, backends, radix cache, CUDA
-    graph flag, mem fraction, max_total_tokens, attention_backend, etc.
-    — must agree. Dynamic ``/get_server_info`` telemetry
-    (``internal_states``, ``kv_events``, ``last_gen_throughput``,
-    scheduler capacity, …) is dropped: none of those keys are
-    ``ServerArgs`` fields so they are excluded by the projection.
+    DS may legitimately differ from DSA on the DS-enablement fields and the
+    DS-only radix-fixture artifact (``_DS_ONLY_SERVER_ARG_KEYS``), and on the
+    recorded-not-matched fields (``_AC11_IGNORED_SERVER_ARG_KEYS``:
+    ``random_seed`` per-boot telemetry, ``mem_fraction_static`` DS-vs-DSA
+    memory asymmetry). All other launch args — TP size, page size, dtype,
+    backends, radix cache, CUDA graph flag, max_total_tokens,
+    attention_backend, etc. — must agree. Dynamic ``/get_server_info``
+    telemetry is dropped because it is not a ``ServerArgs`` field.
     """
     sa = meta.get("server_args") or {}
     if not isinstance(sa, dict):
         return {}
+    excluded = _DS_ONLY_SERVER_ARG_KEYS | _AC11_IGNORED_SERVER_ARG_KEYS
     return {
         k: sa[k] for k in sa.keys() & _AC11_STABLE_LAUNCH_ARG_KEYS
-        if k not in _DS_ONLY_SERVER_ARG_KEYS
+        if k not in excluded
     }
 
 
@@ -896,6 +924,33 @@ def _render_ac11_markdown(
         )
         if not gate["tps_pass"] or not gate["ttft_pass"]:
             overall_fail_reasons.append(f"conc={conc}: {gate['reason']}")
+    rows.append("")
+
+    # Effective-vs-nominal concurrency (#F): DS at mem 0.6 reserves a per-rank
+    # TokenLabelTable on top of the V3.2 FP8 weights, so its KV pool is smaller
+    # and it can be admission/queue-bound at high nominal concurrency. Surface
+    # the ACHIEVED concurrency each side actually sustained so a TTFT gap that
+    # is partly an admission artifact (not pure per-request latency) is visible.
+    rows.append("## Effective vs nominal concurrency (#F)")
+    rows.append("")
+    rows.append("| Conc (nominal) | DSA achieved | DS achieved | DS/nominal |")
+    rows.append("|----------------|--------------|-------------|------------|")
+    for conc in sorted(by_conc.keys()):
+        dsa_m: RunMetrics = by_conc[conc]["dsa_median"]  # type: ignore[assignment]
+        ds_m: RunMetrics = by_conc[conc]["ds_median"]    # type: ignore[assignment]
+        ds_ach = ds_m.achieved_concurrency
+        frac = f"{ds_ach / conc:.0%}" if (ds_ach is not None and conc) else "—"
+        rows.append(
+            f"| {conc} | {_fmt(dsa_m.achieved_concurrency)} "
+            f"| {_fmt(ds_ach)} | {frac} |"
+        )
+    rows.append("")
+    rows.append(
+        "When DS achieved concurrency is below nominal while DSA tracks nominal, "
+        "the DS P99 TTFT gap is partly queue/admission-bound (a mem-0.6 KV-pool "
+        "effect), not solely per-request latency. Per DEC-7 a TTFT/TPS miss is a "
+        "recorded directional follow-up, not a build-break."
+    )
     rows.append("")
     if overall_fail_reasons:
         rows.append("## AC-11 verdict: FAIL")

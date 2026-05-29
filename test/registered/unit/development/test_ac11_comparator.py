@@ -837,7 +837,6 @@ class TestAC11EndToEnd(unittest.TestCase):
             ("dtype", "bfloat16", "float16"),
             ("max_total_tokens", 65536, 32768),
             ("attention_backend", "flashmla", "fa3"),
-            ("mem_fraction_static", 0.9, 0.85),
         ]
         for field, dsa_v, ds_v in cases:
             with self.subTest(field=field):
@@ -857,6 +856,34 @@ class TestAC11EndToEnd(unittest.TestCase):
                         },
                     )
                     self.assertEqual(self._ac11_main(dsa, ds), 2)
+
+    def test_ignored_server_args_differences_do_not_refuse(self):
+        """mem_fraction_static (DS reserves a TokenLabelTable so it serves at a
+        lower fraction than DSA), random_seed (per-boot telemetry), and the
+        DS-only radix-fixture artifact path legitimately differ between sides
+        and must NOT refuse the comparison — the effective-concurrency asymmetry
+        is recorded in the report, not used to refuse. Real locked Option B
+        fields still refuse (covered by the test above)."""
+        for field, dsa_v, ds_v in (
+            ("mem_fraction_static", 0.85, 0.6),
+            ("random_seed", 111, 222),
+            ("double_sparsity_radix_fixture_artifact", None, "/x/state.json"),
+        ):
+            with self.subTest(field=field):
+                with tempfile.TemporaryDirectory() as tmp:
+                    dsa = self._make_trials(
+                        tmp, "dsa", 64, [100, 100, 100], [10, 10, 10],
+                        sidecar_overrides={"server_args": _option_b_sa(**{field: dsa_v})},
+                    )
+                    ds = self._make_trials(
+                        tmp, "ds", 64, [100, 100, 100], [10, 10, 10],
+                        sidecar_overrides={
+                            "server_args": _option_b_sa(enable_ds=True, **{field: ds_v}),
+                        },
+                    )
+                    # Not a refusal (exit 2). Gates may pass (0) or miss (3),
+                    # but the run must proceed.
+                    self.assertIn(self._ac11_main(dsa, ds), (0, 3))
 
     def test_server_args_locked_option_b_field_missing_refused(self):
         """Plan §13 (DEC-1) locks the Option B operating point: every
