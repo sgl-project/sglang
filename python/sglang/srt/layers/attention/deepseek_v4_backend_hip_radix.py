@@ -1204,6 +1204,15 @@ class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
     def init_forward_data(self, forward_batch: ForwardBatch):
         # Delegate to legacy method while Phase E hasn't moved the body yet.
         self.init_forward_metadata(forward_batch)
+        self.init_forward_data_in_graph(forward_batch)
+
+    def init_forward_data_in_graph(self, forward_batch: ForwardBatch) -> None:
+        # MultiStep dispatcher: fan out the in-graph step to every inner
+        # backend so each per-step Raw metadata gets upgraded to Full
+        # inside graph capture (the parent ABC override operates on
+        # self.forward_metadata, which the inner backends don't share).
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_data_in_graph(forward_batch)
 
     def init_forward_data_out_graph(
         self,
