@@ -33,8 +33,12 @@ _JSON_SCHEMA_TYPE_ALIASES: Dict[str, str] = {
     "datetime": "string",
     "time": "string",
     "timestamp": "string",
+    "binary": "string",
+    "blob": "string",
+    "bytea": "string",
+    "bytes": "string",
+    "varbinary": "string",
     "bool": "boolean",
-    "binary": "boolean",
     "bigint": "integer",
     "smallint": "integer",
     "tinyint": "integer",
@@ -94,6 +98,15 @@ def _normalize_single_type(raw: Any) -> Any:
     return raw
 
 
+def _normalize_type_list(raw_items: List[Any]) -> List[Any]:
+    normalized_items: List[Any] = []
+    for item in raw_items:
+        normalized_item = _normalize_single_type(item)
+        if normalized_item not in normalized_items:
+            normalized_items.append(normalized_item)
+    return normalized_items
+
+
 def normalize_json_schema_types(schema: Any) -> None:
     """
     Walk a JSON Schema in place and rewrite non-standard ``"type"`` values
@@ -107,7 +120,7 @@ def normalize_json_schema_types(schema: Any) -> None:
 
     Mutates the input dict in place; the rewritten schema is also what gets
     rendered into the model prompt, so e.g. a user-supplied ``"varchar"``
-    reaches the model as ``"string"``. ``$ref`` values are not resolved —
+    reaches the model as ``"string"``. ``$ref`` values are not resolved;
     callers pass tree-shaped schemas (HTTP JSON input is always a tree).
     """
     if isinstance(schema, list):
@@ -122,7 +135,7 @@ def normalize_json_schema_types(schema: Any) -> None:
         if isinstance(t, str):
             schema["type"] = _normalize_single_type(t)
         elif isinstance(t, list):
-            schema["type"] = [_normalize_single_type(item) for item in t]
+            schema["type"] = _normalize_type_list(t)
 
     for key in (
         "properties",
