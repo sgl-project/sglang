@@ -121,22 +121,29 @@ def build_replay_fb_view(
     """Construct a ForwardBatch-like view for backend replay-side init.
 
     Combines the original ``forward_batch`` (for unpadded / per-iter
-    fields like ``spec_info`` and ``out_cache_loc``) with the padded
-    capture-time buffers from ``buffers`` (for ``req_pool_indices``,
-    ``seq_lens``, ``seq_lens_cpu``, ``encoder_lens``). The returned
-    namespace exposes only the fields the new
-    ``init_forward_data_out_graph(fb)`` contract reads, mirroring what
-    the legacy ``init_forward_metadata_replay_cuda_graph`` signature
-    used to pass explicitly.
+    fields like ``spec_info``, ``out_cache_loc``, and the runtime
+    ``actual_forward_mode``) with the padded capture-time buffers from
+    ``buffers`` (for ``req_pool_indices``, ``seq_lens``, ``seq_lens_cpu``,
+    ``encoder_lens``).
 
-    The ``_replay_forward_batch`` side channel that DSV4 still reads in
-    its replay metadata prep is **not** subsumed here; step 04 will
-    remove that out-of-band attribute by extending this view to cover
-    everything DSV4 needs.
+    Field semantics:
+
+      - ``forward_mode``: the capture-time mode (``capture_forward_mode``),
+        used by backends for bucket / dispatch decisions (e.g. choosing
+        between decode / target-verify / draft-extend code paths).
+      - ``actual_forward_mode``: the original runtime ``forward_batch
+        .forward_mode``, which may be ``IDLE`` even when the captured
+        graph corresponds to ``DECODE``. DSV4's replay metadata prep
+        uses this for IDLE-batch substitution; other backends ignore it.
+
+    This view subsumes the ``_replay_forward_batch`` side channel DSV4
+    previously read out-of-band — step 04 swaps that mechanism for this
+    explicit fb_view field.
     """
     return SimpleNamespace(
         batch_size=bs,
         forward_mode=capture_forward_mode,
+        actual_forward_mode=forward_batch.forward_mode,
         input_ids=buffers.input_ids[:num_tokens],
         req_pool_indices=buffers.req_pool_indices[:bs],
         seq_lens=buffers.seq_lens[:bs],
