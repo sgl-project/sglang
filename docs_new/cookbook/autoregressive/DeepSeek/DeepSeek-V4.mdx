@@ -410,7 +410,7 @@ For AIME25 benchmark, we recommend applying [sgl-eval](https://github.com/sgl-pr
 # Install
 pip install git+https://github.com/sgl-project/sgl-eval
 
-# For Flash model, reference accuracy: ~95%
+# For Flash model, reference accuracy: ~97.5%
 sgl-eval run aime25 --model deepseek-ai/DeepSeek-V4-Flash --api-key <api-key> --n-repeats 16 --max-tokens 200000 --temperature 1.0 --top-p 1.0 --thinking --out-dir /sgl-workspace/logs --base-url http://localhost:30000/v1
 
 # For Pro model, reference accuracy: ~97.5%
