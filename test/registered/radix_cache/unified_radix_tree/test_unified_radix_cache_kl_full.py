@@ -8,29 +8,22 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_ci,
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=250, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=250, stage="base-b", runner_config="2-gpu-large")
 
-SWA_MODEL = "openai/gpt-oss-20b"
+FULL_MODEL = "Qwen/Qwen3-32B"
 
 
-class TestUnifiedSWARadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
-    """SWA hybrid + UnifiedRadixCache."""
+class TestUnifiedFullRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
+    """Full attention."""
 
-    kl_threshold = 0.03
-    gsm8k_threshold = 0.7
-    mmlu_threshold = 0.7
-
-    @unittest.skipIf(is_in_ci(), "SWA model mmlu eval not stable enough")
-    def test_mmlu(self):
-        super().test_mmlu()
+    kl_threshold = 0.0025
 
     @classmethod
     def setUpClass(cls):
-        cls.model = SWA_MODEL
+        cls.model = FULL_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -40,8 +33,9 @@ class TestUnifiedSWARadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "--tp-size",
                 "4",
                 "--mem-fraction-static",
-                "0.7",
-                "--disable-piecewise-cuda-graph",
+                "0.80",
+                "--page-size",
+                "64",
             ],
             env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
