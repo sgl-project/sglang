@@ -868,11 +868,18 @@ class BailingMoEConstructionTest(unittest.TestCase):
         with construction_fixture():
             blk = BailingMoEBlock(cfg, layer_id=0, is_nextn=False)
         topks = _collect_topks(blk)
-        # The target path may construct a sparse block or skip if the first
-        # layer is dense. If sparse, the flag must be True; if dense, no
-        # TopK is expected. Either is a valid target-side outcome.
-        if topks:
-            self.assertTrue(topks[0].topk_config.capture_routed_experts)
+        # `first_k_dense_replace=0` makes layer 0 sparse, so the target
+        # block MUST build exactly one TopK. Asserting the count first
+        # closes the round-7 queued vacuous-pass guard: a future config
+        # change that silently drops the MoE block would otherwise pass
+        # this test by reaching zero TopKs.
+        self.assertEqual(
+            len(topks),
+            1,
+            "Bailing target block must construct exactly one TopK on the "
+            "sparse path (is_nextn=False, first_k_dense_replace=0).",
+        )
+        self.assertTrue(topks[0].topk_config.capture_routed_experts)
 
 
 class Gemma4DecoderLayerConstructionTest(unittest.TestCase):
