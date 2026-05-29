@@ -812,11 +812,14 @@ class PiecewiseCudaGraphRunner:
                 dsa_indexers=self.dsa_indexers,
             ):
                 # Due to the dispatch kernel for MLA model, we init the metadata
-                # with the original forward_batch. This is the replay path —
-                # in_capture defaults to False so backends use their replay branch.
-                self.model_runner.attn_backend.init_forward_metadata_out_graph(
-                    forward_batch
-                )
+                # with the original forward_batch. Replay path — outer
+                # model.forward runs eagerly between this site and the
+                # piecewise-captured layer body, so call the eager entry
+                # to materialize forward_metadata host-side (both legs:
+                # `_out_graph + _in_graph`). The piecewise-captured layers
+                # re-execute `_in_graph` via `graph.replay()`; for DSV4 the
+                # second pass is idempotent via its isinstance check.
+                self.model_runner.attn_backend.init_forward_metadata(forward_batch)
                 output = self.model_runner.model.forward(
                     static_forward_batch.input_ids,
                     static_forward_batch.positions,

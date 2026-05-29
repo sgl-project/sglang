@@ -472,10 +472,14 @@ class BreakableCudaGraphRunner:
             original_layer_forward = self.layer_model.forward
             self.layer_model.forward = replay_layer_forward
             try:
-                # Replay path: in_capture defaults to False.
-                self.model_runner.attn_backend.init_forward_metadata_out_graph(
-                    forward_batch
-                )
+                # Replay path. Outer model.forward runs eagerly here and
+                # only `layer_model.forward` is captured, so call the eager
+                # entry to materialize forward_metadata host-side (both
+                # legs: _out_graph + _in_graph). The captured graph's
+                # recorded `_in_graph` re-fires via `captured_graph.replay()`
+                # inside the layer closure; for DSV4 the second pass is
+                # idempotent via its isinstance check.
+                self.model_runner.attn_backend.init_forward_metadata(forward_batch)
                 with set_forward_context(
                     static_forward_batch,
                     self.attention_layers,
