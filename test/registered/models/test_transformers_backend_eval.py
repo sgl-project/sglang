@@ -3,7 +3,11 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
