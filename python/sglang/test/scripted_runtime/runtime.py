@@ -31,6 +31,7 @@ from typing import (
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ContinueGenerationReqInput,
+    FlushCacheReqInput,
     PauseGenerationReqInput,
     TokenizedGenerateReqInput,
 )
@@ -240,37 +241,23 @@ class ScriptedRuntime:
         assert self._is_driver, "abort_all is only callable from the driver rank"
         self._scheduler.abort_request(AbortReq(abort_all=True))
 
-    def reset_radix_cache(self) -> None:
-        """Clear the radix tree so a script starts from an empty cache.
-
-        Safe to call only when the engine is idle (no in-flight reqs);
-        used by tests that need a deterministic radix-tree shape
-        independent of what earlier scripts on the shared engine left
-        behind.
-        """
-        assert (
-            self._is_driver
-        ), "reset_radix_cache is only callable from the driver rank"
-        self._scheduler.tree_cache.reset()
-
-    def get_all_node_hit_counts(self) -> int:
-        """Sum of ``hit_count`` over every non-root node in the radix tree.
+    def get_all_node_hit_counts(self) -> Dict[int, int]:
+        """Map every non-root radix node id to its ``hit_count``.
 
         The chunked self-referencing guard skips ``_inc_hit_count`` on every
         ``cache_unfinished_req`` insert, so only the single non-chunked
         ``cache_finished_req`` insert bumps hit counts — touching each node on
-        the committed path exactly once. On an otherwise-empty tree this total
-        therefore equals the node count (every node at ``hit_count == 1``);
-        without the guard the early prefix nodes would be re-bumped once per
-        chunk and the total would be far larger.
+        the committed path exactly once. On an otherwise-empty tree every node
+        therefore sits at ``hit_count == 1``; without the guard the early
+        prefix nodes would be re-bumped once per chunk and exceed 1.
         """
-        total = 0
+        hit_counts: Dict[int, int] = {}
         stack = list(self._scheduler.tree_cache.root_node.children.values())
         while stack:
             node = stack.pop()
-            total += node.hit_count
+            hit_counts[node.id] = node.hit_count
             stack.extend(node.children.values())
-        return total
+        return hit_counts
 
     # ============================================================
     # Lookups used by ReqHandle (driver-rank-local view).
@@ -612,18 +599,16 @@ class ScriptedRuntime:
     # === Engine-wide actions ===
 
     def flush_cache(self) -> None:
-        """Trigger an engine-wide cache flush.
+        """Inject an engine-wide cache flush (radix tree + memory pools).
 
-        Equivalent to the operator-facing ``flush_cache`` RPC; used by
-        regression tests to verify state cleanup paths.
-
-        Consumed by: test_flush_cache_releases_kv (kv_pressure),
-                     test_flush_cache_resets_radix (radix).
+        Reaches every rank through the normal request-broadcast path, so it is
+        safe under TP/PP. Like ``start_req``, the flush is visible on the next
+        ``yield``, and the scheduler only honors it when the engine is idle
+        (no in-flight reqs). ``run`` issues one before each script so a sub-
+        script starts from a clean cache.
         """
-        raise NotImplementedError(
-            "scripted_runtime: flush_cache is wishlist — see "
-            "2026-05-26-round-5-de-skip-and-api-wishlist.md"
-        )
+        assert self._is_driver, "flush_cache is only callable from the driver rank"
+        self._tokenizer_recv_proxy.inject(FlushCacheReqInput())
 
     def trigger_abort_on_waiting_timeout(self) -> None:
         """Simulate the watchdog firing on a stuck waiting-queue entry.

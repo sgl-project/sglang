@@ -40,6 +40,12 @@ def router_script(t: ScriptedRuntime) -> Generator:
                 return
             if kind == "run":
                 fn = _resolve_fn(msg["fn_path"])
+                # Start every sub-script from a clean engine: flush so radix /
+                # pool state from the previous sub-script can't leak across
+                # runs. Visible on the next yield (same as start_req), hence the
+                # explicit yield before the sub-script observes any state.
+                t.flush_cache()
+                yield
                 sub_gen = fn(t, *msg["args"])
                 try:
                     yield from sub_gen
