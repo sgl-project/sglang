@@ -761,7 +761,7 @@ class MultiLayerEagleWorker(TpModelWorker):
             else:
                 forward_batch.can_run_dp_cuda_graph = False
                 if not forward_batch.forward_mode.is_idle():
-                    self.mtp_model_runner(step).attn_backend.init_forward_metadata(
+                    self.mtp_model_runner(step).attn_backend.init_forward_data(
                         forward_batch
                     )
                 logits_output = (
