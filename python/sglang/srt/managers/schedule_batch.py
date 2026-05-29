@@ -1939,7 +1939,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
-                # Slice to match extend_input_len — PrefillAdder truncates
+                # Slice to match extend_input_len — PrefillAdder shrinks
                 # fill_len/extend_input_len on chunk overflow but not input_embeds.
                 input_embeds.extend(
                     req.input_embeds[pre_len : pre_len + req.extend_input_len]
