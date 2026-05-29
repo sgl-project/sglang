@@ -639,19 +639,17 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             md.max_seq_len_succ = self.max_context_len
             md.max_seq_len_inter = self.max_context_len
 
-    def init_forward_metadata_replay_cuda_graph(
+    def _apply_cuda_graph_metadata(
         self,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[None],
-        seq_lens_cpu: Optional[torch.Tensor],
-        out_cache_loc: torch.Tensor = None,
     ):
-        """Initialize forward metadata for replaying CUDA graph."""
+        """Shared capture+replay body for the cuda-graph init path.
+
+        Public entry: :py:meth:`init_forward_data_out_graph`.
+        """
         assert forward_mode.is_decode()
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
@@ -728,6 +726,27 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         metadata.max_seq_len_inter = metadata.seq_lens_inter.max().item()
 
         self.forward_metadata = metadata
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[None],
+        seq_lens_cpu: Optional[torch.Tensor],
+        out_cache_loc: torch.Tensor = None,
+    ):
+        """Initialize forward metadata for replaying CUDA graph."""
+        # Thin shim — body lives in _apply_cuda_graph_metadata.
+        self._apply_cuda_graph_metadata(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            forward_mode=forward_mode,
+        )
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
