@@ -1489,31 +1489,23 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             layer, "weight_scale", "weight_scale_interleaved", padded_scales
         )
 
-        # When the caller opts in via `interleave_for_swiglu_fusion=True`, also
-        # produce the [Up, Gate] 64-row-interleaved weight + scale that the
-        # nvfp4_gemm_swiglu_nvfp4_quant CUTE-DSL kernel consumes for FC1.
-        if getattr(layer, "interleave_for_swiglu_fusion", False):
+        if getattr(layer, "_interleave_for_swiglu_fusion", False):
             from sglang.srt.layers.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
                 interleave_linear_and_gate,
                 swizzle_blockscale_2d,
             )
 
             w = layer.weight.data
-            # Reshuffle paths below assume the loaded shapes match what the
-            # kernel will see. K-padding would create a weight/scale K mismatch
-            # (swizzled scale uses the raw, unpadded K); N-padding would shift
-            # the gate/up halves apart. Eligibility is gated upstream in
-            # DeepseekV2MoE.__init__ so a failure here is a setup bug.
             assert weights_padding_cols == 0, (
-                "interleave_for_swiglu_fusion does not support K-padded weights; "
+                "_interleave_for_swiglu_fusion does not support K-padded weights; "
                 f"got weights_padding_cols={weights_padding_cols}."
             )
             assert raw_scale_snapshot.shape[0] == w.shape[0], (
-                "interleave_for_swiglu_fusion requires no N-padding; "
+                "_interleave_for_swiglu_fusion requires no N-padding; "
                 f"raw_scale rows={raw_scale_snapshot.shape[0]} vs weight rows={w.shape[0]}."
             )
             assert w.shape[0] % 128 == 0, (
-                "interleave_for_swiglu_fusion requires N % 128 == 0 (group_size=64 "
+                "_interleave_for_swiglu_fusion requires N % 128 == 0 (group_size=64 "
                 f"with gate+up halves); got N={w.shape[0]}."
             )
 
@@ -1532,21 +1524,29 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             layer.weight_swiglu_interleaved = w_swiglu
             layer.weight_scale_swiglu_interleaved = w_scale_swiglu
 
+            # Keep the Parameter objects alive so weight reload can refill
+            # them and re-run this hook; free their storage in the meantime.
+            layer.weight.data = torch.empty(
+                0, dtype=layer.weight.dtype, device=layer.weight.device
+            )
+            layer.weight_scale_interleaved.data = torch.empty(
+                0,
+                dtype=layer.weight_scale_interleaved.dtype,
+                device=layer.weight_scale_interleaved.device,
+            )
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Pre-quantized (fp4, scale) input — an upstream fused op (e.g.
-        # nvfp4_gemm_swiglu_nvfp4_quant) already produced the FP4 + swizzled
-        # scale and the layer was set up to consume it directly. The flag is
-        # required so an accidental tuple from unrelated code can't silently
-        # bypass quantization.
+        # `_accepts_prequantized_fp4` is the explicit opt-in so an accidental
+        # tuple from unrelated code can't silently bypass quantization.
         if getattr(layer, "_accepts_prequantized_fp4", False) and isinstance(x, tuple):
             x_fp4, x_scale_interleaved = x
             x_m = x_fp4.shape[0]
-            output_dtype = getattr(layer, "prequantized_output_dtype", torch.bfloat16)
+            output_dtype = layer.params_dtype
         else:
             x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
             x_m, _ = x.shape

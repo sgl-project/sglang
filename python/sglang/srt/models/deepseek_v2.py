@@ -275,13 +275,6 @@ class DeepseekV2MLP(nn.Module):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
-        # Full fused gate_up matmul + swiglu + output FP4 quant via the
-        # CUTE-DSL Sm100 kernel. Replaces standalone input-quant +
-        # gate_up gemm + silu_and_mul + output quant with one kernel; the
-        # (fp4, scale) output feeds straight into down_proj's prequantized
-        # path. Eligibility (SM100, NVFP4 on both projections, FC1 N % 128 == 0,
-        # env flag enabled) is checked in DeepseekV2MoE.__init__ for the
-        # shared_experts MLP only; dense MLPs do not opt in.
         if (
             getattr(self, "_enable_nvfp4_gemm_swiglu_fusion", False)
             and self.swiglu_limit is None
@@ -709,13 +702,8 @@ class DeepseekV2MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(dict(tp_rank=0, tp_size=1) if _shared_expert_use_tp1 else {}),
             )
-            # Full fused gate_up matmul + swiglu + output FP4 quant via the
-            # CUTE-DSL Sm100 kernel. Eligibility: env flag enabled, Blackwell
-            # SM100, both gate_up_proj and down_proj are NVFP4 (the kernel
-            # assumes both sides are fp4), and FC1 N is a multiple of 128 (the
-            # weight reshuffle interleaves gate/up at group_size=64). Flags
-            # must be set before weight load so that
-            # ModelOptFp4LinearMethod.process_weights_after_loading builds the
+            # Flags must be set before weight load so
+            # process_weights_after_loading sees them and builds the
             # [Up, Gate]-interleaved weight + scale.
             from sglang.srt.layers.quantization.modelopt_quant import (
                 ModelOptFp4LinearMethod,
@@ -736,12 +724,9 @@ class DeepseekV2MoE(nn.Module):
                 )
                 and fc1_n % 128 == 0
             ):
-                self.shared_experts.gate_up_proj.interleave_for_swiglu_fusion = True
+                self.shared_experts.gate_up_proj._interleave_for_swiglu_fusion = True
                 self.shared_experts._enable_nvfp4_gemm_swiglu_fusion = True
-                # Tell down_proj to accept the pre-quantized (fp4, scale) tuple
-                # from the fused kernel instead of re-quantizing in apply().
                 self.shared_experts.down_proj._accepts_prequantized_fp4 = True
-                self.shared_experts.down_proj.prequantized_output_dtype = torch.bfloat16
             self._shared_expert_tp1 = _shared_expert_use_tp1
             is_packed_weight = hasattr(
                 self.shared_experts.gate_up_proj.quant_method, "quant_config"
