@@ -592,7 +592,9 @@ class SchedulerPPMixin:
                 )
                 req.fill_len = len(req.origin_input_ids)
                 req.logprob_start_len = -1
-                req.set_extend_input_len(req.get_full_untruncated_fill_len() - len(req.prefix_indices))
+                req.set_extend_input_len(
+                    req.get_full_untruncated_fill_len() - len(req.prefix_indices)
+                )
 
                 # Prepare batch
                 batch = ScheduleBatch.init_new(
