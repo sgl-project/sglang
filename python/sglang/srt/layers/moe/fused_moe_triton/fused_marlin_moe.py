@@ -219,6 +219,13 @@ def fused_marlin_moe(
         or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
     ) and (not is_mxfp4_marlin)
 
+    # Disable cross-block FP16 atomicAdd reduction under deterministic mode.
+    from sglang.srt.server_args import get_global_server_args
+
+    use_atomic_add = use_atomic_add and (
+        not get_global_server_args().enable_deterministic_inference
+    )
+
     intermediate_cache1 = moe_wna16_marlin_gemm(
         hidden_states,
         intermediate_cache1,
