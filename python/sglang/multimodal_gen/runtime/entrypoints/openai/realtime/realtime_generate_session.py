@@ -11,6 +11,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.pipelines_core.realtime_session import (
     RealtimeSession,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
@@ -37,13 +40,29 @@ class RealtimeGenerateSession:
 
     def dispose(self):
         if self.adapter is not None:
-            self.adapter.dispose(self)
-        self.request = None
-        self.request_id = None
-        self.generate_chunk_cnt = 0
-        self.adapter = None
-        self.adapter_state = None
-        self.realtime_session.dispose()
+            try:
+                self.adapter.dispose(self)
+            except Exception:
+                logger.warning(
+                    "Failed to dispose realtime adapter for session %s",
+                    self.id,
+                    exc_info=True,
+                )
+
+        try:
+            self.realtime_session.dispose()
+        except Exception:
+            logger.warning(
+                "Failed to dispose realtime session state for session %s",
+                self.id,
+                exc_info=True,
+            )
+        finally:
+            self.request = None
+            self.request_id = None
+            self.generate_chunk_cnt = 0
+            self.adapter = None
+            self.adapter_state = None
 
     def new_request(self):
         self.request_id = f"{self.id}_{uuid4().hex}"
