@@ -222,10 +222,19 @@ class IpcModelLoader(BaseModelLoader):
 
     def _fallback_load(self, model_config, device_config) -> nn.Module:
         """Fall back to DefaultModelLoader for disk-based loading."""
+        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
         from sglang.srt.model_loader.loader import DefaultModelLoader
 
+        # Build a new LoadConfig with the original load_format (not IPC_CACHE),
+        # since DefaultModelLoader doesn't know how to handle IPC_CACHE.
+        fallback_config = LoadConfig(
+            load_format=LoadFormat.AUTO,
+            download_dir=self.load_config.download_dir,
+            model_loader_extra_config=self.load_config.model_loader_extra_config,
+            tp_rank=self.load_config.tp_rank,
+        )
         loader_cls = self._fallback_loader_cls or DefaultModelLoader
-        fallback = loader_cls(self.load_config)
+        fallback = loader_cls(fallback_config)
         return fallback.load_model(model_config=model_config, device_config=device_config)
 
     def download_model(self, model_config) -> None:
