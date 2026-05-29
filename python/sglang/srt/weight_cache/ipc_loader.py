@@ -159,7 +159,7 @@ class IpcModelLoader(BaseModelLoader):
             sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
             sock.settimeout(30)  # 30s timeout for large state dicts
             sock.connect(self.socket_path)
-        except (socket_mod.FileNotFoundError, ConnectionRefusedError) as e:
+        except (FileNotFoundError, ConnectionRefusedError) as e:
             logger.info(f"[IpcModelLoader] Daemon not available at {self.socket_path}: {e}")
             return None
         except Exception as e:
