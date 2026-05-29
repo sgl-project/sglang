@@ -44,9 +44,7 @@ class SchedulerIpcChannels:
                     TokenizerRecvProxy,
                 )
 
-                recv_from_tokenizer = TokenizerRecvProxy(
-                    underlying=recv_from_tokenizer
-                )
+                recv_from_tokenizer = TokenizerRecvProxy(underlying=recv_from_tokenizer)
             recv_from_rpc = get_zmq_socket(
                 context, zmq.DEALER, port_args.rpc_ipc_name, False
             )
