@@ -275,14 +275,17 @@ class ScriptedRuntime:
     # ============================================================
 
     def _lookup_req_status(self, rid: str) -> ReqStatus:
-        if any(getattr(r, "rid", None) == rid for r in self._scheduler.waiting_queue):
-            return "waiting"
-        running_batch = self._scheduler.running_batch
-        if running_batch is not None and any(
-            getattr(r, "rid", None) == rid for r in running_batch.reqs
-        ):
-            return "running"
-        return "unknown"
+        # TODO(reimplement): the previous implementation was wrong. It never
+        # reported "finished", ignored the chunked_req slot, and under PP only
+        # inspected the current microbatch's running_batch — so a req running
+        # in another microbatch read as "unknown". A correct version must fold
+        # in finished / chunked / cross-microbatch state before callers can
+        # trust it; until then use the narrower observables (is_chunking,
+        # finished, _find_req_by_rid + waiting_queue) instead.
+        raise NotImplementedError(
+            "scripted_runtime: _lookup_req_status needs reimplementation — see "
+            "the chunked / PP / finished caveats in the comment above"
+        )
 
     def _find_req_by_rid(self, rid: str) -> Optional[Any]:
         """Locate the raw ``Req`` by rid across scheduler queues / batches.

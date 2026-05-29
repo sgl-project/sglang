@@ -30,7 +30,7 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
     def _script_chunked_prefill_smoke(t: ScriptedRuntime):
         r = t.start_req(prompt_len=_PROMPT_LEN, max_new_tokens=3)
         yield from run_until_finished(r)
-        assert r.finished, f"req did not finish, status={r.status!r}"
+        assert r.finished, "req did not finish"
 
     def test_chunked_req_scheduled_last_iter_observed_true_then_false(self):
         """While chunking, the scheduler flag flips True at least once; after finish it clears to False."""
@@ -50,7 +50,7 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
             if r.finished:
                 break
             yield
-        assert r.finished, f"req did not finish, status={r.status!r}"
+        assert r.finished, "req did not finish"
         assert saw_true, "scheduler flag should be True at least once mid-chunk"
         assert t.last_chunked_req_scheduled_iter_flag() is False, (
             f"flag must clear to False after last chunk; "
@@ -70,9 +70,13 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
         # Retract state is reflected in the scheduler on the next event-loop iter.
         yield
 
-        assert r.status == "waiting", (
+        # _lookup_req_status is pending reimplementation, so check the retract
+        # landing directly against the scheduler: the req must be parked back
+        # in waiting_queue rather than still running or finished.
+        req = t._find_req_by_rid(r.rid)
+        assert req is not None and req in t._scheduler.waiting_queue, (
             f"after pause(retract) the req should be back in waiting_queue; "
-            f"got status={r.status!r}"
+            f"found={req!r}"
         )
         assert t.last_chunked_req_scheduled_iter_flag() is False, (
             f"pause(retract) must clear chunked_req; "
@@ -81,7 +85,7 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
 
         t.continue_generation()
         yield from run_until_finished(r)
-        assert r.finished, f"req did not resume to finished, status={r.status!r}"
+        assert r.finished, "req did not resume to finished"
 
     def test_abort_all_during_chunked_prefill_clears_chunked_req(self):
         """Mid-chunk abort_all() terminates the req; scheduler clears the chunked slot within a few yields."""
@@ -102,7 +106,7 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
             if r.finished:
                 break
 
-        assert r.finished, f"req did not finish after abort_all, status={r.status!r}"
+        assert r.finished, "req did not finish after abort_all"
         assert t.last_chunked_req_scheduled_iter_flag() is False, (
             f"chunked slot must be cleared after abort; "
             f"flag={t.last_chunked_req_scheduled_iter_flag()!r}"
@@ -116,7 +120,7 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
     def _script_chunked_req_prefill_only_finishes(t: ScriptedRuntime):
         r = t.start_req(prompt_len=4 * _CHUNK_SIZE, max_new_tokens=0)
         yield from run_until_finished(r)
-        assert r.finished, f"prefill-only req did not finish, status={r.status!r}"
+        assert r.finished, "prefill-only req did not finish"
         assert t.last_chunked_req_scheduled_iter_flag() is False, (
             f"chunked slot must be cleared after prefill-only finish; "
             f"flag={t.last_chunked_req_scheduled_iter_flag()!r}"
