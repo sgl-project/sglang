@@ -89,27 +89,30 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         in_capture: bool = False,
     ):
         bs = forward_batch.batch_size
-        if in_capture:
-            self.init_forward_metadata_capture_cuda_graph(
-                bs=bs,
-                num_tokens=forward_batch.positions.numel(),
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
-                encoder_lens=forward_batch.encoder_lens,
-                forward_mode=forward_batch.forward_mode,
-                spec_info=forward_batch.spec_info,
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+
+        if forward_mode.is_decode_or_idle() and spec_info is None:
+            # Own decode/idle path: write into cuda_graph_kv_indices buffer.
+            create_flashmla_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                forward_batch.req_pool_indices[:bs],
+                forward_batch.seq_lens[:bs],
+                None,
+                self.cuda_graph_kv_indices,
+                self.req_to_token.stride(0),
+                self.cuda_graph_kv_indices.stride(0),
+                PAGED_SIZE=PAGE_SIZE,
             )
+            if in_capture:
+                max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
+                self.forward_metadata = CutlassMLADecodeMetadata(
+                    self.cuda_graph_mla_workspace,
+                    self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
+                )
         else:
-            self.init_forward_metadata_replay_cuda_graph(
-                bs=bs,
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
-                seq_lens_sum=forward_batch.seq_lens_sum,
-                encoder_lens=forward_batch.encoder_lens,
-                forward_mode=forward_batch.forward_mode,
-                spec_info=forward_batch.spec_info,
-                seq_lens_cpu=forward_batch.seq_lens_cpu,
-            )
+            # Prefill / spec / draft-extend: fall back to FlashInferMLA parent.
+            super().init_forward_data_out_graph(forward_batch, in_capture=in_capture)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
 
@@ -174,77 +177,6 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
             workspace_size, device="cuda", dtype=torch.uint8
         )
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
-
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
-        if forward_mode.is_decode_or_idle() and spec_info is None:
-            self.init_forward_metadata_replay_cuda_graph(
-                bs=bs,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                seq_lens_sum=None,
-                encoder_lens=encoder_lens,
-                forward_mode=forward_mode,
-                spec_info=spec_info,
-                seq_lens_cpu=None,
-            )
-            max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
-            self.forward_metadata = CutlassMLADecodeMetadata(
-                self.cuda_graph_mla_workspace,
-                self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
-            )
-        else:
-            super().init_forward_metadata_capture_cuda_graph(
-                bs,
-                num_tokens,
-                req_pool_indices,
-                seq_lens,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-            )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        if forward_mode.is_decode_or_idle():
-            create_flashmla_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices[:bs],
-                seq_lens[:bs],
-                None,
-                self.cuda_graph_kv_indices,
-                self.req_to_token.stride(0),
-                self.cuda_graph_kv_indices.stride(0),
-                PAGED_SIZE=PAGE_SIZE,
-            )
-        else:
-            super().init_forward_metadata_replay_cuda_graph(
-                bs,
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-                seq_lens_cpu,
-            )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
