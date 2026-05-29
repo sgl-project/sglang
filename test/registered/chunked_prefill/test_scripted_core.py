@@ -22,7 +22,7 @@ _CHUNK_SIZE = 64
 _PROMPT_LEN = 256
 
 
-class TestScriptedCoreSmoke(ScriptedRuntimeTestCase):
+class TestScriptedCore(ScriptedRuntimeTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=_CHUNK_SIZE)
 
     def test_chunked_prefill_smoke(self):
@@ -34,10 +34,6 @@ class TestScriptedCoreSmoke(ScriptedRuntimeTestCase):
         r = t.start_req(prompt_len=_PROMPT_LEN, max_new_tokens=3)
         yield from run_until_finished(r)
         assert r.finished, f"req did not finish, status={r.status!r}"
-
-
-class TestScriptedCoreFlag(ScriptedRuntimeTestCase):
-    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=_CHUNK_SIZE)
 
     def test_chunked_req_scheduled_last_iter_observed_true_then_false(self):
         """While chunking, the scheduler flag flips True at least once; after finish it clears to False."""
@@ -63,10 +59,6 @@ class TestScriptedCoreFlag(ScriptedRuntimeTestCase):
             f"flag must clear to False after last chunk; "
             f"got {t.last_chunked_req_scheduled_iter_flag()!r}"
         )
-
-
-class TestScriptedCorePauseRetract(ScriptedRuntimeTestCase):
-    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=_CHUNK_SIZE)
 
     def test_pause_generation_retract_clears_chunked_req(self):
         """Mid-chunk pause_generation(retract) drops the req back to waiting and clears the chunked slot."""
@@ -94,10 +86,6 @@ class TestScriptedCorePauseRetract(ScriptedRuntimeTestCase):
         yield from run_until_finished(r)
         assert r.finished, f"req did not resume to finished, status={r.status!r}"
 
-
-class TestScriptedCoreAbortAll(ScriptedRuntimeTestCase):
-    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=_CHUNK_SIZE)
-
     def test_abort_all_during_chunked_prefill_clears_chunked_req(self):
         """Mid-chunk abort_all() terminates the req; scheduler clears the chunked slot within a few yields."""
         self.runtime.run(
@@ -122,10 +110,6 @@ class TestScriptedCoreAbortAll(ScriptedRuntimeTestCase):
             f"chunked slot must be cleared after abort; "
             f"flag={t.last_chunked_req_scheduled_iter_flag()!r}"
         )
-
-
-class TestScriptedCorePrefillOnly(ScriptedRuntimeTestCase):
-    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=_CHUNK_SIZE)
 
     def test_chunked_req_prefill_only_finishes(self):
         """max_new_tokens=0 with chunked prefill: req finishes after the last chunk, no decode."""
@@ -225,7 +209,7 @@ class TestScriptedPpChunkSweep(ScriptedRuntimeTestCase):
         )
 
 
-class TestScriptedCoreRadixHitCountSkip(ScriptedRuntimeTestCase):
+class TestScriptedCoreRadix(ScriptedRuntimeTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=_CHUNK_SIZE,
         disable_radix_cache=False,
