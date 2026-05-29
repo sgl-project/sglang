@@ -69,6 +69,20 @@ except ImportError:
     flashinfer_cutlass_fused_moe = None
 
 
+def swiglustep_and_mul(x: torch.Tensor, limit: float = 7.0) -> torch.Tensor:
+    """Out-variant of swiglustep activation.
+
+    Writes into `out`:
+      silu(x[:d]).clamp(max=limit) * x[d:].clamp(-limit, limit)
+    """
+    gate, up = x.chunk(2, dim=-1)
+    gate = F.silu(gate)
+    gate = gate.clamp(max=limit)
+    up = up.clamp(min=-limit, max=limit)
+    out = gate * up
+    return out
+
+
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     """Unquantized method for embeddings."""
 
@@ -693,7 +707,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
             hidden_states = swiglu_oai(layer, hidden_states)
         elif self.moe_runner_config.activation == "silu":
-            hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+            if self.moe_runner_config.gemm1_clamp_limit is not None:
+                hidden_states = swiglustep_and_mul(
+                    hidden_states, self.moe_runner_config.gemm1_clamp_limit
+                )
+            else:
+                hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
         else:
             from sglang.srt.layers.activation import GeluAndMul
 
