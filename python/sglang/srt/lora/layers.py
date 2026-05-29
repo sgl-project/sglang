@@ -1178,3 +1178,12 @@ def get_lora_layer(
             ret = lora_layer_type(layer, lora_backend)
             return ret
     raise Exception(f"No corresponding LoRA layer supported for {type(layer)}.")
+
+
+# === Two-stream LoRA overlap (O1 + O7 + O8) — opt-in via SGLANG_LORA_TWO_STREAM=1 ===
+# All logic lives in `sglang/srt/lora/trtllm_moe/`. The call below is a no-op
+# when the env var is unset (existing single-stream behavior unchanged); when
+# set, it monkey-patches the LoRA forwards above + the trtllm MoE LoRA dispatch
+# to use side-stream overlapped versions defined in that package.
+from sglang.srt.lora.trtllm_moe import install_two_stream_overrides as _install_lora_two_stream  # noqa: E402
+_install_lora_two_stream()

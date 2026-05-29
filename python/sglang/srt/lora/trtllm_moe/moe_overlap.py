@@ -1,0 +1,198 @@
+"""Two-stream MoE LoRA dispatch (O1).
+
+Monkey-patches ``fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora`` in
+``layers/moe/moe_runner/flashinfer_trtllm.py`` (when
+``SGLANG_LORA_TWO_STREAM=1``) so the gate_up LoRA shrink+expand runs on a
+side stream concurrent with the main-stream FP8 quant.
+
+Batches that don't qualify for two-stream (prefill / non-virtual-lora /
+batch without active LoRA) fall through to the saved-original function so
+their behavior is byte-identical to the unpatched code path.
+"""
+import torch
+
+from sglang.srt.lora.trtllm_moe import (
+    get_lora_side_stream,
+    get_original_moe_lora_func,
+    is_two_stream_active,
+)
+
+
+def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
+    dispatch_output,
+    quant_info,
+    runner_config,
+    lora_info,
+):
+    """Drop-in replacement for the like-named function in flashinfer_trtllm.py.
+
+    Two-stream fast path: only fires when the batch is decode-shaped AND uses
+    virtual-experts LoRA. Everything else delegates to the original function.
+    """
+    hidden_states = dispatch_output.hidden_states
+
+    use_virtual_lora_store = bool(
+        lora_info.lora_use_virtual_experts and lora_info.max_lora_rank > 0
+    )
+    # Two-stream requires virtual-experts LoRA AND a decode-shaped batch.
+    # Fall back to the original implementation for anything else (prefill,
+    # non-virtual LoRA, non-LoRA capture, etc.).
+    if not (use_virtual_lora_store and is_two_stream_active(hidden_states)):
+        return get_original_moe_lora_func()(
+            dispatch_output, quant_info, runner_config, lora_info
+        )
+
+    # ---- two-stream fast path ----
+    from flashinfer.fused_moe import Fp8QuantizationType
+
+    from sglang.jit_kernel.flashinfer_trtllm_moe import (
+        trtllm_fp8_block_scale_routed_moe_lora,
+    )
+    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+        use_symmetric_memory,
+    )
+    from sglang.srt.layers.dp_attention import is_allocation_symmetric
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        _pack_topk_for_flashinfer_routed,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.layers.moe.utils import RoutingMethodType
+    from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+    from sglang.srt.lora.triton_ops import merged_experts_fused_moe_lora_add
+    from sglang.srt.utils.common import next_power_of_2
+
+    assert runner_config.activation == "silu" and runner_config.is_gated, (
+        "sgl_flashinfer_trtllm LoRA currently supports the gated SwiGLU FP8 "
+        "Qwen path only."
+    )
+    assert quant_info.block_quant and not quant_info.use_mxfp8, (
+        "sgl_flashinfer_trtllm LoRA currently supports DeepSeekFp8 block-quant "
+        "checkpoints only."
+    )
+    assert quant_info.weight_block_k is not None
+    assert quant_info.w13_weight_scale_inv is not None
+    assert quant_info.w2_weight_scale_inv is not None
+
+    topk_output = dispatch_output.topk_output
+    assert TopKOutputChecker.format_is_standard(topk_output)
+    assert runner_config.top_k is not None
+
+    topk_ids = topk_output.topk_ids
+    topk_weights = topk_output.topk_weights
+    token_lora_mapping = lora_info.token_lora_mapping
+    fused_lora_routing_cache: dict = {}
+
+    side_stream = get_lora_side_stream()
+
+    gate_up_delta_shape = (
+        hidden_states.shape[0],
+        runner_config.top_k,
+        quant_info.w13_weight.shape[1],
+    )
+    gate_up_delta = hidden_states.new_empty(gate_up_delta_shape)
+
+    def _run_gate_up_lora():
+        merged_experts_fused_moe_lora_add(
+            output=gate_up_delta,
+            hidden_states=hidden_states,
+            lora_a=lora_info.gate_up_lora_a_weights,
+            lora_b=lora_info.gate_up_lora_b_weights,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            token_lora_mapping=token_lora_mapping,
+            mul_routed_weight=False,
+            experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
+            experts_shared_outer_loras_b=False,
+            routing_cache=fused_lora_routing_cache,
+            fuse_add_to_output=False,
+            use_direct_expand_add=lora_info.max_lora_rank <= 64,
+        )
+
+    # O1 fork — gate_up shrink/expand on side stream concurrent with the
+    # main-stream per-token-group FP8 quant below. gate_up needs only
+    # hidden_states + token_lora_mapping, so no conflict with quant.
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        _run_gate_up_lora()
+
+    a_q, a_sf = per_token_group_quant_fp8(hidden_states, quant_info.weight_block_k)
+    a_sf_t = a_sf.t().contiguous()
+
+    activation_lora_input = torch.empty(
+        (hidden_states.shape[0], runner_config.top_k, quant_info.intermediate_size),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+
+    packed_topk_ids = _pack_topk_for_flashinfer_routed(
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+    )
+
+    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+        direct_down_output = torch.empty(
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+    # O1 join — trtllm's activation step consumes gate_up_delta produced on side.
+    torch.cuda.current_stream().wait_stream(side_stream)
+
+    moe_result = trtllm_fp8_block_scale_routed_moe_lora(
+        topk_ids=packed_topk_ids,
+        routing_bias=None,
+        hidden_states=a_q,
+        hidden_states_scale=a_sf_t,
+        gemm1_weights=quant_info.w13_weight,
+        gemm1_weights_scale=quant_info.w13_weight_scale_inv,
+        gemm2_weights=quant_info.w2_weight,
+        gemm2_weights_scale=quant_info.w2_weight_scale_inv,
+        gate_up_lora_delta=gate_up_delta,
+        activation_lora_input=activation_lora_input,
+        num_experts=quant_info.global_num_experts,
+        top_k=runner_config.top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=quant_info.intermediate_size,
+        local_expert_offset=quant_info.local_expert_offset,
+        local_num_experts=quant_info.local_num_experts,
+        routed_scaling_factor=(
+            runner_config.routed_scaling_factor
+            if runner_config.routed_scaling_factor is not None
+            else 1.0
+        ),
+        routing_method_type=(
+            RoutingMethodType.TopK
+            if quant_info.routing_method_type == RoutingMethodType.DeepSeekV3
+            else quant_info.routing_method_type
+        ),
+        use_shuffled_weight=False,
+        do_finalize=True,
+        output=direct_down_output,
+        tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+        fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
+        activation_type=quant_info.activation_type,
+    )
+
+    output = moe_result
+    merged_experts_fused_moe_lora_add(
+        output=output,
+        hidden_states=activation_lora_input.view(-1, quant_info.intermediate_size),
+        lora_a=lora_info.down_lora_a_weights,
+        lora_b=lora_info.down_lora_b_weights,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        token_lora_mapping=token_lora_mapping,
+        mul_routed_weight=True,
+        experts_shared_outer_loras_a=False,
+        experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
+        routing_cache=fused_lora_routing_cache,
+        fuse_add_to_output=False,
+        fuse_sum_all_reduce=True,
+        use_direct_expand_add=lora_info.max_lora_rank <= 64,
+    )
+    return StandardCombineInput(hidden_states=output)
