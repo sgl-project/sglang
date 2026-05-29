@@ -163,5 +163,6 @@
       "dsa_text": "PHARAOH-88",
       "ds_text": "PHARAOH-88"
     }
-  ]
+  ],
+  "recomputed_note": "gates recomputed offline under the #J-corrected first_n_tokens_match (alnum-subtoken overlap); model outputs unchanged (deterministic)"
 }

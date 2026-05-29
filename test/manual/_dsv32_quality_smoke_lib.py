@@ -26,6 +26,7 @@ No external dependencies (pure-Python ROUGE-L); JSON is always parsed with
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -236,22 +237,32 @@ def first_n_tokens_match(a: str, b: str, n: int = 8) -> bool:
     b_toks = b.split()[:n]
     if not a_toks or not b_toks:
         return False
-    # Whitespace-token overlap (the primary, position-independent check).
+    # Exact whitespace-token overlap (the primary, position-independent check).
+    # Also covers pure-punctuation answers like "." vs "." that have no alnum
+    # subtoken below.
     if set(a_toks) & set(b_toks):
         return True
     # Short-answer robustness: two correct concise answers can differ only by a
-    # unit/format suffix that whitespace-tokenizes as a single token (e.g. DSA
-    # "100" vs DS "100°C" for the boiling-point prompt), leaving zero token
-    # overlap even though they are NOT "entirely different". Count it as overlap
-    # when one first-n window is a prefix of the other (min 2 chars, to avoid a
-    # trivial single-character prefix matching everything). This preserves the
-    # gate's intent — detect genuinely divergent starts — for short answers.
-    a8 = " ".join(a_toks)
-    b8 = " ".join(b_toks)
-    shorter, longer = (a8, b8) if len(a8) <= len(b8) else (b8, a8)
-    if len(shorter) >= 2 and longer.startswith(shorter):
-        return True
-    return False
+    # unit/format suffix that whitespace-tokenizes as a single token (DSA "100"
+    # vs DS "100°C"), leaving zero whitespace-token overlap though they are NOT
+    # "entirely different". Split each first-n token into ALPHANUMERIC subtokens
+    # ("100°C" -> {"100","C"}; "53,59,61" -> {"53","59","61"}) and require a
+    # shared alnum subtoken. This rescues "100"/"100°C" (share "100") WITHOUT
+    # the over-broad string-prefix rule's false passes: "10" vs "100" stay
+    # distinct, and "Paris." vs "London." (share only punctuation) do not match.
+    return bool(_alnum_subtokens(a_toks) & _alnum_subtokens(b_toks))
+
+
+def _alnum_subtokens(tokens: List[str]) -> set:
+    """Split whitespace tokens into maximal alphabetic / numeric runs.
+
+    Punctuation and symbols (``°``, ``,``, ``.``) are dropped so they cannot
+    create spurious overlap; only shared alphanumeric content counts.
+    """
+    subs: set = set()
+    for t in tokens:
+        subs.update(re.findall(r"[A-Za-z]+|[0-9]+", t))
+    return subs
 
 
 # ----- Gate computation (the load-bearing, server-free core) -----------

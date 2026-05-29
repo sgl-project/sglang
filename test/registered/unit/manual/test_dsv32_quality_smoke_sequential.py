@@ -186,8 +186,7 @@ class TestFirstNTokensMatch(unittest.TestCase):
     divergent starts."""
 
     def test_unit_suffix_counts_as_overlap(self):
-        # DSA "100" vs DS "100°C": same answer, one whitespace token each, zero
-        # set overlap — must still count as overlap via the prefix rule.
+        # DSA "100" vs DS "100°C": same answer, share the alnum subtoken "100".
         self.assertTrue(_lib.first_n_tokens_match("100", "100°C", n=8))
         self.assertTrue(_lib.first_n_tokens_match("100°C", "100", n=8))
 
@@ -196,9 +195,27 @@ class TestFirstNTokensMatch(unittest.TestCase):
         self.assertFalse(_lib.first_n_tokens_match("Au", "Gold", n=8))
         self.assertFalse(_lib.first_n_tokens_match("Paris", "London", n=8))
 
-    def test_trivial_single_char_prefix_not_overlap(self):
-        # A 1-char prefix must not match everything (guard).
+    def test_distinct_numbers_do_not_overlap(self):
+        # #J false-pass hole: the old string-prefix fallback made "10" a prefix
+        # of "100" -> True. Alnum-subtoken overlap keeps distinct numbers apart.
+        self.assertFalse(_lib.first_n_tokens_match("10", "100", n=8))
         self.assertFalse(_lib.first_n_tokens_match("1", "100", n=8))
+        self.assertFalse(_lib.first_n_tokens_match("100", "1000", n=8))
+
+    def test_shared_punctuation_only_does_not_overlap(self):
+        # Two different answers that share only a trailing period must NOT match
+        # (punctuation is dropped from alnum subtokens).
+        self.assertFalse(_lib.first_n_tokens_match("Paris.", "London.", n=8))
+
+    def test_pure_punctuation_exact_match_still_overlaps(self):
+        # The literal "." answer (smoke prompt 19) has no alnum subtoken; the
+        # exact whitespace-token check must still match "." vs ".".
+        self.assertTrue(_lib.first_n_tokens_match(".", ".", n=8))
+
+    def test_shared_number_in_list_overlaps(self):
+        # "53" vs "53, 59, 61" share the alnum subtoken "53" -> not entirely
+        # different.
+        self.assertTrue(_lib.first_n_tokens_match("53", "53, 59, 61", n=8))
 
     def test_set_overlap_still_works(self):
         self.assertTrue(_lib.first_n_tokens_match("alpha beta gamma", "beta gamma alpha", n=3))
