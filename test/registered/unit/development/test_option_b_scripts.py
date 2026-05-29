@@ -105,6 +105,23 @@ class TestOptionBLockedFlagsServerScripts(unittest.TestCase):
             "is provided.",
         )
 
+    def test_both_servers_have_host_knob_defaulting_localhost(self):
+        """Both launchers expose a HOST env knob (default 127.0.0.1) and
+        pass it through as ``--host`` so the AC-12 two-node quality gate can
+        bind the baseline to 0.0.0.0 for cross-node reach, without changing
+        the default localhost-only behavior or the locked Option B flags."""
+        for path, name in ((DS_SERVER, "serve_double_sparsity.sh"),
+                           (DSA_SERVER, "serve_native_nsa.sh")):
+            text = _non_comment_lines(path)
+            self.assertIn(
+                'HOST="${HOST:-127.0.0.1}"', text,
+                f"{name} must default HOST to 127.0.0.1 (localhost-only).",
+            )
+            self.assertIn(
+                '--host "${HOST}"', text,
+                f"{name} must pass --host \"${{HOST}}\" to launch_server.",
+            )
+
     def test_ds_server_artifact_driven_radix_on(self):
         """Radix cache ON is enabled via a config-bound fixture-passed
         state file (``RADIX_FIXTURE_ARTIFACT`` ->

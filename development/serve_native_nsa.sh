@@ -34,6 +34,13 @@ set -euo pipefail
 
 MODEL_PATH="${MODEL_PATH:-/cluster-storage/models/deepseek-ai/DeepSeek-V3.2}"
 PORT="${PORT:-30000}"
+# Bind address. Default 127.0.0.1 (localhost-only, the sglang default). Set
+# HOST=0.0.0.0 to make this baseline reachable from another node — required
+# for the AC-12 two-node quality gate, where the DS server runs on the node
+# holding the calibrated mask/fixture and the DSA baseline runs on the other
+# node, both queried by a single harness process. The locked Option B flags
+# below are unchanged by this knob.
+HOST="${HOST:-127.0.0.1}"
 TP_SIZE="${TP_SIZE:-8}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
 PAGE_SIZE="${PAGE_SIZE:-64}"
@@ -61,6 +68,7 @@ mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/server_native_nsa_$(date +%Y%m%d-%H%M%S).log"
 echo ">>> Starting native_nsa baseline server"
 echo "    model        = ${MODEL_PATH}"
+echo "    host         = ${HOST}"
 echo "    port         = ${PORT}"
 echo "    tp_size      = ${TP_SIZE}"
 echo "    kv_cache     = ${KV_CACHE_DTYPE}"
@@ -71,6 +79,7 @@ echo "    log          = ${LOG_FILE}"
 
 exec python3 -m sglang.launch_server \
   --model-path "${MODEL_PATH}" \
+  --host "${HOST}" \
   --port "${PORT}" \
   --tp-size "${TP_SIZE}" \
   --kv-cache-dtype "${KV_CACHE_DTYPE}" \
