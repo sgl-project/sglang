@@ -1007,9 +1007,7 @@ class DecodePreallocQueue:
 
     @property
     def num_tokens_pre_allocated(self):
-        return sum(
-            decode_req.req.fill_len for decode_req in self.transfer_queue.queue
-        )
+        return sum(decode_req.req.fill_len for decode_req in self.transfer_queue.queue)
 
     def _need_space_for_single_req(
         self, retractable_tokens: Optional[int] = None
@@ -1730,9 +1728,7 @@ class SchedulerDisaggregationDecodeMixin:
                 # token because init_next_round_input rebuilt it as full).
                 if req.kv_committed_len is not None:
                     req.fill_len = req.kv_committed_len
-                    req.set_extend_input_len(
-                        req.fill_len - len(req.prefix_indices)
-                    )
+                    req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
             else:
                 waiting_queue.append(req)
 
