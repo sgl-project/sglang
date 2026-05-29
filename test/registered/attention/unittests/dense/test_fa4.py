@@ -417,12 +417,6 @@ class TestFA4DenseAttentionBackendCorrectness(CustomTestCase):
                     )
 
     def test_runner_mode_eagle_draft_extend_v2_cuda_graph_cases(self):
-        self.skipTest(
-            "deferred: FA4 DRAFT_EXTEND_V2 CUDA-graph replay requires "
-            "`cache_seqlens = prefix + extend` in init_forward_metadata_replay_cuda_graph "
-            "(flashattention_backend.py); without that fix the kernel reads prefix-only KV "
-            "and produces ~82 % wrong attention values. Tracked in KNOWN_FAILURES.md §C.3."
-        )
         for case in self.DRAFT_EXTEND_V2_CUDA_GRAPH_CASES:
             for pad_style in ("small_real", "prod_fill"):
                 for capture_bs in (
