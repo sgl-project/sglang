@@ -39,7 +39,10 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
-from sglang.srt.utils.profile_utils import ProfileManager
+from sglang.srt.utils.profile_utils import (
+    ProfileManager,
+    get_torch_profiler_gpu_activities,
+)
 
 
 @dataclass(kw_only=True)
@@ -163,14 +166,14 @@ class SchedulerProfilerManager:
         record_shapes = self.torch_profiler_record_shapes
 
         activity_map = {
-            "CPU": torch.profiler.ProfilerActivity.CPU,
-            "GPU": torch.profiler.ProfilerActivity.CUDA,
+            "CPU": [torch.profiler.ProfilerActivity.CPU],
+            "GPU": get_torch_profiler_gpu_activities(),
         }
         if hasattr(torch.profiler.ProfilerActivity, "XPU"):
-            activity_map["XPU"] = torch.profiler.ProfilerActivity.XPU
-        torchprof_activities = [
-            activity_map[a] for a in activities if a in activity_map
-        ]
+            activity_map["XPU"] = [torch.profiler.ProfilerActivity.XPU]
+        torchprof_activities = []
+        for activity in activities:
+            torchprof_activities.extend(activity_map.get(activity, []))
 
         if "RPD" in activities:  # for ROCM
             from rpdTracerControl import rpdTracerControl

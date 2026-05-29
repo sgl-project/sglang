@@ -89,6 +89,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.profile_utils import get_torch_profiler_gpu_activities
 from sglang.srt.utils.tensor_bridge import use_mlx
 
 
@@ -123,7 +124,7 @@ def start_profile(
         if "CPU" in profile_activities:
             activities.append(torch.profiler.ProfilerActivity.CPU)
         if "GPU" in profile_activities:
-            activities.append(torch.profiler.ProfilerActivity.CUDA)
+            activities.extend(get_torch_profiler_gpu_activities())
         if "XPU" in profile_activities:
             activities.append(torch.profiler.ProfilerActivity.XPU)
         if activities:
