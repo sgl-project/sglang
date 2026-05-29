@@ -34,13 +34,12 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.server_args import ServerArgs
+    from sglang.test.scripted_runtime.tokenizer_recv_proxy import TokenizerRecvProxy
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
-    # Production: ``zmq.Socket``. Test (ScriptedRuntime active):
-    # ``TokenizerRecvProxy`` quacking the same ``recv_pyobj(flags)``.
-    recv_from_tokenizer: Any
+    recv_from_tokenizer: Union[zmq.Socket, "TokenizerRecvProxy"]
     recv_from_rpc: Optional[zmq.Socket]
     recv_skipper: Any
     input_blocker: Any
