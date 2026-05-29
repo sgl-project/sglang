@@ -6,10 +6,10 @@
 # node, 8-way TP, page=64. Mutually exclusive with --enable-hisparse at
 # startup (per DEC-8).
 #
-# Locked Option B operating point (plan §13 / DEC-1) — these flags MUST
-# agree across this script and development/serve_native_nsa.sh so that
-# the AC-8 / AC-9 / AC-11 comparison only differs by DS enablement and
-# the AC-10 radix-cache gate:
+# Locked operating point — these dense-prefill / sparse-decode flags MUST
+# agree across this script and development/serve_native_nsa.sh so the
+# DS-vs-baseline comparison differs only by Double Sparsity enablement and
+# the radix-cache gate:
 #   --kv-cache-dtype fp8_e4m3
 #   --dsa-prefill-backend flashmla_kv
 #   --dsa-decode-backend  flashmla_kv

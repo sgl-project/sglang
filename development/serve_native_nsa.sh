@@ -2,16 +2,17 @@
 # Reference SGLang server invocation for the native_nsa baseline.
 #
 # Targets DeepSeek-V3.2 (FP8) on a single H200 node, 8-way TP, page=64,
-# matching the operating point in DEC-1 (h200-10-220-51-6 or
-# h200-10-220-51-8). Pair with development/benchmark_baseline.sh to
-# populate the native_nsa column of the two-column comparison.
+# matching the locked operating point. Pair with
+# development/benchmark_baseline.sh to populate the native_nsa column of the
+# two-column comparison.
 #
 # Double Sparsity is intentionally NOT enabled here — the baseline runs
-# unmodified NSA selection so the comparison row pair is honest.
+# unmodified native sparse-attention selection so the comparison row pair is
+# honest.
 #
-# Locked Option B operating point (plan §13 / DEC-1) — same locked flags as
-# development/serve_double_sparsity.sh, so the AC-8 / AC-9 / AC-11
-# comparison only differs by DS enablement and the AC-10 radix-cache gate:
+# Locked operating point — same locked flags as
+# development/serve_double_sparsity.sh, so the DS-vs-baseline comparison only
+# differs by Double Sparsity enablement and the radix-cache gate:
 #   --kv-cache-dtype fp8_e4m3
 #   --dsa-prefill-backend flashmla_kv
 #   --dsa-decode-backend  flashmla_kv

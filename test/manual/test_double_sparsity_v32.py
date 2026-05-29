@@ -44,7 +44,7 @@ Quick env knobs:
     AC12_MMLU_NUM_EXAMPLES MMLU subset size (default 200 — operator
                             override to 14k for the full set on H200)
 
-Negative sensitivity assertions (plan §10 + design doc §9.5 B6):
+Negative sensitivity assertions (the gate has teeth):
 
     corrupt-mask DS_CORRUPT_MASK_URL: NIAH @ 64K drops > 20 pp vs DSA.
     zero-signature DS_ZERO_SIG_URL:  NIAH @ 16K drops > 30 pp vs DSA.
@@ -860,8 +860,8 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
         except Exception as exc:
             # Servers are configured (class-level skipUnless passed) so
             # an operator is actively running the AC-12 gate — silent
-            # skip would mask the failure. Fail loudly per plan §10
-            # ("loop does not close without AC-12 passing").
+            # skip would mask the failure. Fail loudly so a misconfigured
+            # MMLU data path cannot silently bypass the quality gate.
             self.fail(
                 f"AC-12 MMLU data prep failed at {data_dir}: {exc}. "
                 "Pre-populate with `python benchmark/mmlu/bench_sglang.py` "
@@ -930,7 +930,7 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
                 "per_subject": per_subject,
             }
 
-        # DSA first per plan §9.4 convention.
+        # DSA first (reference measured immediately before DS).
         dsa_result = _eval_against(self.dsa_url)
         ds_result = _eval_against(self.ds_url)
         delta_pp = dsa_result["score_pct"] - ds_result["score_pct"]
