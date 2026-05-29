@@ -208,6 +208,7 @@ class NightlyBenchmarkRunner:
         extra_bench_args: Optional[List[str]] = None,
         timeout: Optional[int] = None,
         env: Optional[dict] = None,
+        skip_server_launch: bool = False,
     ) -> Tuple[List[BenchmarkResult], bool, Optional[float]]:
         """Run a complete benchmark for a single model with server management.
 
@@ -238,18 +239,19 @@ class NightlyBenchmarkRunner:
 
         process = None
         try:
-            # Launch server
-            process = popen_launch_server(
-                model=model_path,
-                base_url=self.base_url,
-                other_args=other_args or [],
-                timeout=(
-                    timeout
-                    if timeout is not None
-                    else DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-                ),
-                env=env,
-            )
+            # Launch server (skip if caller manages the server externally)
+            if not skip_server_launch:
+                process = popen_launch_server(
+                    model=model_path,
+                    base_url=self.base_url,
+                    other_args=other_args or [],
+                    timeout=(
+                        timeout
+                        if timeout is not None
+                        else DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+                    ),
+                    env=env,
+                )
 
             # Generate filenames
             json_output_file = self.generate_result_filename(model_path, variant)
