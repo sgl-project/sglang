@@ -809,7 +809,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.req_to_token_pool = full_attn_backend.req_to_token_pool
 
     def _is_full_attn(
-        self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
+        self,
+        layer: Optional[Union[RadixAttention, RadixLinearAttention]],
+        layer_id: Optional[int] = None,
     ) -> bool:
         # RadixLinearAttention is unambiguously a linear-attention layer.
         # Everything else (including plain RadixAttention) must be classified by
