@@ -111,7 +111,12 @@ class MooncakeTransferEngine:
         self.engine = TransferEngine()
         self.hostname = hostname
         self.gpu_id = gpu_id if gpu_id is not None else 0
-        self.ib_device = get_ib_devices_for_gpu(ib_device, self.gpu_id)
+        # MC_FORCE_TCP=1 makes mooncake install TcpTransport instead of RDMA,
+        # in which case RDMA HCA selection is irrelevant; pass empty device.
+        if os.environ.get("MC_FORCE_TCP") == "1":
+            self.ib_device = ""
+        else:
+            self.ib_device = get_ib_devices_for_gpu(ib_device, self.gpu_id)
 
         self.initialize(
             hostname=self.hostname,
