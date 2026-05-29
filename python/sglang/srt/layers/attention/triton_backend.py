@@ -1421,32 +1421,36 @@ class TritonMultiStepDraftBackend:
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        # MultiStep uses custom signatures (fb-only / fb+bs).
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+
         if in_capture:
-            self.init_forward_metadata_capture_cuda_graph(forward_batch)
-        else:
-            self.init_forward_metadata_replay_cuda_graph(
-                forward_batch, forward_batch.batch_size
-            )
-
-    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-        def call_fn(i, forward_batch):
-            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.batch_size * self.topk,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=None,
+            inner_fb = build_inner_fb_view(
+                forward_batch,
+                bs=forward_batch.batch_size,
                 forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
             )
 
-        self.common_template(forward_batch, None, call_fn)
+            def call_fn(i, _forward_batch):
+                self.attn_backends[i].init_forward_data_out_graph(
+                    inner_fb, in_capture=True
+                )
 
-    def init_forward_metadata_replay_cuda_graph(
-        self, forward_batch: ForwardBatch, bs: int
-    ):
-        self.common_template(forward_batch, None, None)
+            self.common_template(forward_batch, None, call_fn)
+        else:
+            bs = forward_batch.batch_size
+            self.common_template(forward_batch, None, None)
+
+            # NOTE: Multi-step's attention backends use the slice of
+            # - kv_indptr buffer (cuda graph and non-cuda graph)
+            # - kv_indices buffer (cuda graph only)
+            # So we don't need to assign the KV indices inside the attention backend.
+
+            # Compute num_kv_splits only once
+            num_token = bs * self.topk
+            self.attn_backends[-1].get_num_kv_splits(
+                self.attn_backends[-1].cuda_graph_num_kv_splits[:num_token],
+                forward_batch.seq_lens[:bs],
+            )
 
         # NOTE: Multi-step's attention backends use the slice of
         # - kv_indptr buffer (cuda graph and non-cuda graph)
