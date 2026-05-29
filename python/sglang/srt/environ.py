@@ -639,6 +639,7 @@ class Envs:
     SGLANG_OPT_USE_FUSED_COMPRESS_TRITON = EnvBool(False)
     SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
     SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL = EnvBool(True)
+    SGLANG_ENABLE_NVFP4_GEMM_SWIGLU_FUSION = EnvBool(True)
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
     # ====================================================================
 
