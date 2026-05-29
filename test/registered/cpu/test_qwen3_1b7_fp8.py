@@ -46,6 +46,7 @@ class TestQwen3_1B7FP8Xeon(unittest.TestCase):
                 input_lens=(1024,),
                 output_lens=(1024,),
                 enable_profile=False,
+                baseline_output_throughput=685.0,
             ),
             share_server=True,
         )

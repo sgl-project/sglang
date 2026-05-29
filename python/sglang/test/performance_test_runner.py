@@ -18,6 +18,8 @@ class PerformanceTestParams:
     # MTP/EAGLE speculative decoding: minimum accept length threshold (None = no validation)
     spec_accept_length_threshold: Optional[float] = None
     enable_profile: bool = True  # Set False for non-NVIDIA backends (CPU, AMD)
+    # Minimum output token throughput (tok/s) at the largest batch size (None = no validation)
+    baseline_output_throughput: Optional[float] = None
 
 
 @dataclass
@@ -52,6 +54,7 @@ def run_performance_test(
     spec_accept_length_threshold: Optional[float] = None,
     enable_profile: bool = True,
     skip_server_launch: bool = False,
+    baseline_output_throughput: Optional[float] = None,
 ) -> PerformanceTestResult:
 
     # Set default for mutable argument
@@ -66,6 +69,8 @@ def run_performance_test(
     print(f"  Output lens: {output_lens}")
     if spec_accept_length_threshold is not None:
         print(f"  Spec accept length threshold: {spec_accept_length_threshold}")
+    if baseline_output_throughput is not None:
+        print(f"  Baseline output throughput: {baseline_output_throughput} tok/s")
     print(f"{'='*60}\n")
 
     # Build extra args for benchmarks
@@ -127,6 +132,29 @@ def run_performance_test(
 
             # Extract aggregate metrics from the largest batch size result
             largest_batch_result = max(results, key=lambda r: r.batch_size)
+
+            # Validate output throughput against baseline if provided
+            if baseline_output_throughput is not None:
+                measured = largest_batch_result.output_throughput
+                if measured < baseline_output_throughput:
+                    tput_error = (
+                        f"Output throughput {measured:.1f} tok/s < "
+                        f"baseline {baseline_output_throughput:.1f} tok/s "
+                        f"(batch_size={largest_batch_result.batch_size})"
+                    )
+                    print(f"✗ {tput_error}")
+                    passed = False
+                    error_msg = (
+                        tput_error
+                        if error_msg is None
+                        else f"{error_msg}; {tput_error}"
+                    )
+                else:
+                    print(
+                        f"✓ Output throughput {measured:.1f} tok/s >= "
+                        f"baseline {baseline_output_throughput:.1f} tok/s"
+                    )
+
             return PerformanceTestResult(
                 model=model.model_path,
                 passed=passed,

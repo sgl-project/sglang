@@ -50,6 +50,7 @@ class TestQwen35_35BFPS8Xeon(unittest.TestCase):
                 input_lens=(1024,),
                 output_lens=(1024,),
                 enable_profile=False,
+                baseline_output_throughput=100.0,
             ),
             share_server=True,
         )
