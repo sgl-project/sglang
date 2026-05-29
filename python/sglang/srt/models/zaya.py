@@ -239,26 +239,48 @@ class CCA(nn.Module):
         # sequence in the HF checkpoint, so the natural ColumnParallel shard
         # (``tp_rank * shard``) lands rank ``r`` on the head set
         # ``[r * heads_per_rank, (r+1) * heads_per_rank)``.
-        self.linear_q = ColumnParallelLinear(
-            self.hidden_size,
-            self.latent_q_dim_full,
-            bias=bias,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("linear_q", prefix),
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-        )
-        self.linear_k = ColumnParallelLinear(
-            self.hidden_size,
-            self.latent_k_dim_full,
-            bias=bias,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("linear_k", prefix),
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-        )
+        #
+        # At ``tp_size == 1`` there is nothing to shard, and on ROCm/aiter the
+        # ColumnParallelLinear path selects a slower GEMM for the large-M prefill
+        # (1.6-2.25x slower than ReplicatedLinear in bench_one_batch), so the
+        # single-GPU case uses ReplicatedLinear. ``tp_size > 1`` keeps
+        # ColumnParallelLinear for the per-rank head shard.
+        if self.tp_size > 1:
+            self.linear_q = ColumnParallelLinear(
+                self.hidden_size,
+                self.latent_q_dim_full,
+                bias=bias,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=add_prefix("linear_q", prefix),
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+            )
+            self.linear_k = ColumnParallelLinear(
+                self.hidden_size,
+                self.latent_k_dim_full,
+                bias=bias,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=add_prefix("linear_k", prefix),
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+            )
+        else:
+            self.linear_q = ReplicatedLinear(
+                self.hidden_size,
+                self.latent_q_dim_full,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=add_prefix("linear_q", prefix),
+            )
+            self.linear_k = ReplicatedLinear(
+                self.hidden_size,
+                self.latent_k_dim_full,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=add_prefix("linear_k", prefix),
+            )
         # The HF V-projection layout maps val_proj1 to the FIRST half of K
         # heads and val_proj2 to the SECOND half (after ``cat([v1, v2]).view(
         # T, num_k_heads_full, head_dim)``). That doesn't align with a simple
