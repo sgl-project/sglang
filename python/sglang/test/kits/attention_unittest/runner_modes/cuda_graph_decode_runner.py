@@ -239,6 +239,7 @@ from ..attention_methods.mla_attention import (
     run_mla_fixture_eager,
     run_mla_forward,
 )
+from .metadata_invariants import assert_cg_metadata_well_formed
 
 DENSE_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 4
 MLA_CUDA_GRAPH_CAPTURE_BATCH_SIZE = 4
@@ -320,6 +321,10 @@ def _init_cuda_graph_replay_metadata(backend, capture_batch_size: int, batch):
         )
     finally:
         backend._replay_forward_batch = None
+    # Best-effort metadata-shape sanity check — catches negative kv_lens and
+    # non-monotonic indptr that would otherwise leave real-row output correct
+    # but corrupt padded-row scratch state. See `metadata_invariants.py`.
+    assert_cg_metadata_well_formed(backend, bs=capture_batch_size)
 
 
 def _run_cuda_graph_decode_case(
