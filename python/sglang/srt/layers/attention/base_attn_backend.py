@@ -132,11 +132,22 @@ class AttentionBackend(ABC):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        """Run forward on an attention layer."""
+        """Run forward on an attention layer.
+
+        Dispatches on the shape class of ``forward_batch.forward_mode``:
+
+        * ``IDLE`` — short-circuits to an empty tensor. This branch will
+          be removed once :py:class:`RadixAttention.forward` takes over
+          the IDLE short-circuit (see attention refactor step 09.d).
+        * ``SINGLE_TOKEN`` (== ``DECODE``) — :py:meth:`forward_single_token`.
+        * ``UNIFORM_LEN`` (NPU only, dispatched via the legacy
+          ``is_mixed()`` predicate today) — :py:meth:`forward_uniform_len`.
+        * everything else — :py:meth:`forward_var_len`.
+        """
         if forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
-        elif forward_batch.forward_mode.is_decode():
-            return self.forward_decode(
+        elif forward_batch.forward_mode.is_single_token():
+            return self.forward_single_token(
                 q,
                 k,
                 v,
@@ -146,7 +157,7 @@ class AttentionBackend(ABC):
                 **kwargs,
             )
         elif forward_batch.forward_mode.is_mixed() and is_npu():
-            return self.forward_mixed(
+            return self.forward_uniform_len(
                 q,
                 k,
                 v,
@@ -156,7 +167,7 @@ class AttentionBackend(ABC):
                 **kwargs,
             )
         else:
-            return self.forward_extend(
+            return self.forward_var_len(
                 q,
                 k,
                 v,
@@ -166,6 +177,87 @@ class AttentionBackend(ABC):
                 **kwargs,
             )
 
+    # ------------------------------------------------------------------
+    # Canonical forward methods (attention refactor step 09)
+    # ------------------------------------------------------------------
+    # Backends should override the canonical names. The deprecated
+    # ``forward_extend`` / ``forward_decode`` / ``forward_mixed`` overrides
+    # below remain dispatchable for one release window: if a backend
+    # overrides only the old name, the default canonical method forwards
+    # to it.
+
+    def forward_var_len(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        """Run a forward for a variable-length batch (extend / chunked
+        prefill / draft extend / split prefill / dllm extend /
+        target verify on non-NPU backends)."""
+        return self.forward_extend(
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            save_kv_cache=save_kv_cache,
+            **kwargs,
+        )
+
+    def forward_single_token(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        """Run a forward for a single-token batch (decode)."""
+        return self.forward_decode(
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            save_kv_cache=save_kv_cache,
+            **kwargs,
+        )
+
+    def forward_uniform_len(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        """Run a forward for a uniform-length batch (NPU mixed dispatch).
+
+        Default forwards to :py:meth:`forward_mixed` for back-compat with
+        backends that still override the old name.
+        """
+        return self.forward_mixed(
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            save_kv_cache=save_kv_cache,
+            **kwargs,
+        )
+
+    # ------------------------------------------------------------------
+    # Deprecated forward methods (one release window)
+    # ------------------------------------------------------------------
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -176,7 +268,7 @@ class AttentionBackend(ABC):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        """Run a forward for decode."""
+        """Deprecated; override :py:meth:`forward_single_token` instead."""
         raise NotImplementedError()
 
     def forward_extend(
@@ -189,7 +281,7 @@ class AttentionBackend(ABC):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        """Run a forward for extend."""
+        """Deprecated; override :py:meth:`forward_var_len` instead."""
         raise NotImplementedError()
 
     def forward_mixed(
@@ -201,7 +293,7 @@ class AttentionBackend(ABC):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
-        """Run a forward for mix."""
+        """Deprecated; override :py:meth:`forward_uniform_len` instead."""
         raise NotImplementedError()
 
     def support_triton(self):

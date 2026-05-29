@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from enum import IntEnum, auto
+from enum import IntEnum
 from functools import total_ordering
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
@@ -77,46 +77,133 @@ _is_npu = is_npu()
 
 
 class ForwardMode(IntEnum):
-    # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
-    # It is also called "prefill" in common terminology.
-    EXTEND = auto()
-    # Decode one token.
-    DECODE = auto()
-    # Contains both EXTEND and DECODE when doing chunked prefill.
-    MIXED = auto()
-    # No sequence to forward. For data parallel attention, some workers will be IDLE if no sequence are allocated.
-    IDLE = auto()
+    """Forward mode for an attention batch.
 
+    Shape-classified canonical names (introduced in attention refactor step 09):
+
+    * ``VAR_LEN`` — each request has a different per-request length
+      (extend / prefill / chunked-prefill mixed / draft-extend /
+      split-prefill / dllm-extend).
+    * ``SINGLE_TOKEN`` — each request has exactly one token (decode).
+    * ``UNIFORM_LEN`` — each request has the same length ``≥ 1``
+      (target-verify, draft-extend-v2, prebuilt).
+    * ``IDLE`` — dispatch sentinel; not a real forward target. Used by
+      data-parallel attention when a worker has no sequence allocated.
+
+    The original semantic names (``EXTEND``, ``DECODE``, ``MIXED``,
+    ``TARGET_VERIFY``, ``DRAFT_EXTEND``, ``DRAFT_EXTEND_V2``, ``PREBUILT``,
+    ``SPLIT_PREFILL``, ``DLLM_EXTEND``) are retained as distinct enum members
+    so that scheduler / dispatch code can still distinguish e.g. chunked-
+    prefill ``MIXED`` from a pure ``EXTEND`` or a target-verify ``UNIFORM_LEN``
+    from a prebuilt ``UNIFORM_LEN``.
+
+    ``EXTEND`` and ``DECODE`` are also exposed as IntEnum aliases
+    (same integer value as ``VAR_LEN`` / ``SINGLE_TOKEN`` respectively), so
+    ``ForwardMode.EXTEND is ForwardMode.VAR_LEN`` and
+    ``ForwardMode.DECODE is ForwardMode.SINGLE_TOKEN``. ``MIXED`` is *not*
+    folded into ``UNIFORM_LEN`` because chunked-prefill MIXED is varying-
+    length, not uniform-length; merging the two would break scheduler
+    metrics and NPU dispatch.
+
+    The deprecated predicate ``is_extend()`` / ``is_decode()`` / ``is_mixed()``
+    accessors are retained one release; new code should use
+    ``is_var_len()`` / ``is_single_token()`` / ``is_uniform_len()``.
+    """
+
+    # ---- New canonical shape-class members (explicit values; IntEnum
+    # aliases pinned to keep cross-version pickle / IPC compatibility) ----
+    VAR_LEN = 1
+    SINGLE_TOKEN = 2
+    UNIFORM_LEN = 3
+
+    # ---- Dispatch sentinel — not a real forward target ----
+    IDLE = 4
+
+    # ---- Semantic labels (preserved; not shape-class) ----
+    # Chunked prefill: a batch that mixes prefill + decode reqs. Shape is
+    # var-len (per-req lengths differ); semantic label is distinct from
+    # plain EXTEND because scheduler / metrics distinguish the two.
+    MIXED = 5
     # Used in speculative decoding: verify a batch in the target model.
-    TARGET_VERIFY = auto()
+    TARGET_VERIFY = 10
     # Used in speculative decoding: extend a batch in the draft model.
-    DRAFT_EXTEND = auto()
+    DRAFT_EXTEND = 11
+    # Used in eagle v2 worker: fixed shape logits output.
+    DRAFT_EXTEND_V2 = 12
+    # Used in disaggregated decode worker: a batch of requests with KV
+    # cache ready to start decoding.
+    PREBUILT = 13
+    # Split Prefill for PD multiplexing.
+    SPLIT_PREFILL = 14
+    # Used in dLLM.
+    DLLM_EXTEND = 15
 
-    DRAFT_EXTEND_V2 = auto()
+    # ---- Deprecated aliases (IntEnum value-aliased; one release window) ----
+    EXTEND = VAR_LEN
+    DECODE = SINGLE_TOKEN
 
-    # Used in disaggregated decode worker
-    # Represent a batch of requests having their KV cache ready to start decoding
-    PREBUILT = auto()
+    # ------------------------------------------------------------------
+    # Shape predicates (canonical)
+    # ------------------------------------------------------------------
+    def is_var_len(self, include_draft_extend_v2: bool = False) -> bool:
+        """Each request has a different per-request length.
 
-    # Split Prefill for PD multiplexing
-    SPLIT_PREFILL = auto()
+        Covers ``VAR_LEN`` (== ``EXTEND``), ``MIXED``, ``DRAFT_EXTEND``,
+        ``SPLIT_PREFILL``, ``DLLM_EXTEND``. ``TARGET_VERIFY`` is *not*
+        var-len even though it's currently dispatched through the same
+        backend method — it has uniform per-req length.
 
-    # Used in dLLM
-    DLLM_EXTEND = auto()
+        With ``include_draft_extend_v2=True``, also returns True for
+        ``DRAFT_EXTEND_V2`` (kept for back-compat with the previous
+        ``is_extend(include_draft_extend_v2=...)`` contract).
+        """
+        if self in (
+            ForwardMode.VAR_LEN,
+            ForwardMode.MIXED,
+            ForwardMode.DRAFT_EXTEND,
+            ForwardMode.SPLIT_PREFILL,
+            ForwardMode.DLLM_EXTEND,
+            ForwardMode.TARGET_VERIFY,
+        ):
+            return True
+        if include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2:
+            return True
+        return False
 
+    def is_single_token(self) -> bool:
+        """Each request has exactly one token (decode)."""
+        return self == ForwardMode.SINGLE_TOKEN
+
+    def is_uniform_len(self) -> bool:
+        """Each request has the same length ``≥ 1``.
+
+        Covers ``UNIFORM_LEN``, ``TARGET_VERIFY``, ``DRAFT_EXTEND_V2``,
+        ``PREBUILT``. Note ``UNIFORM_LEN`` is the post-step-09 canonical
+        name; in current code the dispatch on the NPU backend uses
+        ``MIXED`` instead, but MIXED is *not* uniform-len (it's chunked
+        prefill).
+        """
+        return self in (
+            ForwardMode.UNIFORM_LEN,
+            ForwardMode.TARGET_VERIFY,
+            ForwardMode.DRAFT_EXTEND_V2,
+            ForwardMode.PREBUILT,
+        )
+
+    def is_idle(self) -> bool:
+        return self == ForwardMode.IDLE
+
+    # ------------------------------------------------------------------
+    # Deprecated shape predicates (one release window)
+    # ------------------------------------------------------------------
     def is_prefill(self, include_draft_extend_v2: bool = False):
         return self.is_extend(include_draft_extend_v2=include_draft_extend_v2)
 
     def is_extend(self, include_draft_extend_v2: bool = False):
-        return (
-            self == ForwardMode.EXTEND
-            or self == ForwardMode.MIXED
-            or self == ForwardMode.DRAFT_EXTEND
-            or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
-            or self == ForwardMode.TARGET_VERIFY
-            or self == ForwardMode.SPLIT_PREFILL
-            or self == ForwardMode.DLLM_EXTEND
-        )
+        """Deprecated alias for :py:meth:`is_var_len`. Note that
+        ``TARGET_VERIFY`` is included in both for backward compatibility
+        with the existing dispatch."""
+        return self.is_var_len(include_draft_extend_v2=include_draft_extend_v2)
 
     def is_context_parallel_extend(self, include_draft_extend_v2: bool = False):
         return (
@@ -130,16 +217,17 @@ class ForwardMode(IntEnum):
         )
 
     def is_decode(self):
-        return self == ForwardMode.DECODE
+        """Deprecated alias for :py:meth:`is_single_token`."""
+        return self.is_single_token()
 
     def is_mixed(self):
+        """True only for the explicit ``MIXED`` (chunked-prefill) enum
+        value. ``MIXED`` is *not* folded into ``UNIFORM_LEN`` — see class
+        docstring."""
         return self == ForwardMode.MIXED
 
-    def is_idle(self):
-        return self == ForwardMode.IDLE
-
     def is_decode_or_idle(self):
-        return self == ForwardMode.DECODE or self == ForwardMode.IDLE
+        return self.is_single_token() or self.is_idle()
 
     def is_target_verify(self):
         return self == ForwardMode.TARGET_VERIFY
@@ -163,22 +251,22 @@ class ForwardMode(IntEnum):
         )
 
     def is_cuda_graph(self):
-        return (
-            self == ForwardMode.DECODE
-            or self == ForwardMode.TARGET_VERIFY
-            or self == ForwardMode.IDLE
-            or self == ForwardMode.DLLM_EXTEND
+        return self in (
+            ForwardMode.SINGLE_TOKEN,
+            ForwardMode.TARGET_VERIFY,
+            ForwardMode.IDLE,
+            ForwardMode.DLLM_EXTEND,
         )
 
     def is_cpu_graph(self):
-        return self == ForwardMode.DECODE
+        return self.is_single_token()
 
     def is_split_prefill(self):
         return self == ForwardMode.SPLIT_PREFILL
 
     def is_extend_without_speculative(self):
         return (
-            self.is_extend()
+            self.is_var_len()
             and not self.is_target_verify()
             and not self.is_draft_extend()
         )
