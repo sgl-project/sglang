@@ -46,7 +46,6 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
 
-
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (

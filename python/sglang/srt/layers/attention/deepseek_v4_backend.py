@@ -645,18 +645,18 @@ class DeepseekV4AttnBackend(
         self,
         accept_lens: torch.Tensor,
         model,
-    ) -> None:
+    ) -> bool:
         del model
         if not self._online_c128_mtp_enabled():
-            return
+            return False
 
         ctx = self._online_c128_verify_ctx
         if ctx is None or accept_lens.numel() == 0:
             self._clear_online_c128_verify_context()
-            return
+            return False
         if ctx.seq_lens.numel() == 0 or ctx.req_pool_indices.numel() == 0:
             self._clear_online_c128_verify_context()
-            return
+            return False
 
         accept_lens_i64 = (
             accept_lens if accept_lens.dtype == torch.int64 else accept_lens.to(torch.int64)
@@ -672,6 +672,7 @@ class DeepseekV4AttnBackend(
         token_to_kv_pool = self.token_to_kv_pool
         full_to_swa_index_mapping = token_to_kv_pool.full_to_swa_index_mapping
         swa_page_size = token_to_kv_pool.swa_page_size
+        committed = False
 
         for runtime in self._iter_online_c128_layer_runtimes():
             layer_id = runtime.layer_id
@@ -710,8 +711,10 @@ class DeepseekV4AttnBackend(
                 num_verify_tokens=num_verify_tokens,
                 head_dim=head_dim,
             )
+            committed = True
 
         self._clear_online_c128_verify_context()
+        return committed
 
     def init_forward_metadata_indexer(self, core_attn_metadata: DSV4AttnMetadata):
         return PagedIndexerMetadata(
