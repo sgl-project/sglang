@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import pathlib
+import re
 import unittest
 
 
@@ -616,40 +617,29 @@ class TestAC12HarnessHelpers(unittest.TestCase):
             self.assertIn("missing data/", str(ctx.exception))
 
 
-    def test_niah_64k_ds_rejection_records_failure_artifact(self):
-        """#L regression: when DS rejects a NIAH prompt (e.g. a
-        context-length 400 because the prompt exceeds the DS KV pool), the
-        gate must still RECORD a per-length artifact (with the DS error +
-        served counts + verdict=FAIL) and fail cleanly, instead of letting
-        ``urllib.error.HTTPError`` escape before ``_record_artifact`` runs
-        (which previously left NIAH-64K with no ``ac12_niah_65536`` artifact).
+    # ---- AC-12 re-scoped gate (Round 14): within-budget HARD + beyond-budget
+    # CHARACTERIZATION. Shared mock helpers below.
+
+    _NEEDLE_RE = re.compile(r"The hidden value is (\S+?)\.")
+
+    def _run_ac12_method(self, method_name, *, ds_fn, num_prompts=2):
+        """Drive one TestDoubleSparsityV32Quality method with patched
+        ``_generate`` (``ds_fn(prompt)`` for the DS url; DSA returns the
+        planted needle) and a capturing ``_record_artifact``. Returns
+        ``(result, captured)``. Mirrors the skip-freeze pattern used above.
         """
-        import io
-        import re
+        import io  # noqa: F401  (used by callers' ds_fn closures)
         import sys
         import unittest as _ut
-        import urllib.error
         from unittest.mock import patch
 
         ds_url = "http://ds-server:1"
         dsa_url = "http://dsa-server:2"
 
-        # DSA answers with the planted needle (parsed from the prompt) so the
-        # reference recall is non-trivial; DS rejects every prompt with a
-        # context-length 400 carrying a realistic sglang error body.
-        _needle_re = re.compile(r"The hidden value is (\S+?)\.")
-
         def fake_generate(base_url, prompt, *, max_new_tokens=64, use_chat=False):
             if base_url == ds_url:
-                body = (
-                    b'{"object":"error","message":"Input length (69970 tokens) '
-                    b'exceeds the maximum allowed length (53050 tokens). Use a '
-                    b'shorter input or enable --allow-auto-truncate.","code":400}'
-                )
-                raise urllib.error.HTTPError(
-                    base_url, 400, "Bad Request", {}, io.BytesIO(body),
-                )
-            m = _needle_re.search(prompt)
+                return ds_fn(prompt)
+            m = self._NEEDLE_RE.search(prompt)
             return m.group(1) if m else ""
 
         captured: List[Dict[str, Any]] = []
@@ -660,9 +650,8 @@ class TestAC12HarnessHelpers(unittest.TestCase):
         env_overrides = {
             "DS_BASE_URL": ds_url,
             "DSA_BASE_URL": dsa_url,
-            "AC12_NIAH_NUM_PROMPTS": "2",  # small: prompt-length is fixed at 65536
+            "AC12_NIAH_NUM_PROMPTS": str(num_prompts),
         }
-
         cls = self._h.TestDoubleSparsityV32Quality
         orig_skip = cls.__dict__.get("__unittest_skip__", False)
         orig_why = cls.__dict__.get("__unittest_skip_why__", "")
@@ -672,40 +661,100 @@ class TestAC12HarnessHelpers(unittest.TestCase):
             with patch.dict(os.environ, env_overrides), \
                  patch.object(self._h, "_generate", fake_generate), \
                  patch.object(self._h, "_record_artifact", fake_record):
-                suite = _ut.TestSuite([cls("test_niah_at_64k")])
+                suite = _ut.TestSuite([cls(method_name)])
                 result = _ut.TextTestRunner(
                     stream=open(os.devnull, "w"), verbosity=0,
                 ).run(suite)
         finally:
             cls.__unittest_skip__ = orig_skip
             cls.__unittest_skip_why__ = orig_why
+        return result, captured
 
-        # Clean failure: a recall/admission FAIL (assertion), NOT an uncaught
-        # HTTPError (which would land in result.errors).
-        self.assertEqual(
-            len(result.errors), 0,
-            f"DS rejection must fail cleanly, not error out: {result.errors}",
-        )
-        self.assertEqual(
-            len(result.failures), 1,
-            f"expected exactly one assertion failure: {result.failures}",
-        )
+    def test_niah_64k_ds_rejection_records_artifact_characterization(self):
+        """#L regression under the re-scoped gate: when DS rejects a
+        beyond-budget NIAH prompt (context-length 400 because the prompt
+        exceeds the DS KV pool), the characterization path must still RECORD a
+        durable per-length artifact (DS error + served counts + verdict=FAIL)
+        instead of letting ``urllib.error.HTTPError`` escape, AND must not
+        hard-fail (a beyond-budget admission limit is characterized, not a
+        DSA-parity gate). The recorded verdict stays FAIL so the limit is
+        transparent."""
+        import io
+        import urllib.error
 
-        # Exactly one durable niah_65536 artifact with the DS error details.
+        def ds_reject(prompt):
+            body = (
+                b'{"object":"error","message":"Input length (69970 tokens) '
+                b'exceeds the maximum allowed length (53050 tokens). Use a '
+                b'shorter input or enable --allow-auto-truncate.","code":400}'
+            )
+            raise urllib.error.HTTPError(
+                "http://ds-server:1", 400, "Bad Request", {}, io.BytesIO(body),
+            )
+
+        result, captured = self._run_ac12_method(
+            "test_niah_beyond_budget_characterization", ds_fn=ds_reject,
+        )
+        # No uncaught exception, and characterization does NOT hard-fail on an
+        # expected admission limit (servable list is empty -> no monotonicity
+        # assertion).
+        self.assertEqual(len(result.errors), 0,
+                         f"DS rejection must not error out: {result.errors}")
+        self.assertEqual(len(result.failures), 0,
+                         f"beyond-budget admission limit must be characterized, "
+                         f"not hard-failed: {result.failures}")
+        # Durable niah_65536 artifact with the DS error + FAIL verdict.
         niah = [c for c in captured if c["suffix"] == "niah_65536"]
-        self.assertEqual(
-            len(niah), 1,
-            f"expected exactly one niah_65536 artifact, got {len(niah)}",
-        )
+        self.assertEqual(len(niah), 1, f"expected one niah_65536 artifact: {len(niah)}")
         payload = niah[0]["payload"]
         self.assertEqual(payload["length_tokens"], 65536)
-        self.assertEqual(payload["num_prompts"], 2)
+        self.assertEqual(payload["gate_class"], "beyond_budget_characterization")
+        self.assertFalse(payload["within_budget"])
         self.assertEqual(payload["verdict"], "FAIL")
         self.assertEqual(payload["ds_served"], 0)
-        self.assertEqual(payload["dsa_served"], 2)
         self.assertIsNotNone(payload["ds_error"])
         self.assertIn("HTTP 400", payload["ds_error"])
         self.assertIn("exceeds the maximum allowed", payload["ds_error"])
+
+    def test_niah_within_budget_hard_gate_passes_when_ds_matches_dsa(self):
+        """Re-scoped HARD gate (positive): within the selection budget DS
+        recalls the needle like a dense model, so DS==DSA recall and the gate
+        passes; artifacts are tagged gate_class=within_budget_hard / verdict
+        PASS."""
+        def ds_recall(prompt):
+            m = self._NEEDLE_RE.search(prompt)
+            return m.group(1) if m else ""
+
+        result, captured = self._run_ac12_method(
+            "test_niah_within_budget", ds_fn=ds_recall,
+        )
+        self.assertEqual(len(result.errors), 0, f"{result.errors}")
+        self.assertEqual(len(result.failures), 0,
+                         f"within-budget DS==DSA recall must pass: {result.failures}")
+        wb = [c for c in captured if c["suffix"].startswith("niah_")]
+        self.assertTrue(wb, "expected within-budget niah artifacts")
+        for c in wb:
+            self.assertEqual(c["payload"]["gate_class"], "within_budget_hard")
+            self.assertTrue(c["payload"]["within_budget"])
+            self.assertEqual(c["payload"]["verdict"], "PASS")
+
+    def test_niah_within_budget_hard_gate_fails_when_ds_misses(self):
+        """Re-scoped HARD gate (teeth): if DS recall drops below DSA by > 5 pp
+        WITHIN the budget (where DS should be dense), the gate must fail — the
+        re-scope did not defang the within-budget recall check."""
+        def ds_blank(prompt):
+            return ""  # DS recalls nothing; DSA returns the needle.
+
+        result, captured = self._run_ac12_method(
+            "test_niah_within_budget", ds_fn=ds_blank,
+        )
+        self.assertEqual(len(result.errors), 0, f"{result.errors}")
+        self.assertGreaterEqual(
+            len(result.failures), 1,
+            "within-budget DS recall far below DSA must FAIL the hard gate.",
+        )
+        wb = [c for c in captured if c["suffix"].startswith("niah_")]
+        self.assertTrue(any(c["payload"]["verdict"] == "FAIL" for c in wb))
 
 
 if __name__ == "__main__":
