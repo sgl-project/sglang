@@ -827,11 +827,14 @@ def _validate_jsonl_duration(
 
 
 def _validate_per_side_agreement(metas: List[Dict], paths: List[str], *, side: str) -> None:
-    """All trials within one side must share seed/commit/chunked/server-args."""
+    """All trials within one side must share seed/commit/chunked/server-args
+    and ``mem_fraction_static`` (the latter is ignored cross-side but must be
+    constant within a side)."""
     if not metas:
         return
     first = metas[0]
     first_norm = _normalize_ac11_server_args(first)
+    first_memfrac = (first.get("server_args") or {}).get("mem_fraction_static")
     for m, p in zip(metas[1:], paths[1:]):
         for field in ("seed", "commit_sha", "chunked_prefill_size",
                       "num_prompts", "isl_total_tokens", "osl_tokens"):
@@ -845,6 +848,20 @@ def _validate_per_side_agreement(metas: List[Dict], paths: List[str], *, side: s
             raise ValueError(
                 f"AC-11 {side}: trial {p} normalized server_args disagrees "
                 f"with first trial {paths[0]}."
+            )
+        # mem_fraction_static is recorded-not-matched ACROSS sides (DSA 0.85
+        # vs DS 0.6 is the sanctioned asymmetry, so it is excluded from the
+        # normalized projection above), but it must be CONSTANT WITHIN a side
+        # — otherwise the comparator would median across per-side mismatched
+        # launch knobs (e.g. DSA 0.85/0.80/0.75) without refusing.
+        m_memfrac = (m.get("server_args") or {}).get("mem_fraction_static")
+        if m_memfrac != first_memfrac:
+            raise ValueError(
+                f"AC-11 {side}: trial {p} mem_fraction_static={m_memfrac!r} "
+                f"disagrees with first trial {paths[0]} "
+                f"mem_fraction_static={first_memfrac!r} — within-side launch "
+                "knobs must be constant (the DSA-vs-DS cross-side mem-fraction "
+                "asymmetry is allowed; per-side drift is not)."
             )
 
 

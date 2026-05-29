@@ -12,23 +12,29 @@ blocks of 512 tokens each. ``--dataset`` overrides with a path to an external
 newline-delimited corpus. ``--allow-synthetic`` enables a small NIAH-shaped
 synthetic fallback reserved for CI and developer smoke tests only.
 
-Production recipe (DeepSeek-V3.2 on H200 cluster, FP8 serving):
+Production recipe (DeepSeek-V3.2 on H200 cluster, FP8 serving) — the exact
+command that produced the committed mask (see
+``runs/20260528_dsv32_mvp/calibration_provenance.md``):
 
     python -m sglang.srt.layers.attention.double_sparsity.calibrate \\
         --model /cluster-storage/models/deepseek-ai/DeepSeek-V3.2 \\
-        --dtype bfloat16 \\
-        --kv-cache-dtype fp8_e4m3 \\
-        --tp 1 \\
+        --dtype bfloat16 --kv-cache-dtype fp8_e4m3 --tp 8 \\
         --output /models/dsv32-fp8-channel-mask.safetensors \\
-        --label-dim 16 \\
-        --page-size 64 \\
-        --num-samples 256 \\
-        --block-size 512 \\
-        --seed 42
+        --label-dim 16 --page-size 64 --num-samples 256 --block-size 512 \\
+        --seed 42 \\
+        --dataset runs/20260528_dsv32_mvp/calib_corpus_pileval.txt -v
 
-``--dtype`` is the model loading dtype (bf16 for calibration stability).
-``--kv-cache-dtype`` is what goes into the mask metadata; it must match
-``--kv-cache-dtype`` at serving time (``fp8_e4m3`` for the Option-B path).
+``--dtype`` is a recorded forward-stability hint only — it no longer feeds the
+load: the checkpoint is loaded in its native (FP8) dtype via
+``torch_dtype="auto"`` and HF/Accelerate shards it across the visible GPUs via
+``device_map="auto"`` (V3.2 FP8 is ~671 GB and does not fit one rank). ``--tp``
+is likewise recorded metadata; it does NOT spawn a distributed group, so set it
+to match the serving TP (8) for provenance fidelity while ``device_map="auto"``
+does the actual sharding. ``--kv-cache-dtype`` is what goes into the mask
+metadata; it must match ``--kv-cache-dtype`` at serving time (``fp8_e4m3`` for
+the dense-prefill/sparse-decode serving path). The committed run passed an
+explicit local ``--dataset`` corpus (Pile-val streaming order is not
+seed-deterministic); without ``--dataset`` it streams ``pile-val-backup``.
 
 CI runs with ``--allow-synthetic`` against a tiny fixture (no network, <1 min).
 """

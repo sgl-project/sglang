@@ -885,6 +885,56 @@ class TestAC11EndToEnd(unittest.TestCase):
                     # but the run must proceed.
                     self.assertIn(self._ac11_main(dsa, ds), (0, 3))
 
+    def test_per_side_mem_fraction_drift_refused(self):
+        """``mem_fraction_static`` is ignored ACROSS sides (DSA 0.85 vs DS 0.6
+        is the sanctioned TokenLabelTable asymmetry) but must be CONSTANT
+        WITHIN a side. Per-side drift (e.g. DSA 0.85/0.80/0.75) must refuse
+        (exit 2) so the comparator never medians across mismatched per-side
+        launch knobs; a constant-per-side cross-side asymmetry still proceeds."""
+        # (a) Per-side mem-fraction drift on the DSA side -> refuse (exit 2).
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa_paths = []
+            for i, mf in enumerate((0.85, 0.80, 0.75)):
+                p = os.path.join(tmp, f"dsa_c64_t{i}.jsonl")
+                _write_bench_jsonl(
+                    p, concurrency=64, tps_p50=100, ttft_p99_s=10,
+                    mode="native_nsa", disable_radix_cache=True,
+                    sidecar_overrides={
+                        "server_args": _option_b_sa(mem_fraction_static=mf),
+                    },
+                )
+                dsa_paths.append(p)
+            ds_paths = self._make_trials(tmp, "ds", 64, [100, 100, 100], [10, 10, 10])
+            self.assertEqual(self._ac11_main(dsa_paths, ds_paths), 2)
+
+        # (b) Constant within each side, different across sides -> proceeds.
+        with tempfile.TemporaryDirectory() as tmp:
+            dsa_paths = []
+            for i in range(3):
+                p = os.path.join(tmp, f"dsa_c64_t{i}.jsonl")
+                _write_bench_jsonl(
+                    p, concurrency=64, tps_p50=100, ttft_p99_s=10,
+                    mode="native_nsa", disable_radix_cache=True,
+                    sidecar_overrides={
+                        "server_args": _option_b_sa(mem_fraction_static=0.85),
+                    },
+                )
+                dsa_paths.append(p)
+            ds_paths = []
+            for i in range(3):
+                p = os.path.join(tmp, f"ds_c64_t{i}.jsonl")
+                _write_bench_jsonl(
+                    p, concurrency=64, tps_p50=100, ttft_p99_s=10,
+                    mode="double_sparsity", disable_radix_cache=True,
+                    sidecar_overrides={
+                        "server_args": _option_b_sa(
+                            enable_ds=True, mem_fraction_static=0.6,
+                        ),
+                    },
+                )
+                ds_paths.append(p)
+            self.assertIn(self._ac11_main(dsa_paths, ds_paths), (0, 3))
+
     def test_server_args_locked_option_b_field_missing_refused(self):
         """Plan §13 (DEC-1) locks the Option B operating point: every
         locked launch field must be in the sidecar. A sidecar missing
