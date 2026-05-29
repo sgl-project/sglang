@@ -84,6 +84,12 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
         )
         yield from _advance_to_stage(r, stage)
 
+        # Decode tokens so far; retract preserves output_ids, so a correctly
+        # paused engine must not advance this count while paused.
+        req = r.req
+        assert req is not None, f"stage={stage}: req vanished before pause"
+        output_tokens_before_pause = len(req.output_ids)
+
         t.pause_generation(mode="retract")
         # Retract state is reflected in the scheduler on the next event-loop iter.
         yield
@@ -97,17 +103,16 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
             f"waiting_queue; found={req!r}"
         )
 
-        # retract releases committed KV, so kv_committed_len drops here; a
-        # correctly paused engine then makes no forward progress, so it must
-        # stay put across the paused iters.
-        committed_while_paused = req.kv_committed_len
+        # Sit paused for a few iters: the engine must make no forward progress.
         for _ in range(3):
             yield
             req = r.req
-            assert req is not None and req.kv_committed_len == committed_while_paused, (
+            assert (
+                req is not None and len(req.output_ids) == output_tokens_before_pause
+            ), (
                 f"stage={stage}: paused engine advanced the req "
-                f"(kv_committed_len={req.kv_committed_len if req is not None else None}, "
-                f"expected {committed_while_paused})"
+                f"({len(req.output_ids) if req is not None else None} output tokens, "
+                f"expected {output_tokens_before_pause})"
             )
 
         t.continue_generation()

@@ -142,25 +142,23 @@ def advance_to_nth_chunk(r, target_chunk: int, *, max_steps: int = DEFAULT_MAX_S
 
 
 def advance_to_decode_step(
-    r, target_decode_tokens: int, *, max_steps: int = DEFAULT_MAX_STEPS
+    r, target_output_len: int, *, max_steps: int = DEFAULT_MAX_STEPS
 ):
-    """Generator helper: ``yield`` until the req has decoded ``target_decode_tokens`` tokens.
+    """Generator helper: ``yield`` until the req has produced ``target_output_len`` decode tokens.
 
-    Measures decode progress as ``kv_committed_len - len(origin_input_ids)`` on
-    the raw ``Req`` and assumes the req runs to ``max_new_tokens`` by length —
+    Reads ``Req.output_ids`` directly (the output-length handle property is
+    still wishlist) and assumes the req runs to ``max_new_tokens`` by length —
     the synthetic decode does not stop early.
     """
     for _ in range(max_steps):
         assert (
             not r.finished
-        ), f"req finished before reaching decode step {target_decode_tokens}"
+        ), f"req finished before reaching decode step {target_output_len}"
         req = r.req
-        if req is not None:
-            decoded = req.kv_committed_len - len(req.origin_input_ids)
-            if decoded >= target_decode_tokens:
-                return
+        if req is not None and len(req.output_ids) >= target_output_len:
+            return
         yield
-    raise AssertionError(f"never reached decode step {target_decode_tokens}")
+    raise AssertionError(f"never reached decode step {target_output_len}")
 
 
 def advance_to_lifecycle_stage(
