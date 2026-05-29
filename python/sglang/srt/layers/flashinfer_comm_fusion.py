@@ -1,7 +1,5 @@
-import contextlib
 import inspect
 import logging
-import platform
 from typing import Optional, Tuple
 
 import torch
@@ -21,7 +19,6 @@ from sglang.srt.distributed import (
     get_tp_group,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.environ import envs
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     ceil_align,
@@ -42,7 +39,6 @@ _flashinfer_allreduce_unavailable = False
 _flashinfer_create_workspace_supports_group = False
 _flashinfer_create_workspace_supports_comm_backend = False
 _flashinfer_allreduce_supports_trigger_completion = False
-_posix_transport_override_logged = False
 _mnnvl_non_blackwell_fallback_logged = False
 
 
@@ -69,71 +65,6 @@ def resolve_flashinfer_allreduce_fusion_backend(server_args) -> Optional[str]:
     if backend is None:
         return None
     return _resolve_backend(backend)
-
-
-def _should_force_posix_fd_transport() -> bool:
-    force_posix_env = envs.SGLANG_FLASHINFER_FORCE_POSIX_FD_TRANSPORT.get()
-    if force_posix_env is not None:
-        return force_posix_env
-
-    machine = platform.machine().lower()
-    if machine not in ("aarch64", "arm64"):
-        return False
-
-    if not torch.cuda.is_available():
-        return False
-
-    try:
-        major, _minor = torch.cuda.get_device_capability(torch.cuda.current_device())
-    except Exception as e:
-        logger.debug("Failed to get CUDA device capability: %s", e)
-        return False
-
-    return major == 10
-
-
-@contextlib.contextmanager
-def _flashinfer_posix_fd_transport_override_if_needed():
-    # TODO(mmangkad): Remove this temporary override once the
-    # FlashInfer unified allreduce-fusion transport issue on
-    # GB200/GB300 platforms is fixed and verified resolved.
-    global _posix_transport_override_logged
-
-    if not _should_force_posix_fd_transport():
-        yield
-        return
-
-    try:
-        import flashinfer.comm.mnnvl as flashinfer_mnnvl
-    except Exception as e:
-        logger.debug(
-            "Failed to import flashinfer.comm.mnnvl for transport override: %s", e
-        )
-        yield
-        return
-
-    original_checker = getattr(flashinfer_mnnvl, "is_mnnvl_fabric_supported", None)
-    if original_checker is None:
-        yield
-        return
-
-    if not _posix_transport_override_logged:
-        logger.warning(
-            "Applying FlashInfer transport workaround: forcing PosixFD "
-            "symmetric-memory handle exchange on aarch64 + sm10x to avoid "
-            "known data corruption with Fabric handle exchange on GB systems. "
-            "Set SGLANG_FLASHINFER_FORCE_POSIX_FD_TRANSPORT=0 to disable."
-        )
-        _posix_transport_override_logged = True
-
-    def _always_disable_fabric(_device_idx: int) -> bool:
-        return False
-
-    flashinfer_mnnvl.is_mnnvl_fabric_supported = _always_disable_fabric
-    try:
-        yield
-    finally:
-        flashinfer_mnnvl.is_mnnvl_fabric_supported = original_checker
 
 
 if is_flashinfer_available():
@@ -268,21 +199,16 @@ def is_flashinfer_allreduce_unavailable() -> bool:
 
 
 def _make_flashinfer_workspace_allocation_prop(cuda_driver):
-    if _should_force_posix_fd_transport():
+    from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
+
+    if is_mnnvl_fabric_supported(torch.cuda.current_device()):
+        handle_type = (
+            cuda_driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+        )
+    else:
         handle_type = (
             cuda_driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
         )
-    else:
-        from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
-
-        if is_mnnvl_fabric_supported(torch.cuda.current_device()):
-            handle_type = (
-                cuda_driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-            )
-        else:
-            handle_type = (
-                cuda_driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-            )
 
     prop = cuda_driver.CUmemAllocationProp()
     prop.requestedHandleTypes = handle_type
@@ -564,8 +490,7 @@ class FlashInferWorkspaceManager:
                 create_kw["force_oneshot_support"] = bool(use_oneshot)
             if use_fp32_lamport:
                 create_kw["use_fp32_lamport"] = True
-            with _flashinfer_posix_fd_transport_override_if_needed():
-                self.workspace = _create_allreduce_fusion_workspace(**create_kw)
+            self.workspace = _create_allreduce_fusion_workspace(**create_kw)
             self.world_size = world_size
             self.rank = rank
             self.group = (device_group, cpu_group)
