@@ -143,6 +143,131 @@ class TestRadixKey(unittest.TestCase):
         self.assertIn("...", repr_str)  # Should be truncated
 
 
+def _reference_match(a_tokens, b_tokens, page_size: int, is_bigram: bool) -> int:
+    """Independent scalar reference for RadixKey.match semantics.
+
+    Mirrors the original token-by-token implementation so the vectorized
+    production code can be diff-tested against it.
+    """
+    a = RadixKey(array("q", a_tokens), is_bigram=is_bigram)
+    b = RadixKey(array("q", b_tokens), is_bigram=is_bigram)
+    t0, t1 = a.token_ids, b.token_ids
+
+    if is_bigram:
+        i = 0
+        for x, y in zip(t0, t1):
+            if x != y:
+                break
+            i += 1
+        matched = max(0, min(i - 1, len(a), len(b)))
+        return (matched // page_size) * page_size if page_size > 1 else matched
+
+    if page_size == 1:
+        i = 0
+        for x, y in zip(t0, t1):
+            if x != y:
+                break
+            i += 1
+        return i
+
+    min_len = min(len(a), len(b))
+    i = 0
+    while i < min_len:
+        if t0[i : i + page_size] != t1[i : i + page_size]:
+            break
+        i += page_size
+    return i
+
+
+class TestRadixKeyMatch(unittest.TestCase):
+    """Behavior lock for RadixKey.match across all branches and edge cases."""
+
+    def _match(self, a_tokens, b_tokens, page_size=1, is_bigram=False):
+        a = RadixKey(array("q", a_tokens), is_bigram=is_bigram)
+        b = RadixKey(array("q", b_tokens), is_bigram=is_bigram)
+        return a.match(b, page_size=page_size)
+
+    def test_full_match_page1(self):
+        self.assertEqual(self._match([1, 2, 3], [1, 2, 3]), 3)
+
+    def test_no_match_page1(self):
+        self.assertEqual(self._match([9, 2, 3], [1, 2, 3]), 0)
+
+    def test_partial_match_page1(self):
+        self.assertEqual(self._match([1, 2, 9, 4], [1, 2, 3, 4]), 2)
+
+    def test_prefix_shorter_self(self):
+        self.assertEqual(self._match([1, 2], [1, 2, 3, 4]), 2)
+
+    def test_prefix_shorter_other(self):
+        self.assertEqual(self._match([1, 2, 3, 4], [1, 2]), 2)
+
+    def test_empty_keys(self):
+        self.assertEqual(self._match([], []), 0)
+        self.assertEqual(self._match([], [1, 2]), 0)
+        self.assertEqual(self._match([1, 2], []), 0)
+
+    def test_extra_key_mismatch_raises(self):
+        a = RadixKey(array("q", [1, 2, 3]), extra_key="lora-A")
+        b = RadixKey(array("q", [1, 2, 3]), extra_key="lora-B")
+        with self.assertRaises(ValueError):
+            a.match(b)
+
+    def test_page_size_alignment(self):
+        # 5 matching tokens, page_size 4 -> rounded down to 4
+        self.assertEqual(
+            self._match([1, 2, 3, 4, 5, 9], [1, 2, 3, 4, 5, 8], page_size=4), 4
+        )
+        # 3 matching tokens, page_size 4 -> 0
+        self.assertEqual(self._match([1, 2, 3, 9], [1, 2, 3, 8], page_size=4), 0)
+        # exactly 8 matching, page_size 4 -> 8
+        self.assertEqual(
+            self._match(
+                [1, 2, 3, 4, 5, 6, 7, 8], [1, 2, 3, 4, 5, 6, 7, 8], page_size=4
+            ),
+            8,
+        )
+
+    def test_bigram_basic(self):
+        # raw tokens [1,2,3] => bigrams (1,2),(2,3); both share prefix tokens
+        # L matching tokens => L-1 matching bigrams
+        self.assertEqual(self._match([1, 2, 3, 4], [1, 2, 3, 9], is_bigram=True), 2)
+        self.assertEqual(self._match([1, 2, 9], [1, 2, 8], is_bigram=True), 1)
+        self.assertEqual(self._match([9, 2, 3], [1, 2, 3], is_bigram=True), 0)
+
+    def test_bigram_with_page_size(self):
+        # 5 matching raw tokens -> 4 matching bigrams -> page-align to 4
+        self.assertEqual(
+            self._match(
+                [1, 2, 3, 4, 5, 9], [1, 2, 3, 4, 5, 8], page_size=4, is_bigram=True
+            ),
+            4,
+        )
+
+    def test_differential_random(self):
+        rng = random.Random(20260528)
+        for _ in range(3000):
+            page_size = rng.choice([1, 2, 4, 8])
+            is_bigram = rng.choice([True, False])
+            n0 = rng.randint(0, 40)
+            n1 = rng.randint(0, 40)
+            shared = rng.randint(0, min(n0, n1) if min(n0, n1) > 0 else 0)
+            # vocab kept small to force collisions/matches
+            base = [rng.randint(0, 3) for _ in range(max(n0, n1))]
+            a_tokens = base[:n0]
+            b_tokens = list(base[:shared]) + [
+                rng.randint(0, 3) for _ in range(n1 - shared)
+            ]
+            b_tokens = b_tokens[:n1]
+            expected = _reference_match(a_tokens, b_tokens, page_size, is_bigram)
+            got = self._match(a_tokens, b_tokens, page_size, is_bigram)
+            self.assertEqual(
+                got,
+                expected,
+                msg=f"{a_tokens=} {b_tokens=} {page_size=} {is_bigram=}",
+            )
+
+
 class TestTreeNode(unittest.TestCase):
     """Test cases for TreeNode class."""
 

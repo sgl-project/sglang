@@ -30,6 +30,7 @@ from array import array
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
@@ -145,37 +146,51 @@ class RadixKey:
                 f"{self.extra_key=} != {other.extra_key=}"
             )
 
-    # TODO(Jialin): replace zip with numpy to skip per-element PyLong boxing
+    @staticmethod
+    def _first_mismatch(t0: array[int], t1: array[int]) -> int:
+        """Number of equal leading raw tokens, capped at the shorter length.
+
+        Zero-copy view over the int64 ``array('q')`` buffers, so the per-token
+        comparison runs in C instead of a Python loop with PyLong boxing.
+
+        Precondition: callers must pass ``array('q')`` (int64) buffers. This
+        holds throughout the radix tree -- ``RadixKey.token_ids`` is always an
+        ``array('q')`` (the Scheduler stores token ids this way and every
+        internal producer preserves the type), so ``np.frombuffer`` is safe
+        without a per-call type/itemsize guard on this hot path.
+        """
+        n = len(t0) if len(t0) < len(t1) else len(t1)
+        if n == 0:
+            return 0
+        a = np.frombuffer(t0, dtype=np.int64, count=n)
+        b = np.frombuffer(t1, dtype=np.int64, count=n)
+        nz = np.flatnonzero(a != b)
+        return int(nz[0]) if nz.size else n
+
     def match(self, other: "RadixKey", page_size: int = 1) -> int:
         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
         self._check_compatible(other)
         t0, t1 = self.token_ids, other.token_ids
+        i = self._first_mismatch(t0, t1)
 
         if self.is_bigram:
-            # Walk raw tokens; L matching tokens imply L-1 matching bigrams.
-            i = 0
-            for a, b in zip(t0, t1):
-                if a != b:
-                    break
-                i += 1
+            # L matching raw tokens imply L-1 matching bigrams.
             matched = max(0, min(i - 1, len(self), len(other)))
             return (matched // page_size) * page_size if page_size > 1 else matched
 
         if page_size == 1:
-            i = 0
-            for a, b in zip(t0, t1):
-                if a != b:
-                    break
-                i += 1
             return i
 
-        min_len = min(len(self), len(other))
-        i = 0
-        while i < min_len:
-            if t0[i : i + page_size] != t1[i : i + page_size]:
-                break
-            i += page_size
-        return i
+        len0, len1 = len(t0), len(t1)
+        n = len0 if len0 < len1 else len1
+        if i < n:
+            return (i // page_size) * page_size
+        # All compared tokens matched up to the shorter length. Mirror the
+        # scalar slice-compare: a trailing partial page only counts when both
+        # slices have equal length (i.e. both arrays end together).
+        if len0 == len1:
+            return ((n + page_size - 1) // page_size) * page_size
+        return (n // page_size) * page_size
 
     def child_key(self, page_size: int = 1):
         """Hashable dict-key for the first ``page_size`` logical units, namespaced by ``extra_key``."""
