@@ -1162,52 +1162,20 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
-      - name: Resolve DSv4 image tag
-        id: dsv4_image
-        run: |
-          # Pick the latest Docker Hub tag matching rocm720-mi35x-<sha7>-<YYYYMMDD>-DSv4.
-          # Docker Hub returns results sorted by last_updated DESC by default, so the
-          # first regex match is the most recent daily build.
-          AUTH_HEADER=()
-          if [[ -n "${DOCKERHUB_AMD_USERNAME:-}" && -n "${DOCKERHUB_AMD_TOKEN:-}" ]]; then
-            TOKEN=$(curl -s -H "Content-Type: application/json" \
-              -X POST -d "{\"username\":\"${DOCKERHUB_AMD_USERNAME}\",\"password\":\"${DOCKERHUB_AMD_TOKEN}\"}" \
-              https://hub.docker.com/v2/users/login/ | python3 -c "import json,sys; print(json.load(sys.stdin).get('token',''))")
-            if [[ -n "$TOKEN" ]]; then
-              AUTH_HEADER=(-H "Authorization: JWT $TOKEN")
-            fi
-          fi
-          TAG=$(curl -s "${AUTH_HEADER[@]}" \
-            "https://hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=DSv4" \
-            | grep -oE '"name":"rocm720-mi35x-[a-f0-9]{7}-[0-9]{8}-DSv4"' \
-            | head -n 1 | cut -d'"' -f4)
-          if [ -z "$TAG" ]; then
-            echo "::error::No DSv4 image found matching rocm720-mi35x-<sha7>-<YYYYMMDD>-DSv4 on Docker Hub"
-            exit 1
-          fi
-          echo "image=rocm/sgl-dev:$TAG" >> "$GITHUB_OUTPUT"
-          echo "Resolved DSv4 image: rocm/sgl-dev:$TAG"
-
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
-      - name: Setup docker (ROCm 7.2 DSv4)
+      - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --custom-image ${{ steps.dsv4_image.outputs.image }}
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Install dependencies (preserve DSv4 sglang/aiter from image)
+      - name: Install dependencies
         run: |
-          # --skip-sglang-build: keep the image's pre-installed DSv4 sglang
-          #   (default would `pip install -e /sglang-checkout/python` and clobber it with main's source).
-          # --skip-aiter-build: keep the image's DSv4-tuned aiter
-          #   (default reads /sglang-checkout/docker/rocm.Dockerfile from main and rebuilds aiter to that commit).
           # --skip-test-time-deps: GSM8K + bench_one_batch_server don't need lmms-eval / human-eval.
-          bash scripts/ci/amd/amd_ci_install_dependency.sh \
-            --skip-sglang-build --skip-aiter-build --skip-test-time-deps
-          # tabulate is the only thing run_suite.py imports that may not be in the DSv4 image.
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
       - name: Accuracy + Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Flash FP8 + FP4)
@@ -1229,43 +1197,20 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
-      - name: Resolve DSv4 image tag
-        id: dsv4_image
-        run: |
-          AUTH_HEADER=()
-          if [[ -n "${DOCKERHUB_AMD_USERNAME:-}" && -n "${DOCKERHUB_AMD_TOKEN:-}" ]]; then
-            TOKEN=$(curl -s -H "Content-Type: application/json" \
-              -X POST -d "{\"username\":\"${DOCKERHUB_AMD_USERNAME}\",\"password\":\"${DOCKERHUB_AMD_TOKEN}\"}" \
-              https://hub.docker.com/v2/users/login/ | python3 -c "import json,sys; print(json.load(sys.stdin).get('token',''))")
-            if [[ -n "$TOKEN" ]]; then
-              AUTH_HEADER=(-H "Authorization: JWT $TOKEN")
-            fi
-          fi
-          TAG=$(curl -s "${AUTH_HEADER[@]}" \
-            "https://hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=DSv4" \
-            | grep -oE '"name":"rocm720-mi35x-[a-f0-9]{7}-[0-9]{8}-DSv4"' \
-            | head -n 1 | cut -d'"' -f4)
-          if [ -z "$TAG" ]; then
-            echo "::error::No DSv4 image found matching rocm720-mi35x-<sha7>-<YYYYMMDD>-DSv4 on Docker Hub"
-            exit 1
-          fi
-          echo "image=rocm/sgl-dev:$TAG" >> "$GITHUB_OUTPUT"
-          echo "Resolved DSv4 image: rocm/sgl-dev:$TAG"
-
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
-      - name: Setup docker (ROCm 7.2 DSv4)
+      - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --custom-image ${{ steps.dsv4_image.outputs.image }}
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Install dependencies (preserve DSv4 sglang/aiter from image)
+      - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh \
-            --skip-sglang-build --skip-aiter-build --skip-test-time-deps
+          # --skip-test-time-deps: GSM8K + bench_one_batch_server don't need lmms-eval / human-eval.
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
       - name: Accuracy + Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Pro FP8 + FP4)
