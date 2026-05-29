@@ -18,17 +18,17 @@
 #   --disable-overlap-schedule
 #   --disable-piecewise-cuda-graph
 #   --page-size 64
-# NOTE: by default this script does NOT pass --disable-radix-cache. Per
-# plan §13 the loop4-compatible AC-11 sweep runs the DSA baseline with radix
-# cache ON so any DS TPS gap vs DSA reflects the DS configuration alone, not
-# the radix gate that DS still has to clear (AC-10).
+# NOTE: by default this script does NOT pass --disable-radix-cache. The
+# directional performance sweep runs the DSA baseline with radix cache ON so
+# any DS TPS gap vs DSA reflects the DS configuration alone, not the radix gate
+# that DS still has to clear.
 #
-# The TIER-1 smoke is different: DS still launches with --disable-radix-cache
-# (the AC-10 gate has not been flipped yet) and the two-column comparator
-# (development/benchmark_compare.py) refuses a radix-cache mismatch between
-# the columns. Set DISABLE_RADIX_CACHE=1 to launch this baseline radix-off so
-# the smoke compares apples-to-apples. Leave it unset (default ON) for the
-# radix-on AC-11 sweep once DS has cleared the AC-10 flip.
+# The quick smoke is different: while DS still launches radix-off (before its
+# radix gate is cleared), the two-column comparator
+# (development/benchmark_compare.py) refuses a radix-cache mismatch between the
+# columns. Set DISABLE_RADIX_CACHE=1 to launch this baseline radix-off so the
+# smoke compares apples-to-apples. Leave it unset (default ON) for the radix-on
+# sweep once DS serves radix-on.
 
 set -euo pipefail
 
@@ -47,8 +47,8 @@ PAGE_SIZE="${PAGE_SIZE:-64}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
 LOG_DIR="${LOG_DIR:-$(pwd)/development/logs}"
 
-# Radix-off parity knob for the TIER-1 smoke (see header NOTE). Default 0
-# keeps radix cache ON for the AC-11 sweep; set DISABLE_RADIX_CACHE=1 to add
+# Radix-off parity knob for the quick smoke (see header NOTE). Default 0 keeps
+# radix cache ON for the directional sweep; set DISABLE_RADIX_CACHE=1 to add
 # --disable-radix-cache so the smoke matches the DS launcher.
 DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
 RADIX_CACHE_ARG=""
@@ -66,7 +66,7 @@ echo "    tp_size      = ${TP_SIZE}"
 echo "    kv_cache     = ${KV_CACHE_DTYPE}"
 echo "    page_size    = ${PAGE_SIZE}"
 echo "    mem_fraction = ${MEM_FRACTION_STATIC}"
-echo "    radix_cache  = $([[ -n "${RADIX_CACHE_ARG}" ]] && echo "disabled (smoke parity)" || echo "enabled (AC-11 default)")"
+echo "    radix_cache  = $([[ -n "${RADIX_CACHE_ARG}" ]] && echo "disabled (smoke parity)" || echo "enabled (default)")"
 echo "    log          = ${LOG_FILE}"
 
 exec python3 -m sglang.launch_server \

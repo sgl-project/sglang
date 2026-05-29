@@ -76,51 +76,49 @@ class TestOptionBLockedFlagsServerScripts(unittest.TestCase):
                 f"serve_native_nsa.sh missing locked Option B flag {flag!r}",
             )
 
-    def test_dsa_server_does_not_disable_radix_cache(self):
-        """Per plan §13 the DSA baseline runs with radix cache ON, so the
-        DS-vs-DSA TPS gap reflects DS configuration alone, not the AC-10
-        radix-cache gate that DS still has to clear."""
+    def test_dsa_server_radix_on_by_default_with_smoke_knob(self):
+        """The DSA baseline runs with radix cache ON by default so the
+        DS-vs-DSA TPS gap reflects DS configuration alone. A
+        ``DISABLE_RADIX_CACHE=1`` knob may add ``--disable-radix-cache``
+        for the radix-off smoke parity run, but only inside that guard —
+        never unconditionally."""
         text = _non_comment_lines(DSA_SERVER)
-        self.assertNotIn(
-            "--disable-radix-cache", text,
-            "serve_native_nsa.sh must NOT pass --disable-radix-cache "
-            "(DSA baseline runs with radix on per plan §13).",
+        # Default off => radix cache stays ON unless the operator opts in.
+        self.assertIn(
+            'DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"', text,
+            "serve_native_nsa.sh must default the radix-off knob to 0 "
+            "(radix cache ON by default).",
         )
+        # --disable-radix-cache appears only inside the knob guard.
+        self.assertIn('if [[ "${DISABLE_RADIX_CACHE}" == "1" ]]; then', text)
+        self.assertIn('RADIX_CACHE_ARG="--disable-radix-cache"', text)
 
-    def test_ds_server_does_disable_radix_cache_until_ac10(self):
-        """The DS launcher keeps --disable-radix-cache until AC-10 passes."""
+    def test_ds_server_radix_off_by_default(self):
+        """The DS launcher serves radix-off by default (the radix-cache
+        validator gate is satisfied only via the fixture-artifact path
+        below)."""
         text = _non_comment_lines(DS_SERVER)
         self.assertIn(
-            "--disable-radix-cache", text,
-            "serve_double_sparsity.sh must keep --disable-radix-cache "
-            "until AC-10 (radix-cache fixture) passes.",
+            "RADIX_ARGS=(--disable-radix-cache)", text,
+            "serve_double_sparsity.sh default branch must keep "
+            "--disable-radix-cache (radix-off) when no fixture artifact "
+            "is provided.",
         )
 
-    def test_ds_server_has_ac10_fixture_marker(self):
-        """A marker comment above the ``--disable-radix-cache`` line
-        names the exact edit point operators delete after the M3-B
-        fixture passes + ``record_radix_fixture_passed`` is wired into
-        the launcher. The marker keeps the comment-only audit trail
-        permanent so the next operator can grep for it years later."""
-        # Read the FULL script (including comments) so the inline
-        # marker is visible — `_non_comment_lines` strips comments by
-        # design.
-        text = DS_SERVER.read_text()
+    def test_ds_server_artifact_driven_radix_on(self):
+        """Radix cache ON is enabled via a config-bound fixture-passed
+        state file (``RADIX_FIXTURE_ARTIFACT`` ->
+        ``--double-sparsity-radix-fixture-artifact``), which the validator
+        re-verifies before serving. No environment override and no fixed
+        edit-point marker is required."""
+        text = _non_comment_lines(DS_SERVER)
+        self.assertIn('RADIX_FIXTURE_ARTIFACT="${RADIX_FIXTURE_ARTIFACT:-}"', text)
         self.assertIn(
-            "AC-10-FIXTURE-MARKER", text,
-            "serve_double_sparsity.sh must carry the # AC-10-FIXTURE-MARKER "
-            "comment above --disable-radix-cache so the post-AC-10 flag "
-            "removal is a mechanical one-line edit.",
+            "--double-sparsity-radix-fixture-artifact", text,
+            "serve_double_sparsity.sh must pass the fixture artifact when "
+            "RADIX_FIXTURE_ARTIFACT is set (the radix-on path).",
         )
-        # The marker must sit ABOVE the radix-cache flag (operator
-        # deletes the next line; the marker stays).
-        marker_idx = text.index("AC-10-FIXTURE-MARKER")
-        flag_idx = text.index("--disable-radix-cache")
-        self.assertLess(
-            marker_idx, flag_idx,
-            "the marker must appear before --disable-radix-cache so "
-            "operators see the edit-point context",
-        )
+        self.assertIn('"${RADIX_ARGS[@]}"', text)
 
 
 class TestOptionBBenchmarkSweeps(unittest.TestCase):

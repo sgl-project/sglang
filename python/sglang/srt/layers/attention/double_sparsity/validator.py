@@ -294,13 +294,13 @@ def record_radix_fixture_passed(
     )
 
 
-# ----- AC-10 no-env-override radix flip (DEC-5) ------------------------------
+# ----- No-env-override radix-cache flip via a config-bound state file --------
 #
 # The radix flip is authorized by a config-bound state file, NOT an env var.
-# After the operator runs BOTH M3-B fixtures on hardware and they pass, they
-# write a state file via `write_radix_fixture_state(...)` recording both passes
-# plus a fingerprint of the exact serving config (model / TP / page / KV dtype /
-# channel-mask SHA). `serve_double_sparsity.sh` then passes
+# After the operator runs BOTH page-stability fixtures on hardware and they
+# pass, they write a state file via `write_radix_fixture_state(...)` recording
+# both passes plus a fingerprint of the exact serving config (model / TP / page
+# / KV dtype / channel-mask SHA). `serve_double_sparsity.sh` then passes
 # `--double-sparsity-radix-fixture-artifact <state-file>`; `check_server_args`
 # calls `apply_radix_fixture_artifact(server_args)` BEFORE
 # `validate_double_sparsity`, which verifies the state matches THIS boot's
@@ -374,7 +374,7 @@ def apply_radix_fixture_artifact(server_args: "ServerArgs") -> None:
         return  # radix-off needs no authorization
     artifact = getattr(server_args, "double_sparsity_radix_fixture_artifact", None)
     if not artifact:
-        return  # let validate_double_sparsity raise the DEC-2 refusal
+        return  # let validate_double_sparsity raise the radix-cache refusal
 
     if not os.path.isfile(artifact):
         raise ValueError(

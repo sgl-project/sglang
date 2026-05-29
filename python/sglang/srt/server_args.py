@@ -6114,7 +6114,7 @@ class ServerArgs:
                 "validator.write_radix_fixture_state after BOTH M3-B fixtures pass on "
                 "this config). When provided and --disable-radix-cache is absent, the "
                 "DS validator verifies the state matches this boot's config and then "
-                "permits radix cache ON -- the no-env-override AC-10 flip (DEC-5)."
+                "permits radix cache ON -- the no-env-override radix-cache flip."
             ),
         )
 
@@ -7210,8 +7210,8 @@ class ServerArgs:
             validate_double_sparsity,
         )
 
-        # AC-10 (DEC-5): authorize the radix-cache flip from the config-bound
-        # fixture state file BEFORE validation, with no env override.
+        # Authorize the radix-cache flip from the config-bound fixture state
+        # file BEFORE validation, with no env override.
         apply_radix_fixture_artifact(self)
         validate_double_sparsity(self)
 
