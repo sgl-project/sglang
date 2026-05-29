@@ -479,7 +479,7 @@ Max ITL (ms):                            36863.32
 
 #### 5.1.2 NVIDIA (B200/GB200) Standard Scenario Benchmark
 
-The following runs use the same random dataset benchmark client commands as the AMD section. On GB200, launch the server with `--tp 4 --ep 4`.
+The following runs use the same random dataset benchmark client commands as the AMD section. On B200, launch the server with `SGLANG_USE_AITER=0 python -m sglang.launch_server --model Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 --tp 8 --ep 2 --context-length 8192 --page-size 32 --trust-remote-code`.
 
 ##### 5.1.2.1 FP8 Model
 
