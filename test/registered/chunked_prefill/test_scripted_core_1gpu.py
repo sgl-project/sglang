@@ -32,11 +32,9 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
         yield from run_until_finished(r)
         assert r.finished, "req did not finish"
 
-    _CHUNK_BOUNDARY_OFFSETS = (-2, -1, 1, 2)
-
     def test_chunked_prefill_smoke_at_chunk_boundary_offsets(self):
         """Prompt lengths just off a chunk-size multiple (+/-1, +/-2) still finish cleanly."""
-        for offset in self._CHUNK_BOUNDARY_OFFSETS:
+        for offset in (-2, -1, 1, 2):
             prompt_len = 2 * _CHUNK_SIZE + offset
             with self.subTest(offset=offset, prompt_len=prompt_len):
                 self.runtime.run(
