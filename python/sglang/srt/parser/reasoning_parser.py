@@ -797,14 +797,11 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
             s_text = buf.find(self.TEXT_START_TOKEN)
             s_action = buf.find(self.ACTION_START_TOKEN)
             picks = [
-                (p, k)
-                for p, k in ((s_text, "text"), (s_action, "action"))
-                if p != -1
+                (p, k) for p, k in ((s_text, "text"), (s_action, "action")) if p != -1
             ]
             if not picks:
                 max_keep = (
-                    max(len(self.TEXT_START_TOKEN), len(self.ACTION_START_TOKEN))
-                    - 1
+                    max(len(self.TEXT_START_TOKEN), len(self.ACTION_START_TOKEN)) - 1
                 )
                 if len(buf) > max_keep:
                     self._buffer = buf[-max_keep:]

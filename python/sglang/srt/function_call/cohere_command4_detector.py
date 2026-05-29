@@ -81,9 +81,7 @@ class CohereCommand4Detector(BaseFormatDetector):
             out.append(normalized)
         return out
 
-    def detect_and_parse(
-        self, text: str, tools: List[Tool]
-    ) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """Non-streaming parse."""
         idx = text.find(self.bot_token)
         if idx == -1:
