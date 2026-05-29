@@ -4,6 +4,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
+    DEFAULT_MAX_STEPS,
     base_engine_kwargs,
     run_until,
     run_until_finished,
@@ -19,6 +20,67 @@ _CHUNK_SIZE = 64
 # chunk is partial — exercises the off-by-one path instead of clean
 # chunk boundaries.
 _PROMPT_LEN = 4 * _CHUNK_SIZE - 3
+
+# Chunks that keep the req in the chunked_req slot (is_chunking == True):
+# the final extend completes prefill in one shot and is not chunked, so the
+# count is ceil(_PROMPT_LEN / _CHUNK_SIZE) - 1 == (_PROMPT_LEN - 1) // _CHUNK_SIZE.
+_NUM_MIDDLE_CHUNKS = (_PROMPT_LEN - 1) // _CHUNK_SIZE
+# Enough decode steps that first / middle / last decode are distinct points.
+_PAUSE_MAX_NEW_TOKENS = 4
+_PAUSE_STAGES = (
+    "first_chunk",
+    "last_chunk",
+    "first_decode",
+    "mid_decode",
+    "last_decode",
+)
+
+
+def _advance_to_nth_chunk(t: "ScriptedRuntime", r, target_chunk: int):
+    """Yield until the req is processing its ``target_chunk``-th chunked iter."""
+    seen = 0
+    for _ in range(DEFAULT_MAX_STEPS):
+        assert not r.finished, f"req finished before reaching chunk {target_chunk}"
+        if r.is_chunking:
+            seen += 1
+            if seen >= target_chunk:
+                return
+        yield
+    raise AssertionError(f"never reached chunk {target_chunk} (saw {seen})")
+
+
+def _advance_to_decode_step(t: "ScriptedRuntime", r, target_output_len: int):
+    """Yield until the req has produced ``target_output_len`` decode tokens.
+
+    Assumes the req runs to ``max_new_tokens`` by length (the synthetic decode
+    does not stop early); reads ``Req.output_ids`` directly since the
+    output-length handle property is still wishlist.
+    """
+    for _ in range(DEFAULT_MAX_STEPS):
+        assert (
+            not r.finished
+        ), f"req finished before reaching decode step {target_output_len}"
+        req = t._find_req_by_rid(r.rid)
+        if req is not None and len(req.output_ids) >= target_output_len:
+            return
+        yield
+    raise AssertionError(f"never reached decode step {target_output_len}")
+
+
+def _advance_to_stage(t: "ScriptedRuntime", r, stage: str):
+    """Yield until the req reaches the named lifecycle ``stage``."""
+    if stage == "first_chunk":
+        yield from _advance_to_nth_chunk(t, r, 1)
+    elif stage == "last_chunk":
+        yield from _advance_to_nth_chunk(t, r, _NUM_MIDDLE_CHUNKS)
+    elif stage == "first_decode":
+        yield from _advance_to_decode_step(t, r, 1)
+    elif stage == "mid_decode":
+        yield from _advance_to_decode_step(t, r, _PAUSE_MAX_NEW_TOKENS // 2)
+    elif stage == "last_decode":
+        yield from _advance_to_decode_step(t, r, _PAUSE_MAX_NEW_TOKENS - 1)
+    else:
+        raise AssertionError(f"unknown stage {stage!r}")
 
 
 class TestScriptedCore(ScriptedRuntimeTestCase):
@@ -50,14 +112,19 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
         yield from run_until_finished(r)
         assert r.finished, f"req with prompt_len={prompt_len} did not finish"
 
-    def test_pause_generation_retract_clears_chunked_req(self):
-        """Mid-chunk pause_generation(retract) drops the req back to waiting and clears the chunked slot."""
-        self.runtime.run(self._script_pause_generation_retract_clears_chunked_req)
+    def test_pause_retract_at_lifecycle_points_then_resume(self):
+        """Pause(retract) at each lifecycle stage, sit paused, continue, and the req still finishes."""
+        for stage in _PAUSE_STAGES:
+            with self.subTest(stage=stage):
+                self.runtime.run(
+                    self._script_pause_retract_at_stage,
+                    args=(stage,),
+                )
 
     @staticmethod
-    def _script_pause_generation_retract_clears_chunked_req(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking)
+    def _script_pause_retract_at_stage(t: ScriptedRuntime, stage: str):
+        r = t.start_req(prompt_len=_PROMPT_LEN, max_new_tokens=_PAUSE_MAX_NEW_TOKENS)
+        yield from _advance_to_stage(t, r, stage)
 
         t.pause_generation(mode="retract")
         # Retract state is reflected in the scheduler on the next event-loop iter.
@@ -68,13 +135,17 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
         # in waiting_queue rather than still running or finished.
         req = t._find_req_by_rid(r.rid)
         assert req is not None and req in t._scheduler.waiting_queue, (
-            f"after pause(retract) the req should be back in waiting_queue; "
-            f"found={req!r}"
+            f"stage={stage}: pause(retract) should park the req back in "
+            f"waiting_queue; found={req!r}"
         )
+
+        # Sit paused for a few iters before resuming.
+        for _ in range(3):
+            yield
 
         t.continue_generation()
         yield from run_until_finished(r)
-        assert r.finished, "req did not resume to finished"
+        assert r.finished, f"stage={stage}: req did not finish after pause/continue"
 
     def test_abort_all_during_chunked_prefill_clears_chunked_req(self):
         """Mid-chunk abort_all() terminates the req; scheduler clears the chunked slot within a few yields."""
