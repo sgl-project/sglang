@@ -205,6 +205,8 @@ class MockGDNModelRunner(ModelRunner):
         self.dtype = dtype
         self.kv_cache_dtype = dtype
         self.gpu_id = 0
+        # This mock skips the real ModelRunner.__init__, so install_canary never runs.
+        self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
         speculative_num_draft_tokens = (
