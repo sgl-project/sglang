@@ -3,6 +3,8 @@ import shutil
 import tempfile
 import unittest
 
+from test_unified_radix_cache_kl_hicache_nightly import AccuracyTwoPassMixin
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
@@ -17,7 +19,6 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
-from test_unified_radix_cache_kl_hicache_nightly import AccuracyTwoPassMixin
 
 register_cuda_ci(est_time=768, stage="base-c", runner_config="4-gpu-h100")
 
