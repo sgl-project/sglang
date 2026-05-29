@@ -660,8 +660,19 @@ class DeepseekV4HipRadixBackend(
         )
 
     def init_forward_data(self, forward_batch: ForwardBatch):
-        # Eager path stays on init_forward_metadata.
+        # Eager path: build host-side metadata then run the in-graph step
+        # so PREP_IN_CUDA_GRAPH=1 still upgrades Raw→Full (no-op when
+        # init_forward_metadata already produced a Full DSV4Metadata).
         self.init_forward_metadata(forward_batch)
+        self.init_forward_data_in_graph(forward_batch)
+
+    def init_forward_data_in_graph(self, forward_batch: ForwardBatch) -> None:
+        # In-graph step: with SGLANG_PREP_IN_CUDA_GRAPH=1, init_forward_metadata_*
+        # returned Raw metadata so the Raw→Full upgrade is recorded inside the
+        # cuda graph (per-replay materialization of c4/c128 compress + core_attn
+        # + indexer fields). With PREP_IN_CUDA_GRAPH=0 forward_metadata is
+        # already Full and this is a no-op via the isinstance check.
+        self._maybe_upgrade_forward_metadata()
 
     def init_forward_data_out_graph(
         self,
