@@ -474,7 +474,7 @@ def all_gather_kv_cache_for_mha_extend(
     dcp_local_prefix_kv_indices,
     seq_lens,
     extend_prefix_lens,
-    extend_prefix_lens_cpu,
+    extend_prefix_lens_cpu: list[int],
     extend_seq_lens,
     kv_a: torch.Tensor,
     k_pe: torch.Tensor,
@@ -482,11 +482,11 @@ def all_gather_kv_cache_for_mha_extend(
     prefix_kv_a, prefix_k_pe = token_to_kv_pool.get_mla_kv_buffer(
         attn_mqa, dcp_local_prefix_kv_indices
     )
+    extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
     prefix_kv_a, prefix_k_pe = all_gather_kv_cache_for_mha_chunk_extend(
         prefix_kv_a,
         prefix_k_pe,
         extend_prefix_lens_cpu,
-        prefix_starts_cpu=torch.zeros_like(extend_prefix_lens_cpu),
     )
 
     # re-organize kv with query orders
@@ -542,7 +542,7 @@ def all_gather_q_for_mla_decode(
 def all_gather_kv_cache_for_mla_extend(
     token_to_kv_pool,
     attn_mqa,
-    extend_prefix_lens_cpu,
+    extend_prefix_lens_cpu: list[int],
     dcp_local_prefix_kv_indices,
     dcp_extend_prefix_lens_sum,
     dcp_kv_buffer,
@@ -554,6 +554,7 @@ def all_gather_kv_cache_for_mla_extend(
         attn_mqa,
         dcp_local_prefix_kv_indices,
     )
+    extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
     # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
     gathered_kv = all_gather_kv_cache_for_dcp(
         cache_k_nope,
