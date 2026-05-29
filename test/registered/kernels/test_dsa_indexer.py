@@ -24,7 +24,7 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     DSAIndexerMetadata,
-    DSAMetadata,
+    DSAForwardMetadata,
 )
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import LinearBase
@@ -503,7 +503,7 @@ class TestDSAIndexer(CustomTestCase):
             .contiguous()
         )
         metadata = DSAIndexerMetadata(
-            attn_metadata=DSAMetadata(
+            attn_metadata=DSAForwardMetadata(
                 page_size=1,
                 cache_seqlens_int32=seq_lens_expanded.clone(),
                 max_seq_len_q=1,
@@ -639,7 +639,7 @@ class TestDSAIndexer(CustomTestCase):
             )
         ).contiguous()
 
-        attn_metadata = DSAMetadata(
+        attn_metadata = DSAForwardMetadata(
             page_size=1,
             cache_seqlens_int32=seq_lens_expanded.clone(),
             max_seq_len_q=1,

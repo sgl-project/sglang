@@ -9,7 +9,7 @@ from sglang.srt.layers.attention.linear.lightning_attn import (
     BailingLinearKernel,
     linear_decode_forward_triton,
 )
-from sglang.srt.layers.attention.linear.linear_metadata import BailingLinearMetadata
+from sglang.srt.layers.attention.linear.linear_metadata import BailingLinearForwardMetadata
 from sglang.srt.layers.attention.linear.seg_la import SegLaMeta, seg_la_fwd
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -87,7 +87,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             forward_batch.spec_info,
             forward_batch.seq_lens_cpu if not in_capture else None,
         )
-        self.forward_metadata = BailingLinearMetadata.prepare_decode(
+        self.forward_metadata = BailingLinearForwardMetadata.prepare_decode(
             metadata.query_start_loc,
             metadata.mamba_cache_indices,
             bs,
@@ -96,7 +96,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         metadata = self._forward_metadata(forward_batch)
-        self.forward_metadata = BailingLinearMetadata.prepare_mixed(
+        self.forward_metadata = BailingLinearForwardMetadata.prepare_mixed(
             metadata.query_start_loc,
             metadata.mamba_cache_indices,
             forward_batch,

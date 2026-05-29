@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
+from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2ForwardMetadata
 from sglang.srt.layers.attention.mamba.ops import mamba_chunk_scan_combined
 from sglang.srt.utils import get_device
 from sglang.srt.utils.common import is_hip
@@ -358,7 +358,7 @@ def test_mamba_chunk_scan_cont_batch(d_head, n_heads, seq_len_chunk_size_cases, 
     ):
 
         chunk_indices, chunk_offsets = (
-            Mamba2Metadata._query_start_loc_to_chunk_indices_offsets(
+            Mamba2ForwardMetadata._query_start_loc_to_chunk_indices_offsets(
                 cu_seqlens, chunk_size, cu_seqlens[-1]
             )
         )
@@ -456,7 +456,7 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
 
     ## full seqlen computation
     chunk_indices, chunk_offsets = (
-        Mamba2Metadata._query_start_loc_to_chunk_indices_offsets(
+        Mamba2ForwardMetadata._query_start_loc_to_chunk_indices_offsets(
             cu_seqlens, chunk_size, cu_seqlens[-1]
         )
     )
@@ -509,7 +509,7 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
         # fmt: on
 
     chunk_indices, chunk_offsets = (
-        Mamba2Metadata._query_start_loc_to_chunk_indices_offsets(
+        Mamba2ForwardMetadata._query_start_loc_to_chunk_indices_offsets(
             chunked_cu_seqlens, chunk_size, chunked_cu_seqlens[-1]
         )
     )
@@ -578,7 +578,7 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
     assert concat_batch_f(C_chunked, remaining_C_chunked).equal(C)
 
     chunk_indices, chunk_offsets = (
-        Mamba2Metadata._query_start_loc_to_chunk_indices_offsets(
+        Mamba2ForwardMetadata._query_start_loc_to_chunk_indices_offsets(
             remaining_chunked_cu_seqlens, chunk_size, remaining_chunked_cu_seqlens[-1]
         )
     )

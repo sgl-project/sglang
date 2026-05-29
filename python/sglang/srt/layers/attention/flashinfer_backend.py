@@ -91,12 +91,12 @@ class MultiItemScoringParams:
 
 
 @dataclass
-class DecodeMetadata:
+class FlashInferDecodeForwardMetadata:
     decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper]
 
 
 @dataclass
-class PrefillMetadata:
+class FlashInferPrefillForwardMetadata:
     prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper]
     use_ragged: bool
     extend_no_prefix: bool
@@ -293,7 +293,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.indices_updater_decode = FlashInferIndicesUpdaterDecode(model_runner, self)
 
         # Other metadata
-        self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
+        self.forward_metadata: Union[FlashInferPrefillForwardMetadata, FlashInferDecodeForwardMetadata] = None
 
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
@@ -512,7 +512,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=self.decode_split_tile_size,
                 disable_split_kv=False,
             )
-            self.forward_metadata = DecodeMetadata(self.decode_wrappers)
+            self.forward_metadata = FlashInferDecodeForwardMetadata(self.decode_wrappers)
         elif forward_batch.forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -525,7 +525,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
             )
-            self.forward_metadata = PrefillMetadata(
+            self.forward_metadata = FlashInferPrefillForwardMetadata(
                 self.prefill_wrappers_paged, False, False
             )
         elif forward_batch.forward_mode.is_target_verify():
@@ -540,7 +540,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
             )
-            self.forward_metadata = PrefillMetadata(
+            self.forward_metadata = FlashInferPrefillForwardMetadata(
                 self.prefill_wrappers_verify, False, False
             )
         else:
@@ -584,7 +584,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=forward_batch.cross_attention_custom_mask,
             )
-            self.forward_metadata = PrefillMetadata(
+            self.forward_metadata = FlashInferPrefillForwardMetadata(
                 self.prefill_wrappers_paged,
                 use_ragged,
                 extend_no_prefix,
@@ -681,7 +681,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if forward_mode.is_decode_or_idle():
             decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
-            self.forward_metadata = DecodeMetadata(decode_wrappers)
+            self.forward_metadata = FlashInferDecodeForwardMetadata(decode_wrappers)
         elif (
             forward_mode.is_target_verify()
             or forward_mode.is_draft_extend()
@@ -694,7 +694,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
-            self.forward_metadata = PrefillMetadata(
+            self.forward_metadata = FlashInferPrefillForwardMetadata(
                 prefill_wrappers, forward_mode.is_dllm_extend(), False
             )
         else:

@@ -237,7 +237,7 @@ global_cute_dsl_workspace_buffer = None
 
 
 @dataclass
-class TRTLLMMLAPrefillMetadata:
+class TRTLLMMLAPrefillForwardMetadata:
     """Metadata for TRTLLM MLA prefill operations."""
 
     max_seq_len: int
@@ -247,7 +247,7 @@ class TRTLLMMLAPrefillMetadata:
 
 
 @dataclass
-class TRTLLMMLADecodeMetadata:
+class TRTLLMMLADecodeForwardMetadata:
     """Metadata for TRTLLM MLA decode operations."""
 
     block_kv_indices: Optional[torch.Tensor] = None
@@ -327,8 +327,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.decode_cuda_graph_kv_indices = None
         self.padded_q_buffer = None
         self.unpad_output_buffer = None
-        self.forward_prefill_metadata: Optional[TRTLLMMLAPrefillMetadata] = None
-        self.forward_decode_metadata: Union[TRTLLMMLADecodeMetadata, None] = None
+        self.forward_prefill_metadata: Optional[TRTLLMMLAPrefillForwardMetadata] = None
+        self.forward_decode_metadata: Union[TRTLLMMLADecodeForwardMetadata, None] = None
 
         self.disable_chunked_prefix_cache = (
             get_global_server_args().disable_chunked_prefix_cache
@@ -453,7 +453,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         device: torch.device,
     ):
         """Allocate persistent metadata buffers for CUDA graph capture."""
-        metadata = TRTLLMMLADecodeMetadata()
+        metadata = TRTLLMMLADecodeForwardMetadata()
 
         if forward_mode.is_target_verify():
             metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
@@ -612,7 +612,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
             ).int()
             max_seq_len = max(forward_batch.extend_seq_lens_cpu)
-            self.forward_prefill_metadata = TRTLLMMLAPrefillMetadata(
+            self.forward_prefill_metadata = TRTLLMMLAPrefillForwardMetadata(
                 max_seq_len,
                 cum_seq_lens_q,
                 seq_lens,
@@ -624,7 +624,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
             bs = forward_batch.batch_size
-            self.forward_decode_metadata = TRTLLMMLADecodeMetadata()
+            self.forward_decode_metadata = TRTLLMMLADecodeForwardMetadata()
             # This is necessary because the backend instance persists across forward passes,
             # and forward_prefill_metadata from a previous regular extend call could still be set.
             if (

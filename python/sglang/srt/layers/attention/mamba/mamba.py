@@ -13,7 +13,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
+from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2ForwardMetadata
 from sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated import Mixer2RMSNormGated
 from sglang.srt.layers.attention.mamba.ops import (
     mamba_chunk_scan_combined,
@@ -410,7 +410,7 @@ class MambaMixer2(torch.nn.Module):
         hidden_states: torch.Tensor,
         output: torch.Tensor,
         layer_cache: MambaPool.State,
-        metadata: Mamba2Metadata,
+        metadata: Mamba2ForwardMetadata,
         forward_batch: ForwardBatch,
         mup_vector: Optional[torch.Tensor] = None,
         use_triton_causal_conv: bool = False,

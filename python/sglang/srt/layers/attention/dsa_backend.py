@@ -119,7 +119,7 @@ class DSAFlashMLAMetadata:
 
 
 @dataclass(frozen=True)
-class DSAMetadata:
+class DSAForwardMetadata:
     page_size: int
 
     # Sequence lengths for the forward batch
@@ -195,7 +195,7 @@ def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
 
 @dataclass(frozen=True)
 class DSAIndexerMetadata(BaseIndexerMetadata):
-    attn_metadata: DSAMetadata
+    attn_metadata: DSAForwardMetadata
     topk_transform_method: TopkTransformMethod
     topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
@@ -289,7 +289,7 @@ class DeepseekSparseAttnBackend(
         speculative_num_steps=0,
     ):
         super().__init__()
-        self.forward_metadata: DSAMetadata
+        self.forward_metadata: DSAForwardMetadata
         self.device = model_runner.device
         assert isinstance(model_runner.page_size, int)
         self.real_page_size = model_runner.page_size
@@ -691,7 +691,7 @@ class DeepseekSparseAttnBackend(
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
 
-        metadata = DSAMetadata(
+        metadata = DSAForwardMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
             max_seq_len_q=max_seqlen_q,
@@ -853,7 +853,7 @@ class DeepseekSparseAttnBackend(
         out_cache_loc: Optional[torch.Tensor] = None,
         actual_forward_mode: Optional["ForwardMode"] = None,
     ):
-        """Create and store DSAMetadata for a new batch size during CUDA graph capture."""
+        """Create and store DSAForwardMetadata for a new batch size during CUDA graph capture."""
         self.set_dsa_prefill_impl(forward_batch=None)
 
         if forward_mode.is_decode_or_idle():
@@ -979,7 +979,7 @@ class DeepseekSparseAttnBackend(
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
 
-        metadata = DSAMetadata(
+        metadata = DSAForwardMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
             max_seq_len_q=max_seqlen_q,
@@ -1039,7 +1039,7 @@ class DeepseekSparseAttnBackend(
         req_pool_indices = req_pool_indices[:bs]
 
         # Normal Decode
-        metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
+        metadata: DSAForwardMetadata = self.decode_cuda_graph_metadata[bs]
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             max_len = int(seq_lens_cpu.max().item())
@@ -1827,7 +1827,7 @@ class DeepseekSparseAttnBackend(
         v_head_dim: int,
         sm_scale: float,
         layer,
-        metadata: DSAMetadata,
+        metadata: DSAForwardMetadata,
         page_table_1,
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
@@ -1888,7 +1888,7 @@ class DeepseekSparseAttnBackend(
         v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        metadata: DSAMetadata,
+        metadata: DSAForwardMetadata,
     ) -> torch.Tensor:
         """Standard MHA using FlashAttention varlen for MHA_ONE_SHOT mode."""
         q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -1970,7 +1970,7 @@ class DeepseekSparseAttnBackend(
         kv_cache: torch.Tensor,
         page_table_1: torch.Tensor,
         layer: RadixAttention,
-        metadata: DSAMetadata,
+        metadata: DSAForwardMetadata,
         bs: int,
     ) -> torch.Tensor:
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
@@ -2581,6 +2581,6 @@ class DeepseekSparseAttnMultiStepBackend:
 # Backward-compat aliases (deprecated: use DSA class names)
 DeepseekSparseAttnBackend = DeepseekSparseAttnBackend
 DeepseekSparseAttnMultiStepBackend = DeepseekSparseAttnMultiStepBackend
-DSAMetadata = DSAMetadata
+DSAForwardMetadata = DSAForwardMetadata
 DSAFlashMLAMetadata = DSAFlashMLAMetadata
 DSAIndexerMetadata = DSAIndexerMetadata

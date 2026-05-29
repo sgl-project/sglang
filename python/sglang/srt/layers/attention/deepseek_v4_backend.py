@@ -265,7 +265,7 @@ class DSV4AttnMetadata:
 
 
 @dataclass
-class DSV4Metadata:
+class DSV4ForwardMetadata:
     core_attn_metadata: DSV4AttnMetadata
     indexer_metadata: Optional[PagedIndexerMetadata]
 
@@ -276,7 +276,7 @@ class DSV4Metadata:
     def core_metadata(self) -> DSV4AttnMetadata:
         return self.core_attn_metadata
 
-    def copy_(self, other: DSV4Metadata):
+    def copy_(self, other: DSV4ForwardMetadata):
         self.core_attn_metadata.copy_(other.core_attn_metadata)
         maybe_copy_inplace(self.indexer_metadata, src=other.indexer_metadata)
         maybe_copy_inplace(self.c4_compress_metadata, src=other.c4_compress_metadata)
@@ -286,14 +286,14 @@ class DSV4Metadata:
 
 
 @dataclass
-class DSV4RawVerifyMetadata:
+class DSV4RawVerifyForwardMetadata:
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
     out_cache_loc: torch.Tensor
 
     extend_seq_lens: Optional[torch.Tensor] = None
 
-    def copy_(self, other: DSV4RawVerifyMetadata):
+    def copy_(self, other: DSV4RawVerifyForwardMetadata):
         self.req_pool_indices.copy_(other.req_pool_indices)
         self.seq_lens.copy_(other.seq_lens)
         self.out_cache_loc.copy_(other.out_cache_loc)
@@ -302,12 +302,12 @@ class DSV4RawVerifyMetadata:
 
 
 @dataclass
-class DSV4RawDecodeMetadata:
+class DSV4RawDecodeForwardMetadata:
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
     out_cache_loc: torch.Tensor
 
-    def copy_(self, other: DSV4RawDecodeMetadata):
+    def copy_(self, other: DSV4RawDecodeForwardMetadata):
         self.req_pool_indices.copy_(other.req_pool_indices)
         self.seq_lens.copy_(other.seq_lens)
         self.out_cache_loc.copy_(other.out_cache_loc)
@@ -375,9 +375,9 @@ class DeepseekV4AttnBackend(
         )
         self.speculative_step_id = speculative_step_id
         self.forward_metadata: Union[
-            DSV4Metadata,
-            DSV4RawVerifyMetadata,
-            DSV4RawDecodeMetadata,
+            DSV4ForwardMetadata,
+            DSV4RawVerifyForwardMetadata,
+            DSV4RawDecodeForwardMetadata,
         ] = None
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -396,13 +396,13 @@ class DeepseekV4AttnBackend(
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         out_cache_loc: torch.Tensor,
-    ) -> Union[DSV4Metadata, DSV4RawDecodeMetadata]:
+    ) -> Union[DSV4ForwardMetadata, DSV4RawDecodeForwardMetadata]:
         assert (
             req_pool_indices.shape[0] == seq_lens.shape[0] == out_cache_loc.shape[0]
         ), f"{req_pool_indices.shape=} {seq_lens.shape=} {out_cache_loc.shape=}"
 
         if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
-            return DSV4RawDecodeMetadata(
+            return DSV4RawDecodeForwardMetadata(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc,
@@ -428,7 +428,7 @@ class DeepseekV4AttnBackend(
             seq_lens=seq_lens,
         )
 
-        return DSV4Metadata(
+        return DSV4ForwardMetadata(
             core_attn_metadata,
             indexer_metadata,
             c4_compress_metadata=create(compress_ratio=4),
@@ -447,7 +447,7 @@ class DeepseekV4AttnBackend(
         extend_seq_lens_cpu: List[int],
         need_compress: bool = True,
         use_prefill_cuda_graph: bool = False,
-    ) -> DSV4Metadata:
+    ) -> DSV4ForwardMetadata:
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
             seq_lens=seq_lens_cpu,
@@ -484,7 +484,7 @@ class DeepseekV4AttnBackend(
                 extend_lens_cpu=extend_seq_lens_cpu,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
             )
-        return DSV4Metadata(
+        return DSV4ForwardMetadata(
             core_attn_metadata,
             indexer_metadata,
             c4_compress_metadata=create(compress_ratio=4),
@@ -498,7 +498,7 @@ class DeepseekV4AttnBackend(
         seq_lens: torch.Tensor,
         out_cache_loc: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
-    ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
+    ) -> Union[DSV4ForwardMetadata, DSV4RawVerifyForwardMetadata]:
         if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
             assert out_cache_loc is not None
             if not hasattr(self, "extend_seq_lens_buffer"):
@@ -507,7 +507,7 @@ class DeepseekV4AttnBackend(
                 )
             extend_seq_lens = self.extend_seq_lens_buffer[: len(seq_lens)]
 
-            return DSV4RawVerifyMetadata(
+            return DSV4RawVerifyForwardMetadata(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc,
@@ -532,7 +532,7 @@ class DeepseekV4AttnBackend(
         seq_lens_cpu: Optional[List[int]] = None,
         out_cache_loc: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
-    ) -> DSV4Metadata:
+    ) -> DSV4ForwardMetadata:
         batch_size = len(seq_lens)
         seq_lens = seq_lens + self.speculative_num_draft_tokens
         seq_lens_cpu = [x + self.speculative_num_draft_tokens for x in seq_lens_cpu]
@@ -555,8 +555,8 @@ class DeepseekV4AttnBackend(
         )
 
     def make_forward_metadata_from_raw_verify(
-        self, raw_metadata: DSV4RawVerifyMetadata
-    ) -> DSV4Metadata:
+        self, raw_metadata: DSV4RawVerifyForwardMetadata
+    ) -> DSV4ForwardMetadata:
         req_pool_indices = raw_metadata.req_pool_indices
         seq_lens = raw_metadata.seq_lens
         out_cache_loc = raw_metadata.out_cache_loc
@@ -592,7 +592,7 @@ class DeepseekV4AttnBackend(
             use_prefill_cuda_graph=True,
             num_q_tokens=num_draft_tokens * bs,
         )
-        return DSV4Metadata(
+        return DSV4ForwardMetadata(
             core_attn_metadata,
             indexer_metadata,
             c4_compress_metadata=create(compress_ratio=4),
@@ -600,8 +600,8 @@ class DeepseekV4AttnBackend(
         )
 
     def make_forward_metadata_from_raw_decode(
-        self, raw_metadata: DSV4RawDecodeMetadata
-    ) -> DSV4Metadata:
+        self, raw_metadata: DSV4RawDecodeForwardMetadata
+    ) -> DSV4ForwardMetadata:
         req_pool_indices = raw_metadata.req_pool_indices
         seq_lens = raw_metadata.seq_lens
         out_cache_loc = raw_metadata.out_cache_loc
@@ -625,7 +625,7 @@ class DeepseekV4AttnBackend(
             seq_lens=seq_lens,
         )
 
-        return DSV4Metadata(
+        return DSV4ForwardMetadata(
             core_attn_metadata,
             indexer_metadata,
             c4_compress_metadata=create(compress_ratio=4),
@@ -641,7 +641,7 @@ class DeepseekV4AttnBackend(
         num_tokens_per_bs: int,
         out_cache_loc: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
-    ) -> DSV4Metadata:
+    ) -> DSV4ForwardMetadata:
         batch_size = len(seq_lens)
         extend_seq_lens_cpu = [num_tokens_per_bs] * batch_size
         extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
@@ -786,7 +786,7 @@ class DeepseekV4AttnBackend(
             metadata = self.forward_metadata
             self._current_capture_raw = (
                 metadata
-                if isinstance(metadata, (DSV4RawDecodeMetadata, DSV4RawVerifyMetadata))
+                if isinstance(metadata, (DSV4RawDecodeForwardMetadata, DSV4RawVerifyForwardMetadata))
                 else None
             )
 
@@ -855,7 +855,7 @@ class DeepseekV4AttnBackend(
         self.forward_metadata = metadata
         # Chain the recordable in-graph step so PREP_IN_CUDA_GRAPH=1 upgrades
         # Raw→Full (no-op when init_forward_metadata_decode/verify already
-        # produced a Full DSV4Metadata).
+        # produced a Full DSV4ForwardMetadata).
         self.init_forward_metadata_in_graph(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
@@ -863,7 +863,7 @@ class DeepseekV4AttnBackend(
             _GraphBucket,
             Dict[
                 int,
-                Union[DSV4Metadata, DSV4RawDecodeMetadata, DSV4RawVerifyMetadata],
+                Union[DSV4ForwardMetadata, DSV4RawDecodeForwardMetadata, DSV4RawVerifyForwardMetadata],
             ],
         ] = {bucket: {} for bucket in _GraphBucket}
         self.draft_extend_num_tokens_per_bs = (
@@ -874,9 +874,9 @@ class DeepseekV4AttnBackend(
         self,
         bs: int,
         temp_metadata: Union[
-            DSV4Metadata,
-            DSV4RawVerifyMetadata,
-            DSV4RawDecodeMetadata,
+            DSV4ForwardMetadata,
+            DSV4RawVerifyForwardMetadata,
+            DSV4RawDecodeForwardMetadata,
         ],
         bucket: _GraphBucket,
     ) -> None:
@@ -894,7 +894,7 @@ class DeepseekV4AttnBackend(
 
     def on_after_cuda_graph_warmup(self):
         metadata = self.forward_metadata
-        if isinstance(metadata, DSV4Metadata) and isinstance(
+        if isinstance(metadata, DSV4ForwardMetadata) and isinstance(
             metadata.core_attn_metadata, DSV4AttnMetadata
         ):
             core = metadata.core_attn_metadata
@@ -929,17 +929,17 @@ class DeepseekV4AttnBackend(
     def _maybe_upgrade_forward_metadata(self) -> None:
         # With SGLANG_PREP_IN_CUDA_GRAPH=1, init_forward_metadata_*
         # returns a Raw metadata that only carries a few tensors. The
-        # full DSV4Metadata (including c4/c128 compress + core_attn +
+        # full DSV4ForwardMetadata (including c4/c128 compress + core_attn +
         # indexer metadata) must be materialized before any caller that
         # touches those fields. For 1.6T the first two layers have
         # compress_ratio=128, so forward_core_compressor / forward_c4_indexer
         # can fire before attn_backend.forward(), and must trigger the
         # upgrade themselves.
-        if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
+        if isinstance(self.forward_metadata, DSV4RawVerifyForwardMetadata):
             self.forward_metadata = self.make_forward_metadata_from_raw_verify(
                 raw_metadata=self.forward_metadata,
             )
-        elif isinstance(self.forward_metadata, DSV4RawDecodeMetadata):
+        elif isinstance(self.forward_metadata, DSV4RawDecodeForwardMetadata):
             self.forward_metadata = self.make_forward_metadata_from_raw_decode(
                 raw_metadata=self.forward_metadata,
             )

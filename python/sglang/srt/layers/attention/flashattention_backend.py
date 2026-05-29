@@ -34,7 +34,7 @@ from sglang.jit_kernel.flash_attention import (
 
 
 @dataclass
-class FlashAttentionMetadata:
+class FlashAttentionForwardMetadata:
     """Metadata to be init once in the model forward pass,
     each layer's forward pass can reuse the metadata.
 
@@ -81,7 +81,7 @@ class FlashAttentionMetadata:
     local_attn_metadata: Optional[LocalAttentionMetadata] = None
 
     # For sliding window attention topk>1 spec decoding
-    swa_spec_metadata: Optional[FlashAttentionMetadata] = None
+    swa_spec_metadata: Optional[FlashAttentionForwardMetadata] = None
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -119,9 +119,9 @@ class FlashAttentionBackend(AttentionBackend):
         ), "Sliding window and cross attention are not supported together"
 
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
-        self.forward_metadata: FlashAttentionMetadata = None
+        self.forward_metadata: FlashAttentionForwardMetadata = None
         # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
-        self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
+        self.forward_metadata_spec_decode_expand: FlashAttentionForwardMetadata = None
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.decode_cuda_graph_metadata = {}
@@ -369,7 +369,7 @@ class FlashAttentionBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
-        metadata = FlashAttentionMetadata()
+        metadata = FlashAttentionForwardMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
@@ -416,7 +416,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.page_table = self.req_to_token_pool.req_to_token[
                         forward_batch.req_pool_indices, : metadata.max_seq_len_k
                     ]
-                    metadata_expand = FlashAttentionMetadata()
+                    metadata_expand = FlashAttentionForwardMetadata()
                     decode_length = self.speculative_step_id + 1
                     metadata_expand.cache_seqlens_int32 = torch.full(
                         (seqlens_in_batch.numel() * self.topk,),
@@ -518,7 +518,7 @@ class FlashAttentionBackend(AttentionBackend):
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
 
-                metadata_expand = FlashAttentionMetadata()
+                metadata_expand = FlashAttentionForwardMetadata()
 
                 metadata_expand.max_seq_len_q = 1
                 metadata_expand.cu_seqlens_q = torch.arange(
@@ -1805,14 +1805,14 @@ class FlashAttentionBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         device: torch.device,
     ) -> tuple:
-        """Create FlashAttentionMetadata with pre-allocated buffer slice refs.
+        """Create FlashAttentionForwardMetadata with pre-allocated buffer slice refs.
 
         Assigns all buffer slice references but does NOT fill data values.
         Stores the new metadata object(s) in the appropriate lookup dicts.
         Returns (metadata, metadata_expand).
         """
-        metadata = FlashAttentionMetadata()
-        metadata_expand = FlashAttentionMetadata()
+        metadata = FlashAttentionForwardMetadata()
+        metadata_expand = FlashAttentionForwardMetadata()
 
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
@@ -1946,7 +1946,7 @@ class FlashAttentionBackend(AttentionBackend):
                 self.target_verify_metadata_topk_expand[bs] = metadata_expand
 
                 if self.has_swa:
-                    metadata_swa = FlashAttentionMetadata()
+                    metadata_swa = FlashAttentionForwardMetadata()
                     metadata_swa.cache_seqlens_int32 = (
                         self.target_verify_metadata_topk_swa["cache_seqlens"][
                             : bs * self.speculative_num_draft_tokens
@@ -2385,7 +2385,7 @@ class FlashAttentionBackend(AttentionBackend):
         return 1
 
     def _maybe_init_local_attn_metadata(
-        self, forwardbatch: ForwardBatch, metadata: FlashAttentionMetadata, device
+        self, forwardbatch: ForwardBatch, metadata: FlashAttentionForwardMetadata, device
     ):
         """Centralized utility to initialize local_attn_metadata if chunked attention is enabled."""
         if not self.has_local_attention:
@@ -2419,7 +2419,7 @@ class FlashAttentionBackend(AttentionBackend):
             self.page_size,
         )
 
-        local_metadata = FlashAttentionMetadata.LocalAttentionMetadata(
+        local_metadata = FlashAttentionForwardMetadata.LocalAttentionMetadata(
             local_query_start_loc=torch.from_numpy(cu_seqlens_q_local_np).to(device),
             local_seqused_k=torch.from_numpy(seqlens_k_local_np).to(device),
             local_block_table=block_table_local.to(device),
@@ -2429,7 +2429,7 @@ class FlashAttentionBackend(AttentionBackend):
         metadata.local_attn_metadata = local_metadata
 
     def _maybe_update_local_attn_metadata_for_capture(
-        self, metadata: FlashAttentionMetadata, bs: int
+        self, metadata: FlashAttentionForwardMetadata, bs: int
     ):
         """Update local attention metadata during CUDA graph capture phase.
 
@@ -2479,7 +2479,7 @@ class FlashAttentionBackend(AttentionBackend):
             "local_block_table"
         ][:b0, :b1]
 
-        metadata.local_attn_metadata = FlashAttentionMetadata.LocalAttentionMetadata(
+        metadata.local_attn_metadata = FlashAttentionForwardMetadata.LocalAttentionMetadata(
             local_query_start_loc=local_query_start_loc,
             local_seqused_k=local_seqused_k,
             local_block_table=local_block_table,
@@ -2489,7 +2489,7 @@ class FlashAttentionBackend(AttentionBackend):
 
     def _maybe_update_local_attn_metadata_for_replay(
         self,
-        metadata: FlashAttentionMetadata,
+        metadata: FlashAttentionForwardMetadata,
         bs: int,
     ):
         """Update preallocated local attention metadata in-place before CUDA graph replay."""
@@ -2569,9 +2569,9 @@ class FlashAttentionBackend(AttentionBackend):
 
     def _init_sliding_window_attn_spec_metadata(
         self,
-        metadata: FlashAttentionMetadata,
-        metadata_expand: FlashAttentionMetadata,
-        metadata_swa: Optional[FlashAttentionMetadata] = None,
+        metadata: FlashAttentionForwardMetadata,
+        metadata_expand: FlashAttentionForwardMetadata,
+        metadata_swa: Optional[FlashAttentionForwardMetadata] = None,
     ):
         # TODO: support page_size > 1 for swa spec
         assert (
@@ -2616,7 +2616,7 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
         if metadata_swa is None:
-            metadata_swa = FlashAttentionMetadata()
+            metadata_swa = FlashAttentionForwardMetadata()
             metadata_swa.max_seq_len_q = 1
             metadata_swa.cu_seqlens_q = metadata_expand.cu_seqlens_q
             metadata_swa.cache_seqlens_int32 = cache_seqlens_int32

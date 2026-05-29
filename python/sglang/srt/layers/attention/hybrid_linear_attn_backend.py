@@ -10,7 +10,7 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
-    Mamba2Metadata,
+    Mamba2ForwardMetadata,
 )
 from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     fused_mamba_state_scatter_with_mask,
@@ -693,7 +693,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
         spec_info = forward_batch.spec_info
         draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
-        self.forward_metadata = Mamba2Metadata.prepare_decode(
+        self.forward_metadata = Mamba2ForwardMetadata.prepare_decode(
             metadata,
             forward_batch.seq_lens,
             is_target_verify=forward_batch.forward_mode.is_target_verify(),
@@ -703,7 +703,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self._execute_deferred_mamba_cow_and_clear(forward_batch)
         metadata = self._forward_metadata(forward_batch)
-        self.forward_metadata = Mamba2Metadata.prepare_mixed(
+        self.forward_metadata = Mamba2ForwardMetadata.prepare_mixed(
             metadata,
             self.mamba_chunk_size,
             forward_batch,
@@ -719,7 +719,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         mup_vector: Optional[torch.Tensor] = None,
         use_triton_causal_conv: bool = False,
     ):
-        assert isinstance(self.forward_metadata, Mamba2Metadata)
+        assert isinstance(self.forward_metadata, Mamba2ForwardMetadata)
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         intermediate_states = mixer.forward(
             hidden_states=hidden_states,

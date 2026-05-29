@@ -1243,7 +1243,7 @@ def _pure_torch_dsv4_combined_reference(
     (HF likewise skips the FP8 quantization for the test-suitable form;
     quantization is a QAT-simulation artifact, not part of the math.)
 
-    Forces the lazy `DSV4RawDecodeMetadata → DSV4Metadata` upgrade before
+    Forces the lazy `DSV4RawDecodeForwardMetadata → DSV4ForwardMetadata` upgrade before
     reading per-q-token `swa_page_indices` / `cN_page_indices` so this works
     both pre-forward and post-`on_after_cuda_graph_warmup` (which rolls
     `forward_metadata` back to the captured raw to be re-upgraded inside
@@ -1259,7 +1259,7 @@ def _pure_torch_dsv4_combined_reference(
     # Always rebuild from the current batch (set by
     # `prepare_dsv4_runner_inputs`, falling back to the fixture's
     # construction-time batch for the eager test path). The metadata this
-    # call produces is the same DSV4Metadata the forward path will produce
+    # call produces is the same DSV4ForwardMetadata the forward path will produce
     # for the same batch, so the backend's later
     # `_init_cuda_graph_*_metadata` simply overwrites with an identical
     # metadata layout for the graph buffers.

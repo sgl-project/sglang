@@ -32,7 +32,7 @@ PAGE_SIZE = 128
 
 
 @dataclass
-class CutlassMLADecodeMetadata:
+class CutlassMLADecodeForwardMetadata:
     workspace: Optional[torch.Tensor] = None
     block_kv_indices: Optional[torch.Tensor] = None
 
@@ -69,7 +69,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         self.num_local_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
-        self.forward_metadata: Union[CutlassMLADecodeMetadata] = None
+        self.forward_metadata: Union[CutlassMLADecodeForwardMetadata] = None
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
@@ -102,7 +102,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
             )
             if in_capture:
                 max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
-                self.forward_metadata = CutlassMLADecodeMetadata(
+                self.forward_metadata = CutlassMLADecodeForwardMetadata(
                     self.cuda_graph_mla_workspace,
                     self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
                 )
@@ -141,7 +141,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                 workspace = torch.empty(
                     workspace_size, device="cuda", dtype=torch.uint8
                 )
-                self.forward_metadata = CutlassMLADecodeMetadata(
+                self.forward_metadata = CutlassMLADecodeForwardMetadata(
                     workspace,
                     block_kv_indices,
                 )

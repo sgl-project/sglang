@@ -21,7 +21,7 @@ from sglang.jit_kernel.flash_attention import (
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionForwardMetadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 if TYPE_CHECKING:
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class DualChunkFlashAttentionMetadata:
+class DualChunkFlashAttentionForwardMetadata:
     """Metadata for FlashAttentionBackend.
 
     NOTE: Any python object stored here is not updated when it is
@@ -106,7 +106,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         self,
         model_runner: "ModelRunner",
     ) -> None:
-        self.forward_metadata: FlashAttentionMetadata = None
+        self.forward_metadata: FlashAttentionForwardMetadata = None
         self.device = model_runner.device
         self.max_context_len = model_runner.model_config.context_len
         self.num_heads = model_runner.model_config.get_num_attention_heads(
@@ -208,7 +208,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         assert forward_mode.is_prefill() or forward_mode.is_decode()
         batch_size = forward_batch.batch_size
 
-        metadata = DualChunkFlashAttentionMetadata()
+        metadata = DualChunkFlashAttentionForwardMetadata()
         metadata.seq_lens_tensor = forward_batch.seq_lens.to(torch.int32)
         metadata.seq_lens = forward_batch.seq_lens.tolist()
         metadata.max_seq_len = forward_batch.seq_lens.max().item()
@@ -568,7 +568,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         forward_mode: ForwardMode,
     ):
         """Allocate persistent metadata buffers for CUDA graph capture."""
-        metadata = DualChunkFlashAttentionMetadata()
+        metadata = DualChunkFlashAttentionForwardMetadata()
 
         if forward_mode.is_decode_or_idle():
             if self.original_max_position_embeddings > 0:
@@ -1504,7 +1504,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         chunk_size: int,
         local_size: int,
         original_max_position_embeddings: int,
-        decode_meta: DualChunkFlashAttentionMetadata,
+        decode_meta: DualChunkFlashAttentionForwardMetadata,
     ):
         if not causal:
             raise ValueError("Dual Chunk Attention does not support causal=False")
