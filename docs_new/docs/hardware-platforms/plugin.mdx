@@ -99,8 +99,8 @@ entry_points("sglang.srt.platforms")  → Enumerate ALL plugins by name (metadat
 
 SGLang has two plugin loading phases:
 
-1. `load_startup_plugins()` discovers and executes startup plugins. These run before heavy worker modules are imported in spawned subprocesses, so they are the right place for minimal import-time compatibility shims.
-2. `load_plugins()` discovers and executes general plugins, then applies all registered hooks. These run before hookable runtime objects are constructed.
+1. `load_startup_plugins()` discovers and executes startup plugins. These run before `server_args` pulls in platform-sensitive modules in the main process, and before heavy worker modules are imported in spawned subprocesses, so they are the right place for minimal import-time compatibility shims.
+2. `load_plugins()` first calls `load_startup_plugins()`, then discovers and executes general plugins, then applies all registered hooks. These run before hookable runtime objects are constructed.
 
 Startup plugins are loaded through a lightweight subprocess bootstrap target:
 
@@ -133,12 +133,12 @@ run_subprocess_target()
   </thead>
   <tbody>
     <tr>
-      <td><code>cli/serve.py</code> serve()</td>
-      <td>Main</td>
-      <td>Before <code>prepare_server_args()</code></td>
+      <td><code>server_args.py</code> module import</td>
+      <td>Main / worker</td>
+      <td>Before platform-sensitive <code>server_args</code> dependencies are imported</td>
     </tr>
     <tr>
-      <td><code>launch_server.py</code> <code>__main__</code></td>
+      <td><code>cli/serve.py</code> serve()</td>
       <td>Main</td>
       <td>Before <code>prepare_server_args()</code></td>
     </tr>
@@ -151,6 +151,11 @@ run_subprocess_target()
       <td><code>scheduler.py</code> <code>run_scheduler_process()</code></td>
       <td>Subprocess</td>
       <td>Before <code>Scheduler()</code> construction</td>
+    </tr>
+    <tr>
+      <td><code>ray/scheduler_actor.py</code> <code>SchedulerActor.__init__()</code></td>
+      <td>Ray actor</td>
+      <td>Before scheduler module import and <code>Scheduler()</code> construction</td>
     </tr>
     <tr>
       <td><code>data_parallel_controller.py</code> <code>run_data_parallel_controller_process()</code></td>
@@ -170,7 +175,9 @@ run_subprocess_target()
   </tbody>
 </table>
 
-> **Note**: `load_startup_plugins()` and `load_plugins()` are idempotent (guarded by per-process flags). In spawn'd subprocesses the flags reset, so plugins are correctly re-loaded.
+> **Note**: `load_startup_plugins()` and `load_plugins()` are idempotent (guarded by per-process flags). In spawn'd subprocesses and Ray actors the flags reset, so plugins are correctly re-loaded.
+>
+> **Note**: `SGLANG_PLUGINS` filters both startup and general plugin groups. If you set it, include any startup plugin names required by your selected platform, otherwise early import-time shims may be skipped.
 
 ```
 load_startup_plugins()
@@ -179,6 +186,7 @@ load_startup_plugins()
         excluded_dists=..., raise_on_load_error=True)      skip plugins from unselected platform packages
 
 load_plugins()
+  ├── load_startup_plugins()                            → ensure import-time shims are installed first
   ├── _get_excluded_dists()                             → compute dists to skip (via SGLANG_PLATFORM)
   ├── load_plugins_by_group("sglang.srt.plugins",       → discover entry_points, filter by SGLANG_PLUGINS
   │     excluded_dists=...)                                skip plugins from unselected platform packages

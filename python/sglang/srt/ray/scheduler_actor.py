@@ -50,6 +50,10 @@ class SchedulerActor:
     ):
         import dataclasses
 
+        from sglang.srt.plugins import load_plugins
+
+        load_plugins()
+
         from sglang.srt.environ import envs
         from sglang.srt.managers.scheduler import Scheduler, configure_scheduler_process
         from sglang.srt.utils.numa_utils import (

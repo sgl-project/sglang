@@ -18,7 +18,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import threading
-from typing import Callable, List, Optional
+from typing import List, Optional
 
 import ray
 from ray.util.placement_group import PlacementGroup

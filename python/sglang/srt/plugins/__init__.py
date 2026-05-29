@@ -124,7 +124,6 @@ def load_startup_plugins():
     global _startup_plugins_loaded
     if _startup_plugins_loaded:
         return
-    _startup_plugins_loaded = True
 
     plugins = load_plugins_by_group(
         STARTUP_PLUGINS_GROUP,
@@ -140,6 +139,8 @@ def load_startup_plugins():
             logger.exception("Failed to execute startup plugin: %s", name)
             raise
 
+    _startup_plugins_loaded = True
+
 
 def load_plugins():
     """
@@ -148,6 +149,9 @@ def load_plugins():
     Idempotent - safe to call multiple times. General plugins are functions
     whose side effects (registering hooks, replacing classes, etc.) are the
     desired behavior. Return values are ignored.
+
+    Startup plugins are loaded first, so callers that only need the general
+    plugin phase still get import-time compatibility shims before runtime hooks.
 
     When ``SGLANG_PLATFORM`` is set, general plugins from unselected platform
     packages are automatically skipped (avoids pulling their dependencies).
@@ -160,6 +164,9 @@ def load_plugins():
     global _plugins_loaded
     if _plugins_loaded:
         return
+
+    load_startup_plugins()
+
     _plugins_loaded = True
 
     plugins = load_plugins_by_group(

@@ -12,6 +12,7 @@ from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.plugins import (
+    GENERAL_PLUGINS_GROUP,
     STARTUP_PLUGINS_GROUP,
     _current_plugin_source,
     _get_excluded_dists,
@@ -162,6 +163,33 @@ class TestLoadPlugins(TestCase):
 
     @patch("sglang.srt.plugins.HookRegistry")
     @patch("sglang.srt.plugins.envs")
+    @patch("sglang.srt.plugins.entry_points")
+    def test_load_startup_plugins_can_retry_after_failure(
+        self, mock_eps, mock_envs, mock_registry
+    ):
+        """Startup loader is not marked loaded until plugins execute successfully."""
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.SGLANG_PLUGINS.get.return_value = ""
+        calls = []
+
+        def flaky_startup_plugin():
+            calls.append("call")
+            if len(calls) == 1:
+                raise RuntimeError("startup boom")
+
+        mock_eps.return_value = [
+            _make_ep("flaky_startup", load_fn=flaky_startup_plugin)
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "startup boom"):
+            load_startup_plugins()
+        load_startup_plugins()
+
+        self.assertEqual(calls, ["call", "call"])
+        mock_registry.apply_hooks.assert_not_called()
+
+    @patch("sglang.srt.plugins.HookRegistry")
+    @patch("sglang.srt.plugins.envs")
     @patch("sglang.srt.plugins.entry_points", return_value=[])
     def test_load_plugins_idempotent_and_calls_apply(
         self, mock_eps, mock_envs, mock_registry
@@ -175,6 +203,37 @@ class TestLoadPlugins(TestCase):
 
         load_plugins()  # should be skipped
         self.assertEqual(mock_registry.apply_hooks.call_count, 1)
+
+    @patch("sglang.srt.plugins.HookRegistry")
+    @patch("sglang.srt.plugins.envs")
+    @patch("sglang.srt.plugins.entry_points")
+    def test_load_plugins_loads_startup_before_general(
+        self, mock_eps, mock_envs, mock_registry
+    ):
+        """General plugin loading first executes startup import-time shims."""
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.SGLANG_PLUGINS.get.return_value = ""
+        calls = []
+
+        def startup_plugin():
+            calls.append("startup")
+
+        def general_plugin():
+            calls.append("general")
+
+        def entry_points_side_effect(group):
+            if group == STARTUP_PLUGINS_GROUP:
+                return [_make_ep("startup", load_fn=startup_plugin)]
+            if group == GENERAL_PLUGINS_GROUP:
+                return [_make_ep("general", load_fn=general_plugin)]
+            return []
+
+        mock_eps.side_effect = entry_points_side_effect
+
+        load_plugins()
+
+        self.assertEqual(calls, ["startup", "general"])
+        mock_registry.apply_hooks.assert_called_once()
 
     @patch("sglang.srt.plugins.HookRegistry")
     @patch("sglang.srt.plugins.envs")
@@ -196,7 +255,13 @@ class TestLoadPlugins(TestCase):
             _make_ep("bad", load_fn=bad_plugin),
             _make_ep("good", load_fn=good_plugin),
         ]
-        mock_eps.return_value = eps
+
+        def entry_points_side_effect(group):
+            if group == GENERAL_PLUGINS_GROUP:
+                return eps
+            return []
+
+        mock_eps.side_effect = entry_points_side_effect
 
         with self.assertLogs("sglang.srt.plugins", level="ERROR") as cm:
             load_plugins()
@@ -258,7 +323,14 @@ class TestLoadPlugins(TestCase):
         def spy_plugin():
             sources_seen.append(_current_plugin_source.get())
 
-        mock_eps.return_value = [_make_ep("spy", load_fn=spy_plugin)]
+        eps = [_make_ep("spy", load_fn=spy_plugin)]
+
+        def entry_points_side_effect(group):
+            if group == GENERAL_PLUGINS_GROUP:
+                return eps
+            return []
+
+        mock_eps.side_effect = entry_points_side_effect
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
         mock_envs.SGLANG_PLUGINS.get.return_value = ""
 
@@ -283,7 +355,14 @@ class TestLoadPlugins(TestCase):
         def bad_plugin():
             raise RuntimeError("boom")
 
-        mock_eps.return_value = [_make_ep("bad", load_fn=bad_plugin)]
+        eps = [_make_ep("bad", load_fn=bad_plugin)]
+
+        def entry_points_side_effect(group):
+            if group == GENERAL_PLUGINS_GROUP:
+                return eps
+            return []
+
+        mock_eps.side_effect = entry_points_side_effect
 
         load_plugins()
         self.assertIsNone(_current_plugin_source.get())
