@@ -698,7 +698,7 @@ class Req(ReqDllmMixin):
         )  # Before image padding
         # Each decode stage's output ids
         self.output_ids = array("q")
-        # Length of committed token prefix in build_full_token_ids().
+        # Length of committed token prefix in build_full_untruncated_fill_ids().
         # Token contents are derived on demand via build_fill_token_ids().
         self.fill_len: int = 0
 
@@ -1052,7 +1052,7 @@ class Req(ReqDllmMixin):
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
 
-        full_token_ids = self.build_full_token_ids()
+        full_token_ids = self.build_full_untruncated_fill_ids()
         input_len = len(full_token_ids)
 
         # Streaming sessions reuse committed KV from the session slot, so
@@ -1133,13 +1133,13 @@ class Req(ReqDllmMixin):
         self.set_extend_input_len(input_len - len(self.prefix_indices))
         return full_token_ids
 
-    def get_full_len(self) -> int:
+    def get_full_untruncated_fill_len(self) -> int:
         n = len(self.origin_input_ids) + len(self.output_ids)
         if self.is_dllm():
             n += self.dllm_config.block_size
         return n
 
-    def build_full_token_ids(self) -> array:
+    def build_full_untruncated_fill_ids(self) -> array:
         result = self.origin_input_ids + self.output_ids
         if self.is_dllm():
             result = result + array(
@@ -1148,7 +1148,7 @@ class Req(ReqDllmMixin):
         return result
 
     def build_fill_token_ids(self) -> array:
-        return self.build_full_token_ids()[: self.fill_len]
+        return self.build_full_untruncated_fill_ids()[: self.fill_len]
 
     def _compute_max_prefix_len(self, input_len: int) -> int:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
@@ -1414,7 +1414,7 @@ class Req(ReqDllmMixin):
         # - extend_input_len: Number of tokens that need to be processed in this extend batch
         self.extend_input_len = extend_input_len
         if self.logprob_start_len == -1:
-            logprob_start_len = self.get_full_len()
+            logprob_start_len = self.get_full_untruncated_fill_len()
         else:
             # logprob_start_len should be at least the length of the prefix indices
             logprob_start_len = max(self.logprob_start_len, len(self.prefix_indices))
