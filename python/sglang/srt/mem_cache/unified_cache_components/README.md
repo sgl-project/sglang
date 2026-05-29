@@ -213,12 +213,12 @@ Cache a completed request's KV data into the tree.
 | **Complexity** | **O(K + D·C)** — insert O(K + D·C) + lock release O(D). Simplifies to **O(K)**. |
 
 **Algorithm detail:**
-1. `prepare_for_caching_req()` per component — sets component-specific insert params, returns effective cache length (SWA: sets `swa_evicted_seqlen`; Mamba: prepares `mamba_value` from ping-pong buffer, returns `mamba_last_track_seqlen` as truncation hint)
+1. `prepare_for_caching_req()` per component — sets component-specific insert params, returns effective cache length (SWA: sets `swa_evicted_seqlen`; Mamba: prepares `mamba_value` from `pending_radix_mamba_slot`, returns `mamba_last_track_seqlen` as truncation hint)
 2. Truncates if `effective_cache_len < len(token_ids)`: frees excess pool indices
 3. Converts token IDs (bigram if EAGLE), page-aligns keys, then calls `insert()`
 4. Frees unaligned tail KV indices beyond page boundary
 5. Calls `dec_lock_ref()` on the previous `req.last_node`
-6. `cleanup_after_caching_req()` per component (Mamba: frees forked mamba_value based on `mamba_exist`, handles ping-pong buffer cleanup)
+6. `cleanup_after_caching_req()` per component (Mamba: frees unused `mamba_value` based on `mamba_exist`, handles pending radix slot cleanup)
 
 ---
 
@@ -290,8 +290,8 @@ Each component implements these hooks. See `tree_component.py` for the ABC and d
 
 | Hook | Purpose | Called By | Default |
 |------|---------|-----------|----------|
-| `prepare_for_caching_req()` | Prepare component-specific data before insert, fill fields in `InsertParams`, return effective cache length. Full: no-op. SWA: sets `swa_evicted_seqlen`. Mamba: prepares `mamba_value` from ping-pong buffer, returns `mamba_last_track_seqlen`. | `cache_finished/unfinished_req` | returns `None` |
-| `cleanup_after_caching_req()` | Post-cache cleanup. Full/SWA: no-op. Mamba: frees forked `mamba_value` based on `mamba_exist`, handles ping-pong buffer `keep_idx`, resets `mamba_last_track_seqlen` on unfinished. | `cache_finished/unfinished_req` | no-op |
+| `prepare_for_caching_req()` | Prepare component-specific data before insert, fill fields in `InsertParams`, return effective cache length. Full: no-op. SWA: sets `swa_evicted_seqlen`. Mamba: prepares `mamba_value` from `pending_radix_mamba_slot`, returns `mamba_last_track_seqlen`. | `cache_finished/unfinished_req` | returns `None` |
+| `cleanup_after_caching_req()` | Post-cache cleanup. Full/SWA: no-op. Mamba: frees unused `mamba_value` based on `mamba_exist`, handles pending radix slot cleanup, resets `mamba_last_track_seqlen` on unfinished. | `cache_finished/unfinished_req` | no-op |
 
 ### Utility
 

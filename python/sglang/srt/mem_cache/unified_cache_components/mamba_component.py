@@ -359,8 +359,8 @@ class MambaComponent(TreeComponent):
             req.mamba_last_track_seqlen = None
             # Producer-side: pre-allocate the next pending slot off the
             # forward hot path so the next track interval can write into it
-            # directly. Evict once on failure; leave as None if the pool
-            # remains exhausted (tracking will be skipped for that interval).
+            # directly. Evict once on failure and require the retry to succeed,
+            # matching the legacy extra-buffer launch-time capacity contract.
             if self.enable_mamba_extra_buffer and req.pending_radix_mamba_slot is None:
                 pending = self.cache.req_to_token_pool.mamba_pool.alloc(1)
                 if pending is None:

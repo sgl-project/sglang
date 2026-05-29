@@ -631,6 +631,7 @@ class ServerArgs:
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: Optional[str] = None
     mamba_full_memory_ratio: float = 0.9
+    mamba_cache_v2_additional_ratio: Optional[float] = None
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
     linear_attn_backend: str = "triton"
@@ -2519,6 +2520,14 @@ class ServerArgs:
             assert (
                 not self.enable_mamba_extra_buffer()
             ), f"mamba extra_buffer is not supported for {model_arch} model"
+
+        if self.mamba_cache_v2_additional_ratio is not None and not (
+            1.0 <= self.mamba_cache_v2_additional_ratio <= 2.0
+        ):
+            raise ValueError(
+                "--mamba-cache-v2-additional-ratio must be in [1, 2], "
+                f"got {self.mamba_cache_v2_additional_ratio}."
+            )
 
         if self.enable_mamba_extra_buffer():  # extra_buffer
             if self.disable_radix_cache:
@@ -5882,6 +5891,18 @@ class ServerArgs:
             type=float,
             default=ServerArgs.mamba_full_memory_ratio,
             help="The ratio of mamba state memory to full kv cache memory.",
+        )
+        parser.add_argument(
+            "--mamba-cache-v2-additional-ratio",
+            type=float,
+            default=ServerArgs.mamba_cache_v2_additional_ratio,
+            help=(
+                "Additional Mamba slots per max-running request reserved for "
+                "extra-buffer tracking. If unset, use the legacy-compatible "
+                "defaults: 2 with overlap scheduling and 1 without overlap "
+                "scheduling. Values in [1, 2] trade max running requests for "
+                "extra-buffer headroom."
+            ),
         )
         parser.add_argument(
             "--mamba-scheduler-strategy",

@@ -16,6 +16,9 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
 from sglang.srt.managers.scheduler_components.batch_result_processor import (  # noqa: E402
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.model_executor.model_runner_kv_cache_mixin import (  # noqa: E402
+    ModelRunnerKVCacheMixin,
+)
 
 register_cpu_ci(est_time=3, suite="stage-a-test-cpu")
 
@@ -25,6 +28,24 @@ class FakeServerArgs:
 
     def enable_mamba_extra_buffer(self):
         return True
+
+
+class FakeRatioServerArgs:
+    def __init__(
+        self,
+        *,
+        disable_radix_cache: bool = False,
+        extra_buffer: bool = True,
+        disable_overlap_schedule: bool = False,
+        additional_ratio=None,
+    ):
+        self.disable_radix_cache = disable_radix_cache
+        self.extra_buffer = extra_buffer
+        self.disable_overlap_schedule = disable_overlap_schedule
+        self.mamba_cache_v2_additional_ratio = additional_ratio
+
+    def enable_mamba_extra_buffer(self):
+        return self.extra_buffer
 
 
 class FakeSpecAlgorithm:
@@ -93,6 +114,21 @@ class TestMambaRadixTrackSlots(CustomTestCase):
             mamba_track_indices=torch.tensor([track_slot], dtype=torch.int64),
             spec_algorithm=FakeSpecAlgorithm(is_none=not spec),
         )
+
+    def test_mamba_ratio_preserves_legacy_additional_buffer_defaults(self):
+        runner = ModelRunnerKVCacheMixin.__new__(ModelRunnerKVCacheMixin)
+
+        runner.server_args = FakeRatioServerArgs(disable_overlap_schedule=False)
+        self.assertEqual(runner._calculate_mamba_ratio(), 5)
+
+        runner.server_args = FakeRatioServerArgs(disable_overlap_schedule=True)
+        self.assertEqual(runner._calculate_mamba_ratio(), 4)
+
+        runner.server_args = FakeRatioServerArgs(additional_ratio=1.5)
+        self.assertEqual(runner._calculate_mamba_ratio(), 4.5)
+
+        runner.server_args = FakeRatioServerArgs(extra_buffer=False)
+        self.assertEqual(runner._calculate_mamba_ratio(), 3)
 
     def test_spare_track_slot_preserves_pending_checkpoint(self):
         pool = FakeMambaPool([1007])

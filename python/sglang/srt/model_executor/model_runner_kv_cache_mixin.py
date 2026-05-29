@@ -49,6 +49,8 @@ if TYPE_CHECKING:
 
 # the ratio of mamba cache pool size to max_running_requests
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
+MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
+MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
 logger = logging.getLogger(__name__)
 
@@ -181,11 +183,20 @@ class ModelRunnerKVCacheMixin:
 
         return kv_cache_dim
 
-    def _calculate_mamba_ratio(self: ModelRunner) -> int:
+    def _calculate_mamba_ratio(self: ModelRunner) -> float:
         if self.server_args.disable_radix_cache:
             return 1
 
-        return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO
+        additional_ratio = 0
+        if self.server_args.enable_mamba_extra_buffer():
+            if self.server_args.mamba_cache_v2_additional_ratio is not None:
+                additional_ratio = self.server_args.mamba_cache_v2_additional_ratio
+            elif not self.server_args.disable_overlap_schedule:
+                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
+            else:
+                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
+
+        return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
 
     def _validate_prefill_only_disable_kv_cache_pool_family(
         self: ModelRunner,
