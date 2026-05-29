@@ -85,7 +85,6 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
     run_multi_detokenizer_router_process,
 )
-from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_detection import resolve_auto_parsers
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -106,12 +105,25 @@ from sglang.srt.utils import (
     set_ulimit,
 )
 from sglang.srt.utils.network import get_zmq_socket, is_port_available
+from sglang.srt.utils.subprocess_bootstrap import (
+    DEFAULT_SCHEDULER_TARGET,
+    SubprocessTarget,
+    get_subprocess_target_args,
+)
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
+
+def run_scheduler_process(*args: Any, **kwargs: Any) -> Any:
+    """Compatibility wrapper that lazily imports the scheduler process target."""
+    from sglang.srt.managers.scheduler import run_scheduler_process as target
+
+    return target(*args, **kwargs)
+
 
 _is_cuda = is_cuda()
 
@@ -193,7 +205,7 @@ class Engine(EngineScoreMixin, EngineBase):
     # and launch processes for their private forks.
     server_args_class: ServerArgs = ServerArgs
     init_tokenizer_manager_func: Callable = staticmethod(init_tokenizer_manager)
-    run_scheduler_process_func: Callable = staticmethod(run_scheduler_process)
+    run_scheduler_process_func: SubprocessTarget = DEFAULT_SCHEDULER_TARGET
     run_detokenizer_process_func: Callable = staticmethod(run_detokenizer_process)
 
     def __init__(self, **kwargs):
@@ -565,7 +577,7 @@ class Engine(EngineScoreMixin, EngineBase):
         cls,
         server_args: ServerArgs,
         port_args: PortArgs,
-        run_scheduler_process_func: Callable,
+        run_scheduler_process_func: SubprocessTarget,
     ) -> Tuple[SchedulerInitResult, Optional[List]]:
         """Launch scheduler processes using multiprocessing.
         Override in subclasses for different backends (e.g. Ray).
@@ -605,20 +617,22 @@ class Engine(EngineScoreMixin, EngineBase):
                     )
 
                     with maybe_reindex_device_id(gpu_id) as gpu_id:
+                        scheduler_target, scheduler_args = get_subprocess_target_args(
+                            run_scheduler_process_func,
+                            server_args,
+                            port_args,
+                            gpu_id,
+                            tp_rank,
+                            attn_cp_rank,
+                            moe_dp_rank,
+                            moe_ep_rank,
+                            pp_rank,
+                            None,
+                            writer,
+                        )
                         proc = mp.Process(
-                            target=run_scheduler_process_func,
-                            args=(
-                                server_args,
-                                port_args,
-                                gpu_id,
-                                tp_rank,
-                                attn_cp_rank,
-                                moe_dp_rank,
-                                moe_ep_rank,
-                                pp_rank,
-                                None,
-                                writer,
-                            ),
+                            target=scheduler_target,
+                            args=scheduler_args,
                         )
                         with (
                             memory_saver_adapter.configure_subprocess(),
@@ -736,7 +750,7 @@ class Engine(EngineScoreMixin, EngineBase):
         cls,
         server_args: ServerArgs,
         init_tokenizer_manager_func: Callable,
-        run_scheduler_process_func: Callable,
+        run_scheduler_process_func: SubprocessTarget,
         run_detokenizer_process_func: Callable,
         port_args: Optional[PortArgs] = None,
     ) -> Tuple[

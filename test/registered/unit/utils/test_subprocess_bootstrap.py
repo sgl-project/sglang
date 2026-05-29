@@ -9,6 +9,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from sglang.srt.utils.subprocess_bootstrap import (
+    get_subprocess_target_args,
     resolve_subprocess_target,
     run_subprocess_target,
 )
@@ -93,6 +94,23 @@ class TestSubprocessBootstrap(TestCase):
         self.assertIs(
             pickle.loads(pickle.dumps(run_subprocess_target)), run_subprocess_target
         )
+
+    def test_get_subprocess_target_args_wraps_string_target(self):
+        target, args = get_subprocess_target_args(
+            "bootstrap_test_target:target", "arg", 1
+        )
+
+        self.assertIs(target, run_subprocess_target)
+        self.assertEqual(args, ("bootstrap_test_target:target", "arg", 1))
+
+    def test_get_subprocess_target_args_preserves_callable_target(self):
+        def target_func():
+            return None
+
+        target, args = get_subprocess_target_args(target_func, "arg", 1)
+
+        self.assertIs(target, target_func)
+        self.assertEqual(args, ("arg", 1))
 
 
 if __name__ == "__main__":

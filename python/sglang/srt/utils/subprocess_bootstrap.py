@@ -4,6 +4,9 @@ import importlib
 from collections.abc import Callable
 from typing import Any
 
+DEFAULT_SCHEDULER_TARGET = "sglang.srt.managers.scheduler:run_scheduler_process"
+SubprocessTarget = Callable[..., Any] | str
+
 
 def resolve_subprocess_target(target: str) -> Callable[..., Any]:
     """Resolve a ``module:function`` target string to a callable."""
@@ -32,3 +35,12 @@ def run_subprocess_target(target: str, *args: Any, **kwargs: Any) -> Any:
     load_startup_plugins()
     function = resolve_subprocess_target(target)
     return function(*args, **kwargs)
+
+
+def get_subprocess_target_args(
+    target: SubprocessTarget, *args: Any
+) -> tuple[Callable[..., Any], tuple[Any, ...]]:
+    """Return a multiprocessing target and args tuple for a callable or string target."""
+    if isinstance(target, str):
+        return run_subprocess_target, (target, *args)
+    return target, args
