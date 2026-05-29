@@ -538,8 +538,7 @@ class TritonAttnBackend(AttentionBackend):
                 device=self.device,
             )
             # Different with flashinfer kv_indptr and kv_indices construction.
-            # gpu_only path: seq_lens_sum may be None; over-allocate by ub since
-            # _fill_kv_indptr_and_indices writes ragged using seq_lens tensor.
+            # gpu_only: seq_lens_sum may be None; ub-allocate is safe (ragged write).
             seq_lens_sum = forward_batch.seq_lens_sum
             if seq_lens_sum is None:
                 seq_lens_sum = bs * self.max_context_len
@@ -610,9 +609,8 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits = None
             attn_lse = None
         else:
-            # gpu_only path leaves extend_prefix_lens_cpu unset; over-allocate
-            # via a static ub since _fill_kv_indptr_and_indices writes ragged
-            # using the GPU extend_prefix_lens tensor (extra tail unused).
+            # gpu_only leaves _cpu unset; ub-allocate is safe (ragged write
+            # from GPU tensor, extra tail unused).
             if forward_batch.extend_prefix_lens_cpu is not None:
                 kv_indices_len = sum(forward_batch.extend_prefix_lens_cpu)
             else:
@@ -653,9 +651,8 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr = None
             attn_logits = None
             attn_lse = None
-            # Caller typically sets extend_seq_lens_cpu (eagle_info gpu_only path
-            # supplies the host-constant mirror); fall back to a GPU max only if
-            # some caller leaves it unset.
+            # Caller usually supplies extend_seq_lens_cpu (eagle_info gpu_only
+            # sets host-constant mirror); defensive GPU-max fallback if not.
             if forward_batch.extend_seq_lens_cpu is not None:
                 max_extend_len = max(forward_batch.extend_seq_lens_cpu)
             else:
