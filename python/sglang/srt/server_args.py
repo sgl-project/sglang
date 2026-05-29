@@ -3332,7 +3332,8 @@ class ServerArgs:
         from sglang.srt.configs.model_config import is_deepseek_dsa
 
         hf_config = self.get_model_config().hf_config
-        model_arch = hf_config.architectures[0]
+        architectures = getattr(hf_config, "architectures", [])
+        model_arch = architectures[0] if architectures else None
         supports_bypassed_topk_pcg = (
             # GptOss wraps the entire MoE block in its own custom op (moe_impl),
             # so bypassed topk is handled inside the op body.
