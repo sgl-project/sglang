@@ -3617,6 +3617,15 @@ class Scheduler(
         raise NotImplementedError()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
+        # mode="abort" is handled entirely in TokenizerManager (translated to
+        # AbortReq) and is never forwarded here, so the scheduler only ever
+        # sees retract / in_place. Guard so a stray abort — e.g. the dataclass
+        # default mode, or a caller that bypasses TokenizerManager — fails
+        # loudly instead of silently falling through to a no-op pause.
+        assert recv_req.mode in ("retract", "in_place"), (
+            f"Scheduler.pause_generation got unsupported mode {recv_req.mode!r}; "
+            f"abort is handled in TokenizerManager and must not reach the scheduler"
+        )
         self._engine_paused = True
 
         if recv_req.mode == "in_place":
