@@ -125,6 +125,22 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
             f"flag={t.last_chunked_req_scheduled_iter_flag()!r}"
         )
 
+    def test_chunked_req_skips_radix_hit_count_increment(self):
+        """A chunked prefill triggers at least one _inc_hit_count(chunked=True) skip on radix insert."""
+        self.runtime.run(self._script_chunked_req_skips_radix_hit_count_increment)
+
+    @staticmethod
+    def _script_chunked_req_skips_radix_hit_count_increment(t: ScriptedRuntime):
+        before = t.radix_chunked_hit_count_skip_count()
+        r = t.start_req(prompt_len=4 * _CHUNK_SIZE, max_new_tokens=2)
+        yield from run_until_finished(r)
+        after = t.radix_chunked_hit_count_skip_count()
+        assert r.finished, f"req did not finish, status={r.status!r}"
+        assert after - before >= 1, (
+            f"chunked _inc_hit_count skip branch must be exercised at least "
+            f"once; before={before}, after={after}"
+        )
+
 
 class TestScriptedPpChunkSweep(ScriptedRuntimeTestCase):
     # pp_async_batch_depth=2 makes pp_loop_size = pp_size + depth = 6,
@@ -206,29 +222,6 @@ class TestScriptedPpChunkSweep(ScriptedRuntimeTestCase):
             f"combo num_chunks={num_chunks}, num_conc_reqs={num_conc_reqs}: "
             f"chunked slot must be empty after drain; "
             f"flag={t.last_chunked_req_scheduled_iter_flag()!r}"
-        )
-
-
-class TestScriptedCoreRadix(ScriptedRuntimeTestCase):
-    ENGINE_KWARGS = base_engine_kwargs(
-        chunked_prefill_size=_CHUNK_SIZE,
-        disable_radix_cache=False,
-    )
-
-    def test_chunked_req_skips_radix_hit_count_increment(self):
-        """A chunked prefill triggers at least one _inc_hit_count(chunked=True) skip on radix insert."""
-        self.runtime.run(self._script_chunked_req_skips_radix_hit_count_increment)
-
-    @staticmethod
-    def _script_chunked_req_skips_radix_hit_count_increment(t: ScriptedRuntime):
-        before = t.radix_chunked_hit_count_skip_count()
-        r = t.start_req(prompt_len=4 * _CHUNK_SIZE, max_new_tokens=2)
-        yield from run_until_finished(r)
-        after = t.radix_chunked_hit_count_skip_count()
-        assert r.finished, f"req did not finish, status={r.status!r}"
-        assert after - before >= 1, (
-            f"chunked _inc_hit_count skip branch must be exercised at least "
-            f"once; before={before}, after={after}"
         )
 
 
