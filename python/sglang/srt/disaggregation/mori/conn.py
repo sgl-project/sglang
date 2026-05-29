@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ctypes
 import dataclasses
 import logging
 import os
@@ -33,11 +32,11 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
 )
-from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
-from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
-    filter_kv_indices_for_cp_rank,
+from sglang.srt.disaggregation.common.utils import (
+    AuxDataCodec,
+    group_concurrent_contiguous,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import get_int_env_var
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
@@ -174,22 +173,6 @@ class KVArgsRegisterInfo:
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
         )
-
-
-class AuxDataCodec:
-    @staticmethod
-    def serialize_data_from_buffer(src_addr, data_length):
-        buffer = (ctypes.c_byte * data_length).from_address(src_addr)
-        return bytes(buffer)
-
-    @staticmethod
-    def deserialize_data_to_buffer(kv_args, buffer_index, aux_index, data):
-        dst_aux_ptr = kv_args.aux_data_ptrs[buffer_index]
-        item_len = kv_args.aux_item_lens[buffer_index]
-        dst_addr = dst_aux_ptr + item_len * aux_index
-        buffer = (ctypes.c_byte * len(data)).from_address(dst_addr)
-        buffer[:] = data
-        return
 
 
 @dataclasses.dataclass
@@ -1132,7 +1115,7 @@ class MoriKVManager(CommonKVManager):
         bootstrap_room: int,
         kv_indices: npt.NDArray[np.int32],
         index_slice: slice,
-        is_last: bool,
+        is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[npt.NDArray[np.int32]] = None,
     ) -> Tuple[List[TransferStatus], Optional[List[TransferInfo]]]:
@@ -1163,7 +1146,7 @@ class MoriKVManager(CommonKVManager):
                     self.update_status(bootstrap_room, KVPoll.Failed)
                     return [], list(transfer_infos.values())
                 targets.append(TransferTarget(info=info, peer_info=peer_info))
-            if is_last:
+            if is_last_chunk:
                 target_infos_snapshot = list(transfer_infos.values())
 
         result_statuses: List[TransferStatus] = []
@@ -1179,7 +1162,7 @@ class MoriKVManager(CommonKVManager):
                     )
 
                 if (
-                    is_last
+                    is_last_chunk
                     and state_indices is not None
                     and not info.is_dummy
                     and self.state_mem_descs
@@ -1191,7 +1174,7 @@ class MoriKVManager(CommonKVManager):
                     )
 
                 if (
-                    is_last
+                    is_last_chunk
                     and aux_index is not None
                     and info.dst_aux_index >= 0
                     and self.pp_group.is_last_rank
@@ -1212,7 +1195,7 @@ class MoriKVManager(CommonKVManager):
             )
             return result_statuses, target_infos_snapshot
 
-        if is_last:
+        if is_last_chunk:
             with self.transfer_lock:
                 # Keep transfer_infos alive until sender.clear() so abort/failure
                 # paths can still recover notification targets after posting.
@@ -1243,38 +1226,28 @@ class MoriKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
     ):
-        index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
-        self.curr_idx += len(kv_indices)
-        is_last = self.curr_idx == self.num_kv_indices
+        kv_indices, index_slice, is_last_chunk, should_skip = (
+            self._prepare_send_indices(kv_indices, state_indices)
+        )
+        if should_skip:
+            return
 
-        # Special handling for cp
-        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
-            kv_indices, index_slice = filter_kv_indices_for_cp_rank(
-                self.kv_mgr,
-                kv_indices,
-                index_slice,
-            )
-        elif self.kv_mgr.is_dummy_cp_rank:
-            if not is_last:
-                return
-            else:
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
-                return
-
-        normalized_state = _normalize_state_indices(state_indices) if is_last else None
+        normalized_state = (
+            _normalize_state_indices(state_indices) if is_last_chunk else None
+        )
         statuses, infos = self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             kv_indices,
             index_slice,
-            is_last,
-            aux_index=self.aux_index if is_last else None,
+            is_last_chunk,
+            aux_index=self.aux_index if is_last_chunk else None,
             state_indices=normalized_state,
         )
         self.transfer_statuses.extend(statuses)
         self._record_transfer_indices(kv_indices, None)
         if infos is not None:
             self.pending_infos = infos
-            if is_last:
+            if is_last_chunk:
                 self.sent_last_chunk = True
         self._maybe_finalize_if_room_failed()
 
@@ -1295,15 +1268,9 @@ class MoriKVSender(CommonKVSender):
         status = self.kv_mgr.check_status(self.bootstrap_room)
 
         if status == KVPoll.Bootstrapping:
-            elapsed = time.time() - self.init_time
-            if elapsed >= self.kv_mgr.bootstrap_timeout:
-                reason = (
-                    f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
-                    "waiting for decode handshake"
-                )
-                self.kv_mgr.record_failure(self.bootstrap_room, reason)
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-                self._finalize_failure(reason)
+            timeout_result = self._check_bootstrap_timeout()
+            if timeout_result is not None:
+                self._finalize_failure()
                 return KVPoll.Failed
             return status
 
@@ -1499,14 +1466,10 @@ class MoriKVReceiver(CommonKVReceiver):
             self.conclude_state = status
             return status
 
-        if status == KVPoll.WaitingForInput and self.init_time is not None:
-            elapsed = time.time() - self.init_time
-            if elapsed >= self.kv_mgr.waiting_timeout:
-                reason = f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s waiting for KV transfer"
-                self.kv_mgr.record_failure(self.bootstrap_room, reason)
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-                self.conclude_state = KVPoll.Failed
-                return KVPoll.Failed
+        if status == KVPoll.WaitingForInput:
+            timeout_result = self._check_waiting_timeout()
+            if timeout_result is not None:
+                return timeout_result
 
         return status
 

@@ -76,7 +76,7 @@ class DiffusionTransferManager:
         request_id: str,
         tensor_fields: dict[str, torch.Tensor | list[torch.Tensor] | None],
         scalar_fields: dict | None = None,
-        stream: torch.get_device_module().Stream | None = None,
+        stream: torch.Stream | None = None,
     ) -> StagedTransfer | None:
         """Stage GPU tensors into the local TransferBuffer. Returns None on allocation failure."""
         total_size = 0
@@ -138,8 +138,8 @@ class DiffusionTransferManager:
         request_id: str,
         tensor_fields: dict[str, torch.Tensor | list[torch.Tensor] | None],
         scalar_fields: dict | None = None,
-        stream: torch.get_device_module().Stream | None = None,
-    ) -> tuple[StagedTransfer | None, torch.get_device_module().Event | None]:
+        stream: torch.Stream | None = None,
+    ) -> tuple[StagedTransfer | None, torch.Event | None]:
         """Stage GPU tensors, returning a CUDA event instead of blocking.
 
         Caller MUST wait on the event before reading buffer data.
@@ -206,7 +206,7 @@ class DiffusionTransferManager:
         request_id: str,
         manifest: dict,
         device: torch.device | str = current_platform.device_type,
-        stream: torch.get_device_module().Stream | None = None,
+        stream: torch.Stream | None = None,
     ) -> tuple[
         dict[str, torch.Tensor | list[torch.Tensor]],
         torch.get_device_module().Event | None,
@@ -320,7 +320,7 @@ class DiffusionTransferManager:
         request_id: str,
         manifest: dict,
         device: torch.device | str = current_platform.device_type,
-        stream: torch.get_device_module().Stream | None = None,
+        stream: torch.Stream | None = None,
     ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
         """Load tensors from a receive slot into GPU memory."""
         with self._lock:

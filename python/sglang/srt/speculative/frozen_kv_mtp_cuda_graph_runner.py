@@ -352,6 +352,9 @@ class FrozenKVMTPCudaGraphRunner:
         if bs != raw_bs:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.positions.zero_()
+            # Pair with seq_lens fill: padded rows must point at reserved
+            # req_pool slot 0 (req_to_token[0, :] is all zeros from init).
+            buffers.req_pool_indices.zero_()
 
         num_tokens = expanded_bs
         buffers.seq_lens[:raw_expanded_bs].copy_(forward_batch.seq_lens)

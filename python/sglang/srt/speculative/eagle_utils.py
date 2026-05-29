@@ -23,6 +23,30 @@ if _is_cuda or _is_hip or _is_musa:
     )
 
 
+def per_step_draft_out_cache_loc(
+    out_cache_loc: torch.Tensor,
+    batch_size: int,
+    topk: int,
+    num_steps: int,
+) -> torch.Tensor:
+    """Per-step slice of the multi-step EAGLE draft out_cache_loc buffer.
+
+    Single source of truth for the layout shared by EagleWorkerV2.draft_forward
+    (per-step write target) and DeepseekV4AttnBackend (per-step compression
+    write target baked into metadata).
+    """
+    expected = batch_size * topk * num_steps
+    assert out_cache_loc.shape[0] == expected, (
+        f"out_cache_loc.shape[0]={out_cache_loc.shape[0]} != "
+        f"batch_size * topk * num_steps = {batch_size}*{topk}*{num_steps}={expected}"
+    )
+    return (
+        out_cache_loc.view(batch_size, topk, num_steps)
+        .permute(2, 0, 1)
+        .reshape(num_steps, -1)
+    )
+
+
 def apply_eagle_prefill_input_rotation(
     batch: ScheduleBatch, next_token_ids: torch.Tensor
 ) -> None:
