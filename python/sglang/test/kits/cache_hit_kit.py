@@ -5,7 +5,7 @@ import time
 import aiohttp
 import requests
 
-from sglang.bench_serving import RequestFuncOutput
+from sglang.bench_serving import RequestFuncOutput, get_auth_headers
 from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.utils import get_tokenizer, remove_prefix
 
@@ -22,7 +22,7 @@ async def async_request_sglang_generate(
     Returns a RequestFuncOutput with additional cached_tokens and output_ids attributes.
     """
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
-        headers = {}
+        headers = get_auth_headers()
         generated_text = ""
         all_output_ids = []
         ttft = 0.0
@@ -100,6 +100,7 @@ async def async_request_openai_chat_completions(
     async_request_sglang_generate (except output_ids, which is unavailable).
     """
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+        headers = get_auth_headers()
         generated_text = ""
         ttft = 0.0
         latency = 0.0
@@ -108,7 +109,7 @@ async def async_request_openai_chat_completions(
         output = RequestFuncOutput()
 
         try:
-            async with session.post(url=url, json=payload) as response:
+            async with session.post(url=url, json=payload, headers=headers) as response:
                 if response.status == 200:
                     prompt_tokens = 0
                     cached_tokens = 0
