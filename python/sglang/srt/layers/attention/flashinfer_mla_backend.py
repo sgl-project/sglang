@@ -455,72 +455,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             "kv_indices": self.cuda_graph_kv_indices,
         }
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
-        seq_lens_sum = seq_lens.sum().item()
-        seq_lens_cpu = seq_lens.cpu()
-
-        if forward_mode.is_decode_or_idle():
-            # Decode: create wrapper, run the initial full begin_forward (False),
-            # then install the fast plan.  After that, call replay so the
-            # data-update path (update(True)) is also exercised during capture.
-            decode_wrapper = BatchMLAPagedAttentionWrapper(
-                self.workspace_buffer,
-                use_cuda_graph=True,
-                qo_indptr=self.cuda_graph_qo_indptr[: num_tokens + 1],
-                kv_indptr=self.cuda_graph_kv_indptr[: num_tokens + 1],
-                kv_indices=self.cuda_graph_kv_indices,
-                kv_len_arr=self.cuda_graph_kv_lens[:num_tokens],
-                backend="auto",
-            )
-            self.indices_updater_decode.update(
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                decode_wrapper=decode_wrapper,
-                init_metadata_replay=False,
-                spec_info=spec_info,
-            )
-            self.decode_cuda_graph_metadata[bs] = decode_wrapper
-            self.forward_metadata = DecodeMetadata(decode_wrapper)
-            # fast_mla_decode_plan requires _cached_module set by the initial
-            # begin_forward above; install it only after that call completes.
-            decode_wrapper.plan = partial(fast_mla_decode_plan, decode_wrapper)
-        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
-            # Prefill: create wrapper and store — replay handles the update call.
-            prefill_wrapper = BatchMLAPagedAttentionWrapper(
-                self.workspace_buffer,
-                use_cuda_graph=True,
-                qo_indptr=self.cuda_graph_qo_indptr[: bs + 1],
-                kv_indptr=self.cuda_graph_kv_indptr[: bs + 1],
-                kv_indices=self.cuda_graph_kv_indices,
-                kv_len_arr=self.cuda_graph_kv_lens[:bs],
-                backend="auto",
-            )
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrapper
-            self.forward_metadata = PrefillMetadata(prefill_wrapper, False)
-        else:
-            raise ValueError(f"Invalid mode: {forward_mode=}")
-
-        self.init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_sum=seq_lens_sum,
-            encoder_lens=encoder_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-            seq_lens_cpu=seq_lens_cpu,
-        )
-
     def _apply_cuda_graph_metadata(
         self,
         bs: int,
@@ -570,28 +504,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        # Thin shim — body lives in _apply_cuda_graph_metadata.
-        self._apply_cuda_graph_metadata(
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_sum=seq_lens_sum,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-            seq_lens_cpu=seq_lens_cpu,
-        )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
