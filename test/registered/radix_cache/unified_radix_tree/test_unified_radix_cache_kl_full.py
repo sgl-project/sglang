@@ -31,7 +31,7 @@ class TestUnifiedFullRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--tp-size",
-                "4",
+                "2",
                 "--mem-fraction-static",
                 "0.80",
                 "--page-size",
