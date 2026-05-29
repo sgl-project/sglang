@@ -22,11 +22,13 @@ class TestExpandInputIds(unittest.TestCase):
         rebuilt = _expand_input_ids([11, IMG, 22, IMG, 33], [2, 3], IMG)
         self.assertEqual(rebuilt, [11, IMG, IMG, 22, IMG, IMG, IMG, 33])
 
-    def test_count_mismatch_returns_none(self):
-        self.assertIsNone(_expand_input_ids([11, IMG, 22], [2, 3], IMG))
+    def test_count_mismatch_raises(self):
+        with self.assertRaises(ValueError):
+            _expand_input_ids([11, IMG, 22], [2, 3], IMG)
 
-    def test_no_image_token_id_returns_none(self):
-        self.assertIsNone(_expand_input_ids([11, 22], [3], None))
+    def test_no_image_token_id_raises(self):
+        with self.assertRaises(ValueError):
+            _expand_input_ids([11, 22], [3], None)
 
 
 class TestResolveImageTokenCounts(unittest.TestCase):
@@ -47,17 +49,15 @@ class TestResolveImageTokenCounts(unittest.TestCase):
         )
         self.assertEqual(counts, [3, 3])
 
-    def test_base_returns_none_without_count_api(self):
+    def test_base_raises_without_count_api(self):
         fake_self = SimpleNamespace(_processor=SimpleNamespace())
-        self.assertIsNone(
+        with self.assertRaises(AttributeError):
             BaseMultimodalProcessor.resolve_image_token_counts(fake_self, [_image()])
-        )
 
-    def test_base_returns_none_without_images(self):
+    def test_base_asserts_on_none_images(self):
         fake_self = SimpleNamespace(_processor=SimpleNamespace())
-        self.assertIsNone(
-            BaseMultimodalProcessor.resolve_image_token_counts(fake_self, [])
-        )
+        with self.assertRaises(AssertionError):
+            BaseMultimodalProcessor.resolve_image_token_counts(fake_self, None)
 
     def test_kimi_override_uses_media_tokens_calculator(self):
         def media_tokens_calculator(media):
@@ -75,11 +75,10 @@ class TestResolveImageTokenCounts(unittest.TestCase):
         )
         self.assertEqual(counts, [2, 5])
 
-    def test_kimi_override_returns_none_without_calculator(self):
+    def test_kimi_override_raises_without_calculator(self):
         fake_self = SimpleNamespace(_processor=SimpleNamespace())
-        self.assertIsNone(
+        with self.assertRaises(AttributeError):
             KimiGridMMDataMixin.resolve_image_token_counts(fake_self, [_image()])
-        )
 
 
 if __name__ == "__main__":

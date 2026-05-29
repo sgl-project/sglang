@@ -1219,7 +1219,7 @@ class BaseMultimodalProcessor(ABC):
             return tensor
         return tensor.cpu()
 
-    def resolve_image_token_counts(self, images: List) -> Optional[List[int]]:
+    def resolve_image_token_counts(self, images: List) -> List[int]:
         """Per-image expanded token counts, computed without re-tokenizing.
 
         Default implementation uses the transformers in-tree convention
@@ -1227,33 +1227,22 @@ class BaseMultimodalProcessor(ABC):
         VLM processors, e.g. Qwen-VL, Gemma3, GLM4V). Models whose processor
         does not implement it (e.g. Kimi) override this method.
 
-        Returns ``None`` if unavailable or it raises, so the caller can fall back
-        to the HF re-tokenized ids.
+        Raises if the processor lacks the API or the computation fails; the
+        caller catches, warns, and falls back to the HF re-tokenized ids.
         """
-        if not images:
-            return None
-
-        get_num_multimodal_tokens = getattr(
-            self._processor, "_get_num_multimodal_tokens", None
-        )
-        if not callable(get_num_multimodal_tokens):
-            return None
-
-        try:
-            image_sizes = [(image.height, image.width) for image in images]
-            num_image_tokens = get_num_multimodal_tokens(
-                image_sizes=image_sizes
-            ).num_image_tokens
-            return [int(count) for count in num_image_tokens]
-        except Exception:
-            return None
+        assert images is not None
+        image_sizes = [(image.height, image.width) for image in images]
+        num_image_tokens = self._processor._get_num_multimodal_tokens(
+            image_sizes=image_sizes
+        ).num_image_tokens
+        return [int(count) for count in num_image_tokens]
 
     @staticmethod
     def _expand_input_ids(
         original_ids: List[int],
         counts: List[int],
         image_token_id: Optional[int],
-    ) -> Optional[List[int]]:
+    ) -> List[int]:
         """Rebuild final input_ids for a pre-tokenized (list[int]) prompt.
 
         Keep the user's ORIGINAL tokens verbatim and expand the i-th image
@@ -1261,18 +1250,20 @@ class BaseMultimodalProcessor(ABC):
         processor's re-tokenization is discarded, so non-media tokens cannot
         drift.
 
-        Returns ``None`` when the number of image placeholders in
-        ``original_ids`` does not match ``len(counts)`` (cannot align), so the
-        caller can fall back to the HF re-tokenized ids.
+        Raises ``ValueError`` when expansion cannot be aligned; the caller
+        catches it, warns, and falls back to the HF re-tokenized ids.
         """
         if image_token_id is None:
-            return None
+            raise ValueError("image_token_id is not set for this processor")
 
         num_placeholders = sum(
             1 for token_id in original_ids if token_id == image_token_id
         )
         if num_placeholders != len(counts):
-            return None
+            raise ValueError(
+                f"prompt has {num_placeholders} image placeholder token(s) but "
+                f"{len(counts)} image(s) were provided"
+            )
 
         rebuilt: List[int] = []
         next_image_idx = 0
@@ -1334,39 +1325,33 @@ class BaseMultimodalProcessor(ABC):
             )
             all_collected_items = collected_items
 
-            # Pre-tokenized request: keep the user's exact tokens instead of the
-            # HF re-tokenized prompt (decode + re-tokenize is not identity, which
-            # would drift the prompt length). base_output.input_ids is set only
-            # when the prompt arrived as a list[int] (see load_mm_data), so this
-            # is a no-op for text prompts.
+            # When SGLANG_MM_AVOID_RETOKENIZE is on, keep the user's exact tokens to avoid retokenize drift.
+            # Drift happens when Retokenization is not identity: Decode(X) => String => Re-tokenize => Y, X != Y.
             if (
                 envs.SGLANG_MM_AVOID_RETOKENIZE.get()
                 and base_output.input_ids is not None
                 and input_ids is not None
+                and raw_images
             ):
-                # base_output.input_ids is set only for pre-tokenized prompts
-                # (prompt arrived as list[int], see load_mm_data), so it is
-                # always a plain list here.
                 assert isinstance(
                     base_output.input_ids, list
                 ), f"expected list[int] input_ids, got {type(base_output.input_ids)}"
-                counts = self.resolve_image_token_counts(raw_images)
-                rebuilt = (
-                    self._expand_input_ids(
-                        base_output.input_ids,
-                        counts,
-                        mm_tokens.image_token_id,
+                try:
+                    counts = self.resolve_image_token_counts(raw_images)
+                    input_ids = torch.tensor(
+                        self._expand_input_ids(
+                            base_output.input_ids,
+                            counts,
+                            mm_tokens.image_token_id,
+                        ),
+                        dtype=input_ids.dtype,
                     )
-                    if counts is not None
-                    else None
-                )
-                if rebuilt is not None:
-                    input_ids = torch.tensor(rebuilt, dtype=input_ids.dtype)
-                else:
+                except Exception as e:
                     logger.warning(
                         "Token-id multimodal prompt could not be aligned with the "
-                        "processor expansion; falling back to decode+retokenize, "
-                        "which may change prompt length (token drift)."
+                        "processor expansion (%s); falling back to decode+retokenize, "
+                        "which may change prompt length (token drift).",
+                        e,
                     )
         else:
             ret = None
