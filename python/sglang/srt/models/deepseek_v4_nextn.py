@@ -15,7 +15,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
-    dp_gather_partial,
+    dp_gather_replicate,
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_size,
@@ -161,7 +161,7 @@ class DeepseekV4ModelNextN(nn.Module):
                 dtype=input_ids.dtype,
                 device=input_ids.device,
             )
-            dp_gather_partial(input_ids_global, input_ids[:, None], forward_batch)
+            dp_gather_replicate(input_ids_global, input_ids[:, None], forward_batch)
             input_ids_global = input_ids_global.squeeze(-1)
         else:
             input_ids_global = input_ids
