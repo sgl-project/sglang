@@ -48,21 +48,6 @@ logger = logging.getLogger(__name__)
 START_REQ_ARRIVAL_TIMEOUT_S: float = 60.0
 
 
-class ScriptedRuntimeFinished(Exception):
-    """Raised on every rank when the script generator finishes.
-
-    ``ok=True``: normal return / ``StopIteration``.
-    ``ok=False``: generator raised; ``exc_traceback`` carries the text.
-    Caught by ``run_scheduler_process`` to exit cleanly without
-    SIGQUITing the parent.
-    """
-
-    def __init__(self, *, ok: bool, exc_traceback: Optional[str] = None) -> None:
-        self.ok = ok
-        self.exc_traceback = exc_traceback
-        super().__init__(f"ScriptedRuntime finished (ok={ok})")
-
-
 def _ensure_script_importable(sys_path_entry: Optional[str]) -> None:
     """Forward the script module's directory onto ``sys.path``.
 
@@ -100,8 +85,8 @@ class ScriptedRuntime:
     is set. On the driver rank, instantiates the script generator and
     advances it one step per ``_yield_to_script`` call (invoked by
     ``SchedulerRequestReceiver.recv_requests`` every event-loop iter).
-    When the generator finishes, every rank raises
-    ``ScriptedRuntimeFinished`` so all subprocesses exit together.
+    When the generator finishes, every rank ``sys.exit``s so all
+    subprocesses tear down together.
     """
 
     def __init__(
@@ -374,8 +359,13 @@ class ScriptedRuntime:
 
     def _yield_to_script(self) -> None:
         """Advance the generator one step (driver only) and broadcast
-        completion state. Raises :class:`ScriptedRuntimeFinished` on
-        every rank when the script finishes or raises.
+        completion state. When the script finishes or raises, every rank
+        ``sys.exit``s so all scheduler subprocesses tear down together.
+
+        ``sys.exit`` raises ``SystemExit`` (a ``BaseException``), so it sails
+        past ``run_scheduler_process``'s ``except Exception`` SIGQUIT path and
+        exits the subprocess cleanly with code 0 (ok) / 1 (script failed) —
+        no scripted-runtime hook in the production bootstrap.
         """
         if self._is_driver:
             payload: List = list(self._advance_generator())
@@ -390,11 +380,23 @@ class ScriptedRuntime:
             src=0,
         )
         done, exc_tb = payload[0], payload[1]
-        if done:
-            raise ScriptedRuntimeFinished(
-                ok=(exc_tb is None),
-                exc_traceback=exc_tb,
-            )
+        if not done:
+            return
+
+        if exc_tb is not None and self._is_driver:
+            self._write_traceback(exc_tb)
+        sys.exit(0 if exc_tb is None else 1)
+
+    def _write_traceback(self, exc_tb: str) -> None:
+        """Persist a failed script's traceback for the caller to surface."""
+        path = self._scheduler.server_args.scripted_runtime_traceback_path
+        if not path:
+            return
+        try:
+            with open(path, "w") as f:
+                f.write(exc_tb or "<no traceback>")
+        except OSError:
+            logger.exception("Failed to write scripted_runtime traceback to %s", path)
 
     def _advance_generator(self) -> Tuple[bool, Optional[str]]:
         try:

@@ -3859,12 +3859,6 @@ def run_scheduler_process(
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
-    # Lazy import keeps the test-only module off the production load path
-    # while still letting the ``except`` clause below name the class.
-    from sglang.test.scripted_runtime.runtime import (
-        ScriptedRuntimeFinished as _ScriptedRuntimeFinished,
-    )
-
     dp_rank = configure_scheduler_process(
         server_args,
         gpu_id,
@@ -3889,7 +3883,6 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     scheduler = None
-    scripted_runtime_exit_code = 0
     try:
         scheduler = Scheduler(
             server_args,
@@ -3909,61 +3902,19 @@ def run_scheduler_process(
         # Run the event loop (blocks until shutdown)
         scheduler.run_event_loop()
 
-    except _ScriptedRuntimeFinished as finished:
-        # Cooperative termination from a test script; raised on every rank
-        # after the cross-rank broadcast. Only the driver rank writes the
-        # traceback file to avoid contention.
-        is_driver = (
-            scheduler is not None
-            and scheduler.ps.pp_rank == 0
-            and scheduler.ps.tp_rank == 0
-            and scheduler.ps.attn_cp_rank == 0
-        )
-        if (
-            not finished.ok
-            and is_driver
-            and server_args.scripted_runtime_traceback_path
-        ):
-            try:
-                with open(server_args.scripted_runtime_traceback_path, "w") as f:
-                    f.write(finished.exc_traceback or "<no traceback>")
-            except OSError:
-                logger.exception(
-                    "Failed to write scripted_runtime traceback to %s",
-                    server_args.scripted_runtime_traceback_path,
-                )
-        scripted_runtime_exit_code = 0 if finished.ok else 1
     except Exception:
-        tb = get_exception_traceback()
-        logger.error(f"Scheduler hit an exception: {tb}")
-        if server_args.scripted_runtime_fn_path is not None:
-            # Tests surface failures via the traceback file + non-zero
-            # exit code; SIGQUIT / pgroup SIGKILL would take the test
-            # runner itself down.
-            if server_args.scripted_runtime_traceback_path:
-                try:
-                    with open(server_args.scripted_runtime_traceback_path, "w") as f:
-                        f.write(tb)
-                except OSError:
-                    logger.exception(
-                        "Failed to write scripted_runtime traceback to %s",
-                        server_args.scripted_runtime_traceback_path,
-                    )
-            scripted_runtime_exit_code = 1
-        else:
-            parent_process.send_signal(signal.SIGQUIT)
-            # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands
-            # of NCCL/TCPStore tracebacks before they finally die.
-            if envs.SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION.get():
-                try:
-                    os.killpg(os.getpgrp(), signal.SIGKILL)
-                except Exception:
-                    pass
+        traceback = get_exception_traceback()
+        logger.error(f"Scheduler hit an exception: {traceback}")
+        parent_process.send_signal(signal.SIGQUIT)
+        # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands
+        # of NCCL/TCPStore tracebacks before they finally die.
+        if envs.SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION.get():
+            try:
+                os.killpg(os.getpgrp(), signal.SIGKILL)
+            except Exception:
+                pass
     finally:
         if scheduler is not None:
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
-
-    if scripted_runtime_exit_code != 0:
-        sys.exit(scripted_runtime_exit_code)

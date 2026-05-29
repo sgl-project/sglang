@@ -844,10 +844,6 @@ class ServerArgs:
     msprobe_dump_config: Optional[str] = None
 
     # Scripted runtime (testing only; set programmatically, not via CLI).
-    # See ``sglang.test.scripted_runtime``. ``fn_path`` is
-    # ``"module.path:qualname"``; ``traceback_path`` receives any
-    # script-side exception text; ``sys_path_entry`` is prepended to the
-    # subprocess ``sys.path`` so spawn-mode mp can import the script module.
     scripted_runtime_fn_path: Optional[str] = None
     scripted_runtime_traceback_path: Optional[str] = None
     scripted_runtime_sys_path_entry: Optional[str] = None
