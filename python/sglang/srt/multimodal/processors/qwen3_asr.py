@@ -71,7 +71,7 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
 
         prompt = self._build_transcription_prompt(input_text)
 
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=prompt,
             audio_data=audio_data,
             multimodal_tokens=self.mm_tokens,

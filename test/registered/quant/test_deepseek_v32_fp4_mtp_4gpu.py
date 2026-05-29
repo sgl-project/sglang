@@ -16,8 +16,9 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(
-    est_time=1060,
-    suite="stage-c-test-4-gpu-b200",
+    est_time=690,
+    stage="base-c",
+    runner_config="4-gpu-b200",
 )
 
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3.2-NVFP4"
@@ -36,7 +37,7 @@ class TestDeepseekV32FP4DPSpecV2(CustomTestCase):
             "4",
             "--enable-dp-attention",
             "--attention-backend",
-            "nsa",
+            "dsa",
             "--moe-runner-backend",
             "flashinfer_trtllm",
             "--quantization",
@@ -126,7 +127,7 @@ class TestDeepseekV32FP4TPSpecV2(CustomTestCase):
             "--tp",
             "4",
             "--attention-backend",
-            "nsa",
+            "dsa",
             "--moe-runner-backend",
             "flashinfer_trtllm",
             "--quantization",

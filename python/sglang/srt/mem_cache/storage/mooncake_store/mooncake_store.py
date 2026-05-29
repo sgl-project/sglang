@@ -92,6 +92,8 @@ class MooncakeStoreConfig:
     check_server: bool
     standalone_storage: bool
     client_server_address: str
+    enable_ssd_offload: bool = False
+    ssd_offload_path: Optional[str] = None
 
     @staticmethod
     def from_file() -> "MooncakeStoreConfig":
@@ -142,6 +144,12 @@ class MooncakeStoreConfig:
             client_server_address=config.get(
                 "client_server_address", envs.MOONCAKE_CLIENT.default
             ),
+            enable_ssd_offload=config.get(
+                "enable_ssd_offload", envs.MOONCAKE_ENABLE_SSD_OFFLOAD.default
+            ),
+            ssd_offload_path=config.get(
+                "ssd_offload_path", envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.default
+            ),
         )
 
     @staticmethod
@@ -181,6 +189,8 @@ class MooncakeStoreConfig:
             check_server=envs.MOONCAKE_CHECK_SERVER.get(),
             standalone_storage=envs.MOONCAKE_STANDALONE_STORAGE.get(),
             client_server_address=envs.MOONCAKE_CLIENT.get(),
+            enable_ssd_offload=envs.MOONCAKE_ENABLE_SSD_OFFLOAD.get(),
+            ssd_offload_path=envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.get(),
         )
 
     @staticmethod
@@ -222,6 +232,12 @@ class MooncakeStoreConfig:
             ),
             client_server_address=extra_config.get(
                 "client_server_address", envs.MOONCAKE_CLIENT.default
+            ),
+            enable_ssd_offload=extra_config.get(
+                "enable_ssd_offload", envs.MOONCAKE_ENABLE_SSD_OFFLOAD.default
+            ),
+            ssd_offload_path=extra_config.get(
+                "ssd_offload_path", envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.default
             ),
         )
 
@@ -280,6 +296,52 @@ class MooncakeBaseStore:
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
+    @staticmethod
+    def _standalone_required_bytes(mem_pool: Any) -> int:
+        """Compute total bytes of host buffers that must be visible to the real client.
+
+        In standalone (dummy client) mode, the real mooncake_client process needs
+        to map any host buffers we will later pass by pointer via register_buffer().
+        For hybrid models, that includes KV + sidecar pools (e.g. Mamba temporal/conv).
+        """
+        # Prefer a generic "hybrid pool" accessor when present.
+        total = 0
+        seen_ptrs: set[int] = set()
+
+        def _add_tensor(t: Optional[torch.Tensor]):
+            nonlocal total
+            if t is None:
+                return
+            try:
+                ptr = int(t.data_ptr())
+            except Exception:
+                return
+            if ptr in seen_ptrs:
+                return
+            seen_ptrs.add(ptr)
+            total += int(t.numel() * t.element_size())
+
+        # Always include the anchor KV buffer if present.
+        _add_tensor(getattr(mem_pool, "kv_buffer", None))
+
+        # HostPoolGroup: include each pool's hybrid buffers when available.
+        entries = getattr(mem_pool, "entries", None)
+        if entries:
+            for entry in entries:
+                host_pool = getattr(entry, "host_pool", None)
+                if host_pool is None:
+                    continue
+                # KV pool anchor memory is already covered, but harmless if added twice.
+                _add_tensor(getattr(host_pool, "kv_buffer", None))
+                for buf in getattr(host_pool, "get_hybrid_pool_buffer", lambda: [])():
+                    _add_tensor(buf)
+            return total
+
+        # Single HostKVCache-like pool: add its sidecar buffers if any.
+        for buf in getattr(mem_pool, "get_hybrid_pool_buffer", lambda: [])():
+            _add_tensor(buf)
+        return total
+
     def __init__(
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
     ):
@@ -335,8 +397,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         "Please set standalone_storage=False "
                         "or upgrade Mooncake by 'pip install mooncake --upgrade'."
                     )
+                required_bytes = self._standalone_required_bytes(mem_pool)
                 ret_code = self.store.setup_dummy(
-                    mem_pool.size * mem_pool.size_per_token,
+                    required_bytes,
                     DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
                     self.config.client_server_address,
                 )
@@ -373,16 +436,40 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     client_hostname = self.config.local_hostname
                     transfer_engine = None
 
-                ret_code = self.store.setup(
-                    client_hostname,
-                    self.config.metadata_server,
-                    per_tp_global_segment_size,
-                    DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
-                    self.config.protocol,
-                    device_name,
-                    self.config.master_server_address,
-                    transfer_engine,
-                )
+                setup_kwargs = {}
+                if self.config.enable_ssd_offload:
+                    setup_kwargs["enable_ssd_offload"] = True
+                if self.config.ssd_offload_path is not None:
+                    setup_kwargs["ssd_offload_path"] = self.config.ssd_offload_path
+
+                while True:
+                    try:
+                        ret_code = self.store.setup(
+                            client_hostname,
+                            self.config.metadata_server,
+                            per_tp_global_segment_size,
+                            DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                            self.config.protocol,
+                            device_name,
+                            self.config.master_server_address,
+                            transfer_engine,
+                            **setup_kwargs,
+                        )
+                        break
+                    except TypeError as e:
+                        unsupported_kwargs = [
+                            key for key in list(setup_kwargs) if key in str(e)
+                        ]
+                        if not unsupported_kwargs:
+                            raise
+                        logger.warning(
+                            "The installed Mooncake version does not support the "
+                            f"{', '.join(unsupported_kwargs)} parameter(s) in setup(). "
+                            f"Retrying without {', '.join(unsupported_kwargs)}. "
+                            "Please upgrade Mooncake to enable SSD offload support."
+                        )
+                        for key in unsupported_kwargs:
+                            setup_kwargs.pop(key, None)
             if ret_code:
                 raise RuntimeError(
                     f"Failed to setup Mooncake store, error code: {ret_code}"

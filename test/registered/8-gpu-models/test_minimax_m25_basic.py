@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=307, suite="stage-c-test-8-gpu-h200")
+register_cuda_ci(est_time=250, stage="base-c", runner_config="8-gpu-h200")
 
 MINIMAX_M25_MODEL_PATH = "MiniMaxAI/MiniMax-M2.5"
 
@@ -36,6 +36,7 @@ class TestMiniMaxM25Basic(CustomTestCase):
             "minimax-append-think",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
+            "--weight-loader-prefetch-checkpoints",
         ]
         cls.process = popen_launch_server(
             cls.model,

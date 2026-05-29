@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/6366efc67b0aedd2c1721c14385370e50b297fb3/benchmarks/backend_request_func.py
 # Adapted from https://github.com/vllm-project/vllm/blob/6366efc67b0aedd2c1721c14385370e50b297fb3/benchmarks/benchmark_serving.py
 
@@ -127,6 +129,10 @@ def get_request_headers() -> Dict[str, str]:
     if h := getattr(args, "header", None):
         headers.update(parse_custom_headers(h))
     return headers
+
+
+def _combine_openai_chat_content(message: Dict[str, Any]) -> str:
+    return (message.get("reasoning_content") or "") + (message.get("content") or "")
 
 
 def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
@@ -438,9 +444,8 @@ async def async_request_openai_chat_completions(
                     if args.disable_stream:
                         # Non-streaming response
                         response_json = await response.json()
-                        output.generated_text = response_json["choices"][0]["message"][
-                            "content"
-                        ]
+                        message = response_json["choices"][0]["message"]
+                        output.generated_text = _combine_openai_chat_content(message)
                         output.success = True
                         output.latency = time.perf_counter() - st
                         output.ttft = (
@@ -475,9 +480,7 @@ async def async_request_openai_chat_completions(
                                 # Reasoning models stream thoughts via
                                 # `reasoning_content`; count them like content.
                                 delta = choices[0].get("delta") or {}
-                                content = (delta.get("reasoning_content") or "") + (
-                                    delta.get("content") or ""
-                                )
+                                content = _combine_openai_chat_content(delta)
 
                                 if content:
                                     timestamp = time.perf_counter()
@@ -2178,8 +2181,9 @@ if __name__ == "__main__":
         type=str,
         nargs="+",
         default=["CPU", "GPU"],
-        choices=["CPU", "GPU", "CUDA_PROFILER", "XPU"],
-        help="Profiler activities to capture: CPU, GPU, XPU, CUDA_PROFILER.",
+        choices=["CPU", "GPU", "CUDA_PROFILER", "XPU", "MEM"],
+        help="Profiler activities to capture: CPU, GPU, XPU, CUDA_PROFILER, MEM "
+        "(MEM dumps a torch.cuda.memory snapshot, viewable at https://pytorch.org/memory_viz).",
     )
     parser.add_argument(
         "--profile-start-step",

@@ -4,7 +4,8 @@
   "name": "SGLang Documentation",
   "seo": {
     "metatags": {
-      "google-site-verification": "bX3ofyYQhraIpAYf4DpyZQXZO_G4xLR_RqeBAKnJA7g"
+      "google-site-verification": "bX3ofyYQhraIpAYf4DpyZQXZO_G4xLR_RqeBAKnJA7g",
+      "canonical": "https://docs.sglang.io"
     }
   },
   "redirects": [
@@ -897,10 +898,17 @@
                   "docs/hardware-platforms/ascend-npus/ascend_contribution_guide",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_support_new_models",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_best_practice",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_optimization",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_accuracy_evaluation",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_performance_testing",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_ring_sp_performance",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_5_examples",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_glm5_examples",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables"
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_faq",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_operator_performance_optimizing",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_profiling",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_operator_development"
                 ]
               },
               "docs/hardware-platforms/cpu_server",
@@ -1033,6 +1041,7 @@
                   {
                     "group": "InclusionAI",
                     "pages": [
+                      "cookbook/autoregressive/InclusionAI/Ring-2.6-1T",
                       "cookbook/autoregressive/InclusionAI/Ling-2.6",
                       "cookbook/autoregressive/InclusionAI/Ling-2.5-1T",
                       "cookbook/autoregressive/InclusionAI/Ring-2.5-1T",

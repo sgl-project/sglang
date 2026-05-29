@@ -23,7 +23,7 @@ from sglang.srt.hardware_backend.mlx.model_runner import (
     MlxPendingExtend,
     MlxPendingPrefill,
 )
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -53,6 +53,7 @@ class MlxTpModelWorker(TpModelWorker):
             trust_remote_code=self.server_args.trust_remote_code,
             disable_radix_cache=self.server_args.disable_radix_cache,
             mem_fraction_static=self.server_args.mem_fraction_static,
+            quantization=self.server_args.quantization,
         )
         if self.server_args.max_total_tokens is not None:
             init_kwargs["pool_size"] = self.server_args.max_total_tokens
@@ -93,20 +94,20 @@ class MlxTpModelWorker(TpModelWorker):
 
     def forward_batch_generation(
         self,
-        model_worker_batch: ModelWorkerBatch,
+        batch: Optional[ScheduleBatch],
         forward_batch: Optional[ForwardBatch] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init=False,
     ) -> GenerationBatchResult:
         """Override to route through MLX model runner."""
-        if model_worker_batch is not None:
+        if batch is not None:
             self._ensure_mlx_pool_initialized()
-            return self._forward_batch_generation_mlx(model_worker_batch)
+            return self._forward_batch_generation_mlx(batch)
 
         # Fallback to standard path for None batches
         return super().forward_batch_generation(
-            model_worker_batch,
+            batch,
             forward_batch,
             pp_proxy_tensors,
             is_verify,
@@ -124,14 +125,13 @@ class MlxTpModelWorker(TpModelWorker):
             self._mlx_active_rids |= current_rids
 
     def _forward_batch_generation_mlx(
-        self,
-        model_worker_batch: ModelWorkerBatch,
+        self, batch: ScheduleBatch
     ) -> GenerationBatchResult:
         """Run forward pass through the MLX model runner (greedy only)."""
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
-        forward_mode = model_worker_batch.forward_mode
-        reqs = model_worker_batch.reqs
+        forward_mode = batch.forward_mode
+        reqs = batch.reqs
 
         if forward_mode.is_idle():
             return GenerationBatchResult(
@@ -147,9 +147,9 @@ class MlxTpModelWorker(TpModelWorker):
             # Ensure pool is up-to-date before PoolBackedCache reads it
             # for prefix-cached prefills.  Only runs on extend batches.
             self._mlx_runner.flush_all_decode_kv()
-            input_ids_cpu = model_worker_batch.input_ids.cpu().tolist()
-            out_cache_loc_cpu = model_worker_batch.out_cache_loc.cpu().tolist()
-            extend_seq_lens = model_worker_batch.extend_seq_lens
+            input_ids_cpu = batch.input_ids.cpu().tolist()
+            out_cache_loc_cpu = batch.out_cache_loc.cpu().tolist()
+            extend_seq_lens = batch.extend_lens
 
             offset = 0  # into input_ids_cpu
             slot_offset = 0  # into out_cache_loc_cpu
@@ -225,10 +225,7 @@ class MlxTpModelWorker(TpModelWorker):
             can_run_cuda_graph=False,
         )
 
-    def async_forward_batch_generation_mlx(
-        self,
-        model_worker_batch: ModelWorkerBatch,
-    ) -> tuple[
+    def async_forward_batch_generation_mlx(self, batch: ScheduleBatch) -> tuple[
         Union[mx.array, None],
         list[MlxPendingPrefill],
         list[MlxPendingExtend],
@@ -257,8 +254,8 @@ class MlxTpModelWorker(TpModelWorker):
         """
         self._ensure_mlx_pool_initialized()
 
-        forward_mode = model_worker_batch.forward_mode
-        reqs = model_worker_batch.reqs
+        forward_mode = batch.forward_mode
+        reqs = batch.reqs
 
         if forward_mode.is_idle():
             return None, [], [], None, "idle"
@@ -276,16 +273,13 @@ class MlxTpModelWorker(TpModelWorker):
             # Ensure the pool is up-to-date before any PoolBackedCache
             # reads it for prefix-cached prefills. Mirror the sync path.
             self._mlx_runner.flush_all_decode_kv()
-            return self._async_extend_batch(model_worker_batch)
+            return self._async_extend_batch(batch)
 
         raise ValueError(
             f"MLX async runner does not support forward mode: {forward_mode}"
         )
 
-    def _async_extend_batch(
-        self,
-        model_worker_batch: ModelWorkerBatch,
-    ) -> tuple[
+    def _async_extend_batch(self, batch: ScheduleBatch) -> tuple[
         Union[mx.array, None],
         list[MlxPendingPrefill],
         list[MlxPendingExtend],
@@ -293,10 +287,10 @@ class MlxTpModelWorker(TpModelWorker):
         str,
     ]:
         """Launch each request in an EXTEND batch lazily and kick GPU work."""
-        reqs = model_worker_batch.reqs
-        input_ids_cpu = model_worker_batch.input_ids.cpu().tolist()
-        out_cache_loc_cpu = model_worker_batch.out_cache_loc.cpu().tolist()
-        extend_seq_lens = model_worker_batch.extend_seq_lens
+        reqs = batch.reqs
+        input_ids_cpu = batch.input_ids.cpu().tolist()
+        out_cache_loc_cpu = batch.out_cache_loc.cpu().tolist()
+        extend_seq_lens = batch.extend_lens
 
         offset = 0
         slot_offset = 0
