@@ -918,6 +918,7 @@ class PrefillAdder:
                 self._req_inc_lock_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
+                req.fill_len = len(req.prefix_indices) + req.extend_input_len
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
