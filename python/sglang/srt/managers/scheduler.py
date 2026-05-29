@@ -27,11 +27,11 @@ from functools import partial
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
-from sglang.srt.utils.common import suppress_noisy_warnings
+from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
 suppress_noisy_warnings()
 
-import psutil
+import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
@@ -95,6 +95,7 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
@@ -144,7 +145,9 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
+from sglang.srt.managers.load_snapshot import LoadSnapshot, create_load_snapshot_writer
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -163,26 +166,18 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.managers.scheduler_components.dp_attn import (
-    SchedulerDPAttnAdapter,
-)
-from sglang.srt.managers.scheduler_components.flush_wrapper import (
-    SchedulerFlushWrapper,
-)
+from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
+from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
     create_scheduler_watchdog,
 )
-from sglang.srt.managers.scheduler_components.ipc_channels import (
-    SchedulerIpcChannels,
-)
+from sglang.srt.managers.scheduler_components.ipc_channels import SchedulerIpcChannels
 from sglang.srt.managers.scheduler_components.kv_events_publisher import (
     SchedulerKvEventsPublisher,
 )
-from sglang.srt.managers.scheduler_components.load_inquirer import (
-    SchedulerLoadInquirer,
-)
+from sglang.srt.managers.scheduler_components.load_inquirer import SchedulerLoadInquirer
 from sglang.srt.managers.scheduler_components.logprob_result_processor import (
     SchedulerLogprobResultProcessor,
 )
@@ -245,6 +240,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_int_env_var,
+    is_cuda,
     is_mps,
     kill_itself_when_parent_died,
     require_mlp_sync,
@@ -604,6 +600,22 @@ class Scheduler(
             ),
         )
 
+        self.load_snapshot_writer = None
+        if not is_rank_zero:
+            return
+
+        dp_rank = self.ps.dp_rank if self.ps.dp_rank is not None else 0
+        try:
+            self.load_snapshot_writer = create_load_snapshot_writer(
+                self.server_args,
+                port_args,
+                self.ps.dp_size,
+                dp_rank,
+                publish_interval=self.server_args.load_snapshot_publish_interval,
+            )
+        except Exception as e:
+            logger.warning("load snapshot writer init failed: %s", e)
+
     def init_idle_sleeper(self) -> None:
         if (
             self.ps.pp_rank == 0
@@ -619,6 +631,24 @@ class Scheduler(
             )
         else:
             self.idle_sleeper = None
+
+    def publish_load_snapshot(self, force: bool = False):
+        writer = self.load_snapshot_writer
+        if writer is None:
+            return
+        if not force:
+            writer.publish_counter += 1
+            if writer.publish_counter < writer.publish_interval:
+                return
+        writer.publish_counter = 0
+        try:
+            result = self.load_inquirer.get_loads(GetLoadsReqInput(include=["all"]))
+            writer.write(LoadSnapshot.from_get_loads_output(result))
+        except Exception as e:
+            logger.warning("load snapshot publish failed: %s", e)
+
+    def handle_get_loads_req(self, req: GetLoadsReqInput):
+        return self.load_inquirer.get_loads(req)
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -688,6 +718,7 @@ class Scheduler(
             "num_experts_per_tok",
             "num_experts_per_token",
             "top_k_experts",
+            "moe_top_k",
         )
         if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
             initialize_moe_config(self.server_args)
@@ -1107,10 +1138,12 @@ class Scheduler(
         # Init mm receiver for EPD disaggregation mode
         if (
             self.server_args.language_only
-            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+            and self.server_args.encoder_transfer_backend
+            in ["zmq_to_scheduler", "mooncake"]
         ):
             self.mm_receiver = create_mm_receiver(
                 self.server_args,
+                dtype=self.model_config.dtype,
                 hf_config=self.model_config.hf_config,
                 pp_rank=self.ps.pp_rank,
                 tp_rank=self.ps.tp_rank,
@@ -1142,9 +1175,22 @@ class Scheduler(
             self.future_map = None
             return
 
+        # Workers not on BaseSpecWorker (e.g. FrozenKVMTPWorker) lack the
+        # override; fall back to target-only so the helper still produces a
+        # safe decision (no accidental opt-out for unaudited shapes).
+        if self.draft_worker is not None:
+            attn_backends = getattr(
+                self.draft_worker,
+                "spec_v2_attn_backends",
+                (self.tp_worker.model_runner.attn_backend,),
+            )
+        else:
+            attn_backends = (self.tp_worker.model_runner.attn_backend,)
+        needs_cpu_seq_lens = decide_needs_cpu_seq_lens(self.server_args, attn_backends)
         self.future_map = self.spec_algorithm.create_future_map(
             self.device,
             self.req_to_token_pool,
+            needs_cpu_seq_lens=needs_cpu_seq_lens,
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
@@ -1295,12 +1341,10 @@ class Scheduler(
                     self.load_lora_adapter_from_tensors,
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
-                (
-                    GetLoadsReqInput,
-                    lambda req: self.load_inquirer.get_loads(req),
-                ),
+                (GetLoadsReqInput, self.handle_get_loads_req),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (ConfigureLoggingReq, self.configure_logging),
                 (DumperControlReqInput, self.handle_dumper_control),
                 (AddExternalCorpusReqInput, self.add_external_corpus),
                 (
@@ -1359,6 +1403,8 @@ class Scheduler(
         self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
+        # WAR barrier is CUDA-only; other platforms keep the pre-barrier behavior.
+        self._war_barrier_enabled = is_cuda()
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
@@ -1409,7 +1455,8 @@ class Scheduler(
                 continue
 
             # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
-            self.schedule_stream.wait_stream(self.forward_stream)
+            if self._war_barrier_enabled:
+                self.schedule_stream.wait_stream(self.forward_stream)
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
@@ -3079,6 +3126,8 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
@@ -3183,6 +3232,9 @@ class Scheduler(
 
         # reset device timer window so idle time isn't counted
         self.metrics_reporter.reset_device_timer_window()
+
+        # Publish the idle state so /get_loads and DP balancing do not see stale load.
+        self.publish_load_snapshot(force=True)
 
         # sleep until next event
         self.maybe_sleep_on_idle()
@@ -3709,6 +3761,11 @@ class Scheduler(
         freeze_gc("Scheduler")
         self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
+
+    def configure_logging(self, recv_req: ConfigureLoggingReq):
+        if recv_req.log_level is not None:
+            logging.getLogger().setLevel(recv_req.log_level.upper())
+        self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
 
     def handle_dumper_control(self, recv_req: DumperControlReqInput):
         from sglang.srt.debug_utils.dumper import dumper

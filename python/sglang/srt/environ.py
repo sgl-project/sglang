@@ -254,6 +254,9 @@ class Envs:
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
 
+    # Load snapshot backend
+    SGLANG_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
+
     # Scheduler: new token ratio hyperparameters
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
     SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
@@ -356,7 +359,7 @@ class Envs:
     MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
     MOONCAKE_TE_META_DATA_SERVER = EnvStr("P2PHANDSHAKE")
     MOONCAKE_GLOBAL_SEGMENT_SIZE = EnvStr("4gb")
-    MOONCAKE_PROTOCOL = EnvStr("tcp")
+    MOONCAKE_PROTOCOL = EnvStr("rdma")
     MOONCAKE_DEVICE = EnvStr("")
     MOONCAKE_MASTER_METRICS_PORT = EnvInt(9003)
     MOONCAKE_CHECK_SERVER = EnvBool(False)
@@ -376,6 +379,7 @@ class Envs:
 
     # MPS (Apple Silicon)
     SGLANG_USE_MLX = EnvBool(False)
+    SGLANG_MLX_USE_CUSTOM_ROPE = EnvBool(False)
 
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
@@ -482,6 +486,7 @@ class Envs:
     )
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
+    SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -637,6 +642,7 @@ class Envs:
     SGLANG_OPT_USE_FUSED_COMPRESS_TRITON = EnvBool(False)
     SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
     SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL = EnvBool(True)
+    SGLANG_ENABLE_NVFP4_GEMM_SWIGLU_FUSION = EnvBool(True)
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
     # ====================================================================
 
@@ -650,6 +656,7 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
+    SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
@@ -716,16 +723,21 @@ class Envs:
     # EPD
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
+    SGLANG_ENCODER_HTTP_TIMEOUT = EnvFloat(1800.0)
+    SGLANG_ENCODER_REQ_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
     SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU = EnvBool(False)
     SGLANG_ENCODER_MAX_BATCH_SIZE = EnvInt(8)
-    SGLANG_ENCODER_REQ_TIMEOUT = EnvFloat(180.0)
+    # Persistent receiver-side GPU embedding pool size for mooncake EPD transport.
+    # 0 disables (per-request register/deregister). 4096 = 4GB default per TP
+    SGLANG_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
 
     # Elastic EP Backup Port
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
 
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
+    SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
 
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")
@@ -810,7 +822,7 @@ _warn_deprecated_env_to_cli_flag(
 # Import cuda_coredump to trigger auto-injection of CUDA env vars
 # when SGLANG_CUDA_COREDUMP=1. Best-effort; for strict guarantees,
 # set CUDA_* env vars in the shell before launching Python.
-import sglang.srt.debug_utils.cuda_coredump  # noqa: F401, E402
+import sglang.srt.debug_utils.cuda_coredump  # noqa: F401, E402  # isort: skip
 
 
 def example_with_exit_stack():

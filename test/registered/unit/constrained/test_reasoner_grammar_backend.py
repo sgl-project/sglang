@@ -17,6 +17,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(2.0, "base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-b-test-cpu")
 
 
 class _DummyTokenizer:

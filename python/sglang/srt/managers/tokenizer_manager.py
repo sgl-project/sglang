@@ -73,16 +73,14 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
-    WatchLoadUpdateReq,
 )
+from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
-from sglang.srt.managers.tokenizer_manager_score_mixin import (
-    TokenizerManagerScoreMixin,
-)
+from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
 from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
@@ -297,7 +295,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # so we need to reserve the space for the draft tokens.
             self.num_reserved_tokens = max(
                 server_args.speculative_eagle_topk * server_args.speculative_num_steps,
-                server_args.speculative_num_draft_tokens,
+                server_args.max_speculative_num_draft_tokens,
             )
         else:
             self.num_reserved_tokens = 0
@@ -377,6 +375,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Make sure that each request carries the tokenizer_ipc_name for response routing
             self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
+
+        self.load_snapshot_reader = create_load_snapshot_reader(
+            self.server_args,
+            port_args,
+            caller="tokenizer",
+        )
 
     def init_running_status(self):
         # Request states
@@ -792,8 +796,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if (
                 not self.server_args.language_only
-                or self.server_args.encoder_transfer_backend
-                in ["zmq_to_tokenizer", "mooncake"]
+                or self.server_args.encoder_transfer_backend == "zmq_to_tokenizer"
             ):
                 if self.server_args.language_only:
                     mm_inputs = await self.mm_receiver.recv_mm_data(
@@ -817,10 +820,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
             elif (
                 self.server_args.language_only
-                and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+                and self.server_args.encoder_transfer_backend
+                in ["zmq_to_scheduler", "mooncake"]
                 and not obj.need_wait_for_mm_inputs
             ):
-                # In language_only mode with zmq_to_scheduler, if we didn't dispatch
+                # In language_only mode with zmq_to_scheduler/mooncake, if we didn't dispatch
                 # to encoder (e.g., only one image), process locally like non-language_only mode
                 mm_inputs = await self.mm_processor.process_mm_data_async(
                     image_data=obj.image_data,
@@ -1067,6 +1071,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
+                mm_data_mooncake=obj.mm_data_mooncake,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
@@ -1646,6 +1651,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         if obj.crash_dump_folder is not None:
             self.crash_dump_folder = obj.crash_dump_folder
+        if obj.log_level is not None:
+            # setLevel() may raise exception if obj.log_level is illegal string.
+            # Let the exception propagate to the caller.
+            # Only legal requests will be sent to scheduler.
+            logging.getLogger().setLevel(obj.log_level.upper())
+            self.send_to_scheduler.send_pyobj(obj)
         logging.info(f"Config logging: {obj=}")
 
     async def freeze_gc(self):
@@ -1945,16 +1956,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # handle_loop awaits next recv immediately
         for s in pending_notify.values():
             s.event.set()
-
-        # When skip_tokenizer_init is enabled, tokensizer_manager receives
-        # BatchTokenIDOutput.
-        if (
-            self.server_args.dp_size > 1
-            and isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput))
-            and recv_obj.load is not None
-        ):
-            load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
-            self.send_to_scheduler.send_pyobj(load_update_req)
 
     def add_logprob_to_meta_info(
         self,
@@ -2712,7 +2713,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # This flag will be used in _tokenize_one_request to determine processing path
             if should_dispatch:
                 obj.need_wait_for_mm_inputs = True
-                if self.server_args.encoder_transfer_backend == "zmq_to_scheduler":
+                if self.server_args.encoder_transfer_backend in [
+                    "zmq_to_scheduler",
+                    "mooncake",
+                ]:
                     self.mm_receiver.send_encode_request(obj)
             else:
                 obj.need_wait_for_mm_inputs = False
