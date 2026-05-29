@@ -252,14 +252,45 @@ class ZayaConfig(PretrainedConfig):
         if not attn_layer_ids:
             return None
 
-        in_out_ch = (self.num_attention_heads + self.num_key_value_heads) * self.head_dim
+        # ``conv[0]`` (conv_qk left padding) is sized per TP rank because CCA
+        # is head-parallel. ``conv[1]`` (prev_hs) carries the full hidden_state
+        # and feeds the replicated val_proj1 / val_proj2, so it stays at full
+        # ``hidden_size`` on every rank.
+        #
+        # Use the *global* TP world size -- the same accessor that
+        # ``ZayaAttention`` / ``CCA`` use to split heads and over which
+        # ``o_proj`` all-reduces -- so the cache shape and the per-rank
+        # ``in_out_ch`` stay in lockstep. ZAYA1 asserts the attention-TP group
+        # equals the global TP group (DP attention is unsupported), so the two
+        # are always identical in practice.
+        try:
+            from sglang.srt.distributed import (
+                get_tensor_model_parallel_world_size,
+            )
+
+            tp_size = get_tensor_model_parallel_world_size()
+        except (AssertionError, RuntimeError):
+            tp_size = 1
+
+        in_out_ch_full = (
+            self.num_attention_heads + self.num_key_value_heads
+        ) * self.head_dim
+        assert in_out_ch_full % tp_size == 0, (
+            f"CCA channels ({in_out_ch_full}) must be divisible by TP size "
+            f"({tp_size}); both num_attention_heads and num_query_groups must "
+            "be divisible by tp_size for ZAYA1 head-parallel attention."
+        )
+        in_out_ch_per_rank = in_out_ch_full // tp_size
         total_padding = (self.cca_time0 - 1) + (self.cca_time1 - 1)
 
         shape = Mamba2StateShape(
-            conv=[(in_out_ch, total_padding), (self.hidden_size, 1)],
+            conv=[
+                (in_out_ch_per_rank, total_padding),
+                (self.hidden_size, 1),
+            ],
             temporal=(1, 1, 0),
-            intermediate_size=in_out_ch,
-            conv_dim=in_out_ch,
+            intermediate_size=in_out_ch_per_rank,
+            conv_dim=in_out_ch_per_rank,
             ssm_state_size=0,
             num_heads=1,
             head_dim=1,

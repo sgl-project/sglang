@@ -50,11 +50,17 @@ from torch import nn
 from sglang.srt.configs.zaya import ZayaConfig
 from sglang.srt.distributed import (
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -69,7 +75,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +157,14 @@ class CCA(nn.Module):
     For the first prefill chunk of a request the padding is zero; for a resumed
     prefill or for decode it is read from a per-request cache that this module
     maintains internally.
+
+    Parallelism: when ``tp_size > 1`` the CCA is head-parallel. Both the
+    grouped-mean step and the second ``conv_qk`` stage with
+    ``groups=num_q_heads+num_k_heads`` are head-local (each GQA group lives on
+    a single rank), so the entire QKV projection runs without any cross-rank
+    collective. The QKV projections become ``ColumnParallelLinear`` and the
+    two ``nn.Conv1d`` layers are sized per-rank with custom weight loaders
+    that slice the HF checkpoint rows into ``[rank's q heads, rank's k heads]``.
     """
 
     def __init__(
@@ -165,6 +179,8 @@ class CCA(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -176,51 +192,105 @@ class CCA(nn.Module):
         self.padding0 = self.cca_time0 - 1
         self.padding1 = self.cca_time1 - 1
         self.total_padding = self.padding0 + self.padding1
-        self.num_k_heads = int(cca_num_k_heads)
-        self.num_q_heads = int(cca_num_q_heads)
-        assert self.num_q_heads % self.num_k_heads == 0
-        self.gqa_groups = self.num_q_heads // self.num_k_heads
 
-        self.latent_k_dim = self.num_k_heads * self.head_dim
+        if tp_rank is None:
+            tp_rank = get_tensor_model_parallel_rank()
+        if tp_size is None:
+            tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = int(tp_rank)
+        self.tp_size = int(tp_size)
+
+        # Full (global) head counts retained for weight loading and shape asserts.
+        self.num_q_heads_full = int(cca_num_q_heads)
+        self.num_k_heads_full = int(cca_num_k_heads)
+        assert (
+            self.num_q_heads_full % self.num_k_heads_full == 0
+        ), "num_q_heads must be a multiple of num_k_heads"
+        self.gqa_groups = self.num_q_heads_full // self.num_k_heads_full
+
+        # Head-parallel TP requires both head counts to be divisible by tp_size.
+        # KV-replication-style TP (tp_size > num_k_heads) is not yet supported.
+        assert self.num_q_heads_full % self.tp_size == 0, (
+            f"num_q_heads ({self.num_q_heads_full}) must be divisible by "
+            f"tp_size ({self.tp_size}) for ZAYA1 head-parallel CCA"
+        )
+        assert self.num_k_heads_full % self.tp_size == 0, (
+            f"num_k_heads ({self.num_k_heads_full}) must be divisible by "
+            f"tp_size ({self.tp_size}); KV-replication TP is not supported "
+            "for ZAYA1 because both grouped-mean and conv_qk.1 are per-head"
+        )
+
+        # Per-rank head counts.
+        self.num_q_heads = self.num_q_heads_full // self.tp_size
+        self.num_k_heads = self.num_k_heads_full // self.tp_size
+
+        # Per-rank channel layout.
+        self.latent_q_dim_full = self.num_q_heads_full * self.head_dim
+        self.latent_k_dim_full = self.num_k_heads_full * self.head_dim
+        self.in_out_ch_full = self.latent_q_dim_full + self.latent_k_dim_full
         self.latent_q_dim = self.num_q_heads * self.head_dim
-        self.in_out_ch = self.latent_k_dim + self.latent_q_dim
+        self.latent_k_dim = self.num_k_heads * self.head_dim
+        self.in_out_ch = self.latent_q_dim + self.latent_k_dim
         self.sqrt_head_dim = float(self.head_dim) ** 0.5
         self.clamp_temp = bool(getattr(config, "clamp_temp", False))
 
         bias = bool(getattr(config, "attention_bias", False))
-        self.linear_q = ReplicatedLinear(
+        # ``linear_q`` / ``linear_k`` outputs are laid out as a contiguous head
+        # sequence in the HF checkpoint, so the natural ColumnParallel shard
+        # (``tp_rank * shard``) lands rank ``r`` on the head set
+        # ``[r * heads_per_rank, (r+1) * heads_per_rank)``.
+        self.linear_q = ColumnParallelLinear(
             self.hidden_size,
-            self.latent_q_dim,
+            self.latent_q_dim_full,
             bias=bias,
+            gather_output=False,
             quant_config=quant_config,
             prefix=add_prefix("linear_q", prefix),
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
-        self.linear_k = ReplicatedLinear(
+        self.linear_k = ColumnParallelLinear(
             self.hidden_size,
-            self.latent_k_dim,
+            self.latent_k_dim_full,
             bias=bias,
+            gather_output=False,
             quant_config=quant_config,
             prefix=add_prefix("linear_k", prefix),
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
+        # The HF V-projection layout maps val_proj1 to the FIRST half of K
+        # heads and val_proj2 to the SECOND half (after ``cat([v1, v2]).view(
+        # T, num_k_heads_full, head_dim)``). That doesn't align with a simple
+        # output-dim ColumnParallel shard, so val_proj1 / val_proj2 are kept
+        # Replicated and the per-rank K-head slice is taken in the forward
+        # passes after ``cat + view``. The replicated weight memory is small
+        # (~0.5 MB / layer) and the wasted compute is negligible compared to
+        # linear_q / linear_k / o_proj.
         self.val_proj1 = ReplicatedLinear(
             self.hidden_size,
-            self.latent_k_dim // 2,
+            self.latent_k_dim_full // 2,
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("val_proj1", prefix),
         )
         self.val_proj2 = ReplicatedLinear(
             self.hidden_size,
-            self.latent_k_dim // 2,
+            self.latent_k_dim_full // 2,
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("val_proj2", prefix),
         )
 
-        # Two-stage depthwise + grouped conv along the time axis. Wrapping the
-        # two nn.Conv1d modules in nn.Sequential makes the HF checkpoint keys
-        #   conv_qk.0.{weight,bias}, conv_qk.1.{weight,bias}
-        # map onto submodules 1:1 without any key rewriting at load time.
+        # Per-rank K head range, used for slicing the replicated v tensor.
+        self.k_head_start = self.tp_rank * self.num_k_heads
+        self.k_head_end = self.k_head_start + self.num_k_heads
+
+        # Two-stage depthwise + grouped conv along the time axis, sized for
+        # this rank's head subset. Wrapping the two nn.Conv1d modules in
+        # nn.Sequential makes the HF checkpoint keys ``conv_qk.{0,1}.weight``
+        # / ``conv_qk.{0,1}.bias`` map onto submodules 1:1, with TP slicing
+        # handled by the custom weight_loader attached below.
         self.conv_qk = nn.Sequential(
             nn.Conv1d(
                 in_channels=self.in_out_ch,
@@ -240,8 +310,66 @@ class CCA(nn.Module):
             ),
         )
 
-        # Per-K-head learnable temperature scalar.
+        # Per-K-head learnable temperature scalar (per-rank slice).
         self.temp = nn.Parameter(torch.zeros(self.num_k_heads))
+
+        # Attach TP-aware weight loaders to conv_qk weights/biases and ``temp``
+        # so the existing ``load_weights`` dispatch (``getattr(param,
+        # "weight_loader", default_weight_loader)``) automatically slices the
+        # HF checkpoint into rank-local rows.
+        if self.tp_size > 1:
+            self._install_tp_weight_loaders()
+
+    # ----- TP weight loaders ----------------------------------------------
+
+    def _install_tp_weight_loaders(self) -> None:
+        """Attach TP-aware ``weight_loader`` attributes to parameters whose
+        full-tensor → per-rank slicing cannot be expressed by a generic
+        ColumnParallelLinear loader: the two ``conv_qk`` Conv1d weights and
+        biases (where the per-rank "row" set is the discontiguous union of
+        this rank's q heads and this rank's k heads) and the per-K-head
+        ``temp`` parameter.
+        """
+        head_dim = self.head_dim
+        latent_q_dim_full = self.latent_q_dim_full
+        num_q_heads_per_rank = self.num_q_heads
+        num_k_heads_per_rank = self.num_k_heads
+        tp_rank = self.tp_rank
+
+        q_start = tp_rank * num_q_heads_per_rank * head_dim
+        q_end = q_start + num_q_heads_per_rank * head_dim
+        k_start = latent_q_dim_full + tp_rank * num_k_heads_per_rank * head_dim
+        k_end = k_start + num_k_heads_per_rank * head_dim
+        k_temp_start = tp_rank * num_k_heads_per_rank
+        k_temp_end = k_temp_start + num_k_heads_per_rank
+
+        def conv_row_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+            # Both Conv1d.weight ([C_out, in_per_group, K]) and Conv1d.bias
+            # ([C_out]) slice along the leading (output channel) dim. The
+            # per-rank rows are the rank's q heads (contiguous) followed by
+            # the rank's k heads (contiguous in the second half of the full
+            # tensor).
+            sliced = torch.cat(
+                [loaded_weight[q_start:q_end], loaded_weight[k_start:k_end]],
+                dim=0,
+            )
+            assert (
+                sliced.shape == param.data.shape
+            ), f"conv shard shape mismatch: {sliced.shape} vs {param.data.shape}"
+            param.data.copy_(sliced)
+
+        def temp_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+            sliced = loaded_weight[k_temp_start:k_temp_end]
+            assert (
+                sliced.shape == param.data.shape
+            ), f"temp shard shape mismatch: {sliced.shape} vs {param.data.shape}"
+            param.data.copy_(sliced)
+
+        set_weight_attrs(self.conv_qk[0].weight, {"weight_loader": conv_row_loader})
+        set_weight_attrs(self.conv_qk[0].bias, {"weight_loader": conv_row_loader})
+        set_weight_attrs(self.conv_qk[1].weight, {"weight_loader": conv_row_loader})
+        set_weight_attrs(self.conv_qk[1].bias, {"weight_loader": conv_row_loader})
+        set_weight_attrs(self.temp, {"weight_loader": temp_loader})
 
     # ----- helpers ---------------------------------------------------------
 
@@ -316,6 +444,19 @@ class CCA(nn.Module):
 
     # ----- forward modes ---------------------------------------------------
 
+    def _slice_v_per_rank(self, value_full: torch.Tensor) -> torch.Tensor:
+        """Take this rank's K-head slice of the full ``value`` tensor.
+
+        Returns a no-op view when ``tp_size == 1``. For ``tp_size > 1`` the
+        full V tensor is computed on every rank (see the comment on
+        ``val_proj1`` / ``val_proj2``) and the rank's contiguous K-head range
+        is selected here, leaving the downstream RadixAttention call with a
+        per-rank shape ``[T, num_k_heads_per_rank, head_dim]``.
+        """
+        if self.tp_size == 1:
+            return value_full
+        return value_full[:, self.k_head_start : self.k_head_end, :].contiguous()
+
     def _forward_no_state(self, hs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reference path: process the entire ``hs`` of shape ``[S, H]`` with
         a zero initial conv state and a zero ``prev_hs``.
@@ -327,9 +468,9 @@ class CCA(nn.Module):
         S = hs.shape[0]
         hs_3d = hs.unsqueeze(1)  # [S, 1, H]
 
-        q_raw, _ = self.linear_q(hs_3d)
-        k_raw, _ = self.linear_k(hs_3d)
-        qk = torch.cat([q_raw, k_raw], dim=-1)  # [S, 1, latent_q + latent_k]
+        q_raw, _ = self.linear_q(hs_3d)  # [S, 1, latent_q_dim_per_rank]
+        k_raw, _ = self.linear_k(hs_3d)  # [S, 1, latent_k_dim_per_rank]
+        qk = torch.cat([q_raw, k_raw], dim=-1)  # [S, 1, in_out_ch_per_rank]
 
         query_pre = q_raw.view(S, self.num_q_heads, self.head_dim)
         key_base = k_raw.view(S, self.num_k_heads, self.head_dim)
@@ -351,13 +492,16 @@ class CCA(nn.Module):
         )
         query, key = self._normalize_qk(query, key)
 
+        # val_proj1 / val_proj2 are replicated; compute the full V tensor and
+        # then take this rank's K-head slice.
         # val_proj2 uses a right-shifted hidden_state. First val_proj2 input is 0.
         hs_shifted = F.pad(hs_3d[:-1], (0, 0, 0, 0, 1, 0))  # [S, 1, H]
         v1, _ = self.val_proj1(hs_3d)
         v2, _ = self.val_proj2(hs_shifted)
-        value = torch.cat([v1, v2], dim=-1).squeeze(1).view(
-            S, self.num_k_heads, self.head_dim
+        value_full = torch.cat([v1, v2], dim=-1).squeeze(1).view(
+            S, self.num_k_heads_full, self.head_dim
         )
+        value = self._slice_v_per_rank(value_full)
         return query, key, value
 
     def _forward_extend(
@@ -491,7 +635,10 @@ class CCA(nn.Module):
 
         v1, _ = self.val_proj1(hidden_states)
         v2, _ = self.val_proj2(v2_input)
-        value = torch.cat([v1, v2], dim=-1).view(T, self.num_k_heads, self.head_dim)
+        value_full = torch.cat([v1, v2], dim=-1).view(
+            T, self.num_k_heads_full, self.head_dim
+        )
+        value = self._slice_v_per_rank(value_full)
         return query, key, value
 
     def _forward_decode(
@@ -544,7 +691,10 @@ class CCA(nn.Module):
         prev_hs = prev_hs_state.index_select(0, mamba_indices).squeeze(-1).to(dtype)
         v1, _ = self.val_proj1(hidden_states)
         v2, _ = self.val_proj2(prev_hs)
-        value = torch.cat([v1, v2], dim=-1).view(T, self.num_k_heads, self.head_dim)
+        value_full = torch.cat([v1, v2], dim=-1).view(
+            T, self.num_k_heads_full, self.head_dim
+        )
+        value = self._slice_v_per_rank(value_full)
         prev_hs_state.index_copy_(
             0, mamba_indices, hidden_states.unsqueeze(-1).to(prev_hs_state.dtype)
         )
@@ -599,11 +749,48 @@ class ZayaAttention(nn.Module):
         self.config = config
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
-        self.num_q_heads = config.num_attention_heads
-        self.num_k_heads = config.num_query_groups
+        self.num_q_heads_full = config.num_attention_heads
+        self.num_k_heads_full = config.num_query_groups
         self.head_dim = config.head_dim
-        self.q_dim = self.num_q_heads * self.head_dim
-        self.k_dim = self.num_k_heads * self.head_dim
+
+        # Head-parallel TP: split both Q and KV heads across ranks. Since the
+        # grouped-mean and conv_qk.1 are head-local, no cross-rank collective
+        # is required inside the QKV projection. Both head counts must be
+        # divisible by tp_size; the KV-replicated GQA-TP variant (tp_size >
+        # num_k_heads) is intentionally rejected with a clear error message
+        # because both per-K-head paths assume each rank holds whole K heads.
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
+        # The head split, the ``o_proj`` RowParallel all-reduce, and the
+        # RadixAttention KV cache are all organized on the *global* TP group,
+        # and ``ZayaConfig.mamba2_cache_params`` sizes the conv-state cache on
+        # that same group. DP attention would run attention on the smaller
+        # attention-TP group (and ``o_proj`` would need
+        # ``use_dp_attention_reduce``), which this model does not wire up, so
+        # require the two groups to coincide and fail fast instead of silently
+        # mis-sizing the conv-state cache.
+        attn_tp_size = get_attention_tp_size()
+        assert attn_tp_size == self.tp_size, (
+            f"ZAYA1 head-parallel attention requires the attention TP group "
+            f"({attn_tp_size}) to equal the global TP group ({self.tp_size}); "
+            "DP attention (enable_dp_attention) is not supported for ZAYA1."
+        )
+        assert (
+            self.num_q_heads_full % self.tp_size == 0
+        ), (
+            f"num_attention_heads ({self.num_q_heads_full}) must be divisible "
+            f"by tp_size ({self.tp_size}) for ZAYA1 head-parallel attention"
+        )
+        assert (
+            self.num_k_heads_full % self.tp_size == 0
+        ), (
+            f"num_query_groups ({self.num_k_heads_full}) must be divisible by "
+            f"tp_size ({self.tp_size}); set tp_size <= num_k_heads to keep "
+            "both grouped-mean and conv_qk.1 head-local on each rank"
+        )
+        self.num_q_heads = self.num_q_heads_full // self.tp_size
+        self.num_k_heads = self.num_k_heads_full // self.tp_size
+        self.q_dim_full = self.num_q_heads_full * self.head_dim
         self.scale = self.head_dim**-0.5
 
         # The HF checkpoint stores the CCA QKV projection under
@@ -611,8 +798,8 @@ class ZayaAttention(nn.Module):
         # exact name to keep weight loading a 1:1 key mapping.
         self.qkv = CCA(
             config=config,
-            cca_num_k_heads=self.num_k_heads,
-            cca_num_q_heads=self.num_q_heads,
+            cca_num_k_heads=self.num_k_heads_full,
+            cca_num_q_heads=self.num_q_heads_full,
             hidden_size=self.hidden_size,
             head_dim=self.head_dim,
             cca_time0=config.cca_time0,
@@ -620,14 +807,22 @@ class ZayaAttention(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("qkv", prefix),
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
 
-        self.o_proj = ReplicatedLinear(
-            self.q_dim,
+        # RowParallel o_proj: per-rank input is the rank's q heads, full
+        # output is replicated via the end-of-forward all-reduce.
+        self.o_proj = RowParallelLinear(
+            self.q_dim_full,
             self.hidden_size,
             bias=bool(getattr(config, "attention_bias", False)),
+            input_is_parallel=True,
+            reduce_results=True,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
 
         rope_theta = float(getattr(config, "rope_theta", 1_000_000.0))
@@ -823,6 +1018,44 @@ class ZayaRouter(nn.Module):
         return route_prob, expert_choice, router_hidden_states_next
 
 
+def mod_premask_experts(
+    experts_out: torch.Tensor,
+    indices: torch.Tensor,
+    num_moe_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mask the (per-rank, pre-all-reduce) expert output for the MOD skip path.
+
+    Returns ``(mod_mask, masked_experts)`` where ``mod_mask`` is ``1`` for
+    tokens routed to a real expert and ``0`` for tokens routed to the skip
+    slot (``indices == num_moe_experts``), and
+    ``masked_experts = mod_mask * experts_out``.
+
+    The masking is applied *before* the cross-rank all-reduce so the single
+    reduction yields ``mask · sum_r(partial_r) = mask · experts_out_full``
+    without the replicated ``mod_out`` term being summed ``tp_size`` times.
+    Pairs with :func:`mod_blend`, which adds the skip-path term back after the
+    reduce. Kept as a free function so the MOD math is unit-testable without a
+    live ``torch.distributed`` group.
+    """
+    mod_mask = (indices != num_moe_experts).to(experts_out.dtype)
+    return mod_mask, mod_mask * experts_out
+
+
+def mod_blend(
+    masked_experts_reduced: torch.Tensor,
+    mod_mask: torch.Tensor,
+    mod_out: torch.Tensor,
+) -> torch.Tensor:
+    """Combine the already-all-reduced masked expert output with the skip path.
+
+    ``mod_out`` (the skip-expert residual, ``hidden_states * prob``) is
+    replicated on every rank, so it is folded in here -- after the reduce of
+    ``masked_experts`` -- weighted by ``(1 - mod_mask)``. See
+    :func:`mod_premask_experts`.
+    """
+    return masked_experts_reduced + (1.0 - mod_mask) * mod_out
+
+
 class ZayaBlock(nn.Module):
     """ZAYA1 MoE mixer: ZayaRouter feeding FusedMoE, with optional MOD residual blend."""
 
@@ -912,13 +1145,16 @@ class ZayaBlock(nn.Module):
             # all-reduce so the single reduction yields:
             #   sum_r(mask · partial_r) + (1 - mask) · mod_out
             # = mask · experts_out_full + (1 - mask) · mod_out
-            # without double-counting ``mod_out`` by tp_size.
-            mod_mask = (indices != self.num_moe_experts).to(experts_out.dtype)
+            # without double-counting ``mod_out`` by tp_size. The two steps are
+            # ``mod_premask_experts`` / ``mod_blend`` so the math is testable
+            # without a live distributed group.
             mod_out = hidden_states * probs
-            masked_experts = mod_mask * experts_out
+            mod_mask, masked_experts = mod_premask_experts(
+                experts_out, indices, self.num_moe_experts
+            )
             if self.tp_size > 1:
                 masked_experts = tensor_model_parallel_all_reduce(masked_experts)
-            hidden_out = masked_experts + (1.0 - mod_mask) * mod_out
+            hidden_out = mod_blend(masked_experts, mod_mask, mod_out)
         else:
             hidden_out = self.experts(hidden_states, topk_out)
             if self.tp_size > 1:

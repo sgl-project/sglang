@@ -12,6 +12,9 @@ which are each exercised by a dedicated test case:
    single-request decode of request 0 at the same step.
 4. Multi-request prefills update only the conv state and ``prev_hs`` slots for
    each request and leave unused slots zero.
+5. A simulated tensor-parallel (TP=2) CCA produces per-rank q / k / v slices
+   that match the corresponding head slices of a TP=1 reference, both for
+   prefill (``_forward_extend``) and for decode (``_forward_decode``).
 
 All tests run on CPU with a tiny configuration so they stay fast and have no
 GPU dependency. State is stored in a mock centralized pool that mirrors the
@@ -23,21 +26,55 @@ import unittest
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import List
+from typing import List, Optional
 
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
 def _ensure_dist_initialized() -> None:
+    """Set up a minimal single-rank gloo distributed environment plus the
+    SGLang model-parallel groups (TP=1, PP=1, EP=1). The CCA module reads
+    ``get_tensor_model_parallel_rank()`` / ``get_tensor_model_parallel_world_size()``
+    inside ``__init__`` to size its head-parallel projections, so the world
+    group and model parallel groups must both be initialized before any CCA
+    construction.
+    """
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29632")
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("LOCAL_RANK", "0")
+
+    from sglang.srt.distributed.parallel_state import (
+        init_distributed_environment,
+        initialize_model_parallel,
+        model_parallel_is_initialized,
+    )
+
     if not torch.distributed.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", "29632")
-        torch.distributed.init_process_group(backend="gloo", rank=0, world_size=1)
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            backend="gloo",
+        )
+
+    if not model_parallel_is_initialized():
+        # Pass arguments as kwargs because ``ensure_model_parallel_initialized``
+        # forwards positional ``backend`` into the ``attention_data_parallel_size``
+        # slot of ``initialize_model_parallel``, which then explodes on
+        # ``int // str``. Using kwargs avoids that footgun.
+        initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            backend="gloo",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -53,14 +90,25 @@ class _MockLayerCache:
 
 class _MockReqToTokenPool:
     """Minimal stand-in for ``HybridReqToTokenPool`` providing the two methods
-    that CCA calls: ``mamba2_layer_cache`` and ``get_mamba_indices``."""
+    that CCA calls: ``mamba2_layer_cache`` and ``get_mamba_indices``.
 
-    def __init__(self, pool_size: int, cca_config):
-        in_out_ch = (cca_config.num_attention_heads + cca_config.num_key_value_heads) * cca_config.head_dim
+    For TP-aware tests, ``tp_size`` controls the per-rank ``in_out_ch`` of the
+    ``conv[0]`` state. ``conv[1]`` (prev_hs) is replicated and stays at full
+    ``hidden_size``.
+    """
+
+    def __init__(self, pool_size: int, cca_config, tp_size: int = 1):
+        in_out_ch_full = (
+            cca_config.num_attention_heads + cca_config.num_key_value_heads
+        ) * cca_config.head_dim
+        assert in_out_ch_full % tp_size == 0
+        in_out_ch_per_rank = in_out_ch_full // tp_size
         total_padding = (cca_config.cca_time0 - 1) + (cca_config.cca_time1 - 1)
         num_layers = len(cca_config.linear_layer_ids)
 
-        self.conv_state = torch.zeros(num_layers, pool_size + 1, in_out_ch, total_padding)
+        self.conv_state = torch.zeros(
+            num_layers, pool_size + 1, in_out_ch_per_rank, total_padding
+        )
         self.prev_hs_state = torch.zeros(num_layers, pool_size + 1, cca_config.hidden_size, 1)
         self.temporal = torch.zeros(num_layers, pool_size + 1, 1, 1, 0)
         self._layer_map = {lid: i for i, lid in enumerate(cca_config.linear_layer_ids)}
@@ -143,7 +191,11 @@ def _make_tiny_config():
     )
 
 
-def _make_tiny_cca(seed: int = 0):
+def _make_tiny_cca(
+    seed: int = 0,
+    tp_rank: Optional[int] = None,
+    tp_size: Optional[int] = None,
+):
     from sglang.srt.models.zaya import CCA
 
     config = _make_tiny_config()
@@ -157,6 +209,8 @@ def _make_tiny_cca(seed: int = 0):
         cca_time0=config.cca_time0,
         cca_time1=config.cca_time1,
         layer_id=0,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
     )
     cca.eval()
 
@@ -359,6 +413,247 @@ class TestZayaCCA(CustomTestCase):
         for idx in (0, 1, 3, 4):
             self.assertTrue(torch.all(conv_state[idx] == 0))
             self.assertTrue(torch.all(prev_hs_state[idx] == 0))
+
+
+class TestZayaCCATensorParallel(CustomTestCase):
+    """Head-parallel TP equivalence:
+
+    For each TP rank, the CCA's q / k / v output must equal the head slice of
+    the TP=1 reference's output that corresponds to that rank's heads. This
+    verifies that the grouped-mean step and ``conv_qk.1`` (groups = num_q_heads
+    + num_k_heads) are correctly partitioned across heads with no cross-rank
+    leakage.
+    """
+
+    TP_SIZE = 2
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _ensure_dist_initialized()
+
+    def _slice_full_state_dict_into_rank(self, ref_cca, tp_cca, tp_rank: int):
+        """Copy the reference's full weights into the per-rank CCA, using the
+        per-parameter ``weight_loader`` that the CCA installs on its own
+        parameters during ``__init__``. This mirrors what
+        ``ZayaForCausalLM.load_weights`` does at serving time and is the
+        only way TP correctness is exercised end-to-end.
+        """
+        ref_state = dict(ref_cca.state_dict())
+        from sglang.srt.model_loader.weight_utils import default_weight_loader
+
+        with torch.no_grad():
+            for name, param in tp_cca.named_parameters():
+                full_weight = ref_state[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, full_weight)
+
+    def _check_per_rank_outputs(
+        self,
+        full_q: torch.Tensor,
+        full_k: torch.Tensor,
+        full_v: torch.Tensor,
+        rank_q: torch.Tensor,
+        rank_k: torch.Tensor,
+        rank_v: torch.Tensor,
+        tp_rank: int,
+        cfg,
+    ):
+        """Compare a TP=2 rank's output against the corresponding head slice
+        of the TP=1 reference output. Q heads and K heads are partitioned
+        contiguously across ranks: rank ``r`` owns
+        ``[r*Q_per_rank, (r+1)*Q_per_rank)`` for Q and similarly for K.
+        """
+        q_heads_per_rank = cfg.num_attention_heads // self.TP_SIZE
+        k_heads_per_rank = cfg.num_query_groups // self.TP_SIZE
+        q_lo, q_hi = tp_rank * q_heads_per_rank, (tp_rank + 1) * q_heads_per_rank
+        k_lo, k_hi = tp_rank * k_heads_per_rank, (tp_rank + 1) * k_heads_per_rank
+        torch.testing.assert_close(rank_q, full_q[:, q_lo:q_hi, :], atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(rank_k, full_k[:, k_lo:k_hi, :], atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(rank_v, full_v[:, k_lo:k_hi, :], atol=1e-5, rtol=1e-5)
+
+    def test_tp2_extend_matches_full(self):
+        """Single-chunk extend with TP=2 produces the same q / k / v slices
+        as a TP=1 reference, verified rank-by-rank.
+        """
+        ref_cca, cfg = _make_tiny_cca(seed=21, tp_rank=0, tp_size=1)
+        S = 6
+        torch.manual_seed(901)
+        hs = torch.randn(S, ref_cca.hidden_size, dtype=torch.float32) * 0.1
+
+        ref_pool = _MockReqToTokenPool(pool_size=8, cca_config=cfg, tp_size=1)
+        ref_fb = _make_forward_batch(
+            is_decode=False,
+            extend_seq_lens_cpu=[S],
+            extend_prefix_lens_cpu=[0],
+            req_pool_indices=[0],
+            input_ids=torch.arange(S, dtype=torch.int64),
+        )
+        with _mock_pool_context(ref_pool):
+            full_q, full_k, full_v = ref_cca.forward(hs, ref_fb)
+
+        for tp_rank in range(self.TP_SIZE):
+            rank_cca, _ = _make_tiny_cca(seed=21 + tp_rank, tp_rank=tp_rank, tp_size=self.TP_SIZE)
+            self._slice_full_state_dict_into_rank(ref_cca, rank_cca, tp_rank)
+            rank_pool = _MockReqToTokenPool(
+                pool_size=8, cca_config=cfg, tp_size=self.TP_SIZE
+            )
+            rank_fb = _make_forward_batch(
+                is_decode=False,
+                extend_seq_lens_cpu=[S],
+                extend_prefix_lens_cpu=[0],
+                req_pool_indices=[0],
+                input_ids=torch.arange(S, dtype=torch.int64),
+            )
+            with _mock_pool_context(rank_pool):
+                rank_q, rank_k, rank_v = rank_cca.forward(hs, rank_fb)
+            self._check_per_rank_outputs(
+                full_q, full_k, full_v, rank_q, rank_k, rank_v, tp_rank, cfg
+            )
+
+    def test_tp2_decode_matches_full(self):
+        """Prefill(S0) + decode(1 token) with TP=2 produces the same q / k / v
+        slices as a TP=1 reference, verifying that the per-rank conv state
+        and prev_hs cache (which is replicated on every rank) agree.
+        """
+        ref_cca, cfg = _make_tiny_cca(seed=22, tp_rank=0, tp_size=1)
+        S0 = 5
+        torch.manual_seed(902)
+        hs_prefill = torch.randn(S0, ref_cca.hidden_size, dtype=torch.float32) * 0.1
+        hs_decode = torch.randn(1, ref_cca.hidden_size, dtype=torch.float32) * 0.1
+
+        ref_pool = _MockReqToTokenPool(pool_size=8, cca_config=cfg, tp_size=1)
+        with _mock_pool_context(ref_pool):
+            ref_cca.forward(
+                hs_prefill,
+                _make_forward_batch(
+                    is_decode=False,
+                    extend_seq_lens_cpu=[S0],
+                    extend_prefix_lens_cpu=[0],
+                    req_pool_indices=[0],
+                    input_ids=torch.arange(S0, dtype=torch.int64),
+                ),
+            )
+            full_q, full_k, full_v = ref_cca.forward(
+                hs_decode,
+                _make_forward_batch(
+                    is_decode=True,
+                    extend_seq_lens_cpu=[],
+                    extend_prefix_lens_cpu=[],
+                    req_pool_indices=[0],
+                    input_ids=torch.tensor([0], dtype=torch.int64),
+                ),
+            )
+
+        for tp_rank in range(self.TP_SIZE):
+            rank_cca, _ = _make_tiny_cca(seed=22 + tp_rank, tp_rank=tp_rank, tp_size=self.TP_SIZE)
+            self._slice_full_state_dict_into_rank(ref_cca, rank_cca, tp_rank)
+            rank_pool = _MockReqToTokenPool(
+                pool_size=8, cca_config=cfg, tp_size=self.TP_SIZE
+            )
+            with _mock_pool_context(rank_pool):
+                rank_cca.forward(
+                    hs_prefill,
+                    _make_forward_batch(
+                        is_decode=False,
+                        extend_seq_lens_cpu=[S0],
+                        extend_prefix_lens_cpu=[0],
+                        req_pool_indices=[0],
+                        input_ids=torch.arange(S0, dtype=torch.int64),
+                    ),
+                )
+                rank_q, rank_k, rank_v = rank_cca.forward(
+                    hs_decode,
+                    _make_forward_batch(
+                        is_decode=True,
+                        extend_seq_lens_cpu=[],
+                        extend_prefix_lens_cpu=[],
+                        req_pool_indices=[0],
+                        input_ids=torch.tensor([0], dtype=torch.int64),
+                    ),
+                )
+            self._check_per_rank_outputs(
+                full_q, full_k, full_v, rank_q, rank_k, rank_v, tp_rank, cfg
+            )
+
+    def test_tp2_conv_state_is_per_rank_sliced(self):
+        """After a TP=2 prefill, each rank's conv state must equal the head
+        slice of the TP=1 conv state corresponding to that rank's heads.
+        """
+        ref_cca, cfg = _make_tiny_cca(seed=23, tp_rank=0, tp_size=1)
+        S = 4
+        torch.manual_seed(903)
+        hs = torch.randn(S, ref_cca.hidden_size, dtype=torch.float32) * 0.1
+
+        ref_pool = _MockReqToTokenPool(pool_size=4, cca_config=cfg, tp_size=1)
+        with _mock_pool_context(ref_pool):
+            ref_cca.forward(
+                hs,
+                _make_forward_batch(
+                    is_decode=False,
+                    extend_seq_lens_cpu=[S],
+                    extend_prefix_lens_cpu=[0],
+                    req_pool_indices=[0],
+                    input_ids=torch.arange(S, dtype=torch.int64),
+                ),
+            )
+        full_state = ref_pool.mamba2_layer_cache(0).conv[0][0]  # [in_out_ch_full, pad]
+
+        head_dim = cfg.head_dim
+        num_q_heads_full = cfg.num_attention_heads
+        num_k_heads_full = cfg.num_query_groups
+        latent_q_full = num_q_heads_full * head_dim
+        q_per_rank = num_q_heads_full // self.TP_SIZE
+        k_per_rank = num_k_heads_full // self.TP_SIZE
+
+        for tp_rank in range(self.TP_SIZE):
+            rank_cca, _ = _make_tiny_cca(seed=23 + tp_rank, tp_rank=tp_rank, tp_size=self.TP_SIZE)
+            self._slice_full_state_dict_into_rank(ref_cca, rank_cca, tp_rank)
+            rank_pool = _MockReqToTokenPool(
+                pool_size=4, cca_config=cfg, tp_size=self.TP_SIZE
+            )
+            with _mock_pool_context(rank_pool):
+                rank_cca.forward(
+                    hs,
+                    _make_forward_batch(
+                        is_decode=False,
+                        extend_seq_lens_cpu=[S],
+                        extend_prefix_lens_cpu=[0],
+                        req_pool_indices=[0],
+                        input_ids=torch.arange(S, dtype=torch.int64),
+                    ),
+                )
+            rank_state = rank_pool.mamba2_layer_cache(0).conv[0][0]
+
+            q_lo = tp_rank * q_per_rank * head_dim
+            q_hi = q_lo + q_per_rank * head_dim
+            k_lo = latent_q_full + tp_rank * k_per_rank * head_dim
+            k_hi = k_lo + k_per_rank * head_dim
+            expected = torch.cat([full_state[q_lo:q_hi], full_state[k_lo:k_hi]], dim=0)
+
+            torch.testing.assert_close(rank_state, expected, atol=1e-5, rtol=1e-5)
+
+    def test_tp_assertions_reject_indivisible_head_counts(self):
+        """The CCA constructor must reject TP sizes that don't evenly divide
+        both num_q_heads and num_k_heads, since both grouped-mean and
+        conv_qk.1 require each rank to hold whole K-head groups.
+        """
+        from sglang.srt.models.zaya import CCA
+
+        cfg = _make_tiny_config()
+        # tiny config has num_query_groups=2; TP=4 cannot divide it cleanly.
+        with self.assertRaises(AssertionError):
+            CCA(
+                config=cfg,
+                cca_num_k_heads=cfg.num_query_groups,
+                cca_num_q_heads=cfg.num_attention_heads,
+                hidden_size=cfg.hidden_size,
+                head_dim=cfg.head_dim,
+                cca_time0=cfg.cca_time0,
+                cca_time1=cfg.cca_time1,
+                layer_id=0,
+                tp_rank=0,
+                tp_size=4,
+            )
 
 
 if __name__ == "__main__":
