@@ -22,6 +22,9 @@ def _fused_virtual_topk_ids_kernel(
     M,
     top_k: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    local_expert_offset: tl.constexpr,
+    local_num_experts: tl.constexpr,
+    EP_LOCAL: tl.constexpr,
 ):
     """
     Fuses _get_virtual_topk_ids: comparison + clamp + arithmetic into one kernel.
@@ -48,6 +51,15 @@ def _fused_virtual_topk_ids_kernel(
     safe_lora = tl.maximum(lora_id, 0)
 
     base = tl.load(topk_ids_ptr + offs, mask=valid, other=0)
+    if EP_LOCAL:
+        # EP: drop experts this rank does not own to the -1 sentinel (handled just
+        # below); owned experts keep their GLOBAL id so the global contiguous weight
+        # buffer indexes with a single stride and the merged-weight reshape stays a
+        # free view. Fused in here -> no separate where()/elementwise launch.
+        owned = (base >= local_expert_offset) & (
+            base < local_expert_offset + local_num_experts
+        )
+        base = tl.where(owned, base, -1)
     # Preserve negative sentinel topk_ids (e.g. -1 for non-local experts after
     # EP dispatch). Without this, `-1 + safe_lora * num_experts` would land on
     # a real virtual-expert slot belonging to another adapter and trigger OOB
@@ -69,9 +81,16 @@ def _fused_virtual_topk_ids(
     num_experts: int,
     shared_outer: bool,
     max_loras: int,
+    local_expert_offset: int = 0,
+    local_num_experts: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """
     Returns virtual topk_ids, token_lora_mask, and virtual_num_experts.
+
+    `local_num_experts` (< `num_experts`) enables the EP mask on the per-expert
+    path: non-owned `topk_ids` slots are dropped to the -1 sentinel in-kernel.
+    The shared-outer path routes by lora id, not expert, so it is never masked
+    (else non-owned-but-valid tokens would be dropped on ranks > 0).
     """
     M, top_k = topk_ids.shape
     device = topk_ids.device
@@ -81,9 +100,11 @@ def _fused_virtual_topk_ids(
         # For shared_outer, we need topk_ids to be zeros
         zero_topk = torch.zeros_like(topk_ids)
         input_topk = zero_topk
+        ep_local = False
     else:
         num_experts_for_weight = num_experts
         input_topk = topk_ids
+        ep_local = local_num_experts is not None and local_num_experts < num_experts
 
     virtual_topk_ids = torch.empty_like(topk_ids)
     token_lora_mask = torch.empty(M, dtype=torch.bool, device=device)
@@ -100,6 +121,9 @@ def _fused_virtual_topk_ids(
         M,
         top_k,
         BLOCK_SIZE,
+        local_expert_offset,
+        local_num_experts if local_num_experts is not None else 0,
+        ep_local,
     )
 
     virtual_num_experts = num_experts_for_weight * max_loras
@@ -552,14 +576,27 @@ def _merged_experts_fused_moe_lora_add_impl(
     fuse_add_to_output: bool = True,
     fuse_sum_all_reduce: bool = False,
     use_direct_expand_add: bool = False,
+    local_expert_offset: int = 0,
+    local_num_experts: int | None = None,
 ) -> None:
     """
     1. Prepare virtual expert routing metadata from topk_ids + token_lora_mapping * num_experts.
     2. Flatten LoRA weights from [max_loras, num_experts, ...] to [max_loras * num_experts, ...].
     3. Run regular SGLang fused-MoE kernels for LoRA A and LoRA B.
     4. Mask out tokens with token_lora_mapping == -1 on the add path.
+
+    EP: when `local_num_experts` (< global) is given, this rank only computes the
+    delta for the experts it owns. We keep the GLOBAL expert ids + global contiguous
+    weights (so the merged-weight reshape stays a free view) and mask non-owned
+    [token, k] slots to the -1 sentinel inside `_fused_virtual_topk_ids_kernel`; the
+    grid shrinks via the per-rank trim in `_get_routing`. Slicing the weight's expert
+    dim instead would force the reshape to copy every step (non-contiguous fold).
     """
     max_loras, _, max_lora_rank, _ = lora_a.shape
+    # Global per-expert dim of the LoRA weights. lora_a may be shared-outer (expert
+    # dim 1) while lora_b is per-expert, so take the max for the true global count.
+    per_expert_dim = max(lora_a.shape[1], lora_b.shape[1])
+    ep_local = local_num_experts is not None and local_num_experts < per_expert_dim
     input_top_k = 1 if hidden_states.shape[0] == topk_ids.numel() else topk_ids.shape[1]
 
     def _merge_lora_expert_weight(t: torch.Tensor) -> torch.Tensor:
@@ -635,7 +672,13 @@ def _merged_experts_fused_moe_lora_add_impl(
 
         virtual_topk_ids, token_lora_mask, virtual_num_experts = (
             _fused_virtual_topk_ids(
-                topk_ids, token_lora_mapping, num_experts, shared_outer, max_loras
+                topk_ids,
+                token_lora_mapping,
+                num_experts,
+                shared_outer,
+                max_loras,
+                local_expert_offset,
+                local_num_experts,
             )
         )
         sorted_token_ids, expert_ids, num_tokens_post_padded = _align_block_size(
@@ -644,9 +687,17 @@ def _merged_experts_fused_moe_lora_add_impl(
             num_experts=virtual_num_experts,
         )
         # _align_block_size uses a worst-case padded allocation. Trim the routing buffers
-        # to a tighter upper bound so we keep the real routed work but drop unused padding
+        # to a tighter upper bound so we keep the real routed work but drop unused padding.
+        # Under EP only this rank's experts are populated, so the per-expert stage bounds
+        # the non-empty buckets by `local_num_experts * max_loras` owned (expert, lora)
+        # combos + 1 sentinel bucket (all non-owned -> -1). The +1 matters: each non-empty
+        # bucket adds up to block-1 padding, so omitting it could truncate real tokens.
         num_tokens = topk_ids.numel()
-        max_nonempty = min(num_tokens, virtual_num_experts)
+        if ep_local and not shared_outer and local_num_experts < num_experts:
+            populated_buckets = local_num_experts * max_loras + 1
+        else:
+            populated_buckets = virtual_num_experts
+        max_nonempty = min(num_tokens, populated_buckets)
         tight_padded = (
             triton.cdiv(num_tokens + max_nonempty * (block_size - 1), block_size)
             * block_size
@@ -700,13 +751,20 @@ def _merged_experts_fused_moe_lora_add_impl(
     intermediate_split_k = _get_moe_lora_shrink_split_k(
         lora_a_virtual, sorted_token_ids, a_stage_config
     )
+    # EP leaves non-owned [token, k] shrink slots unwritten. A per-expert expand skips
+    # non-owned blocks (never reads them), but a shared-outer expand routes by lora id
+    # and would read them into the real (all-reduced) output -> must zero. split_k > 1
+    # also needs a zeroed buffer for its accumulation.
+    zero_intermediate = intermediate_split_k > 1 or (
+        ep_local and experts_shared_outer_loras_b
+    )
     intermediate = (
         torch.zeros(
             intermediate_shape,
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        if intermediate_split_k > 1
+        if zero_intermediate
         else torch.empty(
             intermediate_shape,
             dtype=hidden_states.dtype,
@@ -842,6 +900,8 @@ def merged_experts_fused_moe_lora_add(
     fuse_add_to_output: bool = True,
     fuse_sum_all_reduce: bool = False,
     use_direct_expand_add: bool = False,
+    local_expert_offset: int = 0,
+    local_num_experts: int | None = None,
 ) -> None:
     """Public API: wraps the registered op with routing_cache support."""
     _merged_experts_fused_moe_lora_add_impl(
@@ -859,4 +919,6 @@ def merged_experts_fused_moe_lora_add(
         fuse_add_to_output=fuse_add_to_output,
         fuse_sum_all_reduce=fuse_sum_all_reduce,
         use_direct_expand_add=use_direct_expand_add,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=local_num_experts,
     )

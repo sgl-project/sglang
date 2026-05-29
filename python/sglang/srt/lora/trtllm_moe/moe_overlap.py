@@ -86,6 +86,10 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
 
     side_stream = get_lora_side_stream()
 
+    # EP-aware LoRA: under MoE EP each rank computes the delta only for its owned experts
+    # (passed via local_expert_offset/local_num_experts below). gate_up_delta stays
+    # new_empty even though non-owned [token, k] slots are then left unwritten -- the
+    # trtllm MoE is itself EP-aware, so those slots never feed the all-reduced output.
     gate_up_delta_shape = (
         hidden_states.shape[0],
         runner_config.top_k,
@@ -108,6 +112,8 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
             routing_cache=fused_lora_routing_cache,
             fuse_add_to_output=False,
             use_direct_expand_add=lora_info.max_lora_rank <= 64,
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=quant_info.local_num_experts,
         )
 
     # O1 fork — gate_up shrink/expand on side stream concurrent with the
@@ -200,5 +206,7 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
         fuse_add_to_output=False,
         fuse_sum_all_reduce=True,
         use_direct_expand_add=lora_info.max_lora_rank <= 64,
+        local_expert_offset=quant_info.local_expert_offset,
+        local_num_experts=quant_info.local_num_experts,
     )
     return StandardCombineInput(hidden_states=output)
