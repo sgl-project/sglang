@@ -3326,6 +3326,34 @@ class ServerArgs:
                 self.ep_size == 1
             ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
 
+        # TODO(yuwei): Fix piecewise cuda graph support for all bypassed topk
+        # MoE backends. Keep PCG default-deny for these backends and allow only
+        # paths with validated PCG support.
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+
+        hf_config = self.get_model_config().hf_config
+        model_arch = hf_config.architectures[0]
+        supports_bypassed_topk_pcg = (
+            # GptOss wraps the entire MoE block in its own custom op (moe_impl),
+            # so bypassed topk is handled inside the op body.
+            model_arch == "GptOssForCausalLM"
+            # #23351 added PCG support for DSA models by making the DSA
+            # indexer and attention path capture-safe. Keep that support
+            # scoped to configs that the DSA detector recognizes.
+            or is_deepseek_dsa(hf_config)
+        )
+        if (
+            not self.enforce_piecewise_cuda_graph
+            and self.moe_runner_backend in ("flashinfer_trtllm", "flashinfer_mxfp4")
+            and not supports_bypassed_topk_pcg
+        ):
+            self.disable_piecewise_cuda_graph = True
+            logger.info(
+                f"Piecewise cuda graph is disabled for MoE runner backend "
+                f"'{self.moe_runner_backend}' (bypassed topk is incompatible "
+                f"with torch.compile)."
+            )
+
     def _handle_a2a_moe(self):
         if self.enable_deepep_waterfill and self.moe_a2a_backend != "deepep":
             logger.warning(
