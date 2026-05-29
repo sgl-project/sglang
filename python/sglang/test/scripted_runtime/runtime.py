@@ -240,13 +240,35 @@ class ScriptedRuntime:
         assert self._is_driver, "abort_all is only callable from the driver rank"
         self._scheduler.abort_request(AbortReq(abort_all=True))
 
-    def radix_chunked_hit_count_skip_count(self) -> int:
-        """Counter: number of times ``_inc_hit_count`` short-circuited because
-        the insert was chunked. Reads the tree_cache field added in
-        :class:`RadixCache`. Used to verify the chunked self-referencing
-        inflation guard was exercised.
+    def reset_radix_cache(self) -> None:
+        """Clear the radix tree so a script starts from an empty cache.
+
+        Safe to call only when the engine is idle (no in-flight reqs);
+        used by tests that need a deterministic radix-tree shape
+        independent of what earlier scripts on the shared engine left
+        behind.
         """
-        return self._scheduler.tree_cache._chunked_inc_hit_count_skip_count
+        assert self._is_driver, "reset_radix_cache is only callable from the driver rank"
+        self._scheduler.tree_cache.reset()
+
+    def get_all_node_hit_counts(self) -> int:
+        """Sum of ``hit_count`` over every non-root node in the radix tree.
+
+        The chunked self-referencing guard skips ``_inc_hit_count`` on every
+        ``cache_unfinished_req`` insert, so only the single non-chunked
+        ``cache_finished_req`` insert bumps hit counts — touching each node on
+        the committed path exactly once. On an otherwise-empty tree this total
+        therefore equals the node count (every node at ``hit_count == 1``);
+        without the guard the early prefix nodes would be re-bumped once per
+        chunk and the total would be far larger.
+        """
+        total = 0
+        stack = list(self._scheduler.tree_cache.root_node.children.values())
+        while stack:
+            node = stack.pop()
+            total += node.hit_count
+            stack.extend(node.children.values())
+        return total
 
     # ============================================================
     # Lookups used by ReqHandle (driver-rank-local view).

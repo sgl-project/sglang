@@ -125,20 +125,33 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
             f"flag={t.last_chunked_req_scheduled_iter_flag()!r}"
         )
 
-    def test_chunked_req_skips_radix_hit_count_increment(self):
-        """A chunked prefill triggers at least one _inc_hit_count(chunked=True) skip on radix insert."""
-        self.runtime.run(self._script_chunked_req_skips_radix_hit_count_increment)
+    def test_chunked_prefill_does_not_inflate_radix_hit_count(self):
+        """Chunked inserts skip hit_count, so the whole-tree total equals the node count, not the inflated per-chunk sum."""
+        self.runtime.run(self._script_chunked_prefill_does_not_inflate_radix_hit_count)
 
     @staticmethod
-    def _script_chunked_req_skips_radix_hit_count_increment(t: ScriptedRuntime):
-        before = t.radix_chunked_hit_count_skip_count()
-        r = t.start_req(prompt_len=4 * _CHUNK_SIZE, max_new_tokens=2)
+    def _script_chunked_prefill_does_not_inflate_radix_hit_count(t: ScriptedRuntime):
+        # Reset first: the shared engine and the all-ones token prefix mean
+        # earlier scripts leave a radix chain whose hit counts would otherwise
+        # make this total history-dependent.
+        t.reset_radix_cache()
+        before = t.get_all_node_hit_counts()
+        assert before == 0, f"reset must empty the radix tree; got {before}"
+
+        r = t.start_req(prompt_len=_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r)
-        after = t.radix_chunked_hit_count_skip_count()
-        assert r.finished, f"req did not finish, status={r.status!r}"
-        assert after - before >= 1, (
-            f"chunked _inc_hit_count skip branch must be exercised at least "
-            f"once; before={before}, after={after}"
+        assert r.finished
+
+        # _PROMPT_LEN / _CHUNK_SIZE = 4 chunks -> 3 chunked cache_unfinished_req
+        # inserts (all hit_count-skipped) build prefix nodes [0:64], [64:128],
+        # [128:192]; the single non-chunked cache_finished_req insert then bumps
+        # those three plus the [192:] tail node exactly once each. Total == 4.
+        # Without the guard the first node alone would reach 4 (one bump per
+        # chunked insert + the finish insert) and the total would be 10.
+        after = t.get_all_node_hit_counts()
+        assert after - before == 4, (
+            f"chunked prefill must bump each radix node exactly once; "
+            f"expected total 4, got {after - before}"
         )
 
 
