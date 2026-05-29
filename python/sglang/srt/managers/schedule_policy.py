@@ -669,23 +669,25 @@ class PrefillAdder:
         )
 
     def add_non_first_chunk_req(self, req: Req) -> AddReqResult:
-        # Scheduler-side dispatch invariant: only chunked-resume reqs (and
-        # never DLLM, whose `has_pending_chunk` is always False) flow here.
-        assert (
-            req.has_pending_chunk and not req.is_dllm()
-        ), f"add_non_first_chunk_req called on non-resume req {req.rid}"
+        # Scheduler-side dispatch invariant: only chunked-resume non-DLLM reqs reach here.
+        assert req.has_pending_chunk and not req.is_dllm(), f"non-resume req {req.rid}"
 
-        _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
-        if self.is_hybrid_swa:
-            # alloc_extend needs extend_num_tokens + page_size per request,
-            # so reserve one page here to avoid OOM
-            _rem_tokens = min(_rem_tokens, int(self.rem_swa_tokens) - self.page_size)
-        # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
-        # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
-        if _rem_tokens <= 0:
+        if self.dllm_config is not None:
+            _rem_tokens = self._get_dllm_remain_tokens()
+        else:
+            _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
             if self.is_hybrid_swa:
-                return AddReqResult.NO_TOKEN
-            _rem_tokens = self.rem_chunk_tokens
+                # alloc_extend needs extend_num_tokens + page_size per request,
+                # so reserve one page here to avoid OOM
+                _rem_tokens = min(
+                    _rem_tokens, int(self.rem_swa_tokens) - self.page_size
+                )
+            # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
+            # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
+            if _rem_tokens <= 0:
+                if self.is_hybrid_swa:
+                    return AddReqResult.NO_TOKEN
+                _rem_tokens = self.rem_chunk_tokens
 
         truncated = req.extend_input_len > _rem_tokens
         req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
