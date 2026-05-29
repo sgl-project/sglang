@@ -890,7 +890,9 @@ class PrefillAdder:
                     )
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
+                req.set_extend_input_len(
+                    len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+                )
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 
