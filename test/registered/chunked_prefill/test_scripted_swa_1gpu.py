@@ -4,45 +4,71 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
-    DEFAULT_CHUNK_SIZE,
-    VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     run_until,
 )
 
-# Single-GPU scripted chunked-prefill test for the hybrid-SWA
-# add_chunked_req early-return gate. gpt-oss-20b is a hybrid-SWA model
-# and needs a single 80 GB GPU, so this runs on 1-gpu-large rather than
-# the 1-gpu-small runner the rest of the core suite uses.
+# Single-GPU scripted test for the hybrid-SWA add_chunked_req early-return
+# gate. gpt-oss-20b is a hybrid-SWA model and needs an 80 GB GPU for its
+# weights, so this runs on 1-gpu-large rather than the 1-gpu-small runner
+# the rest of the core suite uses.
 register_cuda_ci(est_time=400, stage="extra-a", runner_config="1-gpu-large")
 
 
 _SWA_MODEL = "openai/gpt-oss-20b"
 
+# The whole point of the test is to starve the KV cache so the chunked req
+# cannot allocate its next chunk. We pin the pool to an explicit, tiny size
+# and pick prompts around it:
+#
+#   full KV pool == _MAX_TOTAL_TOKENS slots.
+#   A resident competitor holds ~_RESIDENT_PROMPT slots; that leaves
+#   _MAX_TOTAL_TOKENS - _RESIDENT_PROMPT (< _CHUNKED_PROMPT) for the chunked
+#   req. So once the chunked req has committed a couple of chunks it can no
+#   longer extend -> add_chunked_req returns it without admitting it (the
+#   early-return; valid for any exhausted budget under hybrid SWA). Once the
+#   competitor finishes and frees its slots, the chunked req (which fits the
+#   pool on its own) drains to completion.
+_MAX_TOTAL_TOKENS = 2048
+_CHUNK_SIZE = 256
+_RESIDENT_PROMPT = 1280
+_RESIDENT_DECODE = 32
+_CHUNKED_PROMPT = 1280
 
-class TestScriptedSwaChunkedReqScheduledLastIter(ScriptedRuntimeTestCase):
+
+class TestScriptedSwaChunkedReqEarlyReturn(ScriptedRuntimeTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         model_path=_SWA_MODEL,
-        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        chunked_prefill_size=_CHUNK_SIZE,
+        max_total_tokens=_MAX_TOTAL_TOKENS,
         mem_fraction_static=0.70,
         disable_piecewise_cuda_graph=True,
     )
 
     def test_swa_chunked_req_early_return_no_double_free(self):
-        """SWA add_chunked_req early-return must not stash the un-scheduled chunked req."""
+        """Under KV-cache starvation the chunked req's add_chunked_req early-returns; the stash gate keeps its partial KV out of the tree."""
         self.runtime.run(self._script_swa_chunked_req_early_return_no_double_free)
 
-    # SWA pool critical + add_chunked_req forced early-return: the chunked
-    # req stays parked as scheduler.chunked_req without running, and the
-    # stash gate must keep its partial KV out of the tree so no radix node
-    # is left locked once the engine drains.
+    # A resident competitor occupies most of a deliberately tiny KV pool, so
+    # the chunked req hits the add_chunked_req early-return: it stays parked as
+    # scheduler.chunked_req without running, and the stash gate must keep its
+    # partial KV out of the tree so no radix node is left locked after drain.
     @staticmethod
     def _script_swa_chunked_req_early_return_no_double_free(t: ScriptedRuntime):
         s = t._scheduler
-        # Long competitor consumes SWA budget so the chunked req hits
-        # the add_chunked_req SWA-early-return branch at least once.
-        competitor = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=8)
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+
+        # Bring the competitor up first and let it finish its own chunked
+        # prefill, so it is resident (decoding) and holding ~_RESIDENT_PROMPT
+        # KV slots before the chunked req under test starts. Only one req may
+        # be chunking at a time, so starting them together would just serialize
+        # them with no pressure.
+        competitor = t.start_req(
+            prompt_len=_RESIDENT_PROMPT, max_new_tokens=_RESIDENT_DECODE
+        )
+        yield from run_until(competitor, lambda h: h.is_chunking)
+        yield from run_until(competitor, lambda h: not h.is_chunking)
+
+        r = t.start_req(prompt_len=_CHUNKED_PROMPT, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
 
         # "assert the scenario exists" derived purely from real batch state,
@@ -66,11 +92,11 @@ class TestScriptedSwaChunkedReqScheduledLastIter(ScriptedRuntimeTestCase):
                 break
             yield
 
-        assert r.finished, "chunked req under SWA pressure did not finish"
+        assert r.finished, "chunked req did not finish after the competitor freed its KV"
         assert observed_early_return, (
-            "test must exercise the SWA add_chunked_req early-return branch: "
-            "no iter observed r parked as scheduler.chunked_req while absent "
-            "from the forward batch — SWA budget was never tight enough"
+            "test must exercise the add_chunked_req early-return branch: no iter "
+            "observed r parked as scheduler.chunked_req while absent from the "
+            "forward batch — the KV pool was never tight enough"
         )
 
         # Gate held: drain to a fully idle engine, then assert no radix node
