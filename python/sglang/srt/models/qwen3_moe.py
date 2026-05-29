@@ -1167,7 +1167,6 @@ class Qwen3MoeForCausalLM(nn.Module):
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                print(param.shape,loaded_weight.shape,name,shard_id,1170)
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
@@ -1215,7 +1214,6 @@ class Qwen3MoeForCausalLM(nn.Module):
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
-                        print(param.shape,loaded_weight.shape,name,shard_id,1218)
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")

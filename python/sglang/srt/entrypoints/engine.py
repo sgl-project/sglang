@@ -1033,7 +1033,6 @@ class Engine(EngineScoreMixin, EngineBase):
         load_format: Optional[str] = None,
         flush_cache: bool = True,
     ):
-        raise NotImplementedError
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
         if load_format == "flattened_bucket":
