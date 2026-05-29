@@ -299,25 +299,74 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         in_capture: bool = False,
     ):
         bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+
         if in_capture:
-            self.init_forward_metadata_capture_cuda_graph(
+            num_tokens = forward_batch.positions.numel()
+            seq_lens_sum = seq_lens.sum().item()
+            seq_lens_cpu = seq_lens.cpu()
+
+            if forward_mode.is_decode_or_idle():
+                # Decode: create wrapper, run the initial full begin_forward
+                # (init_metadata_replay=False), then install the fast plan.
+                decode_wrapper = BatchMLAPagedAttentionWrapper(
+                    self.workspace_buffer,
+                    use_cuda_graph=True,
+                    qo_indptr=self.cuda_graph_qo_indptr[: num_tokens + 1],
+                    kv_indptr=self.cuda_graph_kv_indptr[: num_tokens + 1],
+                    kv_indices=self.cuda_graph_kv_indices,
+                    kv_len_arr=self.cuda_graph_kv_lens[:num_tokens],
+                    backend="auto",
+                )
+                self.indices_updater_decode.update(
+                    req_pool_indices,
+                    seq_lens,
+                    seq_lens_sum,
+                    decode_wrapper=decode_wrapper,
+                    init_metadata_replay=False,
+                    spec_info=spec_info,
+                )
+                self.decode_cuda_graph_metadata[bs] = decode_wrapper
+                self.forward_metadata = DecodeMetadata(decode_wrapper)
+                # fast_mla_decode_plan requires _cached_module set by the initial
+                # begin_forward above; install it only after that call completes.
+                decode_wrapper.plan = partial(fast_mla_decode_plan, decode_wrapper)
+            elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+                # Prefill: create wrapper and store — _apply handles the update call.
+                prefill_wrapper = BatchMLAPagedAttentionWrapper(
+                    self.workspace_buffer,
+                    use_cuda_graph=True,
+                    qo_indptr=self.cuda_graph_qo_indptr[: bs + 1],
+                    kv_indptr=self.cuda_graph_kv_indptr[: bs + 1],
+                    kv_indices=self.cuda_graph_kv_indices,
+                    kv_len_arr=self.cuda_graph_kv_lens[:bs],
+                    backend="auto",
+                )
+                self.prefill_cuda_graph_metadata[bs] = prefill_wrapper
+                self.forward_metadata = PrefillMetadata(prefill_wrapper, False)
+            else:
+                raise ValueError(f"Invalid mode: {forward_mode=}")
+
+            self._apply_cuda_graph_metadata(
                 bs=bs,
-                num_tokens=forward_batch.positions.numel(),
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
-                encoder_lens=forward_batch.encoder_lens,
-                forward_mode=forward_batch.forward_mode,
-                spec_info=forward_batch.spec_info,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                seq_lens_sum=seq_lens_sum,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+                seq_lens_cpu=seq_lens_cpu,
             )
         else:
-            self.init_forward_metadata_replay_cuda_graph(
+            self._apply_cuda_graph_metadata(
                 bs=bs,
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
                 seq_lens_sum=forward_batch.seq_lens_sum,
-                encoder_lens=forward_batch.encoder_lens,
-                forward_mode=forward_batch.forward_mode,
-                spec_info=forward_batch.spec_info,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
             )
 
