@@ -379,8 +379,6 @@ class DeepseekV4AttnBackend(
             DSV4RawVerifyMetadata,
             DSV4RawDecodeMetadata,
         ] = None
-        self._replay_forward_batch: Optional[ForwardBatch] = None  # FIXME: out-of-band
-
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
         return pin_tensor.to(self.device, non_blocking=True)
@@ -664,38 +662,128 @@ class DeepseekV4AttnBackend(
         )
 
     def init_forward_data(self, forward_batch: ForwardBatch):
-        # Delegate to legacy method while Phase E hasn't moved the body yet.
+        # Eager path stays on init_forward_metadata.
         self.init_forward_metadata(forward_batch)
 
     def init_forward_data_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
-    ):
-        # DSV4 still reads self._replay_forward_batch in the replay path
-        # (set out-of-band by the graph runner); step 04 will remove that
-        # side channel and have the caller pass a complete fb_view instead.
+    ) -> None:
+        bucket = _GraphBucket.of(forward_batch.forward_mode)
         bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+
         if in_capture:
-            self.init_forward_metadata_capture_cuda_graph(
-                bs=bs,
-                num_tokens=forward_batch.positions.numel(),
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
-                encoder_lens=forward_batch.encoder_lens,
-                forward_mode=forward_batch.forward_mode,
-                spec_info=forward_batch.spec_info,
+            # Capture-time synthesizes a dummy out_cache_loc per bucket
+            # (the captured graph doesn't run real cache writes; replay
+            # supplies the real value) and uses capture-time mode as the
+            # actual mode (no IDLE at capture).
+            assert req_pool_indices.size(0) == bs
+            assert seq_lens.size(0) == bs
+            num_tokens = forward_batch.positions.numel()
+            if bucket == _GraphBucket.DECODE_OR_IDLE:
+                out_cache_loc = torch.zeros_like(seq_lens)
+            elif bucket == _GraphBucket.TARGET_VERIFY:
+                out_cache_loc = torch.zeros(
+                    num_tokens, **self.cuda_int32_kwargs
+                )
+            else:
+                out_cache_loc = None
+            actual_forward_mode = forward_batch.forward_mode
+            seq_lens_sum = int(seq_lens.sum().item())
+            seq_lens_cpu = seq_lens.cpu()
+        else:
+            # Replay reads the real out_cache_loc and runtime actual_forward_mode
+            # from the fb_view (which the graph runner constructed from the
+            # padded buffers + the original forward_batch).
+            out_cache_loc = forward_batch.out_cache_loc
+            actual_forward_mode = getattr(
+                forward_batch, "actual_forward_mode", forward_batch.forward_mode
+            )
+            seq_lens_sum = forward_batch.seq_lens_sum
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+
+        if actual_forward_mode == ForwardMode.IDLE:
+            logger.debug(
+                f"[IDLE replay] bs={bs}, "
+                f"local_seq_lens_len={len(seq_lens)}, "
+                f"has_graph={bs in self.cuda_graph_metadata_of_bucket_and_bs[_GraphBucket.DECODE_OR_IDLE]}"
+            )
+            device = seq_lens.device
+            seq_lens = torch.ones(bs, dtype=seq_lens.dtype, device=device)
+            seq_lens_cpu = torch.ones(bs, dtype=torch.int64)
+            seq_lens_sum = bs
+            req_pool_indices = torch.zeros(
+                bs, dtype=req_pool_indices.dtype, device=device
+            )
+            out_cache_loc = torch.zeros(bs, dtype=torch.int64, device=device)
+
+        assert seq_lens_cpu is not None
+        seq_lens = seq_lens[:bs]
+        seq_lens_cpu = seq_lens_cpu[:bs]
+        req_pool_indices = req_pool_indices[:bs]
+
+        actual_max_seq_len = seq_lens_cpu.max().item()
+        chosen_max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
+        assert actual_max_seq_len <= chosen_max_seq_len
+
+        if bucket == _GraphBucket.DECODE_OR_IDLE:
+            assert out_cache_loc is not None
+            assert len(out_cache_loc.shape) == 1, f"{out_cache_loc.shape=}"
+            out_cache_loc_padded = torch.nn.functional.pad(
+                out_cache_loc,
+                pad=(0, bs - len(out_cache_loc)),
+                mode="constant",
+                value=0,
+            )
+            temp_metadata = self.init_forward_metadata_decode(
+                max_seq_len=chosen_max_seq_len,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                out_cache_loc=out_cache_loc_padded,
+            )
+        elif bucket == _GraphBucket.TARGET_VERIFY:
+            assert out_cache_loc is not None
+            num_tokens_v = self.speculative_num_draft_tokens * bs
+            out_cache_loc_padded = torch.nn.functional.pad(
+                out_cache_loc,
+                pad=(0, num_tokens_v - len(out_cache_loc)),
+                mode="constant",
+                value=0,
+            )
+            temp_metadata = self.init_forward_metadata_target_verify(
+                max_seq_len=chosen_max_seq_len,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                out_cache_loc=out_cache_loc_padded,
+                use_prefill_cuda_graph=True,
+            )
+        elif bucket == _GraphBucket.DRAFT_EXTEND:
+            num_tokens_per_bs = self.draft_extend_num_tokens_per_bs
+            temp_metadata = self.init_forward_metadata_draft_extend(
+                max_seq_len=chosen_max_seq_len,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu.tolist(),
+                num_tokens_per_bs=num_tokens_per_bs,
+                use_prefill_cuda_graph=True,
             )
         else:
-            self.init_forward_metadata_replay_cuda_graph(
-                bs=bs,
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
-                seq_lens_sum=forward_batch.seq_lens_sum,
-                encoder_lens=forward_batch.encoder_lens,
-                forward_mode=forward_batch.forward_mode,
-                spec_info=forward_batch.spec_info,
-                seq_lens_cpu=forward_batch.seq_lens_cpu,
+            raise NotImplementedError
+
+        self.replay_cuda_graph_metadata_from(
+            bs=bs, temp_metadata=temp_metadata, bucket=bucket
+        )
+
+        if in_capture:
+            # Preserve _current_capture_raw for on_after_cuda_graph_warmup
+            metadata = self.forward_metadata
+            self._current_capture_raw = (
+                metadata
+                if isinstance(metadata, (DSV4RawDecodeMetadata, DSV4RawVerifyMetadata))
+                else None
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
@@ -772,141 +860,6 @@ class DeepseekV4AttnBackend(
         ] = {bucket: {} for bucket in _GraphBucket}
         self.draft_extend_num_tokens_per_bs = (
             max_num_tokens // max_bs if max_bs > 0 else 1
-        )
-
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ) -> None:
-        from types import SimpleNamespace
-
-        assert req_pool_indices.size(0) == bs
-        assert seq_lens.size(0) == bs
-
-        bucket = _GraphBucket.of(forward_mode)
-        if bucket == _GraphBucket.DECODE_OR_IDLE:
-            dummy_cache_loc = torch.zeros_like(seq_lens)
-        elif bucket == _GraphBucket.TARGET_VERIFY:
-            dummy_cache_loc = torch.zeros(num_tokens, **self.cuda_int32_kwargs)
-        else:
-            dummy_cache_loc = None
-
-        self._replay_forward_batch = SimpleNamespace(
-            out_cache_loc=dummy_cache_loc,
-            forward_mode=forward_mode,
-        )
-        self.init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_sum=int(seq_lens.sum().item()),
-            encoder_lens=encoder_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-            seq_lens_cpu=seq_lens.cpu(),
-        )
-        # Preserve _current_capture_raw for on_after_cuda_graph_warmup
-        metadata = self.forward_metadata
-        self._current_capture_raw = (
-            metadata
-            if isinstance(metadata, (DSV4RawDecodeMetadata, DSV4RawVerifyMetadata))
-            else None
-        )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ) -> None:
-        bucket = _GraphBucket.of(forward_mode)
-
-        # FIXME: see cuda_graph_runner — this attribute is set out-of-band.
-        fb = self._replay_forward_batch
-        out_cache_loc = fb.out_cache_loc
-        actual_forward_mode = fb.forward_mode
-
-        if actual_forward_mode == ForwardMode.IDLE:
-            logger.debug(
-                f"[IDLE replay] bs={bs}, "
-                f"local_seq_lens_len={len(seq_lens)}, "
-                f"has_graph={bs in self.cuda_graph_metadata_of_bucket_and_bs[_GraphBucket.DECODE_OR_IDLE]}"
-            )
-            device = seq_lens.device
-            seq_lens = torch.ones(bs, dtype=seq_lens.dtype, device=device)
-            seq_lens_cpu = torch.ones(bs, dtype=torch.int64)
-            seq_lens_sum = bs
-            req_pool_indices = torch.zeros(
-                bs, dtype=req_pool_indices.dtype, device=device
-            )
-            out_cache_loc = torch.zeros(bs, dtype=torch.int64, device=device)
-
-        assert seq_lens_cpu is not None
-        seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs]
-        req_pool_indices = req_pool_indices[:bs]
-
-        actual_max_seq_len = seq_lens_cpu.max().item()
-        chosen_max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
-        assert actual_max_seq_len <= chosen_max_seq_len
-
-        if bucket == _GraphBucket.DECODE_OR_IDLE:
-            assert out_cache_loc is not None
-            assert len(out_cache_loc.shape) == 1, f"{out_cache_loc.shape=}"
-            out_cache_loc_padded = torch.nn.functional.pad(
-                out_cache_loc,
-                pad=(0, bs - len(out_cache_loc)),
-                mode="constant",
-                value=0,
-            )
-            temp_metadata = self.init_forward_metadata_decode(
-                max_seq_len=chosen_max_seq_len,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=out_cache_loc_padded,
-            )
-        elif bucket == _GraphBucket.TARGET_VERIFY:
-            assert out_cache_loc is not None
-            num_tokens = self.speculative_num_draft_tokens * bs
-            out_cache_loc_padded = torch.nn.functional.pad(
-                out_cache_loc,
-                pad=(0, num_tokens - len(out_cache_loc)),
-                mode="constant",
-                value=0,
-            )
-            temp_metadata = self.init_forward_metadata_target_verify(
-                max_seq_len=chosen_max_seq_len,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=out_cache_loc_padded,
-                use_prefill_cuda_graph=True,
-            )
-        elif bucket == _GraphBucket.DRAFT_EXTEND:
-            num_tokens_per_bs = self.draft_extend_num_tokens_per_bs
-            temp_metadata = self.init_forward_metadata_draft_extend(
-                max_seq_len=chosen_max_seq_len,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu.tolist(),
-                num_tokens_per_bs=num_tokens_per_bs,
-                use_prefill_cuda_graph=True,
-            )
-        else:
-            raise NotImplementedError
-
-        self.replay_cuda_graph_metadata_from(
-            bs=bs, temp_metadata=temp_metadata, bucket=bucket
         )
 
     def replay_cuda_graph_metadata_from(
@@ -1251,14 +1204,45 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        # MultiStep keeps custom capture/replay signatures (fb-only / fb+bs).
-        # Override the standard delegation to dispatch through them.
+        # MultiStep dispatcher. Inner backends now read out_cache_loc /
+        # actual_forward_mode straight off the passed fb, so no
+        # _replay_forward_batch side channel is needed. We hard-pin
+        # forward_mode=DECODE for inner dispatch (matching the legacy
+        # capture/replay variants that hardcoded it).
+        from types import SimpleNamespace
+
+        inner_fb = SimpleNamespace(
+            batch_size=forward_batch.batch_size,
+            forward_mode=ForwardMode.DECODE,
+            actual_forward_mode=forward_batch.forward_mode,
+            input_ids=getattr(forward_batch, "input_ids", None),
+            positions=getattr(forward_batch, "positions", None),
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            seq_lens_sum=forward_batch.seq_lens_sum,
+            seq_lens_cpu=forward_batch.seq_lens_cpu,
+            encoder_lens=None,
+            out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+            spec_info=forward_batch.spec_info,
+        )
         if in_capture:
-            self.init_forward_metadata_capture_cuda_graph(forward_batch)
+            for i in range(self.speculative_num_steps):
+                self.attn_backends[i].init_forward_data_out_graph(
+                    inner_fb, in_capture=True
+                )
         else:
-            self.init_forward_metadata_replay_cuda_graph(
-                forward_batch, forward_batch.batch_size
-            )
+            if self.speculative_num_steps == 1:
+                return
+            # Drive the first inner backend; subsequent steps clone its
+            # captured metadata via replay_cuda_graph_metadata_from.
+            self.attn_backends[0].init_forward_data_out_graph(inner_fb)
+            temp_metadata = self.attn_backends[0].forward_metadata
+            for i in range(1, self.speculative_num_steps - 1):
+                self.attn_backends[i].replay_cuda_graph_metadata_from(
+                    bs=forward_batch.batch_size,
+                    temp_metadata=temp_metadata,
+                    bucket=_GraphBucket.DECODE_OR_IDLE,
+                )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps - 1):
@@ -1268,48 +1252,9 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         for i in range(self.speculative_num_steps):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
 
-    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-        for i in range(self.speculative_num_steps):
-            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.batch_size * self.topk,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-            )
-
     def on_after_cuda_graph_warmup(self):
         for backend in self.attn_backends:
             backend.on_after_cuda_graph_warmup()
-
-    def init_forward_metadata_replay_cuda_graph(
-        self, forward_batch: ForwardBatch, bs: int
-    ):
-        if self.speculative_num_steps == 1:
-            return
-
-        self.attn_backends[0]._replay_forward_batch = forward_batch
-        self.attn_backends[0].init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=forward_batch.req_pool_indices,
-            seq_lens=forward_batch.seq_lens,
-            seq_lens_sum=forward_batch.seq_lens_sum,
-            encoder_lens=None,
-            forward_mode=ForwardMode.DECODE,
-            spec_info=forward_batch.spec_info,
-            seq_lens_cpu=forward_batch.seq_lens_cpu,
-        )
-        self.attn_backends[0]._replay_forward_batch = None
-        temp_metadata = self.attn_backends[0].forward_metadata
-
-        for i in range(1, self.speculative_num_steps - 1):
-            self.attn_backends[i].replay_cuda_graph_metadata_from(
-                bs=bs,
-                temp_metadata=temp_metadata,
-                bucket=_GraphBucket.DECODE_OR_IDLE,
-            )
 
 
 def _pad_tensor_to_size(tensor: torch.Tensor, size: int, *, value: int = 0):
