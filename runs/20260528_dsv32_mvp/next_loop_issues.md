@@ -50,6 +50,7 @@ R&D that would lift the beyond-budget limits if DS long-context recall is pursue
   decision before further DS investment on V3.2.
 
 ## 6. Cosmetic
-- Pre-existing "Locked Option B operating point (plan §13 / DEC-1)" header lines in
-  `development/serve_*.sh` still carry plan-specific terms (predate Round 11); reword to
-  behavior-based language next time those headers are edited.
+- The `serve_*.sh` operating-point headers and the `serve_double_sparsity.sh` HiSparse-exclusion
+  comment have been reworded to behavior-based language (no plan markers). The only remaining
+  plan-process references are the deliberate `# Round 26-29 …` MMLU-history comments in
+  `test/manual/test_double_sparsity_v32.py` (historical rationale, intentionally kept).

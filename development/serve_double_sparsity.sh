@@ -3,8 +3,8 @@
 #
 # Mirrors development/serve_native_nsa.sh but adds --enable-double-sparsity
 # and --double-sparsity-config. Targets DeepSeek-V3.2 (FP8) on a single H200
-# node, 8-way TP, page=64. Mutually exclusive with --enable-hisparse at
-# startup (per DEC-8).
+# node, 8-way TP, page=64. Double Sparsity and HiSparse are mutually
+# exclusive: enabling both at startup is rejected by the launch validator.
 #
 # Locked operating point — these dense-prefill / sparse-decode flags MUST
 # agree across this script and development/serve_native_nsa.sh so the
