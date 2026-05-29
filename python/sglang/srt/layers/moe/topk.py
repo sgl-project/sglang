@@ -1267,6 +1267,27 @@ def _remap_topk_for_deepep(
     return topk_ids, topk_weights
 
 
+def maybe_capture_routed_experts(
+    topk_config: TopKConfig,
+    layer_id: Optional[int],
+    topk_ids: torch.Tensor,
+) -> None:
+    """Single chokepoint that backends call after producing routed top-k ids.
+
+    Reads `topk_config.capture_routed_experts` and the process-global
+    `RoutedExpertsCapturer`; calls `capture(...)` only when both consent.
+    Centralizing the gate means a future capture-aware backend cannot
+    accidentally bypass the per-`TopKConfig` opt-out used by draft MoE
+    layers (NextN / MTP / EAGLE-MoE).
+    """
+    if not topk_config.capture_routed_experts:
+        return
+    cap = get_global_experts_capturer()
+    if cap is None:
+        return
+    cap.capture(layer_id=layer_id, topk_indices=topk_ids)
+
+
 def _post_process_topk_ids(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -1280,13 +1301,7 @@ def _post_process_topk_ids(
     fused_shared_experts_scaling_factor = (
         topk_config.fused_shared_experts_scaling_factor
     )
-    if topk_config.capture_routed_experts and (
-        cap := get_global_experts_capturer()
-    ) is not None:
-        cap.capture(
-            layer_id=layer_id,
-            topk_indices=topk_ids,
-        )
+    maybe_capture_routed_experts(topk_config, layer_id, topk_ids)
     if _is_cuda:
         # When shared experts are fused (appended as extra columns in topk_ids),
         # EPLB dispatch must only remap the routed expert columns.
