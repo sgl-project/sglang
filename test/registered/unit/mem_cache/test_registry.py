@@ -178,12 +178,15 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
         # we inject a stand-in module rather than letting patch() trigger
         # the real import.
         fake_module = MagicMock()
-        with patch(
-            "sglang.srt.mem_cache.registry.envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get",
-            return_value=True,
-        ), patch.dict(
-            "sys.modules",
-            {"sglang.srt.mem_cache.radix_cache_cpp": fake_module},
+        with (
+            patch(
+                "sglang.srt.mem_cache.registry.envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get",
+                return_value=True,
+            ),
+            patch.dict(
+                "sys.modules",
+                {"sglang.srt.mem_cache.radix_cache_cpp": fake_module},
+            ),
         ):
             result = default_radix_cache_factory(ctx)
             fake_module.RadixCacheCpp.assert_called_once_with(
@@ -196,15 +199,18 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
         # Shim both factory imports — each transitively loads sgl_kernel.
         fake_components = MagicMock()
         fake_radix = MagicMock()
-        with patch(
-            "sglang.srt.mem_cache.registry.envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get",
-            return_value=True,
-        ), patch.dict(
-            "sys.modules",
-            {
-                "sglang.srt.mem_cache.unified_cache_components": fake_components,
-                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
-            },
+        with (
+            patch(
+                "sglang.srt.mem_cache.registry.envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get",
+                return_value=True,
+            ),
+            patch.dict(
+                "sys.modules",
+                {
+                    "sglang.srt.mem_cache.unified_cache_components": fake_components,
+                    "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
+                },
+            ),
         ):
             result = default_radix_cache_factory(ctx)
             fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)

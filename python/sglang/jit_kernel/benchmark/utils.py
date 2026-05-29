@@ -13,6 +13,14 @@ DEFAULT_DEVICE = "cuda"
 DEFAULT_QUANTILES = [0.5, 0.2, 0.8]
 
 
+def create_empty(*shape: int, dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE):
+    return torch.empty(shape, dtype=dtype, device=device)
+
+
+def create_random(*shape: int, dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE):
+    return torch.randn(shape, dtype=dtype, device=device)
+
+
 def get_benchmark_range(full_range: List, ci_range: List) -> List:
     """Return appropriate benchmark range based on CI environment."""
     return ci_range if is_in_ci() else full_range

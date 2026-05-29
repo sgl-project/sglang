@@ -195,7 +195,12 @@ export const KimiK25Deployment = () => {
 
     // Speculative decoding (EAGLE3)
     if (speculative === 'enabled') {
-      cmd += ' \\\n  --speculative-algorithm EAGLE3 \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4 \\\n  --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3';
+      cmd += ' \\\n  --speculative-algorithm EAGLE3 \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4 \\\n  --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3-mla';
+    }
+
+    // Blackwell (B300): tokenspeed MLA attention backend
+    if (hardware === 'b300') {
+      cmd += ' \\\n  --attention-backend tokenspeed_mla';
     }
 
     // AMD: FP8 KV cache for memory efficiency

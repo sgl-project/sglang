@@ -17,10 +17,10 @@ on:
           - 'cu129'
           - 'cu130'
       branch:
-        description: "DeepGEMM branch to build from (default: release-0426)"
+        description: "DeepGEMM branch to build from (default: dev)"
         type: string
         required: false
-        default: 'release-0426'
+        default: 'dev'
 
 concurrency:
   group: release-sgl-deepgemm-${{ github.ref }}

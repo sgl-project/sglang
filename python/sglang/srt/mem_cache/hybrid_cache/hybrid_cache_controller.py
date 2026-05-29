@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
 import time
+from queue import Queue
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
@@ -171,6 +174,7 @@ class HybridCacheController(BaseHiCacheController):
         enable_storage_metrics: bool = False,
     ):
         startup_storage_backend = storage_backend
+        self.extra_host_mem_release_queues: dict[PoolName, Queue] = {}
         super().__init__(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             mem_pool_host=mem_pool_host,
@@ -204,6 +208,10 @@ class HybridCacheController(BaseHiCacheController):
                 host_pools=getattr(mem_pool_host, "entries", None),
             )
 
+    def _start_storage_threads(self):
+        super()._start_storage_threads()
+        self._init_extra_host_mem_release_queues()
+
     def attach_storage_backend(
         self,
         storage_backend: str,
@@ -222,10 +230,133 @@ class HybridCacheController(BaseHiCacheController):
         for entry in host_pools or []:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
+    @staticmethod
+    def parse_storage_backend_extra_config(
+        storage_backend_extra_config: Optional[str],
+    ) -> tuple[dict, int, float, float, bool]:
+        extra_config = {}
+        if storage_backend_extra_config:
+            if storage_backend_extra_config.startswith("@"):
+                path = storage_backend_extra_config[1:]
+                ext = os.path.splitext(path)[1].lower()
+                with open(path, "rb" if ext == ".toml" else "r") as f:
+                    if ext == ".json":
+                        extra_config = json.load(f)
+                    elif ext == ".toml":
+                        import tomllib
+
+                        extra_config = tomllib.load(f)
+                    elif ext in (".yaml", ".yml"):
+                        import yaml
+
+                        extra_config = yaml.safe_load(f)
+                    else:
+                        raise ValueError(
+                            f"Unsupported config file {path} (config format: {ext})"
+                        )
+            else:
+                extra_config = json.loads(storage_backend_extra_config)
+
+        prefetch_threshold = extra_config.pop("prefetch_threshold", 256)
+        prefetch_timeout_base = extra_config.pop("prefetch_timeout_base", 1)
+        prefetch_timeout_per_ki_token = extra_config.pop(
+            "prefetch_timeout_per_ki_token", 0.25
+        )
+        hicache_storage_pass_prefix_keys = extra_config.pop(
+            "hicache_storage_pass_prefix_keys", False
+        )
+
+        if not isinstance(prefetch_threshold, int):
+            raise ValueError(
+                f"prefetch_threshold must be int, got {type(prefetch_threshold).__name__}"
+            )
+        if not isinstance(prefetch_timeout_base, (int, float)):
+            raise ValueError(
+                f"prefetch_timeout_base must be number, got {type(prefetch_timeout_base).__name__}"
+            )
+        if not isinstance(prefetch_timeout_per_ki_token, (int, float)):
+            raise ValueError(
+                "prefetch_timeout_per_ki_token must be number, got "
+                f"{type(prefetch_timeout_per_ki_token).__name__}"
+            )
+        if not isinstance(hicache_storage_pass_prefix_keys, bool):
+            raise ValueError(
+                "hicache_storage_pass_prefix_keys must be bool, got "
+                f"{type(hicache_storage_pass_prefix_keys).__name__}"
+            )
+
+        return (
+            extra_config,
+            prefetch_threshold,
+            float(prefetch_timeout_base),
+            float(prefetch_timeout_per_ki_token),
+            hicache_storage_pass_prefix_keys,
+        )
+
+    def clear_storage_backend(self) -> bool:
+        if not self.enable_storage:
+            logger.warning("Hierarchical cache storage backend is not enabled.")
+            return False
+        if not hasattr(self.storage_backend, "clear"):
+            logger.warning(
+                "Storage backend %s does not support clear operation.",
+                type(self.storage_backend).__name__,
+            )
+            return False
+        self.storage_backend.clear()
+        return True
+
+    def _init_extra_host_mem_release_queues(self) -> None:
+        self.extra_host_mem_release_queues = {}
+        entries = getattr(self.mem_pool_host, "entries", None) or []
+        anchor_entry = getattr(self.mem_pool_host, "anchor_entry", None)
+        for entry in entries:
+            if entry is anchor_entry or entry.is_primary_index_anchor:
+                continue
+            self.extra_host_mem_release_queues[entry.name] = Queue()
+
+    def _append_host_mem_release_pages(
+        self, release_queue: Queue, host_indices: torch.Tensor, page_size: int
+    ) -> None:
+        if host_indices.numel() == 0:
+            return
+        for page in host_indices.split(page_size):
+            release_queue.put(page)
+
+    def append_host_mem_release(
+        self,
+        host_indices: Optional[torch.Tensor] = None,
+        extra_pools: Optional[list[PoolTransfer]] = None,
+    ):
+        if host_indices is not None:
+            self._append_host_mem_release_pages(
+                self.host_mem_release_queue,
+                host_indices,
+                self.mem_pool_host.page_size,
+            )
+        for transfer in extra_pools or []:
+            if transfer.host_indices is None or transfer.host_indices.numel() == 0:
+                continue
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if (
+                entry is None
+                or entry.is_primary_index_anchor
+                or transfer.indices_from_pool is not None
+            ):
+                continue
+            release_queue = self.extra_host_mem_release_queues.get(transfer.name)
+            if release_queue is None:
+                continue
+            self._append_host_mem_release_pages(
+                release_queue, transfer.host_indices, entry.host_pool.page_size
+            )
+
     def reset(self):
         super().reset()
         if self.enable_storage:
             self.host_mem_release_queue.queue.clear()
+            for release_queue in self.extra_host_mem_release_queues.values():
+                release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
 
     def write(

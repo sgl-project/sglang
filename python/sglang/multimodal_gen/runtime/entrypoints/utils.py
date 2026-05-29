@@ -423,8 +423,6 @@ def prepare_request(
     if diffusers_kwargs and "max_sequence_length" in diffusers_kwargs:
         req.max_sequence_length = diffusers_kwargs["max_sequence_length"]
 
-    req.adjust_size(server_args)
-
     if not isinstance(req.prompt, str):
         raise TypeError(f"`prompt` must be a string, but got {type(req.prompt)}")
 

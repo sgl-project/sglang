@@ -22,7 +22,9 @@ class CountingDedupStage(PipelineStage):
     deduplicated_extra_tensor_tree_output_keys = ("mu",)
 
     def __init__(self):
-        self.server_args = SimpleNamespace(comfyui_mode=True)
+        self.server_args = SimpleNamespace(
+            comfyui_mode=True, enable_layerwise_nvtx_marker=False
+        )
         self.forward_calls = 0
 
     def build_dedup_fingerprint(self, batch: Req, server_args):
@@ -40,7 +42,9 @@ class CountingDedupStage(PipelineStage):
 
 class CountingLatentStage(LatentPreparationStage):
     def __init__(self):
-        self.server_args = SimpleNamespace(comfyui_mode=True)
+        self.server_args = SimpleNamespace(
+            comfyui_mode=True, enable_layerwise_nvtx_marker=False
+        )
         self.prepare_group_calls = 0
         self.forward_calls = 0
 

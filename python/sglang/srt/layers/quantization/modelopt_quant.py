@@ -62,6 +62,7 @@ from sglang.srt.utils.common import (
     is_cuda,
     is_sm120_supported,
     next_power_of_2,
+    round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.patch_torch import register_fake_if_exists
@@ -969,6 +970,43 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 activation_scale * w2_weight_scale, requires_grad=False
             )
             layer.fc1_input_dequant = Parameter(input_scale, requires_grad=False)
+
+            # flashinfer_cutlass kernel requires intermediate_size to be a
+            # multiple of 16.  Pad weight tensors with zeros after loading.
+            # For gated activations (swiglu), w13 is [Up, Gate] concatenated
+            # along dim 1 — we must split, pad each half separately, and
+            # re-concat so the kernel's half-split stays aligned.
+            num_shards = 2 if layer.moe_runner_config.is_gated else 1
+            isp = layer.w13_weight.shape[1] // num_shards
+            if isp % 16 != 0:
+                pad_amount = round_up(isp, 16) - isp
+                w13_data = layer.w13_weight.data
+                if num_shards == 2:
+                    up_weight = w13_data[:, :isp, :]
+                    gate_weight = w13_data[:, isp:, :]
+                    layer.w13_weight = Parameter(
+                        torch.cat(
+                            [
+                                torch.nn.functional.pad(
+                                    up_weight, (0, 0, 0, pad_amount)
+                                ),
+                                torch.nn.functional.pad(
+                                    gate_weight, (0, 0, 0, pad_amount)
+                                ),
+                            ],
+                            dim=1,
+                        ),
+                        requires_grad=False,
+                    )
+                else:
+                    layer.w13_weight = Parameter(
+                        torch.nn.functional.pad(w13_data, (0, 0, 0, pad_amount)),
+                        requires_grad=False,
+                    )
+                layer.w2_weight = Parameter(
+                    torch.nn.functional.pad(layer.w2_weight.data, (0, pad_amount)),
+                    requires_grad=False,
+                )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

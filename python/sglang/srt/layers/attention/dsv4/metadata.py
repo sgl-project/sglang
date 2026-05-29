@@ -103,7 +103,10 @@ class PagedIndexerMetadata:
     topk_metadata: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self):
-        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+        if (
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+        ):
             self.deep_gemm_metadata = None
         else:
             import deep_gemm
@@ -148,14 +151,17 @@ class PagedIndexerMetadata:
     def copy_(self, other: "PagedIndexerMetadata"):
         if is_hip():
             copy_fields = ["page_table", "c4_seq_lens"]
+            assign_fields = ["deep_gemm_metadata"]
         else:
             copy_fields = ["page_table", "c4_seq_lens", "deep_gemm_metadata"]
+            assign_fields = []
         copy_fields += ["topk_metadata"]
         copy_metadata(
             src=other,
             dst=self,
             check_eq_fields=["page_size"],
             copy_fields=copy_fields,
+            assign_fields=assign_fields,
         )
 
 

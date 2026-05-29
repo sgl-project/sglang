@@ -118,9 +118,10 @@ class ForwardBatchDeepSeekMHAMixin:
             MLATokenToKVPool,
         )
 
-        assert isinstance(get_token_to_kv_pool(), MLATokenToKVPool) or (
-            isinstance(get_token_to_kv_pool(), HybridLinearKVPool)
-            and isinstance(get_token_to_kv_pool().full_kv_pool, MLATokenToKVPool)
+        token_to_kv_pool = get_token_to_kv_pool()
+        assert isinstance(token_to_kv_pool, MLATokenToKVPool) or (
+            isinstance(token_to_kv_pool, HybridLinearKVPool)
+            and isinstance(token_to_kv_pool.full_kv_pool, MLATokenToKVPool)
         ), "Currently chunked prefix cache can only be used by Deepseek models"
 
         if not any(self.extend_prefix_lens_cpu):

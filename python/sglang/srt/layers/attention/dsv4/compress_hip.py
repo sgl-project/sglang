@@ -12,9 +12,14 @@ import triton.language as tl
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
 from sglang.srt.layers.attention.dsv4.compressor import Compressor as _CompressorBase
+from sglang.srt.layers.attention.dsv4.fused_compress_triton import (
+    fused_ape_pool_norm_rope,
+)
+from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 from sglang.srt.layers.deepseek_v4_rope import (
     apply_rotary_emb_triton,
     fused_norm_rope_inplace_triton,
+    fused_softmax_pool_triton,
 )
 
 try:
@@ -371,10 +376,6 @@ class CompressorHip(_CompressorBase):
             comp_positions = (seq_lens - 1) // self.ratio * self.ratio
             freqs_real_table = self._get_freqs_cis_real()
             freqs_batch = freqs_real_table[comp_positions]
-
-            from sglang.srt.layers.attention.dsv4.fused_compress_kernel import (
-                fused_ape_pool_norm_rope,
-            )
 
             kv_compressed = fused_ape_pool_norm_rope(
                 kv_score_gathered=gathered,

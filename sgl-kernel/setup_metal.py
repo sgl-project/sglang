@@ -95,10 +95,10 @@ metallib_name = "sgl_metal_kernels.metallib"
 # Metal shader sources (compiled with `xcrun metal`) and C++ host sources
 # (compiled with `c++`). Add new kernels by appending to these lists.
 metal_shader_sources = [
-    "csrc/metal/placeholder.metal",
+    "csrc/metal/rope_pool_fused.metal",
 ]
 cxx_sources = [
-    "csrc/metal/placeholder.cpp",
+    "csrc/metal/rope_pool_fused.cpp",
 ]
 
 # Header search paths shared by both the Metal shader compiler and the C++

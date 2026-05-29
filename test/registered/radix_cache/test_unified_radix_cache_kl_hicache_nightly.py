@@ -28,8 +28,8 @@ GLM5_LAUNCH_TIMEOUT = 3600
 register_cuda_ci(est_time=900, suite="nightly-8-gpu-h200", nightly=True)
 
 
-class GSM8KTwoPassMixin:
-    """Mixin: run GSM8K twice with flush in between, verify accuracy diff.
+class AccuracyTwoPassMixin:
+    """Mixin: run an eval twice with flush in between, verify accuracy diff.
 
     Subclass must provide:
       - self.base_url
@@ -38,8 +38,13 @@ class GSM8KTwoPassMixin:
 
     gsm8k_threshold: float = 0.90
     num_gsm8k_questions: int = 200
-    max_accuracy_diff: float = 0.02
     gsm8k_parallel: int = 40
+
+    mmlu_threshold: float = 0.75
+    num_mmlu_examples: int = 200
+    mmlu_num_threads: int = 32
+
+    max_accuracy_diff: float = 0.02
 
     def _run_gsm8k(self):
         from sglang.test.few_shot_gsm8k import run_eval as run_few_shot_gsm8k
@@ -57,6 +62,19 @@ class GSM8KTwoPassMixin:
         metrics = run_few_shot_gsm8k(args)
         return metrics["accuracy"]
 
+    def _run_mmlu(self):
+        from sglang.test.run_eval import run_eval as run_simple_eval
+
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mmlu",
+            num_examples=self.num_mmlu_examples,
+            num_threads=self.mmlu_num_threads,
+        )
+        metrics = run_simple_eval(args)
+        return metrics["score"]
+
     def _flush_cache(self):
         response = requests.post(
             self.base_url + "/flush_cache",
@@ -65,45 +83,52 @@ class GSM8KTwoPassMixin:
         )
         response.raise_for_status()
 
-    def test_gsm8k_two_passes(self):
-        """Run GSM8K twice with flush in between, verify accuracy diff <= max_accuracy_diff."""
+    def _two_pass(self, name: str, run_fn, threshold: float):
         # First pass
-        acc1 = self._run_gsm8k()
-        print(f"[{self.__class__.__name__}] GSM8K pass 1 accuracy: {acc1:.3f}")
+        acc1 = run_fn()
+        print(f"[{self.__class__.__name__}] {name} pass 1 accuracy: {acc1:.3f}")
         self.assertGreaterEqual(
             acc1,
-            self.gsm8k_threshold,
-            f"Pass 1 accuracy {acc1:.3f} < threshold {self.gsm8k_threshold}",
+            threshold,
+            f"{name} pass 1 accuracy {acc1:.3f} < threshold {threshold}",
         )
 
         # Flush cache
         self._flush_cache()
 
         # Second pass
-        acc2 = self._run_gsm8k()
-        print(f"[{self.__class__.__name__}] GSM8K pass 2 accuracy: {acc2:.3f}")
+        acc2 = run_fn()
+        print(f"[{self.__class__.__name__}] {name} pass 2 accuracy: {acc2:.3f}")
         self.assertGreaterEqual(
             acc2,
-            self.gsm8k_threshold,
-            f"Pass 2 accuracy {acc2:.3f} < threshold {self.gsm8k_threshold}",
+            threshold,
+            f"{name} pass 2 accuracy {acc2:.3f} < threshold {threshold}",
         )
 
-        # Verify diff
+        # Verify diff (only fail when 2nd pass regressed)
         if acc1 > acc2:
             diff = abs(acc1 - acc2)
             print(
-                f"[{self.__class__.__name__}] Accuracy diff: {diff:.3f} "
+                f"[{self.__class__.__name__}] {name} accuracy diff: {diff:.3f} "
                 f"(max allowed: {self.max_accuracy_diff})"
             )
             self.assertLessEqual(
                 diff,
                 self.max_accuracy_diff,
-                f"Accuracy diff {diff:.3f} exceeds max {self.max_accuracy_diff} "
+                f"{name} accuracy diff {diff:.3f} exceeds max {self.max_accuracy_diff} "
                 f"(pass1={acc1:.3f}, pass2={acc2:.3f})",
             )
 
+    def test_gsm8k_two_passes(self):
+        """Run GSM8K twice with flush in between, verify accuracy diff <= max_accuracy_diff."""
+        self._two_pass("GSM8K", self._run_gsm8k, self.gsm8k_threshold)
 
-class TestGLM5HiCacheL3GSM8K(GSM8KTwoPassMixin, CustomTestCase):
+    def test_mmlu_two_passes(self):
+        """Run MMLU twice with flush in between, verify accuracy diff <= max_accuracy_diff."""
+        self._two_pass("MMLU", self._run_mmlu, self.mmlu_threshold)
+
+
+class TestGLM5HiCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
     """GLM-5.1-FP8 + HiCache L3 (file backend), with HiRadixTree."""
 
     @classmethod

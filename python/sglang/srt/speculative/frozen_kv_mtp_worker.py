@@ -70,11 +70,14 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     fast_topk,
     generate_token_bitmask,
-    maybe_detect_nan,
-    maybe_detect_oob,
     select_top_k_tokens,
 )
 from sglang.srt.utils import empty_context
+from sglang.srt.utils.async_probe import (
+    maybe_detect_inf,
+    maybe_detect_nan,
+    maybe_detect_oob,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -398,13 +401,15 @@ class FrozenKVMTPWorker(TpModelWorker):
                 forward_batch.mm_input_embeds = mm_input_embeds
             self._set_positions(forward_batch)
             self._init_frozen_kv_metadata(forward_batch)
-            with self._target_kv_pool_view(forward_batch), forward_context(
-                ForwardContext(attn_backend=self.draft_attn_backend)
+            with (
+                self._target_kv_pool_view(forward_batch),
+                forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
             ):
                 logits_output = self.draft_model_runner.forward(
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, "frozen_kv_mtp_seed")
+            maybe_detect_inf(logits_output.next_token_logits, "frozen_kv_mtp_seed")
             self._capture_for_decode(logits_output, draft_input)
         finally:
             batch.forward_mode = forward_mode_backup
@@ -682,14 +687,18 @@ class FrozenKVMTPWorker(TpModelWorker):
             forward_batch.spec_info.hidden_states = hidden_states
             self._set_positions(forward_batch)
 
-            with self._target_kv_pool_view(forward_batch), forward_context(
-                ForwardContext(attn_backend=self.draft_attn_backend)
+            with (
+                self._target_kv_pool_view(forward_batch),
+                forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
             ):
                 logits_output = self.draft_model_runner.forward(
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output
 
             maybe_detect_nan(
+                logits_output.next_token_logits, f"frozen_kv_mtp_draft step {i}"
+            )
+            maybe_detect_inf(
                 logits_output.next_token_logits, f"frozen_kv_mtp_draft step {i}"
             )
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -750,6 +759,7 @@ class FrozenKVMTPWorker(TpModelWorker):
                 batch.sampling_info.vocab_mask = None
 
         maybe_detect_nan(logits_output.next_token_logits, "frozen_kv_mtp_verify")
+        maybe_detect_inf(logits_output.next_token_logits, "frozen_kv_mtp_verify")
 
         spec_info.hidden_states = logits_output.hidden_states
         res: FrozenKVMTPVerifyOutput = spec_info.verify(

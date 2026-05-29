@@ -429,7 +429,7 @@ class TextEncodingStage(PipelineStage):
         # TODO: Keep this begin-only interval until manager supports explicit
         # declared-use interval grouping. Wrapping each encoder call separately
         # can offload between positive and negative prompt encoding.
-        manager.before_use(use)
+        manager.begin_use(use, module=self.text_encoders[encoder_index])
 
     def _forward_text_encoder(self, text_encoder, encoder_forward_kwargs):
         if not getattr(text_encoder, "uses_sglang_forward_context", True):

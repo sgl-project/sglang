@@ -29,40 +29,6 @@ class InputLogprobsResult:
     input_token_ids_logprobs_idx: Optional[List] = None
 
 
-def compute_temp_top_p_normalized_logprobs(
-    last_logits: torch.Tensor,
-    logits_metadata: LogitsMetadata,
-    top_p: Optional[torch.Tensor] = None,
-    temperature: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """
-    compute logprobs for the output token from the given logits.
-
-    Returns:
-        torch.Tensor: logprobs from logits
-    """
-    if top_p is None:
-        top_p = logits_metadata.top_p
-    if temperature is None:
-        temperature = logits_metadata.temperature
-
-    # Scale logits if temperature scaling is enabled
-    if logits_metadata.temp_scaled_logprobs:
-        last_logits = last_logits / temperature
-
-    # Normalize logprobs if top_p normalization is enabled
-    # NOTE: only normalize logprobs when top_p is set and not equal to 1.0
-    if logits_metadata.top_p_normalized_logprobs and (top_p != 1.0).any():
-        from sglang.srt.layers.sampler import top_p_normalize_probs_torch
-
-        probs = torch.softmax(last_logits, dim=-1)
-        del last_logits
-        probs = top_p_normalize_probs_torch(probs, top_p)
-        return torch.log(probs)
-    else:
-        return torch.nn.functional.log_softmax(last_logits, dim=-1)
-
-
 def get_top_logprobs_raw(
     logprobs: torch.Tensor,
     top_logprobs_nums: List[int],

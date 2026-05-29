@@ -24,6 +24,10 @@ from mlx.utils import tree_flatten
 from mlx_lm import load as mlx_lm_load
 from mlx_lm.utils import quantize_model as mlx_lm_quantize_model
 
+from sglang.srt.hardware_backend.mlx.aot import (
+    MLX_AOT_KERNEL_REGISTRY,
+    MlxAOTKernelSet,
+)
 from sglang.srt.hardware_backend.mlx.kv_cache import (
     BatchedDecodeContext,
     ContiguousKVCache,
@@ -148,6 +152,7 @@ class MlxModelRunner:
         self._req_synced_offset: dict[str, int] = {}
 
         self._pool_size = self._compute_pool_size(pool_size)
+        self._aot_kernels = self._build_aot_kernels()
 
     @staticmethod
     def _extract_logits(model_output):
@@ -313,6 +318,19 @@ class MlxModelRunner:
     def pool_size(self) -> int:
         return self._pool_size
 
+    def _build_aot_kernels(self) -> MlxAOTKernelSet:
+        """Build model-level set of optional registered AOT kernels."""
+        layer_list, attn_attr = find_attention_layers(self.model)
+        if not layer_list:
+            return MlxAOTKernelSet()
+        sample_attn = getattr(layer_list[0], attn_attr)
+        n_kv_heads, head_dim, _ = self._get_attn_config()
+        return MLX_AOT_KERNEL_REGISTRY.build_kernel_set(
+            sample_attn=sample_attn,
+            n_kv_heads=int(n_kv_heads),
+            head_dim=int(head_dim),
+        )
+
     def init_kv_pool(self, req_to_token_pool: ReqToTokenPool) -> None:
         """Create MlxKVPool (+1 for padding slot 0) and wire scheduler pools."""
         self._req_to_token_pool = req_to_token_pool
@@ -378,7 +396,7 @@ class MlxModelRunner:
         end = cache_start + len(slot_ids)
         slot_ids_mx = mx.array(slot_ids, dtype=mx.int32)
         # TODO: Standardize ContiguousKVCache size to avoid transpose
-        # Transpose cache (1, n_kv_heads, S, head_dim) → pool (S, n_kv_heads, head_dim)
+        # Transpose cache (1, n_kv_heads, S, head_dim) to pool (S, n_kv_heads, head_dim)
         k_all = mx.stack(
             [
                 cache[i].keys[0, :, cache_start:end, :].transpose(1, 0, 2)
@@ -488,7 +506,7 @@ class MlxModelRunner:
         if new_token_count > 0:
             extend_tokens = new_token_ids
         else:
-            # Full cache hit — rerun last token to get next-token logits
+            # Full cache hit - rerun last token to get next-token logits
             extend_tokens = full_token_ids[-1:]
             for c in cache:
                 c.offset = max(c.offset - 1, 0)
@@ -500,7 +518,7 @@ class MlxModelRunner:
         last_logits = logits[:, -1, :]
         lazy_token = mx.argmax(last_logits, axis=-1)
 
-        # Convert PoolBackedCache → ContiguousKVCache for decode.
+        # Convert PoolBackedCache to ContiguousKVCache for decode.
         # This appends a lazy slice-assign onto the forward graph; the
         # arrays get materialised when the caller evaluates lazy_token.
         if prefix_len > 0:
@@ -610,16 +628,16 @@ class MlxModelRunner:
                 caches=caches,
             )
 
-        seq_lens = [caches[i][0].offset for i in range(batch_size)]
-        layer_caches = [
-            [caches[i][layer_idx] for i in range(batch_size)]
-            for layer_idx in range(num_layers)
-        ]
-        ctx = BatchedDecodeContext(
-            batch_size=batch_size,
-            seq_lens=seq_lens,
-            layer_caches=layer_caches,
+        ctx = BatchedDecodeContext.from_decode(
+            caches=caches,
+            num_layers=num_layers,
+            req_ids=req_ids,
+            aot_kernels=self._aot_kernels,
+            kv_pool=self._kv_pool,
+            req_pool_idx=self._req_pool_idx,
+            req_to_token_pool=self._req_to_token_pool,
         )
+        seq_lens = ctx.seq_lens
         set_context(ctx)
         try:
             max_offset = max(seq_lens)
@@ -668,7 +686,7 @@ class MlxModelRunner:
         # to accommodate dynamic growing like ContiguousKVCache.update_and_fetch.
 
         # After prev's graph ran, each ContiguousKVCache.offset was
-        # bumped by one per layer — attention wrapper's `write_token`
+        # bumped by one per layer - attention wrapper's `write_token`
         # mutates the Python offset synchronously at graph-build time.
         # So layer-0 offsets reflect the position the NEW token will
         # be written at in step N+1 (and equivalently the RoPE offset).
@@ -686,15 +704,16 @@ class MlxModelRunner:
                 caches=caches,
             )
 
-        layer_caches = [
-            [caches[i][layer_idx] for i in range(batch_size)]
-            for layer_idx in range(num_layers)
-        ]
-        ctx = BatchedDecodeContext(
-            batch_size=batch_size,
-            seq_lens=seq_lens,
-            layer_caches=layer_caches,
+        ctx = BatchedDecodeContext.from_decode(
+            caches=caches,
+            num_layers=num_layers,
+            req_ids=prev.req_ids,
+            aot_kernels=self._aot_kernels,
+            kv_pool=self._kv_pool,
+            req_pool_idx=self._req_pool_idx,
+            req_to_token_pool=self._req_to_token_pool,
         )
+        seq_lens = ctx.seq_lens
         set_context(ctx)
         try:
             max_offset = max(seq_lens)

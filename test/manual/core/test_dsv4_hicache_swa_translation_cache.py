@@ -23,7 +23,6 @@ Test strategy:
 
 import unittest
 
-from test_unified_radix_cache_kl import UnifiedRadixTreeTestMixin
 from test_unified_radix_cache_kl_hicache import (
     DSV4_FLASH_LAUNCH_TIMEOUT,
     DSV4_FLASH_MODEL,
@@ -31,6 +30,7 @@ from test_unified_radix_cache_kl_hicache import (
 )
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
 from sglang.test.kl_multiturn_utils import get_input_ids
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,

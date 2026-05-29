@@ -419,6 +419,7 @@ class RotaryEmbedding(MultiPlatformOp):
         ), "fused_set_kv_buffer_arg is not supported for xpu implementation"
         positions = torch.add(positions, offsets) if offsets is not None else positions
 
+        self._match_cos_sin_cache_dtype(query)
         return torch.ops.sgl_kernel.rotary_embedding(
             positions,
             query,

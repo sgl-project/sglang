@@ -14,6 +14,7 @@ from transformers import BatchFeature, ProcessorMixin, TensorType
 from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.step3_vl import Step3VLForConditionalGeneration
 from sglang.srt.models.step3_vl_10b import StepVLForConditionalGeneration
+from sglang.srt.models.step3p7 import Step3p7ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -520,7 +521,11 @@ class Step3VLProcessor:
 
 
 class Step3VLImageProcessor(SGLangBaseProcessor):
-    models = [Step3VLForConditionalGeneration, StepVLForConditionalGeneration]
+    models = [
+        Step3VLForConditionalGeneration,
+        StepVLForConditionalGeneration,
+        Step3p7ForConditionalGeneration,
+    ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         # TODO, check _processor is tokenizer or processor.

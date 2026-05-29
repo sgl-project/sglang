@@ -915,7 +915,7 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
       float k_scale = use_qk_l2norm_in_kernel ? qk_scale_buf[k_scale_offset] : 1.0f;
       int64_t v_offset = si * v_strideS + bi * v_strideB + ni * v_strideH;
       int64_t o_offset = ((bi * seq_len + si) * v_num_heads + ni) * v_head_dim;
-      float beta_val = 1 / (1 + std::exp(-b_ptr[ni]));
+      float beta_val = 1 / (1 + std::exp(-b_ptr[bi * v_num_heads + ni]));
       fVec beta_vec = fVec(beta_val);
       int64_t dvi = 0;
       for (; dvi <= v_head_dim - VecSize; dvi += VecSize) {

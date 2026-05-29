@@ -450,24 +450,6 @@ def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
     return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
 
 
-def get_mhc_pre_token_count_representatives(
-    max_num_tokens: int, hc_hidden_size: int
-) -> Tuple[int, ...]:
-    """Return one token-count representative for each MHC pre split bucket."""
-    if max_num_tokens <= 0:
-        return tuple()
-
-    representatives_by_split: dict[int, int] = {}
-    for num_tokens in range(1, max_num_tokens + 1):
-        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
-        representatives_by_split[n_splits] = num_tokens
-
-    return tuple(
-        representatives_by_split[n_splits]
-        for n_splits in sorted(representatives_by_split)
-    )
-
-
 @tilelang.jit(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
@@ -690,8 +672,6 @@ def mhc_pre(
     )
 
     if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
-        import deep_gemm
-
         n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
         gemm_out_mul = torch.empty(
@@ -701,12 +681,14 @@ def mhc_pre(
             n_splits, num_tokens, dtype=torch.float32, device=residual.device
         )
 
-        deep_gemm.tf32_hc_prenorm_gemm(
+        from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
+
+        tf32_hc_prenorm_gemm(
             residual_flat.view(num_tokens, hc_hidden_size),
             fn_flat,
             gemm_out_mul,
             gemm_out_sqrsum,
-            num_splits=n_splits,
+            n_splits,
         )
         gemm_last_dim = hc_mult3
         big_fuse_n_splits = n_splits

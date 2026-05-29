@@ -12,13 +12,29 @@ import os
 import random
 import subprocess
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
 # Labels to skip when grouping runners (GitHub default labels)
 DEFAULT_LABELS_TO_IGNORE = {"self-hosted", "Linux", "X64", "ARM64"}
 GITHUB_HOSTED_LABELS = {"ubuntu-latest", "ubuntu-22.04", "ubuntu-24.04"}
+
+# Human-facing job outcome buckets, in display order, with emoji.
+STATUS_ORDER = ("pass", "fail", "cancel", "running", "queued")
+STATUS_EMOJI = {
+    "pass": "✅",
+    "fail": "❌",
+    "cancel": "🚫",
+    "running": "🔄",
+    "queued": "⏳",
+}
+
+
+def format_status_counts(counts: dict) -> str:
+    """Compact per-label outcome summary, e.g. '✅120 ❌3 🔄2 ⏳4'."""
+    parts = [f"{STATUS_EMOJI[s]}{counts[s]}" for s in STATUS_ORDER if counts.get(s)]
+    return " ".join(parts) if parts else "—"
 
 
 def run_gh_command(args: list[str], max_retries: int = 10) -> dict:
@@ -157,6 +173,85 @@ def parse_time(time_str: str) -> datetime:
     return datetime.fromisoformat(time_str.replace("Z", "+00:00"))
 
 
+def classify_job(job: dict, now: datetime):
+    """Derive the queue-wait and busy interval for a single job.
+
+    Returns a job_info dict, or None when the job neither waited for nor
+    occupied a runner (skipped / cancelled-before-start / missing data).
+
+    The queue wait runs from when the job entered the runner queue
+    (`created_at`) until a runner picked it up (`started_at`) — or until
+    `now` if it is still waiting.
+
+    GitHub API gotcha this exists to handle: a still-queued job reports
+    status="queued", runner_name="" and `started_at` set to a PLACEHOLDER
+    equal to `created_at` (not null). The previous code required both a
+    runner_name and a `completed_at`, so every in-flight wait — the
+    multi-hour 8-gpu jobs still sitting in the queue, i.e. the worst cases —
+    was dropped, undercounting max/avg queue time. We therefore measure a
+    queued job's wait against `now` rather than its bogus `started_at`, and
+    don't require completion.
+    """
+    status = job.get("status")
+    runner_name = job.get("runner_name") or ""
+    created_at = parse_time(job.get("created_at"))
+    started_at = parse_time(job.get("started_at"))
+    completed_at = parse_time(job.get("completed_at"))
+
+    if status == "queued":
+        # Still waiting for a runner; ignore the placeholder started_at.
+        queue_end, start, end = now, None, None
+    elif status == "in_progress" and started_at is not None:
+        # Running now: the wait is final and it still occupies the runner.
+        queue_end, start, end = started_at, started_at, now
+    elif (
+        status == "completed"
+        and started_at is not None
+        and completed_at is not None
+        and runner_name
+    ):
+        queue_end, start, end = started_at, started_at, completed_at
+    else:
+        # Skipped, cancelled before start, or missing timestamps: never
+        # waited for or occupied a runner.
+        return None
+
+    if created_at is None:
+        return None
+
+    queue_time = max(0.0, (queue_end - created_at).total_seconds())
+    duration = (end - start).total_seconds() if start is not None else 0.0
+    labels = [
+        label
+        for label in job.get("labels", [])
+        if label not in DEFAULT_LABELS_TO_IGNORE | GITHUB_HOSTED_LABELS
+    ]
+
+    # Human-facing outcome bucket used by the report's status breakdown.
+    if status == "queued":
+        outcome = "queued"
+    elif status == "in_progress":
+        outcome = "running"
+    else:  # completed and actually ran
+        outcome = {"success": "pass", "cancelled": "cancel"}.get(
+            job.get("conclusion"), "fail"
+        )
+
+    return {
+        "start": start,
+        "end": end,
+        "created_at": created_at,
+        "queue_end": queue_end,
+        "duration": duration,
+        "queue_time": queue_time,
+        "job_name": job.get("name", ""),
+        "runner_name": runner_name,
+        "labels": labels,
+        "status": outcome,
+        "html_url": job.get("html_url", ""),
+    }
+
+
 def calculate_concurrency_metrics(
     jobs: list,
     window_start: datetime,
@@ -184,6 +279,9 @@ def calculate_concurrency_metrics(
     running_events = []
     for job in jobs:
         start, end = job["start"], job["end"]
+        # Still-queued jobs have no running interval yet (start/end are None).
+        if start is None or end is None:
+            continue
         if end < window_start or start > window_end:
             continue
         running_events.append((max(start, window_start), 1))
@@ -191,12 +289,15 @@ def calculate_concurrency_metrics(
     queue_events = []
     for job in jobs:
         created_at = job.get("created_at")
-        started_at = job["start"]
-        if created_at and created_at < started_at:
-            if started_at < window_start or created_at > window_end:
+        # The wait ends when a runner picks the job up, or `now` if it is
+        # still queued (queue_end was set to now upstream). Counting the
+        # still-open waits is what makes peak_queue reflect the real backlog.
+        queue_end = job.get("queue_end") or job["start"]
+        if created_at and queue_end and created_at < queue_end:
+            if queue_end < window_start or created_at > window_end:
                 continue
             queue_events.append((max(created_at, window_start), 1))
-            queue_events.append((min(started_at, window_end), -1))
+            queue_events.append((min(queue_end, window_end), -1))
     running_events.sort(key=lambda e: (e[0], e[1] == 1))
     current_running = 0
     peak_running = 0
@@ -357,46 +458,38 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
             print(f"  run {rid}: {err}")
     fetch_failure_pct = len(failed_runs) / total_runs * 100 if total_runs > 0 else 0
 
+    # `now` anchors the wait of jobs that are still queued or running. It is
+    # captured once so every in-flight job is measured against a single
+    # reference (matches window_end below to within processing time).
+    now = datetime.now(timezone.utc)
+    all_job_infos = []  # one entry per job (deduped across labels) for detail views
     for job in all_jobs:
-        runner_name = job.get("runner_name")
-        if not runner_name:
+        job_info = classify_job(job, now)
+        if job_info is None:
             continue
+        all_job_infos.append(job_info)
+        runner_name = job_info["runner_name"]
 
-        created_at = parse_time(job.get("created_at"))
-        started_at = parse_time(job.get("started_at"))
-        completed_at = parse_time(job.get("completed_at"))
+        # Per-host busy time only applies to jobs that actually occupied a
+        # runner (ran or still running); a still-queued job has no host yet.
+        if job_info["start"] is not None and runner_name:
+            host_jobs[runner_name].append(job_info)
 
-        if not started_at or not completed_at:
-            continue
-
-        duration = (completed_at - started_at).total_seconds()
-        queue_time = (started_at - created_at).total_seconds() if created_at else 0
-        job_info = {
-            "start": started_at,
-            "end": completed_at,
-            "created_at": created_at,
-            "duration": duration,
-            "queue_time": queue_time,
-            "job_name": job["name"],
-            "runner_name": runner_name,
-        }
-
-        # Per-host: every job on this physical machine, regardless of label.
-        host_jobs[runner_name].append(job_info)
-
-        # Use job labels directly (available in job data)
-        job_labels = job.get("labels", [])
-        for label in job_labels:
-            # Skip generic labels
-            if label in DEFAULT_LABELS_TO_IGNORE | GITHUB_HOSTED_LABELS:
-                continue
-            job_label_runners[label].add(runner_name)
+        for label in job_info["labels"]:
+            if runner_name:
+                job_label_runners[label].add(runner_name)
+                host_labels[runner_name].add(label)
             label_jobs[label].append(job_info)
-            host_labels[runner_name].add(label)
 
     # Merge API runners and job-observed runners
     # Prefer API count (online runners) when available
-    all_labels = set(api_label_runners.keys()) | set(job_label_runners.keys())
+    # Include labels seen only on still-queued jobs (no online runner, no
+    # completed job under them yet) so a fully-backed-up pool still reports.
+    all_labels = (
+        set(api_label_runners.keys())
+        | set(job_label_runners.keys())
+        | set(label_jobs.keys())
+    )
 
     # Filter labels if specified
     if runner_filter:
@@ -452,6 +545,8 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
         queue_times = [j["queue_time"] for j in jobs if j["queue_time"] > 0]
         avg_queue = sum(queue_times) / len(queue_times) if queue_times else 0
         max_queue = max(queue_times) if queue_times else 0
+        # Outcome breakdown for this label (pass/fail/cancel/running/queued).
+        status_counts = dict(Counter(j["status"] for j in jobs))
 
         # Concurrency / saturation / queue-depth metrics. Use observed
         # peak as effective capacity if it's lower than the API count
@@ -484,14 +579,22 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
                 "saturation_hours": conc["saturation_seconds"] / 3600,
                 "saturation_pct": conc["saturation_pct"],
                 "peak_queue": conc["peak_queue"],
+                "status_counts": status_counts,
             }
         )
 
-    return results, fetch_failure_pct
+    # Per-job detail (deduped across labels), longest waits first, for the
+    # links + status section of the report.
+    longest_waits = sorted(all_job_infos, key=lambda j: j["queue_time"], reverse=True)
+    return results, fetch_failure_pct, longest_waits
 
 
 def format_report(
-    results: list[dict], hours: int, fetch_failure_pct: float = 0.0
+    results: list[dict],
+    hours: int,
+    fetch_failure_pct: float = 0.0,
+    longest_waits: list = None,
+    top_n: int = 20,
 ) -> str:
     """One compact summary table — original schema, fixed columns.
 
@@ -520,8 +623,8 @@ def format_report(
         lines.append("")
     lines.extend(
         [
-            "| Label | Runners | Jobs | Active (hrs) | Utilization | Avg Queue | Max Queue |",
-            "|-------|---------|------|--------------|-------------|-----------|-----------|",
+            "| Label | Runners | Jobs | Active (hrs) | Utilization | Avg Queue | Max Queue | Status |",
+            "|-------|---------|------|--------------|-------------|-----------|-----------|--------|",
         ]
     )
     for r in results:
@@ -532,8 +635,35 @@ def format_report(
             f"| {r['label']} | {r['num_runners']} | {r['num_jobs']} | "
             f"{r['total_active_hours']:.1f} | "
             f"{r['utilization_pct']:.1f}% {bar} | "
-            f"{r['avg_queue_min']:.1f}m | {r['max_queue_min']:.1f}m |"
+            f"{r['avg_queue_min']:.1f}m | {r['max_queue_min']:.1f}m | "
+            f"{format_status_counts(r.get('status_counts', {}))} |"
         )
+
+    # Longest queue waits — links to the actual jobs, with live status, so the
+    # worst waits (including jobs still queued/running right now) are one click
+    # away. This is the detail behind the Max Queue column.
+    waits = [j for j in (longest_waits or []) if j.get("queue_time", 0) > 0][:top_n]
+    if waits:
+        lines.extend(
+            [
+                "",
+                f"## Longest Queue Waits (top {len(waits)})",
+                "",
+                "| Wait | Status | Label | Job |",
+                "|------|--------|-------|-----|",
+            ]
+        )
+        for j in waits:
+            status = j.get("status", "")
+            emoji = STATUS_EMOJI.get(status, "")
+            label = ", ".join(j.get("labels", [])) or "—"
+            name = j.get("job_name", "job")
+            url = j.get("html_url", "")
+            job_cell = f"[{name}]({url})" if url else name
+            lines.append(
+                f"| {j['queue_time'] / 60:.0f}m | {emoji} {status} | "
+                f"{label} | {job_cell} |"
+            )
 
     # Concurrency Analysis section
     lines.extend(
@@ -608,10 +738,12 @@ def main():
     parser.add_argument("--output", type=str, help="Output file (default: stdout)")
     args = parser.parse_args()
 
-    results, fetch_failure_pct = calculate_utilization(
+    results, fetch_failure_pct, longest_waits = calculate_utilization(
         args.repo, args.hours, args.filter
     )
-    report = format_report(results, args.hours, fetch_failure_pct)
+    report = format_report(
+        results, args.hours, fetch_failure_pct, longest_waits=longest_waits
+    )
 
     if args.output:
         with open(args.output, "w") as f:

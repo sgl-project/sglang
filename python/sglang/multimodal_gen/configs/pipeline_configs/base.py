@@ -438,6 +438,10 @@ class PipelineConfig:
     def maybe_prepare_latent_ids(self, latents):
         return None
 
+    # called before vae encode
+    def preprocess_vae_encode(self, image, vae):
+        return image
+
     # called after vae encode
     def postprocess_vae_encode(self, image_latents, vae):
         return image_latents

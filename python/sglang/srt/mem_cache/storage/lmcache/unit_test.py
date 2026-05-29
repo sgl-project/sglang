@@ -9,14 +9,9 @@ except ImportError:
         "LMCache is not installed. Please install it by running `pip install lmcache` in the root directory of LMCache"
     )
 
-import os
-
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
-
-os.environ["LMCACHE_USE_EXPERIMENTAL"] = "True"
-os.environ["LMCACHE_CONFIG_FILE"] = "example_config.yaml"
 
 
 def test_load_store_metadata():
@@ -40,7 +35,9 @@ def test_load_store_metadata():
         for _ in range(layer_num)
     ]
 
-    connector = LMCacheLayerwiseConnector(model_config, 1, 0, k_buffer, v_buffer)
+    connector = LMCacheLayerwiseConnector(
+        model_config, 1, 0, k_buffer, v_buffer, config_file="example_config_ip.yaml"
+    )
 
     fake_token_ids = torch.randint(0, model_config.vocab_size, (input_id_len,)).tolist()
     fake_kv_indices = torch.randint(0, buffer_size, (input_id_len,))

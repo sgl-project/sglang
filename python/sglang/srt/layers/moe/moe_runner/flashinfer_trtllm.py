@@ -900,6 +900,18 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         runner_config.activation, is_gated=runner_config.is_gated
     )
 
+    # Build per-expert clamp-limit tensor from the per-layer scalar.
+    _clamp_val = runner_config.gemm1_clamp_limit
+    if _clamp_val is not None:
+        gemm1_clamp_limit = torch.full(
+            (quant_info.local_num_experts,),
+            _clamp_val,
+            dtype=torch.float32,
+            device=hs_fp4.device,
+        )
+    else:
+        gemm1_clamp_limit = None
+
     num_tokens = hs_fp4.shape[0]
     hidden_size = (
         hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
@@ -924,6 +936,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
                 num_tokens, hidden_size, dtype=hidden_states.dtype, device=hs_fp4.device
             )
 
+    # Fall back to routed path when topk was already materialized (e.g. sigmoid routing).
+    if not use_routed_topk and TopKOutputChecker.format_is_standard(topk_output):
+        use_routed_topk = True
+
     if use_routed_topk:
         assert TopKOutputChecker.format_is_standard(topk_output)
 
@@ -940,7 +956,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             gemm1_bias=None,
             gemm1_alpha=None,
             gemm1_beta=None,
-            gemm1_clamp_limit=None,
+            gemm1_clamp_limit=gemm1_clamp_limit,
             gemm2_weights=quant_info.w2_weight,
             gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
             gemm2_bias=None,
@@ -984,7 +1000,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             gemm1_bias=None,
             gemm1_alpha=None,
             gemm1_beta=None,
-            gemm1_clamp_limit=None,
+            gemm1_clamp_limit=gemm1_clamp_limit,
             gemm2_weights=quant_info.w2_weight,
             gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
             gemm2_bias=None,

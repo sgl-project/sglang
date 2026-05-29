@@ -20,11 +20,19 @@ import torch.nn.functional as F
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsv4.compressor import (
-    CompressorBackendMixin,
-    FusedCompressMetadata,
-    create_paged_compressor_data,
-)
+
+if envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
+    from sglang.srt.layers.attention.dsv4.compressor_v2 import (
+        CompressorBackendMixin,
+        FusedCompressMetadata,
+        create_paged_compressor_data,
+    )
+else:
+    from sglang.srt.layers.attention.dsv4.compressor import (
+        CompressorBackendMixin,
+        FusedCompressMetadata,
+        create_paged_compressor_data,
+    )
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
@@ -43,11 +51,12 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import ceil_align
 
 if TYPE_CHECKING:
-    from flash_mla.flash_mla_interface import FlashMLASchedMeta
+    from sgl_kernel.flash_mla import FlashMLASchedMeta
 
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -75,7 +84,7 @@ def _create_flashmla_metadata():
 
     if is_hip():
         return None
-    import flash_mla
+    import sgl_kernel.flash_mla as flash_mla
 
     return flash_mla.get_mla_metadata()[0]
 
@@ -492,32 +501,21 @@ class DeepseekV4HipRadixBackend(
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         out_cache_loc: Optional[torch.Tensor] = None,
+        extend_seq_lens: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
-        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
-            assert out_cache_loc is not None
-            if not hasattr(self, "extend_seq_lens_buffer"):
-                self.extend_seq_lens_buffer = torch.tensor(
-                    [self.speculative_num_draft_tokens] * 1025, device=self.device
-                )
-            extend_seq_lens = self.extend_seq_lens_buffer[: len(seq_lens)]
-
-            return DSV4RawVerifyMetadata(
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=out_cache_loc,
-                extend_seq_lens=extend_seq_lens,
-            )
-        else:
-            seq_lens_cpu = seq_lens.tolist()
-            return self.init_forward_metadata_target_verify_old(
-                max_seq_len=max_seq_len,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu,
-                out_cache_loc=out_cache_loc,
-                use_prefill_cuda_graph=use_prefill_cuda_graph,
-            )
+        # HIP path: build target-verify metadata eagerly even when
+        # SGLANG_PREP_IN_CUDA_GRAPH is enabled. The raw/lazy-upgrade route can
+        # hit planner invariants during graph capture for DSV4+EAGLE.
+        seq_lens_cpu = seq_lens.tolist()
+        return self.init_forward_metadata_target_verify_old(
+            max_seq_len=max_seq_len,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            out_cache_loc=out_cache_loc,
+            use_prefill_cuda_graph=use_prefill_cuda_graph,
+        )
 
     def init_forward_metadata_target_verify_old(
         self,
@@ -557,8 +555,15 @@ class DeepseekV4HipRadixBackend(
         out_cache_loc = raw_metadata.out_cache_loc
 
         bs, num_draft_tokens = len(seq_lens), self.speculative_num_draft_tokens
-        seq_lens = seq_lens + self.speculative_num_draft_tokens
+        seq_lens = seq_lens + num_draft_tokens
         extend_seq_lens = raw_metadata.extend_seq_lens
+        if extend_seq_lens is None or extend_seq_lens.numel() != bs:
+            extend_seq_lens = torch.full_like(seq_lens, num_draft_tokens)
+        else:
+            extend_seq_lens = extend_seq_lens.to(
+                device=seq_lens.device, dtype=seq_lens.dtype
+            )
+        extend_seq_lens = torch.minimum(extend_seq_lens, seq_lens).clamp_min_(1)
 
         seq_lens_casual, req_pool_indices_repeated = (
             self.expand_extend_with_same_length(
@@ -670,11 +675,22 @@ class DeepseekV4HipRadixBackend(
         max_seq_len = int(seq_lens_cpu.max().item())
 
         if forward_batch.forward_mode.is_decode_or_idle():
+            # DSv4 bakes this step's KV write target (c4/c128) into metadata,
+            # so slice the shared multi-step out_cache_loc now rather than at
+            # forward time.
+            out_cache_loc = forward_batch.out_cache_loc
+            if self.topk > 0 and self.speculative_num_steps > 1:
+                out_cache_loc = per_step_draft_out_cache_loc(
+                    out_cache_loc,
+                    forward_batch.batch_size,
+                    self.topk,
+                    self.speculative_num_steps,
+                )[self.speculative_step_id]
             metadata = self.init_forward_metadata_decode(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
-                out_cache_loc=forward_batch.out_cache_loc,
+                out_cache_loc=out_cache_loc,
             )
         elif forward_batch.forward_mode.is_target_verify():
             metadata = self.init_forward_metadata_target_verify(
@@ -682,6 +698,7 @@ class DeepseekV4HipRadixBackend(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 out_cache_loc=forward_batch.out_cache_loc,
+                extend_seq_lens=forward_batch.extend_seq_lens,
             )
         elif forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu

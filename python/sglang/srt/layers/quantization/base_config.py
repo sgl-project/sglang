@@ -131,6 +131,9 @@ class QuantizationConfig(ABC):
         # mapping is updated by models as they initialize
         self.packed_modules_mapping: Dict[str, List[str]] = dict()
 
+    def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
+        self.packed_modules_mapping = mapping
+
     @abstractmethod
     def get_name(self) -> str:
         """Name of the quantization method."""

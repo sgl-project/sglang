@@ -10,6 +10,7 @@ from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(5, "base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-b-test-cpu")
 
 
 class DummyDetector(BaseFormatDetector):

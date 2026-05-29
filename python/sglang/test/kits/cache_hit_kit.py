@@ -344,6 +344,15 @@ def run_multiturn_cache_hit_test(
             print(msg)
 
             assert resp.cached_tokens >= expected_cached
+            # Upper bound: cached tokens are a subset of the prompt, so they can
+            # never exceed prompt_len. In PD disaggregation with decode radix
+            # cache, the shared prefix was previously counted on both the prefill
+            # and the decode node, making cached_tokens exceed prompt_len.
+            assert resp.cached_tokens <= resp.prompt_len, (
+                f"Round {round_num}, client {i}: cached_tokens="
+                f"{resp.cached_tokens} exceeds prompt_len={resp.prompt_len} "
+                f"(double-counted prefix across prefill/decode)"
+            )
 
             # Record this round's prompt_len for next round's expected calc
             prev_prompt_lens[i] = resp.prompt_len

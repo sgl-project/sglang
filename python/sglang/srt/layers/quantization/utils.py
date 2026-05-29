@@ -50,6 +50,8 @@ def _module_path_match(ignored: str, prefix: str) -> bool:
     # match `mlp.gate_up_proj`. Needed for quant configs (e.g. Qwen3.6-FP8)
     # whose `modules_to_not_convert` lists MoE-template names like `mlp.gate`
     # that collide with fused dense MLP names by plain substring.
+    ignored = ignored.rstrip(".")
+    prefix = prefix.rstrip(".")
     if ignored == prefix:
         return True
     if prefix.startswith(ignored + "."):
