@@ -811,11 +811,13 @@ class HybridLinearAttnBackend(AttentionBackend):
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
     ) -> bool:
-        # Dispatch by the layer's runtime type
+        # RadixLinearAttention is unambiguously a linear-attention layer.
+        # Everything else (including plain RadixAttention) must be classified by
+        # layer id: models like Bailing/Ring use a plain RadixAttention for their
+        # linear layers, so an `isinstance(layer, RadixAttention) -> full` shortcut
+        # would misroute those linear layers to the full-attention backend.
         if isinstance(layer, RadixLinearAttention):
             return False
-        if isinstance(layer, RadixAttention):
-            return True
 
         if layer is not None:
             layer_id = layer.layer_id
