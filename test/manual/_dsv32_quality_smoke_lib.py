@@ -320,14 +320,43 @@ def capture_reference_outputs(
 
 
 def _validate_reference_artifact(refs: Dict[str, Any]) -> None:
+    """Refuse a reference artifact that is not the exact committed fixture.
+
+    AC-Q is defined over EXACTLY the 20 smoke prompts + 5 NIAH needles in this
+    module. A truncated or reordered reference file must not be able to pass a
+    later compare run by matching a subset — so enforce the prompt list and the
+    NIAH needles position-by-position, not just non-emptiness.
+    """
     if not isinstance(refs, dict) or refs.get("schema") != REFERENCE_SCHEMA:
         raise ValueError(
             f"reference artifact schema must be {REFERENCE_SCHEMA!r}, got "
             f"{refs.get('schema')!r}"
         )
-    for key in ("smoke", "niah"):
-        if not isinstance(refs.get(key), list) or not refs[key]:
-            raise ValueError(f"reference artifact {key!r} must be a non-empty list")
+    smoke = refs.get("smoke")
+    niah = refs.get("niah")
+    if not isinstance(smoke, list) or len(smoke) != len(SMOKE_PROMPTS):
+        raise ValueError(
+            f"reference artifact 'smoke' must have exactly {len(SMOKE_PROMPTS)} "
+            f"entries, got {len(smoke) if isinstance(smoke, list) else type(smoke).__name__}"
+        )
+    if not isinstance(niah, list) or len(niah) != len(NIAH_MINI_PROMPTS):
+        raise ValueError(
+            f"reference artifact 'niah' must have exactly {len(NIAH_MINI_PROMPTS)} "
+            f"entries, got {len(niah) if isinstance(niah, list) else type(niah).__name__}"
+        )
+    for i, (entry, expected) in enumerate(zip(smoke, SMOKE_PROMPTS)):
+        if not isinstance(entry, dict) or entry.get("prompt") != expected:
+            raise ValueError(
+                f"reference artifact smoke[{i}] prompt does not match the committed "
+                f"fixture (truncated or reordered artifact)."
+            )
+    for i, (entry, (exp_prompt, exp_needle)) in enumerate(zip(niah, NIAH_MINI_PROMPTS)):
+        if not isinstance(entry, dict) or entry.get("prompt") != exp_prompt \
+                or entry.get("needle") != exp_needle:
+            raise ValueError(
+                f"reference artifact niah[{i}] prompt/needle does not match the "
+                f"committed fixture (truncated or reordered artifact)."
+            )
 
 
 def evaluate_against_references(

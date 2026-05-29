@@ -116,11 +116,12 @@ class TestCaptureCompareRoundTrip(unittest.TestCase):
         _lib.server_commit_sha = self._orig_sha
 
     def _make_refs(self):
-        smoke = [{"prompt": f"p{i}", "dsa_text": f"answer {i} stable text here"}
-                 for i in range(20)]
-        niah = [{"prompt": f"n{i}", "needle": nd, "dsa_text": f"the answer is {nd}"}
-                for i, nd in enumerate(["ZEBRA-7", "MARLIN-42", "ORCHID-99",
-                                        "GLACIER-13", "PHARAOH-88"])]
+        # Build from the EXACT committed fixture — the hardened validator now
+        # rejects any other prompt list (truncated/reordered).
+        smoke = [{"prompt": p, "dsa_text": f"answer for {p[:20]} stable text here"}
+                 for p in _lib.SMOKE_PROMPTS]
+        niah = [{"prompt": p, "needle": nd, "dsa_text": f"the answer is {nd}"}
+                for p, nd in _lib.NIAH_MINI_PROMPTS]
         return {
             "schema": _lib.REFERENCE_SCHEMA, "dsa_commit_sha": "cafef00d",
             "captured_at": "20260529T000000Z",
@@ -151,6 +152,29 @@ class TestCaptureCompareRoundTrip(unittest.TestCase):
     def test_compare_rejects_bad_schema(self):
         bad = self._make_refs()
         bad["schema"] = "wrong_schema"
+        _lib.generate = lambda url, prompt, **kw: "x"
+        with self.assertRaises(ValueError):
+            _lib.evaluate_against_references("http://ds.invalid", bad)
+
+    def test_compare_rejects_truncated_reference(self):
+        # Dropping a smoke entry must be refused, not silently scored on the subset.
+        bad = self._make_refs()
+        bad["smoke"] = bad["smoke"][:-1]
+        _lib.generate = lambda url, prompt, **kw: "x"
+        with self.assertRaises(ValueError):
+            _lib.evaluate_against_references("http://ds.invalid", bad)
+
+    def test_compare_rejects_reordered_reference(self):
+        # Swapping two smoke prompts breaks the exact-fixture contract.
+        bad = self._make_refs()
+        bad["smoke"][0], bad["smoke"][1] = bad["smoke"][1], bad["smoke"][0]
+        _lib.generate = lambda url, prompt, **kw: "x"
+        with self.assertRaises(ValueError):
+            _lib.evaluate_against_references("http://ds.invalid", bad)
+
+    def test_compare_rejects_wrong_needle(self):
+        bad = self._make_refs()
+        bad["niah"][0]["needle"] = "WRONG-NEEDLE"
         _lib.generate = lambda url, prompt, **kw: "x"
         with self.assertRaises(ValueError):
             _lib.evaluate_against_references("http://ds.invalid", bad)
