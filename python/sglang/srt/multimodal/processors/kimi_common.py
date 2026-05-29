@@ -30,7 +30,9 @@ class KimiGridMMDataMixin:
 
         """
         assert images is not None
-        media_tokens_calculator = self._processor.media_processor.media_tokens_calculator
+        media_tokens_calculator = (
+            self._processor.media_processor.media_tokens_calculator
+        )
         return [
             int(media_tokens_calculator({"type": "image", "image": image}))
             for image in images
