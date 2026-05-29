@@ -72,6 +72,10 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         else:
             self.ssm_state_indices = cache_indices
 
+    def init_forward_data(self, forward_batch: ForwardBatch):
+        # Delegate to legacy method while Phase E hasn't moved the body yet.
+        self.init_forward_metadata(forward_batch)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_draft_extend(True):
             return
