@@ -31,6 +31,8 @@ class TestMMLU:
             print("Starting mmlu test...")
             metrics = run_eval(args)
             model_metrics["accuracy"] = metrics["score"]
+            model_metrics["latency"] = metrics.get("latency", "-")
+            model_metrics["output_throughput"] = metrics.get("output_throughput", "-")
             self.assertGreater(metrics["score"], accuracy_mmlu_threshold)
         except Exception as e:
             model_metrics["error"] = e
