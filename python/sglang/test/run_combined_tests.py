@@ -148,6 +148,7 @@ def run_combined_tests(
                     spec_accept_length_threshold=performance_params.spec_accept_length_threshold,
                     enable_profile=performance_params.enable_profile,
                     skip_server_launch=share_server,
+                    baseline_output_throughput=performance_params.baseline_output_throughput,
                 )
                 model_result["perf_result"] = perf_result
                 if not perf_result.passed:
