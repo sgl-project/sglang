@@ -1700,43 +1700,37 @@ class FlashAttentionBackend(AttentionBackend):
             # For decoder-only models, skip encoder_metadata allocation
             self.encoder_metadata = {}
 
-    def init_forward_metadata_capture_cuda_graph(
+    def _bind_metadata_buffers(
         self,
         bs: int,
         num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
-    ):
-        """Initialize forward metadata for capturing CUDA graph."""
-        metadata = FlashAttentionMetadata()
+        device: torch.device,
+    ) -> tuple:
+        """Create FlashAttentionMetadata with pre-allocated buffer slice refs.
 
-        # metadata_expand is needed for Spec Decoding when top k > 1
+        Assigns all buffer slice references but does NOT fill data values.
+        Stores the new metadata object(s) in the appropriate lookup dicts.
+        Returns (metadata, metadata_expand).
+        """
+        metadata = FlashAttentionMetadata()
         metadata_expand = FlashAttentionMetadata()
 
-        device = seq_lens.device
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
-                # Draft Decode
                 if self.topk <= 1:
-                    # When topk = 1, we use the normal decode metadata
+                    # Draft Decode topk=1
                     metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
                         "cache_seqlens"
                     ][:bs]
-                    metadata.max_seq_len_k = seq_lens.max().item() + (
-                        self.speculative_step_id + 1
-                    )
                     metadata.cu_seqlens_q = self.decode_cuda_graph_metadata[
                         "cu_seqlens_q"
                     ][: bs + 1]
-                    metadata.cu_seqlens_k = torch.nn.functional.pad(
-                        torch.cumsum(
-                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
-                        ),
-                        (1, 0),
-                    )
+                    metadata.cu_seqlens_k = self.decode_cuda_graph_metadata[
+                        "cu_seqlens_k"
+                    ][: bs + 1]
                     metadata.page_table = self.decode_cuda_graph_metadata[
                         "page_table_draft_decode"
                     ][:bs, :]
@@ -1746,13 +1740,11 @@ class FlashAttentionBackend(AttentionBackend):
                         ][:bs, :]
                     self.decode_cuda_graph_metadata[bs] = metadata
                 else:
-                    # When top k > 1, we need two specific draft decode metadata, and then merge states
-                    # 1. The first half of metadata for prefix tokens
+                    # Draft Decode topk>1: two metadata objects
                     metadata.cache_seqlens_int32 = (
                         self.draft_decode_metadata_topk_normal["cache_seqlens"][:bs]
                     )
                     metadata.max_seq_len_q = self.topk
-                    metadata.max_seq_len_k = seq_lens.max().item()
                     metadata.cu_seqlens_q = self.draft_decode_metadata_topk_normal[
                         "cu_seqlens_q"
                     ][: bs + 1]
@@ -1763,7 +1755,6 @@ class FlashAttentionBackend(AttentionBackend):
                         "page_table"
                     ][:bs, :]
 
-                    # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
                     metadata_expand.cache_seqlens_int32 = (
                         self.draft_decode_metadata_topk_expand["cache_seqlens"][
                             : bs * self.topk
@@ -1787,16 +1778,15 @@ class FlashAttentionBackend(AttentionBackend):
                     self.draft_decode_metadata_topk_expand[bs] = metadata_expand
             else:
                 # Normal Decode
-                # Get sequence information
-                metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
-                batch_size = len(seq_lens)
-                device = seq_lens.device
-                metadata.cu_seqlens_k = torch.nn.functional.pad(
-                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
-                )
-                # Precompute maximum sequence length
-                metadata.max_seq_len_k = seq_lens.max().item()
-                # Precompute page table
+                metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
+                    "cache_seqlens"
+                ][:bs]
+                metadata.cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"][
+                    : bs + 1
+                ]
+                metadata.cu_seqlens_k = self.decode_cuda_graph_metadata["cu_seqlens_k"][
+                    : bs + 1
+                ]
                 metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
                     :bs, :
                 ]
@@ -1804,70 +1794,32 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.swa_page_table = self.decode_cuda_graph_metadata[
                         "swa_page_table"
                     ][:bs, :]
-                # Precompute cumulative sequence lengths
-                metadata.cu_seqlens_q = torch.arange(
-                    0, batch_size + 1, dtype=torch.int32, device=device
-                )
                 self.decode_cuda_graph_metadata[bs] = metadata
-
-                self._maybe_update_local_attn_metadata_for_capture(metadata, batch_size)
-
-                # Compute scheduler_metadata into pre-allocated buffer for CUDA graph capture
-                if self._sched_meta_buf is not None:
-                    sched = self._compute_scheduler_metadata(
-                        batch_size,
-                        max(metadata.max_seq_len_k, 1),
-                        metadata.cache_seqlens_int32,
-                        metadata.cu_seqlens_q,
-                    )
-                    if sched is not None:
-                        n = sched.shape[0]
-                        self._sched_meta_buf[:n] = sched
-                        self._sched_meta_buf[n:] = 0
-                        metadata.scheduler_metadata = self._sched_meta_buf[:n]
 
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
                 metadata.cache_seqlens_int32 = self.target_verify_metadata[
                     "cache_seqlens"
                 ][:bs]
-                metadata.cache_seqlens_int32.copy_(
-                    (seq_lens + self.speculative_num_draft_tokens)
-                )
-
                 metadata.max_seq_len_q = self.speculative_num_draft_tokens
-                metadata.max_seq_len_k = (
-                    seq_lens.max().item() + self.speculative_num_draft_tokens
-                )
-
-                metadata.cu_seqlens_q = torch.arange(
-                    0,
-                    bs * self.speculative_num_draft_tokens + 1,
-                    self.speculative_num_draft_tokens,
-                    dtype=torch.int32,
-                    device=device,
-                )
-
+                metadata.cu_seqlens_q = self.target_verify_metadata["cu_seqlens_q"][
+                    : bs + 1
+                ]
                 metadata.cu_seqlens_k = self.target_verify_metadata["cu_seqlens_k"][
                     : (bs + 1)
                 ]
-
                 metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
-
                 if self.use_sliding_window_kv_pool:
                     metadata.swa_page_table = self.target_verify_metadata[
                         "swa_page_table"
                     ][:bs, :]
-
                 self.target_verify_metadata[bs] = metadata
             else:
-                # When topk > 1, we need two specific target verify metadata, and then merge states
-                # 1. The first half of metadata for prefix tokens
+                # Target Verify topk>1: two (or three with SWA) metadata objects
                 metadata.cache_seqlens_int32 = self.target_verify_metadata_topk_normal[
                     "cache_seqlens"
                 ][:bs]
                 metadata.max_seq_len_q = self.speculative_num_draft_tokens
-                # metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item(), do this in replay
                 metadata.cu_seqlens_q = self.target_verify_metadata_topk_normal[
                     "cu_seqlens_q"
                 ][: bs + 1]
@@ -1878,7 +1830,6 @@ class FlashAttentionBackend(AttentionBackend):
                     "page_table"
                 ][:bs, :]
 
-                # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
                 metadata_expand.cache_seqlens_int32 = (
                     self.target_verify_metadata_topk_expand["cache_seqlens"][
                         : bs * self.speculative_num_draft_tokens
@@ -1891,7 +1842,6 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata_expand.cu_seqlens_k = self.target_verify_metadata_topk_expand[
                     "cu_seqlens_k"
                 ][: bs * self.speculative_num_draft_tokens + 1]
-
                 metadata_expand.page_table = self.target_verify_metadata_topk_expand[
                     "page_table"
                 ][: bs * self.speculative_num_draft_tokens]
@@ -1913,7 +1863,6 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata_swa.cu_seqlens_k = self.target_verify_metadata_topk_swa[
                         "cu_seqlens_k"
                     ][: bs * self.speculative_num_draft_tokens + 1]
-
                     metadata_swa.page_table = self.target_verify_metadata_topk_swa[
                         "page_table"
                     ][: bs * self.speculative_num_draft_tokens]
@@ -1921,33 +1870,20 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.swa_spec_metadata = metadata_swa
 
         elif forward_mode.is_draft_extend(include_v2=True):
+            num_tokens_per_bs = num_tokens // bs
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
             ]
-            metadata.cache_seqlens_int32.copy_(seq_lens)
-
-            num_tokens_per_bs = num_tokens // bs
             metadata.max_seq_len_q = num_tokens_per_bs
-            metadata.max_seq_len_k = seq_lens.max().item()
-
-            metadata.cu_seqlens_q = torch.arange(
-                0,
-                bs * num_tokens_per_bs + 1,
-                num_tokens_per_bs,
-                dtype=torch.int32,
-                device=device,
-            )
-
+            metadata.cu_seqlens_q = self.draft_extend_metadata["cu_seqlens_q"][: bs + 1]
             metadata.cu_seqlens_k = self.draft_extend_metadata["cu_seqlens_k"][
                 : (bs + 1)
             ]
             metadata.page_table = self.draft_extend_metadata["page_table"][:bs, :]
-
             if self.use_sliding_window_kv_pool:
                 metadata.swa_page_table = self.draft_extend_metadata["swa_page_table"][
                     :bs, :
                 ]
-
             self.draft_extend_metadata[bs] = metadata
 
         if encoder_lens is not None:
@@ -1958,13 +1894,81 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.encoder_cu_seqlens_k = self.encoder_metadata[
                 "encoder_cu_seqlens_k"
             ][: (encoder_bs + 1)]
-
             metadata.encoder_page_table = self.encoder_metadata["encoder_page_table"][
                 :bs, :
             ]
 
-        self.forward_metadata = metadata
-        self.forward_metadata_spec_decode_expand = metadata_expand
+        return metadata, metadata_expand
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+    ):
+        """Initialize forward metadata for capturing CUDA graph."""
+        seq_lens_cpu = seq_lens.cpu()
+        self._bind_metadata_buffers(
+            bs, num_tokens, encoder_lens, forward_mode, spec_info, seq_lens.device
+        )
+
+        if forward_mode.is_decode_or_idle() and spec_info is not None and self.topk > 1:
+            # topk>1 draft decode: replay needs out_cache_loc which capture doesn't have;
+            # set forward_metadata directly and let actual CUDA graph replay fill data.
+            self.forward_metadata = self.draft_decode_metadata_topk_normal[bs]
+            self.forward_metadata_spec_decode_expand = (
+                self.draft_decode_metadata_topk_expand[bs]
+            )
+            return
+
+        if forward_mode.is_target_verify() and self.topk > 1:
+            # topk>1 target verify: replay needs spec_info.positions and .custom_mask
+            # which are not populated at capture time.
+            self.forward_metadata = self.target_verify_metadata_topk_normal[bs]
+            self.forward_metadata_spec_decode_expand = (
+                self.target_verify_metadata_topk_expand[bs]
+            )
+            return
+
+        self.init_forward_metadata_replay_cuda_graph(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=None,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            seq_lens_cpu=seq_lens_cpu,
+        )
+
+        if forward_mode.is_decode_or_idle() and spec_info is None:
+            # Local attention and scheduler metadata require capture-time slice sizing.
+            # Both depend on data already filled by replay above.
+            metadata = self.decode_cuda_graph_metadata[bs]
+            self._maybe_update_local_attn_metadata_for_capture(metadata, bs)
+            if self._sched_meta_buf is not None:
+                sched = self._compute_scheduler_metadata(
+                    bs,
+                    max(metadata.max_seq_len_k, 1),
+                    metadata.cache_seqlens_int32,
+                    metadata.cu_seqlens_q,
+                )
+                if sched is not None:
+                    n = sched.shape[0]
+                    self._sched_meta_buf[:n] = sched
+                    self._sched_meta_buf[n:] = 0
+                    metadata.scheduler_metadata = self._sched_meta_buf[:n]
+
+        if forward_mode.is_draft_extend(include_v2=True):
+            # CUDA graph bakes max_seq_len_q as a constant.  replay() sets it to
+            # max(num_accept_tokens_cpu) which is None/empty at capture time,
+            # falling back to 1.  Restore the correct upper bound so the kernel
+            # sees num_tokens_per_bs (not 1) for all replays of this graph.
+            self.forward_metadata.max_seq_len_q = num_tokens // bs
 
     def init_forward_metadata_replay_cuda_graph(
         self,
