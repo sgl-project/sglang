@@ -388,11 +388,13 @@ class BreakableCudaGraphRunner:
     def _capture_one(self, num_tokens, pool, stream):
         """Capture a breakable CUDA graph for one token size."""
         forward_batch = self._build_capture_forward_batch(num_tokens)
-        # Capture-side init: out-of-graph metadata prep + in_capture=True so
-        # backends with capture/replay divergence can branch on the flag.
-        self.model_runner.attn_backend.init_forward_metadata_out_graph(
-            forward_batch, in_capture=True
-        )
+        # Breakable capture uses the eager entry (both legs: `_out_graph` +
+        # `_in_graph`) — like PCG it doesn't use bucket-keyed wrappers, and
+        # also captures `forward_mode=EXTEND` (prefill) where the bucket-prep
+        # path in backends like FlashInfer raises "Invalid mode". The
+        # `_in_graph` call inside `run_once` below still records GPU side
+        # effects (e.g., DSV4's Raw→Full upgrade) into the captured graph.
+        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():
             # Invalidate SWA loc cache — same fix as in cuda_graph_runner.run_once.

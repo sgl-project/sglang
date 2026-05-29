@@ -2356,6 +2356,16 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
 
+        else:
+            raise ValueError(
+                f"FA3 `_apply_cuda_graph_metadata` only supports the modes the "
+                f"full cuda-graph runner captures (decode / idle / target_verify "
+                f"/ draft_extend / draft_extend_v2). Got {forward_mode=}. "
+                f"Piecewise / breakable capture must route through "
+                f"`init_forward_metadata(fb)` (the eager entry) instead of "
+                f"`init_forward_metadata_out_graph(fb, in_capture=True)`."
+            )
+
         if encoder_lens is not None:
             # Per-request varlen encoder support (e.g. MossVL different images).
             metadata.encoder_max_seq_len_k = int(encoder_lens.max().item())

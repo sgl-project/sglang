@@ -597,12 +597,14 @@ class PiecewiseCudaGraphRunner:
             if lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            # PCG capture path — align with full-graph runner: out-of-graph
-            # init runs with in_capture=True so backends with capture/replay
-            # divergences can branch on it.
-            self.model_runner.attn_backend.init_forward_metadata_out_graph(
-                forward_batch, in_capture=True
-            )
+            # PCG capture path. Use the eager entry (both legs: `_out_graph`
+            # + `_in_graph`) — PCG doesn't use bucket-keyed wrappers like the
+            # full-graph runner, so the `in_capture=True` branch in backends
+            # (which preps per-bs wrappers for decode/target_verify/draft_extend
+            # via `_prepare_cuda_graph_metadata`) doesn't apply. PCG also
+            # captures `forward_mode=EXTEND` (prefill chunks), which the
+            # bucket-prep path doesn't handle.
+            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
             # Run and capture
             def run_once():
