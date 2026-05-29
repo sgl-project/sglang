@@ -9,7 +9,10 @@ on:
       sgl_kernel:
         required: true
         type: string
-      b200_runner:
+      runner_config:
+        required: true
+        type: string
+      runs_on_map:
         required: true
         type: string
       continue_on_error:
@@ -28,7 +31,7 @@ on:
         required: false
         type: string
         default: 'false'
-      skip_stage_health_check:
+      skip_pr_test_health_check:
         required: false
         type: string
         default: 'false'
@@ -39,7 +42,7 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
-  SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == 'true' }}
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check == 'true' }}
 
 jobs:
   compute-diffusion-partitions:
@@ -87,7 +90,7 @@ jobs:
         with:
           ref: ${{ inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
+      - uses: ./.github/actions/check-pr-test-health
 
       - uses: ./.github/actions/check-maintenance
 
@@ -160,7 +163,7 @@ jobs:
         with:
           ref: ${{ inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
+      - uses: ./.github/actions/check-pr-test-health
 
       - uses: ./.github/actions/check-maintenance
 
@@ -227,7 +230,7 @@ jobs:
         with:
           ref: ${{ inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
+      - uses: ./.github/actions/check-pr-test-health
 
       - uses: ./.github/actions/check-maintenance
 
@@ -264,7 +267,7 @@ jobs:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
-    runs-on: ${{ inputs.b200_runner }}
+    runs-on: ${{ fromJson(inputs.runs_on_map)[inputs.runner_config] }}
     timeout-minutes: 240
     steps:
       - name: Checkout code
@@ -272,7 +275,7 @@ jobs:
         with:
           ref: ${{ inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
+      - uses: ./.github/actions/check-pr-test-health
 
       - uses: ./.github/actions/check-maintenance
 
@@ -324,7 +327,7 @@ jobs:
         with:
           ref: ${{ inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
+      - uses: ./.github/actions/check-pr-test-health
 
       - uses: ./.github/actions/check-maintenance
 

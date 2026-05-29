@@ -6,6 +6,7 @@ export const Ring261TDeployment = () => {
       items: [
         { id: 'gb300', label: 'GB300 x4', default: true },
         { id: 'b200', label: 'B200 x8', default: false },
+        { id: 'h200', label: 'H200 x8', default: false },
       ],
     },
     toolcall: {
@@ -29,6 +30,7 @@ export const Ring261TDeployment = () => {
   const modelConfigs = {
     gb300: { tp: 4, memFraction: '0.95' },
     b200: { tp: 8, memFraction: '0.8' },
+    h200: { tp: 8, memFraction: '0.95' },
   };
 
   const getInitialState = () => {

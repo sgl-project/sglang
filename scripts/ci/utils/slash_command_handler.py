@@ -9,6 +9,21 @@ from datetime import datetime, timezone
 import requests
 from github import Auth, Github
 
+# Import scripts/ci/runner_configs.py (sibling-up dir) for runner_config -> runs_on lookup.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import runner_configs as _runner_configs  # noqa: E402
+
+# rerun-test workflow doesn't build sgl-kernel, so b200 stages always use the
+# non-kernel pool when resolving the `$b200_runner` sentinel from runner_configs.yml.
+_B200_DEFAULT_RUNNER = "4-gpu-b200"
+
+# install_script values from runner_configs.yml are passed verbatim into a
+# `bash ${{ inputs.install_script }}` step in rerun-test.yml. GHA expression
+# substitution happens before bash parses, so shell metacharacters in the
+# string would inject. Restrict the allowed shape to `scripts/ci/cuda/*.sh`
+# (single path component under that dir, no whitespace/operators).
+_ALLOWED_INSTALL_SCRIPT = re.compile(r"^scripts/ci/cuda/[\w.-]+\.sh$")
+
 # Configuration
 PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
 
@@ -202,9 +217,19 @@ def find_workflow_run_url(
                 continue
 
             # Match by display_title (set by workflow's run-name directive)
-            # This is immediately available, unlike job names which require waiting
+            # This is immediately available, unlike job names which require waiting.
+            #
+            # GitHub caps display_title at 512 chars and appends "..." when the
+            # workflow's run-name is longer (e.g. /rerun-test with many files
+            # newline-joins them into one long command). Accept the un-truncated
+            # prefix when the rest matches our submission verbatim — concurrent
+            # dispatches use different commands (different files per group), so
+            # the prefix is enough to disambiguate.
             display_title = run.get("display_title", "")
-            if display_title == expected_title:
+            if display_title == expected_title or (
+                display_title.endswith("...")
+                and expected_title.startswith(display_title[:-3])
+            ):
                 print(
                     f"Found matching workflow run: {run['id']} with title '{display_title}'"
                 )
@@ -267,23 +292,46 @@ def has_sgl_kernel_changes(pr):
         return False
 
 
-def handle_tag_run_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
+def handle_tag_run_ci(
+    gh_repo, pr, comment, user_perms, react_on_success=True, tag_extra=False
+):
     """
     Handles the /tag-run-ci-label command.
+
+    When tag_extra is True (triggered by the `extra` argument), also adds the
+    `run-ci-extra` label. pr-test-extra.yml gates on BOTH `run-ci` and
+    `run-ci-extra`, so both must be present for the extra workflow to run —
+    we always add `run-ci` alongside `run-ci-extra`. Reuses the same
+    `can_tag_run_ci_label` permission.
+
+    How fresh runs get dispatched: pr-test.yml and pr-test-extra.yml both
+    include `labeled` in `on.pull_request.types`, so adding a label fires a
+    new `pull_request.labeled` event with the up-to-date label set in its
+    payload, which spawns a fresh workflow run that satisfies the
+    `check-changes.if` gate. Note that this is the ONLY way to "un-skip" a
+    label-gated run — `run.rerun()` on a previously-skipped pull_request run
+    reuses the original event payload (frozen labels), so it would skip
+    again. handle_rerun_failed_ci can't recover label-skipped runs; the
+    labeled event is the recovery mechanism.
+
     Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_tag_run_ci_label", False):
         print("Permission denied: can_tag_run_ci_label is false.")
         return False
 
-    print("Permission granted. Adding 'run-ci' label.")
-    pr.add_to_labels("run-ci")
+    labels = ["run-ci"]
+    if tag_extra:
+        labels.append("run-ci-extra")
+    print(f"Permission granted. Adding labels: {labels}.")
+    for label in labels:
+        pr.add_to_labels(label)
 
     if react_on_success:
         comment.create_reaction("+1")
-        print("Label added and comment reacted.")
+        print("Labels added and comment reacted.")
     else:
-        print("Label added (reaction suppressed).")
+        print("Labels added (reaction suppressed).")
 
     return True
 
@@ -351,6 +399,14 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     #   core.setFailed(...) so their conclusion is "failure" and are covered.
     # - skipped: the entire run was skipped (no jobs ran), so there are no
     #   failed jobs for rerun_failed_jobs() to target. Use run.rerun().
+    #
+    #   Caveat: GitHub's `run.rerun()` reuses the original event payload, so
+    #   reruns of `pull_request`-event runs that were skipped because their
+    #   `if` evaluated to false (e.g. missing label) will skip again — the
+    #   label set in the frozen payload doesn't update. To un-skip a
+    #   label-gated workflow, add the missing label (the `labeled` event
+    #   dispatches a fresh run with the current label set); this function
+    #   cannot recover those by rerun alone.
     # - kernel wheel escape: if the PR touches sgl-kernel and not all wheel
     #   builds are success yet, full-rerun failure runs too — Build Wheel
     #   lives in pr-test-sgl-kernel.yml, consumers in pr-test.yml, and
@@ -386,49 +442,6 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     else:
         print("No failed or skipped workflows found to rerun.")
         return False
-
-
-CUDA_SUITE_TO_RUNNER = {
-    # PR test suites
-    "stage-a-test-1-gpu-small": "1-gpu-5090",
-    "stage-a-test-cpu": "ubuntu-latest",
-    "stage-b-test-1-gpu-small": "1-gpu-5090",
-    "stage-b-test-1-gpu-large": "1-gpu-h100",
-    "stage-b-test-2-gpu-large": "2-gpu-h100",
-    "stage-b-test-4-gpu-b200": "4-gpu-b200",
-    "stage-c-test-4-gpu-h100": "4-gpu-h100",
-    "stage-c-test-8-gpu-h200": "8-gpu-h200",
-    "stage-c-test-8-gpu-h20": "8-gpu-h20",
-    "stage-c-test-4-gpu-b200": "4-gpu-b200",
-    "stage-c-test-deepep-4-gpu-h100": "4-gpu-h100",
-    "stage-c-test-deepep-8-gpu-h200": "8-gpu-h200-deepep",
-    "stage-c-test-dsv4-4-gpu-b200": "4-gpu-b200",
-    "stage-c-test-dsv4-8-gpu-h200": "8-gpu-h200",
-    # Nightly test suites (NVIDIA)
-    "nightly-1-gpu": "1-gpu-h100",
-    "nightly-4-gpu": "4-gpu-h100",
-    "nightly-4-gpu-b200": "4-gpu-b200",
-    "nightly-8-gpu-common": "8-gpu-h200",
-    "nightly-8-gpu-h200": "8-gpu-h200",
-    "nightly-8-gpu-h20": "8-gpu-h20",
-    "nightly-8-gpu-b200": "8-gpu-b200",
-    "nightly-eval-text-2-gpu": "2-gpu-h100",
-    "nightly-eval-vlm-2-gpu": "2-gpu-h100",
-    "nightly-perf-text-2-gpu": "2-gpu-h100",
-    "nightly-perf-vlm-2-gpu": "2-gpu-h100",
-    "nightly-kernel-1-gpu": "1-gpu-h100",
-    "nightly-kernel-8-gpu-h200": "8-gpu-h200",
-    # Weekly test suites
-    "weekly-8-gpu-h200": "8-gpu-h200",
-}
-
-DEEPEP_SUITES = {
-    "stage-c-test-8-gpu-h20",
-    "stage-c-test-deepep-4-gpu-h100",
-    "stage-c-test-deepep-8-gpu-h200",
-    "stage-c-test-dsv4-4-gpu-b200",
-    "stage-c-test-dsv4-8-gpu-h200",
-}
 
 
 MULTIMODAL_TEST_DIR = "python/sglang/multimodal_gen/test"
@@ -481,6 +494,87 @@ def resolve_test_group_specs(group_name):
         return [], f"No registered test files found in `{group_dir}`."
 
     return [os.path.relpath(path, "test") for path in test_files], None
+
+
+# A spec is treated as a wildcard pattern (expanding to many files) when its
+# file part contains a glob metacharacter. Plain specs keep the existing
+# single-file resolution, which requires a unique match.
+_GLOB_METACHARS = ("*", "?", "[")
+
+
+def _is_glob_pattern(file_part):
+    return any(ch in file_part for ch in _GLOB_METACHARS)
+
+
+def expand_glob_spec(file_part):
+    """
+    Expand a wildcard file_part into matching test files (repo-relative paths).
+
+    Globs are matched against the same locations resolve_test_file() searches
+    — test/registered/ and the multimodal_gen test dir — so e.g.
+    `test_*backend*.py` reruns every backend test without hand-enumerating
+    each file. Two constraints keep a broad pattern from pulling in non-tests:
+    a match must live under a known test root and be named `test_*.py`.
+
+    glob's `*` matches path separators only via `**`, so a bare pattern is
+    searched recursively under each root; a path-ful pattern is anchored.
+
+    Returns (sorted_repo_relative_paths, error). On success error is None.
+    """
+    pat = file_part
+    if pat.startswith("test/"):
+        pat = pat[len("test/") :]
+
+    matches = set()
+    if "/" in pat:
+        # Path-ful pattern. Glob from the repo root (handles fully qualified
+        # multimodal paths like python/sglang/multimodal_gen/test/**/test_*.py)
+        # and under test/ (handles test/-relative patterns like
+        # registered/attention/test_*.py).
+        for base in (".", "test"):
+            matches.update(glob.glob(os.path.join(base, pat), recursive=True))
+    else:
+        # Bare pattern: search recursively under each known test root.
+        for root in ("test/registered", MULTIMODAL_TEST_DIR):
+            matches.update(glob.glob(os.path.join(root, "**", pat), recursive=True))
+
+    # If the literal glob matched any directories — e.g. `unittest/*` matching
+    # subdirs `dense/`, `dsa/`, … — descend recursively into them for
+    # test_*.py. glob's `*` doesn't cross `/`, so without this a tree of
+    # subdirs containing tests would return only the top-level entries (and
+    # then get filtered out as non-test files).
+    expanded = set()
+    for p in matches:
+        if os.path.isdir(p):
+            expanded.update(
+                glob.glob(os.path.join(p, "**", "test_*.py"), recursive=True)
+            )
+        else:
+            expanded.add(p)
+    matches = expanded
+
+    def _under_test_root(path):
+        return path.startswith("test/registered/") or path.startswith(
+            MULTIMODAL_TEST_DIR + "/"
+        )
+
+    files = sorted(
+        {
+            os.path.normpath(p)
+            for p in matches
+            if os.path.isfile(p)
+            and os.path.basename(p).startswith("test_")
+            and p.endswith(".py")
+            and _under_test_root(os.path.normpath(p))
+        }
+    )
+    if not files:
+        return [], (
+            f"No test files matched wildcard `{file_part}` under "
+            f"`test/registered/` or `{MULTIMODAL_TEST_DIR}/` "
+            f"(patterns only match files named `test_*.py`)."
+        )
+    return files, None
 
 
 def resolve_test_file(file_part):
@@ -574,80 +668,135 @@ def detect_multimodal_suite(file_path):
     return MULTIMODAL_DEFAULT_RUNNER, None
 
 
-def _extract_suite(content, func_name):
-    """Pull a suite name out of a `register_{cuda,cpu}_ci(...)` call.
+def _extract_runner_configs(content):
+    """Pull `(runner_config, args_str)` from EVERY `register_cuda_ci(...)` call.
 
-    Two styles are supported:
-      1. legacy: register_cuda_ci(..., suite="stage-X-test-Y")
-      2. new:    register_cuda_ci(..., stage="stage-X", runner_config="Y")
-                 -> suite = f"{stage}-test-{runner_config}"
+    A test file can register itself on multiple pools (e.g. both
+    `4-gpu-b200` and `1-gpu-large`). The earlier `re.search` variant
+    returned only the first match, so /rerun-test silently dropped every
+    registration after the first — multi-pool files only ever ran on the
+    pool listed first. `re.finditer` is what makes the fan-out happen.
     """
-    legacy = re.search(
-        rf'^[^#\n]*{func_name}\([^)]*suite\s*=\s*["\']([^"\']+)["\']',
-        content,
-        re.MULTILINE,
-    )
-    if legacy:
-        return legacy.group(1)
-    args = re.search(rf"^[^#\n]*{func_name}\(([^)]*)\)", content, re.MULTILINE)
-    if args:
-        stage_m = re.search(r'stage\s*=\s*["\']([^"\']+)["\']', args.group(1))
-        rc_m = re.search(r'runner_config\s*=\s*["\']([^"\']+)["\']', args.group(1))
-        if stage_m and rc_m:
-            return f"{stage_m.group(1)}-test-{rc_m.group(1)}"
-    return None
+    out = []
+    for args in re.finditer(
+        r"^[^#\n]*register_cuda_ci\s*\(([^)]*)\)", content, re.MULTILINE
+    ):
+        m = re.search(r'runner_config\s*=\s*["\']([^"\']+)["\']', args.group(1))
+        if m:
+            out.append((m.group(1), args.group(1)))
+    return out
 
 
 def detect_suite(file_path_from_test):
     """
-    Read a test file and extract the suite from register_cuda_ci or register_cpu_ci.
+    Read a test file and extract dispatch info from register_cuda_ci or
+    register_cpu_ci.
 
-    Returns (suite_name, runner_label, use_deepep, is_cpu, error_message).
+    A CUDA file can carry multiple `register_cuda_ci(...)` calls — one per
+    pool it should run on — so this returns a *list* of dispatch dicts, one
+    per registration. CPU files yield a single-element list. A file with no
+    recognised registration yields a one-element list whose dict has an
+    `error` set.
+
+    Each dict has keys: suite, runner_label, install_script,
+    install_timeout, rdma_devices, is_cpu, error.
     """
     full_path = f"test/{file_path_from_test}"
     with open(full_path, "r") as f:
         content = f.read()
 
-    suite = _extract_suite(content, "register_cuda_ci")
-    if suite:
-        runner = CUDA_SUITE_TO_RUNNER.get(suite)
-        if not runner:
-            known = ", ".join(f"`{s}`" for s in sorted(CUDA_SUITE_TO_RUNNER))
-            return (
-                suite,
-                None,
-                False,
-                False,
-                (
-                    f"Unknown CUDA suite `{suite}` in `{full_path}`.\n\n"
-                    f"Known suites: {known}"
-                ),
+    def _err(suite, msg):
+        return {
+            "suite": suite,
+            "runner_label": None,
+            "install_script": "",
+            "install_timeout": "",
+            "rdma_devices": "",
+            "is_cpu": False,
+            "error": msg,
+        }
+
+    cuda_calls = _extract_runner_configs(content)
+    if cuda_calls:
+        configs = _runner_configs.load()
+        results = []
+        for rc, args_str in cuda_calls:
+            cfg = configs.get(rc)
+            if cfg is None:
+                known = ", ".join(f"`{k}`" for k in sorted(configs))
+                results.append(
+                    _err(
+                        rc,
+                        f"Unknown runner_config `{rc}` in `{full_path}` "
+                        f"— not in scripts/ci/runner_configs.yml.\n\n"
+                        f"Known runner_configs: {known}",
+                    )
+                )
+                continue
+            install_script = cfg["install"]
+            if not _ALLOWED_INSTALL_SCRIPT.match(install_script):
+                results.append(
+                    _err(
+                        rc,
+                        f"Disallowed `install` value `{install_script}` for "
+                        f"runner_config `{rc}` in scripts/ci/runner_configs.yml. "
+                        f"The slash handler passes this string verbatim into a "
+                        f"shell step, so it must match `scripts/ci/cuda/*.sh`.",
+                    )
+                )
+                continue
+            runs_on = cfg.get("runs_on")
+            # Resolve $b200_runner sentinel: rerun-test never builds sgl-kernel,
+            # so always pick the non-kernel b200 pool.
+            if runs_on == "$b200_runner":
+                runs_on = _B200_DEFAULT_RUNNER
+            stage_m = re.search(r'stage\s*=\s*["\']([^"\']+)["\']', args_str)
+            suite = f"{stage_m.group(1)}-test-{rc}" if stage_m else rc
+            results.append(
+                {
+                    "suite": suite,
+                    "runner_label": runs_on,
+                    "install_script": install_script,
+                    "install_timeout": str(cfg["install_timeout"]),
+                    "rdma_devices": cfg.get("rdma_devices", ""),
+                    "is_cpu": False,
+                    "error": None,
+                }
             )
-        use_deepep = suite in DEEPEP_SUITES
-        return suite, runner, use_deepep, False, None
+        return results
 
-    suite = _extract_suite(content, "register_cpu_ci")
-    if suite:
-        return suite, "ubuntu-latest", False, True, None
+    if re.search(r"^[^#\n]*register_cpu_ci\s*\(", content, re.MULTILINE):
+        return [
+            {
+                "suite": "cpu",
+                "runner_label": "ubuntu-latest",
+                "install_script": "",
+                "install_timeout": "",
+                "rdma_devices": "",
+                "is_cpu": True,
+                "error": None,
+            }
+        ]
 
-    return (
-        None,
-        None,
-        False,
-        False,
-        (
-            f"No `register_cuda_ci()` or `register_cpu_ci()` found in `{full_path}`.\n\n"
-            f"This file may not be a registered CI test."
-        ),
-    )
+    return [
+        _err(
+            None,
+            f"No `register_cuda_ci(runner_config=...)` or `register_cpu_ci()` "
+            f"found in `{full_path}`. /rerun-test only supports tests "
+            f"registered via the new-style yml-driven API; nightly/weekly "
+            f"tests aren't dispatchable through this command.",
+        )
+    ]
 
 
 def _resolve_test_spec(test_spec):
     """
-    Resolve a single test spec into its components without dispatching.
+    Resolve a single test spec into one or more dispatch entries.
 
-    Returns a dict with keys: spec, resolved_path, test_command, suite,
-    runner_label, use_deepep, is_cpu, error.
+    A file registered on N pools (multiple `register_cuda_ci(...)` calls)
+    yields N entries — handle_rerun_test's grouping then sends one workflow
+    per pool. Multimodal and CPU files yield a single entry. Resolution
+    errors yield a one-element list with {"spec","error"}.
     """
     if "::" in test_spec:
         file_part, test_selector = test_spec.split("::", 1)
@@ -661,12 +810,12 @@ def _resolve_test_spec(test_spec):
 
     resolved_path, is_multimodal, err = resolve_test_file(file_part)
     if err:
-        return {"spec": test_spec, "error": err}
+        return [{"spec": test_spec, "error": err}]
 
     if is_multimodal:
         runner_label, err = detect_multimodal_suite(resolved_path)
         if err:
-            return {"spec": test_spec, "error": err}
+            return [{"spec": test_spec, "error": err}]
 
         # For multimodal pytest tests, use :: separator for test selection
         test_command = resolved_path
@@ -674,57 +823,68 @@ def _resolve_test_spec(test_spec):
             test_command = f"{resolved_path}::{test_selector}"
 
         print(
-            f"Resolved (multimodal): file={resolved_path}, selector={test_selector}, "
-            f"runner={runner_label}, command='{test_command}'"
+            f"Resolved (multimodal_gen): file={resolved_path}, "
+            f"selector={test_selector}, runner={runner_label}, "
+            f"command='{test_command}'"
         )
-        return {
-            "spec": test_spec,
-            "test_command": test_command,
-            "suite": "multimodal",
-            "runner_label": runner_label,
-            "use_deepep": False,
-            "is_cpu": False,
-            "install_diffusion": True,
-            "error": None,
-        }
-
-    suite, runner_label, use_deepep, is_cpu, err = detect_suite(resolved_path)
-    if err:
-        return {"spec": test_spec, "error": err}
+        return [
+            {
+                "spec": test_spec,
+                "test_command": test_command,
+                "mode": "multimodal_gen",
+                "runs_on": runner_label,
+                "install_script": "",
+                "install_timeout": "",
+                "rdma_devices": "",
+                "error": None,
+            }
+        ]
 
     test_command = resolved_path
     if test_selector:
         test_command = f"{resolved_path} {test_selector}"
 
-    print(
-        f"Resolved: file={resolved_path}, selector={test_selector}, "
-        f"suite={suite}, runner={runner_label}, deepep={use_deepep}, "
-        f"cpu={is_cpu}, command='{test_command}'"
-    )
-    return {
-        "spec": test_spec,
-        "test_command": test_command,
-        "suite": suite,
-        "runner_label": runner_label,
-        "use_deepep": use_deepep,
-        "is_cpu": is_cpu,
-        "install_diffusion": False,
-        "error": None,
-    }
+    out = []
+    for info in detect_suite(resolved_path):
+        if info["error"]:
+            out.append({"spec": test_spec, "error": info["error"]})
+            continue
+        mode = "cpu" if info["is_cpu"] else "cuda"
+        print(
+            f"Resolved: file={resolved_path}, selector={test_selector}, "
+            f"suite={info['suite']}, mode={mode}, runs_on={info['runner_label']}, "
+            f"install={info['install_script']}, rdma={info['rdma_devices']}, "
+            f"command='{test_command}'"
+        )
+        out.append(
+            {
+                "spec": test_spec,
+                "test_command": test_command,
+                "mode": mode,
+                "runs_on": info["runner_label"],
+                "install_script": info["install_script"],
+                "install_timeout": info["install_timeout"],
+                "rdma_devices": info["rdma_devices"],
+                "error": None,
+            }
+        )
+    return out
 
 
 def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker=""):
     """
-    Dispatch a single workflow run for a batch of resolved test specs
-    that share the same (runner_label, use_deepep, is_cpu).
+    Dispatch a single workflow run for a batch of resolved test specs that
+    share the same dispatch shape (mode + runs_on + install_script +
+    install_timeout + rdma_devices).
 
     Returns a dict with keys: specs, success, test_commands, runner_label, run_url, error.
     """
     test_commands = [r["test_command"] for r in batch]
-    runner_label = batch[0]["runner_label"]
-    use_deepep = batch[0]["use_deepep"]
-    is_cpu = batch[0]["is_cpu"]
-    install_diffusion = batch[0].get("install_diffusion", False)
+    mode = batch[0]["mode"]
+    runs_on = batch[0]["runs_on"]
+    install_script = batch[0]["install_script"]
+    install_timeout = batch[0]["install_timeout"]
+    rdma_devices = batch[0]["rdma_devices"]
 
     # Join multiple commands with newlines for the workflow to iterate over
     combined_command = "\n".join(test_commands)
@@ -751,11 +911,12 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
 
         pr_head_sha = None
         inputs = {
+            "mode": mode,
             "test_command": combined_command,
-            "runner_label": runner_label,
-            "use_deepep": str(use_deepep).lower(),
-            "is_cpu": str(is_cpu).lower(),
-            "install_diffusion": str(install_diffusion).lower(),
+            "runs_on": runs_on or "",
+            "install_script": install_script,
+            "install_timeout": install_timeout or "20",
+            "rdma_devices": rdma_devices,
             "reply_comment_id": str(reply_comment_id) if reply_comment_id else "",
             "reply_marker": reply_marker,
         }
@@ -803,7 +964,8 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
             "specs": [r["spec"] for r in batch],
             "success": True,
             "test_commands": test_commands,
-            "runner_label": runner_label,
+            "mode": mode,
+            "runs_on": runs_on,
             "run_url": run_url,
             "reply_marker": reply_marker,
         }
@@ -849,11 +1011,19 @@ def _check_rerun_test_permissions(gh_repo, pr, comment, user_perms, command_name
 
 
 def handle_rerun_test(
-    gh_repo, pr, comment, user_perms, test_specs, token, skip_permission_check=False
+    gh_repo,
+    pr,
+    comment,
+    user_perms,
+    test_specs,
+    token,
+    skip_permission_check=False,
+    command_label=None,
 ):
     """
     Handles the /rerun-test command. Resolves all test specs, groups them by
-    (runner_label, use_deepep, is_cpu), and dispatches one workflow per group.
+    dispatch shape (mode + runs_on + install_script + install_timeout +
+    rdma_devices), and dispatches one workflow per group.
     """
     if not skip_permission_check and not _check_rerun_test_permissions(
         gh_repo, pr, comment, user_perms, "rerun-test"
@@ -868,7 +1038,9 @@ def handle_rerun_test(
             "- `/rerun-test test/registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`\n"
             "- `/rerun-test registered/core/test_srt_endpoint.py::TestSRTEndpoint`\n"
             "- `/rerun-test test_srt_endpoint.py`\n"
-            "- `/rerun-test test_a.py test_b.py test_c.py` (multiple tests)"
+            "- `/rerun-test test_a.py test_b.py test_c.py` (multiple tests)\n"
+            "- `/rerun-test test_*backend*.py` (wildcard — reruns every matching "
+            "file; wrap the pattern in backticks so GitHub keeps the `*` literal)"
         )
         return False
 
@@ -878,31 +1050,83 @@ def handle_rerun_test(
         pr.create_issue_comment(gate_msg)
         return False
 
-    # Phase 1: Resolve all specs
-    resolved = []
+    # Phase 0: Expand wildcard specs into concrete test files. A spec whose
+    # file part contains a glob metacharacter (* ? [) expands to every
+    # matching file; plain specs pass through to single-file resolution.
     resolve_failures = []
+    seen_failures = set()
+
+    def _record_failure(spec, error):
+        # De-dupe failures by canonical path so the same un-dispatchable file
+        # reported two ways (explicit + glob, or two globs) yields one line.
+        key = spec.strip().strip("\"'`")
+        if key.startswith("test/"):
+            key = key[len("test/") :]
+        if key not in seen_failures:
+            seen_failures.add(key)
+            resolve_failures.append({"spec": spec, "error": error})
+
+    expanded_specs = []
     for spec in test_specs:
-        r = _resolve_test_spec(spec)
-        if r.get("error"):
-            resolve_failures.append(r)
-        else:
+        # Quotes/backticks are never meaningful here (the command isn't
+        # shell-parsed), so strip them. Backtick-wrapping is in fact the
+        # recommended way to write a glob: plain `*backend*` renders as italics
+        # in a GitHub comment, but `` `test_*backend*.py` `` stays literal — and
+        # either way the handler reads the raw body, so the `*` survives.
+        file_part = spec.split("::", 1)[0].strip().strip("\"'`")
+        if not _is_glob_pattern(file_part):
+            expanded_specs.append(spec)
+            continue
+        if "::" in spec:
+            _record_failure(
+                spec,
+                "Wildcard patterns can't be combined with a `::test` "
+                "selector — drop the `::...` to rerun whole files.",
+            )
+            continue
+        matched, err = expand_glob_spec(file_part)
+        if err:
+            _record_failure(spec, err)
+            continue
+        expanded_specs.extend(matched)
+
+    # Phase 1: Resolve all specs, de-duping by the *resolved* identity. A glob
+    # expands to `test/`-prefixed paths while an explicit spec keeps the form
+    # the user typed, so the same file requested both ways resolves to two
+    # different raw strings — keying de-dup on the resolved identity is what
+    # collapses them into a single dispatch instead of running twice.
+    # `runs_on` is included in the key so a file registered on N pools fans
+    # out into one dispatch per pool, instead of all-but-the-first collapsing.
+    resolved = []
+    seen_commands = set()
+    for spec in expanded_specs:
+        for r in _resolve_test_spec(spec):
+            if r.get("error"):
+                _record_failure(r["spec"], r["error"])
+                continue
+            key = (r["mode"], r["runs_on"], r["test_command"])
+            if key in seen_commands:
+                continue
+            seen_commands.add(key)
             resolved.append(r)
 
-    # Phase 2: Group by (runner_label, use_deepep, is_cpu, install_diffusion)
+    # Phase 2: Group by dispatch shape.
     groups = {}
     for r in resolved:
         key = (
-            r["runner_label"],
-            r["use_deepep"],
-            r["is_cpu"],
-            r.get("install_diffusion", False),
+            r["mode"],
+            r["runs_on"],
+            r["install_script"],
+            r["install_timeout"],
+            r["rdma_devices"],
         )
         groups.setdefault(key, []).append(r)
 
     # Phase 3a: Create placeholder reply comment so we have its ID before
     # dispatching workflows. This lets each dispatched run write its
     # success/failure result back to the right line in this comment.
-    reply_comment = pr.create_issue_comment("🚀 Dispatching rerun-test workflow(s)...")
+    dispatching = f"`{command_label}`" if command_label else "rerun-test workflow(s)"
+    reply_comment = pr.create_issue_comment(f"🚀 Dispatching {dispatching}...")
 
     # Phase 3b: Dispatch one workflow per group, with a unique per-batch
     # marker each. The marker is an HTML comment that the writeback step
@@ -926,12 +1150,7 @@ def handle_rerun_test(
     lines = []
     for dr in dispatch_results:
         if dr["success"]:
-            install_diff = any(
-                r.get("install_diffusion", False)
-                for r in resolved
-                if r["spec"] in dr["specs"]
-            )
-            if install_diff:
+            if dr["mode"] == "multimodal_gen":
                 cmds = "\n".join(
                     f"python3 -m pytest {cmd} -x" for cmd in dr["test_commands"]
                 )
@@ -940,15 +1159,16 @@ def handle_rerun_test(
                     f"cd test/ && python3 {cmd}" for cmd in dr["test_commands"]
                 )
             marker = dr.get("reply_marker", "")
+            label = dr["runs_on"] or dr["mode"]
             if dr.get("run_url"):
                 lines.append(
-                    f"🚀 `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): "
+                    f"🚀 `{label}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): "
                     f"⏳ [View workflow run]({dr['run_url']}) {marker}\n"
                     f"```\n{cmds}\n```"
                 )
             else:
                 lines.append(
-                    f"🚀 `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): ⏳ {marker}\n"
+                    f"🚀 `{label}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): ⏳ {marker}\n"
                     f"```\n{cmds}\n```\n"
                     f"⚠️ Could not retrieve workflow run URL. "
                     f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
@@ -961,6 +1181,11 @@ def handle_rerun_test(
         lines.append(f"⛔ `{r['spec']}`: {r['error']}")
 
     body = "\n\n".join(lines)
+    # Echo the originating command so each reply is self-identifying when
+    # several /rerun-test commands are in flight at once. Backtick-wrapping
+    # also keeps any `*` in the pattern from rendering as italics.
+    if command_label:
+        body = f"Results for `{command_label}`:\n\n{body}"
 
     successes = [dr for dr in dispatch_results if dr["success"]]
     if successes:
@@ -972,7 +1197,9 @@ def handle_rerun_test(
     return len(successes) > 0
 
 
-def handle_rerun_group(gh_repo, pr, comment, user_perms, group_names, token):
+def handle_rerun_group(
+    gh_repo, pr, comment, user_perms, group_names, token, command_label=None
+):
     """
     Handles the /rerun-group command. Expands one or more registered test
     groups into test file specs, then reuses /rerun-test dispatch behavior.
@@ -1019,6 +1246,7 @@ def handle_rerun_group(gh_repo, pr, comment, user_perms, group_names, token):
         test_specs,
         token,
         skip_permission_check=True,
+        command_label=command_label,
     )
 
 
@@ -1066,19 +1294,24 @@ def main():
 
     # 4. Parse Command and Execute
     first_line = comment_body.split("\n")[0].strip()
+    # `extra` argument opts in to also tagging `run-ci-extra`. Both
+    # `/tag-run-ci-label extra` and `/tag-and-rerun-ci extra` share this
+    # parser so the surface is symmetric.
+    tokens = first_line.split()
+    tag_extra = len(tokens) > 1 and "extra" in tokens[1:]
 
     if first_line.startswith("/tag-run-ci-label"):
-        handle_tag_run_ci(repo, pr, comment, user_perms)
+        handle_tag_run_ci(repo, pr, comment, user_perms, tag_extra=tag_extra)
 
     elif first_line.startswith("/rerun-failed-ci"):
         handle_rerun_failed_ci(repo, pr, comment, user_perms)
 
     elif first_line.startswith("/tag-and-rerun-ci"):
         # Perform both actions, but suppress individual reactions
-        print("Processing combined command: /tag-and-rerun-ci")
+        print(f"Processing combined command: /tag-and-rerun-ci (tag_extra={tag_extra})")
 
         tagged = handle_tag_run_ci(
-            repo, pr, comment, user_perms, react_on_success=False
+            repo, pr, comment, user_perms, react_on_success=False, tag_extra=tag_extra
         )
 
         # Wait for the label to propagate before triggering rerun
@@ -1098,10 +1331,6 @@ def main():
             print("Combined command finished, but no actions were taken.")
 
     elif first_line.startswith("/rerun-stage"):
-        # /rerun-stage is deprecated. Stage-level granularity is too coarse to map to
-        # a specific feature, and a stage rerun re-pays the cost of all unrelated tests
-        # in that stage. Use /rerun-test for selective UT runs, or /rerun-failed-ci /
-        # `run-ci` / `run-ci-extra` labels for a full rerun.
         print("/rerun-stage is deprecated; posting deprecation notice.")
         comment.create_reaction("-1")
         pr.create_issue_comment(
@@ -1128,11 +1357,27 @@ def main():
 
     elif first_line.startswith("/rerun-group"):
         group_names = first_line.split()[1:]
-        handle_rerun_group(repo, pr, comment, user_perms, group_names or None, token)
+        handle_rerun_group(
+            repo,
+            pr,
+            comment,
+            user_perms,
+            group_names or None,
+            token,
+            command_label=first_line,
+        )
 
     elif first_line.startswith("/rerun-test"):
         test_specs = first_line.split()[1:]
-        handle_rerun_test(repo, pr, comment, user_perms, test_specs or None, token)
+        handle_rerun_test(
+            repo,
+            pr,
+            comment,
+            user_perms,
+            test_specs or None,
+            token,
+            command_label=first_line,
+        )
 
     else:
         print(f"Unknown or ignored command: {first_line}")

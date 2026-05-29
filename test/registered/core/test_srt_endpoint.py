@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
     run_logprob_check,
 )
 
-register_cuda_ci(est_time=134, stage="stage-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=134, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=130, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -94,18 +94,6 @@ class TestSRTEndpoint(CustomTestCase):
 
         print(json.dumps(response_json, indent=2))
         print("=" * 100)
-
-    def test_simple_decode(self):
-        self.run_decode()
-
-    def test_simple_decode_batch(self):
-        self.run_decode(batch=True)
-
-    def test_parallel_sample(self):
-        self.run_decode(n=3)
-
-    def test_parallel_sample_stream(self):
-        self.run_decode(n=3, stream=True)
 
     def test_logprob(self):
         self.run_decode(

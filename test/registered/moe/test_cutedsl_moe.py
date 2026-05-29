@@ -780,7 +780,8 @@ class TestCuteDslV2(unittest.TestCase):
 class TestCuteDslV1(unittest.TestCase):
     """Correctness tests for the CuteDSL v1 (deepep) path.
 
-    The v1 path (apply_without_routing_weights -> flashinfer_cutedsl_moe_masked)
+    The v1 path (flashinfer_cutedsl_moe_masked, dispatched via the
+    @register_fused_func("deepep", "flashinfer_cutedsl") MoeRunner entry)
     is used when --moe-runner-backend flashinfer_cutedsl and --moe-a2a-backend
     deepep are combined.  It expects:
       - W13 in default [Gate, Up] order (load_up_proj_weight_first = False)
