@@ -909,13 +909,21 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         else:
             runner_backend = MoeRunnerBackend.TRITON
 
-        self._lora_runner = MoeRunner(
-            runner_backend,
-            base_layer.moe_runner_config,
-            lora_enabled=True,
-        )
+        self._lora_runner_backend = runner_backend
 
-        if runner_backend.is_marlin():
+        if runner_backend.is_sgl_flashinfer_trtllm():
+            # sgl_flashinfer_trtllm LoRA setup lives in lora/trtllm_moe/.
+            from sglang.srt.lora.trtllm_moe.lora_layer import (
+                init_sgl_flashinfer_trtllm_lora,
+            )
+
+            init_sgl_flashinfer_trtllm_lora(self, base_layer)
+        elif runner_backend.is_marlin():
+            self._lora_runner = MoeRunner(
+                runner_backend,
+                base_layer.moe_runner_config,
+                lora_enabled=True,
+            )
             from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
                 CompressedTensorsFusedMoEMethod,
             )
@@ -928,6 +936,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             )
             self._quant_info = base_layer.quant_method.get_marlin_quant_info(base_layer)
         elif runner_backend.is_triton():
+            self._lora_runner = MoeRunner(
+                runner_backend,
+                base_layer.moe_runner_config,
+                lora_enabled=True,
+            )
             assert base_layer.quant_method is not None, "Quant method must be set"
             self._quant_info = base_layer.quant_method.get_triton_quant_info(base_layer)
         else:
@@ -1022,10 +1035,18 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # Use pre-computed quant info (doesn't change so not sure why we need to pass it in every time)
         quant_info = self._quant_info
 
-        # Run the only lora moe runner (Triton)
-        combine_input = self._lora_runner.run(
-            dispatch_output, quant_info, lora_info=lora_info
-        )
+        if self._lora_runner_backend.is_sgl_flashinfer_trtllm():
+            from sglang.srt.lora.trtllm_moe.lora_layer import (
+                dispatch_sgl_flashinfer_trtllm_lora,
+            )
+
+            combine_input = dispatch_sgl_flashinfer_trtllm_lora(
+                dispatch_output, quant_info, base_layer, lora_info
+            )
+        else:
+            combine_input = self._lora_runner.run(
+                dispatch_output, quant_info, lora_info=lora_info
+            )
 
         final_hidden_states = base_layer.dispatcher.combine(combine_input=combine_input)
 

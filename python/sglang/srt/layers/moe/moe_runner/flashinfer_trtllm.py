@@ -583,6 +583,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
     quant_info: FlashInferTrtllmFp8MoeQuantInfo,
     runner_config: MoeRunnerConfig,
     use_routed_topk: bool = False,
+    use_sgl_kernel: bool = False,
 ) -> StandardCombineInput:
     from flashinfer.fused_moe import Fp8QuantizationType
 
@@ -663,7 +664,14 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 topk_weights=topk_output.topk_weights,
             )
 
-            output = trtllm_fp8_block_scale_routed_moe_wrapper(
+            if use_sgl_kernel:
+                from sglang.srt.layers.moe.sgl_flashinfer_trtllm_moe import (
+                    sgl_trtllm_fp8_block_scale_routed_moe_wrapper as fp8_routed_moe,
+                )
+            else:
+                fp8_routed_moe = trtllm_fp8_block_scale_routed_moe_wrapper
+
+            output = fp8_routed_moe(
                 topk_ids=packed_topk_ids,
                 routing_bias=None,
                 hidden_states=a_q,
@@ -697,7 +705,14 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         else:
             assert TopKOutputChecker.format_is_bypassed(topk_output)
 
-            output = trtllm_fp8_block_scale_moe_wrapper(
+            if use_sgl_kernel:
+                from sglang.srt.layers.moe.sgl_flashinfer_trtllm_moe import (
+                    sgl_trtllm_fp8_block_scale_moe_wrapper as fp8_moe,
+                )
+            else:
+                fp8_moe = trtllm_fp8_block_scale_moe_wrapper
+
+            output = fp8_moe(
                 routing_logits=router_logits,
                 routing_bias=correction_bias,
                 hidden_states=a_q,
@@ -786,6 +801,14 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         output = symm_output
 
     return StandardCombineInput(hidden_states=output)
+
+
+# === sgl_flashinfer_trtllm LoRA dispatch lives in lora/trtllm_moe/ ===
+# Re-export so existing import sites continue to resolve; the body was
+# moved to keep this file focused on the non-LoRA trtllm paths.
+from sglang.srt.lora.trtllm_moe.lora_dispatch import (  # noqa: E402,F401
+    fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora,
+)
 
 
 @dataclass
@@ -1176,6 +1199,22 @@ def fused_experts_none_to_flashinfer_trtllm(
         )
     raise TypeError(
         f"Unexpected quant_info type for flashinfer_trtllm: {type(quant_info)}"
+    )
+
+
+@register_fused_func("none", "sgl_flashinfer_trtllm")
+def fused_experts_none_to_sgl_flashinfer_trtllm(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> StandardCombineInput:
+    if isinstance(quant_info, FlashInferTrtllmFp8MoeQuantInfo):
+        return fused_experts_none_to_flashinfer_trtllm_fp8(
+            dispatch_output, quant_info, runner_config, use_sgl_kernel=True
+        )
+    raise TypeError(
+        f"Unexpected quant_info type for sgl_flashinfer_trtllm: {type(quant_info)}. "
+        "The copied backend currently supports the FP8 Qwen path only."
     )
 
 

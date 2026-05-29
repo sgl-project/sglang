@@ -430,12 +430,25 @@ class TopK(MultiPlatformOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
+        moe_runner_backend = get_moe_runner_backend()
         if self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
-        elif get_moe_runner_backend().is_triton_kernels():
+        elif moe_runner_backend.is_triton_kernels():
             output_format = TopKOutputFormat.TRITON_KERNEL
-        elif get_moe_runner_backend().is_flashinfer_trtllm() or (
-            get_moe_runner_backend().is_flashinfer_mxfp4() and not self.is_fp4_experts
+        elif moe_runner_backend.is_sgl_flashinfer_trtllm():
+            try:
+                from sglang.srt.server_args import get_global_server_args
+
+                use_standard_for_lora = bool(get_global_server_args().enable_lora)
+            except ValueError:
+                use_standard_for_lora = False
+            output_format = (
+                TopKOutputFormat.STANDARD
+                if use_standard_for_lora
+                else TopKOutputFormat.BYPASSED
+            )
+        elif moe_runner_backend.is_flashinfer_trtllm() or (
+            moe_runner_backend.is_flashinfer_mxfp4() and not self.is_fp4_experts
         ):
             output_format = TopKOutputFormat.BYPASSED
         else:
