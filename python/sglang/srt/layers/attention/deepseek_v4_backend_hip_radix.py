@@ -1220,7 +1220,13 @@ class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
         inner_fb = SimpleNamespace(
             batch_size=forward_batch.batch_size,
             forward_mode=ForwardMode.DECODE,
-            actual_forward_mode=forward_batch.forward_mode,
+            # Propagate the runtime mode from the replay fb_view so inner
+            # DSV4 backends can detect IDLE and apply their idle substitution
+            # (build_replay_fb_view puts the captured mode in `forward_mode`
+            # and the real runtime mode in `actual_forward_mode`).
+            actual_forward_mode=getattr(
+                forward_batch, "actual_forward_mode", forward_batch.forward_mode
+            ),
             input_ids=getattr(forward_batch, "input_ids", None),
             positions=getattr(forward_batch, "positions", None),
             req_pool_indices=forward_batch.req_pool_indices,
