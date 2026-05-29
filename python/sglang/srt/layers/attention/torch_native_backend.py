@@ -43,6 +43,10 @@ class TorchNativeAttnBackend(AttentionBackend):
         """Init the metadata for a forward pass."""
         pass
 
+    def init_forward_data(self, forward_batch: ForwardBatch):
+        # Delegate to legacy method while Phase E hasn't moved the body yet.
+        self.init_forward_metadata(forward_batch)
+
     def _run_sdpa_forward_extend(
         self,
         query: torch.Tensor,
