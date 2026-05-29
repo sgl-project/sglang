@@ -137,8 +137,8 @@ def build_replay_fb_view(
         uses this for IDLE-batch substitution; other backends ignore it.
 
     This view subsumes the ``_replay_forward_batch`` side channel DSV4
-    previously read out-of-band — step 04 swaps that mechanism for this
-    explicit fb_view field.
+    previously read out-of-band; step 04 swapped that mechanism for the
+    explicit ``actual_forward_mode`` + ``out_cache_loc`` fields here.
     """
     return SimpleNamespace(
         batch_size=bs,
@@ -1280,10 +1280,6 @@ class CudaGraphRunner:
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.attn_backend
-        # FIXME: implicit channel for backends (dsv4) that need forward_batch
-        # in replay metadata prep. Step 04 will remove it by extending
-        # build_replay_fb_view to cover everything dsv4 reads.
-        attn_backend._replay_forward_batch = forward_batch
         fb_view = build_replay_fb_view(
             forward_batch=forward_batch,
             buffers=buffers,
@@ -1295,7 +1291,6 @@ class CudaGraphRunner:
             is_encoder_decoder=self.is_encoder_decoder,
         )
         attn_backend.init_forward_data_out_graph(fb_view)
-        attn_backend._replay_forward_batch = None
 
         # Store fields
         self.raw_bs = raw_bs
