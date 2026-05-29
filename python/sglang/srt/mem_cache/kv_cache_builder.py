@@ -159,6 +159,8 @@ def build_kv_cache(
         tp_worker.model_runner.hybrid_gdn_config is not None
         or tp_worker.model_runner.mamba2_config is not None
         or _registry_needs_mamba
+        or tp_worker.model_runner.kimi_linear_config is not None
+        or tp_worker.model_runner.hybrid_lightning_config is not None
     )
 
     sliding_window_size = None
