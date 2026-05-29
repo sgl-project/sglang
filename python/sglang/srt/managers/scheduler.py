@@ -604,7 +604,7 @@ class Scheduler(
                 self.ps.attn_tp_rank == 0
                 or self.server_args.enable_metrics_for_all_schedulers
             ),
-            scripted_runtime_active=self.server_args.scripted_runtime_fn_path
+            enable_scripted_runtime=self.server_args.scripted_runtime_fn_path
             is not None,
         )
 
@@ -1542,11 +1542,6 @@ class Scheduler(
         self.grammar_manager = GrammarManager(self)
 
     def init_scripted_runtime(self) -> None:
-        # Test-only wiring; see ``sglang.test.scripted_runtime``. When
-        # ``scripted_runtime_fn_path`` is set, ``init_ipc_channels`` has
-        # already swapped ``recv_from_tokenizer`` for a ``TokenizerRecvProxy``;
-        # the ``ScriptedRuntime`` drives the scheduler from inside its event
-        # loop and injects synthetic requests through that proxy.
         if self.server_args.scripted_runtime_fn_path is not None:
             from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 
@@ -3591,11 +3586,6 @@ class Scheduler(
         raise NotImplementedError()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
-        # mode="abort" is handled entirely in TokenizerManager (translated to
-        # AbortReq) and is never forwarded here, so the scheduler only ever
-        # sees retract / in_place. Guard so a stray abort — e.g. the dataclass
-        # default mode, or a caller that bypasses TokenizerManager — fails
-        # loudly instead of silently falling through to a no-op pause.
         assert recv_req.mode in ("retract", "in_place"), (
             f"Scheduler.pause_generation got unsupported mode {recv_req.mode!r}; "
             f"abort is handled in TokenizerManager and must not reach the scheduler"
@@ -3875,15 +3865,6 @@ def run_scheduler_process(
         ScriptedRuntimeFinished as _ScriptedRuntimeFinished,
     )
 
-    # Spawn-mode mp subprocesses don't inherit the parent's sys.path, so
-    # forward the directory of the script module before constructing the
-    # scheduler (which imports the script by qualified name).
-    if (
-        server_args.scripted_runtime_fn_path is not None
-        and server_args.scripted_runtime_sys_path_entry
-        and server_args.scripted_runtime_sys_path_entry not in sys.path
-    ):
-        sys.path.insert(0, server_args.scripted_runtime_sys_path_entry)
     dp_rank = configure_scheduler_process(
         server_args,
         gpu_id,

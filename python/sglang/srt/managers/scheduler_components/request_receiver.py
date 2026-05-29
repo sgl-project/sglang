@@ -58,9 +58,6 @@ class SchedulerRequestReceiver:
     max_recv_per_poll: int
     stream_output: Callable[..., None]
     get_last_forward_mode: Callable[[], Any]
-    # Testing only. When set, ``recv_requests`` yields to the script
-    # generator once per iteration. ``Any`` to avoid an import cycle on
-    # the concrete ``ScriptedRuntime``.
     scripted_runtime: Optional[Any] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
