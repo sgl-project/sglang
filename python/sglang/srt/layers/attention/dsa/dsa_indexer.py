@@ -12,6 +12,9 @@ from sglang.jit_kernel.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
+from sglang.srt.compilation.compilation_config import (
+    is_pcg_dsa_eager_fusion_enabled,
+)
 from sglang.srt.compilation.piecewise_context_manager import (
     get_forward_context,
     is_in_piecewise_cuda_graph,
@@ -30,6 +33,7 @@ from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import 
     eager_on_graph,
 )
 from sglang.srt.model_executor.breakable_cuda_graph.context import (
+    call_with_graph_break,
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.state_capturer.indexer_topk import (
@@ -104,9 +108,7 @@ if TYPE_CHECKING:
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
-_enable_pcg_dsa_eager_fusion = (
-    _is_cuda and envs.SGLANG_ENABLE_PCG_DSA_EAGER_FUSION.get()
-)
+_enable_pcg_dsa_eager_fusion = is_pcg_dsa_eager_fusion_enabled(_is_cuda)
 
 
 def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
@@ -116,11 +118,6 @@ def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
 if _is_cuda:
     from sglang.srt.compilation.compilation_config import register_split_op
     from sglang.srt.utils.custom_op import register_custom_op
-
-    def _maybe_register_pcg_dsa_eager_split_op():
-        if _enable_pcg_dsa_eager_fusion:
-            return register_split_op()
-        return lambda op_func: op_func
 
     @register_custom_op(mutates_args=["topk_result"])
     @register_split_op()
@@ -163,7 +160,7 @@ if _is_cuda:
     bcg_k_cache_and_topk_result = eager_on_graph(True)(k_cache_and_topk_result)
 
     @register_custom_op(mutates_args=["topk_result"])
-    @_maybe_register_pcg_dsa_eager_split_op()
+    @register_split_op()
     def dsa_indexer_pcg_dispatch(
         layer_id: int,
         x: torch.Tensor,
@@ -1516,12 +1513,9 @@ class Indexer(MultiPlatformOp):
                     (0, self.index_topk), device=x_meta.device, dtype=torch.int32
                 )
             )
-            dispatch_fn = (
-                bcg_dsa_indexer_pcg_dispatch
-                if is_in_breakable_cuda_graph()
-                else dsa_indexer_pcg_dispatch
-            )
-            dispatch_fn(
+            call_with_graph_break(
+                bcg_dsa_indexer_pcg_dispatch,
+                dsa_indexer_pcg_dispatch,
                 layer_id=layer_id,
                 x=x,
                 q_lora=q_lora,
@@ -1722,12 +1716,9 @@ class Indexer(MultiPlatformOp):
                         device=q_fp8.device,
                         dtype=torch.int32,
                     )
-                    k_cache_topk_fn = (
-                        bcg_k_cache_and_topk_result
-                        if is_in_breakable_cuda_graph()
-                        else k_cache_and_topk_result
-                    )
-                    k_cache_topk_fn(
+                    call_with_graph_break(
+                        bcg_k_cache_and_topk_result,
+                        k_cache_and_topk_result,
                         layer_id=layer_id,
                         key=key,
                         q_fp8=q_fp8,
