@@ -1060,7 +1060,7 @@ class DecodePreallocQueue:
                     # Two-phase prefetch: trigger L3->L2 and defer prealloc if started
                     if decode_req.prefetch_triggered_time == 0.0:
                         self._trigger_prefetch_if_needed(
-                            decode_req.req, decode_req.req.last_host_node, prefix_len
+                            decode_req.req, match_result.last_host_node, prefix_len
                         )
                         if decode_req.req.rid in self.tree_cache.ongoing_prefetch:
                             self._unlock_prefix(decode_req.req, prefix_len)

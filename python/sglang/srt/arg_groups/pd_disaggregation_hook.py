@@ -51,6 +51,25 @@ def handle_pd_disaggregation(server_args: "ServerArgs") -> None:
                 )
             server_args.disable_radix_cache = False
             logger.warning("EXPERIMENTAL: Radix cache is enabled for decode server")
+
+            if server_args.disaggregation_decode_enable_hicache:
+                server_args.enable_hierarchical_cache = True
+                if server_args.disaggregation_decode_hicache_size > 0:
+                    server_args.hicache_size = (
+                        server_args.disaggregation_decode_hicache_size
+                    )
+                else:
+                    server_args.hicache_ratio = (
+                        server_args.disaggregation_decode_hicache_ratio
+                    )
+                server_args.hicache_write_policy = (
+                    server_args.disaggregation_decode_hicache_write_policy
+                )
+                logger.warning(
+                    "EXPERIMENTAL: HiRadixCache is enabled for decode server "
+                    f"(ratio={server_args.hicache_ratio}, "
+                    f"write_policy={server_args.hicache_write_policy})"
+                )
         else:
             server_args.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
