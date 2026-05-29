@@ -48,6 +48,7 @@ class TestPhi4ReasoningCPU(unittest.TestCase):
                 input_lens=(1024,),
                 output_lens=(1024,),
                 enable_profile=False,
+                baseline_output_throughput=50.0,
             ),
             share_server=True,
         )

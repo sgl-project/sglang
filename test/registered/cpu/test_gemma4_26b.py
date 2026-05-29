@@ -46,6 +46,7 @@ class TestGemma4_26BCPU(unittest.TestCase):
                 input_lens=(1024,),
                 output_lens=(1024,),
                 enable_profile=False,
+                baseline_output_throughput=80.0,
             ),
             share_server=True,
         )
