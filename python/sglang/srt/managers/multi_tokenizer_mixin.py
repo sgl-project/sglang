@@ -51,6 +51,7 @@ from sglang.srt.managers.io_struct import (
     TokenizerWorkerRegistration,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -518,6 +519,8 @@ def run_multi_detokenizer_router_process(
     server_args: ServerArgs,
     port_args: PortArgs,
 ):
+    # Load plugins so hooks can override MultiDetokenizerRouter and dependencies.
+    load_plugins()
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer_router")
     configure_logger(server_args)

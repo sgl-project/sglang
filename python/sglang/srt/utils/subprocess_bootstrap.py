@@ -4,7 +4,18 @@ import importlib
 from collections.abc import Callable
 from typing import Any
 
+DEFAULT_DATA_PARALLEL_CONTROLLER_TARGET = (
+    "sglang.srt.managers.data_parallel_controller:"
+    "run_data_parallel_controller_process"
+)
+DEFAULT_DETOKENIZER_TARGET = (
+    "sglang.srt.managers.detokenizer_manager:run_detokenizer_process"
+)
+DEFAULT_MULTI_DETOKENIZER_ROUTER_TARGET = (
+    "sglang.srt.managers.multi_tokenizer_mixin:" "run_multi_detokenizer_router_process"
+)
 DEFAULT_SCHEDULER_TARGET = "sglang.srt.managers.scheduler:run_scheduler_process"
+SCHEDULER_PIDS_ARG = "scheduler_pids"
 SubprocessTarget = Callable[..., Any] | str
 
 

@@ -16,10 +16,10 @@
 from typing import Callable, Optional
 
 from sglang.srt.entrypoints.engine import (
+    DEFAULT_DETOKENIZER_TARGET,
     DEFAULT_SCHEDULER_TARGET,
     SubprocessTarget,
     init_tokenizer_manager,
-    run_detokenizer_process,
 )
 from sglang.srt.server_args import ServerArgs
 
@@ -28,7 +28,7 @@ def launch_server(
     server_args: ServerArgs,
     init_tokenizer_manager_func: Callable = init_tokenizer_manager,
     run_scheduler_process_func: SubprocessTarget = DEFAULT_SCHEDULER_TARGET,
-    run_detokenizer_process_func: Callable = run_detokenizer_process,
+    run_detokenizer_process_func: SubprocessTarget = DEFAULT_DETOKENIZER_TARGET,
     execute_warmup_func: Optional[Callable] = None,
     launch_callback: Optional[Callable[[], None]] = None,
 ):

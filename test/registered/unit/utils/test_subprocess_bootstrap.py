@@ -9,6 +9,10 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from sglang.srt.utils.subprocess_bootstrap import (
+    DEFAULT_DATA_PARALLEL_CONTROLLER_TARGET,
+    DEFAULT_DETOKENIZER_TARGET,
+    DEFAULT_MULTI_DETOKENIZER_ROUTER_TARGET,
+    DEFAULT_SCHEDULER_TARGET,
     get_subprocess_target_args,
     resolve_subprocess_target,
     run_subprocess_target,
@@ -102,6 +106,30 @@ class TestSubprocessBootstrap(TestCase):
 
         self.assertIs(target, run_subprocess_target)
         self.assertEqual(args, ("bootstrap_test_target:target", "arg", 1))
+
+    def test_default_targets_are_module_function_strings(self):
+        for target in [
+            DEFAULT_DATA_PARALLEL_CONTROLLER_TARGET,
+            DEFAULT_DETOKENIZER_TARGET,
+            DEFAULT_MULTI_DETOKENIZER_ROUTER_TARGET,
+            DEFAULT_SCHEDULER_TARGET,
+        ]:
+            with self.subTest(target=target):
+                module_name, separator, function_name = target.partition(":")
+                self.assertTrue(module_name)
+                self.assertEqual(separator, ":")
+                self.assertTrue(function_name)
+
+    def test_get_subprocess_target_args_wraps_non_scheduler_targets(self):
+        for target in [
+            DEFAULT_DATA_PARALLEL_CONTROLLER_TARGET,
+            DEFAULT_DETOKENIZER_TARGET,
+            DEFAULT_MULTI_DETOKENIZER_ROUTER_TARGET,
+        ]:
+            with self.subTest(target=target):
+                subprocess_target, args = get_subprocess_target_args(target, "arg")
+                self.assertIs(subprocess_target, run_subprocess_target)
+                self.assertEqual(args, (target, "arg"))
 
     def test_get_subprocess_target_args_preserves_callable_target(self):
         def target_func():
