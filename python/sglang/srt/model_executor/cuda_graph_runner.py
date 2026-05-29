@@ -140,8 +140,11 @@ def build_replay_fb_view(
         input_ids=buffers.input_ids[:num_tokens],
         req_pool_indices=buffers.req_pool_indices[:bs],
         seq_lens=buffers.seq_lens[:bs],
-        seq_lens_sum=forward_batch.seq_lens_sum
-        + (bs - raw_bs) * seq_len_fill_value,
+        seq_lens_sum=(
+            None
+            if forward_batch.seq_lens_sum is None
+            else forward_batch.seq_lens_sum + (bs - raw_bs) * seq_len_fill_value
+        ),
         seq_lens_cpu=buffers.seq_lens_cpu[:bs],
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
@@ -1112,14 +1115,11 @@ class CudaGraphRunner:
             if lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            attn_backend.init_forward_metadata_capture_cuda_graph(
-                bs,
-                num_tokens,
-                req_pool_indices,
-                seq_lens,
-                encoder_lens,
-                forward_batch.forward_mode,
-                forward_batch.spec_info,
+            # forward_batch was constructed above from `buffers` and already
+            # carries the padded capture-time tensors, so it can be passed
+            # straight to the new init API.
+            attn_backend.init_forward_data_out_graph(
+                forward_batch, in_capture=True
             )
 
             def run_once():
@@ -1277,23 +1277,20 @@ class CudaGraphRunner:
         else:
             attn_backend = self.attn_backend
         # FIXME: implicit channel for backends (dsv4) that need forward_batch
-        # in replay metadata prep. Should become a real param on the interface.
+        # in replay metadata prep. Step 04 will remove it by extending
+        # build_replay_fb_view to cover everything dsv4 reads.
         attn_backend._replay_forward_batch = forward_batch
-        seq_lens_sum_arg = (
-            None
-            if forward_batch.seq_lens_sum is None
-            else forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
+        fb_view = build_replay_fb_view(
+            forward_batch=forward_batch,
+            buffers=buffers,
+            bs=bs,
+            raw_bs=raw_bs,
+            num_tokens=bs * self.num_tokens_per_bs,
+            seq_len_fill_value=self.seq_len_fill_value,
+            capture_forward_mode=self.capture_forward_mode,
+            is_encoder_decoder=self.is_encoder_decoder,
         )
-        attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            buffers.req_pool_indices[:bs],
-            buffers.seq_lens[:bs],
-            seq_lens_sum_arg,
-            buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
-            self.capture_forward_mode,
-            forward_batch.spec_info,
-            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
-        )
+        attn_backend.init_forward_data_out_graph(fb_view)
         attn_backend._replay_forward_batch = None
 
         # Store fields
