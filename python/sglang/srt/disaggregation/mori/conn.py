@@ -120,9 +120,7 @@ class TransferInfo:
         # exactly zero (full prefix hit), dst_kv_indices is empty but aux is
         # still needed -> not dummy.
         is_dummy = (
-            dst_kv_indices.size == 0
-            and dst_aux_index < 0
-            and not decode_prefix_len
+            dst_kv_indices.size == 0 and dst_aux_index < 0 and not decode_prefix_len
         )
         return cls(
             room=room,
