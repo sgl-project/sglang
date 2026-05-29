@@ -715,6 +715,7 @@ class Scheduler(
             "num_experts_per_tok",
             "num_experts_per_token",
             "top_k_experts",
+            "moe_top_k",
         )
         if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
             initialize_moe_config(self.server_args)
@@ -1134,10 +1135,12 @@ class Scheduler(
         # Init mm receiver for EPD disaggregation mode
         if (
             self.server_args.language_only
-            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+            and self.server_args.encoder_transfer_backend
+            in ["zmq_to_scheduler", "mooncake"]
         ):
             self.mm_receiver = create_mm_receiver(
                 self.server_args,
+                dtype=self.model_config.dtype,
                 hf_config=self.model_config.hf_config,
                 pp_rank=self.ps.pp_rank,
                 tp_rank=self.ps.tp_rank,
@@ -1431,6 +1434,9 @@ class Scheduler(
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+
+            # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
+            self.schedule_stream.wait_stream(self.forward_stream)
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
