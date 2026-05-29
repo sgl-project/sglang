@@ -14,7 +14,10 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    ScheduleBatch,
+    set_mamba_track_indices_from_reqs,
+)
 from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -35,6 +38,7 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
 )
+from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
 from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
 
 _is_cuda = is_cuda()
@@ -93,9 +97,6 @@ class EagleDraftInputV2Mixin:
 
         bs = batch.batch_size()
 
-        # Now seq_lens is correct
-        batch.maybe_wait_verify_done()
-
         # Accumulate penalty
         # This is a relaxed version of penalties for speculative decoding.
         if batch.sampling_info.penalizer_orchestrator.is_required:
@@ -141,21 +142,23 @@ class EagleDraftInputV2Mixin:
         cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
         nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
 
+        # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
+        # barrier has chained to the prev forward -> host stalls a full forward.
+        cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+        nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
         if page_size == 1:
             out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
         else:
-            cur_kv_lens = cur_kv_lens_cpu.to(device=batch.device)
-            nxt_kv_lens = nxt_kv_lens_cpu.to(device=batch.device)
             last_loc = get_last_loc(
                 batch.req_to_token_pool.req_to_token,
                 batch.req_pool_indices,
-                cur_kv_lens,
+                cur_kv_lens_device,
             )
             out_cache_loc = alloc_paged_token_slots_extend(
                 batch.tree_cache,
-                cur_kv_lens,
+                cur_kv_lens_device,
                 cur_kv_lens_cpu,
-                nxt_kv_lens,
+                nxt_kv_lens_device,
                 nxt_kv_lens_cpu,
                 last_loc,
                 num_needed_tokens,
@@ -164,20 +167,16 @@ class EagleDraftInputV2Mixin:
         assign_req_to_token_pool_func(
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
-            cur_kv_lens_cpu.to(device=batch.device),
-            nxt_kv_lens_cpu.to(device=batch.device),
+            cur_kv_lens_device,
+            nxt_kv_lens_device,
             out_cache_loc,
             bs,
         )
 
-        # FIXME(lsyin): make this sync optional
-        batch.seq_lens_cpu = batch.seq_lens.cpu()
-        batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
-
     def prepare_for_v2_draft(
         self: EagleDraftInput,
         req_to_token_pool: ReqToTokenPool,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
         cuda_graph_runner: EAGLEDraftCudaGraphRunner,
         draft_model_runner: ModelRunner,
         topk: int,
@@ -211,15 +210,15 @@ class EagleDraftInputV2Mixin:
             if draft_model_runner.spec_algorithm.is_standalone()
             else CaptureHiddenMode.LAST
         )
-        batch.capture_hidden_mode = capture_mode
         self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
+        batch.capture_hidden_mode = capture_mode
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph
 
     def prepare_for_extend_to_fill_draft_kvcache(
         self,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
         predict: torch.Tensor,
         num_draft_tokens: int,
         draft_model_runner: Any,
@@ -230,24 +229,32 @@ class EagleDraftInputV2Mixin:
 
         batch.spec_info = self
         batch.input_ids = predict
-        batch.seq_lens = batch.seq_lens + num_draft_tokens
-        batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
-        batch.seq_lens_sum += extend_num_tokens
-        batch.extend_seq_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
-        batch.extend_prefix_lens = seq_lens_cpu_.tolist()
+        maybe_detect_oob(
+            batch.input_ids,
+            0,
+            batch.model_config.vocab_size,
+            "v2 prepare_for_extend_to_fill_draft_kvcache input_ids",
+        )
+        batch.extend_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
+        batch.prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens
         capture_mode = (
             CaptureHiddenMode.NULL
             if draft_model_runner.spec_algorithm.is_standalone()
             else CaptureHiddenMode.FULL
         )
-        batch.capture_hidden_mode = capture_mode
         batch.forward_mode = (
             ForwardMode.IDLE
             if batch.forward_mode.is_idle()
             else ForwardMode.DRAFT_EXTEND_V2
         )
+        batch.capture_hidden_mode = capture_mode
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        # Forward sees post-write length (draft extend writes num_draft_tokens
+        # slots); mutation stays on forward_batch to preserve SB.seq_lens.
+        forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
+        forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + num_draft_tokens
+        forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         if not batch.forward_mode.is_idle() and not can_cuda_graph:
             draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
@@ -259,13 +266,19 @@ class EagleVerifyInputV2Mixin:
     def prepare_for_v2_verify(
         self: EagleVerifyInput,
         req_to_token_pool: ReqToTokenPool,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
         target_worker: TpModelWorker,
     ):
         if not batch.forward_mode.is_idle():
             # Assign cache locations
             bs = len(batch.req_pool_indices)
             batch.input_ids = self.draft_token
+            maybe_detect_oob(
+                batch.input_ids,
+                0,
+                batch.model_config.vocab_size,
+                "v2 prepare_for_verify input_ids",
+            )
             device = batch.input_ids.device
             batch.out_cache_loc = assign_extend_cache_locs_func(
                 req_pool_indices=batch.req_pool_indices,
@@ -277,29 +290,15 @@ class EagleVerifyInputV2Mixin:
                 device=device,
             )
 
-            # Set mamba_track_indices for mamba prefix-cache state tracking
             if get_global_server_args().enable_mamba_extra_buffer():
-                mapping = (
-                    req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
-                )
-                req_pool_idx_tensor = batch.req_pool_indices.to(
-                    device=mapping.device, dtype=torch.int64
-                )
-                track_col_idx = torch.tensor(
-                    [req.mamba_next_track_idx for req in batch.reqs],
-                    dtype=torch.int64,
-                    pin_memory=True,
-                ).to(mapping.device, non_blocking=True)
-                batch.mamba_track_indices = mapping[
-                    req_pool_idx_tensor, track_col_idx
-                ].to(dtype=torch.int64)
+                set_mamba_track_indices_from_reqs(batch)
                 batch.mamba_track_mask = None
                 batch.mamba_track_seqlens = None
 
             # Populate seq_lens_cpu/seq_lens_sum on the verify input so that
             # TBO's split_spec_info can slice the custom_mask correctly.
             self.seq_lens_cpu = batch.seq_lens_cpu
-            self.seq_lens_sum = batch.seq_lens_sum
+            self.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
         # Get a forward batch
         batch.forward_mode = (
@@ -322,17 +321,15 @@ class EagleVerifyInputV2Mixin:
         )
         if can_run_cuda_graph:
             target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
-        else:
-            if not batch.forward_mode.is_idle():
-                target_worker.model_runner.attn_backend.init_forward_metadata(
-                    verify_forward_batch
-                )
+        # Non-cuda-graph: defer init to forward_extend, which runs after
+        # `_forward_raw -> prepare_mlp_sync_batch` pads the batch. Initing
+        # here would use pre-pad shapes and trip DSv4 indexer shape match.
 
         return verify_forward_batch, can_run_cuda_graph
 
     def sample(
         self: EagleVerifyInput,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
         logits_output: LogitsProcessorOutput,
         vocab_mask: torch.Tensor = None,
     ):
@@ -416,18 +413,21 @@ class EagleVerifyInputV2Mixin:
             target_probs = F.softmax(
                 next_token_logits / expanded_temperature, dim=-1
             )  # (bs * num_draft_tokens, vocab_size)
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
             target_probs = top_k_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ks, self.draft_token_num, dim=0
                 ),
             )  # (bs * num_draft_tokens, vocab_size)
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
             target_probs = top_p_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ps, self.draft_token_num, dim=0
                 ),
             )
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
             draft_probs = torch.zeros_like(target_probs)
 
