@@ -571,11 +571,15 @@ class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
 def _pack_topk_for_flashinfer_routed(
     topk_ids: torch.Tensor, topk_weights: torch.Tensor
 ) -> torch.Tensor:
-    """Pack routed top-k tensors into FlashInfer's int32 format."""
-    packed_ids = topk_ids.to(torch.int32)
-    packed_weights = topk_weights.to(torch.bfloat16)
-    packed = (packed_ids << 16) | packed_weights.view(torch.int16).to(torch.int32)
-    return packed
+    """Pack routed top-k tensors into FlashInfer's int32 format.
+
+    Single fused Triton launch (bit-identical to the prior elementwise
+    cast/shift/or cluster); collapses the per-MoE-layer pack kernels on the
+    decode critical path.
+    """
+    from sglang.jit_kernel.flashinfer_trtllm_moe.topk_pack import fused_pack_topk
+
+    return fused_pack_topk(topk_ids, topk_weights)
 
 
 def fused_experts_none_to_flashinfer_trtllm_fp8(

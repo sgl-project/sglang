@@ -653,7 +653,11 @@ def _merged_experts_fused_moe_lora_add_impl(
         )
         sorted_token_ids = sorted_token_ids[:tight_padded]
         expert_ids = expert_ids[: tight_padded // block_size]
-        expert_ids = fused_sanitize_expert_ids(expert_ids, virtual_num_experts)
+        # Single adapter (max_loras == 1): the per-adapter virtual-expert offset
+        # (safe_lora * num_experts) is always 0, so align never emits an id >=
+        # virtual_num_experts and fused_sanitize_expert_ids is an identity -> skip it.
+        if max_loras != 1:
+            expert_ids = fused_sanitize_expert_ids(expert_ids, virtual_num_experts)
         result = (
             sorted_token_ids,
             expert_ids,

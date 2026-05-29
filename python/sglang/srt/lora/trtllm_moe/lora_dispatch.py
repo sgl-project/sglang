@@ -99,8 +99,12 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora(
         token_lora_mapping = None
         fused_lora_routing_cache = {}
 
-    a_q, a_sf = per_token_group_quant_fp8(hidden_states, quant_info.weight_block_k)
-    a_sf_t = a_sf.t().contiguous()
+    # Fuse the per-token scale transpose into the quant kernel (column-major scales) so the
+    # `.t()` is a free view -> drops the standalone ~2us transpose+copy. Byte/shape-identical.
+    a_q, a_sf = per_token_group_quant_fp8(
+        hidden_states, quant_info.weight_block_k, column_major_scales=True
+    )
+    a_sf_t = a_sf.t()
 
     gate_up_delta_shape = (
         hidden_states.shape[0],
