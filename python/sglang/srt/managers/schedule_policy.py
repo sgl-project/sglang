@@ -37,7 +37,7 @@ import torch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch, truncate_fill_ids
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     InitLoadBackParams,
@@ -683,7 +683,7 @@ class PrefillAdder:
 
         truncated = req.extend_input_len > _rem_tokens
         req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
-        req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
+        truncate_fill_ids(req, len(req.prefix_indices) + req.extend_input_len)
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
@@ -803,7 +803,7 @@ class PrefillAdder:
             trunc_len = self.rem_chunk_tokens
 
             req.set_extend_input_len(trunc_len)
-            req.fill_ids = req.fill_ids[:trunc_len]
+            truncate_fill_ids(req, trunc_len)
             self.can_run_list.append(req)
             self.new_chunked_req = req
             self._update_prefill_budget(0, trunc_len, 0)
@@ -890,7 +890,7 @@ class PrefillAdder:
                     )
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+                req.set_extend_input_len(req.get_full_len() - len(req.prefix_indices))
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 
@@ -956,7 +956,7 @@ class PrefillAdder:
 
                 # Chunked prefill
                 req.set_extend_input_len(trunc_len)
-                req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
+                truncate_fill_ids(req, len(req.prefix_indices) + trunc_len)
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req

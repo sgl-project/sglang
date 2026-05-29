@@ -1405,7 +1405,7 @@ class Req(ReqDllmMixin):
         # - extend_input_len: Number of tokens that need to be processed in this extend batch
         self.extend_input_len = extend_input_len
         if self.logprob_start_len == -1:
-            logprob_start_len = len(self.fill_ids)
+            logprob_start_len = self.get_full_len()
         else:
             # logprob_start_len should be at least the length of the prefix indices
             logprob_start_len = max(self.logprob_start_len, len(self.prefix_indices))
