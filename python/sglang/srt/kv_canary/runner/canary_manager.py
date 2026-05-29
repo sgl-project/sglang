@@ -20,7 +20,7 @@ from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.perturb.manager import PerturbManager
 from sglang.srt.kv_canary.runner.health_checker import KernelRunCounterHealthChecker
 from sglang.srt.kv_canary.runner.stats_logger import PeriodicCanaryStatsLogger
-from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceReport
+from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceReporter
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation_manager import ViolationManager
 from sglang.srt.kv_canary.single_forward_manager.manager import (
@@ -95,8 +95,8 @@ class CanaryManager:
             envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL.get()
         )
         if swa_divergence_interval > 0:
-            self._swa_divergence_report: Optional[SwaDivergenceReport] = (
-                SwaDivergenceReport(
+            self._swa_divergence_report: Optional[SwaDivergenceReporter] = (
+                SwaDivergenceReporter(
                     device=device,
                     d2h_stream=self._d2h_stream,
                     interval=swa_divergence_interval,

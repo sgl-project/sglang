@@ -25,7 +25,7 @@ _FULL_IDX = 0
 _SWA_IDX = 1
 
 
-class SwaDivergenceReport:
+class SwaDivergenceReporter:
     def __init__(
         self,
         *,

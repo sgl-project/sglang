@@ -12,7 +12,7 @@ from sglang.srt.kv_canary.buffer_group import PoolKind
 from sglang.srt.kv_canary.runner import swa_divergence as swa_div_module
 from sglang.srt.kv_canary.runner.swa_divergence import (
     SwaDivergenceLog,
-    SwaDivergenceReport,
+    SwaDivergenceReporter,
     compute_swa_full_idx_divergence,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -80,10 +80,10 @@ def _run_compute(
     return int(count.item())
 
 
-class TestSwaDivergenceReport(CustomTestCase):
+class TestSwaDivergenceReporter(CustomTestCase):
     def test_swa_divergence_log_emitted(self) -> None:
         d2h_stream = torch.cuda.Stream(device=_DEVICE)
-        stats = SwaDivergenceReport(
+        stats = SwaDivergenceReporter(
             device=_DEVICE,
             d2h_stream=d2h_stream,
             interval=10,
@@ -150,7 +150,7 @@ class TestSwaDivergenceReport(CustomTestCase):
 
     def test_swa_divergence_counts_monotonic_increasing(self) -> None:
         d2h_stream = torch.cuda.Stream(device=_DEVICE)
-        stats = SwaDivergenceReport(
+        stats = SwaDivergenceReporter(
             device=_DEVICE,
             d2h_stream=d2h_stream,
             interval=10,
@@ -350,7 +350,7 @@ class TestSwaFullIdxDivergenceCompute(CustomTestCase):
         )
 
 
-class TestSwaDivergenceReportWithCompute(CustomTestCase):
+class TestSwaDivergenceReporterWithCompute(CustomTestCase):
     def test_swa_divergence_report_emits_swa_full_idx_divergence_from_compute(
         self,
     ) -> None:
@@ -369,7 +369,7 @@ class TestSwaDivergenceReportWithCompute(CustomTestCase):
         swa_allocator = _make_allocator_stub(mapping)
         req_to_token_pool = _make_req_to_token_pool_stub(req_to_token)
         d2h_stream = torch.cuda.Stream(device=_DEVICE)
-        stats = SwaDivergenceReport(
+        stats = SwaDivergenceReporter(
             device=_DEVICE,
             d2h_stream=d2h_stream,
             interval=10,
@@ -424,7 +424,7 @@ class TestCanaryManagerSwaDivergenceWiring(CanaryManagerTestCase):
         ), envs.SGLANG_KV_CANARY_PERTURB_TARGET_GROUP.override("full"):
             manager = make_manager(device=self.device)
         self.assertIsNotNone(manager._swa_divergence_report)
-        self.assertIsInstance(manager._swa_divergence_report, SwaDivergenceReport)
+        self.assertIsInstance(manager._swa_divergence_report, SwaDivergenceReporter)
 
 
 if __name__ == "__main__":

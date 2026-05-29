@@ -21,7 +21,7 @@ from sglang.srt.kv_canary.runner.kernel_launcher import (
     invoke_plan,
     launch_endpoints_per_forward,
 )
-from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceReport
+from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceReporter
 from sglang.srt.kv_canary.single_forward_manager.data import (
     PostOpsInsideGraphOutputBuffer,
 )
@@ -73,7 +73,7 @@ class SingleForwardManager:
         per_forward_write_entry_capacity: int,
         d2h_stream: torch.cuda.Stream,
         token_oracle_manager: Optional[TokenOracleManager],
-        swa_divergence_report: Optional[SwaDivergenceReport],
+        swa_divergence_report: Optional[SwaDivergenceReporter],
         is_eagle_draft_decode: bool,
     ) -> None:
         self._config = config
@@ -85,7 +85,7 @@ class SingleForwardManager:
         self._swa_window_size = swa_window_size
         self._d2h_stream = d2h_stream
         self._token_oracle_manager: Optional[TokenOracleManager] = token_oracle_manager
-        self._swa_divergence_report: Optional[SwaDivergenceReport] = (
+        self._swa_divergence_report: Optional[SwaDivergenceReporter] = (
             swa_divergence_report
         )
         self._is_eagle_draft_decode: bool = is_eagle_draft_decode
