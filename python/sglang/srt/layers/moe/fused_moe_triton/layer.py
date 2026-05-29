@@ -766,6 +766,39 @@ class FusedMoE(torch.nn.Module):
 
         return False
 
+    def restore_canonical_weight_shapes(self) -> None:
+        if not isinstance(self.quant_method, UnquantizedFusedMoEMethod):
+            return
+
+        is_gated = self.moe_runner_config.is_gated
+        w13_rows = (
+            2 * self.intermediate_size_per_partition
+            if is_gated
+            else self.intermediate_size_per_partition
+        )
+        canonical_shapes = {
+            "w13_weight": (self.num_local_experts, w13_rows, self.hidden_size),
+            "w2_weight": (
+                self.num_local_experts,
+                self.hidden_size,
+                self.intermediate_size_per_partition,
+            ),
+        }
+
+        for weight_name, expected_shape in canonical_shapes.items():
+            if not hasattr(self, weight_name):
+                continue
+            param = getattr(self, weight_name)
+            if tuple(param.data.shape) == expected_shape:
+                continue
+            if param.data.numel() != expected_shape[0] * expected_shape[1] * expected_shape[2]:
+                raise RuntimeError(
+                    f"Cannot restore canonical MoE weight shape for {weight_name}: "
+                    f"current shape={tuple(param.data.shape)}, "
+                    f"expected shape={expected_shape}."
+                )
+            param.data = param.data.reshape(expected_shape)
+
     def _weight_loader_impl(
         self,
         param: torch.nn.Parameter,
@@ -795,10 +828,14 @@ class FusedMoE(torch.nn.Module):
         # canonical load-time shapes before copying checkpoint tensors.
         if isinstance(method, UnquantizedFusedMoEMethod):
             if _is_npu:
-                if weight_name.endswith(".experts.w2_weight") or weight_name.endswith(
+                if weight_name.endswith(".experts.w2_weight") :
+                    print(param.shape,weight_name)
+                    if param.data.shape[1] != loaded_weight.shape[0]:
+                        param.data = param.data.transpose(1, 2).contiguous()
+                if weight_name.endswith(
                     ".experts.w13_weight"
                 ):
-                    if param.data.shape[1] != loaded_weight.shape[0]:
+                    if param.data.shape[2] != loaded_weight.shape[1]:
                         param.data = param.data.transpose(1, 2).contiguous()
             print('=======================')
             method.maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
