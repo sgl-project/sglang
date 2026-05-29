@@ -2325,24 +2325,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             }
         )
 
+        # Skip DECODE on prefill nodes (indexer would OOM) and EXTEND on decode nodes.
+        disagg_mode = self.server_args.disaggregation_mode
+        run_decode = self.is_generation and disagg_mode != "prefill"
+        run_extend = disagg_mode != "decode"
+
         logger.info(
-            "PP-parallel DeepGEMM warmup start (pp_rank=%d, tp_rank=%d, batch_sizes=%s).",
+            "PP-parallel DeepGEMM warmup start "
+            "(pp_rank=%d, tp_rank=%d, batch_sizes=%s, "
+            "disagg=%s, run_decode=%s, run_extend=%s).",
             self.pp_rank,
             self.tp_rank,
             batch_sizes,
+            disagg_mode,
+            run_decode,
+            run_extend,
         )
         t0 = time.perf_counter()
         with torch.inference_mode():
             for bs in batch_sizes:
-                if self.is_generation:
+                if run_decode:
                     self._dummy_run(
                         batch_size=bs,
                         forward_mode_override=ForwardMode.DECODE,
                     )
-                self._dummy_run(
-                    batch_size=bs,
-                    forward_mode_override=ForwardMode.EXTEND,
-                )
+                if run_extend:
+                    self._dummy_run(
+                        batch_size=bs,
+                        forward_mode_override=ForwardMode.EXTEND,
+                    )
 
         logger.info(
             "PP-parallel DeepGEMM warmup done in %.2fs (pp_rank=%d).",
