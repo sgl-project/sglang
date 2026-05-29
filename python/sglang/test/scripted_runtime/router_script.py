@@ -7,9 +7,9 @@ forwards success / failure back over a unix-socket connection.
 
 Crucially, when a sub-script raises (including ``AssertionError``), the
 router *captures* the traceback into a socket message and *keeps
-running* — it does not re-raise. Re-raising would surface as
-``ScriptedRuntimeFinished(ok=False)`` and tear the engine down, voiding
-every remaining test in the class.
+running* — it does not re-raise. Re-raising would tear the engine down
+(the runtime ``sys.exit``s the scheduler subprocess), voiding every
+remaining test in the class.
 """
 
 from __future__ import annotations
