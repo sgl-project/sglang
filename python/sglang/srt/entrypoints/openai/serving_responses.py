@@ -141,12 +141,13 @@ def _normalize_responses_input(
                         break
             if not reasoning_text:
                 content = item.get("content", [])
-                for c in content:
-                    if hasattr(c, "model_dump"):
-                        c = c.model_dump()
-                    if isinstance(c, dict) and c.get("type") == "reasoning_text":
-                        reasoning_text = c.get("text", "")
-                        break
+                if content:
+                    for c in content:
+                        if hasattr(c, "model_dump"):
+                            c = c.model_dump()
+                        if isinstance(c, dict) and c.get("type") == "reasoning_text":
+                            reasoning_text = c.get("text", "")
+                            break
             pending_assistant["reasoning_content"] = reasoning_text
 
         elif item_type == "function_call":
@@ -2137,10 +2138,22 @@ class OpenAIServingResponses(OpenAIServingChat):
     ) -> tuple[str, Optional[list[ResponseFunctionToolCall]]]:
         """Process tool calls in the response"""
 
-        # Handle required or named tool choice
-        if tool_choice == "required" or (
-            isinstance(tool_choice, ToolChoice) and tool_choice.type == "function"
-        ):
+        is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
+        if self.tool_call_parser:
+            parser = FunctionCallParser(tools, self.tool_call_parser)
+            should_try_parser = (
+                not is_required or parser.detector.supports_structural_tag()
+            )
+            if should_try_parser:
+                remaining_text, tool_calls = parse_tool_calls_from_content(
+                    content=content,
+                    tools=tools,
+                    tool_call_parser=self.tool_call_parser,
+                    generate_tool_call_id=self._process_tool_call_id,
+                )
+                return remaining_text, tool_calls
+
+        if is_required:
             try:
                 tool_call_data = orjson.loads(content)
                 tool_calls = []
@@ -2156,18 +2169,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                     )
                     tool_calls.append(function_tool_call)
                 return "", tool_calls
-            except json.JSONDecodeError as e:
+            except Exception as e:
                 logger.error(f"Tool call parsing error: {e}")
                 return content, None
 
-        remaining_text, tool_calls = parse_tool_calls_from_content(
-            content=content,
-            tools=tools,
-            tool_call_parser=self.tool_call_parser,
-            generate_tool_call_id=self._process_tool_call_id,
-        )
-
-        return remaining_text, tool_calls
+        return content, None
 
     def _should_return_logprobs(self, request: ResponsesRequest) -> bool:
         """Check if logprobs should be returned based on include parameter."""
