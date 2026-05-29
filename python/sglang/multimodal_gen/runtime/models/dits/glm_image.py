@@ -37,7 +37,9 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import Timesteps
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -63,8 +65,8 @@ class GlmImageLayerKVCache:
             self.k_cache = k
             self.v_cache = v
         else:
-            self.k_cache = torch.cat([self.k_cache, k], dim=2)
-            self.v_cache = torch.cat([self.v_cache, v], dim=2)
+            self.k_cache = torch.cat([self.k_cache, k], dim=1)
+            self.v_cache = torch.cat([self.v_cache, v], dim=1)
 
     def get(self):
         return self.k_cache, self.v_cache
@@ -661,7 +663,7 @@ class GlmImageAdaLayerNormContinuous(nn.Module):
         return x
 
 
-class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
+class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     r"""
     Args:
         patch_size (`int`, defaults to `2`):

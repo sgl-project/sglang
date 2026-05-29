@@ -25,9 +25,10 @@ dependencies = [
   "cuda-python>=13.0",
   "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "datasets",
+  "distro",
   "einops",
   "fastapi",
-  "flashinfer_python==0.6.11.post1", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_python[cu13]==0.6.11.post1", # keep it aligned with jit-cache version in Dockerfile
   "flashinfer_cubin==0.6.11.post1",
   "gguf",
   "interegular",
@@ -37,7 +38,7 @@ dependencies = [
   "ninja",
   "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
   "numpy",
-  "nvidia-cutlass-dsl==4.5.0",
+  "nvidia-cutlass-dsl[cu13]==4.5.1",
   "nvidia-ml-py",
   "openai-harmony==0.0.4",
   "openai==2.6.1",
@@ -60,7 +61,7 @@ dependencies = [
   "setproctitle",
   "flash-attn-4>=4.0.0b9",
   "sgl-deep-gemm==0.1.0",
-  "sglang-kernel==0.4.2.post1",
+  "sglang-kernel==0.4.3",
   "soundfile==0.13.1",
   "tiktoken",
   "tilelang==0.1.8",
@@ -75,13 +76,13 @@ dependencies = [
   "torchvision",
   "tqdm",
   "mistral_common>=1.11.0",
-  "transformers==5.6.0",
+  "transformers==5.8.1",
   "uvicorn",
   "uvloop",
   "watchfiles",
-  "xgrammar==0.2.0",
+  "xgrammar==0.2.1",
   "smg-grpc-servicer>=0.5.0",
-  "kernels",
+  "kernels<0.15",
 ]
 
 [[tool.uv.index]]

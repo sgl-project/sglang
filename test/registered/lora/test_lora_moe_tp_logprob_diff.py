@@ -32,11 +32,7 @@ from sglang.test.test_utils import (
     is_in_ci,
 )
 
-register_cuda_ci(
-    est_time=200,
-    stage="stage-b",
-    runner_config="2-gpu-large",
-)
+register_cuda_ci(est_time=200, stage="extra-a", runner_config="2-gpu-large")
 
 LOGPROB_THRESHOLD = 5e-04
 MAX_NEW_TOKENS = 10

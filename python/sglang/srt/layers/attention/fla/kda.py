@@ -26,7 +26,14 @@ from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.fla.op import exp, log
 from sglang.srt.layers.attention.fla.utils import (
     check_shared_mem,
+    is_intel,
 )
+
+if is_intel:
+    from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_delta_h import (
+        chunk_gated_delta_rule_fwd_h,
+    )
+
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 

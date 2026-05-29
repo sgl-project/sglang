@@ -14,7 +14,7 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, stage="stage-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestDisaggregationPriorityQueueing(unittest.TestCase):
@@ -30,7 +30,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.model_config = SimpleNamespace(num_key_value_heads=8)
         scheduler.disagg_prefill_bootstrap_queue = MagicMock()
         scheduler.disagg_decode_prealloc_queue = MagicMock()
-        scheduler.send_to_tokenizer = MagicMock()
+        scheduler.ipc_channels = MagicMock()
         return scheduler
 
     def _new_req(self, priority=None):
@@ -72,7 +72,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler._add_request_to_queue(req)
 
         scheduler.disagg_decode_prealloc_queue.add.assert_not_called()
-        scheduler.send_to_tokenizer.send_output.assert_called_once()
+        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
         req.time_stats.trace_ctx.abort.assert_called_once()
 
 
@@ -138,7 +138,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         scheduler.enable_hisparse = False
         scheduler.waiting_queue = []
         scheduler.last_batch = None
-        scheduler.stream_output = MagicMock()
+        scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
         return queue
 
@@ -197,7 +197,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         )
         self.assertEqual([decode_req.req.rid for decode_req in failed], ["failed-low"])
         self.assertEqual(queue.queue, [])
-        queue.scheduler.stream_output.assert_called_once_with(
+        queue.scheduler.output_streamer.stream_output.assert_called_once_with(
             [failed_low.req], failed_low.req.return_logprob
         )
 

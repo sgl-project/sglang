@@ -33,6 +33,10 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.layers.amx_utils import (
+    CPUQuantMethod,
+    _amx_process_weight_after_loading,
+)
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
@@ -46,6 +50,8 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
@@ -57,6 +63,7 @@ from sglang.srt.utils import (
     next_power_of_2,
     round_up,
     set_weight_attrs,
+    use_intel_amx_backend,
 )
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
@@ -138,9 +145,12 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
+_is_cpu = is_cpu()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
+_is_cpu_amx_available = cpu_has_amx_support()
+_sm120_mxfp4_min_warps_patched = False
 
 if _is_hip:
     # import aiter
@@ -156,6 +166,49 @@ if _is_hip:
         dynamic_mxfp4_quant = e8m0_shuffle = err
 
 
+def _patch_sm120_mxfp4_min_warps():
+    global _sm120_mxfp4_min_warps_patched
+    if _sm120_mxfp4_min_warps_patched:
+        return
+
+    import inspect
+
+    from triton_kernels.matmul_ogs_details.opt_flags_details import opt_flags_nvidia
+    from triton_kernels.tensor import get_layout
+    from triton_kernels.tensor_details.layout import StridedLayout
+
+    compute_num_warps = opt_flags_nvidia.compute_num_warps
+    params = inspect.signature(compute_num_warps).parameters
+
+    if "is_persistent" in params and not getattr(
+        compute_num_warps, "_sglang_sm120_mxfp4_patch", False
+    ):
+
+        def _compute_num_warps_sm120_mxfp4(
+            block_m, block_n, is_persistent, precision_config
+        ):
+            selected_num_warps = compute_num_warps(
+                block_m, block_n, is_persistent, precision_config
+            )
+            weight_scale = getattr(precision_config, "weight_scale", None)
+            weight_scale_layout = get_layout(weight_scale)
+            if (
+                not is_persistent
+                and weight_scale is not None
+                and (
+                    weight_scale_layout is StridedLayout
+                    or isinstance(weight_scale_layout, StridedLayout)
+                )
+            ):
+                return max(selected_num_warps, 4)
+            return selected_num_warps
+
+        _compute_num_warps_sm120_mxfp4._sglang_sm120_mxfp4_patch = True
+        opt_flags_nvidia.compute_num_warps = _compute_num_warps_sm120_mxfp4
+
+    _sm120_mxfp4_min_warps_patched = True
+
+
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
     import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
@@ -165,8 +218,8 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
 
     if is_sm120_supported():
         # SM120 desktop Blackwell does not support the persistent/TMA MXFP4 path.
-        # This MXFP4 path uses StridedLayout and the non-persistent kernel with
-        # block_k=128 so the selected tile stays within the per-block shared-memory budget.
+        # This MXFP4 path uses StridedLayout and the non-persistent kernel.
+        _patch_sm120_mxfp4_min_warps()
         from triton_kernels.tensor_details.layout import StridedLayout
 
         value_layout = StridedLayout
@@ -175,7 +228,6 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
         scale_layout_opts = {}
         constraints = {
             "is_persistent": False,
-            "block_k": 128,
             "num_stages": 1,
         }
         opt_flags.update_opt_flags_constraints(constraints)
@@ -806,6 +858,30 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.w2_weight_triton_tensor = w2_weight
             del layer.w13_weight
             del layer.w2_weight
+        elif _is_cpu and _is_cpu_amx_available:
+            _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            if use_intel_amx_backend(layer):
+                packed_w13_weight_scale = torch.ops.sgl_kernel.convert_scale_packed(
+                    layer.w13_weight_scale
+                )
+                packed_w2_weight_scale = torch.ops.sgl_kernel.convert_scale_packed(
+                    layer.w2_weight_scale
+                )
+                layer.w13_weight_scale = Parameter(
+                    packed_w13_weight_scale, requires_grad=False
+                )
+                layer.w2_weight_scale = Parameter(
+                    packed_w2_weight_scale, requires_grad=False
+                )
+                if hasattr(layer, "w13_weight_bias"):
+                    layer.w13_weight_bias = Parameter(
+                        layer.w13_weight_bias.float(), requires_grad=False
+                    )
+                if hasattr(layer, "w2_weight_bias"):
+                    layer.w2_weight_bias = Parameter(
+                        layer.w2_weight_bias.float(), requires_grad=False
+                    )
+            return
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 
@@ -963,7 +1039,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto():
             # Must match apply() priority: _use_aiter before use_triton_kernels.
-            if _use_aiter and get_moe_a2a_backend().is_none():
+            if _use_aiter and get_moe_a2a_backend().supports_aiter():
                 moe_runner_backend = MoeRunnerBackend.AITER
             elif self.use_triton_kernels:
                 moe_runner_backend = MoeRunnerBackend.TRITON_KERNELS
@@ -1064,6 +1140,33 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+        if use_intel_amx_backend(layer):
+            from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
+
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+            x, topk_weights = apply_topk_weights_cpu(
+                self.moe_runner_config.apply_router_weight_on_input, topk_weights, x
+            )
+            output = torch.ops.sgl_kernel.fused_experts_cpu(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                False,  # inplace See [Note] inplace should be False in fused_experts.
+                CPUQuantMethod.MXFP4,
+                layer.w13_weight_scale,  # w1_scale
+                layer.w2_weight_scale,  # w2_scale
+                None,  # w1_zp
+                None,  # w2_zp
+                None,  # block_size
+                getattr(layer, "w13_weight_bias", None),
+                getattr(layer, "w2_weight_bias", None),
+                layer.moe_runner_config.gemm1_alpha,
+                layer.moe_runner_config.gemm1_clamp_limit,
+                True,  # is_vnni
+            )
+            return StandardCombineInput(hidden_states=output)
 
         if self.use_marlin:
             assert TopKOutputChecker.format_is_standard(topk_output)
@@ -1317,7 +1420,7 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
     ):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto() and get_moe_a2a_backend().is_none():
+        if moe_runner_backend.is_auto() and get_moe_a2a_backend().supports_aiter():
             moe_runner_backend = MoeRunnerBackend.AITER
 
         if moe_runner_backend.is_aiter():

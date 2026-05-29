@@ -12,6 +12,7 @@ Covers:
 """
 
 import unittest
+from array import array
 
 import torch
 
@@ -30,7 +31,7 @@ from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=12, stage="stage-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 
 def _build_tree(
@@ -110,6 +111,7 @@ def _swa_alloc(allocator, need_size):
 
 
 def _insert_chain(tree, allocator, token_ids):
+    token_ids = array("q", token_ids)
     indices = _swa_alloc(allocator, len(token_ids))
     assert indices is not None
     tree.insert(InsertParams(key=RadixKey(token_ids), value=indices))

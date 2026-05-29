@@ -4,7 +4,8 @@
   "name": "SGLang Documentation",
   "seo": {
     "metatags": {
-      "google-site-verification": "bX3ofyYQhraIpAYf4DpyZQXZO_G4xLR_RqeBAKnJA7g"
+      "google-site-verification": "bX3ofyYQhraIpAYf4DpyZQXZO_G4xLR_RqeBAKnJA7g",
+      "canonical": "https://docs.sglang.io"
     }
   },
   "redirects": [
@@ -904,7 +905,10 @@
                   "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_5_examples",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_glm5_examples",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_faq"
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_faq",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_operator_performance_optimizing",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_profiling",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_operator_development"
                 ]
               },
               "docs/hardware-platforms/cpu_server",
@@ -1030,6 +1034,7 @@
                   {
                     "group": "StepFun",
                     "pages": [
+                      "cookbook/autoregressive/StepFun/Step-3.7-Flash",
                       "cookbook/autoregressive/StepFun/Step3.5",
                       "cookbook/autoregressive/StepFun/Step3-VL-10B"
                     ]
@@ -1037,6 +1042,7 @@
                   {
                     "group": "InclusionAI",
                     "pages": [
+                      "cookbook/autoregressive/InclusionAI/Ring-2.6-1T",
                       "cookbook/autoregressive/InclusionAI/Ling-2.6",
                       "cookbook/autoregressive/InclusionAI/Ling-2.5-1T",
                       "cookbook/autoregressive/InclusionAI/Ring-2.5-1T",

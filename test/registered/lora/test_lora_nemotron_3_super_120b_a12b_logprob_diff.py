@@ -34,11 +34,7 @@ import sglang as sgl
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(
-    est_time=100,
-    suite="nightly-4-gpu-b200",
-    nightly=True,
-)
+register_cuda_ci(est_time=100, stage="extra-b", runner_config="4-gpu-b200")
 
 BASE_MODEL = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
 LORA_HF_REPO = "opherlie/lora-test-case-NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
