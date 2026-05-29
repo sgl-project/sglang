@@ -951,7 +951,7 @@ class MoriKVManager(CommonKVManager):
         if not self.state_mem_descs:
             return []
 
-        state_types = getattr(self.kv_args, "state_types", None) or []
+        state_types = self.kv_args.state_types
         if not state_types:
             raise RuntimeError(
                 "PD state transfer failed: kv_args.state_types is empty but "
@@ -965,10 +965,8 @@ class MoriKVManager(CommonKVManager):
                 f"remote={len(peer_info.dst_state_mem_descs)})"
             )
 
-        src_state_item_lens = self.kv_args.state_item_lens or []
-        src_state_dim_per_tensor = (
-            getattr(self.kv_args, "state_dim_per_tensor", None) or []
-        )
+        src_state_item_lens = self.kv_args.state_item_lens
+        src_state_dim_per_tensor = self.kv_args.state_dim_per_tensor
 
         statuses: List[TransferStatus] = []
         for i, st in enumerate(state_types):
@@ -1470,10 +1468,10 @@ class MoriKVReceiver(CommonKVReceiver):
         decode_tp_rank = str(self.kv_mgr.kv_args.engine_rank).encode("ascii")
         kv_item_len = str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii")
         packed_state_item_lens = pack_int_lists(
-            self.kv_mgr.kv_args.state_item_lens or [], "I"
+            self.kv_mgr.kv_args.state_item_lens, "I"
         )
         packed_state_dim_per_tensor = pack_int_lists(
-            getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", []) or [], "I"
+            self.kv_mgr.kv_args.state_dim_per_tensor, "I"
         )
 
         for bootstrap_info in self.bootstrap_infos:
