@@ -132,6 +132,36 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         torch.cuda.synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 16.0, device=self.device)))
 
+    def test_adjacent_breaks_are_chained_without_empty_segment(self):
+        """Adjacent eager breaks should share one replay slot."""
+        x = torch.zeros(4, device=self.device)
+        y = torch.zeros(4, device=self.device)
+
+        @self.eager_on_graph(enable=True)
+        def add_one(src):
+            return src + 1.0
+
+        @self.eager_on_graph(enable=True)
+        def double(src):
+            return src * 2.0
+
+        graph = self.BreakableCUDAGraph()
+        stream = torch.cuda.Stream(self.device)
+        with self.BreakableCUDAGraphCapture(graph, stream=stream):
+            t1 = x + 1.0
+            t2 = add_one(t1)
+            t3 = double(t2)
+            y.copy_(t3 + 3.0)
+
+        self.assertEqual(len(graph._segments), 2)
+        self.assertEqual(len(graph._break_fns), 1)
+
+        # Replay: x=5 -> +1=6 -> add_one=7 -> double=14 -> +3=17
+        x.fill_(5.0)
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(torch.allclose(y, torch.full((4,), 17.0, device=self.device)))
+
     def test_eager_on_graph_disabled(self):
         """@eager_on_graph(enable=False) should be a no-op passthrough."""
 

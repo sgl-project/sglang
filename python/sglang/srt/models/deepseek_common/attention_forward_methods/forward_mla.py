@@ -24,6 +24,12 @@ from sglang.srt.lora.deepseek_mla_correction import (
 from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
 )
+from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -136,6 +142,10 @@ if _is_cuda:
             topk_indices=topk_indices,
         )
 
+    bcg_mla_bmm_then_unified_attention = eager_on_graph(True)(
+        mla_bmm_then_unified_attention
+    )
+
 
 if _use_aiter:
     # aiter ROCm/aiter#2958 renamed the public `fused_qk_rmsnorm` in
@@ -199,10 +209,13 @@ class DeepseekMLAForwardMixin:
     ) -> bool:
         if not _enable_pcg_dsa_eager_fusion:
             return False
-        if not (_is_cuda and is_in_piecewise_cuda_graph()):
+        if not (
+            _is_cuda
+            and (is_in_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
+        ):
             return False
-        # Keep this fusion on the same non-speculative extend PCG surface as
-        # dsa_indexer_pcg_dispatch. This path already goes through
+        # Keep this fusion on the same non-speculative extend PCG/BCG surface
+        # as dsa_indexer_pcg_dispatch. This path already goes through
         # unified_attention_with_output via RadixAttention.forward, so bypassing
         # RadixAttention does not change the backend call shape.
         if not forward_batch.forward_mode.is_extend_without_speculative():
@@ -619,7 +632,12 @@ class DeepseekMLAForwardMixin:
                         "llama_4_scaling": llama_4_scaling,
                     }
                 if q_nope_out_buf is not None:
-                    mla_bmm_then_unified_attention(
+                    bmm_attention_fn = (
+                        bcg_mla_bmm_then_unified_attention
+                        if is_in_breakable_cuda_graph()
+                        else mla_bmm_then_unified_attention
+                    )
+                    bmm_attention_fn(
                         q_nope_t,
                         self.w_kc,
                         q_nope_out_buf,

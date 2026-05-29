@@ -2207,11 +2207,15 @@ class DeepseekSparseAttnBackend(
         from sglang.srt.compilation.piecewise_context_manager import (
             is_in_piecewise_cuda_graph,
         )
+        from sglang.srt.model_executor.breakable_cuda_graph.context import (
+            is_in_breakable_cuda_graph,
+        )
         from sglang.srt.utils import get_device_sm, is_blackwell
 
         # Decide MHA vs MLA
-        if is_in_piecewise_cuda_graph():
-            # Can't branch on seq_lens_cpu in PCG, force mha off to guarantee correctness.
+        if is_in_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
+            # Can't branch on seq_lens_cpu in graph replay, force MHA off to
+            # guarantee correctness.
             self.use_mha = False
         elif (
             forward_batch and forward_batch.forward_mode.is_extend_without_speculative()

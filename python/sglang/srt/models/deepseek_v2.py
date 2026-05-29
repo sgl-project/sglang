@@ -42,6 +42,9 @@ from sglang.srt.compilation.piecewise_context_manager import (
     get_forward_context as get_pcg_forward_context,
     is_in_piecewise_cuda_graph,
 )
+from sglang.srt.model_executor.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
     get_dsa_index_head_dim,
@@ -873,7 +876,7 @@ class DeepseekV2MoE(nn.Module):
             server_args = get_global_server_args()
             if (
                 _enable_pcg_dsv2_dual_stream
-                and is_in_piecewise_cuda_graph()
+                and (is_in_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
                 and get_moe_runner_backend().is_flashinfer_trtllm()
                 and self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
