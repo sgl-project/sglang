@@ -89,8 +89,47 @@ def _post_json(
 
 def _generate(
     base_url: str, prompt: str, *, max_new_tokens: int = 64,
+    use_chat: bool = False,
 ) -> str:
-    """Issue a /generate POST. Mirrors the smoke harness."""
+    """Issue a generation request and return the completion text.
+
+    Two transports, chosen per task because the V3.2 checkpoint is
+    instruction-tuned:
+
+    * ``use_chat=True`` → ``/v1/chat/completions`` (applies the model's
+      chat template server-side). Required for the NIAH gate: the NIAH
+      prompt is an instruction ("Question: ... Output only the value."),
+      and raw ``/generate`` returns an immediate-EOS **empty string** for
+      these long instruction-style prompts, which would make the paired
+      recall vacuously 0/0 on BOTH servers and the gate falsely "pass"
+      (BL-20260529-dsv32-quality-smoke-needs-chat-template; same fix the
+      AC-Q smoke adopted). Verified live: DS NIAH-4K → exact-needle recall
+      via chat vs empty via raw.
+
+    * ``use_chat=False`` (default) → raw ``/generate``. MMLU 5-shot is a
+      genuine few-shot *completion* benchmark (5 answered examples then
+      the test question ending in ``Answer:``); the model completes the
+      gold letter as the leading token. Applying the chat template here is
+      actively harmful — the model answers conversationally and the letter
+      is no longer the leading token (verified: raw parsed 10/10 correct,
+      chat 0/10). The locked MMLU transport stays raw to match
+      ``benchmark/mmlu/bench_sglang.py``.
+    """
+    if use_chat:
+        body = {
+            "model": "default",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.0,
+            "max_tokens": max_new_tokens,
+        }
+        out = _post_json(
+            f"{_openai_base_url(base_url)}/chat/completions",
+            body, timeout=600.0,
+        )
+        choices = out.get("choices") or []
+        if choices:
+            return (choices[0].get("message") or {}).get("content") or ""
+        return ""
     body = {
         "text": prompt,
         "sampling_params": {
@@ -539,12 +578,16 @@ def _run_niah(
         for i in range(num_prompts)
     ]
     # DSA first per the plan §9.4 "same session, DSA immediately before DS"
-    # convention used by the lightweight smoke harness.
+    # convention used by the lightweight smoke harness. NIAH is an
+    # instruction-style prompt → chat template (use_chat=True); raw
+    # /generate returns empty for these (see _generate docstring).
     dsa_responses = [
-        _generate(dsa_url, p, max_new_tokens=max_new_tokens) for p in prompts
+        _generate(dsa_url, p, max_new_tokens=max_new_tokens, use_chat=True)
+        for p in prompts
     ]
     ds_responses = [
-        _generate(ds_url, p, max_new_tokens=max_new_tokens) for p in prompts
+        _generate(ds_url, p, max_new_tokens=max_new_tokens, use_chat=True)
+        for p in prompts
     ]
     dsa_hits = _niah_recall_hits(needles, dsa_responses)
     ds_hits = _niah_recall_hits(needles, ds_responses)

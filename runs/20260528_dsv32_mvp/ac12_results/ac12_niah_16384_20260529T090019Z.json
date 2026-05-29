@@ -1,0 +1,10 @@
+{
+  "length_tokens": 16384,
+  "num_prompts": 20,
+  "dsa_hits": 20,
+  "ds_hits": 1,
+  "dsa_recall_pct": 100.0,
+  "ds_recall_pct": 5.0,
+  "delta_pct": 95.0,
+  "threshold_pp": 5.0
+}

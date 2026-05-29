@@ -1,0 +1,27 @@
+test/manual/test_double_sparsity_v32.py::TestDoubleSparsityV32Quality::test_mmlu_5shot PASSED [ 16%]
+test/manual/test_double_sparsity_v32.py::TestDoubleSparsityV32Quality::test_niah_16k_sensitivity_zero_signatures SKIPPED [ 33%]
+test/manual/test_double_sparsity_v32.py::TestDoubleSparsityV32Quality::test_niah_64k_sensitivity_corrupt_mask SKIPPED [ 50%]
+test/manual/test_double_sparsity_v32.py::TestDoubleSparsityV32Quality::test_niah_at_16k FAILED [ 66%]
+test/manual/test_double_sparsity_v32.py::TestDoubleSparsityV32Quality::test_niah_at_4k FAILED [ 83%]
+test/manual/test_double_sparsity_v32.py::TestDoubleSparsityV32Quality::test_niah_at_64k FAILED [100%]
+________________ TestDoubleSparsityV32Quality.test_niah_at_16k _________________
+test/manual/test_double_sparsity_v32.py:661: in test_niah_at_16k
+    self._niah_assert(16384)
+test/manual/test_double_sparsity_v32.py:649: in _niah_assert
+    self.assertLessEqual(
+E   AssertionError: 95.0 not less than or equal to 5.0 : NIAH @ 16384: DS recall 5.0% < DSA recall 100.0% by 95.0 pp (> 5.0 pp threshold).
+_________________ TestDoubleSparsityV32Quality.test_niah_at_4k _________________
+test/manual/test_double_sparsity_v32.py:658: in test_niah_at_4k
+    self._niah_assert(4096)
+test/manual/test_double_sparsity_v32.py:649: in _niah_assert
+    self.assertLessEqual(
+E   AssertionError: 25.0 not less than or equal to 5.0 : NIAH @ 4096: DS recall 75.0% < DSA recall 100.0% by 25.0 pp (> 5.0 pp threshold).
+________________ TestDoubleSparsityV32Quality.test_niah_at_64k _________________
+test/manual/test_double_sparsity_v32.py:664: in test_niah_at_64k
+    self._niah_assert(65536)
+test/manual/test_double_sparsity_v32.py:630: in _niah_assert
+E   urllib.error.HTTPError: HTTP Error 400: Bad Request
+FAILED test/manual/test_double_sparsity_v32.py::TestDoubleSparsityV32Quality::test_niah_at_16k
+FAILED test/manual/test_double_sparsity_v32.py::TestDoubleSparsityV32Quality::test_niah_at_4k
+FAILED test/manual/test_double_sparsity_v32.py::TestDoubleSparsityV32Quality::test_niah_at_64k
+======== 3 failed, 1 passed, 2 skipped, 1 warning in 366.23s (0:06:06) =========
