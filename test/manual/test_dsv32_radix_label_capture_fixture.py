@@ -135,8 +135,17 @@ def _get_server_info(base_url: str) -> Dict[str, Any]:
 
 
 def _flush_cache(base_url: str) -> None:
+    # /flush_cache returns a PLAIN-TEXT body ("Cache flushed. ..."), not JSON,
+    # so it must not go through _post_json (which json.loads the response).
+    # Fire the POST and drain the body without parsing it.
+    data = json.dumps({}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/flush_cache", data=data,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
     try:
-        _post_json(f"{base_url.rstrip('/')}/flush_cache", {}, timeout=30.0)
+        with urllib.request.urlopen(req, timeout=30.0) as resp:
+            resp.read()
     except urllib.error.URLError:
         pass
 

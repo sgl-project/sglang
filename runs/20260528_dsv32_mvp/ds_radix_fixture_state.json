@@ -1,0 +1,14 @@
+{
+  "schema": "ds_radix_fixture_state_v1",
+  "label_capture_passed": true,
+  "fp8_scale_stability_passed": true,
+  "config": {
+    "model_path": "/cluster-storage/models/deepseek-ai/DeepSeek-V3.2",
+    "tp_size": 8,
+    "page_size": 64,
+    "kv_cache_dtype": "fp8_e4m3",
+    "channel_mask_path": "/models/dsv32-fp8-channel-mask.safetensors",
+    "channel_mask_sha256": "a63c5b9555e2a7f3c8675343604098850cd2098f30576af5617e2484c99da244"
+  },
+  "recorded_at": "2026-05-29T03:02:35Z"
+}

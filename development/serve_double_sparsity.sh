@@ -55,7 +55,14 @@ DS_CONFIG=$(printf '{"top_k": %s, "page_size": %s, "channel_mask_path": "%s", "d
 # before permitting it. Unset (default) keeps --disable-radix-cache (radix-off).
 RADIX_FIXTURE_ARTIFACT="${RADIX_FIXTURE_ARTIFACT:-}"
 if [[ -n "${RADIX_FIXTURE_ARTIFACT}" ]]; then
+  # Production AC-10 path (DEC-5): the validator re-verifies the state matches
+  # this config and permits radix cache ON. No env override.
   RADIX_ARGS=(--double-sparsity-radix-fixture-artifact "${RADIX_FIXTURE_ARTIFACT}")
+elif [[ "${SGLANG_DS_RADIX_OVERRIDE:-}" == "1" ]]; then
+  # Dev/fixture path ONLY: the env override authorizes radix-on so the operator
+  # can run the M3-B radix fixtures (which need radix reuse) before the artifact
+  # exists. NOT the AC-10 mechanism — the final serving boot uses the artifact.
+  RADIX_ARGS=()
 else
   RADIX_ARGS=(--disable-radix-cache)
 fi

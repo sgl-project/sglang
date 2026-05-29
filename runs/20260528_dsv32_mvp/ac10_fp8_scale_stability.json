@@ -1,0 +1,35 @@
+{
+  "fixture_kind": "fp8_index_cache_scale_stability",
+  "page_size": 64,
+  "index_head_dim": 128,
+  "paths_executed": [
+    "fallback",
+    "fused"
+  ],
+  "per_path": {
+    "fused": {
+      "path_used": "fused_store_index_k_cache",
+      "fp8_singleton_hex": "f0e7fc5ad9eaebe4f2e5f77a63dd7473d9737572e9f5edf452b9796cd3ef74e2ebe4f0eeedce6a764068776ddd71f5eedd6666d470f25869eae4ea70625968f2caf171f3f1586ce7ecea6cf666cd65e9e36efe65c875ad5e60e071775a6972f1d4f5f0e852cb6a70f6686def6ce5f9dc796972f4e1f5763e7af077e1f0dfe4de",
+      "fp8_packed_hex": "f0e7fc5ad9eaebe4f2e5f77a63dd7473d9737572e9f5edf452b9796cd3ef74e2ebe4f0eeedce6a764068776ddd71f5eedd6666d470f25869eae4ea70625968f2caf171f3f1586ce7ecea6cf666cd65e9e36efe65c875ad5e60e071775a6972f1d4f5f0e852cb6a70f6686def6ce5f9dc796972f4e1f5763e7af077e1f0dfe4de",
+      "scale_singleton_hex": "4992e43b",
+      "scale_packed_hex": "4992e43b",
+      "fp8_bytes_equal": true,
+      "scale_bytes_equal": true
+    },
+    "fallback": {
+      "path_used": "fallback_act_quant_set_index_k_scale_buffer",
+      "fp8_singleton_hex": "f0e7fc5ad9eaebe4f2e5f77a63dd7473d9737572e9f5edf452b9796cd3ef74e2ebe4f0eeedce6a764068776ddd71f5eedd6666d470f25869eae4ea70625968f2caf171f3f1586ce7ecea6cf666cd65e9e36efe65c875ad5e60e071775a6972f1d4f5f0e852cb6a70f6686def6ce5f9dc796972f4e1f5763e7af077e1f0dfe4de",
+      "fp8_packed_hex": "f0e7fc5ad9eaebe4f2e5f77a63dd7473d9737572e9f5edf452b9796cd3ef74e2ebe4f0eeedce6a764068776ddd71f5eedd6666d470f25869eae4ea70625968f2caf171f3f1586ce7ecea6cf666cd65e9e36efe65c875ad5e60e071775a6972f1d4f5f0e852cb6a70f6686def6ce5f9dc796972f4e1f5763e7af077e1f0dfe4de",
+      "scale_singleton_hex": "4a92e43b",
+      "scale_packed_hex": "4a92e43b",
+      "fp8_bytes_equal": true,
+      "scale_bytes_equal": true
+    }
+  },
+  "per_path_verdict": {
+    "fused": "PASS",
+    "fallback": "PASS"
+  },
+  "verdict": "PASS",
+  "notes": "If scale bytes differ between singleton and packed writes for either path: per-token scale depends on neighbour tokens within the page, so radix-cache reuse would see different K-noPE in cold vs warm paths. KEEP --disable-radix-cache."
+}
