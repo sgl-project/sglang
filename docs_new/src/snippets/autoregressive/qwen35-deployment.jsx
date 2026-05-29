@@ -335,10 +335,18 @@ export const Qwen35Deployment = () => {
       }
     }
 
-    // Force Mamba V1 for AMD GPUs (V2 requires FLA backend)
-    // Force Mamba V2 when MTP is enabled
+    // Force Mamba V1 for AMD GPUs (V2 requires FLA backend).
+    // Force Mamba V2 when MTP is enabled.
+    // Dense models with MTP off: force V1 — values.mambaCache is not
+    // re-resolved on a speculative toggle (useEffect deps are hardware/model),
+    // so it can stay at 'v2' from a prior MTP-on state. Reading it directly
+    // would emit a spurious --mamba-scheduler-strategy extra_buffer. The UI
+    // radio is hidden for dense models, so users can't manually correct it.
+    // MoE keeps the old behavior — the UI radio is the recovery path there.
     const amdGpus = ['mi300x', 'mi325x', 'mi355x'];
-    const actualMambaCache = amdGpus.includes(hardware) ? 'v1' : (speculative === 'enabled' ? 'v2' : mambaCache);
+    const actualMambaCache = amdGpus.includes(hardware)
+      ? 'v1'
+      : (speculative === 'enabled' ? 'v2' : (MOE_MODELS.has(model) ? mambaCache : 'v1'));
 
     // Apply commandRules from options (reasoning, toolcall, speculative, mambaCache)
     // Skip quantization and model (handled via model name)
