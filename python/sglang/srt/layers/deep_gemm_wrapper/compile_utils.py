@@ -340,7 +340,7 @@ class _BF16GroupedContWarmupExecutor(_BaseWarmupExecutor):
             self.a[:m],
             self.b,
             self.out[:m],
-            m_indices=self.m_indices[:m],
+            self.m_indices[:m],
         )
 
 
