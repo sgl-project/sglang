@@ -14,6 +14,7 @@ the overhead of validation and automatic cleanup. The CI-specific behavior is
 gated by is_in_ci() checks in weight_utils.py.
 """
 
+import errno
 import glob as glob_module
 import hashlib
 import json
@@ -1829,6 +1830,177 @@ def _cleanup_incomplete_blobs(model_name_or_path: str, cache_dir: Optional[str])
         return 0
 
 
+def _ci_cache_min_free_gb() -> float:
+    """Free-space threshold (GB) below which cache space is proactively reclaimed.
+
+    Overridable via the ``SGLANG_CI_CACHE_MIN_FREE_GB`` env var.
+    """
+    try:
+        return float(os.environ.get("SGLANG_CI_CACHE_MIN_FREE_GB", "50"))
+    except (TypeError, ValueError):
+        return 50.0
+
+
+def _ci_stale_incomplete_age_seconds() -> int:
+    """Minimum age (seconds) before an orphaned ``.incomplete`` partial download
+    is considered stale and safe to delete.
+
+    Defaults to 30 minutes and is overridable via
+    ``SGLANG_CI_STALE_INCOMPLETE_AGE_S``. An in-progress download continuously
+    updates its ``.incomplete`` file's mtime, so only files untouched for this
+    long (i.e. left behind by crashed/killed jobs) are removed.
+    """
+    try:
+        return int(os.environ.get("SGLANG_CI_STALE_INCOMPLETE_AGE_S", "1800"))
+    except (TypeError, ValueError):
+        return 1800
+
+
+def _effective_hf_cache_dir(cache_dir: Optional[str]) -> Optional[str]:
+    """Resolve the HF cache directory, returning None when it does not exist."""
+    effective = cache_dir
+    if effective is None:
+        try:
+            import huggingface_hub.constants
+
+            effective = huggingface_hub.constants.HF_HUB_CACHE
+        except Exception:
+            return None
+    return effective if effective and os.path.isdir(effective) else None
+
+
+def _cache_free_gb(path: str) -> Optional[float]:
+    """Return free space (GB) on the volume backing ``path``, or None on error."""
+    try:
+        return shutil.disk_usage(path).free / (1024**3)
+    except OSError:
+        return None
+
+
+def _reclaim_stale_incomplete_blobs(
+    cache_dir: Optional[str], min_age_seconds: int
+) -> Tuple[int, int]:
+    """Remove orphaned ``*.incomplete`` partial downloads across the *entire*
+    shared HF cache (not just one model).
+
+    On the shared CI cache, jobs that are SIGKILL'd mid-download leave behind
+    partial ``.incomplete`` blobs that are never reclaimed and slowly fill the
+    volume (eventually causing ``ENOSPC``). Unlike ``_cleanup_incomplete_blobs``
+    (single model, run under that model's lock), this scans all ``models--*``
+    repos and is therefore gated on file age: an in-progress download keeps its
+    ``.incomplete`` mtime fresh, so only files untouched for ``min_age_seconds``
+    are removed. Active downloads in other processes/containers are never
+    touched.
+
+    Returns:
+        Tuple of (files_removed, bytes_freed).
+    """
+    effective_cache_dir = _effective_hf_cache_dir(cache_dir)
+    if effective_cache_dir is None:
+        return (0, 0)
+
+    now = time.time()
+    files_removed = 0
+    bytes_freed = 0
+    pattern = os.path.join(effective_cache_dir, "models--*", "blobs", "*.incomplete")
+    for path in glob_module.glob(pattern):
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if now - st.st_mtime < min_age_seconds:
+            # Possibly an active download in another process/container; skip.
+            continue
+        try:
+            os.remove(path)
+            files_removed += 1
+            bytes_freed += st.st_size
+        except OSError as e:
+            logger.debug("Failed to remove stale incomplete blob %s: %s", path, e)
+
+    if files_removed > 0:
+        logger.warning(
+            "[CI Download] Reclaimed %d stale .incomplete partial download(s) "
+            "(%.2f GB, older than %ds) from %s",
+            files_removed,
+            bytes_freed / (1024**3),
+            min_age_seconds,
+            effective_cache_dir,
+        )
+    return (files_removed, bytes_freed)
+
+
+def _preflight_reclaim_cache_space(
+    cache_dir: Optional[str], model_name_or_path: str
+) -> None:
+    """Reclaim orphaned partial-download space before taking the download lock.
+
+    Runs *before* lock acquisition because the lock file lives on the same
+    shared cache volume; when that volume is full, even creating the tiny lock
+    file fails with ``ENOSPC``. Only acts when free space is below the
+    configured threshold, so it is a no-op on healthy runners.
+    """
+    effective_cache_dir = _effective_hf_cache_dir(cache_dir)
+    if effective_cache_dir is None:
+        return
+
+    free_before = _cache_free_gb(effective_cache_dir)
+    min_free = _ci_cache_min_free_gb()
+    if free_before is not None and free_before >= min_free:
+        return
+
+    logger.warning(
+        "[CI Download] Low free space on cache volume %s "
+        "(%s GB free < %.1f GB threshold) before downloading %s; "
+        "reclaiming orphaned partial downloads.",
+        effective_cache_dir,
+        "unknown" if free_before is None else f"{free_before:.1f}",
+        min_free,
+        model_name_or_path,
+    )
+    _reclaim_stale_incomplete_blobs(cache_dir, _ci_stale_incomplete_age_seconds())
+    free_after = _cache_free_gb(effective_cache_dir)
+    if free_after is not None:
+        logger.warning(
+            "[CI Download] Cache volume %s free space after reclaim: %.1f GB",
+            effective_cache_dir,
+            free_after,
+        )
+
+
+def _ensure_lock_file_creatable(
+    lock_file_path: str, cache_dir: Optional[str], model_name_or_path: str
+) -> None:
+    """Fail fast with an actionable error when the cache volume is out of space.
+
+    Without this, a full volume surfaces as a cryptic
+    ``OSError: [Errno 28] No space left on device: '.../download_*.lock'`` from
+    deep inside ``filelock`` during lock acquisition, which looks like a locking
+    bug rather than a disk-capacity problem. We probe by creating the lock file
+    up front; on ``ENOSPC`` we raise a clear message instead. (Pre-creating the
+    file is harmless: ``filelock`` coordinates via ``flock`` on the fd, not file
+    existence.)
+    """
+    try:
+        fd = os.open(lock_file_path, os.O_CREAT | os.O_WRONLY, 0o666)
+        os.close(fd)
+    except OSError as e:
+        if getattr(e, "errno", None) != errno.ENOSPC:
+            # Unrelated (e.g. permissions): let filelock surface it normally.
+            return
+        effective_cache_dir = _effective_hf_cache_dir(cache_dir)
+        free = _cache_free_gb(effective_cache_dir) if effective_cache_dir else None
+        raise RuntimeError(
+            f"CI model cache volume is out of disk space (ENOSPC) while preparing "
+            f"to download '{model_name_or_path}'. "
+            f"Lock file: {lock_file_path}; cache dir: {effective_cache_dir} "
+            f"(free: {'unknown' if free is None else f'{free:.1f} GB'}). "
+            f"Reclaiming orphaned partial downloads did not free enough space; "
+            f"the shared HF cache needs an LRU prune or a capacity increase. "
+            f"Tunables: SGLANG_CI_CACHE_MIN_FREE_GB, SGLANG_CI_STALE_INCOMPLETE_AGE_S."
+        ) from e
+
+
 def ci_download_with_validation_and_retry(
     model_name_or_path: str,
     allow_patterns: List[str],
@@ -1893,6 +2065,13 @@ def ci_download_with_validation_and_retry(
         os.getpid(),
         model_name_or_path,
     )
+
+    # On the shared CI cache, reclaim orphaned partial-download space before
+    # taking the lock (the lock file lives on the same volume, so its creation
+    # fails with ENOSPC when the volume is full), then fail fast with a clear,
+    # actionable message if the volume is genuinely out of capacity.
+    _preflight_reclaim_cache_space(cache_dir, model_name_or_path)
+    _ensure_lock_file_creatable(lock_file_path, cache_dir, model_name_or_path)
 
     with lock:
         logger.info(
