@@ -29,15 +29,16 @@ def _jit_topk_v1_module(topk: int):
 
 
 @cache_once
-def _jit_topk_v2_module(topk: int):
+def _jit_topk_v2_module():
+    # v2 is universal: topk (<= 2048) is a runtime argument, not a compile-time
+    # constant, so a single module serves every k.
     return load_jit(
-        make_name(f"topk_v2_{topk}"),
+        make_name("topk_v2"),
         cuda_files=["deepseek_v4/topk_v2.cuh"],
         cuda_wrappers=[
             ("topk_transform", "CombinedTopKKernel::transform"),
             ("topk_plan", "CombinedTopKKernel::plan"),
         ],
-        extra_cuda_cflags=[f"-DSGL_TOPK={topk}"],
     )
 
 
@@ -65,7 +66,7 @@ _PLAN_METADATA_INTS_PER_BATCH = 4
 
 
 def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Tensor:
-    module = _jit_topk_v2_module(512)  # does not matter
+    module = _jit_topk_v2_module()
     bs = seq_lens.shape[0]
     metadata = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
     module.topk_plan(seq_lens, metadata, static_threshold)
@@ -80,7 +81,7 @@ def topk_transform_512_v2(
     page_size: int,
     metadata: torch.Tensor,
 ) -> None:
-    module = _jit_topk_v2_module(out_page_indices.shape[1])
+    module = _jit_topk_v2_module()
     bs = scores.shape[0]
     workspace = seq_lens.new_empty(bs, _WORKSPACE_INTS_PER_BATCH)
     module.topk_transform(
