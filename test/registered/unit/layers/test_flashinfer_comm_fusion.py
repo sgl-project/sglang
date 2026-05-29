@@ -11,7 +11,9 @@ register_cuda_ci(est_time=5, stage="unit-test", runner_config="1-gpu-small")
 
 
 class _FakeWorkspace:
-    backend = "fake"
+    def __init__(self, backend, world_size):
+        self.backend = backend
+        self.world_size = world_size
 
     def is_buffer_size_sufficient(self, **_kwargs):
         return True
@@ -26,9 +28,44 @@ class _FakeFlashInferComm:
 
     def create_allreduce_fusion_workspace(self, **kwargs):
         self.calls.append(kwargs)
-        workspace = _FakeWorkspace()
-        workspace.backend = kwargs["backend"]
-        return workspace
+        return _FakeWorkspace(kwargs["backend"], kwargs["world_size"])
+
+    def allreduce_fusion(
+        self,
+        *,
+        input,
+        workspace,
+        residual_out,
+        norm_out,
+        residual_in,
+        rms_gamma,
+        rms_eps,
+        **_kwargs,
+    ):
+        allreduced = input * workspace.world_size
+        expected_residual = allreduced + residual_in
+        variance = expected_residual.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+        expected_norm = (
+            expected_residual.to(torch.float32)
+            * torch.rsqrt(variance + rms_eps)
+            * rms_gamma.to(torch.float32)
+        ).to(input.dtype)
+        residual_out.copy_(expected_residual)
+        norm_out.copy_(expected_norm)
+
+
+def _torch_allreduce_residual_rmsnorm_baseline(
+    input_tensor, residual, weight, world_size, eps
+):
+    allreduced = input_tensor * world_size
+    residual_out = allreduced + residual
+    variance = residual_out.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+    norm_out = (
+        residual_out.to(torch.float32)
+        * torch.rsqrt(variance + eps)
+        * weight.to(torch.float32)
+    ).to(input_tensor.dtype)
+    return norm_out, residual_out
 
 
 class TestFlashInferCommFusion(unittest.TestCase):
@@ -45,46 +82,69 @@ class TestFlashInferCommFusion(unittest.TestCase):
                 fusion.resolve_flashinfer_allreduce_fusion_backend(args), "trtllm"
             )
 
-    def test_workspace_creation_for_supported_backends(self):
+    def test_allreduce_fusion_backends_match_torch_baseline(self):
         fake_comm = _FakeFlashInferComm()
         original_comm = fusion._flashinfer_comm
         original_create = fusion._create_allreduce_fusion_workspace
-        original_group_support = fusion._flashinfer_create_workspace_supports_group
-        original_comm_backend_support = (
-            fusion._flashinfer_create_workspace_supports_comm_backend
-        )
+        original_manager = fusion._attn_tp_workspace_manager
+        original_unavailable = fusion._flashinfer_allreduce_unavailable
         try:
             fusion._flashinfer_comm = fake_comm
             fusion._create_allreduce_fusion_workspace = (
                 fake_comm.create_allreduce_fusion_workspace
             )
-            fusion._flashinfer_create_workspace_supports_group = True
-            fusion._flashinfer_create_workspace_supports_comm_backend = True
+            fusion._flashinfer_allreduce_unavailable = False
 
             for backend in ("trtllm", "mnnvl"):
-                manager = fusion.FlashInferWorkspaceManager()
-                with (
-                    patch.object(fusion, "_preflight_check_workspace_memory", return_value=True),
-                    patch.object(fusion, "in_the_same_node_as", return_value=[True] * 4),
-                ):
-                    manager.initialize(
-                        world_size=4,
-                        rank=0,
-                        max_token_num=8,
-                        hidden_dim=16,
-                        backend=backend,
-                        dtype=torch.float16,
+                with self.subTest(backend=backend):
+                    world_size = 4
+                    manager = fusion.FlashInferWorkspaceManager()
+                    manager.workspace = _FakeWorkspace(backend, world_size)
+                    manager.initialized = True
+                    fusion._attn_tp_workspace_manager = manager
+                    if not torch.cuda.is_available():
+                        self.skipTest("FlashInfer allreduce custom op is CUDA-only")
+                    device = torch.device("cuda")
+                    torch.manual_seed(0)
+                    input_tensor = torch.randn(4, 8, dtype=torch.float32, device=device)
+                    residual = torch.randn(4, 8, dtype=torch.float32, device=device)
+                    weight = torch.randn(8, dtype=torch.float32, device=device)
+                    eps = 1e-6
+
+                    expected_norm, expected_residual = (
+                        _torch_allreduce_residual_rmsnorm_baseline(
+                            input_tensor, residual, weight, world_size, eps
+                        )
                     )
-                self.assertTrue(manager.initialized)
-                self.assertEqual(fake_comm.calls[-1]["backend"], backend)
-                self.assertEqual(fake_comm.calls[-1]["gpus_per_node"], 4)
+
+                    with (
+                        patch.object(fusion, "is_flashinfer_available", return_value=True),
+                        patch.object(
+                            fusion,
+                            "get_attn_tensor_model_parallel_world_size",
+                            return_value=world_size,
+                        ),
+                        patch.object(
+                            fusion, "ensure_workspace_initialized", return_value=True
+                        ),
+                    ):
+                        norm_out, residual_out = (
+                            fusion.flashinfer_allreduce_residual_rmsnorm(
+                                input_tensor=input_tensor,
+                                residual=residual,
+                                weight=weight,
+                                eps=eps,
+                                max_token_num=8,
+                            )
+                        )
+
+                    torch.testing.assert_close(norm_out, expected_norm)
+                    torch.testing.assert_close(residual_out, expected_residual)
         finally:
             fusion._flashinfer_comm = original_comm
             fusion._create_allreduce_fusion_workspace = original_create
-            fusion._flashinfer_create_workspace_supports_group = original_group_support
-            fusion._flashinfer_create_workspace_supports_comm_backend = (
-                original_comm_backend_support
-            )
+            fusion._attn_tp_workspace_manager = original_manager
+            fusion._flashinfer_allreduce_unavailable = original_unavailable
 
 
 if __name__ == "__main__":

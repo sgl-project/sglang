@@ -445,12 +445,6 @@ class FlashInferWorkspaceManager:
         node_pg = cpu_group if cpu_group is not None else group
         if node_pg is not None:
             gpus_per_node = sum(in_the_same_node_as(node_pg, source_rank=0))
-        if backend == "mnnvl" and gpus_per_node is not None:
-            assert gpus_per_node == 4, (
-                "FlashInfer MNNVL allreduce fusion expects 4 GPUs per node "
-                f"on GB200/GB300, got {gpus_per_node}."
-            )
-
         comm_backend = None
         if (
             _TorchDistBackend is not None

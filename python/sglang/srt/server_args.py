@@ -4087,12 +4087,6 @@ class ServerArgs:
                 )
                 self.enable_aiter_allreduce_fusion = False
 
-            if self.enable_flashinfer_allreduce_fusion:
-                logger.warning(
-                    "Disable --enable-flashinfer-allreduce-fusion because deterministic inference is enabled."
-                )
-                self.enable_flashinfer_allreduce_fusion = False
-
             if self.flashinfer_allreduce_fusion_backend is not None:
                 logger.warning(
                     "Disable --flashinfer-allreduce-fusion-backend because deterministic inference is enabled."
