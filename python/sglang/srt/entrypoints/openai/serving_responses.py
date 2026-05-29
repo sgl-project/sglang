@@ -1854,18 +1854,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ],
                 status="completed",
             )
-            events = [
-                _send_event(
-                    openai_responses_types.ResponseReasoningTextDoneEvent(
-                        type="response.reasoning_text.done",
-                        item_id=reasoning_state["item_id"],
-                        sequence_number=-1,
-                        output_index=reasoning_state["output_index"],
-                        content_index=0,
-                        text=text,
-                    )
-                ),
-            ]
+            events: list = []
             if wants_summary:
                 events.append(
                     _send_event(
@@ -1890,6 +1879,19 @@ class OpenAIServingResponses(OpenAIServingChat):
                             part=ResponseReasoningSummaryDonePart(
                                 type="summary_text", text=text
                             ),
+                        )
+                    )
+                )
+            else:
+                events.append(
+                    _send_event(
+                        openai_responses_types.ResponseReasoningTextDoneEvent(
+                            type="response.reasoning_text.done",
+                            item_id=reasoning_state["item_id"],
+                            sequence_number=-1,
+                            output_index=reasoning_state["output_index"],
+                            content_index=0,
+                            text=text,
                         )
                     )
                 )
@@ -2073,16 +2075,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 )
                             )
                     reasoning_state["text"] += reasoning_chunk
-                    yield _send_event(
-                        openai_responses_types.ResponseReasoningTextDeltaEvent(
-                            type="response.reasoning_text.delta",
-                            item_id=reasoning_state["item_id"],
-                            output_index=reasoning_state["output_index"],
-                            content_index=0,
-                            delta=reasoning_chunk,
-                            sequence_number=-1,
-                        )
-                    )
                     if wants_summary:
                         yield _send_event(
                             openai_responses_types.ResponseReasoningSummaryTextDeltaEvent(
@@ -2090,6 +2082,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 item_id=reasoning_state["item_id"],
                                 output_index=reasoning_state["output_index"],
                                 summary_index=0,
+                                delta=reasoning_chunk,
+                                sequence_number=-1,
+                            )
+                        )
+                    else:
+                        yield _send_event(
+                            openai_responses_types.ResponseReasoningTextDeltaEvent(
+                                type="response.reasoning_text.delta",
+                                item_id=reasoning_state["item_id"],
+                                output_index=reasoning_state["output_index"],
+                                content_index=0,
                                 delta=reasoning_chunk,
                                 sequence_number=-1,
                             )

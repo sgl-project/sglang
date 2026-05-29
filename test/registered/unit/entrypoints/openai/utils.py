@@ -25,6 +25,13 @@ from typing import AsyncIterator
 from unittest.mock import Mock
 
 from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(
+    est_time=0,
+    suite="base-a-test-cpu",
+    disabled="helper module — exported fixtures, not a test",
+)
 
 if torch is not None:
     torch.compile = _ORIGINAL_TORCH_COMPILE
