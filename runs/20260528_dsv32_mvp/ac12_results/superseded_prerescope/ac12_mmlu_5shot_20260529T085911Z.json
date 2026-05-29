@@ -1,0 +1,414 @@
+{
+  "subjects": "all",
+  "num_examples_evaluated": 200,
+  "dsa_score_pct": 89.0,
+  "ds_score_pct": 89.0,
+  "dsa_hits": 178,
+  "ds_hits": 178,
+  "delta_pp": 0.0,
+  "threshold_pp": 1.0,
+  "dsa_per_subject": {
+    "professional_law": {
+      "hits": 21,
+      "total": 30
+    },
+    "marketing": {
+      "hits": 4,
+      "total": 4
+    },
+    "high_school_microeconomics": {
+      "hits": 3,
+      "total": 3
+    },
+    "high_school_psychology": {
+      "hits": 8,
+      "total": 9
+    },
+    "anatomy": {
+      "hits": 3,
+      "total": 4
+    },
+    "high_school_macroeconomics": {
+      "hits": 5,
+      "total": 5
+    },
+    "abstract_algebra": {
+      "hits": 3,
+      "total": 3
+    },
+    "high_school_us_history": {
+      "hits": 2,
+      "total": 2
+    },
+    "econometrics": {
+      "hits": 2,
+      "total": 2
+    },
+    "philosophy": {
+      "hits": 2,
+      "total": 2
+    },
+    "human_sexuality": {
+      "hits": 4,
+      "total": 4
+    },
+    "moral_scenarios": {
+      "hits": 13,
+      "total": 15
+    },
+    "high_school_government_and_politics": {
+      "hits": 4,
+      "total": 4
+    },
+    "high_school_world_history": {
+      "hits": 4,
+      "total": 4
+    },
+    "prehistory": {
+      "hits": 6,
+      "total": 6
+    },
+    "high_school_statistics": {
+      "hits": 4,
+      "total": 4
+    },
+    "professional_medicine": {
+      "hits": 4,
+      "total": 4
+    },
+    "security_studies": {
+      "hits": 4,
+      "total": 4
+    },
+    "high_school_european_history": {
+      "hits": 3,
+      "total": 3
+    },
+    "high_school_geography": {
+      "hits": 6,
+      "total": 6
+    },
+    "high_school_biology": {
+      "hits": 6,
+      "total": 6
+    },
+    "miscellaneous": {
+      "hits": 8,
+      "total": 9
+    },
+    "moral_disputes": {
+      "hits": 7,
+      "total": 8
+    },
+    "professional_psychology": {
+      "hits": 7,
+      "total": 8
+    },
+    "college_mathematics": {
+      "hits": 3,
+      "total": 3
+    },
+    "electrical_engineering": {
+      "hits": 2,
+      "total": 2
+    },
+    "public_relations": {
+      "hits": 1,
+      "total": 2
+    },
+    "logical_fallacies": {
+      "hits": 2,
+      "total": 2
+    },
+    "sociology": {
+      "hits": 4,
+      "total": 5
+    },
+    "high_school_chemistry": {
+      "hits": 3,
+      "total": 3
+    },
+    "medical_genetics": {
+      "hits": 1,
+      "total": 1
+    },
+    "business_ethics": {
+      "hits": 2,
+      "total": 2
+    },
+    "college_chemistry": {
+      "hits": 1,
+      "total": 1
+    },
+    "elementary_mathematics": {
+      "hits": 3,
+      "total": 3
+    },
+    "high_school_mathematics": {
+      "hits": 1,
+      "total": 2
+    },
+    "nutrition": {
+      "hits": 1,
+      "total": 2
+    },
+    "college_physics": {
+      "hits": 2,
+      "total": 2
+    },
+    "clinical_knowledge": {
+      "hits": 2,
+      "total": 2
+    },
+    "world_religions": {
+      "hits": 1,
+      "total": 1
+    },
+    "formal_logic": {
+      "hits": 1,
+      "total": 1
+    },
+    "professional_accounting": {
+      "hits": 1,
+      "total": 2
+    },
+    "conceptual_physics": {
+      "hits": 6,
+      "total": 6
+    },
+    "college_biology": {
+      "hits": 1,
+      "total": 1
+    },
+    "machine_learning": {
+      "hits": 2,
+      "total": 2
+    },
+    "international_law": {
+      "hits": 1,
+      "total": 1
+    },
+    "high_school_computer_science": {
+      "hits": 1,
+      "total": 1
+    },
+    "college_computer_science": {
+      "hits": 1,
+      "total": 1
+    },
+    "management": {
+      "hits": 1,
+      "total": 1
+    },
+    "virology": {
+      "hits": 0,
+      "total": 1
+    },
+    "jurisprudence": {
+      "hits": 1,
+      "total": 1
+    }
+  },
+  "ds_per_subject": {
+    "professional_law": {
+      "hits": 21,
+      "total": 30
+    },
+    "marketing": {
+      "hits": 4,
+      "total": 4
+    },
+    "high_school_microeconomics": {
+      "hits": 3,
+      "total": 3
+    },
+    "high_school_psychology": {
+      "hits": 8,
+      "total": 9
+    },
+    "anatomy": {
+      "hits": 3,
+      "total": 4
+    },
+    "high_school_macroeconomics": {
+      "hits": 5,
+      "total": 5
+    },
+    "abstract_algebra": {
+      "hits": 3,
+      "total": 3
+    },
+    "high_school_us_history": {
+      "hits": 2,
+      "total": 2
+    },
+    "econometrics": {
+      "hits": 2,
+      "total": 2
+    },
+    "philosophy": {
+      "hits": 2,
+      "total": 2
+    },
+    "human_sexuality": {
+      "hits": 4,
+      "total": 4
+    },
+    "moral_scenarios": {
+      "hits": 13,
+      "total": 15
+    },
+    "high_school_government_and_politics": {
+      "hits": 4,
+      "total": 4
+    },
+    "high_school_world_history": {
+      "hits": 4,
+      "total": 4
+    },
+    "prehistory": {
+      "hits": 6,
+      "total": 6
+    },
+    "high_school_statistics": {
+      "hits": 4,
+      "total": 4
+    },
+    "professional_medicine": {
+      "hits": 4,
+      "total": 4
+    },
+    "security_studies": {
+      "hits": 4,
+      "total": 4
+    },
+    "high_school_european_history": {
+      "hits": 3,
+      "total": 3
+    },
+    "high_school_geography": {
+      "hits": 6,
+      "total": 6
+    },
+    "high_school_biology": {
+      "hits": 6,
+      "total": 6
+    },
+    "miscellaneous": {
+      "hits": 8,
+      "total": 9
+    },
+    "moral_disputes": {
+      "hits": 7,
+      "total": 8
+    },
+    "professional_psychology": {
+      "hits": 7,
+      "total": 8
+    },
+    "college_mathematics": {
+      "hits": 3,
+      "total": 3
+    },
+    "electrical_engineering": {
+      "hits": 2,
+      "total": 2
+    },
+    "public_relations": {
+      "hits": 1,
+      "total": 2
+    },
+    "logical_fallacies": {
+      "hits": 2,
+      "total": 2
+    },
+    "sociology": {
+      "hits": 4,
+      "total": 5
+    },
+    "high_school_chemistry": {
+      "hits": 3,
+      "total": 3
+    },
+    "medical_genetics": {
+      "hits": 1,
+      "total": 1
+    },
+    "business_ethics": {
+      "hits": 2,
+      "total": 2
+    },
+    "college_chemistry": {
+      "hits": 1,
+      "total": 1
+    },
+    "elementary_mathematics": {
+      "hits": 3,
+      "total": 3
+    },
+    "high_school_mathematics": {
+      "hits": 1,
+      "total": 2
+    },
+    "nutrition": {
+      "hits": 1,
+      "total": 2
+    },
+    "college_physics": {
+      "hits": 2,
+      "total": 2
+    },
+    "clinical_knowledge": {
+      "hits": 2,
+      "total": 2
+    },
+    "world_religions": {
+      "hits": 1,
+      "total": 1
+    },
+    "formal_logic": {
+      "hits": 1,
+      "total": 1
+    },
+    "professional_accounting": {
+      "hits": 1,
+      "total": 2
+    },
+    "conceptual_physics": {
+      "hits": 6,
+      "total": 6
+    },
+    "college_biology": {
+      "hits": 1,
+      "total": 1
+    },
+    "machine_learning": {
+      "hits": 2,
+      "total": 2
+    },
+    "international_law": {
+      "hits": 1,
+      "total": 1
+    },
+    "high_school_computer_science": {
+      "hits": 1,
+      "total": 1
+    },
+    "college_computer_science": {
+      "hits": 1,
+      "total": 1
+    },
+    "management": {
+      "hits": 1,
+      "total": 1
+    },
+    "virology": {
+      "hits": 0,
+      "total": 1
+    },
+    "jurisprudence": {
+      "hits": 1,
+      "total": 1
+    }
+  }
+}

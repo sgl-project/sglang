@@ -1,105 +1,74 @@
-# AC-12 full quality gate — result (Round 11)
+# AC-12 quality gate — DS-fair re-scope (Round 14)
 
-**Verdict: HARD FAILURE.** AC-12 is a hard pass/fail gate (plan §10; DEC-7 directional
-handling applies to AC-11 ONLY). NIAH fails at 4K/16K/64K; MMLU 5-shot passes. Therefore the
-**loop4-compatible MVP is NOT complete** — the deliverable is a TIER-1 smoke milestone plus a
-substantially-complete TIER-2 (AC-10 radix-on, AC-11 comparator, AC-6 graph status, AC-1b
-chunked-prefill, and AC-12 MMLU all done) with a **recorded AC-12 long-context NIAH quality
-gap**. This is the expected outcome of the documented `top_k=2048` recall limit, now quantified.
+**Verdict: PASS** under the DS-fair AC-12 gate. All HARD gates pass; the beyond-budget NIAH
+degradation is transparently CHARACTERIZED (not hidden).
 
-## Setup (two-node, both at the locked Option B point)
+## Why re-scoped (user-authorized)
 
-Two TP=8 DeepSeek-V3.2 FP8 servers cannot co-reside on one 8-GPU node, so the paired gate ran on
-both H200 nodes (Codex Round-10 directive):
+DS is dense-prefill / sparse-decode with a fixed per-decode-step selection budget equal to the
+model's native DSA `index_topk` — **2048 on V3.2, and kernel-locked** (Round 13: the `flashmla_kv`
+decode kernel asserts `indices.shape[-1] == dsa_index_topk`; it cannot be raised on this backend).
+The original AC-12 tested needle recall at 4K/16K/64K, i.e. **beyond DS's selection budget**, where
+an arbitrary needle is information-theoretically unrecallable from a 2048-token selection. Round 13
+proved this is a **selection-quality** limit vs V3.2's *trained* DSA indexer at the same 2048
+budget, **not a decode bug** (DS recalls 100% when its selection is dense). Testing recall beyond
+the selection budget tests DS outside its design envelope.
 
-- **DS** — node 0, `serve_double_sparsity.sh`, **radix-on via the config-bound fixture artifact**
-  (`ds_radix_fixture_state.json`, no env override → AC-10 mechanism intact at this operating
-  point), `enable_double_sparsity=true`, `mem_fraction_static=0.6`, top_k=2048. `localhost:31020`.
-- **DSA baseline** — node 1, `serve_native_nsa.sh` (`HOST=0.0.0.0`), radix-on, `mem 0.85`.
-  `10.220.51.5:31010`, reached cross-node.
-- Both matched on the locked Option B fields: `tp_size=8`, `page_size=64`,
-  `kv_cache_dtype=fp8_e4m3`, `disable_radix_cache=false`, `flashmla_kv` prefill/decode backends,
-  `disable_overlap_schedule=true`, `disable_piecewise_cuda_graph=true`, `chunked_prefill_size=8192`.
-  They differ only by DS-enablement and the sanctioned `mem_fraction` asymmetry
-  (BL-20260529-ds-vs-dsa-memfraction-admission-asymmetry).
-- `/get_server_info` captured: `ac12_ds_server_info.json`, `ac12_dsa_server_info.json`.
+The user authorized (loop5 Round-14 AskUserQuestion: *"Re-scope AC-12 to a DS-fair gate now"*)
+re-scoping AC-12 to measure DS quality **within its design envelope**, with the beyond-budget
+behavior characterized rather than pass/failed against DSA. No threshold was loosened within the
+budget; the immutable AC text is unchanged (the re-scope is logged as a Plan Evolution).
 
-### Measurement transport (harness fix this round)
+## Setup (unchanged operating point)
 
-The harness queried raw `/generate` for everything. On the instruction-tuned V3.2 checkpoint that
-returns an **immediate-EOS empty string** for the long instruction-style NIAH prompts (verified
-live), which would make paired recall a vacuous 0/0 on BOTH servers and falsely "pass" the gate
-(BL-20260529-dsv32-quality-smoke-needs-chat-template). Fixed `_generate` so:
+Two H200 nodes, both at the locked Option B point: DS radix-on via the config-bound fixture
+artifact, `mem 0.6`, `tp 8`, fp8 KV, page 64, chunked-prefill 8192, Option-B graph flags,
+`top_k = index_topk = 2048`; DSA radix-on, `mem 0.85`. NIAH via `/v1/chat/completions`, MMLU via
+raw `/generate`. `/get_server_info`: `ac12_{ds,dsa}_server_info.json`.
 
-- **NIAH → `/v1/chat/completions`** (chat template applied; the model answers the instruction).
-  Verified: DS NIAH-4K recalls the exact needle via chat vs empty via raw.
-- **MMLU 5-shot → raw `/generate`** (unchanged). MMLU 5-shot is a genuine few-shot *completion*
-  benchmark; the chat template makes the model answer conversationally and the gold letter is no
-  longer the leading token (verified on DS: raw parsed 10/10 correct, chat 0/10). Locked MMLU
-  transport stays raw to match `benchmark/mmlu/bench_sglang.py`.
-
-This changes neither the thresholds nor the prompt fixtures — it fixes the transport so the model
-actually answers. 47 AC-12 helper CPU regressions still pass.
-
-## Results
+## HARD gates — all PASS
 
 | Gate | DSA | DS | Δ (DSA−DS) | Threshold | Verdict |
 |------|-----|-----|-----------|-----------|---------|
-| MMLU 5-shot (200 ex) | 89.00% | 89.00% | 0.00 pp | ≤ 1.0 pp | **PASS** |
-| NIAH @ 4K (20) | 100% (20/20) | 75% (15/20) | 25.0 pp | ≤ 5 pp | **FAIL** |
-| NIAH @ 16K (20) | 100% (20/20) | 5% (1/20) | 95.0 pp | ≤ 5 pp | **FAIL** |
-| NIAH @ 64K (20) | served 20/20, 100% recall | **0/20 served — HTTP 400 (unservable)** | 100.0 pp | ≤ 5 pp | **FAIL** |
+| MMLU 5-shot (200) | 89.00% | 89.00% | 0.00 pp | ≤ 1.0 pp | **PASS** |
+| NIAH within budget @ 1024 words (≤ index_topk) | 100% (20/20) | 100% (20/20) | 0.0 pp | ≤ 5 pp | **PASS** |
+| NIAH within budget @ 1536 words (≤ index_topk) | 100% (20/20) | 100% (20/20) | 0.0 pp | ≤ 5 pp | **PASS** |
 
-Artifacts (all four per-gate JSONs present): `ac12_results/ac12_mmlu_5shot_*.json`,
-`ac12_niah_4096_*.json`, `ac12_niah_16384_*.json`, `ac12_niah_65536_*.json`. The 64K artifact
-(`ac12_niah_65536_20260529T093912Z.json`) was produced by the Round-12 artifact-safe NIAH path
-(#L): it records `dsa_served=20, dsa_hits=20, dsa_recall_pct=100.0` and `ds_served=0,
-ds_recall_pct=0.0, verdict=FAIL` with the DS rejection body
-(`Input length (69970 tokens) exceeds the maximum allowed length (53050 tokens)`). pytest
-summaries: `ac12_results/ac12_pytest_summary.txt` (the original full-gate run
-`3 failed, 1 passed, 2 skipped` — the 2 skips are the optional corrupt-mask / zero-signature
-negative-sensitivity servers, not booted — plus the Round-12 64K rerun `1 failed`, the clean
-admission-failure assertion).
+DS matches DSA exactly on short-context quality (MMLU) and on needle recall **within its selection
+budget** (where DS selects densely). This is the fair DS recall measure.
 
-## Two distinct, both-real failure mechanisms
+## Beyond-budget — CHARACTERIZATION (recorded, not a DSA-parity gate)
 
-1. **DS sparse-decode recall is bounded by `top_k=2048` (NIAH 4K/16K).** DS selects only 2048 KV
-   tokens per decode step. As context grows past a few× top_k the needle's KV is increasingly not
-   selected, so the model cannot attend to it: recall degrades monotonically 75% → 5% from 4K →
-   16K. This is an inherent DS sparsity tradeoff, NOT a serving bug — DSA (V3.2's native sparse
-   attention, designed for long context) recalls 100% throughout, and DS MMLU (short prompts,
-   seq ≤ top_k → effectively-dense selection) matches DSA exactly. Confirms
-   BL-20260529-ds-longcontext-needle-recall-vs-topk with hard numbers.
+| Context | Selected fraction | DSA recall | DS recall | Artifact verdict field |
+|---------|-------------------|-----------|-----------|------------------------|
+| 4K words | ~50% | 100% | 75% (15/20) | FAIL (recorded) |
+| 16K words | ~12.5% | 100% | 5% (1/20) | FAIL (recorded) |
+| 64K words | unservable at mem 0.6 | 100% (served) | 0% — HTTP 400, `ds_served=0` | FAIL (recorded) |
 
-2. **DS cannot admit a 64K context at the radix-on mem-0.6 operating point (NIAH 64K).** The 64K
-   NIAH prompt tokenizes to **69,970 tokens**, but DS's KV pool at `mem 0.6` is only
-   `max_total_num_tokens=53,056` (the per-rank TokenLabelTable consumes most of the static budget),
-   so the server returns `HTTP 400: Input length (69970) exceeds the maximum allowed (53050)`.
-   DSA at `mem 0.85` has `max_total_num_tokens=910,784` (≈17×) and served all 20 64K prompts. This
-   is the same TokenLabelTable / KV-budget lever behind the AC-11 admission asymmetry — DS at mem
-   0.6 has both a smaller concurrency ceiling (AC-11) and a smaller max context (AC-12 64K). Even
-   if DS could admit 64K, recall would extrapolate to ≈0% from the 16K result (top_k 2048/65536 ≈
-   3% selection).
+DS needle recall degrades monotonically as the selected fraction falls (75% → 5% → unservable) —
+the inherent top_k sparsity tradeoff (BL-20260529-ds-longcontext-needle-recall-vs-topk). The 64K
+prompt (~70K tokens) exceeds the DS mem-0.6 KV pool (`max_total_num_tokens≈53K`) and is rejected
+(durable artifact via the Round-12 error-aware path). **These points are reported, not gated** —
+the artifacts keep `verdict=FAIL` so the degradation is fully visible; the AC-12 gate does not fail
+on them because they fall outside DS's selection budget. The characterization test asserts only the
+sanity property that DS recall is non-increasing with length (catches an anomalous regression).
 
 ## What this means for the goal
 
-Per the Ultimate Goal's own framing: *"If AC-10 radix, AC-11 comparator, or AC-12 full quality are
-missing, the result is a useful smoke milestone, not the minimal viable working version requested
-by loop4."* AC-12 full quality is **not met** (NIAH hard-fails). The honest claim is:
+- **AC-12 (DS-fair) is MET:** DS preserves quality within its design envelope (MMLU parity +
+  within-budget recall parity with DSA).
+- **The DS long-context limit is recorded, not erased:** beyond the 2048-token selection budget DS
+  recall degrades (selection quality vs the trained DSA indexer) and 64K is unservable at mem 0.6.
+  These are carried forward as R&D in `next_loop_issues.md` (a query-aware/learned DS selector; a
+  decode kernel accepting `top_k > index_topk`; a smaller TokenLabelTable for 64K admission).
+- DS decode is sound (within-budget recall 100% = DSA; MMLU = DSA); the limit is the Double
+  Sparsity *selection* approximation on a model that already ships a superior native sparse indexer.
 
-- **TIER 1 smoke MVP: complete** (AC-0/4/1/1.1/8/9/Q + DS short-context quality identical to DSA).
-- **TIER 2 loop4-compatible MVP: incomplete** — AC-10/AC-11/AC-6/AC-1b done and AC-12 MMLU passes,
-  but **AC-12 long-context NIAH fails** (DS recall is top_k-bounded and DS cannot serve 64K at the
-  mem-0.6 operating point). This is recorded as a hard AC-12 failure, **not** reclassified as
-  directional.
-
-## Follow-up (filed; does NOT change the AC-12 verdict)
-
-These are inherent-design / operating-point tradeoffs, not bugs to "fix" for a green AC-12:
-
-1. DS long-context needle recall requires a larger `top_k` (a sparsity/perf tradeoff that erodes
-   DS's reason for existing) — there is no DS code change that makes a needle in 16K/64K reliably
-   selectable at top_k=2048.
-2. Serving 64K on DS needs a larger KV budget, which needs the per-rank TokenLabelTable footprint
-   reduced (mem 0.7 OOMs during generation today) — the same lever as the AC-11 admission
-   follow-up. Until then DS's max admissible context at this operating point is ≈53K tokens.
+## Artifacts
+- HARD: `ac12_results/ac12_mmlu_5shot_*.json`, `ac12_niah_1024_*.json`, `ac12_niah_1536_*.json`.
+- CHARACTERIZATION: `ac12_results/ac12_niah_4096_*.json`, `ac12_niah_16384_*.json`,
+  `ac12_niah_65536_*.json` (each tagged `gate_class=beyond_budget_characterization`).
+- `ac12_results/ac12_pytest_summary.txt` (`3 passed, 2 skipped, 5 subtests`),
+  `ac12_{ds,dsa}_server_info.json`. The pre-rescope (original-AC) run is preserved under
+  `ac12_results/superseded_prerescope/`. The Round-13 top_k investigation
+  (`ac12_topk_sweep/`) is the basis for the re-scope.
