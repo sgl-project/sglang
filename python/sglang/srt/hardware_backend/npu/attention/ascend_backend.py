@@ -825,10 +825,8 @@ class AscendAttnBackend(AttentionBackend):
         """
         cp_meta = forward_batch.attn_cp_metadata
 
-        # Split Q into prev/next halves per the zigzag layout. The local tokens
-        # are laid out [all_seqs_prev_blocks, all_seqs_next_blocks], so the split
-        # point is total_q_prev_tokens (sum of per-seq prev blocks), NOT the
-        # global midpoint -- torch.chunk(q, 2) is only correct when bs == 1.
+        # Local tokens are laid out [all_seqs_prev, all_seqs_next]; split at
+        # total_q_prev_tokens rather than the midpoint to support bs > 1.
         split = cp_meta.total_q_prev_tokens
         q_prev = (
             q[:split].contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
@@ -857,7 +855,7 @@ class AscendAttnBackend(AttentionBackend):
             sparse_mode=3,
             next_tokens=0,
             scale=layer.scaling,
-            actual_seq_lengths=np.cumsum(cp_meta.actual_seq_q_prev_list),
+            actual_seq_lengths=np.cumsum(cp_meta.actual_seq_q_prev_list).tolist(),
             actual_seq_lengths_kv=cp_meta.kv_len_prev_list,
         )
 
@@ -874,7 +872,7 @@ class AscendAttnBackend(AttentionBackend):
             sparse_mode=3,
             next_tokens=0,
             scale=layer.scaling,
-            actual_seq_lengths=np.cumsum(cp_meta.actual_seq_q_next_list),
+            actual_seq_lengths=np.cumsum(cp_meta.actual_seq_q_next_list).tolist(),
             actual_seq_lengths_kv=cp_meta.kv_len_next_list,
         )
 
