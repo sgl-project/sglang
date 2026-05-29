@@ -12,6 +12,13 @@ class DraftMeshMessageType(str, Enum):
 
 @dataclass(frozen=True)
 class DraftReqKey:
+    """Request identity on the drafter side.
+
+    The original request_id is only unique within the verifier that owns it.
+    src_verifier_rank keeps the drafter-side request table unambiguous when
+    multiple verifier ranks send work to the same drafter rank.
+    """
+
     src_verifier_rank: int
     request_id: str
 
@@ -35,6 +42,13 @@ def parse_draft_scheduler_rid(rid: str) -> DraftReqKey:
 
 @dataclass
 class DraftSync:
+    """Open or re-open a drafter request from a verifier-owned prefix.
+
+    The verifier is the source of truth for committed tokens. DraftSync gives
+    the drafter the prompt and already committed output prefix that it must
+    align to before it can emit draft tail tokens.
+    """
+
     request_id: str
     src_verifier_rank: int
     dst_drafter_rank: int
@@ -59,7 +73,8 @@ class VerifyCommit:
         pre_verify_committed_len:
         pre_verify_committed_len + len(committed_token_ids)
     ].
-    It is always non-empty.
+    Drafter must align its reqs to these committed tokens,
+    and sometimes needs to truncate tokens / reprefill.
     """
 
     request_id: str
@@ -108,7 +123,15 @@ class DraftClose:
 @dataclass
 class DraftTailStreamOutput:
     """
-    Drafter sends a stream output to verifier whenever it decodes a new token
+    Drafter sends one output token to the verifier-side DraftTailBuffer.
+
+    base_committed_len records the verifier prefix length that the drafter used
+    as the base when this token was emitted. The verifier compares it with its
+    stale-base boundary before accepting the token as tail data or as
+    pending-prefix confirmation.
+
+    new_token_pos is the 0-based output token position for new_token_id. Normal
+    decode streams send the latest generated token.
     """
 
     src_drafter_rank: int
@@ -134,6 +157,15 @@ class DraftControlBatch:
 
 @dataclass
 class VerifierCommitSegment:
+    """Contiguous VerifyCommit messages coalesced for one drafter request.
+
+    When receiving contiguous VerifyCommit messages for the same draft req,
+    the transport thread(TokenSync thread at drafter side) coalesces them into a single VerifierCommitSegment.
+
+    VerifierCommitSegment represents a contiguous verifier-committed token segment for drafter,
+    and drafter scheduler should align with these segments before emitting tail tokens
+    """
+
     draft_key: DraftReqKey
     dst_drafter_rank: int
     pre_verify_committed_len: int
@@ -207,6 +239,12 @@ class VerifierCommitSegment:
 
 @dataclass
 class DraftControlInbox:
+    """Drafter-side inbox for verifier control messages.
+
+    The TokenSync thread temporarily stores incoming control messages here.
+    The drafter scheduler extracts and consumes them each time it finishes a decoding step.
+    """
+
     sync_messages: list[DraftSync] = field(default_factory=list)
     verifier_commit_segments: dict[DraftReqKey, VerifierCommitSegment] = field(
         default_factory=dict
