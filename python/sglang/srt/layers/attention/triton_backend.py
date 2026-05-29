@@ -1414,6 +1414,23 @@ class TritonMultiStepDraftBackend:
                 cuda_graph_num_kv_splits_buf=self.cuda_graph_num_kv_splits,
             )
 
+    def init_forward_data(self, forward_batch: ForwardBatch):
+        # Delegate to legacy method while Phase E hasn't moved the body yet.
+        self.init_forward_metadata(forward_batch)
+
+    def init_forward_data_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        # MultiStep uses custom signatures (fb-only / fb+bs).
+        if in_capture:
+            self.init_forward_metadata_capture_cuda_graph(forward_batch)
+        else:
+            self.init_forward_metadata_replay_cuda_graph(
+                forward_batch, forward_batch.batch_size
+            )
+
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
         def call_fn(i, forward_batch):
             self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
