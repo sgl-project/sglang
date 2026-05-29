@@ -29,6 +29,10 @@ GB = 1024 * 1024 * 1024
 class SWAKVPool(BaseSWAKVPool):
     """KV cache with separate pools for full and SWA attention layers."""
 
+    # Chunked prefill evicts old SWA tokens; the SWA pool does not need to
+    # hold the entire prompt.
+    pd_prefill_swa_pool_holds_full_prompt = False
+
     def __init__(
         self,
         size: int,
