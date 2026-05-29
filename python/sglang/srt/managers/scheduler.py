@@ -245,6 +245,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_int_env_var,
+    is_cuda,
     is_mps,
     kill_itself_when_parent_died,
     require_mlp_sync,
@@ -1362,6 +1363,8 @@ class Scheduler(
         self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
+        # WAR barrier is CUDA-only; other platforms keep the pre-barrier behavior.
+        self._war_barrier_enabled = is_cuda()
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
@@ -1412,7 +1415,8 @@ class Scheduler(
                 continue
 
             # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
-            self.schedule_stream.wait_stream(self.forward_stream)
+            if self._war_barrier_enabled:
+                self.schedule_stream.wait_stream(self.forward_stream)
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
