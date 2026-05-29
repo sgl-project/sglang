@@ -624,16 +624,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // rope
   m.def(
-      "rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
-      "bool is_neox) -> (Tensor, Tensor)");
+      "rotary_embedding_cpu(Tensor positions, Tensor(a!) query, Tensor(b!) key, int head_size, Tensor cos_sin_cache, "
+      "bool is_neox) -> (Tensor(a!), Tensor(b!))");
   m.impl("rotary_embedding_cpu", torch::kCPU, &rotary_embedding_cpu);
-  m.def("apply_rotary_pos_emb_cpu(Tensor query, Tensor key, Tensor cos, Tensor sin) -> (Tensor, Tensor)");
+  m.def(
+      "apply_rotary_pos_emb_cpu(Tensor(a!) query, Tensor(b!) key, Tensor cos, Tensor sin) -> (Tensor(a!), Tensor(b!))");
   m.impl("apply_rotary_pos_emb_cpu", torch::kCPU, &apply_rotary_pos_emb_cpu);
 
   // multimodal rope
   m.def(
-      "multimodal_rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor "
-      "cos_sin_cache, int[]? mrope_section, bool mrope_interleaved, bool is_neox) -> (Tensor, Tensor)");
+      "multimodal_rotary_embedding_cpu(Tensor positions, Tensor(a!) query, Tensor(b!) key, int head_size, Tensor "
+      "cos_sin_cache, int[]? mrope_section, bool mrope_interleaved, bool is_neox) -> (Tensor(a!), Tensor(b!))");
   m.impl("multimodal_rotary_embedding_cpu", torch::kCPU, &multimodal_rotary_embedding_cpu);
 
   // CPU and memory binding
