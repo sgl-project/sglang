@@ -1360,9 +1360,7 @@ class Scheduler(
         self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        # WAR barrier is CUDA-only: verified to not affect CUDA throughput, but it
-        # caused scheduler hangs / regressions on AMD/HIP, so AMD keeps the
-        # pre-barrier behavior.
+        # WAR barrier is CUDA-only; other platforms keep the pre-barrier behavior.
         self._war_barrier_enabled = is_cuda()
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
