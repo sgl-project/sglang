@@ -1006,14 +1006,17 @@ class Qwen3NextForCausalLM(nn.Module):
         self.model = Qwen3NextModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            org_num_embeddings=config.vocab_size,
-            prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-        )
+        if config.tie_word_embeddings:
+            self.lm_head = self.model.embed_tokens
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                org_num_embeddings=config.vocab_size,
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            )
         self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
@@ -1057,9 +1060,11 @@ class Qwen3NextForCausalLM(nn.Module):
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
-        del self.lm_head.weight
         self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
+        if self.lm_head is not self.model.embed_tokens:
+            # When tied, lm_head is the same object; already updated above.
+            del self.lm_head.weight
+            self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
@@ -1109,6 +1114,8 @@ class Qwen3NextForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
+            if self.config.tie_word_embeddings and "lm_head.weight" in name:
+                continue
 
             if is_mtp:
 

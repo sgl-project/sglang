@@ -903,13 +903,20 @@ class Qwen2MoeForCausalLM(nn.Module):
             prefix=add_prefix("model", prefix),
             alt_stream=alt_stream,
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-        )
+        if self.pp_group.is_last_rank:
+            # world_size>1: embed_tokens lives on rank 0, can't share object.
+            if self.pp_group.world_size == 1 and config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                )
+        else:
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
@@ -1010,6 +1017,16 @@ class Qwen2MoeForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            # PP tied: copy embed_tokens into lm_head, then fall through.
+            if name == "model.embed_tokens.weight":
+                if self.pp_group.is_last_rank and self.config.tie_word_embeddings:
+                    if "lm_head.weight" in params_dict:
+                        param = params_dict["lm_head.weight"]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
