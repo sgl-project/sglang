@@ -389,7 +389,7 @@ def _run_eagle_draft_eager(
     if init_eager_metadata is not None:
         init_eager_metadata(worker, batch, settings)
     else:
-        worker.draft_attn_backend.init_forward_metadata(batch)
+        worker.draft_attn_backend.init_forward_data(batch)
     return worker.draft_forward(batch)
 
 
@@ -1388,7 +1388,7 @@ def _init_dsv4_eager_metadata(
     """
     multi_step_backend = worker.draft_attn_backend
     for attn_backend in multi_step_backend.attn_backends:
-        attn_backend.init_forward_metadata(batch)
+        attn_backend.init_forward_data(batch)
 
 
 def _make_dsv4_eagle_draft_forward_batch(
