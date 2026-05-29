@@ -492,6 +492,11 @@ class DeepseekV4AttnBackend(
             req_pool_indices=req_pool_indices.detach(),
             seq_lens=seq_lens.detach(),
         )
+        if req_pool_indices.numel() == 0 or seq_lens.numel() == 0:
+            # Empty DP ranks may still replay a TARGET_VERIFY graph bucket with
+            # padded bs=1. Do not redirect c128 compressor state to the MTP temp
+            # pool when there is no real request state to prepare.
+            return
         self._prepare_online_c128_verify_layers()
 
     def _get_online_c128_layer_state(
@@ -594,6 +599,8 @@ class DeepseekV4AttnBackend(
             )
             ctx = self._online_c128_verify_ctx
             assert ctx is not None
+        if ctx.seq_lens.numel() == 0 or ctx.req_pool_indices.numel() == 0:
+            return None
 
         layer_state = ctx.layer_states.get(compressor.layer_id)
         temp_pool = token_to_kv_pool.get_temp_attention_compress_states(compressor.layer_id)
@@ -645,6 +652,9 @@ class DeepseekV4AttnBackend(
 
         ctx = self._online_c128_verify_ctx
         if ctx is None or accept_lens.numel() == 0:
+            self._clear_online_c128_verify_context()
+            return
+        if ctx.seq_lens.numel() == 0 or ctx.req_pool_indices.numel() == 0:
             self._clear_online_c128_verify_context()
             return
 
@@ -1214,6 +1224,13 @@ class DeepseekV4AttnBackend(
             verify_bs = getattr(fb, "_original_batch_size", fb.batch_size)
             verify_req_pool_indices = req_pool_indices[:verify_bs]
             verify_seq_lens = seq_lens[:verify_bs]
+            if self._online_c128_mtp_enabled() and verify_bs == 0:
+                self._online_c128_replay_key = None
+                self._clear_online_c128_verify_context()
+                self.forward_metadata = self.cuda_graph_metadata_of_bucket_and_bs[
+                    bucket
+                ][bs]
+                return
             self._online_c128_replay_key = (
                 (bucket, bs) if self._online_c128_mtp_enabled() else None
             )

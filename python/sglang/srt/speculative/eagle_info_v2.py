@@ -46,6 +46,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
 
+
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -141,11 +142,21 @@ class EagleDraftInputV2Mixin:
 
         cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
         nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
-
         # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
         # barrier has chained to the prev forward -> host stalls a full forward.
-        cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
-        nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+        cur_kv_lens_device = cur_kv_lens_cpu.to(
+            device=batch.device, non_blocking=True
+        )
+        nxt_kv_lens_device = nxt_kv_lens_cpu.to(
+            device=batch.device, non_blocking=True
+        )
+
+        commit_events = getattr(self, "online_c128_mtp_commit_events", None)
+        if commit_events:
+            for event in commit_events:
+                torch.cuda.current_stream(torch.device(batch.device)).wait_event(event)
+            self.online_c128_mtp_commit_events = None
+
         if page_size == 1:
             out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
         else:
