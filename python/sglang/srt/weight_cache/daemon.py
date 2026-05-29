@@ -174,6 +174,32 @@ class WeightCacheDaemon:
             quantization=self.quantization,
         )
 
+        # Build cache config fingerprint BEFORE loading the model.
+        # Loading may mutate hf_config.quantization_config (e.g. via
+        # process_weights_after_loading), which would produce a different
+        # hash than what the engine computes from the original config.
+        quant_config = getattr(model_config, "hf_config", None)
+        if quant_config is not None:
+            quant_config = getattr(quant_config, "quantization_config", None)
+        quant_method = get_quant_method_name(
+            self.quantization or getattr(model_config, "quantization", None)
+        )
+        if not quant_method and quant_config is not None:
+            quant_method = get_quant_method_name(quant_config)
+
+        self.config = CacheConfig(
+            model_path=self.model_path,
+            model_arch=model_config.hf_config.architectures[0]
+            if model_config.hf_config.architectures
+            else "",
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            dp_size=self.dp_size,
+            quant_method=quant_method,
+            quant_config_hash=hash_quant_config(quant_config),
+            dtype=str(model_config.dtype),
+        )
+
         # Initialize distributed backend (requires server_args + model_config)
         self._init_distributed(server_args, model_config)
 
@@ -201,29 +227,6 @@ class WeightCacheDaemon:
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
             f"Model loaded from disk in {elapsed:.2f}s"
-        )
-
-        # Build cache config fingerprint
-        quant_config = getattr(model_config, "hf_config", None)
-        if quant_config is not None:
-            quant_config = getattr(quant_config, "quantization_config", None)
-        quant_method = get_quant_method_name(
-            self.quantization or getattr(model_config, "quantization", None)
-        )
-        if not quant_method and quant_config is not None:
-            quant_method = get_quant_method_name(quant_config)
-
-        self.config = CacheConfig(
-            model_path=self.model_path,
-            model_arch=model_config.hf_config.architectures[0]
-            if model_config.hf_config.architectures
-            else "",
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            dp_size=self.dp_size,
-            quant_method=quant_method,
-            quant_config_hash=hash_quant_config(quant_config),
-            dtype=str(model_config.dtype),
         )
 
         # Export all parameters and buffers as IPC handles
