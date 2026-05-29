@@ -90,6 +90,12 @@ class BlockStored(KVCacheEvent):
     block_size: int
     lora_id: Optional[int]
     medium: Optional[str] = None
+    swa_sliding_window_size: Optional[int] = None
+    # Scoped to this block's node. Consumers matching a longer prefix should
+    # aggregate this metadata along the matched block path and use the deepest
+    # non-None value. A refreshed None value clears any previous tombstone marker
+    # for this block.
+    swa_valid_from: Optional[int] = None
 
 
 class BlockRemoved(KVCacheEvent):

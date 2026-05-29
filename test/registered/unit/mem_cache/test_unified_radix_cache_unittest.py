@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Optional
 from unittest import mock
 
+import msgspec
 import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
@@ -308,6 +309,55 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
             finish_event.synchronize()
         tree.loading_check()
 
+    def test_kv_events_swa_metadata_wire_order(self):
+        event = BlockStored(
+            block_hashes=[1],
+            parent_block_hash=None,
+            token_ids=[10],
+            block_size=1,
+            lora_id=None,
+            medium="GPU",
+            swa_sliding_window_size=4,
+            swa_valid_from=2,
+        )
+        self.assertEqual(
+            msgspec.msgpack.decode(msgspec.msgpack.encode(event)),
+            [
+                "BlockStored",
+                [1],
+                None,
+                [10],
+                1,
+                None,
+                "GPU",
+                4,
+                2,
+            ],
+        )
+
+        event = BlockStored(
+            block_hashes=[1],
+            parent_block_hash=None,
+            token_ids=[10],
+            block_size=1,
+            lora_id=None,
+            medium="GPU",
+            swa_sliding_window_size=4,
+        )
+        self.assertEqual(
+            msgspec.msgpack.decode(msgspec.msgpack.encode(event)),
+            [
+                "BlockStored",
+                [1],
+                None,
+                [10],
+                1,
+                None,
+                "GPU",
+                4,
+            ],
+        )
+
     def test_kv_events_store_and_remove_full_blocks(self):
         tree, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
         tree.take_events()  # Clear the reset event.
@@ -345,6 +395,49 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertEqual(len(split_parent.hash_value), 1)
         self.assertIsNotNone(split_child.hash_value)
         self.assertEqual(len(split_child.hash_value), 1)
+
+    def test_swa_kv_events_mark_sliding_window_valid_from(self):
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=4,
+            kv_size=64,
+            max_context_len=64,
+        )
+        tree, allocator, _ = build_fixture(cfg, enable_kv_cache_events=True)
+        tree.take_events()  # Clear the reset event.
+
+        self._insert(tree, allocator, [1, 2, 3, 4])
+        first_insert = self._stored_events(tree, StorageMedium.GPU)
+        self.assertGreater(len(first_insert), 0)
+        self.assertTrue(all(e.swa_sliding_window_size == 4 for e in first_insert))
+        self.assertTrue(all(e.swa_valid_from is None for e in first_insert))
+
+        self._insert(tree, allocator, [1, 2, 3, 4, 5, 6])
+        self._stored_events(tree, StorageMedium.GPU)
+
+        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=4))
+        self.assertGreater(result.swa_num_tokens_evicted, 0)
+        updates = self._stored_events(tree, StorageMedium.GPU)
+        self.assertEqual({e.swa_valid_from for e in updates}, {4})
+
+        key = RadixKey(array("q", [1, 2, 3, 4, 5, 6]))
+        value = allocator.alloc(len(key))
+        self.assertIsNotNone(value)
+        tree.insert(
+            InsertParams(
+                key=key,
+                value=value[: len(key)],
+                swa_evicted_seqlen=2,
+            )
+        )
+        partial_restore_updates = self._stored_events(tree, StorageMedium.GPU)
+        self.assertEqual({e.swa_valid_from for e in partial_restore_updates}, {2, None})
+
+        self._insert(tree, allocator, [1, 2, 3, 4, 5, 6])
+        restore_updates = self._stored_events(tree, StorageMedium.GPU)
+        self.assertGreater(len(restore_updates), 0)
+        self.assertEqual({e.swa_valid_from for e in restore_updates}, {None})
 
     def test_hicache_kv_events_track_gpu_cpu_transitions(self):
         tree, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
