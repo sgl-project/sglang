@@ -917,8 +917,11 @@ class PrefillAdder:
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
-                # Non-chunked prefill
-                req.fill_len = len(req.prefix_indices) + req.extend_input_len
+                # Non-chunked prefill — the whole sequence is committed this iter.
+                req.fill_len = len(req.full_untruncated_fill_ids)
+                assert (
+                    req.fill_len == len(req.prefix_indices) + req.extend_input_len
+                ), f"{req.fill_len=} {len(req.prefix_indices)=} {req.extend_input_len=}"
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
