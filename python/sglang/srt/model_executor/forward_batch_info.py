@@ -955,6 +955,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ):
             if self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 setattr(self, "_original_forward_mode", self.forward_mode)
+                setattr(self, "_original_batch_size", self.batch_size)
                 self.forward_mode = ForwardMode.EXTEND
                 self.extend_num_tokens = bs
                 self.extend_seq_lens = torch.full_like(self.seq_lens, 1)

@@ -279,13 +279,14 @@ __global__ __launch_bounds__(kPrefillBlockSize, 2)  //
 
   constexpr int64_t kElementSize = kHeadDim * 2;  // | kv | score |
 
-  // The plan stores last-token coordinates; segment start is recoverable as
-  // ragged_id - window_len + 1.
+  // `j` below is a chunk-local offset. Convert it to the ragged-input row by
+  // anchoring on the last token in this segment: ragged_id - pos_in_chunk_end + 1 + j.
   const uint32_t window_len = plan.buffer_len;
   const uint32_t position = plan.seq_len - 1;
   const uint32_t pos_in_chunk_end = (position % 128u) + 1u;     // exclusive, in [1, 128]
   const uint32_t chunk_offset = pos_in_chunk_end - window_len;  // in [0, 127]
-  const int32_t segment_start_ragged = static_cast<int32_t>(plan.ragged_id) - static_cast<int32_t>(position % 128u);
+  const int32_t chunk_start_ragged =
+      static_cast<int32_t>(plan.ragged_id) - static_cast<int32_t>(pos_in_chunk_end) + 1;
 
   // --- Stage 1: load kv / score / bias for this warp's 8 chunk positions.
   PrefillStorage kv[kElementsPerWarp];
@@ -297,7 +298,8 @@ __global__ __launch_bounds__(kPrefillBlockSize, 2)  //
   for (uint32_t i = 0; i < kElementsPerWarp; ++i) {
     const uint32_t j = i + warp_offset;
     if (j >= chunk_offset && j < pos_in_chunk_end) {
-      const auto kv_src_ptr = kv_score_input + (segment_start_ragged + j) * kElementSize + split_offset;
+      const int32_t ragged_id = chunk_start_ragged + static_cast<int32_t>(j);
+      const auto kv_src_ptr = kv_score_input + ragged_id * kElementSize + split_offset;
       const auto score_src_ptr = kv_src_ptr + kHeadDim;
       const auto bias_src_ptr = score_bias_base + j * kHeadDim + split_offset;
       kv[i].load(kv_src_ptr, lane_id);
