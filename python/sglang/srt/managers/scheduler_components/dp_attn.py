@@ -147,7 +147,11 @@ def prepare_mlp_sync_batch_raw(
     offload_tags: set[str],
 ):
     # Check if other DP workers have running batches
-    if local_batch is None or local_batch.forward_mode.is_prebuilt():
+    if (
+        local_batch is None
+        or local_batch.forward_mode.is_prebuilt()
+        or local_batch.forward_mode.is_idle()
+    ):
         num_tokens = 0
         num_tokens_for_logprob = 0
     elif local_batch.forward_mode.is_decode():
@@ -213,14 +217,22 @@ def prepare_mlp_sync_batch_raw(
             )
         )
 
-    need_idle_batch = skip_all_gather or max(mlp_sync_info.global_num_tokens) > 0
+    # Decide whether to emit idle batch
+    if skip_all_gather:
+        # Skip idle batch when attn-dp=1
+        need_idle_batch = dp_size > 1
+    else:
+        need_idle_batch = max(mlp_sync_info.global_num_tokens) > 0
+
+    batch_to_gather = local_batch
     if need_idle_batch:
-        batch_to_gather = local_batch
         if local_batch is None:
             batch_to_gather = local_batch = get_idle_batch()
         elif local_batch.forward_mode.is_prebuilt():
             # NOTE: for prebuilt batch, we add an inner idle batch to run MLP sync
             batch_to_gather = local_batch.inner_idle_batch = get_idle_batch()
+
+    if batch_to_gather is not None:
         _update_gather_batch(
             batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
         )
