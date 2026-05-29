@@ -1,9 +1,8 @@
 import unittest
 
-from test_unified_radix_cache_kl import UnifiedRadixTreeTestMixin
-
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
 from sglang.test.kl_multiturn_utils import (
     get_input_ids,
     make_mamba_decode_assert,
@@ -24,7 +23,7 @@ MAMBA_TRACK_INTERVAL = 128
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 
-register_cuda_ci(est_time=745, stage="base-c", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=768, stage="base-c", runner_config="8-gpu-h200")
 
 
 class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
