@@ -16,7 +16,7 @@ from sglang.srt.kv_canary.plan_input import PlanInput
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     populate_req_to_expected_token_ids,
 )
-from sglang.srt.kv_canary.runner.enable_warner import _CanaryEnableWarner
+from sglang.srt.kv_canary.runner.enable_warner import CanaryEnableWarner
 from sglang.srt.kv_canary.runner.kernel_launch import (
     invoke_plan,
     launch_endpoints_per_forward,
@@ -94,7 +94,7 @@ class SingleForwardManager:
         self._write_entry_capacity = per_forward_write_entry_capacity
         self._verify_capacity = per_forward_verify_capacity
 
-        self._enable_warner = _CanaryEnableWarner(
+        self._enable_warner = CanaryEnableWarner(
             verify_capacity=self._verify_capacity,
             d2h_stream=d2h_stream,
         )

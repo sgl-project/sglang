@@ -10,7 +10,7 @@ from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
 logger = logging.getLogger(__name__)
 
 
-class _CanaryEnableWarner:
+class CanaryEnableWarner:
     def __init__(
         self, *, verify_capacity: int, d2h_stream: Optional[torch.cuda.Stream]
     ) -> None:
