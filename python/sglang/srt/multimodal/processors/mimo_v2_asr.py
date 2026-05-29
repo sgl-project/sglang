@@ -58,19 +58,11 @@ class MiMoV2ASRProcessor(BaseMultimodalProcessor):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.tokenizer = _processor
 
-        self.audio_sample_rate = 24000
-
-        self.audio_token_id = self._resolve_special_token_id(self.AUDIO_PAD_TOKEN)
-        self.audio_start_token_id = self._resolve_special_token_id(
-            self.AUDIO_START_TOKEN
-        )
-        self.audio_end_token_id = self._resolve_special_token_id(self.AUDIO_END_TOKEN)
-
         self.audio_pipeline = MiMoAudioPipeline(
-            audio_token_id=self.audio_token_id,
-            audio_start_token_id=self.audio_start_token_id,
-            audio_end_token_id=self.audio_end_token_id,
-            audio_sampling_rate=self.audio_sample_rate,
+            audio_token_id=self._resolve_special_token_id(self.AUDIO_PAD_TOKEN),
+            audio_start_token_id=self._resolve_special_token_id(self.AUDIO_START_TOKEN),
+            audio_end_token_id=self._resolve_special_token_id(self.AUDIO_END_TOKEN),
+            audio_sampling_rate=24000,
         )
 
         self.mm_tokens = MultimodalSpecialTokens(
@@ -78,6 +70,15 @@ class MiMoV2ASRProcessor(BaseMultimodalProcessor):
             audio_token_id=self.audio_token_id,
             audio_token_regex=self.AUDIO_REGEX,
         ).build(_processor)
+
+    def __getattr__(self, name):
+        # Delegate audio_pipeline fields so callers can use self.audio_token_id
+        # etc. directly. Only triggers when normal attribute lookup fails;
+        # __dict__.get avoids recursion before audio_pipeline is assigned.
+        pipeline = self.__dict__.get("audio_pipeline")
+        if pipeline is not None and hasattr(pipeline, name):
+            return getattr(pipeline, name)
+        raise AttributeError(name)
 
     def _resolve_special_token_id(self, name: str) -> int:
         tid = self.tokenizer.convert_tokens_to_ids(name)
@@ -131,7 +132,7 @@ class MiMoV2ASRProcessor(BaseMultimodalProcessor):
                     continue
                 if audio_tensor.ndim == 1:
                     processed_audios.append(
-                        (audio_tensor.cpu().contiguous(), self.audio_sample_rate)
+                        (audio_tensor.cpu().contiguous(), self.audio_sampling_rate)
                     )
                 else:
                     processed_audios.append(audio_tensor.cpu().contiguous())
@@ -203,7 +204,7 @@ class MiMoV2ASRProcessor(BaseMultimodalProcessor):
             video_data=[],
             audio_data=audio_data,
             multimodal_tokens=self.mm_tokens,
-            audio_sample_rate=self.audio_sample_rate,
+            audio_sample_rate=self.audio_sampling_rate,
         )
         multimodal_tokens_pattern = self.mm_tokens.get_combined_regex()
 
@@ -229,6 +230,11 @@ class MiMoV2ASRProcessor(BaseMultimodalProcessor):
                         audio_source = raw_audio_item.get("url", loaded_audio)
                     elif isinstance(raw_audio_item, (str, bytes, torch.Tensor)):
                         audio_source = raw_audio_item
+                    else:
+                        raise ValueError(
+                            f"unsupported audio item: loaded={type(loaded_audio).__name__}, "
+                            f"raw={type(raw_audio_item).__name__}"
+                        )
 
                     contents.append(
                         _Content(

@@ -343,11 +343,8 @@ class MiMoProcessor:
 
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
-        self.audio_token_id = audio_token_id
         self.vision_start_token_id = vision_start_token_id
         self.vision_end_token_id = vision_end_token_id
-        self.audio_start_token_id = audio_start_token_id
-        self.audio_end_token_id = audio_end_token_id
         self.video_start_token_id = video_start_token_id
         self.video_end_token_id = video_end_token_id
         self.pad_token_id = pad_token_id
@@ -401,6 +398,15 @@ class MiMoProcessor:
 
         for k in kwargs:
             logger.info(f"[Warning] Ignored unknown parameter {k} for MiMoProcessor")
+
+    def __getattr__(self, name):
+        # Delegate audio_pipeline fields so callers can use self.audio_token_id
+        # etc. directly. Only triggers when normal attribute lookup fails;
+        # __dict__.get avoids recursion before audio_pipeline is assigned.
+        pipeline = self.__dict__.get("audio_pipeline")
+        if pipeline is not None and hasattr(pipeline, name):
+            return getattr(pipeline, name)
+        raise AttributeError(name)
 
     @classmethod
     def from_hf_config(cls, hf_config, mm_config=None, **overrides):
@@ -983,7 +989,7 @@ class MiMoProcessor:
         grid_t_timestamps = timestamps[
             :: self.temporal_patch_size * self.temporal_compression_ratio
         ]
-        audio_token_per_second = self.audio_input_id_per_second / self.audio_group_size
+        audio_token_per_second = self.audio_token_per_second
 
         units = []
         for i in range(len(grid_t_timestamps)):
@@ -1127,7 +1133,7 @@ class MiMoProcessor:
         self, content_idx, content, video_results, verbose
     ):
         visual_patches, thw_grid, timestamps, video_meta = video_results[content_idx]
-        processed_audio = self.process_audio(content.content)
+        processed_audio = self.audio_pipeline.process_audio(content.content)
 
         if isinstance(processed_audio, tuple):
             assert (
@@ -1972,6 +1978,11 @@ class MiMoV2Processor(BaseMultimodalProcessor):
                         audio_source = raw_audio_item.get("url", loaded_audio)
                     elif isinstance(raw_audio_item, (str, bytes, torch.Tensor)):
                         audio_source = raw_audio_item
+                    else:
+                        raise ValueError(
+                            f"unsupported audio item: loaded={type(loaded_audio).__name__}, "
+                            f"raw={type(raw_audio_item).__name__}"
+                        )
 
                     contents.append(
                         Content(
