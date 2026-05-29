@@ -1640,38 +1640,17 @@ class FlashInferMultiStepDraftBackend:
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        # MultiStep uses custom signatures (fb-only / fb+bs); delegate
-        # through them.
-        if in_capture:
-            self.init_forward_metadata_capture_cuda_graph(forward_batch)
-        else:
-            self.init_forward_metadata_replay_cuda_graph(
-                forward_batch, forward_batch.batch_size
-            )
-
-    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
         from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
 
-        def call_fn(i, fb):
-            inner_fb = build_inner_fb_view(
-                fb, bs=fb.batch_size, forward_mode=ForwardMode.DECODE
-            )
-            self.attn_backends[i].init_forward_data_out_graph(
-                inner_fb, in_capture=True
-            )
-
-        self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
-
-    def init_forward_metadata_replay_cuda_graph(
-        self, forward_batch: ForwardBatch, bs: int
-    ):
-        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+        bs = forward_batch.batch_size
 
         def call_fn(i, fb):
             inner_fb = build_inner_fb_view(
                 fb, bs=bs, forward_mode=ForwardMode.DECODE
             )
-            self.attn_backends[i].init_forward_data_out_graph(inner_fb)
+            self.attn_backends[i].init_forward_data_out_graph(
+                inner_fb, in_capture=in_capture
+            )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
 
