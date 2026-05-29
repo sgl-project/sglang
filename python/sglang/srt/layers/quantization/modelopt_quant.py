@@ -1345,7 +1345,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
 
 
 class HybridFp8NvFp4Config(Fp8Config):
-    """FP8 (linear/attention) + NVFP4 (FusedMoE) hybrid quantization.
+    """FP8 (linear/attention/MTP MoE) + NVFP4 (FusedMoE) hybrid quantization.
 
     For checkpoints like nvidia/DeepSeek-V4-Pro-NVFP4 where
     config.json:quantization_config declares quant_method=fp8 and
@@ -1366,9 +1366,16 @@ class HybridFp8NvFp4Config(Fp8Config):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
-            if self.nvfp4_config.is_layer_excluded(prefix):
-                return None
-            return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
+            if not self.nvfp4_config.is_layer_excluded(prefix):
+                return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
+            # Fall back to MXFP4 for MTP MoE layers
+            if self.is_fp4_experts:
+                from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+                from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+                    Mxfp4FlashinferTrtllmMoEMethod,
+                )
+
+                return Mxfp4FlashinferTrtllmMoEMethod(Fp8MoEMethod(self), prefix=prefix)
         return super().get_quant_method(layer, prefix)
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):
