@@ -19,7 +19,7 @@ import tempfile
 import threading
 from multiprocessing.connection import Connection, Listener
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
 from sglang.test.scripted_runtime.router_script import router_script
@@ -99,9 +99,15 @@ class ScriptedRuntimeSession:
         self,
         script_fn: Callable,
         *,
+        args: Tuple[Any, ...] = (),
         timeout_s: float = DEFAULT_RUN_TIMEOUT_S,
     ) -> None:
         """Dispatch ``script_fn`` to the router and block on its result.
+
+        ``args`` are forwarded positionally to the script after the
+        ``ScriptedRuntime`` handle (``script_fn(t, *args)``), letting one
+        parameterized script back many ``subTest`` combos. They cross the
+        IPC pipe, so every element must be picklable.
 
         Re-raises the captured traceback as :class:`AssertionError` if
         the sub-script failed; raises :class:`TimeoutError` (and marks
@@ -112,7 +118,7 @@ class ScriptedRuntimeSession:
         if self._dirty:
             raise RuntimeError(f"ScriptedRuntimeSession is dirty: {self._dirty}")
         fn_path = f"{script_fn.__module__}:{script_fn.__qualname__}"
-        self._conn.send({"kind": "run", "fn_path": fn_path})
+        self._conn.send({"kind": "run", "fn_path": fn_path, "args": args})
         if not self._conn.poll(timeout_s):
             if not self._engine_thread.is_alive():
                 self._dirty = f"engine thread died before responding to {fn_path!r}"

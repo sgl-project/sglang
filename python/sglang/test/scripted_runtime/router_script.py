@@ -40,7 +40,7 @@ def router_script(t: ScriptedRuntime) -> Generator:
                 return
             if kind == "run":
                 fn = _resolve_fn(msg["fn_path"])
-                sub_gen = fn(t)
+                sub_gen = fn(t, *msg["args"])
                 try:
                     yield from sub_gen
                 except BaseException:
