@@ -29,7 +29,7 @@ tag: NEW
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash">DeepSeek-V4-Flash</a></strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>284B</strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>13B</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>single-node serving: B200 / GB200 / GB300 / H200 on 4 GPUs; RTX PRO 6000 (SM120) on 4-8 GPUs</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>single-node serving: B200 / GB200 / GB300 / H200 on 4 GPUs</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro">DeepSeek-V4-Pro</a></strong></td>
@@ -127,20 +127,6 @@ PD-Disagg recipes on H200 may require `docker run --privileged --ulimit memlock=
 (or `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK`) so mooncake
 can discover the IB HCAs; without IB exposure mooncake silently falls back to
 TCP, which can lead to garbled KV transfer on large checkpoints.
-
-<a id="sm120-note" />
-
-**SM120 (RTX PRO 6000)**
-
-DeepSeek-V4-Flash runs on RTX PRO 6000 (SM120, 96 GB GDDR7) with TP only. Use Docker image `lmsysorg/sglang:dev-cu13`.
-
-```bash TP=4
-sglang serve deepseek-ai/DeepSeek-V4-Flash \
-    --tp 4 --mem-fraction-static 0.90 \
-    --moe-runner-backend marlin --cuda-graph-max-bs 4
-```
-
-V4-Pro is not supported on SM120 (does not fit in 8× 96 GB).
 
 **MegaMoE**
 

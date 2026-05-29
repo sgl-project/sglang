@@ -2007,21 +2007,6 @@ class ServerArgs:
                         logger.info(
                             "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
                         )
-            elif is_sm120_supported():
-                # SM120: DSv4-Flash uses MXFP4 experts; marlin backend dispatches
-                # to our SM120 Triton fallback in mxfp4_marlin_moe.py
-                if self.moe_runner_backend == "auto":
-                    self.moe_runner_backend = "marlin"
-                    logger.info(
-                        "Use marlin as MoE runner backend on SM120 for DeepseekV3/V4"
-                    )
-                # SM120 lacks tcgen05/TMEM: disable features that depend on
-                # DeepGEMM or require >99KB SMEM (topk_v2).
-                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
-                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
-                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
-                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
-                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
             elif is_hip():
                 if not self.enable_dp_attention and self.nnodes == 1:
                     # TODO (Hubert): Put this back later

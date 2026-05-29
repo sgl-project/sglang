@@ -1574,7 +1574,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
-        if envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+        if _FP8_WO_A_GEMM:
             self._setup_fp8_wo_a_scales(is_nextn)
 
         if is_nextn:
