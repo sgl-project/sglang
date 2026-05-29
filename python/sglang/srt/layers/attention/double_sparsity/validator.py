@@ -28,6 +28,7 @@ Enforces, at server startup:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -291,3 +292,128 @@ def record_radix_fixture_passed(
         "Source: record_radix_fixture_passed().%s",
         artifact_suffix,
     )
+
+
+# ----- AC-10 no-env-override radix flip (DEC-5) ------------------------------
+#
+# The radix flip is authorized by a config-bound state file, NOT an env var.
+# After the operator runs BOTH M3-B fixtures on hardware and they pass, they
+# write a state file via `write_radix_fixture_state(...)` recording both passes
+# plus a fingerprint of the exact serving config (model / TP / page / KV dtype /
+# channel-mask SHA). `serve_double_sparsity.sh` then passes
+# `--double-sparsity-radix-fixture-artifact <state-file>`; `check_server_args`
+# calls `apply_radix_fixture_artifact(server_args)` BEFORE
+# `validate_double_sparsity`, which verifies the state matches THIS boot's
+# config and only then records the fixture-passed flag. A state file recorded
+# for a different model/mask/config does not authorize this boot (fail-closed).
+
+RADIX_FIXTURE_STATE_SCHEMA = "ds_radix_fixture_state_v1"
+
+
+def _sha256_file(path: str) -> str:
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+def radix_fixture_config_fingerprint(server_args: "ServerArgs") -> dict:
+    """Fingerprint the serving config the radix flip is bound to.
+
+    Includes the channel-mask file SHA so a flip recorded against one
+    calibrated mask cannot authorize a boot that swaps in a different mask.
+    """
+    from sglang.srt.layers.attention.double_sparsity.config import (
+        parse_double_sparsity_config,
+    )
+
+    config = parse_double_sparsity_config(getattr(server_args, "double_sparsity_config"))
+    return {
+        "model_path": getattr(server_args, "model_path", None),
+        "tp_size": getattr(server_args, "tp_size", None),
+        "page_size": getattr(server_args, "page_size", None),
+        "kv_cache_dtype": getattr(server_args, "kv_cache_dtype", None),
+        "channel_mask_path": config.channel_mask_path,
+        "channel_mask_sha256": _sha256_file(config.channel_mask_path),
+    }
+
+
+def write_radix_fixture_state(
+    path: str,
+    *,
+    server_args: "ServerArgs",
+    label_capture_passed: bool,
+    fp8_scale_stability_passed: bool,
+) -> dict:
+    """Write the radix-fixture-passed state file (operator step after both
+    M3-B fixtures pass on hardware). Returns the written dict."""
+    import time as _time
+
+    state = {
+        "schema": RADIX_FIXTURE_STATE_SCHEMA,
+        "label_capture_passed": bool(label_capture_passed),
+        "fp8_scale_stability_passed": bool(fp8_scale_stability_passed),
+        "config": radix_fixture_config_fingerprint(server_args),
+        "recorded_at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2)
+    return state
+
+
+def apply_radix_fixture_artifact(server_args: "ServerArgs") -> None:
+    """If `--double-sparsity-radix-fixture-artifact` is set and DS is radix-on,
+    verify the state file authorizes THIS config and record the fixture-passed
+    flag (so `validate_double_sparsity` accepts radix cache ON).
+
+    No-op when the field is unset, DS is off, or radix is disabled. Fail-closed:
+    a missing/malformed/mismatched/not-both-passed state file raises ValueError
+    rather than silently authorizing the flip.
+    """
+    if not getattr(server_args, "enable_double_sparsity", False):
+        return
+    if getattr(server_args, "disable_radix_cache", True):
+        return  # radix-off needs no authorization
+    artifact = getattr(server_args, "double_sparsity_radix_fixture_artifact", None)
+    if not artifact:
+        return  # let validate_double_sparsity raise the DEC-2 refusal
+
+    if not os.path.isfile(artifact):
+        raise ValueError(
+            f"--double-sparsity-radix-fixture-artifact={artifact!r} does not exist; "
+            "cannot authorize radix-cache ON."
+        )
+    try:
+        with open(artifact, "r", encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ValueError(
+            f"radix-fixture artifact {artifact!r} is unreadable/not JSON: {exc}."
+        ) from exc
+
+    if not isinstance(state, dict) or state.get("schema") != RADIX_FIXTURE_STATE_SCHEMA:
+        raise ValueError(
+            f"radix-fixture artifact {artifact!r} schema must be "
+            f"{RADIX_FIXTURE_STATE_SCHEMA!r}, got {state.get('schema') if isinstance(state, dict) else type(state).__name__!r}."
+        )
+    if not (state.get("label_capture_passed") and state.get("fp8_scale_stability_passed")):
+        raise ValueError(
+            f"radix-fixture artifact {artifact!r} does not record BOTH fixtures as "
+            f"passed (label_capture_passed={state.get('label_capture_passed')!r}, "
+            f"fp8_scale_stability_passed={state.get('fp8_scale_stability_passed')!r}); "
+            "radix-cache ON is not authorized."
+        )
+
+    recorded = state.get("config") or {}
+    current = radix_fixture_config_fingerprint(server_args)
+    mismatches = [
+        f"{k}: artifact={recorded.get(k)!r} current={current[k]!r}"
+        for k in current
+        if recorded.get(k) != current[k]
+    ]
+    if mismatches:
+        raise ValueError(
+            f"radix-fixture artifact {artifact!r} was recorded for a different "
+            "serving config; it cannot authorize this boot. Mismatches: "
+            + "; ".join(mismatches)
+        )
+
+    record_radix_fixture_passed(server_args, artifact_path=artifact)

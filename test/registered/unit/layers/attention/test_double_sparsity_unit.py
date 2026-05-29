@@ -432,6 +432,194 @@ class TestValidator(unittest.TestCase):
                 os.environ.pop("SGLANG_DS_ALLOW_PLACEHOLDER", None)
                 os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
 
+    def _radix_flip_args(self, mask_path, *, artifact=None, tp_size=8):
+        """ServerArgs-shaped namespace for the AC-10 radix-on path."""
+        return self._args(
+            enable_double_sparsity=True,
+            double_sparsity_config=_valid_payload(mask_path),
+            page_size=64,
+            kv_cache_dtype="fp8_e4m3",
+            dsa_prefill_backend="flashmla_kv",
+            dsa_decode_backend="flashmla_kv",
+            disable_radix_cache=False,  # radix-on target
+            model_path="/cluster-storage/models/deepseek-ai/DeepSeek-V3.2",
+            tp_size=tp_size,
+            double_sparsity_radix_fixture_artifact=artifact,
+        )
+
+    def test_apply_radix_fixture_artifact_authorizes_matching_state(self):
+        """AC-10 / DEC-5: a config-bound fixture-passed state file authorizes
+        radix-on with NO env override, and validation then accepts."""
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            apply_radix_fixture_artifact,
+            write_radix_fixture_state,
+        )
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            save_channel_mask,
+        )
+        import tempfile, os as _os
+
+        sel_t = torch.randint(0, 128, (2, 4, 16), dtype=torch.int32)
+        w_t = torch.randn(2, 4, 16, dtype=torch.float32)
+        with tempfile.TemporaryDirectory() as tmp:
+            mask = _os.path.join(tmp, "cm.safetensors")
+            save_channel_mask(
+                mask, sel_t, w_t, dtype="fp8_e4m3", head_dim=128,
+                page_size=64, label_dim=16, created_at="2026-05-20T00:00:00Z",
+            )
+            state = _os.path.join(tmp, "radix_state.json")
+            write_radix_fixture_state(
+                state, server_args=self._radix_flip_args(mask),
+                label_capture_passed=True, fp8_scale_stability_passed=True,
+            )
+            os.environ.pop("SGLANG_DS_RADIX_OVERRIDE", None)
+            os.environ["SGLANG_DS_ALLOW_PLACEHOLDER"] = "1"
+            os.environ["SGLANG_DS_ALLOW_NO_ADAPTER"] = "1"
+            try:
+                args = self._radix_flip_args(mask, artifact=state)
+                apply_radix_fixture_artifact(args)
+                self.assertTrue(
+                    getattr(args, "_double_sparsity_radix_fixture_passed", False),
+                    "matching fixture state must set the radix-passed flag",
+                )
+                validate_double_sparsity(args)  # accepts radix-on now
+            finally:
+                os.environ.pop("SGLANG_DS_ALLOW_PLACEHOLDER", None)
+                os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
+
+    def test_apply_radix_fixture_artifact_rejects_config_mismatch(self):
+        """A state file recorded for a different config (tp_size) must NOT
+        authorize this boot."""
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            apply_radix_fixture_artifact, write_radix_fixture_state,
+        )
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            save_channel_mask,
+        )
+        import tempfile, os as _os
+
+        sel_t = torch.randint(0, 128, (2, 4, 16), dtype=torch.int32)
+        w_t = torch.randn(2, 4, 16, dtype=torch.float32)
+        with tempfile.TemporaryDirectory() as tmp:
+            mask = _os.path.join(tmp, "cm.safetensors")
+            save_channel_mask(
+                mask, sel_t, w_t, dtype="fp8_e4m3", head_dim=128,
+                page_size=64, label_dim=16, created_at="2026-05-20T00:00:00Z",
+            )
+            state = _os.path.join(tmp, "radix_state.json")
+            # state recorded for tp_size=4 ...
+            write_radix_fixture_state(
+                state, server_args=self._radix_flip_args(mask, tp_size=4),
+                label_capture_passed=True, fp8_scale_stability_passed=True,
+            )
+            # ... but this boot is tp_size=8.
+            args = self._radix_flip_args(mask, artifact=state, tp_size=8)
+            with self.assertRaises(ValueError) as ctx:
+                apply_radix_fixture_artifact(args)
+            self.assertIn("different serving config", str(ctx.exception))
+            self.assertFalse(
+                getattr(args, "_double_sparsity_radix_fixture_passed", False)
+            )
+
+    def test_apply_radix_fixture_artifact_rejects_partial_pass(self):
+        """A state file where only one fixture passed must NOT authorize."""
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            apply_radix_fixture_artifact, write_radix_fixture_state,
+        )
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            save_channel_mask,
+        )
+        import tempfile, os as _os
+
+        sel_t = torch.randint(0, 128, (2, 4, 16), dtype=torch.int32)
+        w_t = torch.randn(2, 4, 16, dtype=torch.float32)
+        with tempfile.TemporaryDirectory() as tmp:
+            mask = _os.path.join(tmp, "cm.safetensors")
+            save_channel_mask(
+                mask, sel_t, w_t, dtype="fp8_e4m3", head_dim=128,
+                page_size=64, label_dim=16, created_at="2026-05-20T00:00:00Z",
+            )
+            state = _os.path.join(tmp, "radix_state.json")
+            write_radix_fixture_state(
+                state, server_args=self._radix_flip_args(mask),
+                label_capture_passed=True, fp8_scale_stability_passed=False,
+            )
+            args = self._radix_flip_args(mask, artifact=state)
+            with self.assertRaises(ValueError) as ctx:
+                apply_radix_fixture_artifact(args)
+            self.assertIn("BOTH fixtures", str(ctx.exception))
+
+    def test_apply_radix_fixture_artifact_missing_file_raises(self):
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            apply_radix_fixture_artifact,
+        )
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            save_channel_mask,
+        )
+        import tempfile, os as _os
+
+        sel_t = torch.randint(0, 128, (2, 4, 16), dtype=torch.int32)
+        w_t = torch.randn(2, 4, 16, dtype=torch.float32)
+        with tempfile.TemporaryDirectory() as tmp:
+            mask = _os.path.join(tmp, "cm.safetensors")
+            save_channel_mask(
+                mask, sel_t, w_t, dtype="fp8_e4m3", head_dim=128,
+                page_size=64, label_dim=16, created_at="2026-05-20T00:00:00Z",
+            )
+            args = self._radix_flip_args(
+                mask, artifact=_os.path.join(tmp, "does_not_exist.json")
+            )
+            with self.assertRaises(ValueError) as ctx:
+                apply_radix_fixture_artifact(args)
+            self.assertIn("does not exist", str(ctx.exception))
+
+    def test_apply_radix_fixture_artifact_noop_when_radix_off(self):
+        """Radix-off needs no authorization — apply is a no-op."""
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            apply_radix_fixture_artifact,
+        )
+        args = self._args(
+            enable_double_sparsity=True, disable_radix_cache=True,
+            double_sparsity_radix_fixture_artifact="/nonexistent.json",
+        )
+        apply_radix_fixture_artifact(args)  # must not raise
+        self.assertFalse(
+            getattr(args, "_double_sparsity_radix_fixture_passed", False)
+        )
+
+    def test_radix_on_without_artifact_or_env_is_refused(self):
+        """AC-10 negative: radix-on with neither the fixture artifact nor the
+        env override must be refused by the validator (the artifact is the
+        required no-env mechanism)."""
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            apply_radix_fixture_artifact,
+        )
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            save_channel_mask,
+        )
+        import tempfile, os as _os
+
+        sel_t = torch.randint(0, 128, (2, 4, 16), dtype=torch.int32)
+        w_t = torch.randn(2, 4, 16, dtype=torch.float32)
+        with tempfile.TemporaryDirectory() as tmp:
+            mask = _os.path.join(tmp, "cm.safetensors")
+            save_channel_mask(
+                mask, sel_t, w_t, dtype="fp8_e4m3", head_dim=128,
+                page_size=64, label_dim=16, created_at="2026-05-20T00:00:00Z",
+            )
+            os.environ.pop("SGLANG_DS_RADIX_OVERRIDE", None)
+            os.environ["SGLANG_DS_ALLOW_PLACEHOLDER"] = "1"
+            os.environ["SGLANG_DS_ALLOW_NO_ADAPTER"] = "1"
+            try:
+                args = self._radix_flip_args(mask, artifact=None)
+                apply_radix_fixture_artifact(args)  # no-op (no artifact)
+                with self.assertRaises(ValueError) as ctx:
+                    validate_double_sparsity(args)
+                self.assertIn("M3-B page-stability fixture", str(ctx.exception))
+            finally:
+                os.environ.pop("SGLANG_DS_ALLOW_PLACEHOLDER", None)
+                os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
+
     def test_marks_channel_mask_valid_on_success(self):
         """Round-13 fix [P2]: a healthy validator pass must set the AC-10
         ``sglang_double_sparsity_channel_mask_valid`` gauge to 1.

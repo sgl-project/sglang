@@ -663,6 +663,7 @@ class ServerArgs:
     # Double Sparsity (standalone; mutually exclusive with HiSparse at runtime)
     enable_double_sparsity: bool = False
     double_sparsity_config: Optional[str] = None
+    double_sparsity_radix_fixture_artifact: Optional[str] = None
 
     # LMCache
     enable_lmcache: bool = False
@@ -6103,6 +6104,19 @@ class ServerArgs:
                 '"device_buffer_size": 4096}\'.'
             ),
         )
+        parser.add_argument(
+            "--double-sparsity-radix-fixture-artifact",
+            dest="double_sparsity_radix_fixture_artifact",
+            type=str,
+            default=ServerArgs.double_sparsity_radix_fixture_artifact,
+            help=(
+                "Path to a radix-fixture-passed state file (written by "
+                "validator.write_radix_fixture_state after BOTH M3-B fixtures pass on "
+                "this config). When provided and --disable-radix-cache is absent, the "
+                "DS validator verifies the state matches this boot's config and then "
+                "permits radix cache ON -- the no-env-override AC-10 flip (DEC-5)."
+            ),
+        )
 
         # LMCache
         parser.add_argument(
@@ -7192,9 +7206,13 @@ class ServerArgs:
 
         # Check double sparsity (standalone path; mutually exclusive with hisparse)
         from sglang.srt.layers.attention.double_sparsity.validator import (
+            apply_radix_fixture_artifact,
             validate_double_sparsity,
         )
 
+        # AC-10 (DEC-5): authorize the radix-cache flip from the config-bound
+        # fixture state file BEFORE validation, with no env override.
+        apply_radix_fixture_artifact(self)
         validate_double_sparsity(self)
 
         assert (

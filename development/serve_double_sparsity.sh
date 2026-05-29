@@ -47,6 +47,19 @@ mkdir -p "${LOG_DIR}"
 DS_CONFIG=$(printf '{"top_k": %s, "page_size": %s, "channel_mask_path": "%s", "device_buffer_size": %s}' \
   "${TOP_K}" "${PAGE_SIZE}" "${CHANNEL_MASK_PATH}" "${DEVICE_BUFFER_SIZE}")
 
+# AC-10 radix flip (DEC-5, no env override): set RADIX_FIXTURE_ARTIFACT to a
+# fixture-passed state file (written by validator.write_radix_fixture_state once
+# BOTH M3-B fixtures pass on this exact config). When set, the launcher passes
+# --double-sparsity-radix-fixture-artifact and DROPS --disable-radix-cache so DS
+# boots radix-on; the DS validator re-verifies the state matches this config
+# before permitting it. Unset (default) keeps --disable-radix-cache (radix-off).
+RADIX_FIXTURE_ARTIFACT="${RADIX_FIXTURE_ARTIFACT:-}"
+if [[ -n "${RADIX_FIXTURE_ARTIFACT}" ]]; then
+  RADIX_ARGS=(--double-sparsity-radix-fixture-artifact "${RADIX_FIXTURE_ARTIFACT}")
+else
+  RADIX_ARGS=(--disable-radix-cache)
+fi
+
 LOG_FILE="${LOG_DIR}/server_double_sparsity_$(date +%Y%m%d-%H%M%S).log"
 echo ">>> Starting Double Sparsity server (standalone)"
 echo "    model            = ${MODEL_PATH}"
@@ -57,6 +70,7 @@ echo "    page_size        = ${PAGE_SIZE}"
 echo "    channel_mask     = ${CHANNEL_MASK_PATH}"
 echo "    top_k            = ${TOP_K}"
 echo "    device_buffer    = ${DEVICE_BUFFER_SIZE}"
+echo "    radix_cache      = $([[ -n "${RADIX_FIXTURE_ARTIFACT}" ]] && echo "ENABLED (fixture artifact: ${RADIX_FIXTURE_ARTIFACT})" || echo "disabled (no fixture artifact)")"
 echo "    log              = ${LOG_FILE}"
 
 exec python3 -m sglang.launch_server \
@@ -72,9 +86,9 @@ exec python3 -m sglang.launch_server \
   --disable-piecewise-cuda-graph \
   --enable-double-sparsity \
   --double-sparsity-config "${DS_CONFIG}" \
-  `# AC-10-FIXTURE-MARKER: remove the next line after M3-B fixture` \
-  `# pass + record_radix_fixture_passed(server_args) flip (DEC-2).` \
-  --disable-radix-cache \
+  `# Radix cache: --disable-radix-cache (default, radix-off) OR` \
+  `# --double-sparsity-radix-fixture-artifact <state> (AC-10 radix-on, DEC-5).` \
+  "${RADIX_ARGS[@]}" \
   --trust-remote-code \
   ${EXTRA_SERVER_ARGS:-} \
   2>&1 | tee "${LOG_FILE}"
