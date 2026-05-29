@@ -29,54 +29,66 @@ class TestScriptedSwaChunkedReqScheduledLastIter(ScriptedRuntimeTestCase):
     )
 
     def test_swa_chunked_req_early_return_no_double_free(self):
-        """SWA add_chunked_req early-return must flip _chunked_req_scheduled_last_iter cleanly."""
+        """SWA add_chunked_req early-return must not stash the un-scheduled chunked req."""
         self.runtime.run(self._script_swa_chunked_req_early_return_no_double_free)
 
-    # SWA pool critical + add_chunked_req forced early-return —
-    # _chunked_req_scheduled_last_iter must flip correctly; stash must not
-    # be double-freed.
+    # SWA pool critical + add_chunked_req forced early-return: the chunked
+    # req stays parked as scheduler.chunked_req without running, and the
+    # stash gate must keep its partial KV out of the tree so no radix node
+    # is left locked once the engine drains.
     @staticmethod
     def _script_swa_chunked_req_early_return_no_double_free(t: ScriptedRuntime):
+        s = t._scheduler
         # Long competitor consumes SWA budget so the chunked req hits
         # the add_chunked_req SWA-early-return branch at least once.
         competitor = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=8)
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
-        # Snapshot counters across iters: once the req leaves the
-        # scheduler's structures the rid lookup returns 0, so we must
-        # capture peaks during the chunked-active window.
-        observed_true = False
-        observed_false_after_early_return = False
-        peak_early_return_count = 0
-        peak_double_free_count = 0
+
+        # "assert the scenario exists" derived purely from real batch state,
+        # no scheduler instrumentation: an early-return leaves r parked as
+        # scheduler.chunked_req yet absent from the iter's forward batch
+        # (add_chunked_req returned it without admitting it into can_run_list,
+        # so it never reached last_batch). A normally-scheduled chunk would
+        # appear in last_batch.reqs the next yield.
+        observed_early_return = False
         for _ in range(800):
-            flag = r.chunked_req_scheduled_last_iter
-            er = r.swa_chunked_early_return_count
-            df = r.swa_stash_double_free_count
-            peak_early_return_count = max(peak_early_return_count, er)
-            peak_double_free_count = max(peak_double_free_count, df)
-            if flag is True:
-                observed_true = True
-            if flag is False and er > 0:
-                observed_false_after_early_return = True
+            chunked = s.chunked_req
+            last_batch = s.last_batch
+            if (
+                chunked is not None
+                and chunked.rid == r.rid
+                and last_batch is not None
+                and chunked not in last_batch.reqs
+            ):
+                observed_early_return = True
             if r.finished and competitor.finished:
                 break
             yield
-        assert r.finished
-        assert (
-            observed_true
-        ), "_chunked_req_scheduled_last_iter must be True at least once"
-        assert peak_early_return_count > 0, (
-            "test must exercise the SWA early-return branch; "
-            "peak swa_chunked_early_return_count stayed 0 across the run"
+
+        assert r.finished, "chunked req under SWA pressure did not finish"
+        assert observed_early_return, (
+            "test must exercise the SWA add_chunked_req early-return branch: "
+            "no iter observed r parked as scheduler.chunked_req while absent "
+            "from the forward batch — SWA budget was never tight enough"
         )
-        assert observed_false_after_early_return, (
-            "_chunked_req_scheduled_last_iter must observe False after a "
-            "SWA early-return (gate must close on this iter)"
+
+        # Gate held: drain to a fully idle engine, then assert no radix node
+        # stayed locked. A stash on the un-scheduled chunked req (broken gate)
+        # inc_lock_refs a path with no matching release, surfacing here as a
+        # nonzero terminal lock_ref.
+        yield from run_until(
+            r,
+            lambda _h: s.chunked_req is None
+            and len(s.waiting_queue) == 0
+            and s.running_batch.is_empty(),
         )
-        assert peak_double_free_count == 0, (
-            f"SWA stash double-free observed {peak_double_free_count} times "
-            "(gate at scheduler.get_next_batch_to_run is broken)"
+        locked = {
+            nid: lr for nid, lr in t.get_all_node_lock_refs().items() if lr != 0
+        }
+        assert not locked, (
+            f"radix nodes left locked after drain {locked} — stash gate let "
+            "an un-scheduled chunked req commit partial KV"
         )
 
 

@@ -627,40 +627,37 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
         ), "test must observe the fill_ids reset boundary at least once"
         assert r.finished
 
-    def test_chunked_req_scheduled_last_iter_false_when_chunk_completes(self):
-        """After last chunk admit, last_chunked_req_scheduled_iter_flag clears to False (chunked_req cleared)."""
-        self.runtime.run(
-            self._script_chunked_req_scheduled_last_iter_false_when_chunk_completes
-        )
+    def test_chunked_req_slot_cleared_when_chunk_completes(self):
+        """After the last chunk admit, scheduler.chunked_req clears back to None."""
+        self.runtime.run(self._script_chunked_req_slot_cleared_when_chunk_completes)
 
-    # scheduler.py: ``_chunked_req_scheduled_last_iter`` must
-    # transition from True (during chunked admission) to False once the
-    # last chunk has been admitted and the scheduler.chunked_req has
-    # been cleared back to None. Observable via the flag itself.
+    # scheduler.py: scheduler.chunked_req holds the in-flight chunked req
+    # during chunked admission and must clear back to None once the last
+    # chunk has been admitted. Observed via real scheduler state, not the
+    # internal gate flag.
     @staticmethod
-    def _script_chunked_req_scheduled_last_iter_false_when_chunk_completes(
-        t: ScriptedRuntime,
-    ):
+    def _script_chunked_req_slot_cleared_when_chunk_completes(t: ScriptedRuntime):
+        s = t._scheduler
         # 2 chunks so the second chunk is the last one and clearly
         # exercises the last-chunk admission path.
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
-        # While the req is chunking, observe the flag at least once True.
-        saw_true = False
+        # While the req is chunking the scheduler must hold it in the
+        # chunked_req slot at least once.
+        saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
             if r.is_chunking:
-                # NEW API NEEDED: t.last_chunked_req_scheduled_iter_flag()
-                # returns the value of scheduler._chunked_req_scheduled_last_iter.
-                if t.last_chunked_req_scheduled_iter_flag():
-                    saw_true = True
+                saw_chunking = True
             if r.finished:
                 break
             yield
         assert r.finished
-        assert saw_true, "flag should have been True at least once mid-chunk"
-        # After finish + chunked_req cleared, the flag must be False.
         assert (
-            t.last_chunked_req_scheduled_iter_flag() is False
-        ), f"flag must clear to False after last chunk; got {t.last_chunked_req_scheduled_iter_flag()!r}"
+            saw_chunking
+        ), "req should have occupied the chunked_req slot mid-chunk"
+        # After finish the chunked slot must be cleared back to None.
+        assert (
+            s.chunked_req is None
+        ), f"chunked_req slot must clear after last chunk; got {s.chunked_req!r}"
 
     def test_second_chunked_admit_blocked_when_chunked_req_set(self):
         """While R1 is chunking, R2 (also long) waits; at every yield exactly one of {R1, R2} is_chunking."""
