@@ -132,10 +132,27 @@ def fused_q_indexer_rope_hadamard_quant(
     weights_out = torch.empty(
         (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
     )
-    module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
-    module.forward(
-        q_input, q_fp8, weight, weights_out, float(weight_scale), freqs_real, positions
-    )
+    if _is_hip:
+        torch.ops.sgl_kernel.dsv4_fused_q_indexer_rope_hadamard_quant(
+            q_input,
+            q_fp8,
+            weight,
+            weights_out,
+            float(weight_scale),
+            freqs_real,
+            positions,
+        )
+    else:
+        module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
+        module.forward(
+            q_input,
+            q_fp8,
+            weight,
+            weights_out,
+            float(weight_scale),
+            freqs_real,
+            positions,
+        )
     return q_fp8, weights_out
 
 

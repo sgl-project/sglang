@@ -1,4 +1,5 @@
 import contextlib
+import inspect
 import logging
 import platform
 from typing import Optional, Tuple
@@ -38,18 +39,21 @@ _TorchDistBackend = None
 _mnnvl_comm_backend = None
 _create_allreduce_fusion_workspace = None
 _flashinfer_allreduce_unavailable = False
+_flashinfer_create_workspace_supports_group = False
+_flashinfer_create_workspace_supports_comm_backend = False
+_flashinfer_allreduce_supports_trigger_completion = False
 _posix_transport_override_logged = False
 _mnnvl_non_blackwell_fallback_logged = False
 
 
 def _resolve_backend(backend: str) -> str:
-    """Force any auto/mnnvl selection back to trtllm when not on SM100.
-
-    MNNVL is only enabled on Blackwell GPUs (SM10x) where it has been validated;
-    elsewhere we use TRT-LLM unconditionally.
-    """
+    """Resolve the requested FlashInfer allreduce fusion backend."""
     global _mnnvl_non_blackwell_fallback_logged
-    if backend in ("auto", "mnnvl") and not is_sm100_supported():
+
+    if backend == "auto":
+        return "mnnvl" if is_sm100_supported() else "trtllm"
+
+    if backend == "mnnvl" and not is_sm100_supported():
         if not _mnnvl_non_blackwell_fallback_logged:
             logger.info(
                 "FlashInfer allreduce fusion: forcing trtllm backend "
@@ -60,20 +64,11 @@ def _resolve_backend(backend: str) -> str:
     return backend
 
 
-def flashinfer_mnnvl_allreduce_fusion_enabled(server_args) -> bool:
-    """True when FlashInfer is configured to (potentially) run MNNVL allreduce fusion.
-
-    MNNVL has a known piecewise-CUDA-graph replay hang (Lamport spin in the
-    FlashInfer MNNVL path), so callers use this to skip PCG capture entirely.
-    Returns True if the user selected ``mnnvl`` explicitly, or if ``auto`` is
-    used on a Blackwell system where the auto-resolver may pick mnnvl.
-    """
+def resolve_flashinfer_allreduce_fusion_backend(server_args) -> Optional[str]:
     backend = getattr(server_args, "flashinfer_allreduce_fusion_backend", None)
     if backend is None:
-        return False
-    return _resolve_backend(backend) == "mnnvl" or (
-        backend == "auto" and is_sm100_supported()
-    )
+        return None
+    return _resolve_backend(backend)
 
 
 def _should_force_posix_fd_transport() -> bool:
@@ -145,9 +140,32 @@ if is_flashinfer_available():
     try:
         import flashinfer.comm as comm
 
-        _flashinfer_comm = comm
-        _create_allreduce_fusion_workspace = comm.create_allreduce_fusion_workspace
+        if hasattr(comm, "allreduce_fusion") and hasattr(
+            comm, "create_allreduce_fusion_workspace"
+        ):
+            _flashinfer_comm = comm
+            _create_allreduce_fusion_workspace = (
+                comm.create_allreduce_fusion_workspace
+            )
+            workspace_params = inspect.signature(
+                comm.create_allreduce_fusion_workspace
+            ).parameters
+            allreduce_params = inspect.signature(comm.allreduce_fusion).parameters
+            _flashinfer_create_workspace_supports_group = "group" in workspace_params
+            _flashinfer_create_workspace_supports_comm_backend = (
+                "comm_backend" in workspace_params
+            )
+            _flashinfer_allreduce_supports_trigger_completion = (
+                "trigger_completion_at_end" in allreduce_params
+            )
+        else:
+            _flashinfer_allreduce_unavailable = True
+            logger.warning(
+                "flashinfer.comm unified allreduce_fusion API is not available, "
+                "falling back to standard implementation"
+            )
     except (ImportError, AttributeError) as e:
+        _flashinfer_allreduce_unavailable = True
         logger.warning(
             "flashinfer.comm allreduce_fusion API is not available (%s), "
             "falling back to standard implementation",
@@ -501,6 +519,11 @@ class FlashInferWorkspaceManager:
         node_pg = cpu_group if cpu_group is not None else group
         if node_pg is not None:
             gpus_per_node = sum(in_the_same_node_as(node_pg, source_rank=0))
+        if backend == "mnnvl" and gpus_per_node is not None:
+            assert gpus_per_node == 4, (
+                "FlashInfer MNNVL allreduce fusion expects 4 GPUs per node "
+                f"on GB200/GB300, got {gpus_per_node}."
+            )
 
         comm_backend = None
         if (
@@ -525,13 +548,18 @@ class FlashInferWorkspaceManager:
                 hidden_dim=alloc_hidden_dim,
                 dtype=dtype or torch.bfloat16,
                 gpus_per_node=gpus_per_node,
-                comm_backend=comm_backend,
+            )
+            if (
+                _flashinfer_create_workspace_supports_comm_backend
+                and comm_backend is not None
+            ):
+                create_kw["comm_backend"] = comm_backend
+            if _flashinfer_create_workspace_supports_group:
                 # Pin the symmetric-memory rendezvous to the actual
                 # subgroup. Without this, flashinfer >=0.6.10 falls back
                 # to WORLD and TP/EP/CP subgroup peers get addressed
                 # incorrectly (kernel hangs in cuda-graph warmup).
-                group=device_group,
-            )
+                create_kw["group"] = device_group
             if use_oneshot is not None:
                 create_kw["force_oneshot_support"] = bool(use_oneshot)
             if use_fp32_lamport:
@@ -835,12 +863,11 @@ def flashinfer_allreduce_residual_rmsnorm(
     residual_out = torch.empty_like(residual)
     norm_out = torch.empty_like(input_tensor)
 
-    _flashinfer_comm.allreduce_fusion(
+    kwargs = dict(
         input=input_tensor,
         workspace=workspace_manager.workspace,
         pattern=_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
         launch_with_pdl=True,
-        trigger_completion_at_end=trigger_completion_at_end,
         residual_out=residual_out,
         norm_out=norm_out,
         residual_in=residual,
@@ -849,6 +876,9 @@ def flashinfer_allreduce_residual_rmsnorm(
         use_oneshot=use_oneshot,
         fp32_acc=fp32_acc,
     )
+    if _flashinfer_allreduce_supports_trigger_completion:
+        kwargs["trigger_completion_at_end"] = trigger_completion_at_end
+    _flashinfer_comm.allreduce_fusion(**kwargs)
 
     return norm_out, residual_out
 
