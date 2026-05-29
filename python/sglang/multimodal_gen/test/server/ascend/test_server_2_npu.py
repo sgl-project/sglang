@@ -34,4 +34,5 @@ class TestDiffusionServerTwoNpu(DiffusionServerBase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    import sys
+    sys.exit(pytest.main([__file__], "-v"))
