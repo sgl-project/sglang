@@ -82,9 +82,6 @@ def _build_plan_fixtures(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
 ]:
     bs = 3
     max_reqs = 4

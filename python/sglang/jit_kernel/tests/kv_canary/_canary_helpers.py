@@ -188,7 +188,7 @@ def make_write_plan(
 ) -> WritePlan:
     """Build a WritePlan from raw offsets and seed slot lists.
 
-    ``write_offsets`` must have length ``num_active_reqs + 1`` (the trailing total entry count).
+    ``write_offsets`` must have length ``len(seed_slot_indices) + 1`` (the trailing total entry count).
     """
     n_active = len(seed_slot_indices)
     if len(write_offsets) != n_active + 1:

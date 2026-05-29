@@ -913,7 +913,7 @@ class TestVerifyContent:
         assert req1_positions == [0, 1, 2, 3, 4, 5, 6, 7]
 
     def test_write_num_valid_reqs_excludes_padding(self) -> None:
-        """Padding rows (rpi == 0) at the tail must not be counted toward the active write-req count."""
+        """Padding rows (rpi == 0) contribute zero to write_offsets so the write kernel does no work for them, but they ARE included in write_num_valid_reqs, which equals bs (the full batch size including padding)."""
         req_to_token = make_req_to_token(
             kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE
         )

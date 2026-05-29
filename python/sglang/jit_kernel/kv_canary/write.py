@@ -94,7 +94,7 @@ def launch_canary_write_kernel(
 
     - ``slot`` = ``out_cache_loc[i]`` (caller-pre-translated for SWA groups; entries set to -1 are skipped).
     - ``token / position`` = ``input_ids[i] / positions[i]``.
-    - ``real_kv_hash`` = ``real_kv_fold_sources(real_kv_sources, slot)`` if ``real_kv_hash_mode != OFF`` else 0.
+    - ``real_kv_hash`` = ``real_kv_fold_sources(real_kv_sources, slot)`` if ``real_kv_hash_mode != NONE`` else 0.
     - Store 4 int64s ``(token, position, running_prev_hash, real_kv_hash)`` into ``canary_buf[slot]``.
     - Advance ``running_prev_hash = splitmix64_mix3(prev, token, position)``, where
       splitmix64_mix3 folds each input via ``acc = splitmix64(acc ^ next)`` starting from ``splitmix64(prev)``.
@@ -159,7 +159,7 @@ def launch_canary_write_kernel(
               slot = out_cache_loc[i];  // caller-pre-translated; the kernel never consults a LUT
               if (slot < 0) continue;       // -1 sentinel = skip (SWA out-of-window or padding)
               token = input_ids[i]; position = positions[i];
-              real_kv_hash = (real_kv_hash_mode == OFF) ? 0 : real_kv_fold_sources(real_kv_sources, slot);
+              real_kv_hash = (real_kv_hash_mode == NONE) ? 0 : real_kv_fold_sources(real_kv_sources, slot);
                   // applies RealKvSource access invariant
               if enable_write_input_assert:
                   if token != expected_input_tokens[i] or position != expected_input_positions[i]:

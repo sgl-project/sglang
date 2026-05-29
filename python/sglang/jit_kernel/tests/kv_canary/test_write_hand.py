@@ -200,7 +200,7 @@ class TestSeedSlot:
         assert stored_prev_hash == chain_anchor_signed()
 
     def test_seed_slot_idx_loads_predecessor(self) -> None:
-        """``seed_slot_idx >= 0`` → load 4 fields from ``canary_buf[seed]`` and splitmix64-advance into prev_hash."""
+        """``seed_slot_idx >= 0`` → load 3 fields (token, position, prev_hash) from ``canary_buf[seed]`` and splitmix64_mix3-advance into prev_hash."""
         # Step: pre-stamp slot 7 with a known chain link.
         seed_token, seed_position = 100, 4
         seed_prev_signed = to_signed_int64(splitmix64(consts.CANARY_CHAIN_ANCHOR))
@@ -231,7 +231,7 @@ class TestSeedSlot:
     def test_seed_slot_chain_link_continuous(self) -> None:
         """After write, ``slot[0].prev_hash`` is consistent with verify's chain reconstruction from seed."""
         # Step 1: write a chain from seed slot=7 → newly written slot=2. Then run verify with prev=7 and
-        # assert no violation — i.e., slot[2].prev_hash is the correct splitmix64-mix of seed's 4 fields.
+        # assert no violation — i.e., slot[2].prev_hash is splitmix64_mix3(seed.prev_hash, seed.token, seed.position).
         cuda_buf = self.buf_pair[0]
         seed_token, seed_position = 11, 0
         seed_prev_signed = to_signed_int64(splitmix64(consts.CANARY_CHAIN_ANCHOR))
@@ -635,7 +635,7 @@ class TestSlotHandling:
         self.buf_pair = _make_default_buf_pair()
 
     def test_negative_slot_skips_entry(self) -> None:
-        """``fb_out_cache_loc[i] < 0`` → that entry is skipped: no buf write, no violation, no
+        """``out_cache_loc[i] < 0`` → that entry is skipped: no buf write, no violation, no
         canary slot mutation, and no write slot_run_counter increment.
         Covers both SWA out-of-window (after caller-side LUT gather) and explicit padding intents.
         """

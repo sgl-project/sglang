@@ -20,10 +20,14 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 
 register_cuda_ci(est_time=600, stage="extra-a", runner_config="2-gpu-large")
 
-# DO NOT pass --disable-cuda-graph or --disable-piecewise-cuda-graph in any
-# canary e2e test. The canary kernel must run inside the cuda graph alongside
-# the real attn kernel; disabling the graph silently bypasses the only path
-# that exercises that invariant end-to-end.
+# DO NOT pass --disable-cuda-graph in canary e2e tests.  The canary kernel
+# must run inside the cuda graph alongside the real attn kernel; disabling the
+# full graph silently bypasses the only path that exercises that invariant
+# end-to-end.
+#
+# --disable-piecewise-cuda-graph is REQUIRED by canary: install_canary
+# (api.py) asserts it, and the SingleForwardManager design depends on it.
+# mock_model_server_args() already passes it; do not remove it.
 _NUM_PROMPTS = 32
 _INPUT_LEN = 6144
 _OUTPUT_LEN = 1024

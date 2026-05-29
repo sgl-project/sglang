@@ -103,8 +103,8 @@ def launch_canary_plan_kernels(
         - Padding rows contribute zero entries.
 
     Pinned by Python reference
-    :func:`sglang.jit_kernel.kv_canary.plan_ref.launch_canary_plan_kernels_torch_reference`; Triton must match
-    byte-for-byte.
+    :func:`sglang.jit_kernel.kv_canary.plan_ref.launch_canary_plan_kernels_torch_reference`; both the Triton
+    offsets kernel and the CUDA JIT entries kernel must match byte-for-byte.
     """
     bs = int(req_pool_indices.shape[0])
     if bs > _PLAN_BS_BLOCK_SIZE:

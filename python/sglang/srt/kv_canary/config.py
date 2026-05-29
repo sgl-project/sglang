@@ -23,8 +23,9 @@ class CanaryMode(str, Enum):
 class CanaryConfig:
     """Top-level canary configuration. All knobs live here; nothing reads env vars deeper in the stack.
 
-    Constructed once at server startup from CLI flags / env vars, then frozen and passed into
-    install_canary(server_args, model_runner) once. Subsequent runtime never mutates it.
+    Constructed once inside install_canary(server_args, model_runner, token_oracle_manager) via
+    CanaryConfig.from_env(server_args), then frozen and threaded through the canary stack.
+    Subsequent runtime never mutates it.
 
     Fields:
         mode: CanaryMode value. none = no canary installed; log = canary runs, violations are logged

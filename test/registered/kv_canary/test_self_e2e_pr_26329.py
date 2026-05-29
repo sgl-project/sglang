@@ -69,7 +69,7 @@ class _EagleChunkedRotationBase(CanaryE2EBase):
 
 
 class TestEagleChunkedRotationRegression(_EagleChunkedRotationBase):
-    """Revert PR #26329 fix; expect canary to fire a write_token violation."""
+    """Revert PR #26329 fix; expect canary to fire a verify_token violation."""
 
     revert_pr = True
 
