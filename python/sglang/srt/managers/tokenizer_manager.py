@@ -297,7 +297,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # so we need to reserve the space for the draft tokens.
             self.num_reserved_tokens = max(
                 server_args.speculative_eagle_topk * server_args.speculative_num_steps,
-                server_args.speculative_num_draft_tokens,
+                server_args.max_speculative_num_draft_tokens,
             )
         else:
             self.num_reserved_tokens = 0

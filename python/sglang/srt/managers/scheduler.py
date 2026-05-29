@@ -692,6 +692,7 @@ class Scheduler(
             "num_experts_per_tok",
             "num_experts_per_token",
             "top_k_experts",
+            "moe_top_k",
         )
         if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
             initialize_moe_config(self.server_args)
@@ -1416,6 +1417,9 @@ class Scheduler(
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+
+            # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
+            self.schedule_stream.wait_stream(self.forward_stream)
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
