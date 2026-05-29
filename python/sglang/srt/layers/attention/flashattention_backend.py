@@ -2784,33 +2784,20 @@ class FlashAttentionMultiStepBackend:
                 forward_batch, forward_batch.batch_size
             )
 
-    def _build_inner_fb(self, forward_batch: ForwardBatch, *, bs: int):
-        from types import SimpleNamespace
-
-        return SimpleNamespace(
-            batch_size=bs,
-            forward_mode=ForwardMode.DECODE,
-            actual_forward_mode=forward_batch.forward_mode,
-            input_ids=getattr(forward_batch, "input_ids", None),
-            positions=getattr(forward_batch, "positions", None),
-            req_pool_indices=forward_batch.req_pool_indices,
-            seq_lens=forward_batch.seq_lens,
-            seq_lens_sum=forward_batch.seq_lens_sum,
-            seq_lens_cpu=forward_batch.seq_lens_cpu,
-            encoder_lens=forward_batch.encoder_lens,
-            out_cache_loc=forward_batch.out_cache_loc,
-            spec_info=forward_batch.spec_info,
-        )
-
     def init_forward_metadata_capture_cuda_graph(
         self,
         forward_batch: ForwardBatch,
     ):
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+
         assert forward_batch.spec_info is not None
         assert forward_batch.spec_info.is_draft_input()
 
-        inner_fb = self._build_inner_fb(
-            forward_batch, bs=forward_batch.batch_size
+        inner_fb = build_inner_fb_view(
+            forward_batch,
+            bs=forward_batch.batch_size,
+            forward_mode=ForwardMode.DECODE,
+            encoder_lens=forward_batch.encoder_lens,
         )
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_data_out_graph(
@@ -2820,10 +2807,17 @@ class FlashAttentionMultiStepBackend:
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+
         assert forward_batch.spec_info is not None
         assert forward_batch.spec_info.is_draft_input()
 
-        inner_fb = self._build_inner_fb(forward_batch, bs=bs)
+        inner_fb = build_inner_fb_view(
+            forward_batch,
+            bs=bs,
+            forward_mode=ForwardMode.DECODE,
+            encoder_lens=forward_batch.encoder_lens,
+        )
         for i in range(self.speculative_num_steps - 1):
             # TODO: incrementally update the metadata for the later steps,
             # so that they do not need to recompute everything from scratch.
