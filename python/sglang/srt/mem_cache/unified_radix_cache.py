@@ -1567,51 +1567,57 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Skip if there is nothing to load, or if the Full-KV transfer is too
         # small / exceeds memory quota. Aux transfers should still run even
         # when the Full-KV load is skipped by thresholding.
-        if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
-            mem_quota is not None and kv_tokens > mem_quota + result.delta
-        ):
-            self.dec_lock_ref(best_match_node, ancestor_lock_params)
-            return False
-
-        if self.supports_swa():
-            avail = self.token_to_kv_pool_allocator.full_available_size()
-        else:
-            avail = self.token_to_kv_pool_allocator.available_size()
-        if avail < kv_tokens:
-            needed = kv_tokens - avail
-            result = self.evict(EvictParams(num_tokens=needed))
-            if result.num_tokens_evicted < needed:
-                self.dec_lock_ref(best_match_node, ancestor_lock_params)
+        host_lock_params: Optional[DecLockRefParams] = None
+        try:
+            if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
+                mem_quota is not None and kv_tokens > mem_quota + result.delta
+            ):
                 return False
 
-        # Load H→D
-        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
-        aux_xfers.extend(sidecar_xfers)
-        device_indices = self.cache_controller.load(
-            host_indices=kv_xfer.host_indices,
-            node_id=best_match_node.id,
-            extra_pools=aux_xfers or None,
-        )
+            host_lock_params = self.inc_host_lock_ref(best_match_node).to_dec_params()
 
-        self.dec_lock_ref(best_match_node, ancestor_lock_params)
-        if device_indices is None:
-            return False
+            if self.supports_swa():
+                avail = self.token_to_kv_pool_allocator.full_available_size()
+            else:
+                avail = self.token_to_kv_pool_allocator.available_size()
+            if avail < kv_tokens:
+                needed = kv_tokens - avail
+                result = self.evict(EvictParams(num_tokens=needed))
+                if result.num_tokens_evicted < needed:
+                    return False
 
-        # Commit: each component gets only its own transfers
-        kv_xfer.device_indices = device_indices
-        self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
-            best_match_node,
-            CacheTransferPhase.LOAD_BACK,
-            [kv_xfer],
-        )
-        for node in kv_xfer.nodes_to_load or ():
-            self._record_store_event(node, medium=StorageMedium.GPU)
-        for ct, xfers in comp_xfers.items():
-            self.components[ct].commit_hicache_transfer(
+            # Load H→D
+            aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+            aux_xfers.extend(sidecar_xfers)
+            device_indices = self.cache_controller.load(
+                host_indices=kv_xfer.host_indices,
+                node_id=best_match_node.id,
+                extra_pools=aux_xfers or None,
+            )
+
+            if device_indices is None:
+                return False
+
+            # Commit: each component gets only its own transfers
+            kv_xfer.device_indices = device_indices
+            self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
                 best_match_node,
                 CacheTransferPhase.LOAD_BACK,
-                xfers,
+                [kv_xfer],
             )
+            for node in kv_xfer.nodes_to_load or ():
+                self._record_store_event(node, medium=StorageMedium.GPU)
+            for ct, xfers in comp_xfers.items():
+                self.components[ct].commit_hicache_transfer(
+                    best_match_node,
+                    CacheTransferPhase.LOAD_BACK,
+                    xfers,
+                )
+
+        finally:
+            self.dec_lock_ref(best_match_node, ancestor_lock_params)
+            if host_lock_params is not None:
+                self.dec_host_lock_ref(best_match_node, host_lock_params)
 
         self._update_evictable_leaf_sets(best_match_node)
         self.ongoing_load_back[best_match_node.id] = (

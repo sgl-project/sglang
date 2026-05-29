@@ -2638,6 +2638,33 @@ class UnifiedRadixCacheSuite:
         tree.host_lru_lists[component_type].insert_mru(node)
         tree.component_evictable_size_[component_type] -= len(old_value)
 
+    def test_hicache_swa_host_lock_protects_host_tombstone(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires Full+SWA")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        node = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+
+        self._set_aux_host_tombstone(tree, node, ComponentType.SWA)
+        cd = node.component_data[ComponentType.SWA]
+        host_lru = tree.host_lru_lists[ComponentType.SWA]
+        self.assertIsNone(cd.value)
+        self.assertIsNotNone(cd.host_value)
+        self.assertTrue(host_lru.in_list(node))
+
+        lock_params = tree.inc_host_lock_ref(node).to_dec_params()
+        self.assertEqual(cd.host_lock_ref, 1)
+        self.assertFalse(host_lru.in_list(node))
+
+        tree.dec_host_lock_ref(node, lock_params)
+        self.assertEqual(cd.host_lock_ref, 0)
+        self.assertTrue(host_lru.in_list(node))
+        tree.sanity_check()
+
     def test_match_prefix_best_and_device_node_without_hicache(self):
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
