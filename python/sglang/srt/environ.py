@@ -356,7 +356,7 @@ class Envs:
     MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
     MOONCAKE_TE_META_DATA_SERVER = EnvStr("P2PHANDSHAKE")
     MOONCAKE_GLOBAL_SEGMENT_SIZE = EnvStr("4gb")
-    MOONCAKE_PROTOCOL = EnvStr("tcp")
+    MOONCAKE_PROTOCOL = EnvStr("rdma")
     MOONCAKE_DEVICE = EnvStr("")
     MOONCAKE_MASTER_METRICS_PORT = EnvInt(9003)
     MOONCAKE_CHECK_SERVER = EnvBool(False)
@@ -376,6 +376,7 @@ class Envs:
 
     # MPS (Apple Silicon)
     SGLANG_USE_MLX = EnvBool(False)
+    SGLANG_MLX_USE_CUSTOM_ROPE = EnvBool(False)
 
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
@@ -482,6 +483,7 @@ class Envs:
     )
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
+    SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -717,16 +719,21 @@ class Envs:
     # EPD
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
+    SGLANG_ENCODER_HTTP_TIMEOUT = EnvFloat(1800.0)
+    SGLANG_ENCODER_REQ_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
     SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU = EnvBool(False)
     SGLANG_ENCODER_MAX_BATCH_SIZE = EnvInt(8)
-    SGLANG_ENCODER_REQ_TIMEOUT = EnvFloat(180.0)
+    # Persistent receiver-side GPU embedding pool size for mooncake EPD transport.
+    # 0 disables (per-request register/deregister). 4096 = 4GB default per TP
+    SGLANG_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
 
     # Elastic EP Backup Port
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
 
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
+    SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
 
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")

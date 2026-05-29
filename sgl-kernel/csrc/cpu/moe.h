@@ -258,6 +258,7 @@ inline void gelu_and_mul_stub(
     out_vec.store(out + d);
   }
 }
+
 template <typename scalar_t>
 inline void clamp_sigmoid_and_mul_stub(
     scalar_t* __restrict__ out,

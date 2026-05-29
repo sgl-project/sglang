@@ -1168,6 +1168,8 @@ class GptOssForCausalLM(nn.Module):
                             start = get_attention_tp_rank() * param.numel()
                             tp_size = get_tensor_model_parallel_world_size()
                             full_shard_size = param.numel() * tp_size
+                            # This handles TP padding: if the checkpoint dim is not divisible by tp_size,
+                            # the last TP shard extends beyond `loaded_weight`, pad with zeros before slicing.
                             if (
                                 _is_cpu
                                 and full_shard_size > loaded_weight.size(0)

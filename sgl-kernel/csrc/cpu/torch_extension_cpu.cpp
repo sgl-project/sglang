@@ -241,6 +241,7 @@ at::Tensor fused_experts_cpu(
     const std::optional<double>& limit,
     bool is_vnni,
     const std::optional<std::string>& activation);
+
 at::Tensor shared_expert_cpu(
     at::Tensor& hidden_states,
     at::Tensor& w1,
@@ -322,9 +323,11 @@ at::Tensor causal_conv1d_update_cpu(
     const std::optional<at::Tensor>& conv_state_indices,
     int64_t pad_slot_id,
     bool is_vnni);
+
 // multidimensional rope
 std::tuple<at::Tensor, at::Tensor>
 apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
+
 #else
 // fused moe
 at::Tensor fused_experts_cpu(
