@@ -321,6 +321,18 @@ at::Tensor causal_conv1d_update_cpu(
     const std::optional<at::Tensor>& conv_state_indices,
     int64_t pad_slot_id,
     bool is_vnni);
+
+// conv1d
+at::Tensor conv1d_weight_pack(const at::Tensor& weight);
+
+at::Tensor conv1d_cpu(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    int64_t stride,
+    int64_t padding,
+    bool is_vnni);
+
 #else
 
 // fused moe
@@ -633,6 +645,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "causal_conv1d_update_cpu(Tensor x, Tensor(a!) conv_states, Tensor weight, Tensor? bias, bool silu_activation,"
       "Tensor? cache_seqlens, Tensor? conv_state_indices, int pad_slot_id, bool is_vnni) -> Tensor");
   m.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
+  
+  // conv1d
+  m.def("conv1d_weight_pack(Tensor weight) -> Tensor");
+  m.impl("conv1d_weight_pack", torch::kCPU, &conv1d_weight_pack);
+  m.def("conv1d_cpu(Tensor input, Tensor weight, Tensor? bias, int stride, int padding, bool is_vnni) -> Tensor");
+  m.impl("conv1d_cpu", torch::kCPU, &conv1d_cpu);
+
 #else
   // moe
   m.def(
