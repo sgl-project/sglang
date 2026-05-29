@@ -1346,8 +1346,6 @@ class Req(ReqDllmMixin):
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
-        self.full_untruncated_fill_ids = array("q")
-        self.fill_len = 0
 
         # When using input_embeds, we cannot easily mix the original input embeddings
         # with the newly generated output token IDs during re-prefill of retracted request.
