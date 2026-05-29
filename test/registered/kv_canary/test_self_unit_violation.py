@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
-from typing import Literal
 from unittest.mock import patch
 
 import torch
@@ -10,6 +9,7 @@ import torch
 from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.consts import FailReason
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
+from sglang.srt.kv_canary.config import CanaryMode
 from sglang.srt.kv_canary.runner import violation_reporter as violation_reporter_module
 from sglang.srt.kv_canary.runner.violation_reporter import (
     ViolationReporter,
@@ -174,7 +174,7 @@ def _make_reporter(
     rows: list[list[int]],
     write_index: int,
     ring_capacity: int,
-    mode: Literal["log", "raise"] = "log",
+    mode: CanaryMode = CanaryMode.LOG,
 ) -> ViolationReporter:
     ring = torch.zeros(ring_capacity, consts.VIOLATION_FIELDS, dtype=torch.int64)
     for i, row in enumerate(rows):
@@ -191,7 +191,9 @@ def _make_reporter(
 class TestLogOrRaiseViolation(CustomTestCase):
     def test_log_or_raise_violation_empty_ring_is_noop(self) -> None:
         """Empty ring (write_index=0) emits no warning and leaves reporter non-raised."""
-        reporter = _make_reporter(rows=[], write_index=0, ring_capacity=4, mode="log")
+        reporter = _make_reporter(
+            rows=[], write_index=0, ring_capacity=4, mode=CanaryMode.LOG
+        )
         with patch.object(violation_reporter_module.logger, "warning") as mock_warning:
             reporter.log_or_raise_violation(outer_step_counter=0)
         mock_warning.assert_not_called()
@@ -216,7 +218,9 @@ class TestLogOrRaiseViolation(CustomTestCase):
                 fail_reason_bits=int(FailReason.VERIFY_REAL_KV_HASH_MISMATCH),
             ),
         ]
-        reporter = _make_reporter(rows=rows, write_index=3, ring_capacity=4, mode="log")
+        reporter = _make_reporter(
+            rows=rows, write_index=3, ring_capacity=4, mode=CanaryMode.LOG
+        )
         with patch.object(violation_reporter_module.logger, "warning") as mock_warning:
             reporter.log_or_raise_violation(outer_step_counter=7)
 
@@ -280,7 +284,7 @@ class TestLogOrRaiseViolation(CustomTestCase):
             ),
         ]
         reporter = _make_reporter(
-            rows=rows, write_index=3, ring_capacity=4, mode="raise"
+            rows=rows, write_index=3, ring_capacity=4, mode=CanaryMode.RAISE
         )
         with self.assertRaises(RuntimeError) as ctx:
             reporter.log_or_raise_violation(outer_step_counter=5)
@@ -323,7 +327,9 @@ class TestLogOrRaiseViolation(CustomTestCase):
             _make_row(slot_idx=11, position=101),
             _make_row(slot_idx=22, position=202),
         ]
-        reporter = _make_reporter(rows=rows, write_index=5, ring_capacity=2, mode="log")
+        reporter = _make_reporter(
+            rows=rows, write_index=5, ring_capacity=2, mode=CanaryMode.LOG
+        )
         with patch.object(violation_reporter_module.logger, "warning") as mock_warning:
             reporter.log_or_raise_violation(outer_step_counter=0)
 
