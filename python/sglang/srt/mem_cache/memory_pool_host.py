@@ -31,19 +31,20 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
 from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
     KVCache,
     MambaPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
-    NSATokenToKVPool,
 )
-from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
-if not (_is_npu or _is_xpu or _is_mps):
+if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
         transfer_kv_all_layer_direct_lf_pf,
@@ -91,6 +92,69 @@ class HostTensorAllocator(abc.ABC):
         return tensor
 
 
+class HiSparseHostPoolMixin:
+    def _round_up_to_page_size(self, size: int) -> int:
+        return (size + self.page_size - 1) // self.page_size * self.page_size
+
+    def alloc_page(self, num_pages: int) -> Optional[torch.Tensor]:
+        return self.alloc(num_pages * self.page_size)
+
+    def alloc_paged_token_slots(
+        self,
+        req_to_host_pool: torch.Tensor,
+        req_to_host_pool_allocated_len: torch.Tensor,
+        req_pool_idx: int,
+        start_pos: int,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """Allocate request host slots by page and return token-granular slots."""
+        device = req_to_host_pool.device
+        if num_tokens <= 0:
+            return torch.empty((0,), dtype=torch.int64, device=device)
+
+        allocated_len = int(req_to_host_pool_allocated_len[req_pool_idx])
+        end_pos = start_pos + num_tokens
+        page_end = self._round_up_to_page_size(end_pos)
+        assert start_pos <= allocated_len
+
+        if page_end > allocated_len:
+            num_new_pages = (page_end - allocated_len) // self.page_size
+            host_locs = self.alloc_page(num_new_pages)
+            if host_locs is None:
+                logger.error(
+                    "HiSparse: host mem pool alloc failed for %d host pages "
+                    "(req_pool_idx=%d, start_pos=%d, num_tokens=%d)",
+                    num_new_pages,
+                    req_pool_idx,
+                    start_pos,
+                    num_tokens,
+                )
+                raise RuntimeError(
+                    f"HiSparse host mem pool alloc failed for {num_new_pages} pages"
+                )
+
+            req_to_host_pool[req_pool_idx, allocated_len:page_end] = host_locs.to(
+                device=device, non_blocking=True
+            )
+            req_to_host_pool_allocated_len[req_pool_idx] = page_end
+
+        return req_to_host_pool[req_pool_idx, start_pos:end_pos]
+
+    def allocated_host_indices(
+        self,
+        req_to_host_pool: torch.Tensor,
+        req_pool_idx: int,
+        allocated_len: int,
+    ) -> torch.Tensor:
+        allocated_len = int(allocated_len)
+        host_len = min(
+            self._round_up_to_page_size(allocated_len),
+            req_to_host_pool.shape[1],
+        )
+        host_indices = req_to_host_pool[req_pool_idx, :host_len]
+        return host_indices[host_indices >= 0]
+
+
 def get_allocator_from_storage(allocator_type):
     if allocator_type == "mooncake":
         try:
@@ -123,9 +187,11 @@ def alloc_with_host_register(
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
-        torch.cuda.cudart().cudaHostRegister(
+        ret = torch.cuda.cudart().cudaHostRegister(
             buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
         )
+        if ret != 0:
+            raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
     return buffer
 
 
@@ -785,7 +851,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         return ptr_list, element_size_list
 
 
-class MLATokenToKVPoolHost(HostKVCache):
+class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     device_pool: MLATokenToKVPool
 
     def __init__(
@@ -833,7 +899,7 @@ class MLATokenToKVPoolHost(HostKVCache):
         for registering host memory with the disaggregation transfer engine."""
         data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
         data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
-        item_lens = [self.token_stride_size] * self.layer_num
+        item_lens = [self.token_stride_size * self.page_size] * self.layer_num
         return data_ptrs, data_lens, item_lens
 
     def get_size_per_token(self):
@@ -2544,14 +2610,14 @@ class HostPoolGroup:
             )
 
 
-class NSAIndexerPoolHost(HostKVCache):
-    """Host-side NSA index buffers only. Slot layout matches the anchor MLA host pool."""
+class DSAIndexerPoolHost(HostKVCache):
+    """Host-side DSA index buffers only. Slot layout matches the anchor MLA host pool."""
 
-    device_pool: NSATokenToKVPool
+    device_pool: DSATokenToKVPool
 
     def __init__(
         self,
-        device_pool: NSATokenToKVPool,
+        device_pool: DSATokenToKVPool,
         anchor_host: MLATokenToKVPoolHost,
         layout: str,
         pin_memory: bool = True,
@@ -2571,7 +2637,7 @@ class NSAIndexerPoolHost(HostKVCache):
 
         self.index_head_dim = device_pool.index_head_dim
         self.indexer_quant_block_size = device_pool.quant_block_size
-        self.indexer_dtype = NSATokenToKVPool.index_k_with_scale_buffer_dtype
+        self.indexer_dtype = DSATokenToKVPool.index_k_with_scale_buffer_dtype
         self.indexer_size_per_token = (
             self.index_head_dim
             + self.index_head_dim // self.indexer_quant_block_size * 4
@@ -2594,12 +2660,12 @@ class NSAIndexerPoolHost(HostKVCache):
         available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
         if requested_bytes > available_bytes:
             raise ValueError(
-                f"Not enough host memory for NSA indexer hierarchical cache. "
+                f"Not enough host memory for DSA indexer hierarchical cache. "
                 f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free."
             )
         logger.info(
-            "Allocating %.2f GB host memory for NSA indexer (layout=%s).",
+            "Allocating %.2f GB host memory for DSA indexer (layout=%s).",
             requested_bytes / 1e9,
             layout,
         )
@@ -2662,7 +2728,7 @@ class NSAIndexerPoolHost(HostKVCache):
             return host_indices, device_indices
         if host_indices.numel() % self.page_size != 0:
             raise ValueError(
-                "Index buffer transfer expects page-aligned indices for NSA."
+                "Index buffer transfer expects page-aligned indices for DSA."
             )
         host_page_indices = (
             host_indices.reshape(-1, self.page_size)[:, 0] // self.page_size

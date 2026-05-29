@@ -40,6 +40,8 @@ class StageParallelismType(Enum):
     MAIN_RANK_ONLY = auto()
     # this stage requires a cfg-parallel
     CFG_PARALLEL = auto()
+    # executed on main rank only and send result to other ranks
+    MAIN_RANK_ONLY_AND_SEND_TO_OTHERS = auto()
 
 
 class StageVerificationError(Exception):
@@ -56,6 +58,10 @@ class PipelineStage(StageDedupMixin, ABC):
     composed with other stages to create a complete pipeline. Each stage is responsible
     for a specific part of the process, such as prompt encoding, latent preparation, etc.
     """
+
+    # Class-level default so subclasses that override __init__ without
+    # calling super().__init__() still see a consistent explicit-range gate.
+    _current_use_nvtx: bool = False
 
     def __init__(self):
         self.server_args = get_global_server_args()
@@ -131,6 +137,12 @@ class PipelineStage(StageDedupMixin, ABC):
         )
 
     def _active_component_stage_name(self) -> str:
+        """Stage name reported by the residency manager.
+
+        Only valid between ``before_stage`` and ``after_stage``; outside
+        that window the manager state still holds the previous stage's
+        name. Use :meth:`_component_stage_name` for the static identity.
+        """
         manager = getattr(self, "_component_residency_manager", None)
         manager_state = getattr(manager, "state", None)
         manager_stage_name = getattr(manager_state, "stage_name", None)
@@ -203,6 +215,26 @@ class PipelineStage(StageDedupMixin, ABC):
     ) -> list[ComponentUse]:
         """Declares component uses of current stage for unified residency scheduling."""
         return []
+
+    def _apply_nvtx_gate(self, is_warmup: bool) -> bool:
+        """Resolve the per-request NVTX gate for explicit stage ranges.
+
+        Layerwise module hooks are registered at component use-sites by
+        ``ComponentResidencyManager``. Stages use this value only for
+        explicit ``maybe_nvtx_range`` blocks.
+        """
+        use_nvtx = self.server_args.enable_layerwise_nvtx_marker and not is_warmup
+        self._current_use_nvtx = use_nvtx
+        return use_nvtx
+
+    @property
+    def current_use_nvtx(self) -> bool:
+        """Last resolved ``use_nvtx`` value from :meth:`_apply_nvtx_gate`.
+
+        ``forward`` implementations can read this to gate explicit
+        ``maybe_nvtx_range`` blocks without re-evaluating the flag.
+        """
+        return self._current_use_nvtx
 
     # Default role affinity: ENCODER. Override in subclasses for DENOISING/DECODER.
     @property
@@ -295,16 +327,23 @@ class PipelineStage(StageDedupMixin, ABC):
             logger.error("Input verification failed for %s: %s", stage_name, str(e))
             raise
 
-        # Execute the actual stage logic with unified profiling
-        with StageProfiler(
-            stage_name,
-            logger=logger,
-            metrics=batch.metrics,
-            log_stage_start_end=not batch.is_warmup
-            and not (self.server_args and self.server_args.comfyui_mode),
-            perf_dump_path_provided=batch.perf_dump_path is not None,
-        ):
-            result = self.forward(batch, server_args)
+        # Resolve the NVTX gate once per call. Component-level hooks are
+        # attached by the residency manager at the actual component use-site.
+        self._apply_nvtx_gate(batch.is_warmup)
+
+        # Execute the actual stage logic with unified profiling.
+        try:
+            with StageProfiler(
+                stage_name,
+                logger=logger,
+                metrics=batch.metrics,
+                log_stage_start_end=not batch.is_warmup
+                and not (self.server_args and self.server_args.comfyui_mode),
+                perf_dump_path_provided=batch.perf_dump_path is not None,
+            ):
+                result = self.forward(batch, server_args)
+        finally:
+            self._current_use_nvtx = False
 
         # Post-execution output verification
         try:

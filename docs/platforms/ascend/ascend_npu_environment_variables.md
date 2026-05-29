@@ -9,7 +9,7 @@ This document provides a list of commonly used environment variables and aims to
 |--------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------|
 | `SGLANG_NPU_USE_MLAPO`                           | Adopts the `MLAPO` fusion operator in attention <br/> preprocessing stage of the MLA model.                                                                 | `false`       |
 | `SGLANG_USE_FIA_NZ`                              | Reshapes KV Cache for FIA NZ format.<br/> `SGLANG_USE_FIA_NZ` must be enabled with `SGLANG_NPU_USE_MLAPO`                                                   | `false`       |
-| `SGLANG_NPU_USE_MULTI_STREAM`                    | Enable dual-stream computation of shared experts <br/> and routing experts in DeepSeek models.<br/> Enable dual-stream computation in DeepSeek NSA Indexer. | `false`       |
+| `SGLANG_NPU_USE_MULTI_STREAM`                    | Enable dual-stream computation of shared experts <br/> and routing experts in DeepSeek models.<br/> Enable dual-stream computation in DeepSeek DSA Indexer. | `false`       |
 | `SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT`           | Disable cast model weight tensor to a specific NPU <br/> ACL format.                                                                                        | `false`       |
 | `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | The maximum number of dispatched tokens on each rank.                                                                                                       | `128`         |
 
