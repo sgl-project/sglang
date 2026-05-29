@@ -1104,18 +1104,6 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
 
-            if self.server_args.optimistic_prefill_retries > 0:
-                if self.is_hybrid_swa:
-                    raise ValueError(
-                        "--optimistic-prefill-retries is not supported "
-                        "with sliding window attention (hybrid SWA) models"
-                    )
-                if self.is_hybrid_ssm:
-                    raise ValueError(
-                        "--optimistic-prefill-retries is not supported "
-                        "with hybrid SSM (Mamba/GDN) models"
-                    )
-
         # Init mm receiver for EPD disaggregation mode
         if (
             self.server_args.language_only
@@ -2113,26 +2101,10 @@ class Scheduler(
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
-            if (
-                self.server_args.optimistic_prefill_retries > 0
-                and not is_retracted
-                and not req.optimistic_prefill
-            ):
-                bootstrap_entry_time = time.perf_counter()
-                if self.disagg_prefill_bootstrap_queue.create_sender(
-                    req, self.model_config.num_key_value_heads
-                ):
-                    req.time_stats.set_prefill_bootstrap_queue_entry_time(
-                        bootstrap_entry_time
-                    )
-                    req.optimistic_prefill = True
-                    self.waiting_queue.append(req)
-                    req.time_stats.set_wait_queue_entry_time()
-            else:
-                self.disagg_prefill_bootstrap_queue.add(
-                    req, self.model_config.num_key_value_heads
-                )
-                req.time_stats.set_prefill_bootstrap_queue_entry_time()
+            self.disagg_prefill_bootstrap_queue.add(
+                req, self.model_config.num_key_value_heads
+            )
+            req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
@@ -3516,11 +3488,12 @@ class Scheduler(
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                bootstrap_pending = req.pending_bootstrap
                 release_req_to_metadata_buffer(
                     req, self.req_to_metadata_buffer_idx_allocator
                 )
                 if (
-                    req.optimistic_prefill
+                    bootstrap_pending
                     and hasattr(req, "disagg_kv_sender")
                     and req.disagg_kv_sender is not None
                 ):

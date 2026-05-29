@@ -33,7 +33,9 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreTrueAction,
     LoRAPathAction,
 )
-from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
+from sglang.srt.configs.linear_attn_model_registry import (
+    get_linear_attn_spec_by_arch,
+)
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -1743,6 +1745,7 @@ class ServerArgs:
             is_deepseek_dsa,
         )
 
+        self.uses_mamba_radix_cache = False
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             return
 
@@ -1750,7 +1753,7 @@ class ServerArgs:
         model_arch = hf_config.architectures[0]
 
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
-        if _hybrid_spec is not None:
+        if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
                 support_mamba_cache=_hybrid_spec.support_mamba_cache,
@@ -2547,6 +2550,8 @@ class ServerArgs:
         sm100_default_attention_backend: str = None,
         fallback_attention_backend: str = "triton",
     ):
+        self.uses_mamba_radix_cache = True
+
         if (
             is_sm100_supported()
             and self.attention_backend is None
@@ -3794,24 +3799,6 @@ class ServerArgs:
 
             self.disable_cuda_graph = True
 
-        if self.optimistic_prefill_retries < 0:
-            raise ValueError(
-                "--optimistic-prefill-retries must be non-negative, "
-                f"got {self.optimistic_prefill_retries}"
-            )
-        if self.optimistic_prefill_retries > 0:
-            if self.disaggregation_mode != "prefill":
-                raise ValueError(
-                    "--optimistic-prefill-retries requires "
-                    "--disaggregation-mode prefill, "
-                    f"got '{self.disaggregation_mode}'"
-                )
-            if self.pp_size > 1:
-                raise ValueError(
-                    "--optimistic-prefill-retries is not supported "
-                    "with pipeline parallelism (pp_size > 1)"
-                )
-
         if self.disaggregation_mode in ("prefill", "decode"):
             if (
                 envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -4202,6 +4189,24 @@ class ServerArgs:
             self.enable_mixed_chunk = False
 
     def _handle_other_validations(self):
+        # Handle optimistic prefill validation
+        if (
+            self.optimistic_prefill_retries > 0
+            and self.disaggregation_mode == "prefill"
+        ):
+            if self.pp_size > 1:
+                logger.warning("Optimistic prefill does not support pp_size > 1")
+                self.optimistic_prefill_retries = 0
+            elif self.enable_hierarchical_cache:
+                logger.warning("Optimistic prefill does not support hierarchical cache")
+                self.optimistic_prefill_retries = 0
+            elif getattr(self, "uses_mamba_radix_cache", False):
+                logger.warning(
+                    "Optimistic prefill does not support models that use "
+                    "mamba radix cache."
+                )
+                self.optimistic_prefill_retries = 0
+
         # Handle model inference tensor dump.
         if self.debug_tensor_dump_output_folder is not None:
             logger.warning(
@@ -6721,8 +6726,7 @@ class ServerArgs:
             "--optimistic-prefill-retries",
             type=int,
             default=ServerArgs.optimistic_prefill_retries,
-            help="Number of optimistic prefill retries before falling back to bootstrap-wait. "
-            "0 disables optimistic prefill (default). Only valid with --disaggregation-mode prefill.",
+            help="Number of optimistic prefill retries that will skip the bootstrap wait. ",
         )
 
         # Encode prefill disaggregation
