@@ -86,7 +86,6 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -255,8 +254,6 @@ class MultimodalDataItem:
 
     # the raw features returned by processor, e.g. pixel_values or audio_features
     feature: Union[torch.Tensor, np.ndarray] = None
-    # CPU reference kept during GPU encoding, used to skip GPU->CPU copy on offload
-    _cpu_feature: Optional[torch.Tensor] = None
     # the precomputed embeddings, passed as final encoder embeddings
     # One and only one of the feature and precomputed_embeddings will be empty
     precomputed_embeddings: Optional[Union[torch.Tensor, np.ndarray]] = None
@@ -1470,17 +1467,26 @@ def set_mamba_track_indices_from_reqs(batch):
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
 
-    # Request, memory pool, and cache
+    # === Core: request list (ForwardBatch derives lora_ids / rids / grammars / positions from it) ===
     reqs: List[Req]
+
+    # === Global config and shared resources (engine-lifetime; identical across batches) ===
+    # Memory pool and cache
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
-    is_hybrid_swa: bool = False
 
     # Batch configs
     model_config: ModelConfig = None
-    forward_mode: ForwardMode = None
     enable_overlap: bool = False
+
+    # Device
+    device: str = "cuda"
+
+    # HiSparse (engine-level coordinator ref, same across batches)
+    hisparse_coordinator: Optional[HiSparseCoordinator] = None
+
+    # === Batch-variant scheduler state (per-batch; not read by ForwardBatch) ===
     # Tell whether the current running batch is full so that we can skip
     # the check of whether to prefill new requests.
     # This is an optimization to reduce the overhead of the prefill check.
@@ -1490,22 +1496,55 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     chunked_req: Optional[Req] = None
     contains_last_prefill_chunk: bool = True
 
-    # Sampling info
-    sampling_info: SamplingBatchInfo = None
+    # For DP attention
+    inner_idle_batch: Optional[ScheduleBatch] = None
+    # Decode requests carried alongside a chunked-prefill batch
+    decoding_reqs: List[Req] = None
 
+    # For split prefill
+    split_index: int = 0
+    split_prefill_finished: bool = False
+    split_forward_count: int = 1
+    split_forward_batch: ForwardBatch = None
+
+    # CPU mirror of req_pool_indices; schedule-path only (used in overlap_utils,
+    # not read by ForwardBatch), stale in spec draft window
+    req_pool_indices_cpu: torch.Tensor = None  # shape: [b], int64
+
+    # Forward-pass metrics
+    fpm_start_time: float = 0.0
+
+    # Whether to return captured experts
+    return_routed_experts: bool = False
+    return_indexer_topk: bool = False
+
+    # hicache pointer for synchronizing data loading from CPU to GPU
+    hicache_consumer_index: int = -1
+
+    # Metrics
+    dp_cooperation_info: Optional[DPCooperationInfo] = None
+    prefill_stats: Optional[PrefillStats] = None
+    forward_iter: Optional[int] = None
+
+    # === GPU tensors crossing to ForwardBatch (clone targets for stream isolation) ===
     # Batched arguments to model runner
     input_ids: torch.Tensor = None  # shape: [b], int64
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
+
     # Token replacement embeddings and absolute positions (optional).
     replace_embeds: Optional[torch.Tensor] = None
     replace_positions: Optional[torch.Tensor] = None
+
+    # Read by ForwardBatch ngram embedding init
     ne_token_table: torch.Tensor = None
+
     token_type_ids: torch.Tensor = None  # shape: [b], int64
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
-    seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
-    # CPU mirror of req_pool_indices; schedule-path only, stale in spec draft window
-    req_pool_indices_cpu: torch.Tensor = None  # shape: [b], int64
+
+    # The original sequence lengths, Qwen-1M related
+    orig_seq_lens: torch.Tensor = None  # shape: [b], int32
+
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
 
@@ -1518,47 +1557,31 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_cow_dst_indices: torch.Tensor = None
     mamba_clear_indices: torch.Tensor = None
 
-    # For multimodal inputs
-    multimodal_inputs: Optional[List] = None
+    # Encoder-decoder device tensors (host fields in the host metadata group)
+    encoder_lens: Optional[torch.Tensor] = None
+    encoder_out_cache_loc: Optional[torch.Tensor] = None
 
-    # The sum of all sequence lengths
-    seq_lens_sum: int = None
-    # The original sequence lengths, Qwen-1M related
-    orig_seq_lens: torch.Tensor = None  # shape: [b], int32
+    # It comes empty list if logprob is not required.
+    extend_input_logprob_token_ids: Optional[torch.Tensor] = None
+
+    # === Config / flags crossing to ForwardBatch (by-value) ===
+    forward_mode: ForwardMode = None
+    global_forward_mode: Optional[ForwardMode] = None
 
     # For DP attention
-    inner_idle_batch: Optional[ScheduleBatch] = None
-    global_num_tokens: Optional[List[int]] = None
-    global_num_tokens_for_logprob: Optional[List[int]] = None
     is_extend_in_batch: bool = False
     all_extend_in_batch: bool = False  # plumbing for downstream forks (PR #19639)
     can_run_dp_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
-    global_forward_mode: Optional[ForwardMode] = None
 
     # For processing logprobs
     return_logprob: bool = False
-    top_logprobs_nums: Optional[List[int]] = None
-    token_ids_logprobs: Optional[List[List[int]]] = None
 
-    # For logits and logprob post processing
-    temp_scaled_logprobs: bool = False
-    top_p_normalized_logprobs: bool = False
+    # Whether this batch is prefill-only (no token generation needed)
+    is_prefill_only: bool = False
 
-    # For extend and mixed chunekd prefill
-    prefix_lens: List[int] = None
-    extend_lens: List[int] = None
-    extend_num_tokens: Optional[int] = None
-    decoding_reqs: List[Req] = None
-    extend_logprob_start_lens: List[int] = None
-    # It comes empty list if logprob is not required.
-    extend_input_logprob_token_ids: Optional[torch.Tensor] = None
-
-    # For encoder-decoder architectures
-    encoder_cached: Optional[List[bool]] = None
-    encoder_lens: Optional[torch.Tensor] = None
-    encoder_lens_cpu: Optional[List[int]] = None
-    encoder_out_cache_loc: Optional[torch.Tensor] = None
+    # Speculative decoding
+    spec_algorithm: SpeculativeAlgorithm = None
 
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
@@ -1566,61 +1589,57 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
 
-    # For split prefill
-    split_index: int = 0
-    split_prefill_finished: bool = False
-    split_forward_count: int = 1
-    split_forward_batch: ForwardBatch = None
-
-    # One-shot per-forward overrides; init_new consumes and resets.
-    seq_lens_cpu_cache: torch.Tensor = None
-    capture_hidden_mode: Optional[CaptureHiddenMode] = None
-    return_hidden_states_before_norm: bool = False
-
-    # Forward-pass metrics
-    fpm_start_time: float = 0.0
-
-    # Stream
-    has_stream: bool = False
+    # Whether to return hidden states
+    return_hidden_states: bool = False
 
     # Has grammar
     has_grammar: bool = False
 
-    # Device
-    device: str = "cuda"
-
-    # Speculative decoding
-    spec_algorithm: SpeculativeAlgorithm = None
-    # spec_info: Optional[SpecInput] = None
-    spec_info: Optional[SpecInput] = None
-
-    # Whether to return hidden states
-    return_hidden_states: bool = False
-
-    # Whether to return captured experts
-    return_routed_experts: bool = False
-
-    return_indexer_topk: bool = False
-
-    # Whether this batch is prefill-only (no token generation needed)
-    is_prefill_only: bool = False
-
-    # Multi-item scoring delimiter indices (set during prepare_for_extend)
-    multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
-
-    # hicache pointer for synchronizing data loading from CPU to GPU
-    hicache_consumer_index: int = -1
+    # The sum of all sequence lengths
+    seq_lens_sum: int = None
+    extend_num_tokens: Optional[int] = None
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
 
-    # Metrics
-    dp_cooperation_info: Optional[DPCooperationInfo] = None
-    prefill_stats: Optional[PrefillStats] = None
-    forward_iter: Optional[int] = None
+    # === Host metadata crossing to ForwardBatch (CPU lists / mirrors) ===
+    seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
 
-    # HiSparse
-    hisparse_coordinator: Optional[HiSparseCoordinator] = None
+    # For multimodal inputs
+    multimodal_inputs: Optional[List] = None
+
+    # For processing logprobs
+    top_logprobs_nums: Optional[List[int]] = None
+    token_ids_logprobs: Optional[List[List[int]]] = None
+
+    # For encoder-decoder architectures
+    encoder_cached: Optional[List[bool]] = None
+    encoder_lens_cpu: Optional[List[int]] = None
+
+    # Multi-item scoring delimiter indices (set during prepare_for_extend)
+    multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
+
+    # For extend and mixed chunekd prefill
+    prefix_lens: List[int] = None
+    extend_lens: List[int] = None
+    extend_logprob_start_lens: List[int] = None
+
+    # For DP attention
+    global_num_tokens: Optional[List[int]] = None
+    global_num_tokens_for_logprob: Optional[List[int]] = None
+
+    # === Compound crossing to ForwardBatch (carry their own device tensors) ===
+    # Sampling info
+    sampling_info: SamplingBatchInfo = None
+
+    # Speculative decoding
+    # spec_info: Optional[SpecInput] = None
+    spec_info: Optional[SpecInput] = None
+
+    # === One-shot per-forward overrides; init_new consumes and resets ===
+    seq_lens_cpu_cache: torch.Tensor = None
+    capture_hidden_mode: Optional[CaptureHiddenMode] = None
+    return_hidden_states_before_norm: bool = False
 
     @classmethod
     def init_new(
@@ -1637,20 +1656,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
-        is_hybrid_swa = False
-        if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-            is_hybrid_swa = True
-
         batch = cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
-            is_hybrid_swa=is_hybrid_swa,
             model_config=model_config,
             enable_overlap=enable_overlap,
             return_logprob=return_logprob,
-            has_stream=any(req.stream for req in reqs),
             has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
@@ -2539,7 +2552,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.req_pool_indices_cpu = self.req_pool_indices_cpu[keep_indices]
         self.seq_lens = self.seq_lens[keep_indices_device]
-        self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
@@ -2547,6 +2559,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.input_ids is not None:
             self.input_ids = self.input_ids[keep_indices_device]
+        # Optional under no-verify-sync; resolve_seq_lens repopulates before forward.
+        if self.seq_lens_cpu is not None:
+            self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
 
         self.mamba_track_indices = None
         self.mamba_track_mask = None
@@ -2562,7 +2577,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = None
             self.token_ids_logprobs = None
 
-        self.has_stream = any(req.stream for req in self.reqs)
         self.has_grammar = any(req.grammar for req in self.reqs)
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
@@ -2594,13 +2608,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             [self.req_pool_indices_cpu, other.req_pool_indices_cpu]
         )
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
-        self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
         if self.input_ids is not None:
             self.input_ids = torch.cat([self.input_ids, other.input_ids])
+        # Optional under no-verify-sync; drop the mirror if either side absent.
+        if self.seq_lens_cpu is None or other.seq_lens_cpu is None:
+            self.seq_lens_cpu = None
+        else:
+            self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
@@ -2618,7 +2636,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.multimodal_inputs.extend(other.multimodal_inputs)
 
         self.return_logprob |= other.return_logprob
-        self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
