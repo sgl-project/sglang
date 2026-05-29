@@ -417,28 +417,28 @@ class DeepseekSparseAttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        bs = forward_batch.batch_size
-        if in_capture:
-            self.init_forward_metadata_capture_cuda_graph(
-                bs=bs,
-                num_tokens=forward_batch.positions.numel(),
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
-                encoder_lens=forward_batch.encoder_lens,
-                forward_mode=forward_batch.forward_mode,
-                spec_info=forward_batch.spec_info,
-            )
-        else:
-            self.init_forward_metadata_replay_cuda_graph(
-                bs=bs,
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
-                seq_lens_sum=forward_batch.seq_lens_sum,
-                encoder_lens=forward_batch.encoder_lens,
-                forward_mode=forward_batch.forward_mode,
-                spec_info=forward_batch.spec_info,
-                seq_lens_cpu=forward_batch.seq_lens_cpu,
-            )
+        # DSA's legacy capture was a thin pass-through to replay, so the
+        # branches collapse. seq_lens_cpu is computed at capture time;
+        # out_cache_loc / actual_forward_mode come off the fb (build_replay_fb_view
+        # supplies them at replay-from-graph-runner; spec runners pass them
+        # explicitly via a SimpleNamespace fb_view).
+        seq_lens_cpu = (
+            forward_batch.seq_lens.cpu()
+            if in_capture
+            else forward_batch.seq_lens_cpu
+        )
+        self._apply_cuda_graph_metadata(
+            bs=forward_batch.batch_size,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            forward_mode=forward_batch.forward_mode,
+            spec_info=forward_batch.spec_info,
+            out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+            actual_forward_mode=getattr(
+                forward_batch, "actual_forward_mode", None
+            ),
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -1003,42 +1003,23 @@ class DeepseekSparseAttnBackend(
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
-        """Initialize forward metadata for capturing CUDA graph."""
-        self.init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_sum=None,
-            encoder_lens=encoder_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-            seq_lens_cpu=seq_lens.cpu(),
-        )
-
-    def init_forward_metadata_replay_cuda_graph(
+    def _apply_cuda_graph_metadata(
         self,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
+        seq_lens_cpu: torch.Tensor,
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
         actual_forward_mode: Optional[ForwardMode] = None,
     ):
-        """Initialize forward metadata for replaying CUDA graph."""
+        """Shared capture+replay body for the cuda-graph init path.
+
+        Public entry: :py:meth:`init_forward_data_out_graph`. Spec runners
+        also call this directly via _apply_cuda_graph_metadata when they
+        need to pass out_cache_loc / actual_forward_mode explicitly.
+        """
         assert seq_lens_cpu is not None
 
         if bs not in self.decode_cuda_graph_metadata:
@@ -2411,29 +2392,22 @@ class DeepseekSparseAttnMultiStepBackend:
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        # MultiStep uses custom signatures (fb-only / fb+bs).
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+
         if in_capture:
-            self.init_forward_metadata_capture_cuda_graph(forward_batch)
-        else:
-            self.init_forward_metadata_replay_cuda_graph(
-                forward_batch, forward_batch.batch_size
-            )
-
-    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-        for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.batch_size * self.topk,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=None,
+            inner_fb = build_inner_fb_view(
+                forward_batch,
+                bs=forward_batch.batch_size,
                 forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
             )
+            for i in range(self.speculative_num_steps - 1):
+                self.attn_backends[i].init_forward_data_out_graph(
+                    inner_fb, in_capture=True
+                )
+            return
 
-    def init_forward_metadata_replay_cuda_graph(
-        self, forward_batch: ForwardBatch, bs: int
-    ):
+        # Replay path — preserves the fast-path precompute + fallback.
+        bs = forward_batch.batch_size
         if envs.SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA.get():
             # Precompute metadata once (shared across all backends)
             precomputed = self.attn_backends[0]._precompute_replay_metadata(
@@ -2591,17 +2565,15 @@ class DeepseekSparseAttnMultiStepBackend:
                         forward_mode=ForwardMode.DECODE,
                     )
         else:
-            # Fallback: compute metadata separately for each backend
+            # Fallback: compute metadata separately for each backend.
             for i in range(self.speculative_num_steps - 1):
-                self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
+                self.attn_backends[i]._apply_cuda_graph_metadata(
                     bs=bs,
                     req_pool_indices=forward_batch.req_pool_indices,
                     seq_lens=forward_batch.seq_lens,
-                    seq_lens_sum=forward_batch.seq_lens_sum,
-                    encoder_lens=None,
+                    seq_lens_cpu=forward_batch.seq_lens_cpu,
                     forward_mode=ForwardMode.DECODE,
                     spec_info=forward_batch.spec_info,
-                    seq_lens_cpu=forward_batch.seq_lens_cpu,
                     out_cache_loc=None,
                 )
 
