@@ -183,6 +183,8 @@ class Req:
 
     # Extra parameters that might be needed by specific pipeline implementations (e.g., LTX2.3 DenoisingAVStage)
     extra: dict[str, Any] = field(default_factory=dict)
+    realtime_session_id: str | None = None
+    block_idx: int = 0
     session: RealtimeSession | None = None
 
     is_warmup: bool = False

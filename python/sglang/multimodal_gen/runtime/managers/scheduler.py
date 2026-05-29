@@ -504,6 +504,10 @@ class Scheduler(SchedulerDisaggMixin):
 
         if base_req.is_warmup or candidate_req.is_warmup:
             return "warmup"
+        if self._has_realtime_session(base_req) or self._has_realtime_session(
+            candidate_req
+        ):
+            return "realtime_session"
         if not isinstance(base_req.prompt, str) or not isinstance(
             candidate_req.prompt, str
         ):
@@ -523,9 +527,18 @@ class Scheduler(SchedulerDisaggMixin):
             or "signature_mismatch"
         )
 
+    @staticmethod
+    def _has_realtime_session(req: Req) -> bool:
+        return bool(req.realtime_session_id) or req.session is not None
+
     def _can_dynamic_batch(self, base_req: Req, candidate_req: Req) -> bool:
         """Return whether `candidate_req` can be merged into a batch with `base_req`."""
         if base_req.is_warmup or candidate_req.is_warmup:
+            return False
+
+        if self._has_realtime_session(base_req) or self._has_realtime_session(
+            candidate_req
+        ):
             return False
 
         if not isinstance(base_req.prompt, str) or not isinstance(
