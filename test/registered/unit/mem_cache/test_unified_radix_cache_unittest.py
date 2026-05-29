@@ -1074,16 +1074,21 @@ class UnifiedRadixCacheSuite:
         return nodes
 
     def _swa_pinning_cfg_supported(self) -> bool:
-        return (
-            self.cfg.has_swa
-            and not self.cfg.has_mamba
-            and self.cfg.page_size == 1
-            and self.cfg.sliding_window_size == 4
-        )
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            return False
+        cushion = self.cfg.sliding_window_size + self.cfg.page_size
+        pages_per_node = 8
+        side_pages = 5
+        if pages_per_node * self.cfg.page_size < cushion:
+            return False
+        chain_inserts_pages = 4 * pages_per_node + side_pages
+        if self.cfg.kv_size < chain_inserts_pages * self.cfg.page_size:
+            return False
+        return True
 
     def test_swa_lru_walk_down_does_not_refresh_ancestors_during_insert(self):
         if not self._swa_pinning_cfg_supported():
-            self.skipTest("requires page_size=1, sliding_window_size=4, SWA, no Mamba")
+            self.skipTest("requires SWA-only config with node size >= cushion")
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
 
         seq_a = self._make_seq(1, 8)
@@ -1127,7 +1132,7 @@ class UnifiedRadixCacheSuite:
 
     def test_swa_lru_match_only_refreshes_window_cushion(self):
         if not self._swa_pinning_cfg_supported():
-            self.skipTest("requires page_size=1, sliding_window_size=4, SWA, no Mamba")
+            self.skipTest("requires SWA-only config with node size >= cushion")
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
 
         seq_a = self._make_seq(1, 8)
@@ -1166,7 +1171,7 @@ class UnifiedRadixCacheSuite:
 
     def test_swa_lru_old_ancestors_evict_first_under_pressure(self):
         if not self._swa_pinning_cfg_supported():
-            self.skipTest("requires page_size=1, sliding_window_size=4, SWA, no Mamba")
+            self.skipTest("requires SWA-only config with node size >= cushion")
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
 
         seq_a = self._make_seq(1, 8)
@@ -1185,7 +1190,7 @@ class UnifiedRadixCacheSuite:
         m_side_before = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq_side)))
         self.assertEqual(len(m_side_before.device_indices), len(seq_side))
 
-        tree.evict(EvictParams(num_tokens=0, swa_num_tokens=4))
+        tree.evict(EvictParams(num_tokens=0, swa_num_tokens=self.cfg.page_size))
 
         m_side_after = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq_side)))
         self.assertEqual(
@@ -1198,7 +1203,7 @@ class UnifiedRadixCacheSuite:
 
     def test_swa_lru_cushion_bound_is_sliding_window_plus_page_size(self):
         if not self._swa_pinning_cfg_supported():
-            self.skipTest("requires page_size=1, sliding_window_size=4, SWA, no Mamba")
+            self.skipTest("requires SWA-only config with node size >= cushion")
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
 
         seq_a = self._make_seq(1, 8)
@@ -1220,7 +1225,6 @@ class UnifiedRadixCacheSuite:
         post = self._swa_lru_order(tree)
 
         cushion = self.cfg.sliding_window_size + self.cfg.page_size
-        self.assertEqual(cushion, 5)
         self.assertGreaterEqual(len(c_node.key), cushion)
         self.assertIs(post[0], c_node, "C alone exhausts cushion → only C refreshed")
         # B and A: untouched ordering relative to each other AND to side_node
@@ -1233,7 +1237,7 @@ class UnifiedRadixCacheSuite:
 
     def test_swa_sanity_check_passes_after_deep_match(self):
         if not self._swa_pinning_cfg_supported():
-            self.skipTest("requires page_size=1, sliding_window_size=4, SWA, no Mamba")
+            self.skipTest("requires SWA-only config with node size >= cushion")
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
 
         seq_a = self._make_seq(1, 8)
