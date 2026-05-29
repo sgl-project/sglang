@@ -1,31 +1,55 @@
-"""Proxy for the scheduler's ``recv_from_tokenizer`` socket.
+"""Proxy that wraps the scheduler's real ``recv_from_tokenizer`` socket.
 
-Installed in place of the real zmq PULL socket only when ScriptedRuntime
-is active (see ``SchedulerIpcChannels.create``). Serves requests from an
-in-process queue populated by ``ScriptedRuntime.start_req``, so a script
-fully controls request arrival instead of the HTTP server / tokenizer
-manager. The replaced raw socket is retained as ``underlying`` purely so
-its bound IPC endpoint stays open for the tokenizer manager to connect to.
+Installed in place of the raw zmq PULL socket only when ScriptedRuntime
+is active (see ``SchedulerIpcChannels.create``). Unlike a from-scratch
+injector, this proxy *wraps* the real PULL socket: requests still travel
+the production path (HTTP server -> tokenizer manager -> ZMQ PUSH), and
+the proxy buffers whatever it drains off the underlying socket so a
+script can control the exact step at which each request becomes visible
+to the scheduler.
+
+``ScriptedRuntime.start_req`` fires a real ``/generate`` HTTP request and
+then calls :meth:`wait_until_rid_arrived` to drain the request into the
+buffer without yet handing it to the scheduler; the next ``recv_requests``
+iteration pops it. Control-class messages (e.g. ``flush_cache``) may still
+be injected straight into the buffer via :meth:`inject`.
 """
 
+from __future__ import annotations
+
+import time
 from collections import deque
 from typing import Any, Optional
 
 import zmq
 
 
+class RidNotArrivedError(TimeoutError):
+    """Raised when a rid does not arrive on the socket within the timeout."""
+
+
 class TokenizerRecvProxy:
     """Quacks like a ``zmq.Socket``. NOBLOCK semantics mirror a real PULL
-    socket: an empty queue raises ``zmq.ZMQError`` with ``EAGAIN``.
+    socket: an empty buffer (after draining the underlying socket) raises
+    ``zmq.ZMQError`` with ``EAGAIN``.
     """
 
-    def __init__(self, *, underlying: Optional[zmq.Socket]) -> None:
+    def __init__(self, *, underlying: zmq.Socket) -> None:
         self._underlying = underlying
-        self._queue: deque = deque()
+        self._buffer: deque = deque()
 
     def recv_pyobj(self, flags: int = 0) -> Any:
-        if self._queue:
-            return self._queue.popleft()
+        """Pop one buffered request, draining the underlying socket first.
+
+        Non-blocking drain keeps the proxy buffer in sync with whatever
+        the tokenizer manager has already pushed, then pops the oldest
+        buffered item. An empty buffer under ``NOBLOCK`` raises the same
+        ``EAGAIN`` a real PULL socket would.
+        """
+        self._drain_underlying()
+
+        if self._buffer:
+            return self._buffer.popleft()
 
         if flags & zmq.NOBLOCK:
             raise zmq.ZMQError(zmq.EAGAIN, "Resource temporarily unavailable")
@@ -33,6 +57,43 @@ class TokenizerRecvProxy:
             "TokenizerRecvProxy.recv_pyobj: blocking recv is not supported"
         )
 
+    def wait_until_rid_arrived(self, rid: str, *, timeout_s: float) -> None:
+        """Block until a request carrying ``rid`` has been buffered.
+
+        Repeatedly drains the underlying socket (with a small sleep between
+        polls) until a buffered request exposes ``rid``. Every request read
+        in the meantime stays buffered, so the arrival ordering the
+        scheduler later observes is preserved. Raises
+        :class:`RidNotArrivedError` if the rid does not arrive in time.
+        """
+        deadline = time.monotonic() + timeout_s
+
+        while True:
+            self._drain_underlying()
+            if any(self._req_rid(req) == rid for req in self._buffer):
+                return
+            if time.monotonic() >= deadline:
+                raise RidNotArrivedError(
+                    f"TokenizerRecvProxy: rid {rid!r} did not arrive on the "
+                    f"recv_from_tokenizer socket within {timeout_s}s"
+                )
+            time.sleep(0.005)
+
     def inject(self, req: Any) -> None:
-        """Queue a tokenized request; visible on the next ``recv_requests``."""
-        self._queue.append(req)
+        """Queue a control message directly; visible on the next ``recv_requests``.
+
+        Used for non-HTTP control messages such as ``FlushCacheReqInput``.
+        """
+        self._buffer.append(req)
+
+    def _drain_underlying(self) -> None:
+        while True:
+            try:
+                req = self._underlying.recv_pyobj(zmq.NOBLOCK)
+            except zmq.ZMQError:
+                break
+            self._buffer.append(req)
+
+    @staticmethod
+    def _req_rid(req: Any) -> Optional[str]:
+        return getattr(req, "rid", None)
