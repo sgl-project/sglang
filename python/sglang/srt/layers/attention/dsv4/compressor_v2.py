@@ -14,7 +14,7 @@ from sglang.jit_kernel.utils import is_hip_runtime
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.deepseek_v4_backend import DSV4ForwardMetadata
+    from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
     from sglang.srt.layers.attention.dsv4.compressor import Compressor
     from sglang.srt.layers.layernorm import RMSNorm
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -402,7 +402,7 @@ def _compress_forward_c128_fallback(
 class CompressorBackendMixin:
     def __init__(self):
         super().__init__()
-        self.forward_metadata: DSV4ForwardMetadata
+        self.forward_metadata: DSV4Metadata
 
     def _get_paged_compress_metadata(self, compress_ratio: int) -> CompressMetadata:
         attr_name = f"c{compress_ratio}_compress_metadata"

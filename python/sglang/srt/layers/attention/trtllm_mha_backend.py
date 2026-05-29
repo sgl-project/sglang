@@ -45,7 +45,7 @@ global_zero_init_workspace_buffer = None
 
 
 @dataclass
-class TRTLLMMHAForwardMetadata:
+class TRTLLMMHAMetadata:
     # Sequence lengths for the forward batch
     cache_seqlens_int32: torch.Tensor = None
     # Maximum sequence length for query
@@ -135,7 +135,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
 
         # Forward metadata
-        self.forward_metadata: Optional[TRTLLMMHAForwardMetadata] = None
+        self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
 
         # Init backend (XQA or TRTLLM-GEN)
         # We need to specify q_type and out_type for different backend
@@ -168,7 +168,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     def _copy_swa_page_table(
         self,
-        metadata: TRTLLMMHAForwardMetadata,
+        metadata: TRTLLMMHAMetadata,
         page_indices: torch.Tensor,
         num_pages: int,
     ):
@@ -193,7 +193,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         return forward_batch.out_cache_loc
 
     def _bind_swa_page_table(
-        self, metadata: TRTLLMMHAForwardMetadata, source: dict, key: str, bs: int
+        self, metadata: TRTLLMMHAMetadata, source: dict, key: str, bs: int
     ):
         """Bind a pre-allocated SWA page_table slice to metadata for CUDA graph."""
         buf = source.get(key)
@@ -310,9 +310,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode: ForwardMode,
         spec_info,
         device: torch.device,
-    ) -> "TRTLLMMHAForwardMetadata":
-        """Create TRTLLMMHAForwardMetadata with pre-allocated buffer slice refs, stored in the dict."""
-        metadata = TRTLLMMHAForwardMetadata()
+    ) -> "TRTLLMMHAMetadata":
+        """Create TRTLLMMHAMetadata with pre-allocated buffer slice refs, stored in the dict."""
+        metadata = TRTLLMMHAMetadata()
 
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
@@ -585,7 +585,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
 
-        metadata = TRTLLMMHAForwardMetadata()
+        metadata = TRTLLMMHAMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device

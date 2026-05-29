@@ -266,7 +266,7 @@ class DSV4AttnMetadata:
 
 
 @dataclass
-class DSV4ForwardMetadata:
+class DSV4Metadata:
     core_attn_metadata: DSV4AttnMetadata
     indexer_metadata: Optional[PagedIndexerMetadata]
 
@@ -277,7 +277,7 @@ class DSV4ForwardMetadata:
     def core_metadata(self) -> DSV4AttnMetadata:
         return self.core_attn_metadata
 
-    def copy_(self, other: DSV4ForwardMetadata):
+    def copy_(self, other: DSV4Metadata):
         self.core_attn_metadata.copy_(other.core_attn_metadata)
         maybe_copy_inplace(self.indexer_metadata, src=other.indexer_metadata)
         maybe_copy_inplace(self.c4_compress_metadata, src=other.c4_compress_metadata)
@@ -287,14 +287,14 @@ class DSV4ForwardMetadata:
 
 
 @dataclass
-class DSV4RawVerifyForwardMetadata:
+class DSV4RawVerifyMetadata:
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
     out_cache_loc: torch.Tensor
 
     extend_seq_lens: Optional[torch.Tensor] = None
 
-    def copy_(self, other: DSV4RawVerifyForwardMetadata):
+    def copy_(self, other: DSV4RawVerifyMetadata):
         self.req_pool_indices.copy_(other.req_pool_indices)
         self.seq_lens.copy_(other.seq_lens)
         self.out_cache_loc.copy_(other.out_cache_loc)
@@ -303,12 +303,12 @@ class DSV4RawVerifyForwardMetadata:
 
 
 @dataclass
-class DSV4RawDecodeForwardMetadata:
+class DSV4RawDecodeMetadata:
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
     out_cache_loc: torch.Tensor
 
-    def copy_(self, other: DSV4RawDecodeForwardMetadata):
+    def copy_(self, other: DSV4RawDecodeMetadata):
         self.req_pool_indices.copy_(other.req_pool_indices)
         self.seq_lens.copy_(other.seq_lens)
         self.out_cache_loc.copy_(other.out_cache_loc)
@@ -376,9 +376,9 @@ class DeepseekV4HipRadixBackend(
         )
         self.speculative_step_id = speculative_step_id
         self.forward_metadata: Union[
-            DSV4ForwardMetadata,
-            DSV4RawVerifyForwardMetadata,
-            DSV4RawDecodeForwardMetadata,
+            DSV4Metadata,
+            DSV4RawVerifyMetadata,
+            DSV4RawDecodeMetadata,
         ] = None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
@@ -398,13 +398,13 @@ class DeepseekV4HipRadixBackend(
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         out_cache_loc: torch.Tensor,
-    ) -> Union[DSV4ForwardMetadata, DSV4RawDecodeForwardMetadata]:
+    ) -> Union[DSV4Metadata, DSV4RawDecodeMetadata]:
         assert (
             req_pool_indices.shape[0] == seq_lens.shape[0] == out_cache_loc.shape[0]
         ), f"{req_pool_indices.shape=} {seq_lens.shape=} {out_cache_loc.shape=}"
 
         if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
-            return DSV4RawDecodeForwardMetadata(
+            return DSV4RawDecodeMetadata(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc,
@@ -430,7 +430,7 @@ class DeepseekV4HipRadixBackend(
             seq_lens=seq_lens,
         )
 
-        return DSV4ForwardMetadata(
+        return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
             c4_compress_metadata=create(compress_ratio=4),
@@ -449,7 +449,7 @@ class DeepseekV4HipRadixBackend(
         extend_seq_lens_cpu: List[int],
         need_compress: bool = True,
         use_prefill_cuda_graph: bool = False,
-    ) -> DSV4ForwardMetadata:
+    ) -> DSV4Metadata:
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
             seq_lens=seq_lens_cpu,
@@ -486,7 +486,7 @@ class DeepseekV4HipRadixBackend(
                 extend_lens_cpu=extend_seq_lens_cpu,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
             )
-        return DSV4ForwardMetadata(
+        return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
             c4_compress_metadata=create(compress_ratio=4),
@@ -501,7 +501,7 @@ class DeepseekV4HipRadixBackend(
         out_cache_loc: Optional[torch.Tensor] = None,
         extend_seq_lens: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
-    ) -> Union[DSV4ForwardMetadata, DSV4RawVerifyForwardMetadata]:
+    ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
         # HIP path: build target-verify metadata eagerly even when
         # SGLANG_PREP_IN_CUDA_GRAPH is enabled. The raw/lazy-upgrade route can
         # hit planner invariants during graph capture for DSV4+EAGLE.
@@ -523,7 +523,7 @@ class DeepseekV4HipRadixBackend(
         seq_lens_cpu: Optional[List[int]] = None,
         out_cache_loc: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
-    ) -> DSV4ForwardMetadata:
+    ) -> DSV4Metadata:
         batch_size = len(seq_lens)
         seq_lens = seq_lens + self.speculative_num_draft_tokens
         seq_lens_cpu = [x + self.speculative_num_draft_tokens for x in seq_lens_cpu]
@@ -546,8 +546,8 @@ class DeepseekV4HipRadixBackend(
         )
 
     def make_forward_metadata_from_raw_verify(
-        self, raw_metadata: DSV4RawVerifyForwardMetadata
-    ) -> DSV4ForwardMetadata:
+        self, raw_metadata: DSV4RawVerifyMetadata
+    ) -> DSV4Metadata:
         req_pool_indices = raw_metadata.req_pool_indices
         seq_lens = raw_metadata.seq_lens
         out_cache_loc = raw_metadata.out_cache_loc
@@ -590,7 +590,7 @@ class DeepseekV4HipRadixBackend(
             use_prefill_cuda_graph=True,
             num_q_tokens=num_draft_tokens * bs,
         )
-        return DSV4ForwardMetadata(
+        return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
             c4_compress_metadata=create(compress_ratio=4),
@@ -598,8 +598,8 @@ class DeepseekV4HipRadixBackend(
         )
 
     def make_forward_metadata_from_raw_decode(
-        self, raw_metadata: DSV4RawDecodeForwardMetadata
-    ) -> DSV4ForwardMetadata:
+        self, raw_metadata: DSV4RawDecodeMetadata
+    ) -> DSV4Metadata:
         req_pool_indices = raw_metadata.req_pool_indices
         seq_lens = raw_metadata.seq_lens
         out_cache_loc = raw_metadata.out_cache_loc
@@ -623,7 +623,7 @@ class DeepseekV4HipRadixBackend(
             seq_lens=seq_lens,
         )
 
-        return DSV4ForwardMetadata(
+        return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
             c4_compress_metadata=create(compress_ratio=4),
@@ -639,7 +639,7 @@ class DeepseekV4HipRadixBackend(
         num_tokens_per_bs: int,
         out_cache_loc: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
-    ) -> DSV4ForwardMetadata:
+    ) -> DSV4Metadata:
         batch_size = len(seq_lens)
         extend_seq_lens_cpu = [num_tokens_per_bs] * batch_size
         extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
@@ -665,11 +665,11 @@ class DeepseekV4HipRadixBackend(
         # cuda graph (per-replay materialization of c4/c128 compress + core_attn
         # + indexer fields). With PREP_IN_CUDA_GRAPH=0 forward_metadata is
         # already Full and the isinstance checks below short-circuit.
-        if isinstance(self.forward_metadata, DSV4RawVerifyForwardMetadata):
+        if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
             self.forward_metadata = self.make_forward_metadata_from_raw_verify(
                 raw_metadata=self.forward_metadata,
             )
-        elif isinstance(self.forward_metadata, DSV4RawDecodeForwardMetadata):
+        elif isinstance(self.forward_metadata, DSV4RawDecodeMetadata):
             self.forward_metadata = self.make_forward_metadata_from_raw_decode(
                 raw_metadata=self.forward_metadata,
             )
@@ -783,7 +783,7 @@ class DeepseekV4HipRadixBackend(
                 metadata
                 if isinstance(
                     metadata,
-                    (DSV4RawDecodeForwardMetadata, DSV4RawVerifyForwardMetadata),
+                    (DSV4RawDecodeMetadata, DSV4RawVerifyMetadata),
                 )
                 else None
             )
@@ -854,7 +854,7 @@ class DeepseekV4HipRadixBackend(
         self.forward_metadata = metadata
         # Chain the recordable in-graph step so PREP_IN_CUDA_GRAPH=1 upgrades
         # Raw→Full (no-op when init_forward_metadata_decode/verify already
-        # produced a Full DSV4ForwardMetadata).
+        # produced a Full DSV4Metadata).
         self.init_forward_metadata_in_graph(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
@@ -863,9 +863,9 @@ class DeepseekV4HipRadixBackend(
             Dict[
                 int,
                 Union[
-                    DSV4ForwardMetadata,
-                    DSV4RawDecodeForwardMetadata,
-                    DSV4RawVerifyForwardMetadata,
+                    DSV4Metadata,
+                    DSV4RawDecodeMetadata,
+                    DSV4RawVerifyMetadata,
                 ],
             ],
         ] = {bucket: {} for bucket in _GraphBucket}
@@ -877,9 +877,9 @@ class DeepseekV4HipRadixBackend(
         self,
         bs: int,
         temp_metadata: Union[
-            DSV4ForwardMetadata,
-            DSV4RawVerifyForwardMetadata,
-            DSV4RawDecodeForwardMetadata,
+            DSV4Metadata,
+            DSV4RawVerifyMetadata,
+            DSV4RawDecodeMetadata,
         ],
         bucket: _GraphBucket,
     ) -> None:
@@ -897,7 +897,7 @@ class DeepseekV4HipRadixBackend(
 
     def on_after_cuda_graph_warmup(self):
         metadata = self.forward_metadata
-        if isinstance(metadata, DSV4ForwardMetadata) and isinstance(
+        if isinstance(metadata, DSV4Metadata) and isinstance(
             metadata.core_attn_metadata, DSV4AttnMetadata
         ):
             core = metadata.core_attn_metadata

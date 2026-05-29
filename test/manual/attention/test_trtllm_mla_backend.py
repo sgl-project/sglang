@@ -14,7 +14,7 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
-    TRTLLMMLADecodeForwardMetadata,
+    TRTLLMMLADecodeMetadata,
 )
 from sglang.srt.layers.attention.utils import get_num_page_per_block_flashmla
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -857,7 +857,7 @@ class TestTRTLLMMLA(CustomTestCase):
                 # Verify metadata exists
                 self.assertIsNotNone(backend.forward_decode_metadata)
                 self.assertIsInstance(
-                    backend.forward_decode_metadata, TRTLLMMLADecodeForwardMetadata
+                    backend.forward_decode_metadata, TRTLLMMLADecodeMetadata
                 )
 
                 # Test metadata structure

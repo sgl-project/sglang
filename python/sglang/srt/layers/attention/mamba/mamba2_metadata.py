@@ -50,7 +50,7 @@ class ForwardMetadata:
 
 
 @dataclass(kw_only=True)
-class Mamba2ForwardMetadata(ForwardMetadata):
+class Mamba2Metadata(ForwardMetadata):
     """stable metadata across all mamba2 layers in the forward pass"""
 
     num_prefills: int
@@ -163,9 +163,9 @@ class Mamba2ForwardMetadata(ForwardMetadata):
         *,
         is_target_verify: bool,
         draft_token_num: int,
-    ) -> "Mamba2ForwardMetadata":
+    ) -> "Mamba2Metadata":
         """This path is run during CUDA graph capture, i.e. decode only, so `num_prefills` is 0"""
-        return Mamba2ForwardMetadata(
+        return Mamba2Metadata(
             query_start_loc=forward_metadata.query_start_loc,
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
             retrieve_next_token=forward_metadata.retrieve_next_token,
@@ -189,7 +189,7 @@ class Mamba2ForwardMetadata(ForwardMetadata):
         forward_metadata: ForwardMetadata,
         chunk_size: int,
         forward_batch: ForwardBatch,
-    ) -> "Mamba2ForwardMetadata":
+    ) -> "Mamba2Metadata":
         """This path cannot run with CUDA graph, as it contains extend requests."""
         if forward_batch.extend_num_tokens is None:
             draft_token_num = (
@@ -238,7 +238,7 @@ class Mamba2ForwardMetadata(ForwardMetadata):
             if forward_batch.spec_info is not None
             else 1
         )
-        return Mamba2ForwardMetadata(
+        return Mamba2Metadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
             retrieve_next_token=forward_metadata.retrieve_next_token,

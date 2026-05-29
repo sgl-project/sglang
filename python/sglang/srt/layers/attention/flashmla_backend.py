@@ -28,7 +28,7 @@ PAGE_SIZE = 64
 
 
 @dataclass
-class FlashMLADecodeForwardMetadata:
+class FlashMLADecodeMetadata:
     flashmla_metadata: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
     num_splits: Optional[torch.Tensor] = None
     block_kv_indices: Optional[torch.Tensor] = None
@@ -63,7 +63,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.num_local_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
-        self.forward_metadata: Union[FlashMLADecodeForwardMetadata] = None
+        self.forward_metadata: Union[FlashMLADecodeMetadata] = None
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
@@ -134,7 +134,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 1,
                 is_fp8_kvcache=self.is_fp8_kvcache,
             )
-            self.forward_metadata = FlashMLADecodeForwardMetadata(
+            self.forward_metadata = FlashMLADecodeMetadata(
                 mla_metadata,
                 num_splits,
                 block_kv_indices,
@@ -165,7 +165,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 1,
                 is_fp8_kvcache=self.is_fp8_kvcache,
             )
-            self.forward_metadata = FlashMLADecodeForwardMetadata(
+            self.forward_metadata = FlashMLADecodeMetadata(
                 mla_metadata,
                 num_splits,
                 block_kv_indices,
@@ -282,7 +282,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.cuda_graph_mla_metadata[:actual_num_sm_parts].copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
 
-            self.forward_metadata = FlashMLADecodeForwardMetadata(
+            self.forward_metadata = FlashMLADecodeMetadata(
                 self.cuda_graph_mla_metadata_view,
                 self.cuda_graph_num_splits_view,
                 self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],

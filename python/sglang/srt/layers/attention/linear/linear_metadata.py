@@ -7,7 +7,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 @dataclass(kw_only=True)
-class BailingLinearForwardMetadata(ForwardMetadata):
+class BailingLinearMetadata(ForwardMetadata):
     num_prefills: int
     num_prefill_tokens: int
     num_decodes: int
@@ -21,9 +21,9 @@ class BailingLinearForwardMetadata(ForwardMetadata):
         mamba_cache_indices: torch.Tensor,
         bs: int,
         seq_lens: torch.Tensor,
-    ) -> "BailingLinearForwardMetadata":
+    ) -> "BailingLinearMetadata":
         """This path is run during CUDA graph capture, i.e. decode only, so `num_prefills` is 0"""
-        return BailingLinearForwardMetadata(
+        return BailingLinearMetadata(
             batch_size=bs,
             query_start_loc=query_start_loc,
             mamba_cache_indices=mamba_cache_indices,
@@ -40,7 +40,7 @@ class BailingLinearForwardMetadata(ForwardMetadata):
         query_start_loc: torch.Tensor,
         mamba_cache_indices: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> "BailingLinearForwardMetadata":
+    ) -> "BailingLinearMetadata":
         """This path cannot run with CUDA graph, as it contains extend requests."""
         if forward_batch.extend_num_tokens is None:
             return cls.prepare_decode(
@@ -58,7 +58,7 @@ class BailingLinearForwardMetadata(ForwardMetadata):
 
         query_start_loc = query_start_loc[: num_prefills + 1]
 
-        return BailingLinearForwardMetadata(
+        return BailingLinearMetadata(
             batch_size=forward_batch.batch_size,
             query_start_loc=query_start_loc,
             mamba_cache_indices=mamba_cache_indices,

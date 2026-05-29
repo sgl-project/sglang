@@ -7,7 +7,7 @@ import torch
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashattention_backend import (
-    FlashAttentionForwardMetadata,
+    FlashAttentionMetadata,
     make_local_attention_virtual_batches,
     merge_state_v2_wrapper,
     prepare_swa_spec_page_table_triton,
@@ -48,9 +48,9 @@ class XPUAttentionBackend(AttentionBackend):
             and model_runner.model_config.is_encoder_decoder
         ), "Sliding window and cross attention are not supported together"
 
-        self.forward_metadata: FlashAttentionForwardMetadata = None
+        self.forward_metadata: FlashAttentionMetadata = None
         # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
-        self.forward_metadata_spec_decode_expand: FlashAttentionForwardMetadata = None
+        self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
         self.max_context_len = model_runner.model_config.context_len
         self.num_attention_heads = (
             model_runner.model_config.hf_text_config.num_attention_heads
@@ -99,7 +99,7 @@ class XPUAttentionBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
-        metadata = FlashAttentionForwardMetadata()
+        metadata = FlashAttentionMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
@@ -150,7 +150,7 @@ class XPUAttentionBackend(AttentionBackend):
                         forward_batch.req_pool_indices, : metadata.max_seq_len_k
                     ]
 
-                    metadata_expand = FlashAttentionForwardMetadata()
+                    metadata_expand = FlashAttentionMetadata()
                     decode_length = self.speculative_step_id + 1
                     metadata_expand.cache_seqlens_int32 = torch.full(
                         (seqlens_in_batch.numel() * self.topk,),
@@ -244,7 +244,7 @@ class XPUAttentionBackend(AttentionBackend):
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
 
-                metadata_expand = FlashAttentionForwardMetadata()
+                metadata_expand = FlashAttentionMetadata()
 
                 metadata_expand.max_seq_len_q = 1
                 metadata_expand.cu_seqlens_q = torch.arange(
@@ -908,7 +908,7 @@ class XPUAttentionBackend(AttentionBackend):
     def _init_local_attn_metadata(
         self,
         forwardbatch: ForwardBatch,
-        metadata: FlashAttentionForwardMetadata,
+        metadata: FlashAttentionMetadata,
         device,
     ):
         """Centralized utility to initialize local_attn_metadata if chunked attention is enabled."""
@@ -954,7 +954,7 @@ class XPUAttentionBackend(AttentionBackend):
             self.page_size,
         )
 
-        local_metadata = FlashAttentionForwardMetadata.LocalAttentionMetadata(
+        local_metadata = FlashAttentionMetadata.LocalAttentionMetadata(
             local_query_start_loc=torch.from_numpy(cu_seqlens_q_local_np).to(device),
             local_seqused_k=torch.from_numpy(seqlens_k_local_np).to(device),
             local_block_table=block_table_local.to(device),
@@ -965,9 +965,9 @@ class XPUAttentionBackend(AttentionBackend):
 
     def _init_sliding_window_attn_spec_metadata(
         self,
-        metadata: FlashAttentionForwardMetadata,
-        metadata_expand: FlashAttentionForwardMetadata,
-        metadata_swa: Optional[FlashAttentionForwardMetadata] = None,
+        metadata: FlashAttentionMetadata,
+        metadata_expand: FlashAttentionMetadata,
+        metadata_swa: Optional[FlashAttentionMetadata] = None,
     ):
         # TODO: support page_size > 1 for swa spec
         assert (
@@ -1002,7 +1002,7 @@ class XPUAttentionBackend(AttentionBackend):
         )
 
         if metadata_swa is None:
-            metadata_swa = FlashAttentionForwardMetadata()
+            metadata_swa = FlashAttentionMetadata()
             metadata_swa.max_seq_len_q = 1
             metadata_swa.cu_seqlens_q = metadata_expand.cu_seqlens_q
             metadata_swa.cache_seqlens_int32 = cache_seqlens_int32
