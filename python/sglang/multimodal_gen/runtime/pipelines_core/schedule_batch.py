@@ -17,7 +17,7 @@ import pprint
 from collections import Counter
 from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields
-from typing import Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import PIL.Image
 import torch
@@ -36,6 +36,11 @@ from sglang.multimodal_gen.utils import align_to
 from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.pipelines_core.realtime_session import (
+        RealtimeSession,
+    )
 
 SAMPLING_PARAMS_FIELDS = {f.name for f in fields(SamplingParams)}
 
@@ -178,6 +183,7 @@ class Req:
 
     # Extra parameters that might be needed by specific pipeline implementations (e.g., LTX2.3 DenoisingAVStage)
     extra: dict[str, Any] = field(default_factory=dict)
+    session: RealtimeSession | None = None
 
     is_warmup: bool = False
 

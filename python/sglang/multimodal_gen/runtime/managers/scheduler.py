@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     GetDisaggStatsReq,
     ListLorasReq,
     MergeLoraWeightsReq,
+    ReleaseRealtimeSessionReq,
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
@@ -135,6 +136,7 @@ class Scheduler(SchedulerDisaggMixin):
             Req: self._handle_generation,
             ListLorasReq: self._handle_list_loras,
             ShutdownReq: self._handle_shutdown,
+            ReleaseRealtimeSessionReq: self._handle_release_realtime_session,
             GetDisaggStatsReq: self._handle_get_disagg_stats,
             UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
@@ -211,6 +213,10 @@ class Scheduler(SchedulerDisaggMixin):
     def _handle_shutdown(self, _reqs: List[Any]) -> OutputBatch:
         self._running = False
         return OutputBatch()
+
+    def _handle_release_realtime_session(self, reqs: List[Any]) -> OutputBatch:
+        req = reqs[0]
+        return self.worker.release_realtime_session(req.session_id)
 
     def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
         """Handle update_weights_from_disk request for RL workflows."""

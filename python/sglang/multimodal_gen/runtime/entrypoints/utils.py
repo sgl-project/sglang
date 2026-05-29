@@ -73,6 +73,11 @@ class ShutdownReq:
 
 
 @dataclass
+class ReleaseRealtimeSessionReq:
+    session_id: str
+
+
+@dataclass
 class GetDisaggStatsReq:
     """Request to get disagg pipeline metrics from the scheduler."""
 
