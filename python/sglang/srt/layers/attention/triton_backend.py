@@ -537,9 +537,14 @@ class TritonAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-            # Different with flashinfer kv_indptr and kv_indices construction
+            # Different with flashinfer kv_indptr and kv_indices construction.
+            # gpu_only path: seq_lens_sum may be None; over-allocate by ub since
+            # _fill_kv_indptr_and_indices writes ragged using seq_lens tensor.
+            seq_lens_sum = forward_batch.seq_lens_sum
+            if seq_lens_sum is None:
+                seq_lens_sum = bs * self.max_context_len
             kv_indices = torch.empty(
-                forward_batch.seq_lens_sum, dtype=torch.int64, device=self.device
+                seq_lens_sum, dtype=torch.int64, device=self.device
             )
             kv_indptr = self._fill_kv_indptr_and_indices(
                 bs,
