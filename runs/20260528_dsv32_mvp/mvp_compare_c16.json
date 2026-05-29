@@ -1,0 +1,57 @@
+{
+  "baseline_path": "runs/20260528_dsv32_mvp/smoke_results/native_nsa_gsp_isl4096_osl512_c16_t1.jsonl",
+  "ds_path": "runs/20260528_dsv32_mvp/smoke_results/double_sparsity_gsp_isl4096_osl512_c16_t1.jsonl",
+  "baseline_context": {
+    "gpu_id": "0",
+    "tp_size": 8,
+    "page_size": 64,
+    "disable_radix_cache": true,
+    "concurrency": 16
+  },
+  "ds_context": {
+    "gpu_id": "0",
+    "tp_size": 8,
+    "page_size": 64,
+    "disable_radix_cache": true,
+    "concurrency": 16
+  },
+  "baseline_metrics": {
+    "concurrency": 16,
+    "num_prompts": 64,
+    "isl": 4096,
+    "osl": 512,
+    "output_tps_p50": 46.0160115345373,
+    "output_tps_p99": 47.17352640534772,
+    "ttft_p50_s": 33.589580410160124,
+    "ttft_p99_s": 33.77616577750072,
+    "tpot_p50_ms": 21.77410282435191,
+    "tpot_p99_ms": 82.65942224709649,
+    "goodput_under_slo": null,
+    "selected_tokens_mean": null,
+    "dense_fallback_total": null,
+    "total_tokens_mean": null,
+    "duration_s": 178.77386254351586
+  },
+  "ds_metrics": {
+    "concurrency": 16,
+    "num_prompts": 64,
+    "isl": 4096,
+    "osl": 512,
+    "output_tps_p50": 36.961256499540156,
+    "output_tps_p99": 39.11039883781068,
+    "ttft_p50_s": 119.87448769621551,
+    "ttft_p99_s": 120.0322373612877,
+    "tpot_p50_ms": 27.10831669248538,
+    "tpot_p99_ms": 29.783349201309182,
+    "goodput_under_slo": null,
+    "selected_tokens_mean": null,
+    "dense_fallback_total": null,
+    "total_tokens_mean": null,
+    "duration_s": 533.3391699828207
+  },
+  "ds_slo_verdict": "fail",
+  "ds_no_op_flag": {
+    "status": "unknown",
+    "reason": "no-op inputs missing: dense_fallback_total, selected_tokens_mean, total_tokens_mean"
+  }
+}
