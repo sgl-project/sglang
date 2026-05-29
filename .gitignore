@@ -180,6 +180,11 @@ benchmark/llava_bench/mme_pack
 tmp*.txt
 /tmp/
 
+# Double Sparsity dev scratch outputs: benchmark.sh / benchmark_baseline.sh and
+# the manual M3-B / quality fixtures write JSONLs + .json result files here at
+# runtime. Curated evidence is copied under runs/<date>_dsv32_mvp/ instead.
+development/results/
+
 # Torch Compile logs
 tl_out/
 
