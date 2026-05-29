@@ -57,9 +57,6 @@ class CompressorBackendMixin:
         assert isinstance(metadata, FusedCompressMetadata)
         return metadata
 
-    def _maybe_upgrade_forward_metadata(self) -> None:
-        pass
-
     def forward_compress(
         self,
         *,

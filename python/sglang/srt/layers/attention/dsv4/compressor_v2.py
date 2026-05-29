@@ -404,9 +404,6 @@ class CompressorBackendMixin:
         super().__init__()
         self.forward_metadata: DSV4ForwardMetadata
 
-    # NOTE: Will be overridden
-    def _maybe_upgrade_forward_metadata(self): ...
-
     def _get_paged_compress_metadata(self, compress_ratio: int) -> CompressMetadata:
         attr_name = f"c{compress_ratio}_compress_metadata"
         return getattr(self.forward_metadata, attr_name)

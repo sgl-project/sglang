@@ -664,8 +664,15 @@ class DeepseekV4HipRadixBackend(
         # returned Raw metadata so the Raw→Full upgrade is recorded inside the
         # cuda graph (per-replay materialization of c4/c128 compress + core_attn
         # + indexer fields). With PREP_IN_CUDA_GRAPH=0 forward_metadata is
-        # already Full and this is a no-op via the isinstance check.
-        self._maybe_upgrade_forward_metadata()
+        # already Full and the isinstance checks below short-circuit.
+        if isinstance(self.forward_metadata, DSV4RawVerifyForwardMetadata):
+            self.forward_metadata = self.make_forward_metadata_from_raw_verify(
+                raw_metadata=self.forward_metadata,
+            )
+        elif isinstance(self.forward_metadata, DSV4RawDecodeForwardMetadata):
+            self.forward_metadata = self.make_forward_metadata_from_raw_decode(
+                raw_metadata=self.forward_metadata,
+            )
 
     def init_forward_metadata_out_graph(
         self,
@@ -920,24 +927,6 @@ class DeepseekV4HipRadixBackend(
                 layer_id=layer_id,
                 raw_loc=raw_loc,
                 cache_nope_fp8_rope_bf16_pack=swa_k_pack,
-            )
-
-    def _maybe_upgrade_forward_metadata(self) -> None:
-        # With SGLANG_PREP_IN_CUDA_GRAPH=1, init_forward_metadata_*
-        # returns a Raw metadata that only carries a few tensors. The
-        # full DSV4ForwardMetadata (including c4/c128 compress + core_attn +
-        # indexer metadata) must be materialized before any caller that
-        # touches those fields. For 1.6T the first two layers have
-        # compress_ratio=128, so forward_core_compressor / forward_c4_indexer
-        # can fire before attn_backend.forward(), and must trigger the
-        # upgrade themselves.
-        if isinstance(self.forward_metadata, DSV4RawVerifyForwardMetadata):
-            self.forward_metadata = self.make_forward_metadata_from_raw_verify(
-                raw_metadata=self.forward_metadata,
-            )
-        elif isinstance(self.forward_metadata, DSV4RawDecodeForwardMetadata):
-            self.forward_metadata = self.make_forward_metadata_from_raw_decode(
-                raw_metadata=self.forward_metadata,
             )
 
     def forward(
