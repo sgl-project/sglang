@@ -4,9 +4,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
-    DEFAULT_MAX_STEPS,
+    LIFECYCLE_STAGES,
+    advance_to_lifecycle_stage,
     base_engine_kwargs,
-    run_until,
     run_until_finished,
 )
 
@@ -26,61 +26,18 @@ _PROMPT_LEN = 4 * _CHUNK_SIZE - 3
 # count is ceil(_PROMPT_LEN / _CHUNK_SIZE) - 1 == (_PROMPT_LEN - 1) // _CHUNK_SIZE.
 _NUM_MIDDLE_CHUNKS = (_PROMPT_LEN - 1) // _CHUNK_SIZE
 # Enough decode steps that first / middle / last decode are distinct points.
-_PAUSE_MAX_NEW_TOKENS = 4
-_PAUSE_STAGES = (
-    "first_chunk",
-    "last_chunk",
-    "first_decode",
-    "mid_decode",
-    "last_decode",
-)
+_LIFECYCLE_MAX_NEW_TOKENS = 4
 
 
-def _advance_to_nth_chunk(t: "ScriptedRuntime", r, target_chunk: int):
-    """Yield until the req is processing its ``target_chunk``-th chunked iter."""
-    seen = 0
-    for _ in range(DEFAULT_MAX_STEPS):
-        assert not r.finished, f"req finished before reaching chunk {target_chunk}"
-        if r.is_chunking:
-            seen += 1
-            if seen >= target_chunk:
-                return
-        yield
-    raise AssertionError(f"never reached chunk {target_chunk} (saw {seen})")
-
-
-def _advance_to_decode_step(t: "ScriptedRuntime", r, target_output_len: int):
-    """Yield until the req has produced ``target_output_len`` decode tokens.
-
-    Assumes the req runs to ``max_new_tokens`` by length (the synthetic decode
-    does not stop early); reads ``Req.output_ids`` directly since the
-    output-length handle property is still wishlist.
-    """
-    for _ in range(DEFAULT_MAX_STEPS):
-        assert (
-            not r.finished
-        ), f"req finished before reaching decode step {target_output_len}"
-        req = t._find_req_by_rid(r.rid)
-        if req is not None and len(req.output_ids) >= target_output_len:
-            return
-        yield
-    raise AssertionError(f"never reached decode step {target_output_len}")
-
-
-def _advance_to_stage(t: "ScriptedRuntime", r, stage: str):
-    """Yield until the req reaches the named lifecycle ``stage``."""
-    if stage == "first_chunk":
-        yield from _advance_to_nth_chunk(t, r, 1)
-    elif stage == "last_chunk":
-        yield from _advance_to_nth_chunk(t, r, _NUM_MIDDLE_CHUNKS)
-    elif stage == "first_decode":
-        yield from _advance_to_decode_step(t, r, 1)
-    elif stage == "mid_decode":
-        yield from _advance_to_decode_step(t, r, _PAUSE_MAX_NEW_TOKENS // 2)
-    elif stage == "last_decode":
-        yield from _advance_to_decode_step(t, r, _PAUSE_MAX_NEW_TOKENS - 1)
-    else:
-        raise AssertionError(f"unknown stage {stage!r}")
+def _advance_to_stage(t: ScriptedRuntime, r, stage: str):
+    """Yield until the req reaches ``stage``, wired to this file's prompt config."""
+    yield from advance_to_lifecycle_stage(
+        t,
+        r,
+        stage,
+        num_middle_chunks=_NUM_MIDDLE_CHUNKS,
+        max_new_tokens=_LIFECYCLE_MAX_NEW_TOKENS,
+    )
 
 
 class TestScriptedCore(ScriptedRuntimeTestCase):
@@ -114,7 +71,7 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
 
     def test_pause_retract_at_lifecycle_points_then_resume(self):
         """Pause(retract) at each lifecycle stage, sit paused, continue, and the req still finishes."""
-        for stage in _PAUSE_STAGES:
+        for stage in LIFECYCLE_STAGES:
             with self.subTest(stage=stage):
                 self.runtime.run(
                     self._script_pause_retract_at_stage,
@@ -123,8 +80,16 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
 
     @staticmethod
     def _script_pause_retract_at_stage(t: ScriptedRuntime, stage: str):
-        r = t.start_req(prompt_len=_PROMPT_LEN, max_new_tokens=_PAUSE_MAX_NEW_TOKENS)
+        r = t.start_req(
+            prompt_len=_PROMPT_LEN, max_new_tokens=_LIFECYCLE_MAX_NEW_TOKENS
+        )
         yield from _advance_to_stage(t, r, stage)
+
+        # Decode progress so far; retract preserves output_ids, so a correctly
+        # paused engine must not advance this while paused.
+        req = t._find_req_by_rid(r.rid)
+        assert req is not None, f"stage={stage}: req vanished before pause"
+        output_tokens_before_pause = len(req.output_ids)
 
         t.pause_generation(mode="retract")
         # Retract state is reflected in the scheduler on the next event-loop iter.
@@ -139,24 +104,34 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
             f"waiting_queue; found={req!r}"
         )
 
-        # Sit paused for a few iters before resuming.
+        # Sit paused for a few iters: the engine must make no forward progress.
         for _ in range(3):
             yield
+            req = t._find_req_by_rid(r.rid)
+            assert (
+                req is not None and len(req.output_ids) == output_tokens_before_pause
+            ), (
+                f"stage={stage}: paused engine advanced the req "
+                f"({len(req.output_ids) if req is not None else None} output tokens, "
+                f"expected {output_tokens_before_pause})"
+            )
 
         t.continue_generation()
         yield from run_until_finished(r)
         assert r.finished, f"stage={stage}: req did not finish after pause/continue"
 
-    def test_abort_all_during_chunked_prefill_clears_chunked_req(self):
-        """Mid-chunk abort_all() terminates the req; scheduler clears the chunked slot within a few yields."""
-        self.runtime.run(
-            self._script_abort_all_during_chunked_prefill_clears_chunked_req
-        )
+    def test_abort_all_at_lifecycle_points(self):
+        """abort_all() at each lifecycle stage terminates the req within a few yields."""
+        for stage in LIFECYCLE_STAGES:
+            with self.subTest(stage=stage):
+                self.runtime.run(self._script_abort_all_at_stage, args=(stage,))
 
     @staticmethod
-    def _script_abort_all_during_chunked_prefill_clears_chunked_req(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking)
+    def _script_abort_all_at_stage(t: ScriptedRuntime, stage: str):
+        r = t.start_req(
+            prompt_len=_PROMPT_LEN, max_new_tokens=_LIFECYCLE_MAX_NEW_TOKENS
+        )
+        yield from _advance_to_stage(t, r, stage)
 
         t.abort_all()
         # abort_request marks the req FINISH_ABORT but the chunked_req slot
@@ -166,7 +141,7 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
             if r.finished:
                 break
 
-        assert r.finished, "req did not finish after abort_all"
+        assert r.finished, f"stage={stage}: req did not finish after abort_all"
 
     def test_chunked_req_single_decode_finishes(self):
         """A chunked-prefill req with max_new_tokens=1 finishes cleanly after its single decode step."""
