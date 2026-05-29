@@ -90,7 +90,7 @@ def run_until(handle, predicate, *, max_steps: int = DEFAULT_MAX_STEPS):
         yield
     raise AssertionError(
         f"run_until: predicate never satisfied after {max_steps} steps "
-        f"(handle rid={handle.rid!r}, status={handle.status!r})"
+        f"(handle rid={handle.rid!r}, finished={handle.finished})"
     )
 
 
@@ -99,22 +99,91 @@ def run_until_finished(handle, *, max_steps: int = DEFAULT_MAX_STEPS):
 
     Mirrors the most common idiom across the suite.
     """
-    yield from run_until(
-        handle,
-        lambda h: getattr(h, "finished", False) or h.status == "finished",
-        max_steps=max_steps,
-    )
+    yield from run_until(handle, lambda h: h.finished, max_steps=max_steps)
 
 
 def run_until_all_finished(handles: List[Any], *, max_steps: int = DEFAULT_MAX_STEPS):
     """Generator helper: ``yield`` until every handle reports finished."""
     for _ in range(max_steps):
-        if all(
-            getattr(h, "finished", False) or h.status == "finished" for h in handles
-        ):
+        if all(h.finished for h in handles):
             return
         yield
     raise AssertionError(
         f"run_until_all_finished: not all reqs finished after {max_steps} "
-        f"steps (statuses={[h.status for h in handles]})"
+        f"steps (finished={[h.finished for h in handles]})"
     )
+
+
+LIFECYCLE_STAGES = (
+    "first_chunk",
+    "last_chunk",
+    "first_decode",
+    "mid_decode",
+    "last_decode",
+)
+
+
+def advance_to_nth_chunk(
+    t, r, target_chunk: int, *, max_steps: int = DEFAULT_MAX_STEPS
+):
+    """Generator helper: ``yield`` until the req is on its ``target_chunk``-th chunked iter.
+
+    Counts iterations where the req holds the scheduler's chunked_req slot
+    (``is_chunking``); the final extend that completes prefill is not chunked
+    and is therefore not counted.
+    """
+    seen = 0
+    for _ in range(max_steps):
+        assert not r.finished, f"req finished before reaching chunk {target_chunk}"
+        if r.is_chunking:
+            seen += 1
+            if seen >= target_chunk:
+                return
+        yield
+    raise AssertionError(f"never reached chunk {target_chunk} (saw {seen})")
+
+
+def advance_to_decode_step(
+    t, r, target_output_len: int, *, max_steps: int = DEFAULT_MAX_STEPS
+):
+    """Generator helper: ``yield`` until the req has produced ``target_output_len`` decode tokens.
+
+    Reads ``Req.output_ids`` directly (the output-length handle property is
+    still wishlist) and assumes the req runs to ``max_new_tokens`` by length —
+    the synthetic decode does not stop early.
+    """
+    for _ in range(max_steps):
+        assert (
+            not r.finished
+        ), f"req finished before reaching decode step {target_output_len}"
+        req = t._find_req_by_rid(r.rid)
+        if req is not None and len(req.output_ids) >= target_output_len:
+            return
+        yield
+    raise AssertionError(f"never reached decode step {target_output_len}")
+
+
+def advance_to_lifecycle_stage(
+    t,
+    r,
+    stage: str,
+    *,
+    num_middle_chunks: int,
+    max_new_tokens: int,
+    max_steps: int = DEFAULT_MAX_STEPS,
+):
+    """Generator helper: ``yield`` until the req reaches the named :data:`LIFECYCLE_STAGES` point."""
+    if stage == "first_chunk":
+        yield from advance_to_nth_chunk(t, r, 1, max_steps=max_steps)
+    elif stage == "last_chunk":
+        yield from advance_to_nth_chunk(t, r, num_middle_chunks, max_steps=max_steps)
+    elif stage == "first_decode":
+        yield from advance_to_decode_step(t, r, 1, max_steps=max_steps)
+    elif stage == "mid_decode":
+        yield from advance_to_decode_step(
+            t, r, max(1, max_new_tokens // 2), max_steps=max_steps
+        )
+    elif stage == "last_decode":
+        yield from advance_to_decode_step(t, r, max_new_tokens - 1, max_steps=max_steps)
+    else:
+        raise AssertionError(f"unknown lifecycle stage {stage!r}")
