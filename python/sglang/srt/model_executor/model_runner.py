@@ -250,6 +250,7 @@ MLA_ATTENTION_BACKENDS = [
     "fa4",
     "triton",
     "flashmla",
+    "cutedsl_mla",
     "cutlass_mla",
     "trtllm_mla",
     "tokenspeed_mla",
@@ -264,6 +265,7 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "fa3",
     "fa4",
     "flashmla",
+    "cutedsl_mla",
     "cutlass_mla",
     "trtllm_mla",
     "tokenspeed_mla",
@@ -923,7 +925,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.remote_instance_transfer_engine = TransferEngine()
         local_ip = get_local_ip_auto()
         self.remote_instance_transfer_engine.initialize(
-            local_ip, "P2PHANDSHAKE", "rdma", envs.MOONCAKE_DEVICE.get()
+            local_ip,
+            "P2PHANDSHAKE",
+            envs.MOONCAKE_PROTOCOL.get(),
+            envs.MOONCAKE_DEVICE.get(),
         )
         self.remote_instance_transfer_engine_session_id = NetworkAddress(
             local_ip, self.remote_instance_transfer_engine.get_rpc_port()
@@ -1050,7 +1055,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cuda" and self.server_args.elastic_ep_backend == "mooncake":
             backend = "mooncake"
             if self.server_args.mooncake_ib_device:
-                mooncake_ib_device = self.server_args.mooncake_ib_device.split(",")
+                from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+                    get_ib_devices_for_gpu,
+                )
+
+                ib_device_for_gpu = get_ib_devices_for_gpu(
+                    self.server_args.mooncake_ib_device, self.gpu_id
+                )
+                mooncake_ib_device = (
+                    ib_device_for_gpu.split(",") if ib_device_for_gpu else []
+                )
                 try:
                     from mooncake import ep as mooncake_ep
 
@@ -2305,20 +2319,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def kernel_warmup(self):
         """
         Warmup and tune kernels before cuda graph capture.
-        Covers framework-level warmups and optional model-specific warmups.
+        Currently only doing FlashInfer autotune.
         """
         if self.device != "cuda":
             return
 
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
-
-        # Models may need their own warmup for model-specific kernels or JIT paths.
-        # Register those hooks on the model class so ModelRunner can keep this
-        # warmup entry point generic.
-        model_kernel_warmup = getattr(self.model, "kernel_warmup", None)
-        if model_kernel_warmup is not None:
-            model_kernel_warmup(self)
 
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Pre-initialize flashinfer allreduce fusion workspaces.
@@ -2386,13 +2393,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         from flashinfer.autotuner import autotune
 
         cache_path = self._flashinfer_autotune_cache_path()
-        logger.info("Running FlashInfer autotune with cache: %s", cache_path)
+        if envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
+            autotune_cache = cache_path
+            logger.info("Running FlashInfer autotune with cache: %s", autotune_cache)
+        else:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            runs_dir = cache_path.parent / "runs"
+            runs_dir.mkdir(parents=True, exist_ok=True)
+            autotune_cache = (
+                runs_dir / f"{cache_path.stem}.{timestamp}{cache_path.suffix}"
+            )
+            logger.info(
+                "Running FlashInfer autotune (cache reuse DISABLED via "
+                "SGLANG_FLASHINFER_AUTOTUNE_CACHE=0); writing fresh result to: %s",
+                autotune_cache,
+            )
 
         # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
         # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
         self.forward_stream.wait_stream(torch.cuda.current_stream())
         with torch.get_device_module(self.device).stream(self.forward_stream):
-            with torch.inference_mode(), autotune(True, cache=str(cache_path)):
+            with torch.inference_mode(), autotune(True, cache=str(autotune_cache)):
                 self._dummy_run(batch_size=self.req_to_token_pool.size)
         torch.cuda.current_stream().wait_stream(self.forward_stream)
         logger.info("FlashInfer autotune completed.")
