@@ -51,6 +51,7 @@ def run_performance_test(
     dataset_name: str = "mmmu",
     spec_accept_length_threshold: Optional[float] = None,
     enable_profile: bool = True,
+    skip_server_launch: bool = False,
 ) -> PerformanceTestResult:
 
     # Set default for mutable argument
@@ -83,6 +84,7 @@ def run_performance_test(
             extra_bench_args=extra_bench_args,
             enable_profile=enable_profile,
             env=model.env,
+            skip_server_launch=skip_server_launch,
         )
 
         if success and results:
