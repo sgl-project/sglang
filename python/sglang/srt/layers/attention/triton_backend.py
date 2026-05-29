@@ -877,12 +877,17 @@ class TritonAttnBackend(AttentionBackend):
                 # DRAFT_EXTEND_V2: seq_lens = prefix + extend (bumped by eagle_info_v2).
                 # Triton extend kernel receives extend K/V as separate tensors, so
                 # kv_indptr/kv_indices must cover only the prefix portion.
+                # Clamp at 0 because padded rows (raw_bs..bs) leave seq_lens at
+                # the fill value (1) while extend_seq_lens stays at num_tokens_per_bs,
+                # which would otherwise produce negative kv_lens; padded rows
+                # reference reserved req-pool slot 0 and their output is discarded.
                 assert (
                     spec_info is not None
                     and getattr(spec_info, "extend_seq_lens_tensor", None) is not None
                 ), "DRAFT_EXTEND_V2 replay requires spec_info.extend_seq_lens_tensor"
-                kv_lens = (
-                    seq_lens - spec_info.extend_seq_lens_tensor[:bs].to(torch.int32)
+                kv_lens = torch.clamp(
+                    seq_lens - spec_info.extend_seq_lens_tensor[:bs].to(torch.int32),
+                    min=0,
                 ).to(torch.int32)
             else:
                 # DRAFT_EXTEND_V1: seq_lens = prefix only.
