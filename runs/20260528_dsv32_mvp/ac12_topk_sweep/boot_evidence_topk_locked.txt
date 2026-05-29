@@ -1,0 +1,12 @@
+# DS top_k investigation — boot evidence (Round 13)
+
+## (a) Validator refuses top_k != model DSA index_topk (no override):
+ValueError: Double Sparsity top_k=8192 does not match the model's DSA index_topk=2048. The two must agree for the Option B apples-to-apples comparison. Either set top_k=2048 in --double-sparsity-config or set SGLANG_DS_ALLOW_TOPK_MISMATCH=1 to override.
+
+## (b) With override, the flashmla_kv DECODE KERNEL itself asserts top_k==index_topk:
+    indices.shape[-1] == self.dsa_index_topk
+AssertionError
+    return self._forward_flashmla_kv(
+  File "/sgl-workspace/sglang/python/sglang/srt/layers/attention/dsa_backend.py", line 2148, in _forward_flashmla_kv
+    indices.shape[-1] == self.dsa_index_topk
+AssertionError

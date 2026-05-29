@@ -1,0 +1,30 @@
+{
+  "top_k": 2048,
+  "transport": "chat_completions",
+  "dsa_reference_recall_pct": 100.0,
+  "note": "DSA (native DSA indexer, same flashmla_kv kernel + same 2048 budget) recalls 100% at all lengths; AC-12 had DS 4K=75%, 16K=5%.",
+  "rows": [
+    {
+      "length_words": 1024,
+      "num_prompts": 20,
+      "ds_hits": 20,
+      "ds_recall_pct": 100.0,
+      "regime": "dense (budget>=seq)"
+    },
+    {
+      "length_words": 1536,
+      "num_prompts": 20,
+      "ds_hits": 20,
+      "ds_recall_pct": 100.0,
+      "regime": "dense (budget>=seq)"
+    },
+    {
+      "length_words": 4096,
+      "num_prompts": 20,
+      "ds_hits": 15,
+      "ds_recall_pct": 75.0,
+      "regime": "sparse (~50% selected)"
+    }
+  ],
+  "recorded_at": "2026-05-29T10:31:34Z"
+}
