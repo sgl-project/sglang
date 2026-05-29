@@ -8,6 +8,7 @@ If the actual run is significantly better than the baseline, the improved cases 
 from __future__ import annotations
 
 import pytest
+import unittest
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.server.ascend.testcase_configs_npu import (
@@ -32,3 +33,7 @@ class TestDiffusionServerEightNpu(DiffusionServerBase):
     def case(self, request) -> DiffusionTestCase:
         """Provide a DiffusionTestCase for each 8-NPU test."""
         return request.param
+
+
+if __name__ == "__main__":
+    unittest.main()
