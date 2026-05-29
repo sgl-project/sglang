@@ -3,8 +3,8 @@ import torch
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
 from sglang.srt.utils import get_compiler_backend, is_npu
 
-
 if not is_npu():
+
     @torch.compile(dynamic=True, backend=get_compiler_backend())
     def apply_scaling_penalties(logits, scaling_penalties):
         logits[:] = torch.where(
@@ -12,7 +12,9 @@ if not is_npu():
             logits * scaling_penalties,
             logits / scaling_penalties,
         )
+
 else:
+
     def apply_scaling_penalties(logits, scaling_penalties):
         logits[:] = torch.where(
             logits < 0,
