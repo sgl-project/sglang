@@ -1,0 +1,30 @@
+{
+  "request_text": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cUser\uff5c>List three prime numbers between 50 and 80.<\uff5cAssistant\uff5c>",
+  "sampling_params": {
+    "temperature": 0.0,
+    "max_new_tokens": 200
+  },
+  "generated_text": "Let\u2019s list the prime numbers between 50 and 80.\n\nFirst, note that 50 and  are not prime. We'll check numbers like 51, 53, 57, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 173, 179, 181, 191, 193, 197, 199, 211, 223, 227, 229, 233, 239, 241, 251, 257, 263, 263, 269, 271, 277, 281, 283, 293, 307, 311, 313, 317, 331, ",
+  "meta_info": {
+    "id": "4d322ce73d0d4be7b8803c2e17866d27",
+    "finish_reason": {
+      "type": "length",
+      "length": 200
+    },
+    "prompt_tokens": 14,
+    "weight_version": "default",
+    "num_retractions": 0,
+    "reasoning_tokens": 0,
+    "completion_tokens": 200,
+    "cached_tokens": 0,
+    "cached_tokens_details": null,
+    "double_sparsity": {
+      "sparsity_rate": 0.0046948356807511304,
+      "selected_tokens": 212,
+      "dense_fallback": 0
+    },
+    "dp_rank": null,
+    "e2e_latency": 38.249095001257956,
+    "response_sent_to_client_ts": 1780019087.6542592
+  }
+}

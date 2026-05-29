@@ -1,0 +1,30 @@
+{
+  "request_text": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cUser\uff5c>Compute 17 * 23 and output the result.<\uff5cAssistant\uff5c>",
+  "sampling_params": {
+    "temperature": 0,
+    "max_new_tokens": 120
+  },
+  "generated_text": "We are asked to compute \\(17 \\times 23\\). Let's do the multiplication step by step.\n\nFirst, multiply 17 by the tens digit of 23, which is 2. So, \\(17 \\times 2 = 34\\). But since this is 20, we'll multiply 17 by 20. So, \\(17 \\times 20 = 340\\). But wait, let's not confuse. Actually, we can multiply 17 by 23 directly:\n\n\\[\n\\begin{array}{c c c c c}\n& & 1 & 7 & \\\\\n\\times",
+  "meta_info": {
+    "id": "c7dd92794af5483ebc910aa6e76a94d0",
+    "finish_reason": {
+      "type": "length",
+      "length": 120
+    },
+    "prompt_tokens": 14,
+    "weight_version": "default",
+    "num_retractions": 0,
+    "reasoning_tokens": 0,
+    "completion_tokens": 120,
+    "cached_tokens": 0,
+    "cached_tokens_details": null,
+    "double_sparsity": {
+      "sparsity_rate": 0.007518796992481258,
+      "selected_tokens": 132,
+      "dense_fallback": 0
+    },
+    "dp_rank": null,
+    "e2e_latency": 23.931880014017224,
+    "response_sent_to_client_ts": 1780018890.3215406
+  }
+}

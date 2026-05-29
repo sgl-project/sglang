@@ -1,0 +1,30 @@
+{
+  "request_text": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cUser\uff5c>List three prime numbers between 50 and 80. Output only the three numbers separated by commas.<\uff5cAssistant\uff5c>",
+  "sampling_params": {
+    "temperature": 0.0,
+    "max_new_tokens": 20
+  },
+  "generated_text": "53, 59, 61",
+  "meta_info": {
+    "id": "4845ef01b2194709b17b971d9b4a64b1",
+    "finish_reason": {
+      "type": "stop",
+      "matched": 1
+    },
+    "prompt_tokens": 23,
+    "weight_version": "default",
+    "num_retractions": 0,
+    "reasoning_tokens": 0,
+    "completion_tokens": 8,
+    "cached_tokens": 0,
+    "cached_tokens_details": null,
+    "double_sparsity": {
+      "sparsity_rate": 0.033333333333333326,
+      "selected_tokens": 29,
+      "dense_fallback": 0
+    },
+    "dp_rank": null,
+    "e2e_latency": 1.5018416196107864,
+    "response_sent_to_client_ts": 1780019089.5325298
+  }
+}

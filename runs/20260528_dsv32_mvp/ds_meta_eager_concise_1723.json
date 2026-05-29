@@ -1,0 +1,30 @@
+{
+  "request_text": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cUser\uff5c>What is 17 times 23? Output only the number, nothing else.<\uff5cAssistant\uff5c>",
+  "sampling_params": {
+    "temperature": 0.0,
+    "max_new_tokens": 12
+  },
+  "generated_text": "391",
+  "meta_info": {
+    "id": "bbae8c1ee0c44e548f86fa903611f739",
+    "finish_reason": {
+      "type": "stop",
+      "matched": 1
+    },
+    "prompt_tokens": 19,
+    "weight_version": "default",
+    "num_retractions": 0,
+    "reasoning_tokens": 0,
+    "completion_tokens": 2,
+    "cached_tokens": 0,
+    "cached_tokens_details": null,
+    "double_sparsity": {
+      "sparsity_rate": 0.050000000000000044,
+      "selected_tokens": 19,
+      "dense_fallback": 0
+    },
+    "dp_rank": null,
+    "e2e_latency": 0.37337352335453033,
+    "response_sent_to_client_ts": 1780019088.029401
+  }
+}

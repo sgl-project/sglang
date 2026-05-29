@@ -1,0 +1,5 @@
+{
+  "source": "dsa_quality_refs.json smoke[10]",
+  "prompt": "Compute 17 * 23 and output the result.",
+  "dsa_text": "Let's compute \\( 17 \\times 23 \\).\n\nWe can break it down:\n\n\\[\n17 \\times 23 = 17 \\times (20 + 3)\n\\]\n\\[\n= (17 \\times 20) + (17 \\times 3)\n\\]\n\\[\n= 340 + 51\n\\]\n\\[\n= 391\n\\]\n\n**Answer:** 391"
+}

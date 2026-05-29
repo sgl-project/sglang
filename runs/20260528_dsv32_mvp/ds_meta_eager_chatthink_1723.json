@@ -1,0 +1,30 @@
+{
+  "request_text": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cUser\uff5c>Compute 17 * 23 and output the result.<\uff5cAssistant\uff5c><think>",
+  "sampling_params": {
+    "temperature": 0.0,
+    "max_new_tokens": 250
+  },
+  "generated_text": "We are asked to compute 17 * 23. This is a straightforward multiplication. Let's do it step by step.\n\nFirst, note that 17 and 23 are both prime numbers. But that doesn't affect the multiplication.\n\nWe can compute 17 * 23 as follows:\n\n23 * 10 = 230, and 23 * 7 = 161 (since 7*3=21, 7*2=14, but we'll do the multiplication directly).\n\nAlternatively, we can compute:\n\n17 * 20 = 340, and 17 * 3 = 51, so total 340 + 51 = 391, but that's 17*23? Wait, 23 is not 20+3, it's 20+3? Actually, 20+3=23, so that's a valid method. But 17*20=340, 17*3=51, sum=391. But 17*23 is not 391? Let's check: 17*23 = 391? Actually, 20*20=400, so 17*23 is likely a bit less than 400, but 391 is a plausible value. But let",
+  "meta_info": {
+    "id": "979a887764f1431c81feabf831580452",
+    "finish_reason": {
+      "type": "length",
+      "length": 250
+    },
+    "prompt_tokens": 15,
+    "weight_version": "default",
+    "num_retractions": 0,
+    "reasoning_tokens": 0,
+    "completion_tokens": 250,
+    "cached_tokens": 0,
+    "cached_tokens_details": null,
+    "double_sparsity": {
+      "sparsity_rate": 0.0037878787878787845,
+      "selected_tokens": 263,
+      "dense_fallback": 0
+    },
+    "dp_rank": null,
+    "e2e_latency": 47.82516261562705,
+    "response_sent_to_client_ts": 1780019049.403278
+  }
+}

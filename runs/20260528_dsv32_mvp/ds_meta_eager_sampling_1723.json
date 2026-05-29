@@ -1,0 +1,30 @@
+{
+  "request_text": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cUser\uff5c>Compute 17 * 23 and output the result.<\uff5cAssistant\uff5c>",
+  "sampling_params": {
+    "temperature": 0.5,
+    "max_new_tokens": 160
+  },
+  "generated_text": "We are asked to compute the product of 17 and 23. The simplest approach is to multiply these numbers.\n\nWe can break down the multiplication:\n- Multiply 17 by 20: \\( 17 \\times 20 = 340 \\).\n- Multiply 17 by 3: \\( 17 \\times 3 = 51 \\).\n- Add the two results: \\( 340 + 51 = 391 \\).\n\nHowever, note that 20 and 3 are the digits of 23, but we need to be careful because 23 is not 20+3, but 20+3. So, we can also compute directly by multiplying the numbers.\n\nWe can also use the formula for the product of two numbers that are close to a round number. For example,",
+  "meta_info": {
+    "id": "02b08a259f5245c18b1f3d7a180056e8",
+    "finish_reason": {
+      "type": "length",
+      "length": 160
+    },
+    "prompt_tokens": 14,
+    "weight_version": "default",
+    "num_retractions": 0,
+    "reasoning_tokens": 0,
+    "completion_tokens": 160,
+    "cached_tokens": 0,
+    "cached_tokens_details": null,
+    "double_sparsity": {
+      "sparsity_rate": 0.005780346820809301,
+      "selected_tokens": 172,
+      "dense_fallback": 0
+    },
+    "dp_rank": null,
+    "e2e_latency": 30.567552352324128,
+    "response_sent_to_client_ts": 1780019166.663703
+  }
+}
