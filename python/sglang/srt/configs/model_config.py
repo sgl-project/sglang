@@ -527,6 +527,7 @@ class ModelConfig:
             "MiMoV2MTP",
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
+            "Gemma4UnifiedForConditionalGeneration",
         ]
 
     def _detect_attention_sinks(self) -> bool:
@@ -1510,6 +1511,7 @@ multimodal_model_archs = [
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
     "Gemma4ForConditionalGeneration",
+    "Gemma4UnifiedForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
     "GlmOcrForConditionalGeneration",
@@ -1681,6 +1683,7 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "Step3p7ForConditionalGeneration",
         "Gemma4ForCausalLM",
         "Gemma4ForConditionalGeneration",
+        "Gemma4UnifiedForConditionalGeneration",
         "LagunaForCausalLM",
     }
     return any(arch in hybrid_swa_archs for arch in model_architectures)
@@ -1738,6 +1741,7 @@ def get_hybrid_layer_ids(
     elif (
         "Gemma4ForCausalLM" in model_architectures
         or "Gemma4ForConditionalGeneration" in model_architectures
+        or "Gemma4UnifiedForConditionalGeneration" in model_architectures
     ):
         layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [
