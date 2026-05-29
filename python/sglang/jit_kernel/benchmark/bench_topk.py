@@ -47,26 +47,36 @@ def _make_inputs(batch_size: int, seq_len: int, k: int):
 
 
 def _build_fn(provider: str, batch_size: int, seq_len: int, k: int):
+    """Return (fn, input_args, memory_args, memory_output).
+
+    All *read* tensors a provider touches go in `input_args` so do_bench rotates
+    them across cuda-graph iterations (cold L2) -- including page_table, whose
+    same ~topk entries are re-read every iteration and would otherwise stay
+    L2-resident. But page_table is deliberately *excluded* from `memory_args`:
+    only ~topk of its entries are read per row (not the whole table), so counting
+    its full size would overstate the footprint. The reported bandwidth therefore
+    counts the fully-read inputs (scores + seq_lens) plus the written output.
+    """
     scores, seq_lens, page_table, out = _make_inputs(batch_size, seq_len, k)
 
     if provider == "jit_v1":
 
-        def fn(scores):
+        def fn(scores, seq_lens, page_table):
             topk_transform_512(scores, seq_lens, page_table, out, PAGE_SIZE)
             return out
 
-        return fn, scores, (out,)
+        return fn, (scores, seq_lens, page_table), (scores, seq_lens), (out,)
 
     if provider == "jit_v2":
         metadata = plan_topk_v2(seq_lens)  # amortized once per metadata init
 
-        def fn(scores):
+        def fn(scores, seq_lens, page_table):
             topk_transform_512_v2(
                 scores, seq_lens, page_table, out, PAGE_SIZE, metadata
             )
             return out
 
-        return fn, scores, (out,)
+        return fn, (scores, seq_lens, page_table), (scores, seq_lens), (out,)
 
     if provider == "flashinfer":
         import flashinfer
@@ -74,14 +84,14 @@ def _build_fn(provider: str, batch_size: int, seq_len: int, k: int):
         def fn(scores):
             return flashinfer.top_k(scores, k)[1]
 
-        return fn, scores, "out"
+        return fn, (scores,), (scores,), "out"
 
     if provider == "torch":
 
         def fn(scores):
             return scores.topk(k, dim=-1).indices
 
-        return fn, scores, "out"
+        return fn, (scores,), (scores,), "out"
 
     raise ValueError(f"unknown provider: {provider}")
 
@@ -102,8 +112,10 @@ def benchmark(seq_len: int, batch_size: int, k: int, provider: str):
     if batch_size * seq_len * 4 > (4 << 30):
         marker.skip("input too large (>4GB)")
 
-    fn, scores, mem_out = _build_fn(provider, batch_size, seq_len, k)
-    return marker.do_bench(fn, input_args=(scores,), memory_output=mem_out)
+    fn, input_args, mem_args, mem_out = _build_fn(provider, batch_size, seq_len, k)
+    return marker.do_bench(
+        fn, input_args=input_args, memory_args=mem_args, memory_output=mem_out
+    )
 
 
 if __name__ == "__main__":
