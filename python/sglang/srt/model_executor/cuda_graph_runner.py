@@ -1237,12 +1237,10 @@ class CudaGraphRunner:
         # FIXME: implicit channel for backends (dsv4) that need forward_batch
         # in replay metadata prep. Should become a real param on the interface.
         attn_backend._replay_forward_batch = forward_batch
-        # Under the no-verify-sync path seq_lens_sum is None; pass it through
-        # (backends that opt out discard it in verify mode).
         seq_lens_sum_arg = (
-            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
-            if forward_batch.seq_lens_sum is not None
-            else None
+            None
+            if forward_batch.seq_lens_sum is None
+            else forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
         )
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,

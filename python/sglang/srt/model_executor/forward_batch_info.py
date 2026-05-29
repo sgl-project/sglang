@@ -508,8 +508,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         else:
             seq_lens_cpu = batch.seq_lens_cpu
 
-        # Under the no-verify-sync path seq_lens_cpu is None; leave seq_lens_sum
-        # as None so downstream lazily computes from the GPU seq_lens when needed.
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
@@ -631,12 +629,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
-            # gpu_only path hands device tensors directly; skip H2D, leave *_cpu unset.
-            if isinstance(extend_seq_lens, torch.Tensor):
-                ret.extend_seq_lens = extend_seq_lens
-                ret.extend_prefix_lens = extend_prefix_lens
-            else:
-                assert isinstance(extend_seq_lens, list)
+            if isinstance(extend_seq_lens, list):
+                # Main path: H2D from host lists; populate *_cpu mirrors.
                 assert isinstance(extend_prefix_lens, list)
                 ret.extend_seq_lens = torch.tensor(
                     extend_seq_lens, dtype=torch.int32
@@ -644,6 +638,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_prefix_lens = torch.tensor(
                     extend_prefix_lens, dtype=torch.int32
                 ).to(device, non_blocking=True)
+                ret.extend_prefix_lens_cpu = extend_prefix_lens
+                ret.extend_seq_lens_cpu = extend_seq_lens
+            else:
+                # gpu_only: device tensors handed in directly; leave *_cpu unset.
+                assert isinstance(extend_seq_lens, torch.Tensor)
+                ret.extend_seq_lens = extend_seq_lens
+                ret.extend_prefix_lens = extend_prefix_lens
             ret.extend_num_tokens = batch.extend_num_tokens
             positions, ret.extend_start_loc = compute_position(
                 model_runner.server_args.attention_backend,
@@ -653,9 +654,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
             if ret.positions is None:
                 ret.positions = positions
-            if isinstance(extend_prefix_lens, list):
-                ret.extend_prefix_lens_cpu = extend_prefix_lens
-                ret.extend_seq_lens_cpu = extend_seq_lens
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
 
         if model_runner.use_ngram_embedding:
