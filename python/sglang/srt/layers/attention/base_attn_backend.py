@@ -33,10 +33,12 @@ class AttentionBackend(ABC):
         GPU op, runs inside ``with graph.capture():`` at capture time and
         is auto-replayed by ``graph.replay()``. Default is no-op.
 
-    The legacy methods (``init_forward_metadata``,
-    ``init_forward_metadata_capture_cuda_graph``,
-    ``init_forward_metadata_replay_cuda_graph``) are retained as deprecation
-    shims for one release window and will be removed in a follow-up.
+    The legacy ``init_forward_metadata`` is retained as a deprecation shim
+    (warns + forwards to ``init_forward_data``) for one release window.
+    The legacy ``init_forward_metadata_capture_cuda_graph`` and
+    ``init_forward_metadata_replay_cuda_graph`` overrides are fully
+    deprecated and removed from the ABC: out-of-tree backends overriding
+    those must migrate to ``init_forward_data_out_graph(fb, in_capture)``.
     """
 
     def init_forward_data(self, forward_batch: ForwardBatch):
@@ -105,52 +107,6 @@ class AttentionBackend(ABC):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()
-
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
-        """Deprecated — use :py:meth:`init_forward_data_out_graph` with
-        ``in_capture=True`` instead.
-
-        Out-of-tree backends overriding this method must migrate to
-        ``init_forward_data_out_graph(fb, in_capture=True)``; callers
-        should construct a ``ForwardBatch`` (or fb_view) and switch.
-        """
-        raise NotImplementedError(
-            "AttentionBackend.init_forward_metadata_capture_cuda_graph is "
-            "deprecated; override init_forward_data_out_graph(fb, "
-            "in_capture=True) instead."
-        )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        """Deprecated — use :py:meth:`init_forward_data_out_graph` (with
-        the default ``in_capture=False``) instead.
-
-        Out-of-tree backends overriding this method must migrate to
-        ``init_forward_data_out_graph(fb)``; callers should construct a
-        ``ForwardBatch`` (or fb_view) and switch.
-        """
-        raise NotImplementedError(
-            "AttentionBackend.init_forward_metadata_replay_cuda_graph is "
-            "deprecated; override init_forward_data_out_graph(fb) instead."
-        )
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
