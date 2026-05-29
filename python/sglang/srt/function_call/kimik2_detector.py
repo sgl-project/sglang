@@ -79,7 +79,6 @@ class KimiK2Detector(BaseFormatDetector):
 
         self._last_arguments = ""
         self._current_stream_function_name: str | None = None
-        self._current_stream_tool_index: int = 0
 
         # Standard ID: "functions.search:0", "search:0"
         self.tool_call_id_regex = re.compile(
@@ -205,27 +204,11 @@ class KimiK2Detector(BaseFormatDetector):
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
-        """
-        Streaming incremental parsing tool calls for KimiK2 format.
-
-        Behavior:
-        - Text outside <|tool_call_begin|>...<|tool_call_end|> regions is
-          surfaced as normal_text (with section markers stripped).
-        - Arguments stream incrementally as they arrive; JSON validity is the
-          client's concern. A section is finalized on <|tool_call_end|>.
-        - If a new <|tool_call_begin|> appears before the previous one closed,
-          the in-progress section is discarded and parsing restarts on the new.
-        - Tool-call ID formats:
-            * "(functions.)?NAME:INT"  -> use captured name + index
-            * "INT"                    -> infer name from args, index = INT
-            * empty / whitespace only  -> infer name from args
-            * anything else            -> skip entire section silently (log warn)
-        """
+        """Streaming incremental parsing tool calls for KimiK2 format."""
         self._buffer += new_text
 
-        # Fast path: no tool call in flight and no section/start markers in
-        # the buffer. Emit as normal text, but hold back a trailing fragment
-        # that could be the start of a future <|tool_call_begin|>.
+        # Fast path: no tool call in flight and no markers yet -- emit as
+        # normal text, holding back any trailing partial start token.
         if (
             self._current_stream_function_name is None
             and self.bot_token not in self._buffer
@@ -245,20 +228,15 @@ class KimiK2Detector(BaseFormatDetector):
             while True:
                 buffer = self._buffer
 
-                # Find the next <|tool_call_begin|>. Drain any prefix as
-                # normal text (with section markers stripped); hold back an
-                # incomplete trailing token. Returns None if no start is
-                # present yet — wait for more chunks.
+                # Locate next <|tool_call_begin|>, draining any prefix as text.
                 begin_idx = self._locate_tool_call_start(buffer, normal_text_parts)
                 if begin_idx is None:
                     break
-                buffer = self._buffer  # may have been advanced
+                buffer = self._buffer
 
-                # Now buffer starts with <|tool_call_begin|>. The header runs
-                # up to <|tool_call_argument_begin|>; if another
-                # <|tool_call_begin|> appears inside that header span, the
-                # current section is malformed (model never closed it) —
-                # discard and restart at the orphan start token.
+                # If another <|tool_call_begin|> appears before the header
+                # closes with <|tool_call_argument_begin|>, the section is
+                # malformed -- discard and restart at the orphan.
                 arg_begin_idx = buffer.find(self.tool_call_argument_begin_token)
                 next_begin = buffer.find(
                     self.tool_call_start_token, len(self.tool_call_start_token)
@@ -275,7 +253,7 @@ class KimiK2Detector(BaseFormatDetector):
                     continue
 
                 if arg_begin_idx == -1:
-                    # Header not fully arrived yet — wait for more chunks.
+                    # Header not fully arrived yet.
                     break
 
                 id_start = len(self.tool_call_start_token)
@@ -296,11 +274,8 @@ class KimiK2Detector(BaseFormatDetector):
                     )
                     if resolved is None:
                         if end_idx == -1:
-                            # Can't yet tell if this is a bad ID we should skip
-                            # or just a section pending more bytes. Skip only
-                            # when we've seen the end marker.
+                            # Wait for the end marker before deciding.
                             break
-                        # Unrecognized ID -> drop the entire section.
                         logger.warning(
                             "Kimi-K2 unrecognized tool_call_id %r; skipping section.",
                             function_id,
@@ -308,14 +283,13 @@ class KimiK2Detector(BaseFormatDetector):
                         self._buffer = buffer[end_idx + len(self.tool_call_end_token) :]
                         self._reset_inflight_call_state()
                         continue
-                    name, parsed_index = resolved
+                    name = resolved
                     self._current_stream_function_name = name
                     name_just_resolved = True
 
-                    # Initialize per-call tracking state. Use the parsed index
-                    # from the tool_call_id as the externally-visible
-                    # tool_index, but keep an internal monotonic counter so
-                    # prev_tool_call_arr / streamed_args_for_tool stay packed.
+                    # ``tool_index`` is the per-response 0-based position
+                    # (OpenAI streaming spec); ignore the model's ``:N`` suffix
+                    # which is a conversation-level counter.
                     if self.current_tool_id == -1:
                         self.current_tool_id = 0
                         self.prev_tool_call_arr = []
@@ -328,13 +302,10 @@ class KimiK2Detector(BaseFormatDetector):
                         "name": name,
                         "arguments": {},
                     }
-                    self._current_stream_tool_index = parsed_index
                     self.current_tool_name_sent = True
 
-                # Stream any newly-arrived args (everything up to <|tool_call_end|>
-                # or end-of-buffer). On the first event of this section, also
-                # carry the freshly-resolved name so the client gets a single
-                # combined event instead of name-only + args.
+                # Stream newly-arrived args, combining the first event with
+                # the freshly-resolved name.
                 if end_idx != -1:
                     args_full = buffer[args_start:end_idx]
                 else:
@@ -343,7 +314,7 @@ class KimiK2Detector(BaseFormatDetector):
                 if argument_diff or name_just_resolved:
                     calls.append(
                         ToolCallItem(
-                            tool_index=self._current_stream_tool_index,
+                            tool_index=self.current_tool_id,
                             name=(
                                 self._current_stream_function_name
                                 if name_just_resolved
@@ -362,8 +333,7 @@ class KimiK2Detector(BaseFormatDetector):
                     # Args still streaming.
                     break
 
-                # Section finalized — advance buffer past <|tool_call_end|>
-                # and prepare state for the next call.
+                # Section finalized -- advance buffer and prepare next call.
                 self._buffer = buffer[end_idx + len(self.tool_call_end_token) :]
                 self.current_tool_id += 1
                 self._reset_inflight_call_state()
@@ -374,8 +344,7 @@ class KimiK2Detector(BaseFormatDetector):
 
         except Exception as e:
             logger.error("Error in parse_streaming_increment: %s", e, exc_info=True)
-            # Preserve calls already drained in this invocation; do not leak
-            # raw buffer (with special tokens / partial args) into normal_text.
+            # Drop the buffer to avoid leaking raw special tokens.
             self._buffer = ""
             self._reset_inflight_call_state()
             return StreamingParseResult(
@@ -387,23 +356,13 @@ class KimiK2Detector(BaseFormatDetector):
         self._last_arguments = ""
         self.current_tool_name_sent = False
         self._current_stream_function_name = None
-        self._current_stream_tool_index = 0
 
     def _locate_tool_call_start(
         self, buffer: str, normal_text_parts: list
     ) -> int | None:
-        """Find the next <|tool_call_begin|> in ``buffer``.
+        """Find the next <|tool_call_begin|>; drain any prefix as normal text.
 
-        Side effects:
-        - If a prefix precedes the start token, it is appended to
-          ``normal_text_parts`` (with section markers stripped) and the buffer
-          is advanced past it.
-        - If no start token is present, a trailing fragment that could be the
-          incomplete prefix of a future start/section token is held back in
-          ``self._buffer`` and the rest is appended to ``normal_text_parts``.
-
-        Returns the index of the start token in the (possibly advanced) buffer
-        (always 0 on success), or ``None`` when no start is present yet.
+        Returns 0 on success, or ``None`` when no start token is present yet.
         """
         begin_idx = buffer.find(self.tool_call_start_token)
         if begin_idx == -1:
@@ -433,23 +392,17 @@ class KimiK2Detector(BaseFormatDetector):
 
     def _resolve_function_name(
         self, function_id: str, tools: List[Tool], function_args: str
-    ):
-        """Map a tool_call_id to (name, index) per Kimi-K2 grammar.
-
-        Returns (name, index), or None if the ID is unrecognized.
-        """
+    ) -> Optional[str]:
+        """Map a Kimi-K2 tool_call_id to a tool name, or ``None`` if unknown."""
         if not function_id:
-            # Bare start: no id between begin and arg_begin -> infer, index 0.
-            name = self._infer_tool_name(tools, function_args)
-            return (name, 0) if name else None
+            return self._infer_tool_name(tools, function_args)
 
         m = self.tool_call_id_regex.match(function_id)
         if m:
-            return m.group("name"), int(m.group("index"))
+            return m.group("name")
 
         if self.tool_call_id_counter_regex.match(function_id):
-            name = self._infer_tool_name(tools, function_args)
-            return (name, int(function_id)) if name else None
+            return self._infer_tool_name(tools, function_args)
 
         return None
 
