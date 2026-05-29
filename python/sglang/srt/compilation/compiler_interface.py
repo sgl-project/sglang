@@ -152,7 +152,6 @@ class AlwaysHitShapeEnv:
 
     def __init__(self) -> None:
         self.guards: list[Any] = []
-        self.var_to_hint_override: dict[Any, int] = {}
 
     def evaluate_guards_expression(self, *args, **kwargs):
         return True
