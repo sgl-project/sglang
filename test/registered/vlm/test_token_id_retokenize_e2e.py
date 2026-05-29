@@ -108,9 +108,7 @@ class TestQwenVLTokenIdRetokenize(CustomTestCase):
 
         # ON keeps the user's original tokens; OFF loses the drift_delta tokens.
         pt_off, pt_on = prompt_tokens["0"], prompt_tokens["1"]
-        self.assertEqual(
-            pt_on - pt_off, drift_delta, f"on={pt_on}, off={pt_off}"
-        )
+        self.assertEqual(pt_on - pt_off, drift_delta, f"on={pt_on}, off={pt_off}")
 
 
 if __name__ == "__main__":

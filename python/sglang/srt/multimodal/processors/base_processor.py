@@ -1329,9 +1329,9 @@ class BaseMultimodalProcessor(ABC):
                 and input_ids is not None
                 and raw_images
             ):
-                assert isinstance(base_output.input_ids, list), (
-                    f"expected list[int] input_ids, got {type(base_output.input_ids)}"
-                )
+                assert isinstance(
+                    base_output.input_ids, list
+                ), f"expected list[int] input_ids, got {type(base_output.input_ids)}"
                 try:
                     counts = self.resolve_image_token_counts(raw_images)
                     input_ids = torch.tensor(
