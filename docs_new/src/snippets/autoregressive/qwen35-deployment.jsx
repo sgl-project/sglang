@@ -365,7 +365,7 @@ export const Qwen35Deployment = () => {
       // its condition gates only the UI radio (hidden for dense models), but
       // the rule still fires for dense models on NVIDIA + MTP to emit
       // --mamba-scheduler-strategy extra_buffer.
-      if (option.condition && !option.condition(values) && key !== 'mambaCache') continue;
+      if (option.condition && !option.condition(values) && (key !== 'mambaCache' || speculative !== 'enabled')) continue;
       const rule = commandRules[key];
       if (rule) {
         const adjustedValue = key === 'mambaCache' ? actualMambaCache : values[key];
