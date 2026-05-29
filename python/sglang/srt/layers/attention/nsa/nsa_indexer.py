@@ -432,11 +432,13 @@ class Indexer(MultiPlatformOp):
             return
         dst.copy_(src)
 
-    def _capture_and_return(self, layer_id, topk_result, raw_result):
+    def _capture_and_return(self, layer_id, topk_result, raw_result, forward_batch):
         # capture sequence-relative indices for rollout replay; return the
         # transformed (paged/ragged) indices for the attention kernel
         maybe_capture_indexer_topk(
-            layer_id, raw_result if raw_result is not None else topk_result
+            layer_id,
+            raw_result if raw_result is not None else topk_result,
+            forward_batch,
         )
         return topk_result
 
@@ -1249,7 +1251,9 @@ class Indexer(MultiPlatformOp):
                 metadata,
                 return_indices,
             )
-            return self._capture_and_return(layer_id, topk_result, raw_result)
+            return self._capture_and_return(
+                layer_id, topk_result, raw_result, forward_batch
+            )
 
         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
@@ -1355,6 +1359,7 @@ class Indexer(MultiPlatformOp):
                         dtype=torch.int,
                         device=x_meta.device,
                     ),
+                    forward_batch,
                 )
 
             if (
@@ -1408,6 +1413,7 @@ class Indexer(MultiPlatformOp):
                         layer_id,
                         torch.cat([topk_result_prev, topk_result_next], dim=0),
                         torch.cat([raw_prev, raw_next], dim=0),
+                        forward_batch,
                     )
                 else:
                     topk_result, raw_result = self._get_topk_ragged(
@@ -1426,7 +1432,9 @@ class Indexer(MultiPlatformOp):
                 topk=self.index_topk,
                 layer_id=layer_id,
             )
-        return self._capture_and_return(layer_id, topk_result, raw_result)
+        return self._capture_and_return(
+            layer_id, topk_result, raw_result, forward_batch
+        )
 
     def forward_npu(
         self,
