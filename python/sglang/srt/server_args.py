@@ -795,6 +795,8 @@ class ServerArgs:
     # TODO(guoyuhong): clean the old dumper code.
     debug_tensor_dump_input_file: Optional[str] = None
     debug_tensor_dump_inject: bool = False
+    # Graph-compatible tensor dump (works WITH cuda graph enabled).
+    debug_graph_tensor_dump_output_folder: Optional[str] = None
 
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
@@ -6705,6 +6707,13 @@ class ServerArgs:
             type=str,
             default=ServerArgs.debug_tensor_dump_inject,
             help="Inject the outputs from jax as the input of every layer.",
+        )
+        parser.add_argument(
+            "--debug-graph-tensor-dump-output-folder",
+            type=str,
+            default=ServerArgs.debug_graph_tensor_dump_output_folder,
+            help="Output folder for dumping tensors during CUDA graph replay. "
+            "Unlike --debug-tensor-dump-output-folder, this works with CUDA graphs enabled.",
         )
 
         # PD disaggregation

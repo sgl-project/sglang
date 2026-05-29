@@ -1403,6 +1403,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.pp_rank,
             )
 
+        if self.server_args.debug_graph_tensor_dump_output_folder is not None:
+            from sglang.srt.utils.graph_debug_utils import gdebug
+
+            gdebug.configure(
+                self.server_args.debug_graph_tensor_dump_output_folder,
+                self.tp_size,
+                self.tp_rank,
+                self.pp_rank,
+            )
+            gdebug.register_hooks(self.model)
+
         if dumper.may_enable:
             dumper.apply_source_patches()
             dumper.register_non_intrusive_dumper(self.model)
