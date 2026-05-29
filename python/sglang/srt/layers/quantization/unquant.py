@@ -268,6 +268,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            if hasattr(layer, "w13_weight_bias"):
+                layer.w13_weight_bias = Parameter(
+                    layer.w13_weight_bias.float(), requires_grad=False
+                )
+            if hasattr(layer, "w2_weight_bias"):
+                layer.w2_weight_bias = Parameter(
+                    layer.w2_weight_bias.float(), requires_grad=False
+                )
 
         if (
             self.use_deep_gemm
@@ -579,6 +587,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 None,  # w1_zp
                 None,  # w2_zp
                 None,  # block_size
+                getattr(layer, "w13_weight_bias", None),
+                getattr(layer, "w2_weight_bias", None),
+                layer.moe_runner_config.gemm1_alpha,
+                layer.moe_runner_config.gemm1_clamp_limit,
                 True,  # is_vnni
             )
             return StandardCombineInput(hidden_states=output)
