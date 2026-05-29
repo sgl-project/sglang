@@ -1,0 +1,13 @@
+{
+  "prompt_tokens": 10565,
+  "completion_tokens": 7,
+  "reply": "OSPREY-3141",
+  "needle": "OSPREY-3141",
+  "needle_recalled": true,
+  "chunked_prefill_engaged": true,
+  "chunked_prefill_size": 8192,
+  "disable_radix_cache": false,
+  "served_without_crash": true,
+  "verdict": "PASS",
+  "note": "radix flushed + unique prefix => uncached => full prompt prefills in multiple 8192-token chunks; DS serves radix-on without crash"
+}
