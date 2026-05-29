@@ -410,6 +410,15 @@ std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
     bool disable_grouping,
     at::ScalarType out_dtype);
 
+// kvcache
+void store_cache_cpu(
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& indices,
+    std::optional<int64_t> row_dim);
+
 // [NOTE] When registering kernels, we should accurately describe the in-place information.
 // Taking fused_add_rmsnorm_cpu as an example, add `Tensor(a!)` modifier to all tensors that
 // will be modified in-place to avoid incorrect fusing and execution order on graph mode.
@@ -658,6 +667,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "image_std, int patch_size, int temporal_patch_size, int merge_size, bool disable_grouping, ScalarType "
       "out_dtype) -> (Tensor, Tensor)");
   m.impl("image_preprocess_cpu", torch::kCPU, &image_preprocess_cpu);
+
+  // kvcache
+  m.def(
+      "store_cache_cpu(Tensor k, Tensor v, Tensor(a!) k_cache, Tensor(a!) v_cache, Tensor indices, int? row_dim) -> "
+      "()");
+  m.impl("store_cache_cpu", torch::kCPU, &store_cache_cpu);
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {

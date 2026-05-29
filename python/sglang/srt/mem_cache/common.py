@@ -428,14 +428,14 @@ def alloc_req_slots(
 
 def alloc_for_extend(
     batch: ScheduleBatch,
-) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Allocate KV cache for extend batch and write to req_to_token_pool.
 
     Returns:
         out_cache_loc: allocated cache locations
-        req_pool_indices_device: request pool indices at a device tensor
-        req_pool_indices: request pool indices as list
+        req_pool_indices_device: request pool indices as a device tensor
+        req_pool_indices_cpu: request pool indices as a CPU tensor (host mirror)
     """
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
@@ -489,7 +489,7 @@ def alloc_for_extend(
         batch.req_to_token_pool,
     )
 
-    return out_cache_loc, req_pool_indices_device, req_pool_indices
+    return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
 
 def alloc_paged_token_slots_decode(
@@ -531,12 +531,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     batch.maybe_evict_swa()
 
-    if batch.enable_overlap:
-        # batch.seq_lens (GPU) is a sentinel between iters (FutureMap.invalidate);
-        # materialize from CPU shadow for the allocator. Tensor stays local.
-        seq_lens_gpu = batch.seq_lens_cpu.to(batch.device, non_blocking=True)
-    else:
-        seq_lens_gpu = batch.seq_lens
+    seq_lens_gpu = batch.seq_lens
     bs = seq_lens_gpu.shape[0]
 
     if batch.tree_cache.page_size == 1:
